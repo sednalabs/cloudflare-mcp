@@ -1,0 +1,13 @@
+[mcp_servers.cloudflare-mcp]
+command = "C:\\Tools\\cloudflare-mcp\\cloudflare-mcp.exe"
+args = ["--stdio"]
+startup_timeout_sec = 30.0
+tool_timeout_sec = 300.0
+env_vars = [
+  "CLOUDFLARE_MCP_API_TOKEN",
+  "CLOUDFLARE_MCP_DEFAULT_ACCOUNT_ID",
+  "CLOUDFLARE_MCP_DEFAULT_ZONE_ID",
+]
+
+[mcp_servers.cloudflare-mcp.env]
+CLOUDFLARE_MCP_AUTH_MODE = "off"

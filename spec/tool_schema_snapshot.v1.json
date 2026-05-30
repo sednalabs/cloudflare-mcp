@@ -1,0 +1,3670 @@
+{
+  "schema": "mcp_tool_schema_snapshot",
+  "tools": [
+    {
+      "description": "Get a Cloudflare Access application by app_id.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "app_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "app_id"
+        ],
+        "title": "GetAccessAppArgs",
+        "type": "object"
+      },
+      "name": "access_get_app"
+    },
+    {
+      "description": "Verify a hostname has exactly one Access app and at least one Access policy before public exposure.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "hostname": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "hostname"
+        ],
+        "title": "VerifyAccessHostnameGateArgs",
+        "type": "object"
+      },
+      "name": "access_verify_hostname_gate"
+    },
+    {
+      "description": "Curated account-owned API token management: list permission groups, list/get/verify tokens, and guarded create/update/delete/roll actions.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "action": {
+            "type": "string"
+          },
+          "body": {
+            "default": null
+          },
+          "confirmation_token": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "max_bytes": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "query": {
+            "additionalProperties": true,
+            "default": {},
+            "type": "object"
+          },
+          "reason": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "token_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "AccountApiTokensArgs",
+        "type": "object"
+      },
+      "name": "account_api_tokens"
+    },
+    {
+      "description": "Describe Workers Analytics Engine dataset schema hints, including canonical blob/double/index columns.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_rows": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "title": "AnalyticsEngineListDatasetsArgs",
+        "type": "object"
+      },
+      "name": "analytics_engine_describe_schema"
+    },
+    {
+      "description": "List Workers Analytics Engine datasets using SHOW TABLES.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_rows": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "title": "AnalyticsEngineListDatasetsArgs",
+        "type": "object"
+      },
+      "name": "analytics_engine_list_datasets"
+    },
+    {
+      "description": "Run one read-only Workers Analytics Engine SQL statement.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_rows": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "sql": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sql"
+        ],
+        "title": "AnalyticsEngineQueryArgs",
+        "type": "object"
+      },
+      "name": "analytics_engine_query"
+    },
+    {
+      "description": "Validate one read-only Workers Analytics Engine SQL statement against dataset and column schema hints without executing the statement.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "include_dataset_readback": {
+            "default": true,
+            "type": "boolean"
+          },
+          "sql": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "sql"
+        ],
+        "title": "AnalyticsEngineValidateQueryArgs",
+        "type": "object"
+      },
+      "name": "analytics_engine_validate_query"
+    },
+    {
+      "description": "Search the official Cloudflare REST API v4 operation catalog by product, method, scope, risk, and keywords.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "include_deprecated": {
+            "default": false,
+            "type": "boolean"
+          },
+          "limit": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "method": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "query": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "risk": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scope": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tag": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "ApiFindOperationsArgs",
+        "type": "object"
+      },
+      "name": "api_find_operations"
+    },
+    {
+      "description": "Inspect one Cloudflare REST API v4 operation and get its call template, parameters, risk class, and preferred curated tool if any.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "operation_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id"
+        ],
+        "title": "ApiGetOperationArgs",
+        "type": "object"
+      },
+      "name": "api_get_operation"
+    },
+    {
+      "description": "Dry-run or execute a guarded mutating operation from the Cloudflare REST API v4 catalog.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "body": {
+            "default": null
+          },
+          "confirmation_token": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "path_params": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "type": "object"
+          },
+          "query": {
+            "additionalProperties": true,
+            "default": {},
+            "type": "object"
+          },
+          "reason": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "operation_id"
+        ],
+        "title": "ApiMutateArgs",
+        "type": "object"
+      },
+      "name": "api_mutate"
+    },
+    {
+      "description": "Summarize the local Cloudflare REST API v4 parity catalog and generic executor coverage.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "ApiParityStatusArgs",
+        "type": "object"
+      },
+      "name": "api_parity_status"
+    },
+    {
+      "description": "Resolve a Cloudflare REST API operation from an operation_id or search query and return exact api_read/api_mutate arguments.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "body": {
+            "default": null
+          },
+          "include_deprecated": {
+            "default": false,
+            "type": "boolean"
+          },
+          "limit": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "method": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "operation_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path_params": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "type": "object"
+          },
+          "query": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "query_params": {
+            "additionalProperties": true,
+            "default": {},
+            "type": "object"
+          },
+          "risk": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scope": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tag": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "ApiPrepareCallArgs",
+        "type": "object"
+      },
+      "name": "api_prepare_call"
+    },
+    {
+      "description": "Execute a read-only GET operation from the Cloudflare REST API v4 catalog.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "max_bytes": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "path_params": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "type": "object"
+          },
+          "query": {
+            "additionalProperties": true,
+            "default": {},
+            "type": "object"
+          }
+        },
+        "required": [
+          "operation_id"
+        ],
+        "title": "ApiReadArgs",
+        "type": "object"
+      },
+      "name": "api_read"
+    },
+    {
+      "description": "Mutate Access allowlist using replace/additive modes with post-apply invariant validation.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "app_id": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "mode": {
+            "default": "replace",
+            "type": "string"
+          },
+          "requested_principals": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "app_id",
+          "requested_principals"
+        ],
+        "title": "ApplyAccessAllowlistArgs",
+        "type": "object"
+      },
+      "name": "apply_access_allowlist"
+    },
+    {
+      "description": "Discover D1, Queues, Worker, and Pages resources that may be used as application bindings.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "include_pages": {
+            "default": true,
+            "type": "boolean"
+          },
+          "include_workers": {
+            "default": true,
+            "type": "boolean"
+          },
+          "name_contains": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "BindingsDiscoverArgs",
+        "type": "object"
+      },
+      "name": "bindings_discover"
+    },
+    {
+      "description": "Create or update the account redirect ruleset so it enables a Bulk Redirect list.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "enabled": {
+            "default": true,
+            "type": "boolean"
+          },
+          "list_name": {
+            "type": "string"
+          },
+          "rule_description": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "list_name"
+        ],
+        "title": "BulkRedirectAttachListArgs",
+        "type": "object"
+      },
+      "name": "bulk_redirects_attach_list_to_ruleset"
+    },
+    {
+      "description": "Create a Bulk Redirect Rules List with dry-run support.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "BulkRedirectCreateListArgs",
+        "type": "object"
+      },
+      "name": "bulk_redirects_create_list"
+    },
+    {
+      "description": "Get an account Rules List.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "list_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "list_id"
+        ],
+        "title": "BulkRedirectListArgs",
+        "type": "object"
+      },
+      "name": "bulk_redirects_get_list"
+    },
+    {
+      "description": "Get a Bulk Redirect list operation status.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "operation_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation_id"
+        ],
+        "title": "BulkRedirectOperationArgs",
+        "type": "object"
+      },
+      "name": "bulk_redirects_get_operation"
+    },
+    {
+      "description": "Get the account Bulk Redirect Ruleset.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "BulkRedirectRulesetArgs",
+        "type": "object"
+      },
+      "name": "bulk_redirects_get_ruleset"
+    },
+    {
+      "description": "Import Bulk Redirect items with dry-run support.",
+      "inputSchema": {
+        "$defs": {
+          "BulkRedirectItemWrite": {
+            "properties": {
+              "include_subdomains": {
+                "default": null,
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "preserve_path_suffix": {
+                "default": null,
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "preserve_query_string": {
+                "default": null,
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "source_url": {
+                "type": "string"
+              },
+              "status_code": {
+                "default": null,
+                "format": "uint16",
+                "maximum": 65535,
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "subpath_matching": {
+                "default": null,
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "target_url": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "source_url",
+              "target_url"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "list_id": {
+            "type": "string"
+          },
+          "mode": {
+            "default": "append",
+            "type": "string"
+          },
+          "redirects": {
+            "items": {
+              "$ref": "#/$defs/BulkRedirectItemWrite"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "list_id",
+          "redirects"
+        ],
+        "title": "BulkRedirectImportItemsArgs",
+        "type": "object"
+      },
+      "name": "bulk_redirects_import_items"
+    },
+    {
+      "description": "List items in an account Rules List.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cursor": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "list_id": {
+            "type": "string"
+          },
+          "per_page": {
+            "default": null,
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "list_id"
+        ],
+        "title": "BulkRedirectListItemsArgs",
+        "type": "object"
+      },
+      "name": "bulk_redirects_list_items"
+    },
+    {
+      "description": "List account Rules Lists, optionally redirect lists only.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "include_non_redirect": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "title": "BulkRedirectsListArgs",
+        "type": "object"
+      },
+      "name": "bulk_redirects_list_lists"
+    },
+    {
+      "description": "Update a Bulk Redirect Rules List with dry-run support.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "list_id": {
+            "type": "string"
+          },
+          "name": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "list_id"
+        ],
+        "title": "BulkRedirectUpdateListArgs",
+        "type": "object"
+      },
+      "name": "bulk_redirects_update_list"
+    },
+    {
+      "description": "Manage deprecated origin cloud-region cache mappings where Cloudflare still exposes the API.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "payload": {
+            "default": null
+          },
+          "resource": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "zone_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "CacheResourceArgs",
+        "type": "object"
+      },
+      "name": "cache_origin_regions"
+    },
+    {
+      "description": "Purge Cloudflare cache by everything, files, URL headers, tags, hosts, or prefixes.",
+      "inputSchema": {
+        "$defs": {
+          "CachePurgePayload": {
+            "properties": {
+              "everything": {
+                "default": false,
+                "type": "boolean"
+              },
+              "files": {
+                "default": null,
+                "items": true,
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
+              "hosts": {
+                "default": null,
+                "items": {
+                  "type": "string"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
+              "prefixes": {
+                "default": null,
+                "items": {
+                  "type": "string"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
+              "tags": {
+                "default": null,
+                "items": {
+                  "type": "string"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "confirmation_token": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "environment_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "payload": {
+            "$ref": "#/$defs/CachePurgePayload",
+            "default": {
+              "everything": false,
+              "files": null,
+              "hosts": null,
+              "prefixes": null,
+              "tags": null
+            }
+          },
+          "zone_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "CachePurgeArgs",
+        "type": "object"
+      },
+      "name": "cache_purge"
+    },
+    {
+      "description": "Read, update, clear, and inspect Cloudflare Cache Reserve state.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "payload": {
+            "default": null
+          },
+          "resource": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "zone_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "CacheResourceArgs",
+        "type": "object"
+      },
+      "name": "cache_reserve"
+    },
+    {
+      "description": "Manage Cache Rules and Cache Response Rules through Cloudflare Rulesets entrypoint phases.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "confirmation_token": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "phase": {
+            "default": "request",
+            "type": "string"
+          },
+          "rule": {
+            "default": null
+          },
+          "rule_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rules": {
+            "default": null,
+            "items": true,
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "zone_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "CacheRulesArgs",
+        "type": "object"
+      },
+      "name": "cache_rules"
+    },
+    {
+      "description": "Read, update, or delete Smart Tiered Cache and Regional Tiered Cache settings.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "payload": {
+            "default": null
+          },
+          "resource": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "zone_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "CacheResourceArgs",
+        "type": "object"
+      },
+      "name": "cache_tiered"
+    },
+    {
+      "description": "Read, update, or delete Cloudflare cache variants settings.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "payload": {
+            "default": null
+          },
+          "resource": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "zone_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "CacheResourceArgs",
+        "type": "object"
+      },
+      "name": "cache_variants"
+    },
+    {
+      "description": "Read or update zone-level cache settings such as browser TTL, cache level, development mode, and origin cache control.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "setting_id": {
+            "type": "string"
+          },
+          "value": {
+            "default": null
+          },
+          "zone_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "action",
+          "setting_id"
+        ],
+        "title": "CacheZoneSettingArgs",
+        "type": "object"
+      },
+      "name": "cache_zone_setting"
+    },
+    {
+      "description": "Read-only Cloudflare API capability probe for configured DNS, Tunnel, Access, Pages, D1, Queues, Workers, and redirect surfaces.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "zone_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "CapabilitiesCheckArgs",
+        "type": "object"
+      },
+      "name": "capabilities_check"
+    },
+    {
+      "description": "Idempotent connector run-control hook for tunnel runtime state (start/stop/restart).",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "connector_key": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "connector_key",
+          "action"
+        ],
+        "title": "ConnectorControlArgs",
+        "type": "object"
+      },
+      "name": "connector_control"
+    },
+    {
+      "description": "Apply local Wrangler-style D1 SQL migration files in lexical order with dry-run safety.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "database_id": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "max_rows": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "migrations_directory": {
+            "type": "string"
+          },
+          "migrations_table": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "database_id",
+          "migrations_directory"
+        ],
+        "title": "D1ApplyMigrationsArgs",
+        "type": "object"
+      },
+      "name": "d1_apply_migrations"
+    },
+    {
+      "description": "Delete a Cloudflare D1 database through the curated high-risk endpoint. Dry-run emits a required confirmation token.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "confirmation_token": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "database_id": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "reason": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "database_id"
+        ],
+        "title": "D1DeleteDatabaseArgs",
+        "type": "object"
+      },
+      "name": "d1_delete_database"
+    },
+    {
+      "description": "Execute one audited D1 row-write SQL statement with dry-run safety. Allows INSERT, UPDATE, DELETE, or REPLACE only.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "database_id": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "max_rows": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "params": {
+            "default": [],
+            "items": true,
+            "type": "array"
+          },
+          "sql": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "database_id",
+          "sql"
+        ],
+        "title": "D1ExecuteWriteArgs",
+        "type": "object"
+      },
+      "name": "d1_execute_write"
+    },
+    {
+      "description": "Get Cloudflare D1 database metadata by database_id. Read-only.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "database_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "database_id"
+        ],
+        "title": "D1DatabaseArgs",
+        "type": "object"
+      },
+      "name": "d1_get_database"
+    },
+    {
+      "description": "Inspect D1 application tables, indexes, views, and columns using read-only SQLite catalog queries; supports targeted include filters and skips Cloudflare internal _cf_* objects.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "database_id": {
+            "type": "string"
+          },
+          "include_columns": {
+            "default": true,
+            "type": "boolean"
+          },
+          "include_table_pattern": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "include_tables": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "database_id"
+        ],
+        "title": "D1InspectSchemaArgs",
+        "type": "object"
+      },
+      "name": "d1_inspect_schema"
+    },
+    {
+      "description": "List Cloudflare D1 databases for an account. Read-only.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "page": {
+            "default": null,
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "per_page": {
+            "default": null,
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "title": "D1ListDatabasesArgs",
+        "type": "object"
+      },
+      "name": "d1_list_databases"
+    },
+    {
+      "description": "Run or execute one read-only Cloudflare D1 SQL SELECT/query statement against a database after the shared restricted-SQL classifier approves it, returning rows.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "database_id": {
+            "type": "string"
+          },
+          "max_rows": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "params": {
+            "default": [],
+            "items": true,
+            "type": "array"
+          },
+          "sql": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "database_id",
+          "sql"
+        ],
+        "title": "D1QueryArgs",
+        "type": "object"
+      },
+      "name": "d1_query_read_only"
+    },
+    {
+      "description": "Rename a Cloudflare D1 database through the curated partial-update endpoint. Supports dry-run planning.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "database_id": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "database_id",
+          "name"
+        ],
+        "title": "D1RenameDatabaseArgs",
+        "type": "object"
+      },
+      "name": "d1_rename_database"
+    },
+    {
+      "description": "Validate one read-only D1 SQL statement against application schema metadata without executing the statement.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "database_id": {
+            "type": "string"
+          },
+          "include_query_plan": {
+            "default": false,
+            "type": "boolean"
+          },
+          "sql": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "database_id",
+          "sql"
+        ],
+        "title": "D1ValidateQueryArgs",
+        "type": "object"
+      },
+      "name": "d1_validate_query"
+    },
+    {
+      "description": "Get an Email Routing destination address.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "destination_address_identifier": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "destination_address_identifier"
+        ],
+        "title": "EmailRoutingAddressArgs",
+        "type": "object"
+      },
+      "name": "email_routing_get_address"
+    },
+    {
+      "description": "Get Email Routing catch-all rule.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "zone_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "EmailRoutingZoneArgs",
+        "type": "object"
+      },
+      "name": "email_routing_get_catch_all"
+    },
+    {
+      "description": "Get Email Routing DNS status for a zone.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "zone_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "EmailRoutingZoneArgs",
+        "type": "object"
+      },
+      "name": "email_routing_get_dns"
+    },
+    {
+      "description": "Get an Email Routing rule.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "rule_identifier": {
+            "type": "string"
+          },
+          "zone_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "rule_identifier"
+        ],
+        "title": "EmailRoutingRuleArgs",
+        "type": "object"
+      },
+      "name": "email_routing_get_rule"
+    },
+    {
+      "description": "Get Email Routing settings for a zone.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "zone_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "EmailRoutingZoneArgs",
+        "type": "object"
+      },
+      "name": "email_routing_get_settings"
+    },
+    {
+      "description": "List Email Routing destination addresses.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "page": {
+            "default": null,
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "per_page": {
+            "default": null,
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "title": "EmailRoutingListAddressesArgs",
+        "type": "object"
+      },
+      "name": "email_routing_list_addresses"
+    },
+    {
+      "description": "List Email Routing rules for a zone.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "page": {
+            "default": null,
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "per_page": {
+            "default": null,
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "zone_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "EmailRoutingListRulesArgs",
+        "type": "object"
+      },
+      "name": "email_routing_list_rules"
+    },
+    {
+      "description": "Emergency unpublish path: disable public DNS route for a hostname (idempotent).",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "reason": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "zone_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "hostname"
+        ],
+        "title": "EmergencyUnpublishArgs",
+        "type": "object"
+      },
+      "name": "emergency_unpublish"
+    },
+    {
+      "description": "Idempotently ensure tunnel exists by (account_id,tunnel_name): reuse existing or create.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "tunnel_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "tunnel_name"
+        ],
+        "title": "EnsureTunnelArgs",
+        "type": "object"
+      },
+      "name": "ensure_tunnel"
+    },
+    {
+      "description": "Search Cloudflare MCP tools by keyword, group, and read-only status for deferred-loading clients.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "group": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "include_schema": {
+            "default": false,
+            "type": "boolean"
+          },
+          "limit": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "query": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "read_only": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "title": "FindToolsArgs",
+        "type": "object"
+      },
+      "name": "find_tools"
+    },
+    {
+      "description": "Generate deterministic cloudflared-style ingress config for a tunnel and validate rule set.",
+      "inputSchema": {
+        "$defs": {
+          "IngressRuleArgs": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/IngressRuleObjectArgs"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          },
+          "IngressRuleObjectArgs": {
+            "properties": {
+              "hostname": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "service": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "service"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "rules": {
+            "items": {
+              "$ref": "#/$defs/IngressRuleArgs"
+            },
+            "type": "array"
+          },
+          "tunnel_id": {
+            "type": "string"
+          },
+          "tunnel_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "tunnel_id",
+          "tunnel_name",
+          "rules"
+        ],
+        "title": "GenerateTunnelIngressArgs",
+        "type": "object"
+      },
+      "name": "generate_tunnel_ingress"
+    },
+    {
+      "description": "Read Worker script settings, including bindings, for deploy verification.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "binding_name": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "script_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "script_name"
+        ],
+        "title": "GetWorkerSettingsArgs",
+        "type": "object"
+      },
+      "name": "get_worker_settings"
+    },
+    {
+      "description": "Return cloudflare-mcp runtime health summary.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "HealthArgs",
+        "type": "object"
+      },
+      "name": "health"
+    },
+    {
+      "description": "List Cloudflare Access applications.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "hostname": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "ListAccessAppsArgs",
+        "type": "object"
+      },
+      "name": "list_access_apps"
+    },
+    {
+      "description": "List Access policies for an app.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "app_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "app_id"
+        ],
+        "title": "ListAccessPoliciesArgs",
+        "type": "object"
+      },
+      "name": "list_access_policies"
+    },
+    {
+      "description": "List Cloudflare CNAME DNS records for a zone.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "hostname": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "zone_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "ListDnsRecordsArgs",
+        "type": "object"
+      },
+      "name": "list_dns_records"
+    },
+    {
+      "description": "List Cloudflare tunnels for an account.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "page": {
+            "default": null,
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "per_page": {
+            "default": null,
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "title": "ListTunnelsArgs",
+        "type": "object"
+      },
+      "name": "list_tunnels"
+    },
+    {
+      "description": "List Cloudflare Workers scripts for an account.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tags": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "ListWorkersArgs",
+        "type": "object"
+      },
+      "name": "list_workers"
+    },
+    {
+      "description": "Policy-gated lock-first publish path: preflight gate then DNS route mutation.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "override_publish_guard": {
+            "default": false,
+            "type": "boolean"
+          },
+          "override_reason": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "proxied": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "target": {
+            "type": "string"
+          },
+          "ttl": {
+            "default": null,
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "zone_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "hostname",
+          "target"
+        ],
+        "title": "LockFirstPublishArgs",
+        "type": "object"
+      },
+      "name": "lock_first_publish"
+    },
+    {
+      "description": "Inspect and direct-upload a local Pages output directory, including static assets, advanced-mode _worker.js, and Wrangler-built Pages Functions _worker.bundle payloads, as a Cloudflare Pages deployment.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "branch": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "commit_dirty": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "commit_hash": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "commit_message": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "directory": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "max_files": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project_name": {
+            "type": "string"
+          },
+          "project_root": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "skip_caching": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "project_name",
+          "directory"
+        ],
+        "title": "PagesDeployDirectoryArgs",
+        "type": "object"
+      },
+      "name": "pages_deploy_directory"
+    },
+    {
+      "description": "Attach a custom domain to a Cloudflare Pages project with dry-run support.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "domain_name": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "project_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_name",
+          "domain_name"
+        ],
+        "title": "PagesEnsureDomainArgs",
+        "type": "object"
+      },
+      "name": "pages_ensure_domain"
+    },
+    {
+      "description": "Get a Cloudflare Pages deployment.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deployment_id": {
+            "type": "string"
+          },
+          "project_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_name",
+          "deployment_id"
+        ],
+        "title": "PagesDeploymentArgs",
+        "type": "object"
+      },
+      "name": "pages_get_deployment"
+    },
+    {
+      "description": "Get a custom domain for a Cloudflare Pages project.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "domain_name": {
+            "type": "string"
+          },
+          "project_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_name",
+          "domain_name"
+        ],
+        "title": "PagesDomainArgs",
+        "type": "object"
+      },
+      "name": "pages_get_domain"
+    },
+    {
+      "description": "Get a Cloudflare Pages project.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_name"
+        ],
+        "title": "PagesProjectArgs",
+        "type": "object"
+      },
+      "name": "pages_get_project"
+    },
+    {
+      "description": "List Cloudflare Pages deployments.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "environment": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "page": {
+            "default": null,
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "per_page": {
+            "default": null,
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_name"
+        ],
+        "title": "PagesListDeploymentsArgs",
+        "type": "object"
+      },
+      "name": "pages_list_deployments"
+    },
+    {
+      "description": "List custom domains for a Cloudflare Pages project.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_name"
+        ],
+        "title": "PagesProjectArgs",
+        "type": "object"
+      },
+      "name": "pages_list_domains"
+    },
+    {
+      "description": "List Cloudflare Pages projects.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "page": {
+            "default": null,
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "per_page": {
+            "default": null,
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "title": "PagesListProjectsArgs",
+        "type": "object"
+      },
+      "name": "pages_list_projects"
+    },
+    {
+      "description": "Retry a Cloudflare Pages deployment with dry-run support.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deployment_id": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "project_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_name",
+          "deployment_id"
+        ],
+        "title": "PagesDeploymentActionArgs",
+        "type": "object"
+      },
+      "name": "pages_retry_deployment"
+    },
+    {
+      "description": "Retry validation for a Cloudflare Pages custom domain.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "domain_name": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "project_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_name",
+          "domain_name"
+        ],
+        "title": "PagesEnsureDomainArgs",
+        "type": "object"
+      },
+      "name": "pages_retry_domain_validation"
+    },
+    {
+      "description": "Rollback to a Cloudflare Pages deployment with dry-run support.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deployment_id": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "project_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_name",
+          "deployment_id"
+        ],
+        "title": "PagesDeploymentActionArgs",
+        "type": "object"
+      },
+      "name": "pages_rollback_deployment"
+    },
+    {
+      "description": "Trigger a Git-backed Cloudflare Pages deployment with dry-run support. Use pages_deploy_directory for direct-upload projects.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "branch": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "commit_dirty": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "commit_hash": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "commit_message": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "project_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_name"
+        ],
+        "title": "PagesTriggerDeploymentArgs",
+        "type": "object"
+      },
+      "name": "pages_trigger_deployment"
+    },
+    {
+      "description": "Update Cloudflare Pages project settings with dry-run support.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "project_name": {
+            "type": "string"
+          },
+          "settings": true
+        },
+        "required": [
+          "project_name",
+          "settings"
+        ],
+        "title": "PagesUpdateProjectArgs",
+        "type": "object"
+      },
+      "name": "pages_update_project"
+    },
+    {
+      "description": "Patch Worker script settings with dry-run planning and readback verification.",
+      "inputSchema": {
+        "$defs": {
+          "WorkerBindingExpectation": {
+            "properties": {
+              "binding_type": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "field": {
+                "default": "text",
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "value": {
+                "default": null
+              }
+            },
+            "required": [
+              "name"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "expect_binding": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WorkerBindingExpectation"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "script_name": {
+            "type": "string"
+          },
+          "settings_patch": true
+        },
+        "required": [
+          "script_name",
+          "settings_patch"
+        ],
+        "title": "PatchWorkerSettingsArgs",
+        "type": "object"
+      },
+      "name": "patch_worker_settings"
+    },
+    {
+      "description": "Call an allowlisted portal agent endpoint with configured server-side agent and optional Cloudflare Access service credentials. Secret values are never returned.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "body": {
+            "default": null
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "method": {
+            "default": "POST",
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          },
+          "use_access_service_token": {
+            "default": false,
+            "type": "boolean"
+          },
+          "use_agent_token": {
+            "default": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "title": "PortalAgentRequestArgs",
+        "type": "object"
+      },
+      "name": "portal_agent_request"
+    },
+    {
+      "description": "Evaluate publish policy gate for a hostname without performing mutations.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "override_publish_guard": {
+            "default": false,
+            "type": "boolean"
+          },
+          "override_reason": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "hostname"
+        ],
+        "title": "PublishPreflightArgs",
+        "type": "object"
+      },
+      "name": "publish_preflight"
+    },
+    {
+      "description": "Get Cloudflare Queue details.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "queue_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "queue_id"
+        ],
+        "title": "QueueArgs",
+        "type": "object"
+      },
+      "name": "queues_get"
+    },
+    {
+      "description": "Get Cloudflare Queue backlog metrics, including depth and oldest message timestamp.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "queue_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "queue_id"
+        ],
+        "title": "QueueArgs",
+        "type": "object"
+      },
+      "name": "queues_get_metrics"
+    },
+    {
+      "description": "Read Queue health: backlog depth, message age, delivery pause state, consumers, purge status, and configured DLQ backlog.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "include_dlq": {
+            "default": true,
+            "type": "boolean"
+          },
+          "queue_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "queue_id"
+        ],
+        "title": "QueueHealthArgs",
+        "type": "object"
+      },
+      "name": "queues_health"
+    },
+    {
+      "description": "List Cloudflare Queues.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "QueuesListArgs",
+        "type": "object"
+      },
+      "name": "queues_list"
+    },
+    {
+      "description": "List consumers for a Cloudflare Queue, including Worker and pull consumer settings.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "queue_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "queue_id"
+        ],
+        "title": "QueueArgs",
+        "type": "object"
+      },
+      "name": "queues_list_consumers"
+    },
+    {
+      "description": "Read or download a private Cloudflare R2 object through the signed S3-compatible API.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "allow_large_download": {
+            "default": false,
+            "type": "boolean"
+          },
+          "bucket_name": {
+            "type": "string"
+          },
+          "create_parent_dirs": {
+            "default": false,
+            "type": "boolean"
+          },
+          "max_bytes": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "object_key": {
+            "type": "string"
+          },
+          "output_path": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "persist_output_path": {
+            "default": false,
+            "type": "boolean"
+          },
+          "range": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "response_mode": {
+            "default": "auto",
+            "type": "string"
+          }
+        },
+        "required": [
+          "bucket_name",
+          "object_key"
+        ],
+        "title": "R2GetObjectArgs",
+        "type": "object"
+      },
+      "name": "r2_get_object"
+    },
+    {
+      "description": "Inspect private Cloudflare R2 object metadata through a signed S3-compatible HEAD request.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "bucket_name": {
+            "type": "string"
+          },
+          "object_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "bucket_name",
+          "object_key"
+        ],
+        "title": "R2InspectObjectArgs",
+        "type": "object"
+      },
+      "name": "r2_inspect_object"
+    },
+    {
+      "description": "Write a private Cloudflare R2 object through the signed S3-compatible API.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "bucket_name": {
+            "type": "string"
+          },
+          "content_base64": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "content_text": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "content_type": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "metadata": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "type": "object"
+          },
+          "object_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "bucket_name",
+          "object_key"
+        ],
+        "title": "R2PutObjectArgs",
+        "type": "object"
+      },
+      "name": "r2_put_object"
+    },
+    {
+      "description": "Low-level replacement of Access policies for an app (no invariant guardrails).",
+      "inputSchema": {
+        "$defs": {
+          "AccessPolicyWrite": {
+            "properties": {
+              "decision": {
+                "type": "string"
+              },
+              "exclude": true,
+              "id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "include": true,
+              "name": {
+                "type": "string"
+              },
+              "precedence": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "require": true
+            },
+            "required": [
+              "name",
+              "decision",
+              "include"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "app_id": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "policies": {
+            "items": {
+              "$ref": "#/$defs/AccessPolicyWrite"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "app_id",
+          "policies"
+        ],
+        "title": "ReplaceAccessPoliciesArgs",
+        "type": "object"
+      },
+      "name": "replace_access_policies"
+    },
+    {
+      "description": "Create/update an Access app for a hostname.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "app_name": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "hostname": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "hostname",
+          "app_name"
+        ],
+        "title": "UpsertAccessAppArgs",
+        "type": "object"
+      },
+      "name": "upsert_access_app"
+    },
+    {
+      "description": "Create/update a CNAME record for a hostname. Enforces publish preflight by default.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "override_publish_guard": {
+            "default": false,
+            "type": "boolean"
+          },
+          "override_reason": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "proxied": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "target": {
+            "type": "string"
+          },
+          "ttl": {
+            "default": null,
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "zone_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "hostname",
+          "target"
+        ],
+        "title": "UpsertDnsCnameArgs",
+        "type": "object"
+      },
+      "name": "upsert_dns_cname"
+    },
+    {
+      "description": "Verify observed DNS CNAME route state against desired hostname/target/proxied/ttl intent.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "hostname": {
+            "type": "string"
+          },
+          "proxied": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "target": {
+            "type": "string"
+          },
+          "ttl": {
+            "default": null,
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "zone_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "hostname",
+          "target"
+        ],
+        "title": "VerifyDnsRouteArgs",
+        "type": "object"
+      },
+      "name": "verify_dns_route"
+    },
+    {
+      "description": "Probe URL and classify verification state as access_gated, origin_reachable, misconfigured, timeout, or transport_error.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "expected_state": {
+            "default": "access_gated",
+            "type": "string"
+          },
+          "timeout_ms": {
+            "default": null,
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "title": "VerifyHttpGateArgs",
+        "type": "object"
+      },
+      "name": "verify_http_gate"
+    },
+    {
+      "description": "Get Cloudflare Worker script settings.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "binding_name": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "script_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "script_name"
+        ],
+        "title": "GetWorkerSettingsArgs",
+        "type": "object"
+      },
+      "name": "workers_get_script_settings"
+    },
+    {
+      "description": "List Cloudflare Worker scripts.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "QueuesListArgs",
+        "type": "object"
+      },
+      "name": "workers_list_scripts"
+    },
+    {
+      "description": "List Worker tail consumers for a script.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "script_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "script_name"
+        ],
+        "title": "WorkersListTailsArgs",
+        "type": "object"
+      },
+      "name": "workers_list_tails"
+    },
+    {
+      "description": "List Workers Observability event keys.",
+      "inputSchema": {
+        "$defs": {
+          "WorkersObservabilityTimeframe": {
+            "properties": {
+              "from": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "to": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "from",
+              "to"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "default": null,
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "lookback_minutes": {
+            "default": null,
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "script_name": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timeframe": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WorkersObservabilityTimeframe"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "title": "WorkersObservabilityListKeysArgs",
+        "type": "object"
+      },
+      "name": "workers_observability_list_keys"
+    },
+    {
+      "description": "List values for a Workers Observability event key.",
+      "inputSchema": {
+        "$defs": {
+          "WorkersObservabilityTimeframe": {
+            "properties": {
+              "from": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "to": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "from",
+              "to"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key": {
+            "type": "string"
+          },
+          "limit": {
+            "default": null,
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "lookback_minutes": {
+            "default": null,
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "script_name": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timeframe": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WorkersObservabilityTimeframe"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "type": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "key"
+        ],
+        "title": "WorkersObservabilityListValuesArgs",
+        "type": "object"
+      },
+      "name": "workers_observability_list_values"
+    },
+    {
+      "description": "Query Workers Observability events.",
+      "inputSchema": {
+        "$defs": {
+          "WorkersObservabilityTimeframe": {
+            "properties": {
+              "from": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "to": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "from",
+              "to"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "default": null,
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "lookback_minutes": {
+            "default": null,
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "query_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "script_name": {
+            "type": "string"
+          },
+          "timeframe": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WorkersObservabilityTimeframe"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "script_name"
+        ],
+        "title": "WorkersObservabilityQueryEventsArgs",
+        "type": "object"
+      },
+      "name": "workers_observability_query_events"
+    }
+  ],
+  "version": 1
+}
