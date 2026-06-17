@@ -254,6 +254,10 @@ predicate jobNeedsWritePermission(Job job, string permissionName) {
   permissionName = "security-events" and
   jobUsesActionMatching(job, "(?i)^github/codeql-action.*", _)
   or
+  permissionName = "security-events" and
+  job.getWorkflow().getLocation().getFile().getRelativePath() = ".github/workflows/osv-scanner.yml" and
+  job.getId() = ["scan-scheduled", "scan-pr"]
+  or
   permissionName = "actions" and
   exists(string command |
     jobRunCommand(job, command) and
