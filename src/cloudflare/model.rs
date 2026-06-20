@@ -254,6 +254,23 @@ pub struct CapabilityProbe {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZoneIdentity {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub account: Option<ZoneIdentityAccount>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZoneIdentityAccount {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Queue {
     #[serde(default)]
     pub queue_id: Option<String>,
