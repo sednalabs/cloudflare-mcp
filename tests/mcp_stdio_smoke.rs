@@ -120,6 +120,16 @@ impl McpStdioProcess {
         self.response(id)
     }
 
+    fn request(&mut self, id: u64, method: &str, params: Value) -> Value {
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        }));
+        self.response(id)
+    }
+
     fn response(&self, id: u64) -> Value {
         let deadline = Duration::from_secs(10);
         loop {
@@ -146,6 +156,16 @@ fn structured_content(response: &Value) -> &Value {
         .get("result")
         .and_then(|result| result.get("structuredContent"))
         .unwrap_or_else(|| panic!("missing structuredContent in response: {response}"))
+}
+
+fn text_resource_content(response: &Value) -> String {
+    response["result"]["contents"]
+        .as_array()
+        .expect("resource contents")
+        .iter()
+        .filter_map(|content| content.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn read_http_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
@@ -1564,6 +1584,77 @@ fn stdio_tool_calls_cover_context_and_body_normalization_edges() {
     assert!(
         result_names.contains(&"d1_query_read_only"),
         "find_tools should expose curated D1 tools: {tools_content}"
+    );
+}
+
+#[test]
+fn stdio_boundary_covers_large_catalog_deferred_loading_contract() {
+    let mut mcp = McpStdioProcess::start();
+
+    let list = mcp.request(2, "tools/list", json!({}));
+    let tool_names = list["result"]["tools"]
+        .as_array()
+        .expect("tools/list tools")
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert!(tool_names.len() >= 100, "large catalog should stay visible");
+    assert!(tool_names.contains(&"find_tools"));
+    assert!(tool_names.contains(&"api_prepare_call"));
+    assert!(tool_names.contains(&"waf_ruleset_plan_change"));
+
+    let narrowed = mcp.call_tool(
+        3,
+        "find_tools",
+        json!({
+            "query": "d1",
+            "group": "d1",
+            "read_only": true,
+            "limit": 20,
+            "include_schema": true
+        }),
+    );
+    let narrowed_content = structured_content(&narrowed);
+    assert_eq!(narrowed_content["ok"], json!(true), "{narrowed_content}");
+    assert_eq!(
+        narrowed_content["openai_deferred_loading"]["recommended_model"],
+        json!("gpt-5.5")
+    );
+    let allowed = narrowed_content["openai_allowed_tools"]
+        .as_array()
+        .expect("allowed tools");
+    assert!(allowed.iter().any(|tool| tool == "d1_inspect_schema"));
+    assert!(allowed.iter().any(|tool| tool == "d1_query_read_only"));
+    assert!(!allowed.iter().any(|tool| tool == "d1_execute_write"));
+    assert!(narrowed_content["schemas"]["d1_inspect_schema"].is_object());
+    assert!(narrowed_content["schemas"]["d1_query_read_only"].is_object());
+
+    let config_resource = mcp.request(
+        4,
+        "resources/read",
+        json!({
+            "uri": "cloudflare-mcp://openai/tool-search-config"
+        }),
+    );
+    let config_text = text_resource_content(&config_resource);
+    let config: Value = serde_json::from_str(&config_text).expect("tool search config json");
+    assert_eq!(config["tools"][0]["type"], json!("mcp"));
+    assert_eq!(config["tools"][0]["defer_loading"], json!(true));
+    assert_eq!(config["tools"][1]["type"], json!("tool_search"));
+    assert!(config["tools"][0]["require_approval"].is_null());
+    assert!(
+        config["optional_trusted_read_only_approval_override"]["require_approval"]["never"]
+            ["tool_names"]
+            .as_array()
+            .expect("trusted read-only tools")
+            .iter()
+            .any(|tool| tool == "find_tools")
+    );
+
+    let denied = mcp.call_tool(5, "not_registered_tool", json!({}));
+    assert!(
+        denied.get("error").is_some(),
+        "strict inventory should reject unknown tool calls: {denied}"
     );
 }
 

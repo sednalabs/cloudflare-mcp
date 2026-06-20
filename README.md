@@ -221,6 +221,9 @@ See [docs/API-PARITY.md](docs/API-PARITY.md).
   rollback workflow.
 - [docs/AGENT_ROUTING.md](docs/AGENT_ROUTING.md): when to use this server,
   Cloudflare's managed MCP servers, or Cloudflare-documented CLIs.
+- [docs/CONFORMANCE_DOGFOOD.md](docs/CONFORMANCE_DOGFOOD.md): how this server
+  dogfoods MCP Toolkit behavior such as strict inventory, tool search,
+  deferred loading, resources, error envelopes, and release provenance.
 - [docs/API-PARITY.md](docs/API-PARITY.md): OpenAPI catalog and generic
   executor policy.
 - [spec/README.md](spec/README.md): tool schema snapshot workflow.
