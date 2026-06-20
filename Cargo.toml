@@ -11,7 +11,7 @@ axum-server = { version = "0.8.0", features = ["tls-rustls"] }
 base64 = "0.22.1"
 blake3 = "1"
 futures = "0.3.31"
-hmac = "0.12.1"
+hmac = "0.13.0"
 mcp-toolkit-auth = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "6cdc0ebdb7e1b2fb234d279c3725f85e5a1ce05f", package = "mcp-toolkit-auth" }
 mcp-toolkit-core = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "6cdc0ebdb7e1b2fb234d279c3725f85e5a1ce05f", package = "mcp-toolkit-core" }
 mcp-toolkit-http = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "6cdc0ebdb7e1b2fb234d279c3725f85e5a1ce05f", package = "mcp-toolkit-http", features = ["session"] }
