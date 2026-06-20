@@ -258,7 +258,7 @@ impl CloudflareClient {
     pub async fn get_zone_identity(&self, zone_id: &str) -> Result<ZoneIdentity, AdapterError> {
         let zone_id = require_non_empty("zone_id", zone_id)?;
         let token = self.bearer_token()?;
-        let url = self.endpoint(&format!("/zones/{zone_id}"));
+        let url = self.endpoint(&format!("/zones/{}", path_segment(zone_id)));
 
         let envelope: CloudflareEnvelope<ZoneIdentity> = self
             .send_envelope("cloudflare.zones.get", RetryPolicy::Idempotent, || {
@@ -2633,7 +2633,7 @@ fn d1_column_discovery_fidelity() -> Value {
 }
 
 fn path_segment(value: &str) -> String {
-    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+    aws_uri_encode(value, true)
 }
 
 fn null_as_default_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
@@ -2867,7 +2867,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{
-        AdapterError, CloudflareApiError, CloudflareClient, is_d1_sqlite_auth_error,
+        AdapterError, CloudflareApiError, CloudflareClient, is_d1_sqlite_auth_error, path_segment,
         with_request_api_token_override,
     };
     use crate::cloudflare::model::AccessPolicyWrite;
@@ -2912,6 +2912,11 @@ mod tests {
             let _ = axum::serve(listener, router).await;
         });
         format!("http://{}", addr)
+    }
+
+    #[test]
+    fn path_segment_encodes_separators() {
+        assert_eq!(path_segment("zone/one two"), "zone%2Fone%20two");
     }
 
     #[tokio::test]

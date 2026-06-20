@@ -4198,8 +4198,10 @@ impl CloudflareMcp {
 
         let mut observed_zone_name = None;
         let mut observed_zone_account_id = None;
+        let mut zone_identity_ok = false;
         let zone_identity = match self.cloudflare.get_zone_identity(zone_id).await {
             Ok(identity) => {
+                zone_identity_ok = true;
                 observed_zone_name = identity.name.clone();
                 observed_zone_account_id = identity
                     .account
@@ -4243,7 +4245,10 @@ impl CloudflareMcp {
                 }));
             }
         }
-        if let Some(expected_zone_name) = normalized_zone_name(args.expected_zone_name.as_deref()) {
+        if zone_identity_ok
+            && let Some(expected_zone_name) =
+                normalized_zone_name(args.expected_zone_name.as_deref())
+        {
             let observed = observed_zone_name
                 .as_deref()
                 .and_then(|name| normalized_zone_name(Some(name)));
