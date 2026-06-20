@@ -400,6 +400,23 @@ fn spawn_fake_cloudflare_api() -> String {
     let addr = listener.local_addr().expect("fake API addr");
     thread::spawn(move || {
         let mut requests_seen = 0usize;
+        let mut waf_custom_ruleset = json!({
+            "id": "ruleset-custom",
+            "name": "Zone custom WAF rules",
+            "kind": "zone",
+            "phase": "http_request_firewall_custom",
+            "version": "7",
+            "last_updated": "2026-06-04T00:00:00Z",
+            "rules": [{
+                "id": "rule-1",
+                "version": "3",
+                "description": "Block admin probes",
+                "action": "block",
+                "enabled": true,
+                "expression": "http.request.uri.path contains \"/admin\"",
+                "ref": "block-admin"
+            }]
+        });
         for stream in listener.incoming() {
             let mut stream = stream.expect("fake API stream");
             let mut request = Vec::new();
@@ -430,6 +447,12 @@ fn spawn_fake_cloudflare_api() -> String {
                 .lines()
                 .next()
                 .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or_default()
+                .to_string();
+            let method = headers
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().next())
                 .unwrap_or_default()
                 .to_string();
             let path_only = path.split('?').next().unwrap_or(path.as_str());
@@ -661,27 +684,14 @@ fn spawn_fake_cloudflare_api() -> String {
             } else if path_only
                 .ends_with("/rulesets/phases/http_request_firewall_custom/entrypoint")
             {
+                if method == "PUT" {
+                    waf_custom_ruleset = body_json.clone();
+                }
                 json!({
                     "success": true,
                     "errors": [],
                     "messages": [],
-                    "result": {
-                        "id": "ruleset-custom",
-                        "name": "Zone custom WAF rules",
-                        "kind": "zone",
-                        "phase": "http_request_firewall_custom",
-                        "version": "7",
-                        "last_updated": "2026-06-04T00:00:00Z",
-                        "rules": [{
-                            "id": "rule-1",
-                            "version": "3",
-                            "description": "Block admin probes",
-                            "action": "block",
-                            "enabled": true,
-                            "expression": "http.request.uri.path contains \"/admin\"",
-                            "ref": "block-admin"
-                        }]
-                    }
+                    "result": waf_custom_ruleset
                 })
             } else if path_only
                 .ends_with("/rulesets/phases/http_request_firewall_managed/entrypoint")
@@ -787,7 +797,7 @@ fn spawn_fake_cloudflare_api() -> String {
             .expect("write response headers");
             stream.write_all(&response).expect("write response body");
             requests_seen += 1;
-            if requests_seen >= 8 {
+            if requests_seen >= 20 {
                 break;
             }
         }
@@ -2569,8 +2579,9 @@ fn waf_ruleset_and_security_events_work_through_stdio_boundary() {
         2,
         "find_tools",
         json!({
-            "query": "what WAF rule blocked this request security events analytics",
-            "include_schema": true
+            "query": "what WAF rule blocked this request security events analytics plan apply",
+            "include_schema": true,
+            "limit": 8
         }),
     );
     let tools_content = structured_content(&tools);
@@ -2578,13 +2589,22 @@ fn waf_ruleset_and_security_events_work_through_stdio_boundary() {
     let allowed = tools_content["openai_allowed_tools"]
         .as_array()
         .expect("allowed tools");
-    assert!(allowed.iter().any(|tool| tool == "waf_ruleset_summary"));
+    assert!(
+        allowed.iter().any(|tool| tool == "waf_ruleset_summary"),
+        "{tools_content}"
+    );
     assert!(
         allowed
             .iter()
             .any(|tool| tool == "waf_security_events_summary")
     );
     assert!(allowed.iter().any(|tool| tool == "waf_rule_activity"));
+    assert!(allowed.iter().any(|tool| tool == "waf_ruleset_plan_change"));
+    assert!(
+        allowed
+            .iter()
+            .any(|tool| tool == "waf_ruleset_apply_change")
+    );
 
     let rulesets = mcp.call_tool(
         3,
@@ -2656,6 +2676,135 @@ fn waf_ruleset_and_security_events_work_through_stdio_boundary() {
     assert_eq!(
         activity_content["analytics"]["samples"][0]["clientRequestPath"],
         json!("/admin")
+    );
+
+    let stale_plan = mcp.call_tool(
+        6,
+        "waf_ruleset_plan_change",
+        json!({
+            "phase": "custom",
+            "max_rules": 5,
+            "stale_list_refs": ["blocked_ips"],
+            "edits": [{
+                "operation": "add",
+                "rule_ref": "stale-list-rule",
+                "description": "Block stale list",
+                "expression": "ip.src in $blocked_ips",
+                "rule_action": "block"
+            }]
+        }),
+    );
+    let stale_content = structured_content(&stale_plan);
+    assert_eq!(stale_content["ok"], json!(false), "{stale_content}");
+    assert_eq!(
+        stale_content["error"]["code"],
+        json!("waf.stale_list_reference")
+    );
+
+    let cap_plan = mcp.call_tool(
+        7,
+        "waf_ruleset_plan_change",
+        json!({
+            "phase": "custom",
+            "max_rules": 1,
+            "edits": [{
+                "operation": "add",
+                "rule_ref": "extra-rule",
+                "description": "Log suspicious probes",
+                "expression": "http.request.uri.path contains \"/probe\"",
+                "rule_action": "log"
+            }]
+        }),
+    );
+    let cap_content = structured_content(&cap_plan);
+    assert_eq!(cap_content["ok"], json!(false), "{cap_content}");
+    assert_eq!(cap_content["error"]["code"], json!("waf.rule_cap_exceeded"));
+
+    let plan = mcp.call_tool(
+        8,
+        "waf_ruleset_plan_change",
+        json!({
+            "phase": "custom",
+            "max_rules": 5,
+            "edits": [{
+                "operation": "update",
+                "rule_id": "rule-1",
+                "description": "Challenge admin probes",
+                "expression": "http.request.uri.path contains \"/admin\"",
+                "rule_action": "managed_challenge",
+                "enabled": true
+            }]
+        }),
+    );
+    let plan_content = structured_content(&plan);
+    assert_eq!(plan_content["ok"], json!(true), "{plan_content}");
+    assert_eq!(
+        plan_content["diff"]["changes"][0]["after"]["action"],
+        json!("managed_challenge")
+    );
+    assert_eq!(
+        plan_content["diff"]["action_change_warnings"][0]["rule"],
+        json!("rule-1")
+    );
+    let token = plan_content["required_confirmation_token"]
+        .as_str()
+        .expect("confirmation token")
+        .to_string();
+
+    let denied = mcp.call_tool(
+        9,
+        "waf_ruleset_apply_change",
+        json!({
+            "phase": "custom",
+            "confirmation_token": "wrong-token",
+            "edits": [{
+                "operation": "update",
+                "rule_id": "rule-1",
+                "description": "Challenge admin probes",
+                "expression": "http.request.uri.path contains \"/admin\"",
+                "rule_action": "managed_challenge",
+                "enabled": true
+            }]
+        }),
+    );
+    let denied_content = structured_content(&denied);
+    assert_eq!(denied_content["ok"], json!(false), "{denied_content}");
+    assert_eq!(
+        denied_content["error"]["code"],
+        json!("waf.confirmation_required")
+    );
+
+    let applied = mcp.call_tool(
+        10,
+        "waf_ruleset_apply_change",
+        json!({
+            "phase": "custom",
+            "confirmation_token": token,
+            "readback_security_events": true,
+            "readback_sample_limit": 3,
+            "edits": [{
+                "operation": "update",
+                "rule_id": "rule-1",
+                "description": "Challenge admin probes",
+                "expression": "http.request.uri.path contains \"/admin\"",
+                "rule_action": "managed_challenge",
+                "enabled": true
+            }]
+        }),
+    );
+    let applied_content = structured_content(&applied);
+    assert_eq!(applied_content["ok"], json!(true), "{applied_content}");
+    assert_eq!(
+        applied_content["readback"]["rules"][0]["action"],
+        json!("managed_challenge")
+    );
+    assert_eq!(
+        applied_content["security_events_readback"]["enabled"],
+        json!(true)
+    );
+    assert_eq!(
+        applied_content["audit"]["action"],
+        json!("waf_ruleset_apply_change")
     );
 }
 

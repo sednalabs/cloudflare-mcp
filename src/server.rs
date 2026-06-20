@@ -1178,6 +1178,8 @@ mod tests {
             "verify_dns_route",
             "verify_http_gate",
             "waf_rule_activity",
+            "waf_ruleset_apply_change",
+            "waf_ruleset_plan_change",
             "waf_ruleset_summary",
             "waf_security_events_summary",
             "workers_get_script_settings",

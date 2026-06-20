@@ -163,6 +163,8 @@ fn build_help_text() -> String {
         "- waf_ruleset_summary",
         "- waf_security_events_summary",
         "- waf_rule_activity",
+        "- waf_ruleset_plan_change",
+        "- waf_ruleset_apply_change",
         "- list_tunnels",
         "- ensure_tunnel",
         "- generate_tunnel_ingress",
@@ -233,6 +235,8 @@ fn build_openai_tool_search_config() -> String {
         "waf_ruleset_summary",
         "waf_security_events_summary",
         "waf_rule_activity",
+        "waf_ruleset_plan_change",
+        "waf_ruleset_apply_change",
         "account_api_token_permission_plan",
         "list_tunnels",
         "generate_tunnel_ingress",
@@ -301,6 +305,7 @@ fn build_openai_tool_search_config() -> String {
         "Use api_find_operations/api_get_operation/api_prepare_call/api_read/api_mutate for broad Cloudflare REST API v4 parity.",
         "Use account_billing_usage for billing records and graphql_analytics_query for Cloudflare Analytics GraphQL attribution.",
         "Use waf_ruleset_summary, waf_security_events_summary, and waf_rule_activity for WAF rules and Security Events triage.",
+        "Use waf_ruleset_plan_change before waf_ruleset_apply_change for WAF mutations; the apply tool requires the plan token and performs readback.",
         "Keep approval enabled for mutating tools unless another workflow-level review gate applies.",
     ]);
     if let Some(approval_override) =
