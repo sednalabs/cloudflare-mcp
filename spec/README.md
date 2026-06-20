@@ -4,6 +4,8 @@ Related docs:
 - `../README.md` for operator/client setup and runtime behavior.
 - `../docs/CLIENT-CONTRACT.md` for explicit per-tool request argument expectations.
 - `../docs/RUNBOOK.md` for rollout sequencing and safety gates.
+- `../docs/CONFORMANCE_DOGFOOD.md` for the MCP Toolkit dogfood matrix and
+  where to add large-catalog/tool-search/deferred-loading regressions.
 
 This server uses a committed tool schema contract snapshot at:
 
