@@ -36,9 +36,11 @@ artifacts, and readback verification.
 
 ## Relationship to Cloudflare's official MCP server
 
-Cloudflare provides an official hosted MCP server for broad Cloudflare API
-access. If you want general-purpose access to the full Cloudflare API with
-minimal model context, start there.
+Cloudflare provides official managed MCP servers for broad Cloudflare API
+access, current docs, GraphQL analytics, observability, browser rendering, and
+other product-specific workflows. If you want general-purpose access to the full
+Cloudflare API with minimal model context, start with Cloudflare's Code Mode API
+MCP server.
 
 This project serves a different purpose. It is a self-hosted operator MCP
 server for workflows where local credential control, curated safety policy,
@@ -207,6 +209,8 @@ See [docs/API-PARITY.md](docs/API-PARITY.md).
   tool argument contract.
 - [docs/RUNBOOK.md](docs/RUNBOOK.md): operator rollout, verification, and
   rollback workflow.
+- [docs/AGENT_ROUTING.md](docs/AGENT_ROUTING.md): when to use this server,
+  Cloudflare's managed MCP servers, or Cloudflare-documented CLIs.
 - [docs/API-PARITY.md](docs/API-PARITY.md): OpenAPI catalog and generic
   executor policy.
 - [spec/README.md](spec/README.md): tool schema snapshot workflow.
