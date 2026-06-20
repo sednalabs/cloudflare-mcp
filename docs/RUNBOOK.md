@@ -12,6 +12,9 @@ Companion docs:
 - [AGENT_ROUTING.md](AGENT_ROUTING.md): agent-facing routing between this
   operator MCP, Cloudflare managed MCP servers, and Cloudflare-documented CLIs.
 - [API-PARITY.md](API-PARITY.md): generic Cloudflare REST API parity model.
+- [../packaging/codex/cloudflare-managed-mcp.example.toml](../packaging/codex/cloudflare-managed-mcp.example.toml):
+  Codex profile template for placing this guarded server beside Cloudflare's
+  official managed MCP endpoints.
 
 ## Preconditions
 
@@ -120,6 +123,28 @@ Expected behavior:
 - Approval prompts include a request digest that must be echoed in the response.
 
 ## Baseline Read-Only Audit
+
+When the task needs broad or current Cloudflare discovery before a guarded
+operator action, add the relevant managed MCP endpoints from
+`packaging/codex/cloudflare-managed-mcp.example.toml` to the agent profile.
+Use OAuth for interactive sessions or an out-of-repository bearer token for
+automation. Treat a configured managed endpoint as connection setup only:
+account/API endpoints still need Cloudflare authorization before read-only
+calls work.
+
+Before relying on a managed endpoint, run a safe smoke check:
+
+```bash
+curl -sS -X POST https://docs.mcp.cloudflare.com/mcp \
+  -H 'content-type: application/json' \
+  -H 'accept: application/json, text/event-stream' \
+  --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"cloudflare-mcp-smoke","version":"0.0.0"}}}'
+```
+
+For account/API endpoints such as `https://mcp.cloudflare.com/mcp` or
+`https://graphql.mcp.cloudflare.com/mcp`, an unauthenticated `401 invalid_token`
+is an acceptable pre-auth smoke result. The next proof must be an authorized
+read-only MCP call through the target client or an allowlisted probe profile.
 
 Capture current state before mutation:
 

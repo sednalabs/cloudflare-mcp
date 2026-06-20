@@ -122,6 +122,13 @@ CLOUDFLARE_MCP_AUTH_MODE=off cargo run -- --print-tools
 See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for client setup,
 configuration profiles, and validation examples.
 
+For agents that should use this guarded server beside Cloudflare's official
+managed MCP endpoints, start from
+[packaging/codex/cloudflare-managed-mcp.example.toml](packaging/codex/cloudflare-managed-mcp.example.toml).
+It keeps the local dry-run/apply/readback path separate from managed discovery
+surfaces such as Cloudflare Docs, Code Mode API, GraphQL, Observability, Audit
+Logs, DNS Analytics, and Browser Run.
+
 ## MCP client usage
 
 The server supports:
@@ -217,6 +224,9 @@ See [docs/API-PARITY.md](docs/API-PARITY.md).
 - [docs/API-PARITY.md](docs/API-PARITY.md): OpenAPI catalog and generic
   executor policy.
 - [spec/README.md](spec/README.md): tool schema snapshot workflow.
+- [packaging/codex/cloudflare-managed-mcp.example.toml](packaging/codex/cloudflare-managed-mcp.example.toml):
+  example Codex MCP profile for enabling official Cloudflare managed MCPs
+  beside this guarded operator MCP.
 
 ## Development
 
