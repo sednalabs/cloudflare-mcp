@@ -12,9 +12,10 @@ use rmcp::model::CallToolResult;
 use rmcp::tool;
 use rmcp::tool_router;
 use schemars::JsonSchema;
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+use time::{Duration as TimeDuration, OffsetDateTime};
 use url::Url;
 
 use crate::access_app::{
@@ -23,8 +24,9 @@ use crate::access_app::{
 };
 use crate::api_catalog::{
     ApiCatalogError, ApiOperationSearch, find_operation, mutation_confirmation_token,
-    operation_allowed_by_default, operation_detail, parse_risk, parse_scope, query_pairs,
-    render_path, search_operations, status as api_catalog_status, validate_required_query,
+    operation_allowed_by_default, operation_detail, parse_risk, parse_scope, path_parameter_names,
+    query_pairs, render_path, resolved_path_params, search_operations,
+    status as api_catalog_status, validate_required_query,
 };
 use crate::cache::{
     CachePurgePayload, CacheResourceAction, CacheRulePhase, CacheRulesAction, CacheValidationError,
@@ -41,7 +43,7 @@ use crate::mutation::{
     MutationAuditSession, MutationPlan, emit_mutation_audit_log, plan_apply_access_allowlist,
     plan_cache_mutation, plan_connector_control, plan_emergency_unpublish, plan_ensure_tunnel,
     plan_lock_first_publish, plan_patch_worker_settings, plan_replace_access_policies,
-    plan_upsert_access_app, plan_upsert_dns_cname,
+    plan_upload_worker_script, plan_upsert_access_app, plan_upsert_dns_cname,
 };
 use crate::pages_deploy::{
     MAX_PAGES_ASSET_COUNT_DEFAULT, PagesDirectoryInspectOptions,
@@ -65,7 +67,10 @@ use crate::verification::{
     ExpectedVerificationState, VerificationState, classify_http_result, now_unix_ms,
     timeout_result, transport_error_result,
 };
-use mcp_toolkit_core::tool_inventory::{ToolOperation, ToolSearchFilter};
+use crate::worker_upload::{
+    WorkerUploadBody, WorkerUploadError, WorkerUploadInput, build_worker_upload,
+};
+use mcp_toolkit_core::tool_inventory::{ToolOperation, ToolSearchFilter, ToolSearchResponse};
 use mcp_toolkit_policy_core::{RestrictedSqlError, classify_restricted_sql};
 
 #[derive(Debug, Deserialize, JsonSchema, Default)]
@@ -166,6 +171,129 @@ pub struct ApiMutateArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct AccountBillingUsageArgs {
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub metric: Option<String>,
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WafRulesetSummaryArgs {
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub zone_id: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub phases: Vec<String>,
+    #[serde(default = "default_true")]
+    pub include_rules: bool,
+    #[serde(default)]
+    pub include_raw: bool,
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WafSecurityEventsSummaryArgs {
+    #[serde(default)]
+    pub zone_id: Option<String>,
+    #[serde(default = "default_waf_window_hours")]
+    pub window_hours: u32,
+    #[serde(default)]
+    pub since: Option<String>,
+    #[serde(default)]
+    pub until: Option<String>,
+    #[serde(default = "default_waf_group_by")]
+    pub group_by: Vec<String>,
+    #[serde(default)]
+    pub action: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub client_ip: Option<String>,
+    #[serde(default)]
+    pub rule_id: Option<String>,
+    #[serde(default = "default_waf_limit")]
+    pub limit: u32,
+    #[serde(default = "default_waf_sample_limit")]
+    pub sample_limit: u32,
+    #[serde(default)]
+    pub include_query: bool,
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WafRuleActivityArgs {
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub zone_id: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    pub rule_id: String,
+    #[serde(default)]
+    pub phases: Vec<String>,
+    #[serde(default = "default_waf_window_hours")]
+    pub window_hours: u32,
+    #[serde(default)]
+    pub since: Option<String>,
+    #[serde(default)]
+    pub until: Option<String>,
+    #[serde(default = "default_waf_sample_limit")]
+    pub sample_limit: u32,
+    #[serde(default)]
+    pub include_query: bool,
+    #[serde(default)]
+    pub include_raw: bool,
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+}
+
+fn default_waf_window_hours() -> u32 {
+    24
+}
+
+fn default_waf_limit() -> u32 {
+    20
+}
+
+fn default_waf_sample_limit() -> u32 {
+    10
+}
+
+fn default_waf_group_by() -> Vec<String> {
+    ["action", "source", "host", "path", "country", "hour"]
+        .iter()
+        .map(|value| value.to_string())
+        .collect()
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GraphqlAnalyticsQueryArgs {
+    pub query: String,
+    #[serde(default)]
+    pub variables: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct AccountApiTokensArgs {
     #[serde(default)]
     pub account_id: Option<String>,
@@ -180,6 +308,30 @@ pub struct AccountApiTokensArgs {
     pub dry_run: bool,
     #[serde(default)]
     pub confirmation_token: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AccountApiTokenPermissionPlanArgs {
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub token_id: Option<String>,
+    #[serde(default)]
+    pub policy_index: Option<usize>,
+    #[serde(default, alias = "add", alias = "add_scopes")]
+    pub add_permissions: Vec<String>,
+    #[serde(default, alias = "remove", alias = "remove_scopes")]
+    pub remove_permissions: Vec<String>,
+    #[serde(default)]
+    pub current_token: Option<Value>,
+    #[serde(default)]
+    pub permission_groups: Option<Value>,
+    #[serde(default)]
+    pub include_catalog: bool,
     #[serde(default)]
     pub reason: Option<String>,
     #[serde(default)]
@@ -440,6 +592,33 @@ pub struct GetWorkerSettingsArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct WorkersUploadScriptArgs {
+    #[serde(default)]
+    pub account_id: Option<String>,
+    pub script_name: String,
+    #[serde(default)]
+    pub main_module: Option<String>,
+    #[serde(default)]
+    pub script_path: Option<String>,
+    #[serde(default)]
+    pub script_content: Option<String>,
+    #[serde(default)]
+    pub script_content_base64: Option<String>,
+    #[serde(default)]
+    pub multipart_path: Option<String>,
+    #[serde(default = "default_empty_object")]
+    pub metadata: Value,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub confirmation_token: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct CapabilitiesCheckArgs {
     #[serde(default)]
     pub account_id: Option<String>,
@@ -644,7 +823,12 @@ pub struct QueueHealthArgs {
 pub struct WorkersObservabilityQueryEventsArgs {
     #[serde(default)]
     pub account_id: Option<String>,
-    pub script_name: String,
+    #[serde(default)]
+    pub script_name: Option<String>,
+    #[serde(default)]
+    pub datasets: Vec<String>,
+    #[serde(default)]
+    pub filters: Vec<Value>,
     #[serde(default)]
     pub limit: Option<u32>,
     #[serde(default)]
@@ -653,6 +837,12 @@ pub struct WorkersObservabilityQueryEventsArgs {
     pub lookback_minutes: Option<u64>,
     #[serde(default)]
     pub query_id: Option<String>,
+    #[serde(default)]
+    pub dry: Option<bool>,
+    #[serde(default)]
+    pub view: Option<String>,
+    #[serde(default)]
+    pub needle: Option<Value>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -662,11 +852,19 @@ pub struct WorkersObservabilityListKeysArgs {
     #[serde(default)]
     pub script_name: Option<String>,
     #[serde(default)]
+    pub datasets: Vec<String>,
+    #[serde(default)]
+    pub filters: Vec<Value>,
+    #[serde(default)]
     pub limit: Option<u32>,
     #[serde(default)]
     pub timeframe: Option<WorkersObservabilityTimeframe>,
     #[serde(default)]
     pub lookback_minutes: Option<u64>,
+    #[serde(default)]
+    pub needle: Option<Value>,
+    #[serde(default, rename = "keyNeedle")]
+    pub key_needle: Option<Value>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -677,6 +875,10 @@ pub struct WorkersObservabilityListValuesArgs {
     #[serde(default)]
     pub script_name: Option<String>,
     #[serde(default)]
+    pub datasets: Vec<String>,
+    #[serde(default)]
+    pub filters: Vec<Value>,
+    #[serde(default)]
     pub limit: Option<u32>,
     #[serde(default, rename = "type")]
     pub value_type: Option<String>,
@@ -684,6 +886,8 @@ pub struct WorkersObservabilityListValuesArgs {
     pub timeframe: Option<WorkersObservabilityTimeframe>,
     #[serde(default)]
     pub lookback_minutes: Option<u64>,
+    #[serde(default)]
+    pub needle: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -1056,6 +1260,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_empty_object() -> Value {
+    Value::Object(Map::new())
+}
+
 fn default_expected_probe_state() -> String {
     "access_gated".to_string()
 }
@@ -1102,7 +1310,7 @@ impl CloudflareMcp {
 
     #[tool(
         name = "find_tools",
-        description = "Search Cloudflare MCP tools by keyword, group, and read-only status for deferred-loading clients."
+        description = "Search Cloudflare MCP tools by keyword, group, and read-only status. Use this for non-hosted deferred-loading clients, or to produce a narrow OpenAI allowed_tools list before loading full schemas."
     )]
     async fn cloudflare_find_tools(
         &self,
@@ -1144,6 +1352,23 @@ impl CloudflareMcp {
         } else {
             Vec::new()
         };
+        if args.group.is_none() && query_mentions_waf(args.query.as_deref()) {
+            let waf_filter = ToolSearchFilter {
+                query: None,
+                group: Some("waf".to_string()),
+                read_only: args.read_only,
+                limit: Some(3),
+            };
+            for result in self.tool_inventory.search(
+                &waf_filter,
+                ToolOperation::List,
+                &self.tool_inventory_policy,
+            ) {
+                if !results.iter().any(|existing| existing.name == result.name) {
+                    results.push(result);
+                }
+            }
+        }
         let api_executor_tools = api_results
             .iter()
             .map(|operation| {
@@ -1162,11 +1387,11 @@ impl CloudflareMcp {
                     schema_map.insert(result.name.clone(), json!(tool));
                 }
             }
-            for tool_name in api_executor_tools
-                .iter()
-                .copied()
-                .chain(["api_find_operations", "api_get_operation"])
-            {
+            for tool_name in api_executor_tools.iter().copied().chain([
+                "api_find_operations",
+                "api_get_operation",
+                "api_prepare_call",
+            ]) {
                 if !schema_map.contains_key(tool_name)
                     && let Some(tool) = tools.iter().find(|tool| tool.name.as_ref() == tool_name)
                 {
@@ -1177,31 +1402,16 @@ impl CloudflareMcp {
         } else {
             None
         };
-        let mut openai_allowed_tools = results
-            .iter()
-            .map(|result| result.name.clone())
-            .collect::<Vec<_>>();
+        let mut companion_allowed_tools = Vec::new();
         if !api_results.is_empty() {
-            openai_allowed_tools.push("api_find_operations".to_string());
-            openai_allowed_tools.push("api_get_operation".to_string());
-            openai_allowed_tools.extend(api_executor_tools.iter().map(|name| (*name).to_string()));
-            openai_allowed_tools.sort();
-            openai_allowed_tools.dedup();
+            companion_allowed_tools.extend([
+                "api_find_operations",
+                "api_get_operation",
+                "api_prepare_call",
+            ]);
+            companion_allowed_tools.extend(api_executor_tools);
         }
-        let mut result_values = results
-            .drain(..)
-            .map(|result| {
-                json!({
-                    "type": "tool",
-                    "name": result.name,
-                    "group": result.group,
-                    "read_only": result.read_only,
-                    "description": result.description,
-                    "keywords": result.keywords,
-                })
-            })
-            .collect::<Vec<_>>();
-        result_values.extend(api_results.iter().map(|operation| {
+        let api_result_values = api_results.iter().map(|operation| {
             let executor = if operation.method.eq_ignore_ascii_case("GET") {
                 "api_read"
             } else {
@@ -1227,23 +1437,20 @@ impl CloudflareMcp {
                 ],
                 "api_operation": operation,
             })
-        }));
+        });
+        let mut payload =
+            ToolSearchResponse::find_tools(args.query, args.group, args.read_only, results)
+                .with_schemas(schemas)
+                .into_openai_response()
+                .with_companion_allowed_tools(companion_allowed_tools)
+                .with_extra_results(api_result_values)
+                .to_value();
+        if let Value::Object(fields) = &mut payload {
+            fields.insert("ok".to_string(), json!(true));
+            fields.insert("api_operations".to_string(), json!(api_results));
+        }
 
-        Ok(CallToolResult::structured(json!({
-            "ok": true,
-            "operation": "find_tools",
-            "query": args.query,
-            "group": args.group,
-            "read_only": args.read_only,
-            "results": result_values,
-            "api_operations": api_results,
-            "openai_allowed_tools": openai_allowed_tools,
-            "schemas": schemas,
-            "openai_deferred_loading": {
-                "mcp_tool": { "defer_loading": true },
-                "tool_search": { "type": "tool_search" }
-            }
-        })))
+        Ok(CallToolResult::structured(payload))
     }
 
     #[tool(
@@ -1395,6 +1602,13 @@ impl CloudflareMcp {
             find_operation(operation_id).expect("search result must refer to catalog operation")
         };
 
+        let resolved_path_params = resolved_path_params(
+            selected,
+            &args.path_params,
+            self.default_account_id.as_deref(),
+            self.default_zone_id.as_deref(),
+        )
+        .ok();
         let rendered_path = render_path(
             selected,
             &args.path_params,
@@ -1416,7 +1630,7 @@ impl CloudflareMcp {
         };
         let mut call_arguments = json!({
             "operation_id": selected.operation_id,
-            "path_params": args.path_params,
+            "path_params": resolved_path_params.as_ref().unwrap_or(&args.path_params),
             "query": args.query_params,
         });
         if selected.method.eq_ignore_ascii_case("GET") {
@@ -1433,6 +1647,7 @@ impl CloudflareMcp {
             "api_operation": operation_detail(selected),
             "executor": executor,
             "rendered_path": rendered_path,
+            "resolved_path_params": resolved_path_params,
             "missing_path_params": missing_path_params,
             "missing_query_params": missing_query_params,
             "call": {
@@ -1509,6 +1724,431 @@ impl CloudflareMcp {
                 }),
                 args.max_bytes.unwrap_or(1_048_576).clamp(1, 10_485_760),
             ))),
+            Err(err) => Ok(adapter_error_result(err)),
+        }
+    }
+
+    #[tool(
+        name = "account_billing_usage",
+        description = "Read account billable usage from Cloudflare billing REST endpoints. Use mode=paygo for PayGo usage or mode=billable_usage for the restricted v2 usage endpoint."
+    )]
+    async fn cloudflare_account_billing_usage(
+        &self,
+        Parameters(args): Parameters<AccountBillingUsageArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        let mode = normalize_action(args.mode.as_deref().unwrap_or("paygo"));
+        let (path, canonical_mode, required_metric) = match mode.as_str() {
+            "" | "paygo" | "paygo_usage" => (
+                format!("/accounts/{account_id}/paygo-usage"),
+                "paygo",
+                false,
+            ),
+            "billable" | "billable_usage" | "usage" | "v2" => (
+                format!("/accounts/{account_id}/billable/usage"),
+                "billable_usage",
+                true,
+            ),
+            _ => {
+                return Ok(invalid_argument_result(
+                    "billing_usage.invalid_mode",
+                    "mode must be paygo or billable_usage",
+                    "Use mode=paygo for PayGo account usage, or mode=billable_usage for Cloudflare's restricted v2 billable usage endpoint.",
+                ));
+            }
+        };
+
+        let mut query = BTreeMap::new();
+        if let Some(from) = args
+            .from
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            query.insert("from".to_string(), json!(from));
+        }
+        if let Some(to) = args
+            .to
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            query.insert("to".to_string(), json!(to));
+        }
+        let metric = args
+            .metric
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if let Some(metric) = metric {
+            query.insert("metric".to_string(), json!(metric));
+        } else if required_metric {
+            return Ok(invalid_argument_result(
+                "billing_usage.missing_metric",
+                "metric is required for mode=billable_usage",
+                "Pass the Cloudflare billable metric identifier or use mode=paygo when an aggregate PayGo usage read is enough.",
+            ));
+        }
+
+        let query_pairs = match query_pairs(&query) {
+            Ok(query_pairs) => query_pairs,
+            Err(err) => return Ok(api_catalog_error_result(err)),
+        };
+        match self
+            .cloudflare
+            .api_request(
+                "cloudflare.billing.usage",
+                reqwest::Method::GET,
+                &path,
+                &query_pairs,
+                None,
+            )
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::structured(truncate_api_payload(
+                json!({
+                    "ok": true,
+                    "operation": "account_billing_usage",
+                    "account_id": account_id,
+                    "mode": canonical_mode,
+                    "path": path,
+                    "query": query,
+                    "result": result,
+                    "source": {
+                        "kind": "cloudflare_rest_billing_usage",
+                        "note": "This is the billing REST usage surface. For product analytics and attribution, use graphql_analytics_query.",
+                    },
+                }),
+                args.max_bytes.unwrap_or(1_048_576).clamp(1, 10_485_760),
+            ))),
+            Err(err) => Ok(adapter_error_result(err)),
+        }
+    }
+
+    #[tool(
+        name = "waf_ruleset_summary",
+        description = "Read WAF custom, managed, and rate-limit Rulesets entrypoints at zone or account scope with compact rule summaries."
+    )]
+    async fn cloudflare_waf_ruleset_summary(
+        &self,
+        Parameters(args): Parameters<WafRulesetSummaryArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let target = match resolve_waf_target(
+            self,
+            args.scope.as_deref(),
+            args.account_id.as_deref(),
+            args.zone_id.as_deref(),
+        ) {
+            Ok(target) => target,
+            Err(base) => return Ok(base),
+        };
+        let phases = match normalize_waf_phases(&args.phases) {
+            Ok(phases) => phases,
+            Err(base) => return Ok(base),
+        };
+        let mut rulesets = Vec::new();
+        for phase in &phases {
+            let path = target.entrypoint_path(phase);
+            let result = self
+                .cloudflare
+                .api_request(
+                    "cloudflare.waf.ruleset.entrypoint.read",
+                    reqwest::Method::GET,
+                    &path,
+                    &[],
+                    None,
+                )
+                .await;
+            rulesets.push(waf_ruleset_readback_entry(
+                &target,
+                phase,
+                &path,
+                result,
+                args.include_rules,
+                args.include_raw,
+            ));
+        }
+
+        Ok(CallToolResult::structured(truncate_api_payload(
+            json!({
+                "ok": true,
+                "operation": "waf_ruleset_summary",
+                "target": target.to_json(),
+                "phases": phases,
+                "rulesets": rulesets,
+                "source": waf_source_notes(),
+            }),
+            args.max_bytes.unwrap_or(1_048_576).clamp(1, 10_485_760),
+        )))
+    }
+
+    #[tool(
+        name = "waf_security_events_summary",
+        description = "Run a curated Cloudflare Analytics GraphQL Security Events query over firewallEventsAdaptive with grouped WAF evidence and recent samples."
+    )]
+    async fn cloudflare_waf_security_events_summary(
+        &self,
+        Parameters(args): Parameters<WafSecurityEventsSummaryArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let zone_id = resolve_zone_id(self, args.zone_id.as_deref())?;
+        let window = waf_time_window(
+            args.window_hours,
+            args.since.as_deref(),
+            args.until.as_deref(),
+        );
+        let group_by = match normalize_waf_group_by(&args.group_by) {
+            Ok(group_by) => group_by,
+            Err(base) => return Ok(base),
+        };
+        let limit = args.limit.clamp(1, 100);
+        let sample_limit = args.sample_limit.clamp(0, 100);
+        let filter = waf_security_events_filter(
+            &window,
+            WafEventFilterInput {
+                action: args.action.as_deref(),
+                source: args.source.as_deref(),
+                host: args.host.as_deref(),
+                path: args.path.as_deref(),
+                client_ip: args.client_ip.as_deref(),
+                rule_id: args.rule_id.as_deref(),
+            },
+        );
+        let query = build_waf_security_events_query(&group_by, limit, sample_limit);
+        let body = json!({
+            "query": query,
+            "variables": {
+                "zoneTag": zone_id,
+                "filter": filter,
+            },
+        });
+
+        match self.cloudflare.graphql_analytics_query(&body).await {
+            Ok(result) => {
+                let has_graphql_errors = result
+                    .get("errors")
+                    .and_then(Value::as_array)
+                    .is_some_and(|errors| !errors.is_empty());
+                let payload = truncate_api_payload(
+                    json!({
+                        "ok": !has_graphql_errors,
+                        "operation": "waf_security_events_summary",
+                        "zone_id": zone_id,
+                        "window_utc": window,
+                        "group_by": group_by,
+                        "limits": {
+                            "groups_per_dimension": limit,
+                            "samples": sample_limit,
+                        },
+                        "filter": body["variables"]["filter"].clone(),
+                        "analytics": waf_security_events_projection(&result),
+                        "graphql": {
+                            "endpoint": "/graphql",
+                            "query": if args.include_query { body["query"].clone() } else { Value::Null },
+                            "variables": body["variables"].clone(),
+                            "result": result,
+                        },
+                        "source": waf_source_notes(),
+                    }),
+                    args.max_bytes.unwrap_or(1_048_576).clamp(1, 10_485_760),
+                );
+                if has_graphql_errors {
+                    Ok(CallToolResult::structured_error(payload))
+                } else {
+                    Ok(CallToolResult::structured(payload))
+                }
+            }
+            Err(err) => Ok(adapter_error_result(err)),
+        }
+    }
+
+    #[tool(
+        name = "waf_rule_activity",
+        description = "Look up a WAF rule in current Rulesets and query recent Security Events for that rule id in one compact response."
+    )]
+    async fn cloudflare_waf_rule_activity(
+        &self,
+        Parameters(args): Parameters<WafRuleActivityArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let rule_id = args.rule_id.trim();
+        if rule_id.is_empty() {
+            return Ok(invalid_argument_result(
+                "waf.rule_id_required",
+                "rule_id must not be empty",
+                "Pass the Cloudflare WAF rule id to inspect.",
+            ));
+        }
+        let target = match resolve_waf_target(
+            self,
+            args.scope.as_deref(),
+            args.account_id.as_deref(),
+            args.zone_id.as_deref(),
+        ) {
+            Ok(target) => target,
+            Err(base) => return Ok(base),
+        };
+        let phases = match normalize_waf_phases(&args.phases) {
+            Ok(phases) => phases,
+            Err(base) => return Ok(base),
+        };
+        let window = waf_time_window(
+            args.window_hours,
+            args.since.as_deref(),
+            args.until.as_deref(),
+        );
+        let sample_limit = args.sample_limit.clamp(1, 100);
+        let analytics_zone_id = match args
+            .zone_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or(self.default_zone_id.as_deref())
+        {
+            Some(zone_id) => zone_id,
+            None => {
+                return Ok(invalid_argument_result(
+                    "waf.analytics_zone_required",
+                    "zone_id is required for WAF Security Events analytics",
+                    "Pass zone_id for the zone-scoped firewallEventsAdaptive GraphQL dataset, even when inspecting account-level WAF rulesets.",
+                ));
+            }
+        };
+
+        let mut rulesets = Vec::new();
+        let mut matching_rules = Vec::new();
+        for phase in &phases {
+            let path = target.entrypoint_path(phase);
+            let result = self
+                .cloudflare
+                .api_request(
+                    "cloudflare.waf.ruleset.entrypoint.read",
+                    reqwest::Method::GET,
+                    &path,
+                    &[],
+                    None,
+                )
+                .await;
+            if let Ok(result) = &result {
+                matching_rules.extend(find_waf_rules(result, rule_id, phase, args.include_raw));
+            }
+            rulesets.push(waf_ruleset_readback_entry(
+                &target,
+                phase,
+                &path,
+                result,
+                true,
+                args.include_raw,
+            ));
+        }
+
+        let filter = waf_security_events_filter(
+            &window,
+            WafEventFilterInput {
+                action: None,
+                source: None,
+                host: None,
+                path: None,
+                client_ip: None,
+                rule_id: Some(rule_id),
+            },
+        );
+        let query = build_waf_rule_activity_query(sample_limit);
+        let body = json!({
+            "query": query,
+            "variables": {
+                "zoneTag": analytics_zone_id,
+                "filter": filter,
+            },
+        });
+
+        match self.cloudflare.graphql_analytics_query(&body).await {
+            Ok(result) => {
+                let has_graphql_errors = result
+                    .get("errors")
+                    .and_then(Value::as_array)
+                    .is_some_and(|errors| !errors.is_empty());
+                let payload = truncate_api_payload(
+                    json!({
+                        "ok": !has_graphql_errors,
+                        "operation": "waf_rule_activity",
+                        "target": target.to_json(),
+                        "rule_id": rule_id,
+                        "window_utc": window,
+                        "matching_rules": matching_rules,
+                        "rulesets": rulesets,
+                        "analytics": waf_security_events_projection(&result),
+                        "graphql": {
+                            "endpoint": "/graphql",
+                            "query": if args.include_query { body["query"].clone() } else { Value::Null },
+                            "variables": body["variables"].clone(),
+                            "result": result,
+                        },
+                        "source": waf_source_notes(),
+                    }),
+                    args.max_bytes.unwrap_or(1_048_576).clamp(1, 10_485_760),
+                );
+                if has_graphql_errors {
+                    Ok(CallToolResult::structured_error(payload))
+                } else {
+                    Ok(CallToolResult::structured(payload))
+                }
+            }
+            Err(err) => Ok(adapter_error_result(err)),
+        }
+    }
+
+    #[tool(
+        name = "graphql_analytics_query",
+        description = "Run a read-only Cloudflare Analytics GraphQL query against /client/v4/graphql for product analytics such as D1 usage attribution."
+    )]
+    async fn cloudflare_graphql_analytics_query(
+        &self,
+        Parameters(args): Parameters<GraphqlAnalyticsQueryArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let query = args.query.trim();
+        if query.is_empty() {
+            return Ok(invalid_argument_result(
+                "graphql_analytics.empty_query",
+                "query must not be empty",
+                "Pass a Cloudflare Analytics GraphQL query document.",
+            ));
+        }
+        if graphql_document_has_forbidden_operation(query) {
+            return Ok(invalid_argument_result(
+                "graphql_analytics.not_read_only",
+                "graphql_analytics_query only accepts read-only query operations",
+                "Use a GraphQL query operation or an anonymous selection set; mutations and subscriptions are rejected.",
+            ));
+        }
+
+        let body = json!({
+            "query": query,
+            "variables": args.variables,
+        });
+        match self.cloudflare.graphql_analytics_query(&body).await {
+            Ok(result) => {
+                let has_graphql_errors = result
+                    .get("errors")
+                    .and_then(Value::as_array)
+                    .is_some_and(|errors| !errors.is_empty());
+                let payload = truncate_api_payload(
+                    json!({
+                        "ok": !has_graphql_errors,
+                        "operation": "graphql_analytics_query",
+                        "endpoint": "/graphql",
+                        "result": result,
+                        "source": {
+                            "kind": "cloudflare_graphql_analytics_api",
+                            "note": "Cloudflare Analytics GraphQL is useful for product analytics and attribution. Cloudflare documents that GraphQL analytics datasets are not a substitute for billing usage records.",
+                        },
+                    }),
+                    args.max_bytes.unwrap_or(1_048_576).clamp(1, 10_485_760),
+                );
+                if has_graphql_errors {
+                    Ok(CallToolResult::structured_error(payload))
+                } else {
+                    Ok(CallToolResult::structured(payload))
+                }
+            }
             Err(err) => Ok(adapter_error_result(err)),
         }
     }
@@ -1885,6 +2525,292 @@ impl CloudflareMcp {
         };
 
         Ok(finalize_mutation_result(base, &plan, audit, args.dry_run))
+    }
+
+    #[tool(
+        name = "account_api_token_permission_plan",
+        description = "Read-only planner for account API token permission changes. Fetches current token/catalog state, computes add/remove deltas, and returns a safe account_api_tokens update dry-run payload without mutating Cloudflare."
+    )]
+    async fn cloudflare_account_api_token_permission_plan(
+        &self,
+        Parameters(args): Parameters<AccountApiTokenPermissionPlanArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        let token_id = args
+            .token_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if token_id.is_none() && args.current_token.is_none() {
+            return Ok(invalid_argument_result(
+                "account_api_token_permission_plan.missing_token",
+                "token_id or current_token is required",
+                "Pass token_id to let the MCP read the current token, or pass current_token from account_api_tokens action=get.",
+            ));
+        }
+        if args.add_permissions.is_empty() && args.remove_permissions.is_empty() {
+            return Ok(invalid_argument_result(
+                "account_api_token_permission_plan.empty_delta",
+                "at least one add_permissions or remove_permissions entry is required",
+                "Pass permission group names, ids, or exact scope strings to add/remove.",
+            ));
+        }
+
+        let current_token_envelope = if let Some(current_token) = args.current_token.clone() {
+            current_token
+        } else {
+            let token_id = token_id.expect("checked above");
+            let Some(operation) = find_operation("account-api-tokens-token-details") else {
+                return Ok(api_catalog_error_result(
+                    ApiCatalogError::OperationNotFound(
+                        "account-api-tokens-token-details".to_string(),
+                    ),
+                ));
+            };
+            let path = match render_path(
+                operation,
+                &BTreeMap::from([
+                    ("account_id".to_string(), account_id.to_string()),
+                    ("token_id".to_string(), token_id.to_string()),
+                ]),
+                self.default_account_id.as_deref(),
+                self.default_zone_id.as_deref(),
+            ) {
+                Ok(path) => path,
+                Err(err) => return Ok(api_catalog_error_result(err)),
+            };
+            match self
+                .cloudflare
+                .api_request(
+                    "cloudflare.account_api_token_permission_plan.token_read",
+                    reqwest::Method::GET,
+                    &path,
+                    &[],
+                    None,
+                )
+                .await
+            {
+                Ok(result) => result,
+                Err(err) => return Ok(adapter_error_result(err)),
+            }
+        };
+
+        let permission_groups_envelope =
+            if let Some(permission_groups) = args.permission_groups.clone() {
+                permission_groups
+            } else {
+                let Some(operation) = find_operation("account-api-tokens-list-permission-groups")
+                else {
+                    return Ok(api_catalog_error_result(
+                        ApiCatalogError::OperationNotFound(
+                            "account-api-tokens-list-permission-groups".to_string(),
+                        ),
+                    ));
+                };
+                let path = match render_path(
+                    operation,
+                    &BTreeMap::from([("account_id".to_string(), account_id.to_string())]),
+                    self.default_account_id.as_deref(),
+                    self.default_zone_id.as_deref(),
+                ) {
+                    Ok(path) => path,
+                    Err(err) => return Ok(api_catalog_error_result(err)),
+                };
+                match self
+                    .cloudflare
+                    .api_request(
+                        "cloudflare.account_api_token_permission_plan.permission_groups_read",
+                        reqwest::Method::GET,
+                        &path,
+                        &[],
+                        None,
+                    )
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(err) => return Ok(adapter_error_result(err)),
+                }
+            };
+
+        let token = cloudflare_result_value(&current_token_envelope).clone();
+        let catalog_groups = extract_permission_group_summaries(&permission_groups_envelope);
+        if catalog_groups.is_empty() {
+            return Ok(invalid_argument_result(
+                "account_api_token_permission_plan.empty_permission_catalog",
+                "permission group catalog is empty or not in a recognized shape",
+                "Pass permission_groups from account_api_tokens action=list_permission_groups, or allow the MCP to read the catalog.",
+            ));
+        }
+
+        let policies = match token.get("policies").and_then(Value::as_array) {
+            Some(policies) if !policies.is_empty() => policies,
+            _ => {
+                return Ok(invalid_argument_result(
+                    "account_api_token_permission_plan.missing_policies",
+                    "current token does not include a non-empty policies array",
+                    "Pass current_token from account_api_tokens action=get, or verify the token details endpoint returned full token metadata.",
+                ));
+            }
+        };
+        let policy_index = match args.policy_index {
+            Some(index) if index < policies.len() => index,
+            Some(_) => {
+                return Ok(invalid_argument_result(
+                    "account_api_token_permission_plan.invalid_policy_index",
+                    "policy_index is outside the current token policies array",
+                    "Inspect policy_summaries in the token details and choose a valid zero-based policy_index.",
+                ));
+            }
+            None if policies.len() == 1 => 0,
+            None => {
+                return Ok(CallToolResult::structured_error(json!({
+                    "ok": false,
+                    "operation": "account_api_token_permission_plan",
+                    "error": {
+                        "code": "account_api_token_permission_plan.ambiguous_policy",
+                        "message": "token has multiple policies; choose policy_index before planning permission changes",
+                        "hint": "Pass policy_index for the policy whose resources should receive the add/remove permission groups."
+                    },
+                    "account_id": account_id,
+                    "token_id": token_id,
+                    "policy_summaries": summarize_token_policies(policies),
+                })));
+            }
+        };
+
+        let selected_policy = &policies[policy_index];
+        let current_groups =
+            extract_permission_group_summaries_from_array(selected_policy.get("permission_groups"));
+        if current_groups
+            .iter()
+            .any(|group| group.id.trim().is_empty())
+        {
+            return Ok(invalid_argument_result(
+                "account_api_token_permission_plan.invalid_current_permission_group",
+                "selected policy has a permission group without an id",
+                "Refresh token details before planning the update; the MCP preserves permission groups by id.",
+            ));
+        }
+
+        let add_resolution = match resolve_permission_selectors(
+            &args.add_permissions,
+            &catalog_groups,
+            &current_groups,
+            PermissionSelectorMode::Add,
+        ) {
+            Ok(resolution) => resolution,
+            Err(error) => return Ok(error),
+        };
+        let remove_resolution = match resolve_permission_selectors(
+            &args.remove_permissions,
+            &catalog_groups,
+            &current_groups,
+            PermissionSelectorMode::Remove,
+        ) {
+            Ok(resolution) => resolution,
+            Err(error) => return Ok(error),
+        };
+
+        let mut resulting_by_id: BTreeMap<String, PermissionGroupSummary> = current_groups
+            .iter()
+            .cloned()
+            .map(|group| (group.id.clone(), group))
+            .collect();
+        for group in &remove_resolution.to_change {
+            resulting_by_id.remove(&group.id);
+        }
+        for group in &add_resolution.to_change {
+            resulting_by_id.insert(group.id.clone(), group.clone());
+        }
+        let resulting_groups: Vec<PermissionGroupSummary> =
+            resulting_by_id.values().cloned().collect();
+
+        let mut update_body = match build_account_api_token_update_body(&token) {
+            Ok(body) => body,
+            Err(error) => return Ok(error),
+        };
+        if let Some(policy) = update_body
+            .get_mut("policies")
+            .and_then(Value::as_array_mut)
+            .and_then(|policies| policies.get_mut(policy_index))
+        {
+            policy["permission_groups"] = json!(
+                resulting_groups
+                    .iter()
+                    .map(|group| json!({ "id": group.id }))
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        let no_changes_required =
+            add_resolution.to_change.is_empty() && remove_resolution.to_change.is_empty();
+        let resolved_token_id = token_id
+            .or_else(|| token.get("id").and_then(Value::as_str))
+            .map(str::to_string);
+        if !no_changes_required && resolved_token_id.is_none() {
+            return Ok(invalid_argument_result(
+                "account_api_token_permission_plan.missing_update_token_id",
+                "permission changes were planned, but no token id is available for the update call",
+                "Pass token_id, or include id in current_token from account_api_tokens action=get.",
+            ));
+        }
+        let next_call = if no_changes_required {
+            Value::Null
+        } else {
+            json!({
+                "tool": "account_api_tokens",
+                "arguments": {
+                    "account_id": account_id,
+                    "action": "update",
+                    "token_id": resolved_token_id,
+                    "body": update_body,
+                    "dry_run": true,
+                    "reason": args.reason.clone().unwrap_or_else(|| "permission delta planned by account_api_token_permission_plan".to_string()),
+                }
+            })
+        };
+
+        let mut payload = json!({
+            "ok": true,
+            "operation": "account_api_token_permission_plan",
+            "read_only": true,
+            "account_id": account_id,
+            "token_id": resolved_token_id,
+            "token_name": token.get("name").cloned().unwrap_or(Value::Null),
+            "policy": {
+                "index": policy_index,
+                "effect": selected_policy.get("effect").cloned().unwrap_or(Value::Null),
+                "resources": selected_policy.get("resources").cloned().unwrap_or(Value::Null),
+                "current_permission_count": current_groups.len(),
+                "resulting_permission_count": resulting_groups.len(),
+            },
+            "requested": {
+                "add_permissions": args.add_permissions,
+                "remove_permissions": args.remove_permissions,
+            },
+            "delta": {
+                "permissions_to_add": add_resolution.to_change,
+                "permissions_to_remove": remove_resolution.to_change,
+                "already_present": add_resolution.noops,
+                "not_present": remove_resolution.noops,
+            },
+            "no_changes_required": no_changes_required,
+            "resulting_permission_groups": resulting_groups,
+            "update_body": next_call.get("arguments").and_then(|arguments| arguments.get("body")).cloned().unwrap_or(Value::Null),
+            "next_call": next_call,
+            "safety_notes": [
+                "This helper is read-only and does not mutate Cloudflare.",
+                "Run the returned account_api_tokens update payload with dry_run=true first, then apply only with the emitted confirmation token.",
+                "Existing permission groups on the selected policy are preserved unless explicitly listed in remove_permissions."
+            ],
+        });
+        if args.include_catalog {
+            payload["permission_group_catalog"] = json!(catalog_groups);
+        }
+        Ok(CallToolResult::structured(truncate_api_payload(
+            payload,
+            args.max_bytes.unwrap_or(1_048_576).clamp(1, 10_485_760),
+        )))
     }
 
     #[tool(
@@ -2432,6 +3358,9 @@ impl CloudflareMcp {
             Err(err) if is_d1_no_such_column_error(&err) => {
                 Ok(d1_no_such_column_result(err, &args.database_id))
             }
+            Err(err) if is_d1_no_such_table_error(&err) => {
+                Ok(d1_no_such_table_result(err, &args.database_id))
+            }
             Err(err) if crate::cloudflare::client::is_d1_sqlite_auth_error(&err) => {
                 Ok(d1_sqlite_auth_result(err))
             }
@@ -2457,6 +3386,12 @@ impl CloudflareMcp {
             .await
         {
             Ok(schema) => schema,
+            Err(err) if is_d1_no_such_table_error(&err) => {
+                return Ok(d1_no_such_table_result(err, &args.database_id));
+            }
+            Err(err) if is_d1_no_such_column_error(&err) => {
+                return Ok(d1_no_such_column_result(err, &args.database_id));
+            }
             Err(err) if crate::cloudflare::client::is_d1_sqlite_auth_error(&err) => {
                 return Ok(d1_sqlite_auth_result(err));
             }
@@ -2476,6 +3411,16 @@ impl CloudflareMcp {
                     "result": plan,
                     "estimated_rows": null,
                     "estimated_read_bytes": null,
+                }),
+                Err(err) if is_d1_no_such_table_error(&err) => json!({
+                    "available": false,
+                    "reason": "d1.no_such_table",
+                    "error": err.payload(),
+                }),
+                Err(err) if is_d1_no_such_column_error(&err) => json!({
+                    "available": false,
+                    "reason": "d1.no_such_column",
+                    "error": err.payload(),
                 }),
                 Err(err) if crate::cloudflare::client::is_d1_sqlite_auth_error(&err) => json!({
                     "available": false,
@@ -4627,6 +5572,229 @@ impl CloudflareMcp {
     }
 
     #[tool(
+        name = "workers_upload_script",
+        description = "Upload a Cloudflare Worker module script or prebuilt multipart bundle with dry-run planning, confirmation-token apply, and settings readback."
+    )]
+    async fn cloudflare_workers_upload_script(
+        &self,
+        Parameters(args): Parameters<WorkersUploadScriptArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        let script_name = args.script_name.trim();
+        if script_name.is_empty() {
+            let plan = MutationPlan::new("workers_upload_script");
+            let audit = MutationAuditSession::start(
+                Some(&parts),
+                "workers_upload_script",
+                json!({
+                    "account_id": account_id,
+                    "script_name": script_name,
+                }),
+                args.dry_run,
+            );
+            return Ok(finalize_mutation_result(
+                worker_upload_error_result(WorkerUploadError {
+                    code: "workers.invalid_script_name",
+                    message: "script_name must not be empty".to_string(),
+                    hint: "Provide the Worker script name shown by Cloudflare.",
+                }),
+                &plan,
+                audit,
+                args.dry_run,
+            ));
+        }
+        let upload_operation =
+            find_operation("worker-script-upload-worker-module").ok_or_else(|| {
+                crate::McpError::internal_error(
+                    "missing Worker upload operation catalog entry",
+                    None,
+                )
+            })?;
+        let mut path_params = BTreeMap::new();
+        path_params.insert("account_id".to_string(), account_id.to_string());
+        path_params.insert("script_name".to_string(), script_name.to_string());
+        let rendered_path = render_path(
+            upload_operation,
+            &path_params,
+            Some(account_id),
+            self.default_zone_id.as_deref(),
+        )
+        .map_err(|err| crate::McpError::invalid_params(format!("{err:?}"), None))?;
+
+        let upload = match build_worker_upload(WorkerUploadInput {
+            script_path: args.script_path.as_deref(),
+            script_content: args.script_content.as_deref(),
+            script_content_base64: args.script_content_base64.as_deref(),
+            multipart_path: args.multipart_path.as_deref(),
+            main_module: args.main_module.as_deref(),
+            metadata: &args.metadata,
+            content_type: args.content_type.as_deref(),
+        }) {
+            Ok(upload) => upload,
+            Err(err) => {
+                let plan = MutationPlan::new("workers_upload_script");
+                let audit = MutationAuditSession::start(
+                    Some(&parts),
+                    "workers_upload_script",
+                    json!({
+                        "account_id": account_id,
+                        "script_name": script_name,
+                    }),
+                    args.dry_run,
+                );
+                return Ok(finalize_mutation_result(
+                    worker_upload_error_result(err),
+                    &plan,
+                    audit,
+                    args.dry_run,
+                ));
+            }
+        };
+
+        let upload_summary = json!(upload.summary);
+        let token_body = Some(json!({
+            "script_name": script_name,
+            "upload": upload_summary,
+        }));
+        let required_confirmation_token =
+            mutation_confirmation_token(upload_operation, &rendered_path, &token_body);
+        let plan = plan_upload_worker_script(account_id, script_name, upload_summary.clone());
+        let audit = MutationAuditSession::start(
+            Some(&parts),
+            "workers_upload_script",
+            json!({
+                "account_id": account_id,
+                "script_name": script_name,
+                "source_kind": upload.summary.source_kind,
+                "source_label": upload.summary.source_label,
+                "sha256": upload.summary.sha256,
+                "reason": args.reason.as_deref().map(str::trim),
+            }),
+            args.dry_run,
+        );
+
+        let base = if args.dry_run {
+            CallToolResult::structured(json!({
+                "ok": true,
+                "planned": true,
+                "operation": "workers_upload_script",
+                "account_id": account_id,
+                "script_name": script_name,
+                "request_path": rendered_path,
+                "upload": upload_summary,
+                "required_confirmation_token": required_confirmation_token,
+                "dry_run_note": "No Worker script upload applied.",
+            }))
+        } else if args.confirmation_token.as_deref() != Some(required_confirmation_token.as_str()) {
+            CallToolResult::structured_error(json!({
+                "ok": false,
+                "operation": "workers_upload_script",
+                "error": {
+                    "code": "workers.upload_confirmation_required",
+                    "message": "Worker script upload requires the confirmation token returned by dry-run",
+                    "hint": "Run workers_upload_script with dry_run=true and echo required_confirmation_token in confirmation_token.",
+                },
+                "account_id": account_id,
+                "script_name": script_name,
+                "upload": upload_summary,
+                "required_confirmation_token": required_confirmation_token,
+            }))
+        } else {
+            let uploaded = match upload.body {
+                WorkerUploadBody::Module {
+                    metadata,
+                    module_name,
+                    file_name,
+                    content_type,
+                    bytes,
+                } => {
+                    self.cloudflare
+                        .upload_worker_module(
+                            account_id,
+                            script_name,
+                            &metadata,
+                            &module_name,
+                            &file_name,
+                            &content_type,
+                            bytes,
+                        )
+                        .await
+                }
+                WorkerUploadBody::Multipart {
+                    content_type,
+                    bytes,
+                } => {
+                    self.cloudflare
+                        .upload_worker_multipart(account_id, script_name, &content_type, bytes)
+                        .await
+                }
+            };
+            match uploaded {
+                Ok(script) => match self
+                    .cloudflare
+                    .get_worker_settings(account_id, script_name)
+                    .await
+                {
+                    Ok(readback_settings) => {
+                        let readback_verification =
+                            verify_worker_upload_readback(&upload_summary, &readback_settings);
+                        let ok = readback_verification
+                            .get("matched")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        if ok {
+                            CallToolResult::structured(json!({
+                                "ok": true,
+                                "operation": "workers_upload_script",
+                                "account_id": account_id,
+                                "script_name": script_name,
+                                "upload": upload_summary,
+                                "script": script,
+                                "readback_settings": readback_settings,
+                                "readback_verification": readback_verification,
+                            }))
+                        } else {
+                            CallToolResult::structured_error(json!({
+                                "ok": false,
+                                "operation": "workers_upload_script",
+                                "error": {
+                                    "code": "workers.upload_readback_mismatch",
+                                    "message": "Worker script upload returned success, but settings readback did not match the requested module.",
+                                    "hint": "Inspect readback_settings.main_module and rerun the upload or use the documented Wrangler deployment path if the Worker bundle owns the module graph.",
+                                },
+                                "account_id": account_id,
+                                "script_name": script_name,
+                                "upload": upload_summary,
+                                "script": script,
+                                "readback_settings": readback_settings,
+                                "readback_verification": readback_verification,
+                            }))
+                        }
+                    }
+                    Err(err) => CallToolResult::structured_error(json!({
+                        "ok": false,
+                        "operation": "workers_upload_script",
+                        "error": {
+                            "code": "workers.upload_readback_failed",
+                            "message": "Worker script upload returned success, but settings readback failed",
+                            "hint": "Inspect the uploaded script in Cloudflare and rerun workers_get_script_settings.",
+                            "readback_error": err.payload(),
+                        },
+                        "account_id": account_id,
+                        "script_name": script_name,
+                        "upload": upload_summary,
+                        "script": script,
+                    })),
+                },
+                Err(err) => adapter_error_result(err),
+            }
+        };
+
+        Ok(finalize_mutation_result(base, &plan, audit, args.dry_run))
+    }
+
+    #[tool(
         name = "workers_list_tails",
         description = "List Worker tail consumers for a script."
     )]
@@ -4659,10 +5827,15 @@ impl CloudflareMcp {
         let limit = args.limit.unwrap_or(100).clamp(1, 1000);
         let timeframe = workers_observability_timeframe(args.timeframe, args.lookback_minutes);
         let body = workers_observability_query_body(
-            &args.script_name,
+            args.script_name.as_deref(),
+            &args.datasets,
+            &args.filters,
             limit,
             timeframe,
             args.query_id.as_deref(),
+            args.dry.unwrap_or(true),
+            args.view.as_deref(),
+            args.needle,
         );
         match self
             .cloudflare
@@ -4687,8 +5860,12 @@ impl CloudflareMcp {
         let account_id = resolve_account_id(self, args.account_id.as_deref())?;
         let body = workers_observability_discovery_body(
             args.script_name.as_deref(),
+            &args.datasets,
+            &args.filters,
             args.limit.unwrap_or(100).clamp(1, 1000),
             workers_observability_timeframe(args.timeframe, args.lookback_minutes),
+            args.needle,
+            args.key_needle,
         );
         match self
             .cloudflare
@@ -4715,8 +5892,11 @@ impl CloudflareMcp {
             &args.key,
             args.value_type.as_deref().unwrap_or("string"),
             args.script_name.as_deref(),
+            &args.datasets,
+            &args.filters,
             args.limit.unwrap_or(100).clamp(1, 1000),
             workers_observability_timeframe(args.timeframe, args.lookback_minutes),
+            args.needle,
         );
         match self
             .cloudflare
@@ -6442,6 +7622,235 @@ fn account_api_token_operation(action: &str) -> Option<(&'static str, bool)> {
     }
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+struct PermissionGroupSummary {
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    scopes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PermissionSelectorMode {
+    Add,
+    Remove,
+}
+
+#[derive(Debug)]
+struct PermissionSelectorResolution {
+    to_change: Vec<PermissionGroupSummary>,
+    noops: Vec<PermissionGroupSummary>,
+}
+
+fn cloudflare_result_value(value: &Value) -> &Value {
+    value.get("result").unwrap_or(value)
+}
+
+fn extract_permission_group_summaries(value: &Value) -> Vec<PermissionGroupSummary> {
+    let result = cloudflare_result_value(value);
+    if let Some(groups) = result.as_array() {
+        return extract_permission_group_summaries_from_values(groups);
+    }
+    for field in ["permission_groups", "groups", "data"] {
+        if let Some(groups) = result.get(field).and_then(Value::as_array) {
+            return extract_permission_group_summaries_from_values(groups);
+        }
+    }
+    Vec::new()
+}
+
+fn extract_permission_group_summaries_from_array(
+    value: Option<&Value>,
+) -> Vec<PermissionGroupSummary> {
+    value
+        .and_then(Value::as_array)
+        .map(|groups| extract_permission_group_summaries_from_values(groups))
+        .unwrap_or_default()
+}
+
+fn extract_permission_group_summaries_from_values(groups: &[Value]) -> Vec<PermissionGroupSummary> {
+    groups.iter().filter_map(permission_group_summary).collect()
+}
+
+fn permission_group_summary(value: &Value) -> Option<PermissionGroupSummary> {
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())?
+        .to_string();
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string);
+    let scopes = value
+        .get("scopes")
+        .and_then(Value::as_array)
+        .map(|scopes| {
+            scopes
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|scope| !scope.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(PermissionGroupSummary { id, name, scopes })
+}
+
+fn resolve_permission_selectors(
+    selectors: &[String],
+    catalog_groups: &[PermissionGroupSummary],
+    current_groups: &[PermissionGroupSummary],
+    mode: PermissionSelectorMode,
+) -> Result<PermissionSelectorResolution, CallToolResult> {
+    let current_ids: BTreeSet<&str> = current_groups
+        .iter()
+        .map(|group| group.id.as_str())
+        .collect();
+    let mut by_change_id = BTreeMap::new();
+    let mut by_noop_id = BTreeMap::new();
+    for selector in selectors {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            continue;
+        }
+        let group = match resolve_permission_selector(selector, catalog_groups, current_groups) {
+            Ok(group) => group,
+            Err(error) => return Err(error),
+        };
+        let is_present = current_ids.contains(group.id.as_str());
+        match (mode, is_present) {
+            (PermissionSelectorMode::Add, true) => {
+                by_noop_id.insert(group.id.clone(), group);
+            }
+            (PermissionSelectorMode::Add, false) => {
+                by_change_id.insert(group.id.clone(), group);
+            }
+            (PermissionSelectorMode::Remove, true) => {
+                by_change_id.insert(group.id.clone(), group);
+            }
+            (PermissionSelectorMode::Remove, false) => {
+                by_noop_id.insert(group.id.clone(), group);
+            }
+        }
+    }
+    Ok(PermissionSelectorResolution {
+        to_change: by_change_id.into_values().collect(),
+        noops: by_noop_id.into_values().collect(),
+    })
+}
+
+fn resolve_permission_selector(
+    selector: &str,
+    catalog_groups: &[PermissionGroupSummary],
+    current_groups: &[PermissionGroupSummary],
+) -> Result<PermissionGroupSummary, CallToolResult> {
+    let mut matches: BTreeMap<String, PermissionGroupSummary> = BTreeMap::new();
+    for group in current_groups.iter().chain(catalog_groups.iter()) {
+        if permission_group_matches_selector(group, selector) {
+            matches.insert(group.id.clone(), group.clone());
+        }
+    }
+    match matches.len() {
+        0 => Err(CallToolResult::structured_error(json!({
+            "ok": false,
+            "operation": "account_api_token_permission_plan",
+            "error": {
+                "code": "account_api_token_permission_plan.permission_not_found",
+                "message": "permission selector did not match a permission group id, name, or exact scope",
+                "hint": "Use account_api_tokens action=list_permission_groups, then pass an exact permission group id or name.",
+                "selector": selector,
+            },
+            "catalog_sample": catalog_groups.iter().take(25).collect::<Vec<_>>(),
+        }))),
+        1 => Ok(matches.into_values().next().expect("one match")),
+        _ => Err(CallToolResult::structured_error(json!({
+            "ok": false,
+            "operation": "account_api_token_permission_plan",
+            "error": {
+                "code": "account_api_token_permission_plan.ambiguous_permission",
+                "message": "permission selector matched multiple permission groups",
+                "hint": "Pass the exact permission group id to disambiguate.",
+                "selector": selector,
+            },
+            "matches": matches.into_values().collect::<Vec<_>>(),
+        }))),
+    }
+}
+
+fn permission_group_matches_selector(group: &PermissionGroupSummary, selector: &str) -> bool {
+    let normalized_selector = normalize_permission_selector(selector);
+    group.id.eq_ignore_ascii_case(selector)
+        || group
+            .name
+            .as_ref()
+            .is_some_and(|name| normalize_permission_selector(name) == normalized_selector)
+        || group
+            .scopes
+            .iter()
+            .any(|scope| normalize_permission_selector(scope) == normalized_selector)
+}
+
+fn normalize_permission_selector(value: &str) -> String {
+    value
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn summarize_token_policies(policies: &[Value]) -> Vec<Value> {
+    policies
+        .iter()
+        .enumerate()
+        .map(|(index, policy)| {
+            json!({
+                "index": index,
+                "effect": policy.get("effect").cloned().unwrap_or(Value::Null),
+                "resources": policy.get("resources").cloned().unwrap_or(Value::Null),
+                "permission_groups": extract_permission_group_summaries_from_array(policy.get("permission_groups")),
+            })
+        })
+        .collect()
+}
+
+fn build_account_api_token_update_body(token: &Value) -> Result<Value, CallToolResult> {
+    let Some(token_object) = token.as_object() else {
+        return Err(invalid_argument_result(
+            "account_api_token_permission_plan.invalid_current_token",
+            "current token is not a JSON object",
+            "Pass current_token from account_api_tokens action=get or let the MCP fetch token details by token_id.",
+        ));
+    };
+    let mut body = Map::new();
+    for field in ["name", "policies", "condition", "expires_on", "not_before"] {
+        if let Some(value) = token_object.get(field) {
+            body.insert(field.to_string(), value.clone());
+        }
+    }
+    if !body.contains_key("name") {
+        return Err(invalid_argument_result(
+            "account_api_token_permission_plan.missing_token_name",
+            "current token does not include name",
+            "Refresh token details before planning an update; Cloudflare token updates require preserving the token name.",
+        ));
+    }
+    if !body.contains_key("policies") {
+        return Err(invalid_argument_result(
+            "account_api_token_permission_plan.missing_token_policies",
+            "current token does not include policies",
+            "Refresh token details before planning an update; the helper preserves existing policies and only changes permission_groups.",
+        ));
+    }
+    Ok(Value::Object(body))
+}
+
 fn normalize_ingress_rule_arg(rule: &IngressRuleArgs) -> IngressRule {
     match rule {
         IngressRuleArgs::Object(rule) => IngressRule {
@@ -6476,6 +7885,538 @@ fn parse_ingress_rule_text(raw: &str) -> IngressRule {
 
 fn normalize_action(action: &str) -> String {
     action.trim().to_ascii_lowercase().replace(['-', ' '], "_")
+}
+
+fn query_mentions_waf(query: Option<&str>) -> bool {
+    let Some(query) = query else {
+        return false;
+    };
+    let query = query.to_ascii_lowercase();
+    query.contains("waf")
+        || query.contains("firewall")
+        || query.contains("security event")
+        || query.contains("security_events")
+        || query.contains("firewalleventsadaptive")
+        || query.contains("blocked request")
+}
+
+const DEFAULT_WAF_PHASES: &[&str] = &[
+    "http_request_firewall_custom",
+    "http_request_firewall_managed",
+    "http_ratelimit",
+];
+
+#[derive(Debug, Clone)]
+struct WafTarget {
+    scope: &'static str,
+    identifier: String,
+}
+
+impl WafTarget {
+    fn entrypoint_path(&self, phase: &str) -> String {
+        match self.scope {
+            "account" => format!(
+                "/accounts/{}/rulesets/phases/{}/entrypoint",
+                self.identifier, phase
+            ),
+            _ => format!(
+                "/zones/{}/rulesets/phases/{}/entrypoint",
+                self.identifier, phase
+            ),
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "scope": self.scope,
+            "id": self.identifier,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WafTimeWindow {
+    start: String,
+    end: String,
+    window_hours: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WafEventFilterInput<'a> {
+    action: Option<&'a str>,
+    source: Option<&'a str>,
+    host: Option<&'a str>,
+    path: Option<&'a str>,
+    client_ip: Option<&'a str>,
+    rule_id: Option<&'a str>,
+}
+
+fn resolve_waf_target(
+    server: &CloudflareMcp,
+    scope: Option<&str>,
+    account_id: Option<&str>,
+    zone_id: Option<&str>,
+) -> Result<WafTarget, CallToolResult> {
+    let normalized = normalize_action(scope.unwrap_or("auto"));
+    match normalized.as_str() {
+        "" | "auto" => {
+            if let Some(zone_id) = zone_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .or_else(|| server.default_zone_id.as_deref())
+            {
+                Ok(WafTarget {
+                    scope: "zone",
+                    identifier: zone_id.to_string(),
+                })
+            } else if let Some(account_id) = account_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .or_else(|| server.default_account_id.as_deref())
+            {
+                Ok(WafTarget {
+                    scope: "account",
+                    identifier: account_id.to_string(),
+                })
+            } else {
+                Err(invalid_argument_result(
+                    "waf.target_required",
+                    "zone_id or account_id is required for WAF ruleset reads",
+                    "Pass zone_id/account_id or configure CLOUDFLARE_MCP_DEFAULT_ZONE_ID/CLOUDFLARE_MCP_DEFAULT_ACCOUNT_ID.",
+                ))
+            }
+        }
+        "zone" => {
+            let zone_id = zone_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .or_else(|| server.default_zone_id.as_deref())
+                .ok_or_else(|| {
+                    invalid_argument_result(
+                        "waf.zone_id_required",
+                        "zone_id is required when scope=zone",
+                        "Pass zone_id or configure CLOUDFLARE_MCP_DEFAULT_ZONE_ID.",
+                    )
+                })?;
+            Ok(WafTarget {
+                scope: "zone",
+                identifier: zone_id.to_string(),
+            })
+        }
+        "account" => {
+            let account_id = account_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .or_else(|| server.default_account_id.as_deref())
+                .ok_or_else(|| {
+                    invalid_argument_result(
+                        "waf.account_id_required",
+                        "account_id is required when scope=account",
+                        "Pass account_id or configure CLOUDFLARE_MCP_DEFAULT_ACCOUNT_ID.",
+                    )
+                })?;
+            Ok(WafTarget {
+                scope: "account",
+                identifier: account_id.to_string(),
+            })
+        }
+        _ => Err(invalid_argument_result(
+            "waf.invalid_scope",
+            "scope must be auto, zone, or account",
+            "Use scope=zone for zone WAF rules, scope=account for account WAF rulesets, or omit scope to prefer a configured/provided zone.",
+        )),
+    }
+}
+
+fn normalize_waf_phases(values: &[String]) -> Result<Vec<String>, CallToolResult> {
+    let raw: Vec<&str> = if values.is_empty() {
+        DEFAULT_WAF_PHASES.to_vec()
+    } else {
+        values.iter().map(String::as_str).collect()
+    };
+    let mut phases = Vec::new();
+    for value in raw {
+        let normalized = normalize_action(value);
+        let phase = match normalized.as_str() {
+            "custom" | "custom_rules" | "firewall_custom" | "waf_custom" => {
+                "http_request_firewall_custom"
+            }
+            "managed" | "managed_rules" | "firewall_managed" | "waf_managed" => {
+                "http_request_firewall_managed"
+            }
+            "ratelimit" | "rate_limit" | "rate_limiting" | "waf_rate_limit" => "http_ratelimit",
+            "http_request_firewall_custom"
+            | "http_request_firewall_managed"
+            | "http_ratelimit"
+            | "ddos_l7" => normalized.as_str(),
+            _ => {
+                return Err(invalid_argument_result(
+                    "waf.invalid_phase",
+                    format!("Unsupported WAF phase {value:?}"),
+                    "Use custom, managed, ratelimit, ddos_l7, or an explicit WAF Ruleset Engine phase.",
+                ));
+            }
+        };
+        if !phases.iter().any(|existing| existing == phase) {
+            phases.push(phase.to_string());
+        }
+    }
+    Ok(phases)
+}
+
+fn normalize_waf_group_by(values: &[String]) -> Result<Vec<String>, CallToolResult> {
+    let raw: Vec<&str> = if values.is_empty() {
+        vec!["action", "source", "host", "path", "country", "hour"]
+    } else {
+        values.iter().map(String::as_str).collect()
+    };
+    let mut group_by = Vec::new();
+    for value in raw {
+        let normalized = normalize_action(value);
+        let dimension = match normalized.as_str() {
+            "action" | "source" | "host" | "path" | "country" | "hour" | "ip" | "rule" => {
+                normalized.as_str()
+            }
+            "client_ip" | "clientip" => "ip",
+            "hostname" => "host",
+            "rule_id" | "ruleid" => "rule",
+            "datetime_hour" | "datetimehour" => "hour",
+            _ => {
+                return Err(invalid_argument_result(
+                    "waf.invalid_group_by",
+                    format!("Unsupported WAF group_by dimension {value:?}"),
+                    "Use action, source, host, path, country, hour, ip, or rule.",
+                ));
+            }
+        };
+        if !group_by.iter().any(|existing| existing == dimension) {
+            group_by.push(dimension.to_string());
+        }
+    }
+    Ok(group_by)
+}
+
+fn waf_time_window(window_hours: u32, since: Option<&str>, until: Option<&str>) -> WafTimeWindow {
+    let hours = window_hours.clamp(1, 24 * 31);
+    let end = until
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format_utc_second(OffsetDateTime::now_utc()));
+    let start = since
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            format_utc_second(OffsetDateTime::now_utc() - TimeDuration::hours(hours as i64))
+        });
+    WafTimeWindow {
+        start,
+        end,
+        window_hours: hours,
+    }
+}
+
+fn format_utc_second(dt: OffsetDateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        dt.year(),
+        u8::from(dt.month()),
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second()
+    )
+}
+
+fn waf_security_events_filter(window: &WafTimeWindow, input: WafEventFilterInput<'_>) -> Value {
+    let mut filter = Map::new();
+    filter.insert("datetime_geq".to_string(), json!(window.start));
+    filter.insert("datetime_leq".to_string(), json!(window.end));
+    insert_non_empty(&mut filter, "action", input.action);
+    insert_non_empty(&mut filter, "source", input.source);
+    insert_non_empty(&mut filter, "clientRequestHTTPHost", input.host);
+    insert_non_empty(&mut filter, "clientRequestPath", input.path);
+    insert_non_empty(&mut filter, "clientIP", input.client_ip);
+    insert_non_empty(&mut filter, "ruleId", input.rule_id);
+    Value::Object(filter)
+}
+
+fn insert_non_empty(map: &mut Map<String, Value>, key: &str, value: Option<&str>) {
+    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+        map.insert(key.to_string(), json!(value));
+    }
+}
+
+fn build_waf_security_events_query(group_by: &[String], limit: u32, sample_limit: u32) -> String {
+    let mut group_nodes = String::new();
+    for dimension in group_by {
+        if let Some((alias, field)) = waf_group_dimension_field(dimension) {
+            group_nodes.push_str(&format!(
+                "{alias}: firewallEventsAdaptiveGroups(filter: $filter, limit: {limit}, orderBy: [count_DESC]) {{ count dimensions {{ {field} }} }}\n"
+            ));
+        }
+    }
+    let samples = if sample_limit == 0 {
+        String::new()
+    } else {
+        format!(
+            "samples: firewallEventsAdaptive(filter: $filter, limit: {sample_limit}, orderBy: [datetime_DESC]) {{ action clientAsn clientCountryName clientIP clientRequestHTTPHost clientRequestPath clientRequestQuery datetime source userAgent ruleId rulesetId rayName }}\n"
+        )
+    };
+    format!(
+        "query WafSecurityEvents($zoneTag: string, $filter: FirewallEventsAdaptiveFilter_InputObject) {{ viewer {{ zones(filter: {{ zoneTag: $zoneTag }}) {{ settings {{ firewallEventsAdaptive {{ maxDuration maxPageSize notOlderThan }} }} {group_nodes}{samples} }} }} }}"
+    )
+}
+
+fn build_waf_rule_activity_query(sample_limit: u32) -> String {
+    format!(
+        "query WafRuleActivity($zoneTag: string, $filter: FirewallEventsAdaptiveFilter_InputObject) {{ viewer {{ zones(filter: {{ zoneTag: $zoneTag }}) {{ byAction: firewallEventsAdaptiveGroups(filter: $filter, limit: 20, orderBy: [count_DESC]) {{ count dimensions {{ action }} }} bySource: firewallEventsAdaptiveGroups(filter: $filter, limit: 20, orderBy: [count_DESC]) {{ count dimensions {{ source }} }} samples: firewallEventsAdaptive(filter: $filter, limit: {sample_limit}, orderBy: [datetime_DESC]) {{ action clientAsn clientCountryName clientIP clientRequestHTTPHost clientRequestPath clientRequestQuery datetime source userAgent ruleId rulesetId rayName }} }} }} }}"
+    )
+}
+
+fn waf_group_dimension_field(dimension: &str) -> Option<(&'static str, &'static str)> {
+    match dimension {
+        "action" => Some(("byAction", "action")),
+        "source" => Some(("bySource", "source")),
+        "host" => Some(("byHost", "clientRequestHTTPHost")),
+        "path" => Some(("byPath", "clientRequestPath")),
+        "country" => Some(("byCountry", "clientCountryName")),
+        "hour" => Some(("byHour", "datetimeHour")),
+        "ip" => Some(("byIp", "clientIP")),
+        "rule" => Some(("byRule", "ruleId")),
+        _ => None,
+    }
+}
+
+fn waf_ruleset_readback_entry(
+    target: &WafTarget,
+    phase: &str,
+    path: &str,
+    result: Result<Value, crate::cloudflare::AdapterError>,
+    include_rules: bool,
+    include_raw: bool,
+) -> Value {
+    match result {
+        Ok(result) => {
+            let rules = result
+                .get("rules")
+                .and_then(Value::as_array)
+                .map(|rules| {
+                    rules
+                        .iter()
+                        .map(|rule| compact_waf_rule(rule, include_raw))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let enabled_rules = rules
+                .iter()
+                .filter(|rule| rule.get("enabled").and_then(Value::as_bool).unwrap_or(true))
+                .count();
+            let disabled_rules = rules.len().saturating_sub(enabled_rules);
+            let mut payload = json!({
+                "ok": true,
+                "scope": target.scope,
+                "phase": phase,
+                "path": path,
+                "ruleset": {
+                    "id": result.get("id").cloned().unwrap_or(Value::Null),
+                    "name": result.get("name").cloned().unwrap_or(Value::Null),
+                    "kind": result.get("kind").cloned().unwrap_or(Value::Null),
+                    "version": result.get("version").cloned().unwrap_or(Value::Null),
+                    "last_updated": result.get("last_updated").cloned().unwrap_or(Value::Null),
+                    "rule_count": rules.len(),
+                    "enabled_rule_count": enabled_rules,
+                    "disabled_rule_count": disabled_rules,
+                },
+            });
+            if include_rules {
+                payload["rules"] = Value::Array(rules);
+            }
+            if include_raw {
+                payload["raw"] = result;
+            }
+            payload
+        }
+        Err(err) => json!({
+            "ok": false,
+            "scope": target.scope,
+            "phase": phase,
+            "path": path,
+            "error": err.payload(),
+        }),
+    }
+}
+
+fn compact_waf_rule(rule: &Value, include_raw: bool) -> Value {
+    let mut payload = json!({
+        "id": rule.get("id").cloned().unwrap_or(Value::Null),
+        "version": rule.get("version").cloned().unwrap_or(Value::Null),
+        "description": rule.get("description").cloned().unwrap_or(Value::Null),
+        "action": rule.get("action").cloned().unwrap_or(Value::Null),
+        "enabled": rule.get("enabled").cloned().unwrap_or(json!(true)),
+        "expression": rule.get("expression").cloned().unwrap_or(Value::Null),
+        "ref": rule.get("ref").cloned().unwrap_or(Value::Null),
+        "categories": rule.get("categories").cloned().unwrap_or(Value::Null),
+        "last_updated": rule.get("last_updated").cloned().unwrap_or(Value::Null),
+    });
+    if let Some(action_parameters) = rule.get("action_parameters") {
+        payload["action_parameters"] = summarize_waf_action_parameters(action_parameters);
+    }
+    if let Some(overrides) = rule.get("overrides") {
+        payload["overrides"] = overrides.clone();
+    }
+    if include_raw {
+        payload["raw"] = rule.clone();
+    }
+    payload
+}
+
+fn summarize_waf_action_parameters(value: &Value) -> Value {
+    let Some(object) = value.as_object() else {
+        return value.clone();
+    };
+    json!({
+        "id": object.get("id").cloned().unwrap_or(Value::Null),
+        "version": object.get("version").cloned().unwrap_or(Value::Null),
+        "ruleset": object.get("ruleset").cloned().unwrap_or(Value::Null),
+        "products": object.get("products").cloned().unwrap_or(Value::Null),
+        "phases": object.get("phases").cloned().unwrap_or(Value::Null),
+        "overrides": object.get("overrides").cloned().unwrap_or(Value::Null),
+    })
+}
+
+fn find_waf_rules(ruleset: &Value, rule_id: &str, phase: &str, include_raw: bool) -> Vec<Value> {
+    ruleset
+        .get("rules")
+        .and_then(Value::as_array)
+        .map(|rules| {
+            rules
+                .iter()
+                .filter(|rule| {
+                    rule.get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| value == rule_id)
+                        || rule
+                            .get("ref")
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| value == rule_id)
+                })
+                .map(|rule| {
+                    let mut compact = compact_waf_rule(rule, include_raw);
+                    compact["phase"] = json!(phase);
+                    compact["ruleset_id"] = ruleset.get("id").cloned().unwrap_or(Value::Null);
+                    compact["ruleset_name"] = ruleset.get("name").cloned().unwrap_or(Value::Null);
+                    compact
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn waf_security_events_projection(result: &Value) -> Value {
+    let Some(zone) = result
+        .pointer("/data/viewer/zones/0")
+        .and_then(Value::as_object)
+    else {
+        return json!({
+            "zones_returned": 0,
+            "groups": {},
+            "samples": [],
+        });
+    };
+    let mut groups = Map::new();
+    for (key, value) in zone {
+        if key.starts_with("by") {
+            groups.insert(key.clone(), value.clone());
+        }
+    }
+    json!({
+        "zones_returned": result
+            .pointer("/data/viewer/zones")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len),
+        "settings": zone.get("settings").cloned().unwrap_or(Value::Null),
+        "groups": groups,
+        "samples": zone.get("samples").cloned().unwrap_or_else(|| json!([])),
+    })
+}
+
+fn waf_source_notes() -> Value {
+    json!({
+        "kind": "cloudflare_waf_rulesets_and_security_events",
+        "ruleset_phases": DEFAULT_WAF_PHASES,
+        "rulesets_reference": "https://developers.cloudflare.com/ruleset-engine/reference/phases-list/",
+        "analytics_dataset": "firewallEventsAdaptive",
+        "analytics_reference": "https://developers.cloudflare.com/waf/analytics/security-events/",
+        "notes": [
+            "WAF custom, managed, and rate limiting rules are Ruleset Engine phases.",
+            "Security Events are individual events; one HTTP request can trigger more than one security event.",
+            "Cloudflare may sample Security Events; use narrower windows when investigating spikes."
+        ],
+    })
+}
+
+fn graphql_document_has_forbidden_operation(query: &str) -> bool {
+    let bytes = query.as_bytes();
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        match bytes[offset] {
+            b'#' => {
+                offset += 1;
+                while offset < bytes.len() && bytes[offset] != b'\n' {
+                    offset += 1;
+                }
+            }
+            b'"' => {
+                offset = skip_graphql_string(query, offset);
+            }
+            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+                let start = offset;
+                offset += 1;
+                while offset < bytes.len()
+                    && (bytes[offset].is_ascii_alphanumeric() || bytes[offset] == b'_')
+                {
+                    offset += 1;
+                }
+                let token = &query[start..offset];
+                if token.eq_ignore_ascii_case("mutation")
+                    || token.eq_ignore_ascii_case("subscription")
+                {
+                    return true;
+                }
+            }
+            _ => offset += 1,
+        }
+    }
+    false
+}
+
+fn skip_graphql_string(query: &str, start: usize) -> usize {
+    let bytes = query.as_bytes();
+    if bytes
+        .get(start..start.saturating_add(3))
+        .is_some_and(|prefix| prefix == b"\"\"\"")
+    {
+        let mut offset = start + 3;
+        while offset + 2 < bytes.len() {
+            if &bytes[offset..offset + 3] == b"\"\"\"" {
+                return offset + 3;
+            }
+            offset += 1;
+        }
+        return bytes.len();
+    }
+
+    let mut offset = start + 1;
+    while offset < bytes.len() {
+        match bytes[offset] {
+            b'\\' => offset = offset.saturating_add(2),
+            b'"' => return offset + 1,
+            _ => offset += 1,
+        }
+    }
+    bytes.len()
 }
 
 fn api_catalog_error_result(err: ApiCatalogError) -> CallToolResult {
@@ -6594,6 +8535,13 @@ fn invalid_argument_result(
             "message": message.into(),
             "hint": hint,
         }
+    }))
+}
+
+fn worker_upload_error_result(err: WorkerUploadError) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "error": err.payload(),
     }))
 }
 
@@ -6921,6 +8869,46 @@ fn worker_binding_presence(bindings: Option<&[Value]>, binding_name: &str) -> Va
     verify_worker_binding(bindings, &expectation)
 }
 
+fn verify_worker_upload_readback(
+    upload_summary: &Value,
+    readback: &crate::cloudflare::model::WorkerSettings,
+) -> Value {
+    let expected_main_module = upload_summary
+        .get("main_module")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let Some(expected_main_module) = expected_main_module else {
+        return json!({
+            "matched": true,
+            "code": "workers.upload_readback_not_applicable",
+            "message": "upload summary did not declare a main module, so module readback verification was skipped",
+        });
+    };
+
+    match readback.main_module.as_deref().map(str::trim) {
+        Some(observed) if observed == expected_main_module => json!({
+            "matched": true,
+            "code": "workers.upload_main_module_matched",
+            "main_module": expected_main_module,
+        }),
+        Some(observed) if !observed.is_empty() => json!({
+            "matched": false,
+            "code": "workers.upload_main_module_mismatch",
+            "expected_main_module": expected_main_module,
+            "observed_main_module": observed,
+            "message": "Worker settings readback reported a different main_module than the upload request",
+        }),
+        _ => json!({
+            "matched": false,
+            "code": "workers.upload_main_module_absent",
+            "expected_main_module": expected_main_module,
+            "message": "Worker settings readback did not include main_module",
+        }),
+    }
+}
+
 fn is_pages_generated_worker_settings_error(err: &crate::cloudflare::AdapterError) -> bool {
     let message = err
         .cloudflare_api_error_message()
@@ -7090,8 +9078,22 @@ fn workers_observability_timeframe(
     }
 }
 
-fn workers_observability_script_filter(script_name: Option<&str>) -> Vec<Value> {
-    script_name
+fn workers_observability_datasets(datasets: &[String]) -> Vec<Value> {
+    let datasets = datasets
+        .iter()
+        .map(|dataset| dataset.trim())
+        .filter(|dataset| !dataset.is_empty())
+        .map(|dataset| Value::String(dataset.to_string()))
+        .collect::<Vec<_>>();
+    if datasets.is_empty() {
+        vec![json!("workers")]
+    } else {
+        datasets
+    }
+}
+
+fn workers_observability_filters(script_name: Option<&str>, filters: &[Value]) -> Vec<Value> {
+    let mut all_filters = script_name
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(|script_name| {
@@ -7102,65 +9104,119 @@ fn workers_observability_script_filter(script_name: Option<&str>) -> Vec<Value> 
                 "value": script_name,
             })]
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    all_filters.extend(filters.iter().cloned());
+    all_filters
 }
 
 fn workers_observability_query_body(
-    script_name: &str,
+    script_name: Option<&str>,
+    datasets: &[String],
+    filters: &[Value],
     limit: u32,
     timeframe: Value,
     query_id: Option<&str>,
+    dry: bool,
+    view: Option<&str>,
+    needle: Option<Value>,
 ) -> Value {
-    if let Some(query_id) = query_id.map(str::trim).filter(|value| !value.is_empty()) {
-        return json!({
-            "queryId": query_id,
-            "timeframe": timeframe,
-        });
+    let query_id = query_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("mcp-workers-observability-events");
+    let mut parameters = Map::new();
+    parameters.insert(
+        "datasets".to_string(),
+        Value::Array(workers_observability_datasets(datasets)),
+    );
+    parameters.insert(
+        "filters".to_string(),
+        Value::Array(workers_observability_filters(script_name, filters)),
+    );
+    parameters.insert("filterCombination".to_string(), json!("and"));
+    parameters.insert("limit".to_string(), json!(limit.min(1000)));
+    parameters.insert(
+        "view".to_string(),
+        json!(
+            view.map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("events")
+        ),
+    );
+    if let Some(needle) = needle {
+        parameters.insert("needle".to_string(), needle);
     }
 
     json!({
+        "queryId": query_id,
         "timeframe": timeframe,
-        "query": {
-            "adhoc": true,
-            "name": "MCP Workers events",
-            "parameters": {
-                "datasets": ["workers"],
-                "filters": workers_observability_script_filter(Some(script_name)),
-                "filter_combination": "and",
-                "limit": limit.min(100),
-            },
-        },
+        "dry": dry,
+        "limit": limit.min(1000),
+        "parameters": parameters,
     })
 }
 
 fn workers_observability_discovery_body(
     script_name: Option<&str>,
+    datasets: &[String],
+    filters: &[Value],
     limit: u32,
     timeframe: Value,
+    needle: Option<Value>,
+    key_needle: Option<Value>,
 ) -> Value {
-    json!({
-        "timeframe": timeframe,
-        "filters": workers_observability_script_filter(script_name),
-        "filter_combination": "and",
-        "limit": limit,
-    })
+    let mut body = Map::new();
+    body.insert(
+        "datasets".to_string(),
+        Value::Array(workers_observability_datasets(datasets)),
+    );
+    body.insert(
+        "filters".to_string(),
+        Value::Array(workers_observability_filters(script_name, filters)),
+    );
+    body.insert("limit".to_string(), json!(limit));
+    if let Some(from) = timeframe.get("from").cloned() {
+        body.insert("from".to_string(), from);
+    }
+    if let Some(to) = timeframe.get("to").cloned() {
+        body.insert("to".to_string(), to);
+    }
+    if let Some(needle) = needle {
+        body.insert("needle".to_string(), needle);
+    }
+    if let Some(key_needle) = key_needle {
+        body.insert("keyNeedle".to_string(), key_needle);
+    }
+    Value::Object(body)
 }
 
 fn workers_observability_values_body(
     key: &str,
     value_type: &str,
     script_name: Option<&str>,
+    datasets: &[String],
+    filters: &[Value],
     limit: u32,
     timeframe: Value,
+    needle: Option<Value>,
 ) -> Value {
-    json!({
-        "key": key,
-        "type": value_type,
-        "timeframe": timeframe,
-        "filters": workers_observability_script_filter(script_name),
-        "filter_combination": "and",
-        "limit": limit,
-    })
+    let mut body = Map::new();
+    body.insert("key".to_string(), json!(key));
+    body.insert("type".to_string(), json!(value_type));
+    body.insert("timeframe".to_string(), timeframe);
+    body.insert(
+        "datasets".to_string(),
+        Value::Array(workers_observability_datasets(datasets)),
+    );
+    body.insert(
+        "filters".to_string(),
+        Value::Array(workers_observability_filters(script_name, filters)),
+    );
+    body.insert("limit".to_string(), json!(limit));
+    if let Some(needle) = needle {
+        body.insert("needle".to_string(), needle);
+    }
+    Value::Object(body)
 }
 
 fn missing_path_params(
@@ -7169,8 +9225,7 @@ fn missing_path_params(
     default_account_id: Option<&str>,
     default_zone_id: Option<&str>,
 ) -> Vec<String> {
-    operation
-        .path_params
+    path_parameter_names(operation)
         .iter()
         .filter(|name| {
             path_params
@@ -8147,14 +10202,22 @@ fn d1_sqlite_auth_result(err: crate::cloudflare::AdapterError) -> CallToolResult
 }
 
 fn is_d1_no_such_column_error(err: &crate::cloudflare::AdapterError) -> bool {
-    fn message_matches(message: &str) -> bool {
-        message.to_ascii_lowercase().contains("no such column")
+    d1_error_message_matches(err, "no such column")
+}
+
+fn is_d1_no_such_table_error(err: &crate::cloudflare::AdapterError) -> bool {
+    d1_error_message_matches(err, "no such table")
+}
+
+fn d1_error_message_matches(err: &crate::cloudflare::AdapterError, needle: &str) -> bool {
+    fn message_matches(message: &str, needle: &str) -> bool {
+        message.to_ascii_lowercase().contains(needle)
     }
 
-    message_matches(&err.message)
+    message_matches(&err.message, needle)
         || err
             .cloudflare_api_error_message()
-            .is_some_and(message_matches)
+            .is_some_and(|message| message_matches(message, needle))
 }
 
 fn d1_no_such_column_result(
@@ -8180,6 +10243,34 @@ fn d1_no_such_column_result(
             {
                 "tool": "d1_inspect_schema",
                 "why": "Use include_tables or include_table_pattern to inspect only the suspected table or view."
+            }
+        ],
+    }))
+}
+
+fn d1_no_such_table_result(
+    err: crate::cloudflare::AdapterError,
+    database_id: &str,
+) -> CallToolResult {
+    let payload = err.payload();
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "database_id": database_id,
+        "error": {
+            "code": "d1.no_such_table",
+            "message": payload.message,
+            "hint": "Validate the specific SQL with d1_validate_query, or inspect the database with d1_inspect_schema include_tables/include_table_pattern for the expected application table or view.",
+            "retryable": false,
+            "status": payload.status,
+        },
+        "recommended_next_steps": [
+            {
+                "tool": "d1_validate_query",
+                "why": "Checks the exact SQL against application tables and columns without executing the user query."
+            },
+            {
+                "tool": "d1_inspect_schema",
+                "why": "Confirm the expected table or view exists before retrying the query."
             }
         ],
     }))
@@ -8523,7 +10614,7 @@ mod tests {
 
     use axum::extract::{Path, Query, State};
     use axum::http::{HeaderMap, Request, StatusCode};
-    use axum::routing::get;
+    use axum::routing::{get, post};
     use axum::{Json, Router};
     use mcp_toolkit_auth::AuthContext;
     use mcp_toolkit_core::notifications::ToolListTracker;
@@ -8538,16 +10629,19 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{
-        AccountApiTokensArgs, AnalyticsEngineListDatasetsArgs, AnalyticsEngineQueryArgs,
+        AccountApiTokenPermissionPlanArgs, AccountApiTokensArgs, AccountBillingUsageArgs,
+        AnalyticsEngineListDatasetsArgs, AnalyticsEngineQueryArgs,
         AnalyticsEngineValidateQueryArgs, ApiFindOperationsArgs, ApiMutateArgs, ApiPrepareCallArgs,
         ApiReadArgs, ApplyAccessAllowlistArgs, BindingsDiscoverArgs, CloudflareMcp,
         ConnectorControlArgs, D1ApplyMigrationsArgs, D1InspectSchemaArgs, D1ListDatabasesArgs,
         D1QueryArgs, D1ValidateQueryArgs, EmergencyUnpublishArgs, EnsureTunnelArgs, FindToolsArgs,
-        GenerateTunnelIngressArgs, LockFirstPublishArgs, PagesDeploymentActionArgs,
-        PagesUpdateProjectArgs, PatchWorkerSettingsArgs, PortalAgentRequestArgs, QueueHealthArgs,
-        UpsertAccessAppArgs, UpsertDnsCnameArgs, VerifyHttpGateArgs,
+        GenerateTunnelIngressArgs, GraphqlAnalyticsQueryArgs, LockFirstPublishArgs,
+        PagesDeploymentActionArgs, PagesUpdateProjectArgs, PatchWorkerSettingsArgs,
+        PortalAgentRequestArgs, QueueHealthArgs, UpsertAccessAppArgs, UpsertDnsCnameArgs,
+        VerifyHttpGateArgs, WafEventFilterInput, WafTimeWindow, WorkersObservabilityListKeysArgs,
         WorkersObservabilityListValuesArgs, WorkersObservabilityQueryEventsArgs,
-        WorkersObservabilityTimeframe,
+        WorkersObservabilityTimeframe, build_waf_security_events_query, normalize_waf_group_by,
+        normalize_waf_phases, query_mentions_waf, waf_security_events_filter,
     };
     use crate::cloudflare::CloudflareClient;
     use crate::config::PortalAgentConfig;
@@ -8701,6 +10795,103 @@ mod tests {
 
         assert_eq!(result["matched"], json!(true));
         assert_eq!(result["code"], json!("workers.binding_matched"));
+    }
+
+    #[test]
+    fn worker_upload_readback_verification_detects_main_module_mismatch() {
+        let readback = serde_json::from_value(json!({
+            "main_module": "unexpected.js",
+            "bindings": []
+        }))
+        .expect("worker settings");
+        let result =
+            super::verify_worker_upload_readback(&json!({"main_module": "worker.js"}), &readback);
+
+        assert_eq!(result["matched"], json!(false));
+        assert_eq!(result["code"], json!("workers.upload_main_module_mismatch"));
+        assert_eq!(result["expected_main_module"], json!("worker.js"));
+        assert_eq!(result["observed_main_module"], json!("unexpected.js"));
+    }
+
+    #[test]
+    fn waf_phase_aliases_default_to_operator_phases() {
+        assert_eq!(
+            normalize_waf_phases(&[]).expect("default phases"),
+            vec![
+                "http_request_firewall_custom",
+                "http_request_firewall_managed",
+                "http_ratelimit"
+            ]
+        );
+        assert_eq!(
+            normalize_waf_phases(&[
+                "custom".to_string(),
+                "managed".to_string(),
+                "rate-limit".to_string(),
+                "custom".to_string(),
+            ])
+            .expect("phase aliases"),
+            vec![
+                "http_request_firewall_custom",
+                "http_request_firewall_managed",
+                "http_ratelimit"
+            ]
+        );
+        assert!(normalize_waf_phases(&["cache".to_string()]).is_err());
+    }
+
+    #[test]
+    fn waf_group_by_normalizes_dashboard_language() {
+        assert_eq!(
+            normalize_waf_group_by(&["hostname".to_string(), "client-ip".to_string()])
+                .expect("group aliases"),
+            vec!["host", "ip"]
+        );
+        assert!(normalize_waf_group_by(&["colo".to_string()]).is_err());
+    }
+
+    #[test]
+    fn waf_security_events_query_uses_firewall_events_dataset() {
+        let group_by = normalize_waf_group_by(&[
+            "action".to_string(),
+            "source".to_string(),
+            "rule".to_string(),
+        ])
+        .expect("group_by");
+        let query = build_waf_security_events_query(&group_by, 20, 5);
+        assert!(query.contains("firewallEventsAdaptiveGroups"));
+        assert!(query.contains("firewallEventsAdaptive"));
+        assert!(query.contains("ruleId"));
+        let filter = waf_security_events_filter(
+            &WafTimeWindow {
+                start: "2026-06-04T00:00:00Z".to_string(),
+                end: "2026-06-04T01:00:00Z".to_string(),
+                window_hours: 1,
+            },
+            WafEventFilterInput {
+                action: Some("block"),
+                source: Some("waf"),
+                host: Some("example.com"),
+                path: Some("/admin"),
+                client_ip: Some("203.0.113.10"),
+                rule_id: Some("rule-1"),
+            },
+        );
+        assert_eq!(filter["datetime_geq"], json!("2026-06-04T00:00:00Z"));
+        assert_eq!(filter["action"], json!("block"));
+        assert_eq!(filter["clientRequestHTTPHost"], json!("example.com"));
+        assert_eq!(filter["ruleId"], json!("rule-1"));
+    }
+
+    #[test]
+    fn waf_discovery_phrase_is_boosted() {
+        assert!(query_mentions_waf(Some(
+            "what WAF rule blocked this request security events analytics"
+        )));
+        assert!(query_mentions_waf(Some(
+            "firewallEventsAdaptive top blocked request"
+        )));
+        assert!(!query_mentions_waf(Some("d1 rows written")));
     }
 
     #[tokio::test]
@@ -8985,6 +11176,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn find_tools_returns_worker_upload_for_deploy_phrasing() {
+        let server = test_server("http://127.0.0.1:9".to_string());
+        let result = server
+            .cloudflare_find_tools(Parameters(FindToolsArgs {
+                query: Some("deploy upload worker script module".to_string()),
+                group: Some("workers".to_string()),
+                read_only: Some(false),
+                limit: Some(10),
+                include_schema: true,
+            }))
+            .await
+            .expect("find tools");
+        let payload = result.structured_content.expect("payload");
+        assert_eq!(payload["ok"], json!(true));
+        assert!(
+            payload["openai_allowed_tools"]
+                .as_array()
+                .expect("allowed tools")
+                .iter()
+                .any(|tool| tool == "workers_upload_script")
+        );
+        assert!(payload["schemas"]["workers_upload_script"].is_object());
+    }
+
+    #[tokio::test]
     async fn find_tools_returns_api_operations_for_deferred_loading() {
         let server = test_server("http://127.0.0.1:9".to_string());
         let result = server
@@ -9016,7 +11232,47 @@ mod tests {
                 .iter()
                 .any(|tool| tool == "api_mutate")
         );
+        assert!(
+            payload["openai_allowed_tools"]
+                .as_array()
+                .expect("allowed tools")
+                .iter()
+                .any(|tool| tool == "api_prepare_call")
+        );
         assert!(payload["schemas"]["api_mutate"].is_object());
+        assert!(payload["schemas"]["api_prepare_call"].is_object());
+        assert_eq!(
+            payload["openai_deferred_loading"]["recommended_model"],
+            json!("gpt-5.5")
+        );
+        assert_eq!(
+            payload["openai_deferred_loading"]["tool_search"]["type"],
+            json!("tool_search")
+        );
+    }
+
+    #[tokio::test]
+    async fn find_tools_returns_usage_investigation_tools() {
+        let server = test_server("http://127.0.0.1:9".to_string());
+        let result = server
+            .cloudflare_find_tools(Parameters(FindToolsArgs {
+                query: Some("billing usage d1 rows written spike graph".to_string()),
+                group: None,
+                read_only: Some(true),
+                limit: Some(20),
+                include_schema: true,
+            }))
+            .await
+            .expect("find tools");
+        let payload = result.structured_content.expect("payload");
+        let allowed = payload["openai_allowed_tools"]
+            .as_array()
+            .expect("allowed tools");
+
+        assert!(allowed.iter().any(|tool| tool == "account_billing_usage"));
+        assert!(allowed.iter().any(|tool| tool == "graphql_analytics_query"));
+        assert!(payload["schemas"]["account_billing_usage"].is_object());
+        assert!(payload["schemas"]["graphql_analytics_query"].is_object());
     }
 
     #[tokio::test]
@@ -9248,6 +11504,141 @@ mod tests {
                 .expect("token")
                 .starts_with("cf-api-")
         );
+    }
+
+    #[tokio::test]
+    async fn account_api_token_permission_plan_preserves_existing_permissions() {
+        async fn token_details() -> Json<Value> {
+            Json(json!({
+                "success": true,
+                "result": {
+                    "id": "token-1",
+                    "name": "deploy-token",
+                    "condition": {"request_ip": {"in": ["203.0.113.10"]}},
+                    "policies": [{
+                        "effect": "allow",
+                        "resources": {"com.cloudflare.api.account.acct-1": "*"},
+                        "permission_groups": [
+                            {"id": "perm-d1-read", "name": "D1 Read"},
+                            {"id": "perm-account-analytics-read", "name": "Account Analytics Read"}
+                        ]
+                    }],
+                    "status": "active",
+                    "modified_on": "2026-06-04T00:00:00Z"
+                }
+            }))
+        }
+
+        async fn permission_groups() -> Json<Value> {
+            Json(json!({
+                "success": true,
+                "result": [
+                    {"id": "perm-d1-read", "name": "D1 Read"},
+                    {"id": "perm-account-analytics-read", "name": "Account Analytics Read"},
+                    {"id": "perm-workers-scripts-edit", "name": "Workers Scripts Edit", "scopes": ["com.cloudflare.api.account.zone.worker.script.edit"]}
+                ]
+            }))
+        }
+
+        let router = Router::new()
+            .route("/accounts/acct-1/tokens/token-1", get(token_details))
+            .route(
+                "/accounts/acct-1/tokens/permission_groups",
+                get(permission_groups),
+            );
+        let server = test_server(spawn_router(router).await);
+
+        let result = server
+            .cloudflare_account_api_token_permission_plan(Parameters(
+                AccountApiTokenPermissionPlanArgs {
+                    account_id: Some("acct-1".to_string()),
+                    token_id: Some("token-1".to_string()),
+                    policy_index: None,
+                    add_permissions: vec!["Workers Scripts Edit".to_string()],
+                    remove_permissions: vec!["Account Analytics Read".to_string()],
+                    current_token: None,
+                    permission_groups: None,
+                    include_catalog: false,
+                    reason: Some("add worker upload permission".to_string()),
+                    max_bytes: None,
+                },
+            ))
+            .await
+            .expect("permission plan");
+
+        assert_eq!(result.is_error, Some(false));
+        let payload = result.structured_content.expect("payload");
+        assert_eq!(payload["ok"], json!(true));
+        assert_eq!(
+            payload["delta"]["permissions_to_add"][0]["id"],
+            json!("perm-workers-scripts-edit")
+        );
+        assert_eq!(
+            payload["delta"]["permissions_to_remove"][0]["id"],
+            json!("perm-account-analytics-read")
+        );
+        assert_eq!(
+            payload["update_body"]["condition"]["request_ip"]["in"][0],
+            json!("203.0.113.10")
+        );
+        assert_eq!(
+            payload["update_body"]["policies"][0]["permission_groups"],
+            json!([
+                {"id": "perm-d1-read"},
+                {"id": "perm-workers-scripts-edit"}
+            ])
+        );
+        assert_eq!(payload["next_call"]["arguments"]["action"], json!("update"));
+        assert_eq!(payload["next_call"]["arguments"]["dry_run"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn account_api_token_permission_plan_requires_policy_index_for_multiple_policies() {
+        let server = test_server("http://127.0.0.1:9".to_string());
+
+        let result = server
+            .cloudflare_account_api_token_permission_plan(Parameters(
+                AccountApiTokenPermissionPlanArgs {
+                    account_id: Some("acct-1".to_string()),
+                    token_id: Some("token-1".to_string()),
+                    policy_index: None,
+                    add_permissions: vec!["Workers Scripts Edit".to_string()],
+                    remove_permissions: Vec::new(),
+                    current_token: Some(json!({
+                        "id": "token-1",
+                        "name": "deploy-token",
+                        "policies": [
+                            {
+                                "effect": "allow",
+                                "resources": {"com.cloudflare.api.account.acct-1": "*"},
+                                "permission_groups": [{"id": "perm-d1-read", "name": "D1 Read"}]
+                            },
+                            {
+                                "effect": "allow",
+                                "resources": {"com.cloudflare.api.account.acct-2": "*"},
+                                "permission_groups": [{"id": "perm-d1-read", "name": "D1 Read"}]
+                            }
+                        ]
+                    })),
+                    permission_groups: Some(json!([
+                        {"id": "perm-d1-read", "name": "D1 Read"},
+                        {"id": "perm-workers-scripts-edit", "name": "Workers Scripts Edit"}
+                    ])),
+                    include_catalog: false,
+                    reason: None,
+                    max_bytes: None,
+                },
+            ))
+            .await
+            .expect("permission plan");
+
+        assert_eq!(result.is_error, Some(true));
+        let payload = result.structured_content.expect("payload");
+        assert_eq!(
+            payload["error"]["code"],
+            json!("account_api_token_permission_plan.ambiguous_policy")
+        );
+        assert_eq!(payload["policy_summaries"].as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -9701,6 +12092,184 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_read_derives_catalog_path_template_params_for_paygo_usage() {
+        async fn paygo_usage(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
+            Json(json!({
+                "success": true,
+                "errors": [],
+                "messages": [],
+                "result": [{
+                    "ServiceName": "D1",
+                    "ConsumedQuantity": 42,
+                    "ConsumedUnit": "rows",
+                    "ChargePeriodStart": query.get("from").cloned().unwrap_or_default(),
+                    "ChargePeriodEnd": query.get("to").cloned().unwrap_or_default()
+                }]
+            }))
+        }
+
+        let router = Router::new().route("/accounts/acct-1/paygo-usage", get(paygo_usage));
+        let server = test_server(spawn_router(router).await);
+        let result = server
+            .cloudflare_api_read(Parameters(ApiReadArgs {
+                operation_id: "billable-usage-get-paygo-account-usage".to_string(),
+                path_params: BTreeMap::new(),
+                query: BTreeMap::from([
+                    ("from".to_string(), json!("2026-06-01T00:00:00Z")),
+                    ("to".to_string(), json!("2026-06-02T00:00:00Z")),
+                ]),
+                max_bytes: Some(20_000),
+            }))
+            .await
+            .expect("api read");
+        let payload = result.structured_content.expect("payload");
+
+        assert_eq!(payload["ok"], json!(true), "{payload}");
+        assert_eq!(
+            payload["api_operation"]["rendered_path"],
+            json!("/accounts/acct-1/paygo-usage")
+        );
+        assert_eq!(payload["result"][0]["ServiceName"], json!("D1"));
+    }
+
+    #[tokio::test]
+    async fn account_billing_usage_reads_current_paygo_endpoint() {
+        async fn paygo_usage(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
+            Json(json!({
+                "success": true,
+                "errors": [],
+                "messages": [],
+                "result": [{
+                    "ServiceName": "D1",
+                    "ConsumedQuantity": 12,
+                    "ChargePeriodStart": query.get("from").cloned().unwrap_or_default(),
+                    "ChargePeriodEnd": query.get("to").cloned().unwrap_or_default()
+                }]
+            }))
+        }
+
+        let router = Router::new().route("/accounts/acct-1/paygo-usage", get(paygo_usage));
+        let server = test_server(spawn_router(router).await);
+        let result = server
+            .cloudflare_account_billing_usage(Parameters(AccountBillingUsageArgs {
+                account_id: None,
+                mode: None,
+                from: Some("2026-06-01T00:00:00Z".to_string()),
+                to: Some("2026-06-02T00:00:00Z".to_string()),
+                metric: None,
+                max_bytes: Some(20_000),
+            }))
+            .await
+            .expect("billing usage");
+        let payload = result.structured_content.expect("payload");
+
+        assert_eq!(payload["ok"], json!(true), "{payload}");
+        assert_eq!(payload["mode"], json!("paygo"));
+        assert_eq!(payload["path"], json!("/accounts/acct-1/paygo-usage"));
+        assert_eq!(payload["result"][0]["ConsumedQuantity"], json!(12));
+    }
+
+    #[tokio::test]
+    async fn graphql_analytics_query_posts_raw_graphql_payload() {
+        #[derive(Clone)]
+        struct CallState {
+            body: Arc<Mutex<Option<Value>>>,
+        }
+
+        async fn graphql(State(state): State<CallState>, Json(body): Json<Value>) -> Json<Value> {
+            *state.body.lock().expect("body lock") = Some(body);
+            Json(json!({
+                "data": {
+                    "viewer": {
+                        "accounts": [{
+                            "d1AnalyticsAdaptiveGroups": [{
+                                "sum": {"rowsRead": 10, "rowsWritten": 4},
+                                "dimensions": {"date": "2026-06-02", "databaseId": "db-1"}
+                            }]
+                        }]
+                    }
+                }
+            }))
+        }
+
+        let state = CallState {
+            body: Arc::new(Mutex::new(None)),
+        };
+        let router = Router::new()
+            .route("/graphql", post(graphql))
+            .with_state(state.clone());
+        let server = test_server(spawn_router(router).await);
+        let result = server
+            .cloudflare_graphql_analytics_query(Parameters(GraphqlAnalyticsQueryArgs {
+                query: "query D1Usage($accountTag: string!) { viewer { accounts(filter: { accountTag: $accountTag }) { d1AnalyticsAdaptiveGroups(limit: 1) { sum { rowsRead rowsWritten } } } } }".to_string(),
+                variables: BTreeMap::from([("accountTag".to_string(), json!("acct-1"))]),
+                max_bytes: Some(20_000),
+            }))
+            .await
+            .expect("graphql query");
+        let payload = result.structured_content.expect("payload");
+
+        assert_eq!(payload["ok"], json!(true), "{payload}");
+        assert_eq!(
+            payload["result"]["data"]["viewer"]["accounts"][0]["d1AnalyticsAdaptiveGroups"][0]["sum"]
+                ["rowsWritten"],
+            json!(4)
+        );
+        let posted = state
+            .body
+            .lock()
+            .expect("body lock")
+            .clone()
+            .expect("posted body");
+        assert_eq!(posted["variables"]["accountTag"], json!("acct-1"));
+    }
+
+    #[tokio::test]
+    async fn graphql_analytics_query_rejects_mutations_before_http() {
+        let server = test_server("http://127.0.0.1:9".to_string());
+        let result = server
+            .cloudflare_graphql_analytics_query(Parameters(GraphqlAnalyticsQueryArgs {
+                query: "mutation { forbidden }".to_string(),
+                variables: BTreeMap::new(),
+                max_bytes: None,
+            }))
+            .await
+            .expect("graphql rejection");
+        let payload = result.structured_content.expect("payload");
+
+        assert_eq!(payload["ok"], json!(false), "{payload}");
+        assert_eq!(
+            payload["error"]["code"],
+            json!("graphql_analytics.not_read_only")
+        );
+    }
+
+    #[tokio::test]
+    async fn graphql_analytics_query_rejects_mutation_after_fragment() {
+        let server = test_server("http://127.0.0.1:9".to_string());
+        let result = server
+            .cloudflare_graphql_analytics_query(Parameters(GraphqlAnalyticsQueryArgs {
+                query: r#"
+                    # comments mentioning mutation are ignored
+                    fragment AccountFields on Account { accountTag }
+                    mutation HiddenWrite { forbidden }
+                "#
+                .to_string(),
+                variables: BTreeMap::new(),
+                max_bytes: None,
+            }))
+            .await
+            .expect("graphql rejection");
+        let payload = result.structured_content.expect("payload");
+
+        assert_eq!(payload["ok"], json!(false), "{payload}");
+        assert_eq!(
+            payload["error"]["code"],
+            json!("graphql_analytics.not_read_only")
+        );
+    }
+
+    #[tokio::test]
     async fn api_prepare_call_resolves_best_match_into_executor_arguments() {
         let server = test_server("http://127.0.0.1:9".to_string());
         let result = server
@@ -9727,6 +12296,14 @@ mod tests {
         assert_eq!(
             payload["call"]["arguments"]["operation_id"],
             json!("queues-get-metrics")
+        );
+        assert_eq!(
+            payload["resolved_path_params"],
+            json!({"account_id": "acct-1", "queue_id": "queue-1"})
+        );
+        assert_eq!(
+            payload["call"]["arguments"]["path_params"],
+            json!({"account_id": "acct-1", "queue_id": "queue-1"})
         );
         assert_eq!(
             payload["rendered_path"],
@@ -10448,6 +13025,47 @@ mod tests {
                 .unwrap()
                 .contains("include_tables")
         );
+        assert_eq!(
+            payload["recommended_next_steps"][0]["tool"],
+            json!("d1_validate_query")
+        );
+    }
+
+    #[tokio::test]
+    async fn d1_query_read_only_no_such_table_does_not_mask_as_sqlite_auth() {
+        async fn query_d1(Json(_body): Json<Value>) -> (StatusCode, Json<Value>) {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "success": false,
+                    "errors": [{"code": 7500, "message": "SQLITE_ERROR: no such table: missing_table"}],
+                    "messages": [],
+                    "result": null
+                })),
+            )
+        }
+
+        let router = Router::new().route(
+            "/accounts/acct-1/d1/database/db-1/query",
+            axum::routing::post(query_d1),
+        );
+        let server = test_server(spawn_router(router).await);
+
+        let result = server
+            .cloudflare_d1_query_read_only(Parameters(D1QueryArgs {
+                account_id: None,
+                database_id: "db-1".to_string(),
+                sql: "SELECT id FROM missing_table".to_string(),
+                params: vec![],
+                max_rows: None,
+            }))
+            .await
+            .expect("d1 query");
+
+        assert_eq!(result.is_error, Some(true));
+        let payload = result.structured_content.expect("payload");
+        assert_eq!(payload["ok"], json!(false));
+        assert_eq!(payload["error"]["code"], json!("d1.no_such_table"));
         assert_eq!(
             payload["recommended_next_steps"][0]["tool"],
             json!("d1_validate_query")
@@ -11401,10 +14019,13 @@ mod tests {
                     account_id: None,
                     key: "$workers.scriptName".to_string(),
                     script_name: Some("pages-worker".to_string()),
+                    datasets: Vec::new(),
+                    filters: Vec::new(),
                     limit: Some(50),
                     value_type: None,
                     timeframe: None,
                     lookback_minutes: Some(30),
+                    needle: None,
                 },
             ))
             .await
@@ -11416,12 +14037,76 @@ mod tests {
         assert_eq!(body["type"], json!("string"));
         assert!(body["timeframe"]["from"].is_number());
         assert!(body["timeframe"]["to"].is_number());
+        assert_eq!(body["datasets"], json!(["workers"]));
         assert_eq!(body["filters"][0]["key"], json!("$workers.scriptName"));
         assert_eq!(body["filters"][0]["value"], json!("pages-worker"));
     }
 
     #[tokio::test]
-    async fn workers_observability_query_events_builds_inline_timeframed_query() {
+    async fn workers_observability_list_keys_uses_top_level_time_bounds() {
+        #[derive(Clone)]
+        struct CallState {
+            body: Arc<Mutex<Option<Value>>>,
+        }
+
+        async fn keys(State(state): State<CallState>, Json(body): Json<Value>) -> Json<Value> {
+            *state.body.lock().expect("body lock") = Some(body);
+            Json(json!({
+                "success": true,
+                "errors": [],
+                "messages": [],
+                "result": [{"key": "$workers.scriptName", "type": "string"}]
+            }))
+        }
+
+        let state = CallState {
+            body: Arc::new(Mutex::new(None)),
+        };
+        let router = Router::new()
+            .route(
+                "/accounts/acct-1/workers/observability/telemetry/keys",
+                axum::routing::post(keys),
+            )
+            .with_state(state.clone());
+        let server = test_server(spawn_router(router).await);
+
+        let result = server
+            .cloudflare_workers_observability_list_keys(Parameters(
+                WorkersObservabilityListKeysArgs {
+                    account_id: None,
+                    script_name: Some("pages-worker".to_string()),
+                    datasets: vec!["workers".to_string()],
+                    filters: vec![json!({
+                        "key": "$metadata.request.method",
+                        "operation": "eq",
+                        "type": "string",
+                        "value": "GET",
+                    })],
+                    limit: Some(25),
+                    timeframe: Some(WorkersObservabilityTimeframe { from: 10, to: 20 }),
+                    lookback_minutes: None,
+                    needle: Some(json!({"value": "script"})),
+                    key_needle: Some(json!({"value": "$workers"})),
+                },
+            ))
+            .await
+            .expect("workers observability keys");
+
+        assert_eq!(result.is_error, Some(false));
+        let body = state.body.lock().expect("body lock").clone().unwrap();
+        assert_eq!(body["from"], json!(10));
+        assert_eq!(body["to"], json!(20));
+        assert!(body.get("timeframe").is_none());
+        assert_eq!(body["datasets"], json!(["workers"]));
+        assert_eq!(body["filters"][0]["value"], json!("pages-worker"));
+        assert_eq!(body["filters"][1]["key"], json!("$metadata.request.method"));
+        assert_eq!(body["needle"], json!({"value": "script"}));
+        assert_eq!(body["keyNeedle"], json!({"value": "$workers"}));
+        assert_eq!(body["limit"], json!(25));
+    }
+
+    #[tokio::test]
+    async fn workers_observability_query_events_builds_documented_timeframed_query() {
         #[derive(Clone)]
         struct CallState {
             body: Arc<Mutex<Option<Value>>>,
@@ -11452,11 +14137,16 @@ mod tests {
             .cloudflare_workers_observability_query_events(Parameters(
                 WorkersObservabilityQueryEventsArgs {
                     account_id: None,
-                    script_name: "pages-worker".to_string(),
+                    script_name: Some("pages-worker".to_string()),
+                    datasets: Vec::new(),
+                    filters: Vec::new(),
                     limit: Some(20),
                     timeframe: Some(WorkersObservabilityTimeframe { from: 1, to: 2 }),
                     lookback_minutes: None,
                     query_id: None,
+                    dry: None,
+                    view: None,
+                    needle: None,
                 },
             ))
             .await
@@ -11465,11 +14155,17 @@ mod tests {
         assert_eq!(result.is_error, Some(false));
         let body = state.body.lock().expect("body lock").clone().unwrap();
         assert_eq!(body["timeframe"], json!({"from": 1, "to": 2}));
+        assert_eq!(body["queryId"], json!("mcp-workers-observability-events"));
+        assert_eq!(body["dry"], json!(true));
+        assert_eq!(body["limit"], json!(20));
         assert_eq!(
-            body["query"]["parameters"]["filters"][0]["value"],
+            body["parameters"]["filters"][0]["value"],
             json!("pages-worker")
         );
-        assert_eq!(body["query"]["parameters"]["limit"], json!(20));
+        assert_eq!(body["parameters"]["datasets"], json!(["workers"]));
+        assert_eq!(body["parameters"]["filterCombination"], json!("and"));
+        assert_eq!(body["parameters"]["view"], json!("events"));
+        assert_eq!(body["parameters"]["limit"], json!(20));
     }
 
     #[tokio::test]
@@ -11737,6 +14433,47 @@ mod tests {
         assert_eq!(
             state.bodies.lock().expect("body lock").as_slice(),
             ["SHOW TABLES"]
+        );
+    }
+
+    #[tokio::test]
+    async fn analytics_engine_validate_query_treats_function_calls_as_functions_not_columns() {
+        async fn analytics(body: String) -> Json<Value> {
+            assert_eq!(body, "SHOW TABLES");
+            Json(json!({
+                "meta": [{"name": "name", "type": "String"}],
+                "data": [{"name": "WEB"}],
+                "rows": 1
+            }))
+        }
+
+        let router = Router::new().route(
+            "/accounts/acct-1/analytics_engine/sql",
+            axum::routing::post(analytics),
+        );
+        let server = test_server(spawn_router(router).await);
+
+        let result = server
+            .cloudflare_analytics_engine_validate_query(Parameters(
+                AnalyticsEngineValidateQueryArgs {
+                    account_id: None,
+                    sql: "SELECT coalesce(blob1, 'unknown') AS route, quantileExactWeighted(0.95)(double1, _sample_interval) AS p95 FROM WEB WHERE timestamp >= toDateTime('2026-01-01') GROUP BY route".to_string(),
+                    include_dataset_readback: true,
+                },
+            ))
+            .await
+            .expect("analytics validate");
+
+        let payload = result.structured_content.expect("payload");
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(payload["ok"], json!(true));
+        assert_eq!(
+            payload["validation"]["referenced_functions"],
+            json!(["coalesce", "quantileexactweighted", "todatetime"])
+        );
+        assert_eq!(
+            payload["validation"]["referenced_columns"],
+            json!(["_sample_interval", "blob1", "double1", "timestamp"])
         );
     }
 

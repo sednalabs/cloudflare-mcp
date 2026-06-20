@@ -48,6 +48,16 @@ When changing generic API parity behavior, update:
 - `../tests/mcp_stdio_smoke.rs` when behavior depends on MCP argument extraction,
   arbitrary JSON bodies, dry-run planning, or stdio context.
 
+Generic REST executor path parameters are derived from the URL template in
+addition to the compact catalog's `path_params` field. If a generated catalog
+entry omits a placeholder such as `{account_id}`, the executor must still render
+that placeholder from explicit arguments or configured defaults. Keep a stdio
+regression when fixing this class of catalog drift.
+
+Cloudflare Analytics GraphQL is not part of the REST catalog. Use the curated
+`graphql_analytics_query` tool for read-only `/client/v4/graphql` analytics
+queries and `account_billing_usage` for billing/usage REST records.
+
 Note on read-only mode:
 - `CLOUDFLARE_MCP_READ_ONLY=1` intentionally filters tool exposure at runtime.
 - The snapshot remains the canonical full tool contract; runtime policy decides which tools are visible/callable.
@@ -55,6 +65,9 @@ Note on read-only mode:
 Note on elicitation mode:
 - `CLOUDFLARE_MCP_ELICITATION_ENABLED=1` adds runtime approval gates for configured dangerous calls.
 - `account_api_tokens` and `api_mutate` are mandatory-gated when elicitation is enabled; token read actions bypass approval.
+- `account_api_token_permission_plan` is read-only and returns a safe
+  `account_api_tokens` update dry-run payload for permission deltas; it does
+  not mutate token scopes itself.
 - This does not change tool argument schemas; it changes pre-execution policy behavior.
 
 Preserved curated tool families:

@@ -1,6 +1,11 @@
-use mcp_toolkit_core::rmcp_models;
+use mcp_toolkit_core::{
+    openai_tool_search::{
+        OpenAiMcpServerTool, OpenAiMcpToolSearchConfig, OpenAiReadOnlyApprovalOverride,
+    },
+    rmcp_models,
+};
 use rmcp::model::{Annotated, RawResource, ReadResourceResult, Resource, ResourceContents};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::verification::{VerificationStatus, now_unix_ms};
 use mcp_toolkit_http::session::SessionStats;
@@ -10,6 +15,8 @@ const HELP_URI: &str = "cloudflare-mcp://help";
 const ADAPTER_URI: &str = "cloudflare-mcp://adapter-status";
 const API_PARITY_URI: &str = "cloudflare-mcp://api-parity-status";
 const OPENAI_TOOL_SEARCH_URI: &str = "cloudflare-mcp://openai/tool-search-config";
+const OPENAI_SERVER_DESCRIPTION: &str = "Self-hosted Cloudflare operator workflows: Tunnel, DNS, Access, Pages, D1, R2, Workers, Queues, WAF, Email Routing, cache, guarded publish, dry-run planning, approval gates, and readback verification.";
+const OPENAI_READ_ONLY_APPROVAL_NOTE: &str = "By default, OpenAI requests approval before sharing data with a remote MCP server. If this server and workflow are trusted, this read-only tool override can reduce approval friction while leaving mutating tools approval-gated.";
 
 const MIME_MARKDOWN: &str = "text/markdown";
 const MIME_JSON: &str = "application/json";
@@ -151,6 +158,11 @@ fn build_help_text() -> String {
         "- api_prepare_call",
         "- api_read",
         "- api_mutate",
+        "- account_billing_usage",
+        "- graphql_analytics_query",
+        "- waf_ruleset_summary",
+        "- waf_security_events_summary",
+        "- waf_rule_activity",
         "- list_tunnels",
         "- ensure_tunnel",
         "- generate_tunnel_ingress",
@@ -189,8 +201,11 @@ fn build_help_text() -> String {
         "- Override requires explicit flag and reason, and is surfaced in structured audit payloads.",
         "- All mutating tools support `dry_run=true` and emit deterministic `plan` payloads with zero side effects.",
         "- Broad cache purge/ruleset replacement require dry-run confirmation tokens before apply.",
-        "- OpenAI Responses API clients should combine MCP `defer_loading=true` with `{ \"type\": \"tool_search\" }`; non-hosted clients can call `find_tools`.",
+        "- OpenAI Responses API clients on GPT-5.4+ should combine MCP `defer_loading=true` with `{ \"type\": \"tool_search\" }`; use `gpt-5.5` for the current flagship model target.",
+        "- Hosted OpenAI `tool_search` is client-side; non-hosted clients can call `find_tools` to produce a narrow `allowed_tools` list and optional MCP schemas.",
         "- For REST API parity, search with `api_find_operations`, inspect with `api_get_operation`, prepare exact fallback payloads with `api_prepare_call`, use `api_read` for GET, and run `api_mutate` with `dry_run=true` before apply.",
+        "- For usage-spike investigations, use `account_billing_usage` for billing usage records and `graphql_analytics_query` for product analytics attribution such as D1 rows read/written.",
+        "- For WAF investigations, use `waf_ruleset_summary`, `waf_security_events_summary`, and `waf_rule_activity` before composing raw Rulesets or GraphQL calls.",
         "- High-risk generic API operations are denied by default; prefer curated workflow tools when `preferred_tool` is present.",
         "- Mutating tool responses include structured `audit` metadata with actor + correlation ids + typed outcome/error code.",
         "- Access allowlist mutations enforce replace/additive invariants with post-apply readback validation.",
@@ -205,51 +220,106 @@ fn build_help_text() -> String {
 }
 
 fn build_openai_tool_search_config() -> String {
-    serde_json::to_string_pretty(&json!({
-        "tools": [
-            {
-                "type": "mcp",
-                "server_label": "cloudflare",
-                "server_description": "Cloudflare Tunnel, DNS, Access, Workers, cache control, and guarded publish operations.",
-                "server_url": "https://<host>/mcp",
-                "defer_loading": true,
-                "require_approval": {
-                    "never": {
-                        "tool_names": [
-                            "health",
-                            "find_tools",
-                            "api_parity_status",
-                            "api_find_operations",
-                            "api_get_operation",
-                            "api_prepare_call",
-                            "api_read",
-                            "list_tunnels",
-                            "list_dns_records",
-                            "r2_get_object",
-                            "r2_inspect_object",
-                            "get_worker_settings",
-                            "cache_zone_setting",
-                            "cache_rules",
-                            "cache_reserve",
-                            "cache_tiered",
-                            "cache_variants",
-                            "verify_dns_route",
-                            "verify_http_gate"
-                        ]
-                    }
-                }
-            },
-            {
-                "type": "tool_search"
-            }
-        ],
-        "notes": [
-            "Hosted OpenAI tool_search is client-side; this server exposes stable tool descriptions and a find_tools helper.",
-            "Use api_find_operations/api_get_operation/api_prepare_call/api_read/api_mutate for broad Cloudflare REST API v4 parity.",
-            "Keep approval enabled for mutating cache tools unless another workflow-level review gate applies."
-        ]
-    }))
-    .unwrap_or_else(|_| "{}".to_string())
+    let read_only_auto_approval_tools = [
+        "health",
+        "find_tools",
+        "api_parity_status",
+        "api_find_operations",
+        "api_get_operation",
+        "api_prepare_call",
+        "api_read",
+        "account_billing_usage",
+        "graphql_analytics_query",
+        "waf_ruleset_summary",
+        "waf_security_events_summary",
+        "waf_rule_activity",
+        "account_api_token_permission_plan",
+        "list_tunnels",
+        "generate_tunnel_ingress",
+        "list_dns_records",
+        "list_workers",
+        "get_worker_settings",
+        "d1_list_databases",
+        "d1_get_database",
+        "d1_inspect_schema",
+        "d1_query_read_only",
+        "d1_validate_query",
+        "analytics_engine_query",
+        "analytics_engine_validate_query",
+        "analytics_engine_describe_schema",
+        "analytics_engine_list_datasets",
+        "capabilities_check",
+        "pages_list_projects",
+        "pages_get_project",
+        "pages_list_deployments",
+        "pages_get_deployment",
+        "pages_list_domains",
+        "pages_get_domain",
+        "r2_get_object",
+        "r2_inspect_object",
+        "verify_dns_route",
+        "list_access_apps",
+        "access_get_app",
+        "access_verify_hostname_gate",
+        "list_access_policies",
+        "queues_list",
+        "queues_get",
+        "queues_get_metrics",
+        "queues_list_consumers",
+        "queues_health",
+        "workers_list_scripts",
+        "workers_get_script_settings",
+        "workers_list_tails",
+        "workers_observability_query_events",
+        "workers_observability_list_keys",
+        "workers_observability_list_values",
+        "bindings_discover",
+        "email_routing_get_settings",
+        "email_routing_get_dns",
+        "email_routing_list_rules",
+        "email_routing_get_rule",
+        "email_routing_get_catch_all",
+        "email_routing_list_addresses",
+        "email_routing_get_address",
+        "bulk_redirects_list_lists",
+        "bulk_redirects_get_list",
+        "bulk_redirects_list_items",
+        "bulk_redirects_get_operation",
+        "bulk_redirects_get_ruleset",
+        "publish_preflight",
+        "verify_http_gate",
+    ];
+    let mcp_tool = OpenAiMcpServerTool::new(
+        "cloudflare",
+        OPENAI_SERVER_DESCRIPTION,
+        "https://<host>/mcp",
+    );
+    let mut config = OpenAiMcpToolSearchConfig::new(mcp_tool).with_notes([
+        "Hosted OpenAI tool_search is client-side; this server exposes stable MCP tool descriptions and a find_tools helper for non-hosted clients.",
+        "Keep the MCP server definition's server_label and server_description clear because the model sees those before individual deferred tool schemas are loaded.",
+        "Use find_tools.openai_allowed_tools as the allowed_tools value when manually narrowing a follow-up Responses request.",
+        "Use api_find_operations/api_get_operation/api_prepare_call/api_read/api_mutate for broad Cloudflare REST API v4 parity.",
+        "Use account_billing_usage for billing records and graphql_analytics_query for Cloudflare Analytics GraphQL attribution.",
+        "Use waf_ruleset_summary, waf_security_events_summary, and waf_rule_activity for WAF rules and Security Events triage.",
+        "Keep approval enabled for mutating tools unless another workflow-level review gate applies.",
+    ]);
+    if let Some(approval_override) =
+        OpenAiReadOnlyApprovalOverride::new(read_only_auto_approval_tools)
+    {
+        config = config.with_optional_trusted_read_only_approval_override(approval_override);
+    }
+
+    let mut payload = config.to_documentation_value();
+    if let Some(Value::Object(approval_override)) =
+        payload.get_mut("optional_trusted_read_only_approval_override")
+    {
+        approval_override.insert(
+            "use_only_after_review".to_string(),
+            json!(OPENAI_READ_ONLY_APPROVAL_NOTE),
+        );
+    }
+
+    serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
 }
 
 fn build_api_parity_status() -> String {
@@ -368,7 +438,7 @@ fn resource_for_text(
 mod tests {
     use serde_json::Value;
 
-    use super::{AdapterStatusView, build_adapter_status};
+    use super::{AdapterStatusView, build_adapter_status, build_openai_tool_search_config};
     use crate::verification::{VerificationState, VerificationStatus, now_unix_ms};
 
     #[test]
@@ -421,5 +491,40 @@ mod tests {
                 .expect("freshness")
                 >= 1000
         );
+    }
+
+    #[test]
+    fn openai_tool_search_config_uses_deferred_loading_and_safe_approval_default() {
+        let payload = build_openai_tool_search_config();
+        let parsed: Value = serde_json::from_str(&payload).expect("json");
+
+        assert_eq!(parsed["model"], Value::String("gpt-5.5".to_string()));
+        assert_eq!(
+            parsed["minimum_model_for_tool_search"],
+            Value::String("gpt-5.4".to_string())
+        );
+        assert_eq!(parsed["tools"][0]["type"], Value::String("mcp".to_string()));
+        assert_eq!(parsed["tools"][0]["defer_loading"], Value::Bool(true));
+        assert!(parsed["tools"][0]["require_approval"].is_null());
+        assert_eq!(
+            parsed["tools"][1]["type"],
+            Value::String("tool_search".to_string())
+        );
+        let server_description = parsed["tools"][0]["server_description"]
+            .as_str()
+            .expect("server description");
+        assert!(server_description.contains("D1"));
+        assert!(server_description.contains("WAF"));
+        assert!(server_description.contains("readback verification"));
+
+        let approved = parsed["optional_trusted_read_only_approval_override"]["require_approval"]
+            ["never"]["tool_names"]
+            .as_array()
+            .expect("read-only approval tools");
+        assert!(approved.iter().any(|tool| tool == "find_tools"));
+        assert!(approved.iter().any(|tool| tool == "api_prepare_call"));
+        assert!(!approved.iter().any(|tool| tool == "api_mutate"));
+        assert!(!approved.iter().any(|tool| tool == "cache_purge"));
+        assert!(!approved.iter().any(|tool| tool == "cache_zone_setting"));
     }
 }

@@ -8,7 +8,8 @@ requirements, use [CLIENT-CONTRACT.md](CLIENT-CONTRACT.md).
 Use these first when orienting a session:
 
 - `health`: runtime status and configured defaults.
-- `find_tools`: local tool search for deferred-loading clients.
+- `find_tools`: local tool search for non-hosted deferred-loading clients;
+  returns a narrow `openai_allowed_tools` list and optional MCP schemas.
 - `api_parity_status`: generic Cloudflare REST API catalog status.
 - `capabilities_check`: read-only Cloudflare capability probe.
 
@@ -77,6 +78,35 @@ Use curated D1 tools instead of generic API calls for database workflows:
 Read/query tools use restricted SQL checks. Write and migration tools preserve
 dry-run discipline and fail closed on unsafe or ambiguous state.
 
+For D1 usage-spike investigations, start with `account_billing_usage` to read
+Cloudflare billing usage records, then use `graphql_analytics_query` for
+Cloudflare Analytics GraphQL attribution such as `d1AnalyticsAdaptiveGroups` or
+`d1QueriesAdaptiveGroups`. Only inspect D1 table schemas after the analytics
+result narrows the database, query, or time window.
+
+## WAF and Security Events
+
+Use these before composing raw Rulesets API or GraphQL calls:
+
+- `waf_ruleset_summary`
+- `waf_security_events_summary`
+- `waf_rule_activity`
+
+`waf_ruleset_summary` reads the Ruleset Engine entrypoints for WAF custom
+rules, managed rules, and rate limiting rules. It accepts aliases such as
+`custom`, `managed`, and `ratelimit`, and returns compact rule IDs,
+descriptions, actions, enabled state, expressions, and deployment metadata.
+
+`waf_security_events_summary` runs a curated Cloudflare Analytics GraphQL query
+against the Security Events dataset, `firewallEventsAdaptive`, and returns
+grouped evidence plus recent samples. Security Events represent individual
+events, not unique HTTP requests, and Cloudflare may sample large windows; use
+narrower windows for spike triage.
+
+`waf_rule_activity` combines the two: it looks for a rule ID in current WAF
+Rulesets and queries recent Security Events for that rule. Use it for questions
+like "what rule blocked this path?" or "is this rule still firing?"
+
 ## Workers and Bindings
 
 Use these to inspect Workers, settings, bindings, and event telemetry:
@@ -85,12 +115,26 @@ Use these to inspect Workers, settings, bindings, and event telemetry:
 - `workers_list_scripts`
 - `get_worker_settings`
 - `workers_get_script_settings`
+- `workers_upload_script`
 - `patch_worker_settings`
 - `workers_list_tails`
 - `workers_observability_query_events`
 - `workers_observability_list_keys`
 - `workers_observability_list_values`
 - `bindings_discover`
+
+Workers Observability tools accept optional `script_name`, `datasets`, and
+`filters` so operators can start broad and narrow down without switching to raw
+API calls.
+
+Use `workers_upload_script` when the deploy boundary is the Worker script body
+itself. It accepts a single module file/content or a prebuilt multipart Worker
+bundle, returns a dry-run confirmation token, and summarizes script/metadata
+evidence with SHA-256 digests plus metadata keys rather than raw metadata
+values. Apply requires the dry-run token, reads back Worker settings, and
+reports `readback_verification`; module uploads fail closed when readback shows
+a different `main_module`. Use Wrangler only to generate a bundle when the
+project already documents that build path.
 
 Use `bindings_discover` to find D1, Queues, Worker, and Pages resources that
 may need to be wired into an application.
@@ -173,6 +217,15 @@ sensitive: run dry-run first and keep correlation IDs.
 `account_api_tokens` is a curated tool for account-owned API token management.
 Read actions do not prompt when elicitation is enabled; create, update, delete,
 and roll apply calls are dangerous operations and can be approval-gated.
+
+Use `account_api_token_permission_plan` before updating an existing token's
+permission groups. It is read-only: it reads the current token and permission
+group catalog, resolves exact permission group names/ids/scopes, reports what
+would be added or removed, and returns the safe `account_api_tokens` update
+payload with `dry_run=true`. This avoids the common full-body `PUT` trap where
+an operator accidentally submits only the new scopes and drops existing ones.
+If a token has multiple policies, the planner refuses to guess and asks for a
+zero-based `policy_index`.
 
 ## Generic Cloudflare REST API Tools
 

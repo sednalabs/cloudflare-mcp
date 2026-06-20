@@ -41,6 +41,17 @@ tree:
 CLOUDFLARE_MCP_AUTH_MODE=off target/release/cloudflare-mcp --print-tools
 ```
 
+If an existing `cloudflare-mcp --stdio` process is already serving traffic,
+verify that process as well as the file on disk. Stdio sessions keep the old
+executable inode until restarted, so a promoted symlink or copied binary is not
+proof that the live process has changed:
+
+```bash
+pgrep -af 'cloudflare-mcp.*--stdio'
+readlink -f /proc/<pid>/exe
+sha256sum /proc/<pid>/exe target/release/cloudflare-mcp
+```
+
 ## Safety Profiles
 
 ### Read-Only
@@ -134,9 +145,32 @@ tools/call name=lock_first_publish arguments='{
   "target":"<target>",
   "dry_run":true
 }'
+
+tools/call name=workers_upload_script arguments='{
+  "account_id":"<account_id>",
+  "script_name":"<worker_script>",
+  "main_module":"index.js",
+  "script_path":"dist/worker/index.js",
+  "metadata":{"compatibility_date":"YYYY-MM-DD"},
+  "dry_run":true
+}'
 ```
 
-Review the plan and policy output before apply.
+Review the plan and policy output before apply. For `workers_upload_script`,
+review `upload.sha256`, `upload.metadata_sha256`, and `upload.metadata_keys`;
+the tool intentionally reports digests and keys instead of raw Worker metadata
+values. Apply by echoing `required_confirmation_token` in
+`confirmation_token`. Treat `workers.upload_readback_mismatch` as a failed
+deployment proof even when Cloudflare accepted the upload request, because the
+settings readback did not match the requested module.
+
+For projects that already use Wrangler to build a multipart Worker bundle, pass
+`multipart_path` instead of `script_path`/`script_content`/`main_module`.
+The MCP infers `content_type` from a leading multipart boundary when possible;
+otherwise pass `content_type:"multipart/form-data; boundary=<boundary>"`.
+Multipart uploads still require dry-run review and the confirmation token, but
+`readback_verification` reports module-name verification as not applicable
+because the bundle owns its module graph.
 
 ## Apply Sequence
 
@@ -168,6 +202,31 @@ tools/call name=api_mutate arguments='{"operation_id":"<mutating-operation-id>",
 
 `api_mutate` apply calls require the dry-run confirmation token. Denied
 high-risk categories fail closed.
+
+For billing or D1 usage-spike investigations:
+
+```text
+tools/call name=account_billing_usage arguments='{"mode":"paygo","from":"<iso-start>","to":"<iso-end>"}'
+tools/call name=graphql_analytics_query arguments='{"query":"query D1Usage($accountTag: string!) { viewer { accounts(filter: { accountTag: $accountTag }) { d1AnalyticsAdaptiveGroups(limit: 10000) { sum { rowsRead rowsWritten readQueries writeQueries } dimensions { date databaseId } } } } }","variables":{"accountTag":"<account-id>"}}'
+```
+
+Use billing usage for billable records and GraphQL analytics for attribution.
+The REST executor derives path parameters from URL templates, so operations with
+stale catalog parameter metadata should not send literal `{account_id}` paths.
+
+For WAF rule and Security Events investigations:
+
+```text
+tools/call name=waf_ruleset_summary arguments='{"scope":"zone","phases":["custom","managed","ratelimit"],"include_rules":true}'
+tools/call name=waf_security_events_summary arguments='{"window_hours":24,"group_by":["action","source","host","path","rule"],"sample_limit":10}'
+tools/call name=waf_rule_activity arguments='{"rule_id":"<rule-id>","window_hours":24,"phases":["custom","managed","ratelimit"]}'
+```
+
+WAF Rulesets are read through the Ruleset Engine entrypoint phases
+`http_request_firewall_custom`, `http_request_firewall_managed`, and
+`http_ratelimit`. Security Events analytics use Cloudflare Analytics GraphQL
+dataset `firewallEventsAdaptive`; a single HTTP request can produce multiple
+security events and large windows may be sampled.
 
 ## R2 Object Workflow
 
@@ -241,6 +300,10 @@ For accidental exposure or failed verification:
 ## Validation For Changes
 
 For docs-only changes, scan public wording and verify links.
+
+GitHub Actions also runs CodeQL as a static-analysis guardrail. SARIF upload is
+disabled in this repository's CodeQL workflow, so the guardrail can run even
+when GitHub code scanning is not enabled for the repository.
 
 For tool, transport, auth, or runtime behavior changes:
 

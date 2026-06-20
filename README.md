@@ -19,15 +19,20 @@ matter more than raw endpoint breadth:
 - Pages deployments and custom domains.
 - D1 database discovery, read-only queries, guarded writes, and migrations.
 - R2 object inspection, bounded reads/downloads, and writes.
-- Workers settings, bindings discovery, and observability event queries.
+- Workers script upload with digest-based summaries and settings readback,
+  bindings discovery, and observability event queries.
 - Queues health, backlog, metrics, consumers, and DLQ readback.
+- Account billing usage and Cloudflare Analytics GraphQL attribution for
+  usage-spike investigations.
+- WAF Rulesets and Security Events summaries for rule/activity investigations.
 - Cache controls, Bulk Redirects, Email Routing, and account API token
   management.
 - A guarded generic Cloudflare REST API v4 executor backed by a committed
   OpenAPI-derived catalog.
 
 Mutating tools are designed around dry-run planning, optional confirmation
-tokens, structured audit metadata, and readback verification.
+tokens, structured audit metadata, digest-based evidence for deployable
+artifacts, and readback verification.
 
 ## Relationship to Cloudflare's official MCP server
 
@@ -126,20 +131,25 @@ The server supports:
   - `cloudflare-mcp://about`
   - `cloudflare-mcp://help`
   - `cloudflare-mcp://adapter-status`
+  - `cloudflare-mcp://api-parity-status`
+  - `cloudflare-mcp://openai/tool-search-config`
 
 Tool names intentionally omit a `cloudflare.` prefix. MCP clients already attach
 the server label, so short names keep prompts and traces easier to read.
 
-For OpenAI Responses API clients that support deferred MCP loading, configure
-the MCP server with `defer_loading: true` and include a `tool_search` tool.
-Non-hosted clients can call `find_tools` to search the local inventory.
+For OpenAI Responses API clients, GPT-5.4 and later support tool search; use
+`gpt-5.5` as the current flagship target for complex operator workflows. To
+defer this large MCP tool catalog, configure the MCP server with
+`defer_loading: true` and include a `tool_search` tool. Non-hosted clients can
+call `find_tools` to produce a narrow `allowed_tools` list and optional MCP
+schemas before a follow-up call.
 
 ```json
 [
   {
     "type": "mcp",
     "server_label": "cloudflare",
-    "server_description": "Self-hosted Cloudflare operator workflows with dry-run planning, approval gates, and readback verification.",
+    "server_description": "Self-hosted Cloudflare operator workflows: Tunnel, DNS, Access, Pages, D1, R2, Workers, Queues, WAF, Email Routing, cache, guarded publish, dry-run planning, approval gates, and readback verification.",
     "server_url": "https://<host>/mcp",
     "defer_loading": true
   },
@@ -164,6 +174,11 @@ Use curated tools first when they exist. They encode workflow-specific dry-run
 shape, validation, and readback checks. Use `api_find_operations`,
 `api_get_operation`, `api_prepare_call`, `api_read`, and `api_mutate` for
 Cloudflare REST API operations that do not yet have a curated workflow.
+For billing or D1 usage-spike work, use `account_billing_usage` for billable
+usage records and `graphql_analytics_query` for product analytics attribution.
+For WAF investigations, use `waf_ruleset_summary`,
+`waf_security_events_summary`, and `waf_rule_activity` before falling back to
+raw GraphQL or generic Rulesets API calls.
 
 See [docs/TOOL_GUIDE.md](docs/TOOL_GUIDE.md) for a product-oriented map.
 
@@ -213,6 +228,11 @@ When tool schemas intentionally change:
 MCP_TOOLKIT_UPDATE_TOOL_SNAPSHOTS=1 cargo test tools::tests::tool_schema_snapshot_contract_is_stable
 cargo test tools::tests::tool_schema_snapshot_contract_is_stable
 ```
+
+GitHub Actions runs the same Rust validation lane on pull requests and pushes.
+The CodeQL workflow runs analysis as a static guardrail with SARIF upload
+disabled, so repositories without GitHub code scanning enabled do not fail only
+because the results cannot be uploaded.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) before opening changes.
 

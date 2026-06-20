@@ -66,9 +66,27 @@ fn tool_capabilities() -> Vec<ToolCapability> {
         gated_api_cap("api_mutate")
             .with_group("api")
             .with_read_only(false),
+        cap("account_billing_usage")
+            .with_group("billing")
+            .with_read_only(true),
+        cap("graphql_analytics_query")
+            .with_group("analytics")
+            .with_read_only(true),
+        cap("waf_ruleset_summary")
+            .with_group("waf")
+            .with_read_only(true),
+        cap("waf_security_events_summary")
+            .with_group("waf")
+            .with_read_only(true),
+        cap("waf_rule_activity")
+            .with_group("waf")
+            .with_read_only(true),
         cap("account_api_tokens")
             .with_group("api")
             .with_read_only(false),
+        cap("account_api_token_permission_plan")
+            .with_group("api")
+            .with_read_only(true),
         cap("list_tunnels")
             .with_group("tunnel")
             .with_read_only(true),
@@ -215,6 +233,9 @@ fn tool_capabilities() -> Vec<ToolCapability> {
         cap("workers_get_script_settings")
             .with_group("workers")
             .with_read_only(true),
+        cap("workers_upload_script")
+            .with_group("workers")
+            .with_read_only(false),
         cap("workers_list_tails")
             .with_group("workers")
             .with_read_only(true),

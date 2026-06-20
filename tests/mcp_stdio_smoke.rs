@@ -432,13 +432,85 @@ fn spawn_fake_cloudflare_api() -> String {
                 .and_then(|line| line.split_whitespace().nth(1))
                 .unwrap_or_default()
                 .to_string();
+            let path_only = path.split('?').next().unwrap_or(path.as_str());
             let body_text = String::from_utf8_lossy(&body).to_string();
             let body_json: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
             let d1_sql = body_json
                 .get("sql")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let response = if path.ends_with("/analytics_engine/sql") {
+            let response = if path_only.ends_with("/graphql") {
+                if body_json
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .is_some_and(|query| {
+                        query.contains("WafSecurityEvents") || query.contains("WafRuleActivity")
+                    })
+                {
+                    json!({
+                        "data": {
+                            "viewer": {
+                                "zones": [{
+                                    "settings": {
+                                        "firewallEventsAdaptive": {
+                                            "maxDuration": 86400,
+                                            "maxPageSize": 100,
+                                            "notOlderThan": "2026-06-01T00:00:00Z"
+                                        }
+                                    },
+                                    "byAction": [{
+                                        "count": 3,
+                                        "dimensions": {"action": "block"}
+                                    }],
+                                    "bySource": [{
+                                        "count": 3,
+                                        "dimensions": {"source": "waf"}
+                                    }],
+                                    "byHost": [{
+                                        "count": 3,
+                                        "dimensions": {"clientRequestHTTPHost": "example.com"}
+                                    }],
+                                    "samples": [{
+                                        "action": "block",
+                                        "clientIP": "203.0.113.10",
+                                        "clientRequestHTTPHost": "example.com",
+                                        "clientRequestPath": "/admin",
+                                        "datetime": "2026-06-04T01:02:03Z",
+                                        "source": "waf",
+                                        "ruleId": "rule-1",
+                                        "rulesetId": "ruleset-custom",
+                                        "userAgent": "curl/8"
+                                    }]
+                                }]
+                            }
+                        }
+                    })
+                } else {
+                    json!({
+                        "data": {
+                            "viewer": {
+                                "accounts": [{
+                                    "d1AnalyticsAdaptiveGroups": [{
+                                        "sum": {"rowsRead": 10, "rowsWritten": 4},
+                                        "dimensions": {"date": "2026-06-02", "databaseId": "db-1"}
+                                    }]
+                                }]
+                            }
+                        }
+                    })
+                }
+            } else if path_only.ends_with("/paygo-usage") {
+                json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": [{
+                        "ServiceName": "D1",
+                        "ConsumedQuantity": 42,
+                        "ConsumedUnit": "rows"
+                    }]
+                })
+            } else if path_only.ends_with("/analytics_engine/sql") {
                 match body_text.as_str() {
                     "SHOW TABLES" => json!({
                         "meta": [{"name": "name", "type": "String"}],
@@ -463,7 +535,7 @@ fn spawn_fake_cloudflare_api() -> String {
                         "result": null
                     }),
                 }
-            } else if path.ends_with("/queues/queue-1/metrics") {
+            } else if path_only.ends_with("/queues/queue-1/metrics") {
                 json!({
                     "success": true,
                     "errors": [],
@@ -474,7 +546,7 @@ fn spawn_fake_cloudflare_api() -> String {
                         "oldest_message_timestamp_ms": 0
                     }
                 })
-            } else if path.ends_with("/queues/dlq-1/metrics") {
+            } else if path_only.ends_with("/queues/dlq-1/metrics") {
                 json!({
                     "success": true,
                     "errors": [],
@@ -485,7 +557,7 @@ fn spawn_fake_cloudflare_api() -> String {
                         "oldest_message_timestamp_ms": 0
                     }
                 })
-            } else if path.ends_with("/queues/queue-1/consumers") {
+            } else if path_only.ends_with("/queues/queue-1/consumers") {
                 json!({
                     "success": true,
                     "errors": [],
@@ -498,14 +570,14 @@ fn spawn_fake_cloudflare_api() -> String {
                         "settings": {"max_retries": 5}
                     }]
                 })
-            } else if path.ends_with("/queues/queue-1/purge") {
+            } else if path_only.ends_with("/queues/queue-1/purge") {
                 json!({
                     "success": true,
                     "errors": [],
                     "messages": [],
                     "result": {"completed": "2026-05-21T00:00:00Z"}
                 })
-            } else if path.ends_with("/queues/queue-1") {
+            } else if path_only.ends_with("/queues/queue-1") {
                 json!({
                     "success": true,
                     "errors": [],
@@ -517,7 +589,7 @@ fn spawn_fake_cloudflare_api() -> String {
                         "consumers_total_count": 1
                     }
                 })
-            } else if path.ends_with("/queues") {
+            } else if path_only.ends_with("/queues") {
                 json!({
                     "success": true,
                     "errors": [],
@@ -527,8 +599,11 @@ fn spawn_fake_cloudflare_api() -> String {
                         {"queue_id": "dlq-1", "queue_name": "editor-forwarder-dlq"}
                     ]
                 })
-            } else if path.ends_with("/workers/observability/telemetry/values") {
-                if body_json.get("timeframe").is_some() && body_json.get("type").is_some() {
+            } else if path_only.ends_with("/workers/observability/telemetry/values") {
+                if body_json.get("timeframe").is_some()
+                    && body_json.get("type").is_some()
+                    && body_json.get("datasets").is_some()
+                {
                     json!({
                         "success": true,
                         "errors": [],
@@ -543,8 +618,32 @@ fn spawn_fake_cloudflare_api() -> String {
                         "result": null
                     })
                 }
-            } else if path.ends_with("/workers/observability/telemetry/query") {
-                if body_json.get("timeframe").is_some() && body_json.get("query").is_some() {
+            } else if path_only.ends_with("/workers/observability/telemetry/keys") {
+                if body_json.get("from").is_some()
+                    && body_json.get("to").is_some()
+                    && body_json.get("datasets").is_some()
+                    && body_json.get("timeframe").is_none()
+                {
+                    json!({
+                        "success": true,
+                        "errors": [],
+                        "messages": [],
+                        "result": [{"key": "$workers.scriptName", "type": "string"}]
+                    })
+                } else {
+                    json!({
+                        "success": false,
+                        "errors": [{"code": 7000, "message": "missing top-level from/to/datasets"}],
+                        "messages": [],
+                        "result": null
+                    })
+                }
+            } else if path_only.ends_with("/workers/observability/telemetry/query") {
+                if body_json.get("timeframe").is_some()
+                    && body_json.get("queryId").is_some()
+                    && body_json.get("limit").is_some()
+                    && body_json.get("parameters").is_some()
+                {
                     json!({
                         "success": true,
                         "errors": [],
@@ -554,11 +653,66 @@ fn spawn_fake_cloudflare_api() -> String {
                 } else {
                     json!({
                         "success": false,
-                        "errors": [{"code": 7000, "message": "missing timeframe/query"}],
+                        "errors": [{"code": 7000, "message": "missing timeframe/queryId/parameters"}],
                         "messages": [],
                         "result": null
                     })
                 }
+            } else if path_only
+                .ends_with("/rulesets/phases/http_request_firewall_custom/entrypoint")
+            {
+                json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": {
+                        "id": "ruleset-custom",
+                        "name": "Zone custom WAF rules",
+                        "kind": "zone",
+                        "phase": "http_request_firewall_custom",
+                        "version": "7",
+                        "last_updated": "2026-06-04T00:00:00Z",
+                        "rules": [{
+                            "id": "rule-1",
+                            "version": "3",
+                            "description": "Block admin probes",
+                            "action": "block",
+                            "enabled": true,
+                            "expression": "http.request.uri.path contains \"/admin\"",
+                            "ref": "block-admin"
+                        }]
+                    }
+                })
+            } else if path_only
+                .ends_with("/rulesets/phases/http_request_firewall_managed/entrypoint")
+            {
+                json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": {
+                        "id": "ruleset-managed",
+                        "name": "Zone managed WAF rules",
+                        "kind": "zone",
+                        "phase": "http_request_firewall_managed",
+                        "version": "2",
+                        "rules": []
+                    }
+                })
+            } else if path_only.ends_with("/rulesets/phases/http_ratelimit/entrypoint") {
+                json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": {
+                        "id": "ruleset-ratelimit",
+                        "name": "Zone rate limiting rules",
+                        "kind": "zone",
+                        "phase": "http_ratelimit",
+                        "version": "1",
+                        "rules": []
+                    }
+                })
             } else {
                 match d1_sql {
                     sql if sql.contains("sqlite_master") => json!({
@@ -685,6 +839,95 @@ fn spawn_fake_d1_database_mutation_api(
                     "errors": [],
                     "messages": [],
                     "result": {"id": "db-1", "deleted": true},
+                }),
+                _ => json!({
+                    "success": false,
+                    "errors": [{"code": 7000, "message": format!("unexpected request: {method} {path}")}],
+                    "messages": [],
+                    "result": null,
+                }),
+            };
+            let response = serde_json::to_vec(&response).expect("serialize response");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                response.len()
+            )
+            .expect("write response headers");
+            stream.write_all(&response).expect("write response body");
+        }
+    });
+    (format!("http://{addr}"), requests)
+}
+
+fn spawn_fake_worker_upload_api(expected_requests: usize) -> (String, Arc<Mutex<Vec<Value>>>) {
+    spawn_fake_worker_upload_api_with_readback(expected_requests, "worker.js")
+}
+
+fn spawn_fake_worker_upload_api_with_readback(
+    expected_requests: usize,
+    readback_main_module: &'static str,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake Worker upload API");
+    let addr = listener.local_addr().expect("fake Worker upload API addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().take(expected_requests) {
+            let mut stream = stream.expect("fake Worker upload API stream");
+            let (headers, body) = read_http_request(&mut stream);
+            let request_line = headers.lines().next().unwrap_or_default().to_string();
+            let mut request_parts = request_line.split_whitespace();
+            let method = request_parts.next().unwrap_or_default().to_string();
+            let path = request_parts.next().unwrap_or_default().to_string();
+            let content_type = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-type:"))
+                .or_else(|| {
+                    headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Content-Type:"))
+                })
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string();
+            let body_text = String::from_utf8_lossy(&body).to_string();
+            requests_for_thread
+                .lock()
+                .expect("request log lock")
+                .push(json!({
+                    "method": method,
+                    "path": path,
+                    "content_type": content_type,
+                    "body_text": body_text,
+                }));
+
+            let response = match (method.as_str(), path.as_str()) {
+                ("PUT", "/accounts/acct-1/workers/scripts/worker-a") => {
+                    assert!(body_text.contains("name=\"metadata\""));
+                    assert!(body_text.contains("\"main_module\":\"worker.js\""));
+                    assert!(body_text.contains("name=\"worker.js\"; filename=\"worker.js\""));
+                    assert!(body_text.contains("export default"));
+                    json!({
+                        "success": true,
+                        "errors": [],
+                        "messages": [],
+                        "result": {
+                            "id": "worker-a",
+                            "script_name": "worker-a",
+                            "modified_on": "2026-06-03T00:00:00Z"
+                        },
+                    })
+                }
+                ("GET", "/accounts/acct-1/workers/scripts/worker-a/settings") => json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": {
+                        "main_module": readback_main_module,
+                        "compatibility_date": "2026-06-03",
+                        "bindings": []
+                    },
                 }),
                 _ => json!({
                     "success": false,
@@ -1241,8 +1484,59 @@ fn stdio_tool_calls_cover_context_and_body_normalization_edges() {
         json!("perm-1")
     );
 
-    let find_tools = mcp.call_tool(
+    let token_permission_plan = mcp.call_tool(
         5,
+        "account_api_token_permission_plan",
+        json!({
+            "account_id": "acct-1",
+            "token_id": "token-1",
+            "current_token": {
+                "id": "token-1",
+                "name": "deploy-token",
+                "policies": [{
+                    "effect": "allow",
+                    "resources": {"com.cloudflare.api.account.acct-1": "*"},
+                    "permission_groups": [
+                        {"id": "perm-d1-read", "name": "D1 Read"},
+                        {"id": "perm-account-analytics-read", "name": "Account Analytics Read"}
+                    ]
+                }]
+            },
+            "permission_groups": [
+                {"id": "perm-d1-read", "name": "D1 Read"},
+                {"id": "perm-account-analytics-read", "name": "Account Analytics Read"},
+                {"id": "perm-workers-scripts-edit", "name": "Workers Scripts Edit"}
+            ],
+            "add": ["Workers Scripts Edit"],
+            "remove": ["Account Analytics Read"],
+            "reason": "stdio smoke token permission planning"
+        }),
+    );
+    assert!(
+        token_permission_plan.get("error").is_none(),
+        "account_api_token_permission_plan failed before tool body: {token_permission_plan}"
+    );
+    let token_plan_content = structured_content(&token_permission_plan);
+    assert_eq!(token_plan_content["ok"], json!(true));
+    assert_eq!(token_plan_content["read_only"], json!(true));
+    assert_eq!(
+        token_plan_content["delta"]["permissions_to_add"][0]["id"],
+        json!("perm-workers-scripts-edit")
+    );
+    assert_eq!(
+        token_plan_content["update_body"]["policies"][0]["permission_groups"],
+        json!([
+            {"id": "perm-d1-read"},
+            {"id": "perm-workers-scripts-edit"}
+        ])
+    );
+    assert_eq!(
+        token_plan_content["next_call"]["arguments"]["dry_run"],
+        json!(true)
+    );
+
+    let find_tools = mcp.call_tool(
+        6,
         "find_tools",
         json!({
             "query": "d1",
@@ -1977,6 +2271,134 @@ fn d1_delete_database_requires_token_and_deletes_through_stdio_boundary() {
 }
 
 #[test]
+fn workers_upload_script_requires_token_and_reads_back_through_stdio_boundary() {
+    let (base_url, requests) = spawn_fake_worker_upload_api(2);
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let dry_run = mcp.call_tool(
+        2,
+        "workers_upload_script",
+        json!({
+            "script_name": "worker-a",
+            "main_module": "worker.js",
+            "script_content": "export default { fetch() { return new Response('ok'); } };",
+            "metadata": {"compatibility_date": "2026-06-03"},
+            "dry_run": true,
+            "reason": "stdio regression"
+        }),
+    );
+    let dry_run_content = structured_content(&dry_run);
+    assert_eq!(dry_run_content["ok"], json!(true), "{dry_run_content}");
+    assert_eq!(dry_run_content["planned"], json!(true));
+    assert_eq!(dry_run_content["upload"]["main_module"], json!("worker.js"));
+    assert_eq!(dry_run_content["upload"]["metadata"], Value::Null);
+    assert_eq!(
+        dry_run_content["upload"]["metadata_keys"],
+        json!(["compatibility_date", "main_module"])
+    );
+    assert!(dry_run_content["upload"]["metadata_sha256"].is_string());
+    assert_eq!(requests.lock().expect("request log lock").len(), 0);
+    let token = dry_run_content["required_confirmation_token"]
+        .as_str()
+        .expect("confirmation token")
+        .to_string();
+
+    let response = mcp.call_tool(
+        3,
+        "workers_upload_script",
+        json!({
+            "script_name": "worker-a",
+            "main_module": "worker.js",
+            "script_content": "export default { fetch() { return new Response('ok'); } };",
+            "metadata": {"compatibility_date": "2026-06-03"},
+            "dry_run": false,
+            "confirmation_token": token,
+            "reason": "stdio regression"
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(true), "{content}");
+    assert_eq!(content["script"]["script_name"], json!("worker-a"));
+    assert_eq!(
+        content["readback_settings"]["main_module"],
+        json!("worker.js")
+    );
+    assert_eq!(
+        content["readback_verification"]["code"],
+        json!("workers.upload_main_module_matched")
+    );
+    let requests = requests.lock().expect("request log lock");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["method"], json!("PUT"));
+    assert_eq!(
+        requests[0]["path"],
+        json!("/accounts/acct-1/workers/scripts/worker-a")
+    );
+    assert!(
+        requests[0]["content_type"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("multipart/form-data;")
+    );
+    assert_eq!(requests[1]["method"], json!("GET"));
+    assert_eq!(
+        requests[1]["path"],
+        json!("/accounts/acct-1/workers/scripts/worker-a/settings")
+    );
+}
+
+#[test]
+fn workers_upload_script_reports_readback_mismatch_through_stdio_boundary() {
+    let (base_url, requests) = spawn_fake_worker_upload_api_with_readback(2, "unexpected.js");
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let dry_run = mcp.call_tool(
+        2,
+        "workers_upload_script",
+        json!({
+            "script_name": "worker-a",
+            "main_module": "worker.js",
+            "script_content": "export default { fetch() { return new Response('ok'); } };",
+            "metadata": {"compatibility_date": "2026-06-03"},
+            "dry_run": true,
+            "reason": "stdio regression"
+        }),
+    );
+    let dry_run_content = structured_content(&dry_run);
+    let token = dry_run_content["required_confirmation_token"]
+        .as_str()
+        .expect("confirmation token")
+        .to_string();
+
+    let response = mcp.call_tool(
+        3,
+        "workers_upload_script",
+        json!({
+            "script_name": "worker-a",
+            "main_module": "worker.js",
+            "script_content": "export default { fetch() { return new Response('ok'); } };",
+            "metadata": {"compatibility_date": "2026-06-03"},
+            "dry_run": false,
+            "confirmation_token": token,
+            "reason": "stdio regression"
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(
+        content["error"]["code"],
+        json!("workers.upload_readback_mismatch")
+    );
+    assert_eq!(
+        content["readback_verification"]["code"],
+        json!("workers.upload_main_module_mismatch")
+    );
+    assert_eq!(
+        content["readback_verification"]["observed_main_module"],
+        json!("unexpected.js")
+    );
+    assert_eq!(requests.lock().expect("request log lock").len(), 2);
+}
+
+#[test]
 fn workers_observability_values_work_through_stdio_boundary() {
     let base_url = spawn_fake_cloudflare_api();
     let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
@@ -1995,6 +2417,26 @@ fn workers_observability_values_work_through_stdio_boundary() {
 }
 
 #[test]
+fn workers_observability_keys_work_through_stdio_boundary() {
+    let base_url = spawn_fake_cloudflare_api();
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let response = mcp.call_tool(
+        2,
+        "workers_observability_list_keys",
+        json!({
+            "script_name": "pages-worker",
+            "limit": 50
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(true), "{content}");
+    assert_eq!(
+        content["page"]["items"][0]["key"],
+        json!("$workers.scriptName")
+    );
+}
+
+#[test]
 fn workers_observability_query_events_work_through_stdio_boundary() {
     let base_url = spawn_fake_cloudflare_api();
     let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
@@ -2002,7 +2444,6 @@ fn workers_observability_query_events_work_through_stdio_boundary() {
         2,
         "workers_observability_query_events",
         json!({
-            "script_name": "pages-worker",
             "limit": 20
         }),
     );
@@ -2052,6 +2493,170 @@ fn queue_health_and_api_prepare_work_through_stdio_boundary() {
         json!("configured")
     );
     assert_eq!(health_content["dlq"]["backlog_count"], json!(2.0));
+}
+
+#[test]
+fn billing_usage_and_graphql_analytics_work_through_stdio_boundary() {
+    let base_url = spawn_fake_cloudflare_api();
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+
+    let prepared = mcp.call_tool(
+        2,
+        "api_prepare_call",
+        json!({
+            "operation_id": "billable-usage-get-paygo-account-usage",
+            "query_params": {
+                "from": "2026-06-01T00:00:00Z",
+                "to": "2026-06-02T00:00:00Z"
+            }
+        }),
+    );
+    let prepared_content = structured_content(&prepared);
+    assert_eq!(prepared_content["ok"], json!(true), "{prepared_content}");
+    assert_eq!(
+        prepared_content["rendered_path"],
+        json!("/accounts/acct-1/paygo-usage")
+    );
+    assert_eq!(
+        prepared_content["resolved_path_params"],
+        json!({"account_id": "acct-1"})
+    );
+    assert_eq!(
+        prepared_content["call"]["arguments"]["path_params"],
+        json!({"account_id": "acct-1"})
+    );
+    assert_eq!(
+        prepared_content["api_operation"]["call_template"]["path_params"]["account_id"],
+        json!("<account_id>")
+    );
+
+    let usage = mcp.call_tool(
+        3,
+        "account_billing_usage",
+        json!({
+            "from": "2026-06-01T00:00:00Z",
+            "to": "2026-06-02T00:00:00Z"
+        }),
+    );
+    let usage_content = structured_content(&usage);
+    assert_eq!(usage_content["ok"], json!(true), "{usage_content}");
+    assert_eq!(usage_content["path"], json!("/accounts/acct-1/paygo-usage"));
+    assert_eq!(usage_content["result"][0]["ConsumedQuantity"], json!(42));
+
+    let graphql = mcp.call_tool(
+        4,
+        "graphql_analytics_query",
+        json!({
+            "query": "query D1Usage($accountTag: string!) { viewer { accounts(filter: { accountTag: $accountTag }) { d1AnalyticsAdaptiveGroups(limit: 1) { sum { rowsRead rowsWritten } } } } }",
+            "variables": {"accountTag": "acct-1"}
+        }),
+    );
+    let graphql_content = structured_content(&graphql);
+    assert_eq!(graphql_content["ok"], json!(true), "{graphql_content}");
+    assert_eq!(
+        graphql_content["result"]["data"]["viewer"]["accounts"][0]["d1AnalyticsAdaptiveGroups"][0]
+            ["sum"]["rowsWritten"],
+        json!(4)
+    );
+}
+
+#[test]
+fn waf_ruleset_and_security_events_work_through_stdio_boundary() {
+    let base_url = spawn_fake_cloudflare_api();
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+
+    let tools = mcp.call_tool(
+        2,
+        "find_tools",
+        json!({
+            "query": "what WAF rule blocked this request security events analytics",
+            "include_schema": true
+        }),
+    );
+    let tools_content = structured_content(&tools);
+    assert_eq!(tools_content["ok"], json!(true), "{tools_content}");
+    let allowed = tools_content["openai_allowed_tools"]
+        .as_array()
+        .expect("allowed tools");
+    assert!(allowed.iter().any(|tool| tool == "waf_ruleset_summary"));
+    assert!(
+        allowed
+            .iter()
+            .any(|tool| tool == "waf_security_events_summary")
+    );
+    assert!(allowed.iter().any(|tool| tool == "waf_rule_activity"));
+
+    let rulesets = mcp.call_tool(
+        3,
+        "waf_ruleset_summary",
+        json!({
+            "phases": ["custom"],
+            "include_rules": true
+        }),
+    );
+    let rulesets_content = structured_content(&rulesets);
+    assert_eq!(rulesets_content["ok"], json!(true), "{rulesets_content}");
+    assert_eq!(
+        rulesets_content["rulesets"][0]["ruleset"]["id"],
+        json!("ruleset-custom")
+    );
+    assert_eq!(
+        rulesets_content["rulesets"][0]["rules"][0]["id"],
+        json!("rule-1")
+    );
+    assert_eq!(
+        rulesets_content["source"]["ruleset_phases"][0],
+        json!("http_request_firewall_custom")
+    );
+
+    let events = mcp.call_tool(
+        4,
+        "waf_security_events_summary",
+        json!({
+            "since": "2026-06-04T00:00:00Z",
+            "until": "2026-06-04T02:00:00Z",
+            "group_by": ["action", "source", "host"],
+            "action": "block",
+            "host": "example.com",
+            "sample_limit": 5,
+            "include_query": true
+        }),
+    );
+    let events_content = structured_content(&events);
+    assert_eq!(events_content["ok"], json!(true), "{events_content}");
+    assert_eq!(
+        events_content["analytics"]["groups"]["byAction"][0]["dimensions"]["action"],
+        json!("block")
+    );
+    assert_eq!(
+        events_content["analytics"]["samples"][0]["ruleId"],
+        json!("rule-1")
+    );
+    assert!(
+        events_content["graphql"]["query"]
+            .as_str()
+            .expect("query")
+            .contains("firewallEventsAdaptive")
+    );
+
+    let activity = mcp.call_tool(
+        5,
+        "waf_rule_activity",
+        json!({
+            "rule_id": "rule-1",
+            "phases": ["custom"],
+            "since": "2026-06-04T00:00:00Z",
+            "until": "2026-06-04T02:00:00Z",
+            "include_raw": false
+        }),
+    );
+    let activity_content = structured_content(&activity);
+    assert_eq!(activity_content["ok"], json!(true), "{activity_content}");
+    assert_eq!(activity_content["matching_rules"][0]["id"], json!("rule-1"));
+    assert_eq!(
+        activity_content["analytics"]["samples"][0]["clientRequestPath"],
+        json!("/admin")
+    );
 }
 
 #[test]
@@ -2118,8 +2723,26 @@ fn analytics_engine_validate_and_describe_schema_work_through_stdio_boundary() {
         validate_dataset_key_content["schema"]["objects"][1]["name"],
         json!("example_staff_publish_telemetry")
     );
+    let validate_functions = mcp.call_tool(
+        4,
+        "analytics_engine_validate_query",
+        json!({
+            "sql": "SELECT coalesce(blob1, 'unknown') AS route, quantileExactWeighted(0.95)(double1, _sample_interval) AS p95 FROM WEB WHERE timestamp >= toDateTime('2026-01-01') GROUP BY route",
+            "include_dataset_readback": true
+        }),
+    );
+    let validate_functions_content = structured_content(&validate_functions);
+    assert_eq!(
+        validate_functions_content["ok"],
+        json!(true),
+        "{validate_functions_content}"
+    );
+    assert_eq!(
+        validate_functions_content["validation"]["referenced_functions"],
+        json!(["coalesce", "quantileexactweighted", "todatetime"])
+    );
 
-    let describe = mcp.call_tool(4, "analytics_engine_describe_schema", json!({}));
+    let describe = mcp.call_tool(5, "analytics_engine_describe_schema", json!({}));
     let describe_content = structured_content(&describe);
     assert_eq!(describe_content["ok"], json!(true), "{describe_content}");
     assert_eq!(

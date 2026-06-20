@@ -12,14 +12,14 @@ base64 = "0.22.1"
 blake3 = "1"
 futures = "0.3.31"
 hmac = "0.12.1"
-mcp-toolkit-auth = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "ce9fd09aa0f9ad96396fd1888873eb27cc2638d4", package = "mcp-toolkit-auth" }
-mcp-toolkit-core = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "ce9fd09aa0f9ad96396fd1888873eb27cc2638d4", package = "mcp-toolkit-core" }
-mcp-toolkit-http = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "ce9fd09aa0f9ad96396fd1888873eb27cc2638d4", package = "mcp-toolkit-http", features = ["session"] }
-mcp-toolkit-observability = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "ce9fd09aa0f9ad96396fd1888873eb27cc2638d4", package = "mcp-toolkit-observability" }
-mcp-toolkit-policy-core = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "ce9fd09aa0f9ad96396fd1888873eb27cc2638d4", package = "mcp-toolkit-policy-core" }
+mcp-toolkit-auth = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "6cdc0ebdb7e1b2fb234d279c3725f85e5a1ce05f", package = "mcp-toolkit-auth" }
+mcp-toolkit-core = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "6cdc0ebdb7e1b2fb234d279c3725f85e5a1ce05f", package = "mcp-toolkit-core" }
+mcp-toolkit-http = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "6cdc0ebdb7e1b2fb234d279c3725f85e5a1ce05f", package = "mcp-toolkit-http", features = ["session"] }
+mcp-toolkit-observability = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "6cdc0ebdb7e1b2fb234d279c3725f85e5a1ce05f", package = "mcp-toolkit-observability" }
+mcp-toolkit-policy-core = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "6cdc0ebdb7e1b2fb234d279c3725f85e5a1ce05f", package = "mcp-toolkit-policy-core" }
 mime_guess = "2.0.5"
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
-rmcp = { version = "=1.5.0", features = ["server", "transport-io", "transport-streamable-http-server", "macros", "elicitation", "schemars"] }
+rmcp = { version = "=1.7.0", features = ["server", "transport-io", "transport-streamable-http-server", "macros", "elicitation", "schemars"] }
 schemars = "1.2.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -34,5 +34,5 @@ url = "2.5.7"
 
 [dev-dependencies]
 jsonwebtoken = "10.4.0"
-mcp-toolkit-testing = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "ce9fd09aa0f9ad96396fd1888873eb27cc2638d4", package = "mcp-toolkit-testing" }
+mcp-toolkit-testing = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "6cdc0ebdb7e1b2fb234d279c3725f85e5a1ce05f", package = "mcp-toolkit-testing" }
 tower = "0.5.2"

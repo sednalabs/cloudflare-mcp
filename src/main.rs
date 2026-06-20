@@ -334,6 +334,11 @@ async fn build_auth_surface_layer(
             .introspection_url
             .clone()
             .or(discovered_introspection),
+        device_authorization_endpoint: None,
+        grant_types_supported: None,
+        client_id_metadata_document_supported: None,
+        token_endpoint_auth_methods_supported: None,
+        code_challenge_methods_supported: None,
         realm: config.auth_realm.clone(),
         scopes_supported: config.auth_scopes_supported.clone(),
         allowed_client_ids: config.auth_allowed_client_ids.iter().cloned().collect(),
