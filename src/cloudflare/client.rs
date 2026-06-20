@@ -20,7 +20,7 @@ use url::Url;
 use crate::cloudflare::model::{
     AccessAppUpsertRequest, AccessApplication, AccessPolicy, AccessPolicyWrite, CacheRuleset,
     D1Database, DnsRecord, DnsRecordUpsertRequest, DnsRouteDisableResult, Page, PageInfo, Tunnel,
-    WorkerScript, WorkerSettings,
+    WorkerScript, WorkerSettings, ZoneIdentity,
 };
 use crate::config::{ApiTokenSource, CloudflareApiConfig};
 use mcp_toolkit_observability::sanitize_error_message;
@@ -253,6 +253,29 @@ impl CloudflareClient {
 
     pub fn default_zone_id(&self) -> Option<&str> {
         self.cfg.default_zone_id.as_deref()
+    }
+
+    pub async fn get_zone_identity(&self, zone_id: &str) -> Result<ZoneIdentity, AdapterError> {
+        let zone_id = require_non_empty("zone_id", zone_id)?;
+        let token = self.bearer_token()?;
+        let url = self.endpoint(&format!("/zones/{}", path_segment(zone_id)));
+
+        let envelope: CloudflareEnvelope<ZoneIdentity> = self
+            .send_envelope("cloudflare.zones.get", RetryPolicy::Idempotent, || {
+                self.http
+                    .get(url.clone())
+                    .bearer_auth(&token)
+                    .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone())
+            })
+            .await?;
+
+        envelope.result.ok_or_else(|| {
+            AdapterError::new(
+                "cloudflare.empty_result",
+                "Cloudflare returned success without a zone result payload",
+                "Inspect Cloudflare API response schema and ensure expected fields are present.",
+            )
+        })
     }
 
     pub async fn list_d1_databases(
@@ -2610,7 +2633,7 @@ fn d1_column_discovery_fidelity() -> Value {
 }
 
 fn path_segment(value: &str) -> String {
-    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+    aws_uri_encode(value, true)
 }
 
 fn null_as_default_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
@@ -2844,7 +2867,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{
-        AdapterError, CloudflareApiError, CloudflareClient, is_d1_sqlite_auth_error,
+        AdapterError, CloudflareApiError, CloudflareClient, is_d1_sqlite_auth_error, path_segment,
         with_request_api_token_override,
     };
     use crate::cloudflare::model::AccessPolicyWrite;
@@ -2889,6 +2912,11 @@ mod tests {
             let _ = axum::serve(listener, router).await;
         });
         format!("http://{}", addr)
+    }
+
+    #[test]
+    fn path_segment_encodes_separators() {
+        assert_eq!(path_segment("zone/one two"), "zone%2Fone%20two");
     }
 
     #[tokio::test]

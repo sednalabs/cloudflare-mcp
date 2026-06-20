@@ -716,6 +716,14 @@ pub struct CapabilitiesCheckArgs {
     pub account_id: Option<String>,
     #[serde(default)]
     pub zone_id: Option<String>,
+    #[serde(default)]
+    pub expected_account_id: Option<String>,
+    #[serde(default)]
+    pub expected_zone_id: Option<String>,
+    #[serde(default)]
+    pub expected_zone_name: Option<String>,
+    #[serde(default)]
+    pub require_explicit_zone_id: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -4135,16 +4143,151 @@ impl CloudflareMcp {
         &self,
         Parameters(args): Parameters<CapabilitiesCheckArgs>,
     ) -> Result<CallToolResult, crate::McpError> {
+        let account_id_source = resolved_identifier_source(
+            args.account_id.as_deref(),
+            self.default_account_id.as_deref(),
+        );
+        let zone_id_source =
+            resolved_identifier_source(args.zone_id.as_deref(), self.default_zone_id.as_deref());
         let account_id = resolve_account_id(self, args.account_id.as_deref())?;
         let zone_id = resolve_zone_id(self, args.zone_id.as_deref())?;
         let capabilities = self
             .cloudflare
             .check_capabilities(Some(account_id), Some(zone_id))
             .await;
+        let cloudflare_api_ok = capabilities
+            .iter()
+            .all(|probe| !capability_probe_blocks_preflight(probe));
+
+        let mut findings = Vec::new();
+        if !cloudflare_api_ok {
+            findings.push(json!({
+                "code": "cloudflare.capability_probe_failed",
+                "severity": "error",
+                "message": "One or more Cloudflare API capability probes failed.",
+            }));
+        }
+        if args.require_explicit_zone_id && zone_id_source != "argument" {
+            findings.push(json!({
+                "code": "target.zone_id_from_default",
+                "severity": "error",
+                "message": "zone_id came from CLOUDFLARE_MCP_DEFAULT_ZONE_ID while explicit zone targeting was required.",
+            }));
+        }
+        if let Some(expected_account_id) = normalized_non_empty(args.expected_account_id.as_deref())
+        {
+            if expected_account_id != account_id {
+                findings.push(json!({
+                    "code": "target.account_id_mismatch",
+                    "severity": "error",
+                    "expected": expected_account_id,
+                    "observed": account_id,
+                }));
+            }
+        }
+        if let Some(expected_zone_id) = normalized_non_empty(args.expected_zone_id.as_deref()) {
+            if expected_zone_id != zone_id {
+                findings.push(json!({
+                    "code": "target.zone_id_mismatch",
+                    "severity": "error",
+                    "expected": expected_zone_id,
+                    "observed": zone_id,
+                }));
+            }
+        }
+
+        let mut observed_zone_name = None;
+        let mut observed_zone_account_id = None;
+        let mut zone_identity_ok = false;
+        let zone_identity = match self.cloudflare.get_zone_identity(zone_id).await {
+            Ok(identity) => {
+                zone_identity_ok = true;
+                observed_zone_name = identity.name.clone();
+                observed_zone_account_id = identity
+                    .account
+                    .as_ref()
+                    .and_then(|account| account.id.clone());
+                json!({
+                    "checked": true,
+                    "ok": true,
+                    "id": identity.id,
+                    "name": identity.name,
+                    "account": identity.account,
+                })
+            }
+            Err(err) => {
+                if args.expected_zone_name.as_deref().is_some_and(|value| {
+                    normalized_zone_name(Some(value))
+                        .map(|normalized| !normalized.is_empty())
+                        .unwrap_or(false)
+                }) {
+                    findings.push(json!({
+                        "code": "target.zone_identity_unavailable",
+                        "severity": "error",
+                        "message": "Expected zone name was provided, but Cloudflare zone identity readback failed.",
+                    }));
+                }
+                json!({
+                    "checked": true,
+                    "ok": false,
+                    "error": err.payload(),
+                })
+            }
+        };
+        if let Some(zone_account_id) = observed_zone_account_id.as_deref() {
+            if zone_account_id != account_id {
+                findings.push(json!({
+                    "code": "target.zone_account_mismatch",
+                    "severity": "error",
+                    "message": "The effective zone belongs to a different account than the effective account_id.",
+                    "zone_account_id": zone_account_id,
+                    "account_id": account_id,
+                }));
+            }
+        }
+        if zone_identity_ok
+            && let Some(expected_zone_name) =
+                normalized_zone_name(args.expected_zone_name.as_deref())
+        {
+            let observed = observed_zone_name
+                .as_deref()
+                .and_then(|name| normalized_zone_name(Some(name)));
+            if observed.as_deref() != Some(expected_zone_name.as_str()) {
+                findings.push(json!({
+                    "code": "target.zone_name_mismatch",
+                    "severity": "error",
+                    "expected": expected_zone_name,
+                    "observed": observed_zone_name,
+                }));
+            }
+        }
+
+        let preflight_ok = findings.is_empty();
         Ok(CallToolResult::structured(json!({
-            "ok": true,
+            "ok": preflight_ok,
             "account_id": account_id,
             "zone_id": zone_id,
+            "preflight": {
+                "ok": preflight_ok,
+                "mcp": {
+                    "session_initialized": true,
+                    "tool_call_reached_handler": true,
+                    "auth_enabled": self.auth_enabled,
+                    "proof": "This payload is produced inside a normal MCP tools/call handler after initialize and tool-call dispatch."
+                },
+                "target": {
+                    "account_id": account_id,
+                    "account_id_source": account_id_source,
+                    "zone_id": zone_id,
+                    "zone_id_source": zone_id_source,
+                    "zone_identity": zone_identity,
+                },
+                "cloudflare_api": {
+                    "ok": cloudflare_api_ok,
+                    "probe_count": capabilities.len(),
+                },
+                "findings": findings,
+            },
             "capabilities": capabilities,
         })))
     }
@@ -7699,6 +7842,46 @@ fn resolve_zone_id<'a>(
                 None,
             )
         })
+}
+
+fn resolved_identifier_source(provided: Option<&str>, default: Option<&str>) -> &'static str {
+    if provided
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        "argument"
+    } else if default
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        "server_default"
+    } else {
+        "missing"
+    }
+}
+
+fn normalized_non_empty(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn normalized_zone_name(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .map(|value| value.trim_end_matches('.'))
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+fn capability_probe_blocks_preflight(probe: &crate::cloudflare::model::CapabilityProbe) -> bool {
+    if probe.code.as_deref() == Some("capability.not_probed_without_mutation") {
+        return false;
+    }
+    !probe.ok
 }
 
 fn adapter_error_result(err: crate::cloudflare::AdapterError) -> CallToolResult {
@@ -11607,7 +11790,7 @@ mod tests {
 
     use axum::extract::{Path, Query, State};
     use axum::http::{HeaderMap, Request, StatusCode};
-    use axum::routing::{get, post};
+    use axum::routing::{any, get, post};
     use axum::{Json, Router};
     use mcp_toolkit_auth::AuthContext;
     use mcp_toolkit_core::notifications::ToolListTracker;
@@ -11625,16 +11808,17 @@ mod tests {
         AccountApiTokenPermissionPlanArgs, AccountApiTokensArgs, AccountBillingUsageArgs,
         AnalyticsEngineListDatasetsArgs, AnalyticsEngineQueryArgs,
         AnalyticsEngineValidateQueryArgs, ApiFindOperationsArgs, ApiMutateArgs, ApiPrepareCallArgs,
-        ApiReadArgs, ApplyAccessAllowlistArgs, BindingsDiscoverArgs, CloudflareMcp,
-        ConnectorControlArgs, D1ApplyMigrationsArgs, D1InspectSchemaArgs, D1ListDatabasesArgs,
-        D1QueryArgs, D1ValidateQueryArgs, EmergencyUnpublishArgs, EnsureTunnelArgs, FindToolsArgs,
-        GenerateTunnelIngressArgs, GraphqlAnalyticsQueryArgs, LockFirstPublishArgs,
-        PagesDeploymentActionArgs, PagesUpdateProjectArgs, PatchWorkerSettingsArgs,
-        PortalAgentRequestArgs, QueueHealthArgs, UpsertAccessAppArgs, UpsertDnsCnameArgs,
-        VerifyHttpGateArgs, WafEventFilterInput, WafTimeWindow, WorkersObservabilityListKeysArgs,
-        WorkersObservabilityListValuesArgs, WorkersObservabilityQueryEventsArgs,
-        WorkersObservabilityTimeframe, build_waf_security_events_query, normalize_waf_group_by,
-        normalize_waf_phases, query_mentions_waf, waf_security_events_filter,
+        ApiReadArgs, ApplyAccessAllowlistArgs, BindingsDiscoverArgs, CapabilitiesCheckArgs,
+        CloudflareMcp, ConnectorControlArgs, D1ApplyMigrationsArgs, D1InspectSchemaArgs,
+        D1ListDatabasesArgs, D1QueryArgs, D1ValidateQueryArgs, EmergencyUnpublishArgs,
+        EnsureTunnelArgs, FindToolsArgs, GenerateTunnelIngressArgs, GraphqlAnalyticsQueryArgs,
+        LockFirstPublishArgs, PagesDeploymentActionArgs, PagesUpdateProjectArgs,
+        PatchWorkerSettingsArgs, PortalAgentRequestArgs, QueueHealthArgs, UpsertAccessAppArgs,
+        UpsertDnsCnameArgs, VerifyHttpGateArgs, WafEventFilterInput, WafTimeWindow,
+        WorkersObservabilityListKeysArgs, WorkersObservabilityListValuesArgs,
+        WorkersObservabilityQueryEventsArgs, WorkersObservabilityTimeframe,
+        build_waf_security_events_query, normalize_waf_group_by, normalize_waf_phases,
+        query_mentions_waf, waf_security_events_filter,
     };
     use crate::cloudflare::CloudflareClient;
     use crate::config::PortalAgentConfig;
@@ -11767,6 +11951,82 @@ mod tests {
         let snapshot_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("spec/tool_schema_snapshot.v1.json");
         assert_tool_schema_snapshot(snapshot_path, &tools);
+    }
+
+    #[tokio::test]
+    async fn capabilities_check_reports_mcp_boundary_and_zone_name_drift() {
+        async fn zone_identity() -> Json<Value> {
+            Json(json!({
+                "success": true,
+                "errors": [],
+                "messages": [],
+                "result": {
+                    "id": "zone-1",
+                    "name": "example.com",
+                    "account": {
+                        "id": "acct-1",
+                        "name": "Example Account"
+                    }
+                }
+            }))
+        }
+
+        async fn ok_envelope() -> Json<Value> {
+            Json(json!({
+                "success": true,
+                "errors": [],
+                "messages": [],
+                "result": {}
+            }))
+        }
+
+        let router = Router::new()
+            .route("/zones/zone-1", get(zone_identity))
+            .fallback(any(ok_envelope));
+        let base_url = spawn_router(router).await;
+        let server = test_server(base_url);
+
+        let result = server
+            .cloudflare_capabilities_check(Parameters(CapabilitiesCheckArgs {
+                account_id: None,
+                zone_id: None,
+                expected_account_id: Some("acct-1".to_string()),
+                expected_zone_id: Some("zone-1".to_string()),
+                expected_zone_name: Some("sednalabs.io".to_string()),
+                require_explicit_zone_id: true,
+            }))
+            .await
+            .expect("capabilities check");
+
+        let payload = result.structured_content.expect("structured payload");
+        assert_eq!(payload["ok"], json!(false));
+        assert_eq!(
+            payload["preflight"]["mcp"]["tool_call_reached_handler"],
+            json!(true)
+        );
+        assert_eq!(
+            payload["preflight"]["target"]["zone_id_source"],
+            json!("server_default")
+        );
+        assert_eq!(
+            payload["preflight"]["target"]["zone_identity"]["name"],
+            json!("example.com")
+        );
+        assert_eq!(payload["preflight"]["cloudflare_api"]["ok"], json!(true));
+
+        let findings = payload["preflight"]["findings"]
+            .as_array()
+            .expect("findings");
+        assert!(
+            findings
+                .iter()
+                .any(|finding| { finding["code"] == json!("target.zone_id_from_default") })
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| { finding["code"] == json!("target.zone_name_mismatch") })
+        );
     }
 
     #[test]

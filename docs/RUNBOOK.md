@@ -146,6 +146,27 @@ For account/API endpoints such as `https://mcp.cloudflare.com/mcp` or
 is an acceptable pre-auth smoke result. The next proof must be an authorized
 read-only MCP call through the target client or an allowlisted probe profile.
 
+For this self-hosted server in Streamable HTTP mode, distinguish MCP auth
+readiness from Cloudflare API capability readiness:
+
+```text
+mcp_probe probe_http_smoke url=http://127.0.0.1:9501/mcp expect_auth_required=true
+mcp_probe probe_handshake transport=streamable-http url=http://127.0.0.1:9501/mcp expect_auth_required=true
+```
+
+Those checks prove the HTTP/OAuth metadata and unauthenticated challenge shape.
+They do not prove a logged-in MCP client. The first authenticated pre-mutation
+tool call should be:
+
+```text
+tools/call name=capabilities_check arguments='{"account_id":"<account_id>","zone_id":"<zone_id>","expected_zone_name":"<zone_name>","require_explicit_zone_id":true}'
+```
+
+Treat `preflight.ok=false` as a stop condition until every entry in
+`preflight.findings` is understood. In particular, `target.zone_id_from_default`
+means the workflow is relying on `CLOUDFLARE_MCP_DEFAULT_ZONE_ID`; pass the
+intended zone explicitly for DNS, Pages, Access, Worker, and publish work.
+
 Capture current state before mutation:
 
 ```text

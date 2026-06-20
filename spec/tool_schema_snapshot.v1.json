@@ -1374,6 +1374,31 @@
               "null"
             ]
           },
+          "expected_account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expected_zone_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expected_zone_name": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "require_explicit_zone_id": {
+            "default": false,
+            "type": "boolean"
+          },
           "zone_id": {
             "default": null,
             "type": [
