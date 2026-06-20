@@ -1,0 +1,111 @@
+# Example Codex MCP profile for using Sedna's guarded Cloudflare operator MCP
+# beside Cloudflare's official managed MCP servers.
+#
+# Copy only the servers that match the operator's task. Do not enable every
+# managed endpoint by default: each one creates a separate authorization surface
+# and may request different Cloudflare permissions during OAuth.
+
+[mcp_servers.cloudflare-mcp]
+# Local guarded operator path for dry-run/apply/readback workflows.
+#
+# Replace this with the promoted binary path for the target host. Stdio keeps
+# credential custody local and avoids exposing the server on a network socket.
+command = "/opt/cloudflare-mcp/current/cloudflare-mcp"
+args = ["--stdio"]
+startup_timeout_sec = 30.0
+tool_timeout_sec = 300.0
+env_vars = [
+  "CLOUDFLARE_MCP_API_TOKEN",
+  "CLOUDFLARE_MCP_DEFAULT_ACCOUNT_ID",
+  "CLOUDFLARE_MCP_DEFAULT_ZONE_ID",
+]
+
+[mcp_servers.cloudflare-mcp.env]
+CLOUDFLARE_MCP_AUTH_MODE = "off"
+
+[mcp_servers.cloudflare-api]
+# Cloudflare Code Mode API MCP. Use for broad endpoint discovery and current
+# API reach, then move production-affecting guarded apply workflows back to the
+# local cloudflare-mcp when policy gates, confirmation tokens, or readback are
+# required.
+url = "https://mcp.cloudflare.com/mcp"
+startup_timeout_sec = 30.0
+tool_timeout_sec = 300.0
+
+[mcp_servers.cloudflare-docs]
+# Public documentation/search surface. This endpoint is safe to prefer for
+# current Cloudflare docs and Agents SDK questions before falling back to broad
+# web search.
+url = "https://docs.mcp.cloudflare.com/mcp"
+startup_timeout_sec = 30.0
+tool_timeout_sec = 120.0
+
+[mcp_servers.cloudflare-agents-docs]
+url = "https://agents.cloudflare.com/mcp"
+startup_timeout_sec = 30.0
+tool_timeout_sec = 120.0
+
+[mcp_servers.cloudflare-bindings]
+url = "https://bindings.mcp.cloudflare.com/mcp"
+startup_timeout_sec = 30.0
+tool_timeout_sec = 300.0
+
+[mcp_servers.cloudflare-builds]
+url = "https://builds.mcp.cloudflare.com/mcp"
+startup_timeout_sec = 30.0
+tool_timeout_sec = 300.0
+
+[mcp_servers.cloudflare-observability]
+url = "https://observability.mcp.cloudflare.com/mcp"
+startup_timeout_sec = 30.0
+tool_timeout_sec = 300.0
+
+[mcp_servers.cloudflare-radar]
+url = "https://radar.mcp.cloudflare.com/mcp"
+startup_timeout_sec = 30.0
+tool_timeout_sec = 300.0
+
+[mcp_servers.cloudflare-browser]
+url = "https://browser.mcp.cloudflare.com/mcp"
+startup_timeout_sec = 30.0
+tool_timeout_sec = 300.0
+
+[mcp_servers.cloudflare-logs]
+url = "https://logs.mcp.cloudflare.com/mcp"
+startup_timeout_sec = 30.0
+tool_timeout_sec = 300.0
+
+[mcp_servers.cloudflare-ai-gateway]
+url = "https://ai-gateway.mcp.cloudflare.com/mcp"
+startup_timeout_sec = 30.0
+tool_timeout_sec = 300.0
+
+[mcp_servers.cloudflare-autorag]
+url = "https://autorag.mcp.cloudflare.com/mcp"
+startup_timeout_sec = 30.0
+tool_timeout_sec = 300.0
+
+[mcp_servers.cloudflare-auditlogs]
+url = "https://auditlogs.mcp.cloudflare.com/mcp"
+startup_timeout_sec = 30.0
+tool_timeout_sec = 300.0
+
+[mcp_servers.cloudflare-dns-analytics]
+url = "https://dns-analytics.mcp.cloudflare.com/mcp"
+startup_timeout_sec = 30.0
+tool_timeout_sec = 300.0
+
+[mcp_servers.cloudflare-dex]
+url = "https://dex.mcp.cloudflare.com/mcp"
+startup_timeout_sec = 30.0
+tool_timeout_sec = 300.0
+
+[mcp_servers.cloudflare-casb]
+url = "https://casb.mcp.cloudflare.com/mcp"
+startup_timeout_sec = 30.0
+tool_timeout_sec = 300.0
+
+[mcp_servers.cloudflare-graphql]
+url = "https://graphql.mcp.cloudflare.com/mcp"
+startup_timeout_sec = 30.0
+tool_timeout_sec = 300.0

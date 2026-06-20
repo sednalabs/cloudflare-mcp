@@ -11,6 +11,10 @@ Last verified against Cloudflare's managed MCP server documentation on
 - `https://github.com/cloudflare/mcp`
 - `https://github.com/cloudflare/mcp-server-cloudflare`
 
+Codex/agent profile template:
+
+- `packaging/codex/cloudflare-managed-mcp.example.toml`
+
 ## Default Decision Rules
 
 Use this server first when the task needs one of its curated workflows:
@@ -59,6 +63,54 @@ documents the local developer workflow around that CLI:
 | Browser rendering | Browser Run managed MCP | Cloudflare REST API only when a guarded local workflow exists |
 | Audit logs, Logpush, DNS Analytics, Radar | Matching managed MCP server | Official API MCP for one-off endpoint reach |
 | Current Cloudflare docs or schema discovery | Cloudflare Docs managed MCP, Code Mode API MCP | Local `api_find_operations` for committed REST catalog checks |
+
+## Managed MCP Profile Set
+
+Use the checked-in profile template to place official Cloudflare MCPs beside
+this server in an agent profile. Enable only the endpoints needed for the
+current operator lane:
+
+| Profile key | Managed endpoint | Prefer for |
+| --- | --- | --- |
+| `cloudflare-api` | `https://mcp.cloudflare.com/mcp` | Broad current Cloudflare API discovery through Code Mode `search()` and `execute()` |
+| `cloudflare-docs` | `https://docs.mcp.cloudflare.com/mcp` | Current Cloudflare reference docs |
+| `cloudflare-agents-docs` | `https://agents.cloudflare.com/mcp` | Agents SDK docs and MCP protocol guidance |
+| `cloudflare-bindings` | `https://bindings.mcp.cloudflare.com/mcp` | Workers bindings, storage, AI, and compute primitive exploration |
+| `cloudflare-builds` | `https://builds.mcp.cloudflare.com/mcp` | Workers Builds insight and management |
+| `cloudflare-observability` | `https://observability.mcp.cloudflare.com/mcp` | Workers logs and analytics exploration |
+| `cloudflare-radar` | `https://radar.mcp.cloudflare.com/mcp` | Internet traffic trends, URL scans, and Radar utilities |
+| `cloudflare-browser` | `https://browser.mcp.cloudflare.com/mcp` | Browser rendering, page fetches, markdown conversion, and screenshots |
+| `cloudflare-logs` | `https://logs.mcp.cloudflare.com/mcp` | Logpush job health summaries |
+| `cloudflare-ai-gateway` | `https://ai-gateway.mcp.cloudflare.com/mcp` | AI Gateway logs and prompt/response lookup |
+| `cloudflare-autorag` | `https://autorag.mcp.cloudflare.com/mcp` | AI Search and AutoRAG document search |
+| `cloudflare-auditlogs` | `https://auditlogs.mcp.cloudflare.com/mcp` | Audit log queries and reports |
+| `cloudflare-dns-analytics` | `https://dns-analytics.mcp.cloudflare.com/mcp` | DNS performance and troubleshooting analytics |
+| `cloudflare-dex` | `https://dex.mcp.cloudflare.com/mcp` | Digital Experience Monitoring insight |
+| `cloudflare-casb` | `https://casb.mcp.cloudflare.com/mcp` | Cloudflare One CASB misconfiguration review |
+| `cloudflare-graphql` | `https://graphql.mcp.cloudflare.com/mcp` | Cloudflare GraphQL analytics exploration |
+
+## Auth And Smoke Expectations
+
+Cloudflare's managed MCPs use Streamable HTTP at `/mcp`. Interactive clients
+should authorize with OAuth and grant the narrowest permissions needed for the
+task. Automation can pass a Cloudflare bearer token with the required scopes in
+the `Authorization` header, but this repository does not check tokens into
+profile templates.
+
+The managed endpoints are not proof of authorization until an MCP client has
+completed OAuth or attached an appropriate bearer token. On 2026-06-20,
+unauthenticated JSON-RPC `initialize` smoke checks returned:
+
+- `https://docs.mcp.cloudflare.com/mcp`: `200 text/event-stream`, initialized.
+- `https://mcp.cloudflare.com/mcp`: `401 invalid_token`.
+- `https://graphql.mcp.cloudflare.com/mcp`: `401 invalid_token`.
+- `https://auditlogs.mcp.cloudflare.com/mcp`: `401 invalid_token`.
+
+That is expected: the docs endpoint can answer public documentation requests,
+while account/API endpoints require Cloudflare authorization before read-only
+tool calls will succeed. Local `mcp-probe` may also reject these public hosts if
+its allowlist does not include them; in that case use an allowlisted probe
+profile or a direct JSON-RPC `initialize` smoke with no credentials.
 
 ## Guardrails
 
