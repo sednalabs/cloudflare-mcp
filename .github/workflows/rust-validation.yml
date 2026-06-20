@@ -35,3 +35,25 @@ jobs:
           count=$(CLOUDFLARE_MCP_AUTH_MODE=off cargo run -- --print-tools | jq length)
           test "$count" -ge 80
           echo "tool_count=$count"
+
+      - name: Release provenance manifest
+        run: |
+          set -euo pipefail
+          cargo build --release
+          scripts/generate-release-provenance.sh \
+            --binary target/release/cloudflare-mcp \
+            --output .tmp/release-provenance.json
+          jq -e '
+            .source.repository == "sednalabs/cloudflare-mcp" and
+            .source.commit == env.GITHUB_SHA and
+            .source.dirty == false and
+            .binary.sha256 != "" and
+            .binary.size_bytes > 0 and
+            .tools.count >= 80 and
+            .tools.inventory_sha256 != "" and
+            .contracts.tool_schema_snapshot_sha256 != "" and
+            .contracts.cloudflare_api_catalog_sha256 != "" and
+            .dependencies.mcp_toolkit_rs_revision != ""
+          ' .tmp/release-provenance.json >/dev/null
+          jq '{source, binary: {sha256: .binary.sha256, size_bytes: .binary.size_bytes}, tools, contracts, dependencies}' \
+            .tmp/release-provenance.json

@@ -9,6 +9,8 @@ Companion docs:
 - [SECURITY_MODEL.md](SECURITY_MODEL.md): safety controls and auth model.
 - [CLIENT-CONTRACT.md](CLIENT-CONTRACT.md): exact MCP request and tool argument
   contract.
+- [AGENT_ROUTING.md](AGENT_ROUTING.md): agent-facing routing between this
+  operator MCP, Cloudflare managed MCP servers, and Cloudflare-documented CLIs.
 - [API-PARITY.md](API-PARITY.md): generic Cloudflare REST API parity model.
 
 ## Preconditions
@@ -38,7 +40,12 @@ For release binaries, verify the promoted binary rather than only the source
 tree:
 
 ```bash
+CLOUDFLARE_MCP_AUTH_MODE=off cargo build --release
 CLOUDFLARE_MCP_AUTH_MODE=off target/release/cloudflare-mcp --print-tools
+scripts/generate-release-provenance.sh \
+  --binary target/release/cloudflare-mcp \
+  --output .tmp/release-provenance.json
+jq . .tmp/release-provenance.json
 ```
 
 If an existing `cloudflare-mcp --stdio` process is already serving traffic,
@@ -51,6 +58,19 @@ pgrep -af 'cloudflare-mcp.*--stdio'
 readlink -f /proc/<pid>/exe
 sha256sum /proc/<pid>/exe target/release/cloudflare-mcp
 ```
+
+The provenance manifest is secret-free. It records the source commit, dirty
+state, binary SHA-256 and size, registered tool count, normalized tool inventory
+hash, committed schema/catalog hashes, and pinned `mcp-toolkit-rs` revision.
+Treat it as the release note for an installed binary. For a promoted symlink or
+versioned install directory, keep the manifest beside the binary or in the
+release artifact bundle so agents can compare:
+
+- source commit versus repository `main` or the release tag,
+- binary SHA-256 versus the installed file,
+- tool count and inventory hash versus `--print-tools`,
+- schema snapshot hash versus `spec/tool_schema_snapshot.v1.json`,
+- `/proc/<pid>/exe` hash for any already-running stdio process.
 
 ## Safety Profiles
 

@@ -29,6 +29,8 @@ Use this workflow for intentional tool-surface changes:
 4. Re-run full validation:
    - `cargo test`
    - `cargo test --test mcp_stdio_smoke`
+   - `cargo build --release`
+   - `scripts/generate-release-provenance.sh --binary target/release/cloudflare-mcp --output .tmp/release-provenance.json`
 5. Review snapshot diff and ensure it matches the intended API change before merge.
 
 This keeps accidental tool schema drift out of CI while allowing explicit, reviewed updates.
@@ -47,6 +49,12 @@ When changing generic API parity behavior, update:
 - `../docs/API-PARITY.md` for parity policy and workflow changes.
 - `../tests/mcp_stdio_smoke.rs` when behavior depends on MCP argument extraction,
   arbitrary JSON bodies, dry-run planning, or stdio context.
+
+The release provenance manifest complements the schema snapshot. The snapshot
+proves the committed tool schemas; the manifest ties a built binary to the
+source commit, normalized `--print-tools` inventory hash, schema/catalog hashes,
+binary SHA-256, and pinned `mcp-toolkit-rs` revision. Use both before relying on
+an installed binary for production-like operations.
 
 Generic REST executor path parameters are derived from the URL template in
 addition to the compact catalog's `path_params` field. If a generated catalog
