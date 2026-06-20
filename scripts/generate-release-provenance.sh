@@ -71,7 +71,10 @@ tool_inventory_json="$(mktemp)"
 normalized_tool_inventory_json="$(mktemp)"
 trap 'rm -f "$tool_inventory_json" "$normalized_tool_inventory_json"' EXIT
 
-CLOUDFLARE_MCP_AUTH_MODE=off "$binary_realpath" --print-tools > "$tool_inventory_json"
+if ! CLOUDFLARE_MCP_AUTH_MODE=off "$binary_realpath" --print-tools > "$tool_inventory_json"; then
+  echo "failed to execute binary with --print-tools: $binary_realpath" >&2
+  exit 1
+fi
 jq -e 'type == "array" and all(.[]; type == "string")' "$tool_inventory_json" >/dev/null
 jq -cS 'sort' "$tool_inventory_json" > "$normalized_tool_inventory_json"
 tool_count="$(jq 'length' "$normalized_tool_inventory_json")"
