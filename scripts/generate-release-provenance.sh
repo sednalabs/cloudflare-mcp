@@ -81,7 +81,6 @@ schema_snapshot_sha256="$(sha256sum spec/tool_schema_snapshot.v1.json | awk '{pr
 api_catalog_sha256="$(sha256sum spec/cloudflare_api_catalog.v1.json | awk '{print $1}')"
 toolkit_revision="$(
   grep -E -m 1 'rev = "[0-9a-f]+"' Cargo.toml |
-    head -n 1 |
     sed -E 's/.*"([0-9a-f]+)".*/\1/'
 )"
 
