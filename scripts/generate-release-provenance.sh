@@ -85,6 +85,11 @@ toolkit_revision="$(
     sed -E 's/.*"([0-9a-f]+)".*/\1/'
 )"
 
+if [[ -z "$toolkit_revision" ]]; then
+  echo "failed to extract mcp-toolkit-rs revision from Cargo.toml" >&2
+  exit 1
+fi
+
 manifest="$(
   jq -n \
     --arg generated_at "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
