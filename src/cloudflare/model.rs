@@ -3,12 +3,20 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-fn null_to_default_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+fn null_as_default_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
 {
     Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn null_to_default_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    null_as_default_vec(deserializer)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
