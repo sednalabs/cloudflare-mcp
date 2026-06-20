@@ -490,6 +490,46 @@ pub fn plan_patch_worker_settings(
         )
 }
 
+pub fn plan_upload_worker_script(
+    account_id: &str,
+    script_name: &str,
+    upload: Value,
+) -> MutationPlan {
+    MutationPlan::new("workers_upload_script")
+        .step(
+            "prepare_worker_script_upload",
+            false,
+            json!({
+                "account_id": account_id,
+                "script_name": script_name,
+                "upload": upload,
+            }),
+        )
+        .step(
+            "upload_worker_script",
+            true,
+            json!({
+                "account_id": account_id,
+                "script_name": script_name,
+            }),
+        )
+        .step(
+            "readback_worker_settings",
+            false,
+            json!({
+                "account_id": account_id,
+                "script_name": script_name,
+            }),
+        )
+        .step(
+            "verify_worker_upload_readback",
+            false,
+            json!({
+                "script_name": script_name,
+            }),
+        )
+}
+
 pub fn plan_cache_mutation(operation: &'static str, zone_id: &str, target: Value) -> MutationPlan {
     MutationPlan::new(operation)
         .step(

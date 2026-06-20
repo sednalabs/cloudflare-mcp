@@ -253,6 +253,7 @@ pub fn search_operations(filter: ApiOperationSearch<'_>) -> Vec<ApiOperationSear
 }
 
 pub fn operation_detail(operation: &ApiOperation) -> Value {
+    let path_params = path_parameter_names(operation);
     json!({
         "operation_id": operation.operation_id,
         "method": operation.method,
@@ -262,7 +263,8 @@ pub fn operation_detail(operation: &ApiOperation) -> Value {
         "deprecated": operation.deprecated,
         "scope": operation.scope,
         "risk": operation.risk,
-        "path_params": operation.path_params,
+        "path_params": path_params,
+        "catalog_path_params": operation.path_params,
         "query_params": operation.query_params,
         "required_query_params": operation.required_query_params,
         "has_request_body": operation.has_request_body,
@@ -270,12 +272,22 @@ pub fn operation_detail(operation: &ApiOperation) -> Value {
         "executor": if operation.method.eq_ignore_ascii_case("GET") { "api_read" } else { "api_mutate" },
         "call_template": {
             "operation_id": operation.operation_id,
-            "path_params": template_params(&operation.path_params),
+            "path_params": template_params(&path_params),
             "query": {},
             "body": operation.has_request_body.then_some(json!({})),
             "dry_run": (!operation.method.eq_ignore_ascii_case("GET")).then_some(true),
         }
     })
+}
+
+pub fn path_parameter_names(operation: &ApiOperation) -> Vec<String> {
+    let mut names = operation.path_params.clone();
+    for name in path_template_parameter_names(&operation.path) {
+        if !names.iter().any(|existing| existing == &name) {
+            names.push(name);
+        }
+    }
+    names
 }
 
 pub fn render_path(
@@ -285,18 +297,33 @@ pub fn render_path(
     default_zone_id: Option<&str>,
 ) -> Result<String, ApiCatalogError> {
     let mut rendered = operation.path.clone();
-    for name in &operation.path_params {
+    for (name, value) in
+        resolved_path_params(operation, path_params, default_account_id, default_zone_id)?
+    {
+        rendered = rendered.replace(&format!("{{{name}}}"), &encode_path_segment(&value));
+    }
+    Ok(rendered)
+}
+
+pub fn resolved_path_params(
+    operation: &ApiOperation,
+    path_params: &BTreeMap<String, String>,
+    default_account_id: Option<&str>,
+    default_zone_id: Option<&str>,
+) -> Result<BTreeMap<String, String>, ApiCatalogError> {
+    let mut resolved = BTreeMap::new();
+    for name in path_parameter_names(operation) {
         let value = path_params
-            .get(name)
+            .get(&name)
             .map(String::as_str)
-            .or_else(|| default_param(name, default_account_id, default_zone_id))
+            .or_else(|| default_param(&name, default_account_id, default_zone_id))
             .ok_or_else(|| ApiCatalogError::MissingPathParam(name.clone()))?;
         if value.trim().is_empty() {
             return Err(ApiCatalogError::MissingPathParam(name.clone()));
         }
-        rendered = rendered.replace(&format!("{{{name}}}"), &encode_path_segment(value));
+        resolved.insert(name, value.to_string());
     }
-    Ok(rendered)
+    Ok(resolved)
 }
 
 pub fn validate_required_query(
@@ -376,6 +403,30 @@ fn operation_search_text(operation: &ApiOperation) -> String {
         operation.summary.as_deref().unwrap_or_default()
     )
     .to_ascii_lowercase()
+}
+
+fn path_template_parameter_names(path: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut remaining = path;
+    while let Some(open) = remaining.find('{') {
+        let after_open = &remaining[open + 1..];
+        let Some(close) = after_open.find('}') else {
+            break;
+        };
+        let name = after_open[..close].trim();
+        if is_valid_path_template_name(name) && !names.iter().any(|existing| existing == name) {
+            names.push(name.to_string());
+        }
+        remaining = &after_open[close + 1..];
+    }
+    names
+}
+
+fn is_valid_path_template_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
 }
 
 fn template_params(names: &[String]) -> BTreeMap<String, String> {
@@ -631,6 +682,56 @@ mod tests {
             render_path(&operation, &BTreeMap::new(), None, Some("zone-1")).unwrap(),
             "/zones/zone-1/dns_records"
         );
+    }
+
+    #[test]
+    fn render_path_derives_placeholders_from_template_when_catalog_metadata_is_empty() {
+        let operation = ApiOperation {
+            operation_id: "test-paygo".to_string(),
+            method: "GET".to_string(),
+            path: "/accounts/{account_id}/paygo-usage".to_string(),
+            tag: "Billable Usage".to_string(),
+            summary: None,
+            deprecated: false,
+            scope: ApiScope::Account,
+            risk: ApiRisk::Read,
+            path_params: Vec::new(),
+            query_params: Vec::new(),
+            required_query_params: Vec::new(),
+            has_request_body: false,
+            preferred_tool: None,
+        };
+
+        assert_eq!(
+            path_parameter_names(&operation),
+            vec!["account_id".to_string()]
+        );
+        assert_eq!(
+            render_path(&operation, &BTreeMap::new(), Some("acct-1"), None).unwrap(),
+            "/accounts/acct-1/paygo-usage"
+        );
+        assert_eq!(
+            operation_detail(&operation)["call_template"]["path_params"]["account_id"],
+            json!("<account_id>")
+        );
+    }
+
+    #[test]
+    fn paygo_usage_catalog_path_matches_current_cloudflare_api_docs() {
+        let operation =
+            find_operation("billable-usage-get-paygo-account-usage").expect("paygo operation");
+
+        assert_eq!(operation.path, "/accounts/{account_id}/paygo-usage");
+        assert_eq!(
+            path_parameter_names(operation),
+            vec!["account_id".to_string()]
+        );
+        assert_eq!(
+            operation.preferred_tool.as_deref(),
+            Some("account_billing_usage")
+        );
+        assert!(operation.query_params.iter().any(|name| name == "from"));
+        assert!(operation.query_params.iter().any(|name| name == "to"));
     }
 
     #[test]

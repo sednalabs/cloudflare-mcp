@@ -50,6 +50,80 @@
       "name": "access_verify_hostname_gate"
     },
     {
+      "description": "Read-only planner for account API token permission changes. Fetches current token/catalog state, computes add/remove deltas, and returns a safe account_api_tokens update dry-run payload without mutating Cloudflare.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "add_permissions": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "current_token": {
+            "default": null
+          },
+          "include_catalog": {
+            "default": false,
+            "type": "boolean"
+          },
+          "max_bytes": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "permission_groups": {
+            "default": null
+          },
+          "policy_index": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reason": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "remove_permissions": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "token_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "AccountApiTokenPermissionPlanArgs",
+        "type": "object"
+      },
+      "name": "account_api_token_permission_plan"
+    },
+    {
       "description": "Curated account-owned API token management: list permission groups, list/get/verify tokens, and guarded create/update/delete/roll actions.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -114,6 +188,61 @@
         "type": "object"
       },
       "name": "account_api_tokens"
+    },
+    {
+      "description": "Read account billable usage from Cloudflare billing REST endpoints. Use mode=paygo for PayGo usage or mode=billable_usage for the restricted v2 usage endpoint.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "from": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_bytes": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "metric": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "to": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "AccountBillingUsageArgs",
+        "type": "object"
+      },
+      "name": "account_billing_usage"
     },
     {
       "description": "Describe Workers Analytics Engine dataset schema hints, including canonical blob/double/index columns.",
@@ -1872,7 +2001,7 @@
       "name": "ensure_tunnel"
     },
     {
-      "description": "Search Cloudflare MCP tools by keyword, group, and read-only status for deferred-loading clients.",
+      "description": "Search Cloudflare MCP tools by keyword, group, and read-only status. Use this for non-hosted deferred-loading clients, or to produce a narrow OpenAI allowed_tools list before loading full schemas.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
@@ -2004,6 +2133,37 @@
         "type": "object"
       },
       "name": "get_worker_settings"
+    },
+    {
+      "description": "Run a read-only Cloudflare Analytics GraphQL query against /client/v4/graphql for product analytics such as D1 usage attribution.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "max_bytes": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "query": {
+            "type": "string"
+          },
+          "variables": {
+            "additionalProperties": true,
+            "default": {},
+            "type": "object"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "title": "GraphqlAnalyticsQueryArgs",
+        "type": "object"
+      },
+      "name": "graphql_analytics_query"
     },
     {
       "description": "Return cloudflare-mcp runtime health summary.",
@@ -3352,6 +3512,269 @@
       "name": "verify_http_gate"
     },
     {
+      "description": "Look up a WAF rule in current Rulesets and query recent Security Events for that rule id in one compact response.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "include_query": {
+            "default": false,
+            "type": "boolean"
+          },
+          "include_raw": {
+            "default": false,
+            "type": "boolean"
+          },
+          "max_bytes": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "phases": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "rule_id": {
+            "type": "string"
+          },
+          "sample_limit": {
+            "default": 10,
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "scope": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "since": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "until": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "window_hours": {
+            "default": 24,
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "zone_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "rule_id"
+        ],
+        "title": "WafRuleActivityArgs",
+        "type": "object"
+      },
+      "name": "waf_rule_activity"
+    },
+    {
+      "description": "Read WAF custom, managed, and rate-limit Rulesets entrypoints at zone or account scope with compact rule summaries.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "include_raw": {
+            "default": false,
+            "type": "boolean"
+          },
+          "include_rules": {
+            "default": true,
+            "type": "boolean"
+          },
+          "max_bytes": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "phases": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "scope": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "zone_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "WafRulesetSummaryArgs",
+        "type": "object"
+      },
+      "name": "waf_ruleset_summary"
+    },
+    {
+      "description": "Run a curated Cloudflare Analytics GraphQL Security Events query over firewallEventsAdaptive with grouped WAF evidence and recent samples.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "action": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "client_ip": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "group_by": {
+            "default": [
+              "action",
+              "source",
+              "host",
+              "path",
+              "country",
+              "hour"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "host": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "include_query": {
+            "default": false,
+            "type": "boolean"
+          },
+          "limit": {
+            "default": 20,
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_bytes": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "path": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rule_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sample_limit": {
+            "default": 10,
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "since": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "until": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "window_hours": {
+            "default": 24,
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "zone_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "WafSecurityEventsSummaryArgs",
+        "type": "object"
+      },
+      "name": "waf_security_events_summary"
+    },
+    {
       "description": "Get Cloudflare Worker script settings.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3457,6 +3880,21 @@
               "null"
             ]
           },
+          "datasets": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "filters": {
+            "default": [],
+            "items": true,
+            "type": "array"
+          },
+          "keyNeedle": {
+            "default": null
+          },
           "limit": {
             "default": null,
             "format": "uint32",
@@ -3474,6 +3912,9 @@
               "integer",
               "null"
             ]
+          },
+          "needle": {
+            "default": null
           },
           "script_name": {
             "default": null,
@@ -3531,6 +3972,18 @@
               "null"
             ]
           },
+          "datasets": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "filters": {
+            "default": [],
+            "items": true,
+            "type": "array"
+          },
           "key": {
             "type": "string"
           },
@@ -3551,6 +4004,9 @@
               "integer",
               "null"
             ]
+          },
+          "needle": {
+            "default": null
           },
           "script_name": {
             "default": null,
@@ -3618,6 +4074,25 @@
               "null"
             ]
           },
+          "datasets": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "dry": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "filters": {
+            "default": [],
+            "items": true,
+            "type": "array"
+          },
           "limit": {
             "default": null,
             "format": "uint32",
@@ -3636,6 +4111,9 @@
               "null"
             ]
           },
+          "needle": {
+            "default": null
+          },
           "query_id": {
             "default": null,
             "type": [
@@ -3644,7 +4122,11 @@
             ]
           },
           "script_name": {
-            "type": "string"
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "timeframe": {
             "anyOf": [
@@ -3655,15 +4137,106 @@
                 "type": "null"
               }
             ]
+          },
+          "view": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "WorkersObservabilityQueryEventsArgs",
+        "type": "object"
+      },
+      "name": "workers_observability_query_events"
+    },
+    {
+      "description": "Upload a Cloudflare Worker module script or prebuilt multipart bundle with dry-run planning, confirmation-token apply, and settings readback.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "confirmation_token": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "content_type": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "main_module": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {
+            "default": {}
+          },
+          "multipart_path": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "script_content": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "script_content_base64": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "script_name": {
+            "type": "string"
+          },
+          "script_path": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
           "script_name"
         ],
-        "title": "WorkersObservabilityQueryEventsArgs",
+        "title": "WorkersUploadScriptArgs",
         "type": "object"
       },
-      "name": "workers_observability_query_events"
+      "name": "workers_upload_script"
     }
   ],
   "version": 1

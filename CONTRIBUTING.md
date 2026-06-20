@@ -9,7 +9,17 @@ patterns where they genuinely belong.
 
 ## Development Setup
 
-Use the workspace layout described in [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md):
+For normal development, a fresh clone is enough. The Toolkit crates are pinned
+as public git dependencies in `Cargo.toml`, so the standard Cargo workflow does
+not require a sibling checkout:
+
+```bash
+cargo build
+```
+
+If you are changing reusable Toolkit primitives at the same time, use a sibling
+checkout and temporarily point Cargo at that local tree for the duration of the
+Toolkit work:
 
 ```text
 workspace/
@@ -17,12 +27,6 @@ workspace/
     cloudflare-mcp/
   toolkits/
     mcp-toolkit-rs/
-```
-
-Then run:
-
-```bash
-cargo build
 ```
 
 ## Change Guidelines

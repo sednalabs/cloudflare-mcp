@@ -25,8 +25,8 @@ preferred path for safety-sensitive operations.
   `analytics_engine_list_datasets`, `analytics_engine_describe_schema`,
   `analytics_engine_validate_query`, and `analytics_engine_query`; R2
   S3-compatible object access uses `r2_get_object`, `r2_inspect_object`, and
-  `r2_put_object`; future GraphQL-specific coverage should be added
-  separately.
+  `r2_put_object`; account billing usage uses `account_billing_usage`; Cloudflare
+  Analytics GraphQL uses `graphql_analytics_query`.
 
 The server intentionally does not register one MCP tool per Cloudflare endpoint.
 Instead, clients search and inspect operations before calling the generic
@@ -39,9 +39,25 @@ executor:
 4. `api_read` for `GET` operations.
 5. `api_mutate` for `POST`, `PUT`, `PATCH`, or `DELETE` operations.
 
+`api_prepare_call`, `api_read`, and `api_mutate` derive path parameters from
+the endpoint template as well as the compact catalog metadata. If the upstream
+OpenAPI snapshot omits `path_params` for a path such as
+`/accounts/{account_id}/...`, the executor still substitutes the configured
+default or explicit path parameter instead of sending literal braces.
+
 Set `CLOUDFLARE_MCP_API_PARITY_ENABLED=0` for curated-tools-only profiles. In
 that mode, all generic `api_*` parity tools are hidden and denied, while curated
 first-class tools remain governed by the usual read-only/auth policy.
+
+## Billing and analytics
+
+For usage-spike investigations, start with `account_billing_usage` when the
+question is "what is Cloudflare billing or usage recording?" Then use
+`graphql_analytics_query` for product attribution, such as D1 rows read/written
+by database, date, or query-insights dataset. Cloudflare's Analytics GraphQL API
+is a single `/client/v4/graphql` endpoint rather than a REST catalog operation,
+so it intentionally has a curated read-only tool instead of being forced through
+`api_read`.
 
 ## Safety policy
 

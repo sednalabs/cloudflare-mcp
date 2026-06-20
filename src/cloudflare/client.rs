@@ -1488,6 +1488,113 @@ impl CloudflareClient {
         })
     }
 
+    pub async fn upload_worker_module(
+        &self,
+        account_id: &str,
+        script_name: &str,
+        metadata: &Value,
+        module_name: &str,
+        file_name: &str,
+        content_type: &str,
+        bytes: Vec<u8>,
+    ) -> Result<WorkerScript, AdapterError> {
+        let account_id = require_non_empty("account_id", account_id)?;
+        let script_name = require_non_empty("script_name", script_name)?;
+        let module_name = require_non_empty("module_name", module_name)?;
+        let file_name = require_non_empty("file_name", file_name)?;
+        let content_type = require_non_empty("content_type", content_type)?;
+        reqwest::multipart::Part::bytes(Vec::new())
+            .mime_str(content_type)
+            .map_err(|err| {
+                AdapterError::new(
+                    "cloudflare.invalid_content_type",
+                    format!("invalid Worker module content type: {err}"),
+                    "Use a MIME type such as application/javascript+module.",
+                )
+            })?;
+
+        let token = self.bearer_token()?;
+        let url = self.endpoint(&format!(
+            "/accounts/{account_id}/workers/scripts/{script_name}"
+        ));
+        let metadata_text = metadata.to_string();
+        let module_name = module_name.to_string();
+        let file_name = file_name.to_string();
+        let content_type = content_type.to_string();
+
+        let envelope: CloudflareEnvelope<WorkerScript> = self
+            .send_envelope(
+                "cloudflare.workers.script.upload_module",
+                RetryPolicy::NonIdempotent,
+                || {
+                    let metadata_part = reqwest::multipart::Part::text(metadata_text.clone())
+                        .mime_str("application/json")
+                        .expect("static metadata MIME type");
+                    let module_part = reqwest::multipart::Part::bytes(bytes.clone())
+                        .file_name(file_name.clone())
+                        .mime_str(&content_type)
+                        .expect("Worker module content type was validated");
+                    let form = reqwest::multipart::Form::new()
+                        .part("metadata", metadata_part)
+                        .part(module_name.clone(), module_part);
+                    self.http
+                        .put(url.clone())
+                        .bearer_auth(&token)
+                        .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone())
+                        .multipart(form)
+                },
+            )
+            .await?;
+
+        envelope.result.ok_or_else(|| {
+            AdapterError::new(
+                "cloudflare.empty_result",
+                "Cloudflare returned success without uploaded Worker script details",
+                "Verify Worker script upload endpoint and response schema.",
+            )
+        })
+    }
+
+    pub async fn upload_worker_multipart(
+        &self,
+        account_id: &str,
+        script_name: &str,
+        content_type: &str,
+        bytes: Vec<u8>,
+    ) -> Result<WorkerScript, AdapterError> {
+        let account_id = require_non_empty("account_id", account_id)?;
+        let script_name = require_non_empty("script_name", script_name)?;
+        let content_type = require_non_empty("content_type", content_type)?;
+        let content_type_header = header_value("content-type", content_type)?;
+        let token = self.bearer_token()?;
+        let url = self.endpoint(&format!(
+            "/accounts/{account_id}/workers/scripts/{script_name}"
+        ));
+
+        let envelope: CloudflareEnvelope<WorkerScript> = self
+            .send_envelope(
+                "cloudflare.workers.script.upload_multipart",
+                RetryPolicy::NonIdempotent,
+                || {
+                    self.http
+                        .put(url.clone())
+                        .bearer_auth(&token)
+                        .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone())
+                        .header(reqwest::header::CONTENT_TYPE, content_type_header.clone())
+                        .body(bytes.clone())
+                },
+            )
+            .await?;
+
+        envelope.result.ok_or_else(|| {
+            AdapterError::new(
+                "cloudflare.empty_result",
+                "Cloudflare returned success without uploaded Worker script details",
+                "Verify Worker script upload endpoint and response schema.",
+            )
+        })
+    }
+
     pub async fn replace_access_policies(
         &self,
         account_id: &str,
@@ -1866,6 +1973,82 @@ impl CloudflareClient {
         Ok(envelope.result.unwrap_or_else(|| json!({})))
     }
 
+    pub async fn graphql_analytics_query(&self, payload: &Value) -> Result<Value, AdapterError> {
+        let token = self.bearer_token()?;
+        let url = self.endpoint("/graphql");
+        let mut attempt = 0u32;
+        let max_attempts = self.cfg.max_retries;
+
+        loop {
+            let response = match self
+                .http
+                .post(url.clone())
+                .bearer_auth(&token)
+                .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone())
+                .json(payload)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    let retryable = err.is_timeout() || err.is_connect() || err.is_request();
+                    if retryable && attempt < max_attempts {
+                        tokio::time::sleep(backoff_delay(
+                            attempt,
+                            self.cfg.retry_base_delay,
+                            self.cfg.retry_max_delay,
+                        ))
+                        .await;
+                        attempt += 1;
+                        continue;
+                    }
+                    let code = if err.is_timeout() {
+                        "cloudflare.timeout"
+                    } else {
+                        "cloudflare.transport_error"
+                    };
+                    return Err(AdapterError::new(
+                        code,
+                        format!("cloudflare.graphql.analytics request failed: {err}"),
+                        "Check Cloudflare API reachability, token validity, GraphQL permissions, and timeout settings.",
+                    )
+                    .with_retryable(retryable));
+                }
+            };
+
+            let status = response.status();
+            let retry_after = parse_retry_after(response.headers());
+            let body = response.text().await.map_err(|err| {
+                AdapterError::new(
+                    "cloudflare.response_read_failed",
+                    format!("failed reading Cloudflare GraphQL response body: {err}"),
+                    "Retry request and inspect Cloudflare GraphQL API availability.",
+                )
+            })?;
+
+            if is_retryable_status(status) && attempt < max_attempts {
+                let delay = retry_after.unwrap_or_else(|| {
+                    backoff_delay(attempt, self.cfg.retry_base_delay, self.cfg.retry_max_delay)
+                });
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+                continue;
+            }
+
+            if !status.is_success() {
+                return Err(http_status_error(status, &body));
+            }
+
+            return serde_json::from_str(&body).map_err(|err| {
+                AdapterError::new(
+                    "cloudflare.decode_error",
+                    format!("failed decoding Cloudflare GraphQL response: {err}"),
+                    "Verify Cloudflare GraphQL endpoint compatibility with expected JSON response schema.",
+                )
+            });
+        }
+    }
+
     async fn delete_dns_record(&self, zone_id: &str, record_id: &str) -> Result<(), AdapterError> {
         let zone_id = require_non_empty("zone_id", zone_id)?;
         let record_id = require_non_empty("record_id", record_id)?;
@@ -2059,11 +2242,19 @@ fn require_non_empty<'a>(name: &'static str, value: &'a str) -> Result<&'a str, 
 }
 
 pub(crate) fn is_d1_sqlite_auth_error(err: &AdapterError) -> bool {
-    err.cloudflare_api_error_code() == Some(7500)
-        || err
-            .cloudflare_api_error_message()
-            .is_some_and(|message| message.contains("SQLITE_AUTH"))
-        || err.message.contains("SQLITE_AUTH")
+    let mut message = err.message.to_ascii_lowercase();
+    if let Some(api_message) = err.cloudflare_api_error_message() {
+        message.push(' ');
+        message.push_str(&api_message.to_ascii_lowercase());
+    }
+    if message.contains("no such column") || message.contains("no such table") {
+        return false;
+    }
+    message.contains("sqlite_auth")
+        || message.contains("not authorized")
+        || message.contains("authorization policy")
+        || message.contains("access denied")
+        || err.cloudflare_api_error_code() == Some(7500)
 }
 
 fn is_d1_catalog_discovery_query(sql: &str) -> bool {
@@ -2652,7 +2843,10 @@ mod tests {
     use serde_json::{Value, json};
     use tokio::net::TcpListener;
 
-    use super::{CloudflareClient, with_request_api_token_override};
+    use super::{
+        AdapterError, CloudflareApiError, CloudflareClient, is_d1_sqlite_auth_error,
+        with_request_api_token_override,
+    };
     use crate::cloudflare::model::AccessPolicyWrite;
     use crate::config::{ApiTokenSource, CloudflareApiConfig};
 
@@ -3185,6 +3379,36 @@ mod tests {
             err.cloudflare_api_error_message(),
             Some("D1 query rejected by authorization policy")
         );
+    }
+
+    #[test]
+    fn d1_sqlite_auth_detection_keeps_opaque_code_7500_as_fallback_signal() {
+        let err = AdapterError::new(
+            "cloudflare.api_error",
+            "Cloudflare API error 7500",
+            "Inspect D1 permissions.",
+        )
+        .with_cloudflare_api_error(Some(CloudflareApiError {
+            code: Some(7500),
+            message: None,
+        }));
+
+        assert!(is_d1_sqlite_auth_error(&err));
+    }
+
+    #[test]
+    fn d1_sqlite_auth_detection_does_not_mask_missing_schema_errors() {
+        let err = AdapterError::new(
+            "cloudflare.api_error",
+            "SQLITE_ERROR: no such table: missing_table",
+            "Inspect D1 permissions.",
+        )
+        .with_cloudflare_api_error(Some(CloudflareApiError {
+            code: Some(7500),
+            message: Some("SQLITE_ERROR: no such table: missing_table".to_string()),
+        }));
+
+        assert!(!is_d1_sqlite_auth_error(&err));
     }
 
     #[tokio::test]

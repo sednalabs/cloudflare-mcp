@@ -1108,6 +1108,7 @@ mod tests {
         let tools = server.tool_names().into_iter().collect::<HashSet<_>>();
         let required = [
             "access_get_app",
+            "account_billing_usage",
             "analytics_engine_describe_schema",
             "analytics_engine_list_datasets",
             "analytics_engine_query",
@@ -1145,6 +1146,7 @@ mod tests {
             "emergency_unpublish",
             "ensure_tunnel",
             "generate_tunnel_ingress",
+            "graphql_analytics_query",
             "health",
             "list_access_apps",
             "list_access_policies",
@@ -1175,12 +1177,16 @@ mod tests {
             "upsert_dns_cname",
             "verify_dns_route",
             "verify_http_gate",
+            "waf_rule_activity",
+            "waf_ruleset_summary",
+            "waf_security_events_summary",
             "workers_get_script_settings",
             "workers_list_scripts",
             "workers_list_tails",
             "workers_observability_list_keys",
             "workers_observability_list_values",
             "workers_observability_query_events",
+            "workers_upload_script",
         ];
         for name in required {
             assert!(tools.contains(name), "{name} missing from tool inventory");

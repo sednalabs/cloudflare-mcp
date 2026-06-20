@@ -6723,17 +6723,22 @@
     {
       "operation_id": "billable-usage-get-paygo-account-usage",
       "method": "GET",
-      "path": "/accounts/{account_id}/billing/usage/paygo",
+      "path": "/accounts/{account_id}/paygo-usage",
       "tag": "Billable Usage",
       "summary": "Get PayGo Account Billable Usage (Alpha)",
       "deprecated": false,
       "scope": "account",
       "risk": "read",
-      "path_params": [],
-      "query_params": [],
+      "path_params": [
+        "account_id"
+      ],
+      "query_params": [
+        "from",
+        "to"
+      ],
       "required_query_params": [],
       "has_request_body": false,
-      "preferred_tool": null
+      "preferred_tool": "account_billing_usage"
     },
     {
       "operation_id": "get_BinDBGetBinary",

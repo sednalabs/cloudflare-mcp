@@ -20,5 +20,6 @@ pub(crate) mod tool_surface;
 pub mod tools;
 pub mod tunnel;
 pub mod verification;
+pub(crate) mod worker_upload;
 
 pub type McpError = rmcp::ErrorData;
