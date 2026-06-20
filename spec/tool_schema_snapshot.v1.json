@@ -3600,6 +3600,366 @@
       "name": "waf_rule_activity"
     },
     {
+      "description": "Apply a previously planned WAF Ruleset change after confirmation, then read back the Ruleset and optional Security Events context.",
+      "inputSchema": {
+        "$defs": {
+          "WafRuleEdit": {
+            "properties": {
+              "action_parameters": {
+                "default": null
+              },
+              "after_rule_id": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "before_rule_id": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "description": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "enabled": {
+                "default": null,
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "expression": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "index": {
+                "default": null,
+                "format": "uint",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "operation": {
+                "type": "string"
+              },
+              "rule_action": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "rule_id": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "rule_ref": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "operation"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "confirmation_token": {
+            "type": "string"
+          },
+          "edits": {
+            "items": {
+              "$ref": "#/$defs/WafRuleEdit"
+            },
+            "type": "array"
+          },
+          "empty_list_refs": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "fail_on_stale_lists": {
+            "default": true,
+            "type": "boolean"
+          },
+          "max_bytes": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_rules": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "phase": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "readback_sample_limit": {
+            "default": 5,
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "readback_security_events": {
+            "default": true,
+            "type": "boolean"
+          },
+          "readback_window_hours": {
+            "default": 24,
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reason": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scope": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stale_list_refs": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "zone_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "confirmation_token"
+        ],
+        "title": "WafRulesetApplyArgs",
+        "type": "object"
+      },
+      "name": "waf_ruleset_apply_change"
+    },
+    {
+      "description": "Plan typed WAF Ruleset rule edits with stable diff, rule-cap checks, stale-list checks, ordering, and a confirmation token for apply.",
+      "inputSchema": {
+        "$defs": {
+          "WafRuleEdit": {
+            "properties": {
+              "action_parameters": {
+                "default": null
+              },
+              "after_rule_id": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "before_rule_id": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "description": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "enabled": {
+                "default": null,
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "expression": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "index": {
+                "default": null,
+                "format": "uint",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "operation": {
+                "type": "string"
+              },
+              "rule_action": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "rule_id": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "rule_ref": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "operation"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "edits": {
+            "items": {
+              "$ref": "#/$defs/WafRuleEdit"
+            },
+            "type": "array"
+          },
+          "empty_list_refs": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "fail_on_stale_lists": {
+            "default": true,
+            "type": "boolean"
+          },
+          "max_bytes": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_rules": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "phase": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scope": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stale_list_refs": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "zone_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "title": "WafRulesetChangeArgs",
+        "type": "object"
+      },
+      "name": "waf_ruleset_plan_change"
+    },
+    {
       "description": "Read WAF custom, managed, and rate-limit Rulesets entrypoints at zone or account scope with compact rule summaries.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",

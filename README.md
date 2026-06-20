@@ -179,8 +179,11 @@ Cloudflare REST API operations that do not yet have a curated workflow.
 For billing or D1 usage-spike work, use `account_billing_usage` for billable
 usage records and `graphql_analytics_query` for product analytics attribution.
 For WAF investigations, use `waf_ruleset_summary`,
-`waf_security_events_summary`, and `waf_rule_activity` before falling back to
-raw GraphQL or generic Rulesets API calls.
+`waf_security_events_summary`, and `waf_rule_activity`. For WAF changes, use
+`waf_ruleset_plan_change` to produce a stable diff, rule-cap/list validation,
+and confirmation token, then `waf_ruleset_apply_change` for apply and readback.
+Fall back to raw GraphQL or generic Rulesets API calls only when the curated
+lifecycle tools do not cover the workflow.
 
 See [docs/TOOL_GUIDE.md](docs/TOOL_GUIDE.md) for a product-oriented map.
 

@@ -81,6 +81,12 @@ fn tool_capabilities() -> Vec<ToolCapability> {
         cap("waf_rule_activity")
             .with_group("waf")
             .with_read_only(true),
+        cap("waf_ruleset_plan_change")
+            .with_group("waf")
+            .with_read_only(true),
+        cap("waf_ruleset_apply_change")
+            .with_group("waf")
+            .with_read_only(false),
         cap("account_api_tokens")
             .with_group("api")
             .with_read_only(false),

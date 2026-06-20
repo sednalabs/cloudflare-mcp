@@ -265,6 +265,90 @@ pub struct WafRuleActivityArgs {
     pub max_bytes: Option<usize>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WafRulesetChangeArgs {
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub zone_id: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub phase: Option<String>,
+    #[serde(default)]
+    pub edits: Vec<WafRuleEdit>,
+    #[serde(default)]
+    pub max_rules: Option<usize>,
+    #[serde(default)]
+    pub stale_list_refs: Vec<String>,
+    #[serde(default)]
+    pub empty_list_refs: Vec<String>,
+    #[serde(default = "default_true")]
+    pub fail_on_stale_lists: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WafRulesetApplyArgs {
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub zone_id: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub phase: Option<String>,
+    #[serde(default)]
+    pub edits: Vec<WafRuleEdit>,
+    #[serde(default)]
+    pub max_rules: Option<usize>,
+    #[serde(default)]
+    pub stale_list_refs: Vec<String>,
+    #[serde(default)]
+    pub empty_list_refs: Vec<String>,
+    #[serde(default = "default_true")]
+    pub fail_on_stale_lists: bool,
+    pub confirmation_token: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default = "default_true")]
+    pub readback_security_events: bool,
+    #[serde(default = "default_waf_lifecycle_readback_hours")]
+    pub readback_window_hours: u32,
+    #[serde(default = "default_waf_lifecycle_readback_samples")]
+    pub readback_sample_limit: u32,
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WafRuleEdit {
+    pub operation: String,
+    #[serde(default)]
+    pub rule_id: Option<String>,
+    #[serde(default)]
+    pub rule_ref: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub expression: Option<String>,
+    #[serde(default)]
+    pub rule_action: Option<String>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub action_parameters: Option<Value>,
+    #[serde(default)]
+    pub before_rule_id: Option<String>,
+    #[serde(default)]
+    pub after_rule_id: Option<String>,
+    #[serde(default)]
+    pub index: Option<usize>,
+}
+
 fn default_waf_window_hours() -> u32 {
     24
 }
@@ -275,6 +359,14 @@ fn default_waf_limit() -> u32 {
 
 fn default_waf_sample_limit() -> u32 {
     10
+}
+
+fn default_waf_lifecycle_readback_hours() -> u32 {
+    24
+}
+
+fn default_waf_lifecycle_readback_samples() -> u32 {
+    5
 }
 
 fn default_waf_group_by() -> Vec<String> {
@@ -1357,7 +1449,7 @@ impl CloudflareMcp {
                 query: None,
                 group: Some("waf".to_string()),
                 read_only: args.read_only,
-                limit: Some(3),
+                limit: Some(5),
             };
             for result in self.tool_inventory.search(
                 &waf_filter,
@@ -2094,6 +2186,201 @@ impl CloudflareMcp {
             }
             Err(err) => Ok(adapter_error_result(err)),
         }
+    }
+
+    #[tool(
+        name = "waf_ruleset_plan_change",
+        description = "Plan typed WAF Ruleset rule edits with stable diff, rule-cap checks, stale-list checks, ordering, and a confirmation token for apply."
+    )]
+    async fn cloudflare_waf_ruleset_plan_change(
+        &self,
+        Parameters(args): Parameters<WafRulesetChangeArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let plan = match build_waf_lifecycle_plan(
+            self,
+            args.account_id.as_deref(),
+            args.zone_id.as_deref(),
+            args.scope.as_deref(),
+            args.phase.as_deref(),
+            &args.edits,
+            args.max_rules,
+            &args.stale_list_refs,
+            &args.empty_list_refs,
+            args.fail_on_stale_lists,
+        )
+        .await
+        {
+            Ok(plan) => plan,
+            Err(base) => return Ok(base),
+        };
+
+        Ok(CallToolResult::structured(truncate_api_payload(
+            json!({
+                "ok": true,
+                "operation": "waf_ruleset_plan_change",
+                "target": plan.target.to_json(),
+                "phase": plan.phase,
+                "planned": true,
+                "current_ruleset": plan.current_ruleset,
+                "planned_ruleset": plan.planned_ruleset,
+                "diff": plan.diff,
+                "validation": plan.validation,
+                "ordering": plan.ordering,
+                "performance_readback": plan.performance_readback,
+                "required_confirmation_token": plan.required_confirmation_token,
+                "dry_run_note": "No Cloudflare ruleset update applied.",
+                "source": waf_source_notes(),
+            }),
+            args.max_bytes.unwrap_or(1_048_576).clamp(1, 10_485_760),
+        )))
+    }
+
+    #[tool(
+        name = "waf_ruleset_apply_change",
+        description = "Apply a previously planned WAF Ruleset change after confirmation, then read back the Ruleset and optional Security Events context."
+    )]
+    async fn cloudflare_waf_ruleset_apply_change(
+        &self,
+        Parameters(args): Parameters<WafRulesetApplyArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let lifecycle = match build_waf_lifecycle_plan(
+            self,
+            args.account_id.as_deref(),
+            args.zone_id.as_deref(),
+            args.scope.as_deref(),
+            args.phase.as_deref(),
+            &args.edits,
+            args.max_rules,
+            &args.stale_list_refs,
+            &args.empty_list_refs,
+            args.fail_on_stale_lists,
+        )
+        .await
+        {
+            Ok(plan) => plan,
+            Err(base) => return Ok(base),
+        };
+        let mutation_plan = MutationPlan::new("waf_ruleset_apply_change")
+            .step(
+                "read_waf_ruleset_entrypoint",
+                false,
+                json!({
+                    "target": lifecycle.target.to_json(),
+                    "phase": lifecycle.phase,
+                    "path": lifecycle.entrypoint_path,
+                }),
+            )
+            .step(
+                "apply_waf_ruleset_entrypoint",
+                true,
+                json!({
+                    "target": lifecycle.target.to_json(),
+                    "phase": lifecycle.phase,
+                    "path": lifecycle.entrypoint_path,
+                    "diff": lifecycle.diff,
+                }),
+            )
+            .step(
+                "readback_waf_ruleset_entrypoint",
+                false,
+                json!({
+                    "target": lifecycle.target.to_json(),
+                    "phase": lifecycle.phase,
+                    "path": lifecycle.entrypoint_path,
+                }),
+            );
+        let audit = MutationAuditSession::start(
+            Some(&parts),
+            "waf_ruleset_apply_change",
+            json!({
+                "target": lifecycle.target.to_json(),
+                "phase": lifecycle.phase,
+                "diff": lifecycle.diff,
+                "reason": args.reason,
+            }),
+            false,
+        );
+
+        let base = if args.confirmation_token != lifecycle.required_confirmation_token {
+            CallToolResult::structured_error(json!({
+                "ok": false,
+                "operation": "waf_ruleset_apply_change",
+                "error": {
+                    "code": "waf.confirmation_required",
+                    "message": "waf_ruleset_apply_change requires the confirmation token returned by waf_ruleset_plan_change",
+                    "hint": "Run waf_ruleset_plan_change with the same edits and echo required_confirmation_token in confirmation_token.",
+                },
+                "required_confirmation_token": lifecycle.required_confirmation_token,
+            }))
+        } else {
+            match self
+                .cloudflare
+                .api_request(
+                    "cloudflare.waf.ruleset.entrypoint.update",
+                    reqwest::Method::PUT,
+                    &lifecycle.entrypoint_path,
+                    &[],
+                    Some(lifecycle.planned_ruleset.clone()),
+                )
+                .await
+            {
+                Ok(apply_result) => {
+                    let readback_result = self
+                        .cloudflare
+                        .api_request(
+                            "cloudflare.waf.ruleset.entrypoint.readback",
+                            reqwest::Method::GET,
+                            &lifecycle.entrypoint_path,
+                            &[],
+                            None,
+                        )
+                        .await;
+                    let readback = waf_ruleset_readback_entry(
+                        &lifecycle.target,
+                        &lifecycle.phase,
+                        &lifecycle.entrypoint_path,
+                        readback_result,
+                        true,
+                        false,
+                    );
+                    let security_events = if args.readback_security_events {
+                        waf_lifecycle_security_events_readback(
+                            self,
+                            lifecycle.analytics_zone_id.as_deref(),
+                            &lifecycle.changed_rule_ids,
+                            args.readback_window_hours,
+                            args.readback_sample_limit,
+                        )
+                        .await
+                    } else {
+                        json!({
+                            "enabled": false,
+                            "reason": "readback_security_events=false",
+                        })
+                    };
+                    CallToolResult::structured(truncate_api_payload(
+                        json!({
+                            "ok": readback.get("ok").and_then(Value::as_bool).unwrap_or(false),
+                            "operation": "waf_ruleset_apply_change",
+                            "target": lifecycle.target.to_json(),
+                            "phase": lifecycle.phase,
+                            "applied_ruleset": apply_result,
+                            "readback": readback,
+                            "diff": lifecycle.diff,
+                            "validation": lifecycle.validation,
+                            "ordering": lifecycle.ordering,
+                            "performance_readback": lifecycle.performance_readback,
+                            "security_events_readback": security_events,
+                        }),
+                        args.max_bytes.unwrap_or(1_048_576).clamp(1, 10_485_760),
+                    ))
+                }
+                Err(err) => adapter_error_result(err),
+            }
+        };
+
+        Ok(finalize_mutation_result(base, &mutation_plan, audit, false))
     }
 
     #[tool(
@@ -7932,6 +8219,712 @@ impl WafTarget {
             "id": self.identifier,
         })
     }
+}
+
+struct WafLifecyclePlan {
+    target: WafTarget,
+    phase: String,
+    entrypoint_path: String,
+    current_ruleset: Value,
+    planned_ruleset: Value,
+    diff: Value,
+    validation: Value,
+    ordering: Value,
+    performance_readback: Value,
+    required_confirmation_token: String,
+    changed_rule_ids: Vec<String>,
+    analytics_zone_id: Option<String>,
+}
+
+async fn build_waf_lifecycle_plan(
+    server: &CloudflareMcp,
+    account_id: Option<&str>,
+    zone_id: Option<&str>,
+    scope: Option<&str>,
+    phase: Option<&str>,
+    edits: &[WafRuleEdit],
+    max_rules: Option<usize>,
+    stale_list_refs: &[String],
+    empty_list_refs: &[String],
+    fail_on_stale_lists: bool,
+) -> Result<WafLifecyclePlan, CallToolResult> {
+    if edits.is_empty() {
+        return Err(invalid_argument_result(
+            "waf.edits_required",
+            "at least one WAF rule edit is required",
+            "Pass edits with operation=add, update, delete, enable, disable, or move.",
+        ));
+    }
+    let target = resolve_waf_target(server, scope, account_id, zone_id)?;
+    let phase = normalize_single_waf_phase(phase)?;
+    let entrypoint_path = target.entrypoint_path(&phase);
+    let current_ruleset = server
+        .cloudflare
+        .api_request(
+            "cloudflare.waf.ruleset.entrypoint.read",
+            reqwest::Method::GET,
+            &entrypoint_path,
+            &[],
+            None,
+        )
+        .await
+        .map_err(adapter_error_result)?;
+
+    let planned = plan_waf_ruleset_changes(
+        &current_ruleset,
+        edits,
+        max_rules,
+        stale_list_refs,
+        empty_list_refs,
+        fail_on_stale_lists,
+    )?;
+    let required_confirmation_token =
+        waf_ruleset_confirmation_token(&entrypoint_path, &planned.planned_ruleset);
+    let analytics_zone_id = zone_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| server.default_zone_id.clone())
+        .filter(|_| {
+            target.scope == "zone" || zone_id.is_some() || server.default_zone_id.is_some()
+        });
+    let performance_readback = json!({
+        "ruleset_readback": true,
+        "security_events_readback_available": analytics_zone_id.is_some(),
+        "security_events_dataset": "firewallEventsAdaptive",
+        "changed_rule_ids": planned.changed_rule_ids,
+        "note": "Security Events readback is contextual and may lag; ruleset readback remains the apply source of truth.",
+    });
+
+    Ok(WafLifecyclePlan {
+        target,
+        phase,
+        entrypoint_path,
+        current_ruleset,
+        planned_ruleset: planned.planned_ruleset,
+        diff: planned.diff,
+        validation: planned.validation,
+        ordering: planned.ordering,
+        performance_readback,
+        required_confirmation_token,
+        changed_rule_ids: planned.changed_rule_ids,
+        analytics_zone_id,
+    })
+}
+
+struct PlannedWafRuleset {
+    planned_ruleset: Value,
+    diff: Value,
+    validation: Value,
+    ordering: Value,
+    changed_rule_ids: Vec<String>,
+}
+
+fn plan_waf_ruleset_changes(
+    current_ruleset: &Value,
+    edits: &[WafRuleEdit],
+    max_rules: Option<usize>,
+    stale_list_refs: &[String],
+    empty_list_refs: &[String],
+    fail_on_stale_lists: bool,
+) -> Result<PlannedWafRuleset, CallToolResult> {
+    let mut planned_ruleset = current_ruleset.clone();
+    let rules = planned_ruleset
+        .get_mut("rules")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            invalid_argument_result(
+                "waf.rules_missing",
+                "current WAF ruleset does not contain a rules array",
+                "Verify the WAF Rulesets API response before planning mutations.",
+            )
+        })?;
+    let before_order = waf_rule_order(rules);
+    let mut changes = Vec::new();
+    let mut changed_rule_ids = BTreeSet::new();
+    let mut action_change_warnings = Vec::new();
+
+    for edit in edits {
+        let op = normalize_action(&edit.operation);
+        match op.as_str() {
+            "add" | "create" => {
+                let mut rule = waf_rule_from_add_edit(edit)?;
+                place_waf_rule(rules, &mut rule, edit)?;
+                let label = waf_rule_label(&rule);
+                changed_rule_ids.insert(label.clone());
+                changes.push(json!({
+                    "operation": "add",
+                    "rule": compact_waf_rule(&rule, false),
+                    "position": waf_edit_position(edit),
+                }));
+            }
+            "update" | "patch" => {
+                let index = find_waf_rule_index(rules, edit).ok_or_else(|| {
+                    invalid_argument_result(
+                        "waf.rule_not_found",
+                        "cannot update WAF rule because no rule matched rule_id or rule_ref",
+                        "Pass the existing Cloudflare rule id or stable ref.",
+                    )
+                })?;
+                let before = rules[index].clone();
+                apply_waf_rule_update(&mut rules[index], edit)?;
+                if let Some(position) = waf_requested_position(edit) {
+                    let mut rule = rules.remove(index);
+                    place_waf_rule_with_position(rules, &mut rule, position)?;
+                }
+                let after_index = find_waf_rule_index(rules, edit)
+                    .unwrap_or(index.min(rules.len().saturating_sub(1)));
+                let after = rules[after_index].clone();
+                if before.get("action") != after.get("action") {
+                    action_change_warnings.push(waf_action_change_warning(&before, &after));
+                }
+                let label = waf_rule_label(&after);
+                changed_rule_ids.insert(label);
+                changes.push(json!({
+                    "operation": "update",
+                    "before": compact_waf_rule(&before, false),
+                    "after": compact_waf_rule(&after, false),
+                    "position": waf_edit_position(edit),
+                }));
+            }
+            "delete" | "remove" => {
+                let index = find_waf_rule_index(rules, edit).ok_or_else(|| {
+                    invalid_argument_result(
+                        "waf.rule_not_found",
+                        "cannot delete WAF rule because no rule matched rule_id or rule_ref",
+                        "Pass the existing Cloudflare rule id or stable ref.",
+                    )
+                })?;
+                let removed = rules.remove(index);
+                changed_rule_ids.insert(waf_rule_label(&removed));
+                changes.push(json!({
+                    "operation": "delete",
+                    "rule": compact_waf_rule(&removed, false),
+                }));
+            }
+            "enable" | "disable" => {
+                let index = find_waf_rule_index(rules, edit).ok_or_else(|| {
+                    invalid_argument_result(
+                        "waf.rule_not_found",
+                        "cannot change WAF rule enabled state because no rule matched rule_id or rule_ref",
+                        "Pass the existing Cloudflare rule id or stable ref.",
+                    )
+                })?;
+                let before = rules[index].clone();
+                rules[index]["enabled"] = json!(op == "enable");
+                let after = rules[index].clone();
+                changed_rule_ids.insert(waf_rule_label(&after));
+                changes.push(json!({
+                    "operation": op,
+                    "before": compact_waf_rule(&before, false),
+                    "after": compact_waf_rule(&after, false),
+                }));
+            }
+            "move" | "reorder" => {
+                let index = find_waf_rule_index(rules, edit).ok_or_else(|| {
+                    invalid_argument_result(
+                        "waf.rule_not_found",
+                        "cannot move WAF rule because no rule matched rule_id or rule_ref",
+                        "Pass the existing Cloudflare rule id or stable ref.",
+                    )
+                })?;
+                let mut rule = rules.remove(index);
+                let label = waf_rule_label(&rule);
+                place_waf_rule(rules, &mut rule, edit)?;
+                changed_rule_ids.insert(label.clone());
+                changes.push(json!({
+                    "operation": "move",
+                    "rule": label,
+                    "position": waf_edit_position(edit),
+                }));
+            }
+            _ => {
+                return Err(invalid_argument_result(
+                    "waf.invalid_edit_operation",
+                    format!("unsupported WAF edit operation {:?}", edit.operation),
+                    "Use add, update, delete, enable, disable, or move.",
+                ));
+            }
+        }
+    }
+
+    if let Some(max_rules) = max_rules
+        && rules.len() > max_rules
+    {
+        return Err(invalid_argument_result(
+            "waf.rule_cap_exceeded",
+            format!(
+                "planned WAF ruleset has {} rules, exceeding max_rules={max_rules}",
+                rules.len()
+            ),
+            "Increase max_rules only after confirming the account or zone rule cap.",
+        ));
+    }
+
+    let list_validation =
+        validate_waf_list_references(rules, stale_list_refs, empty_list_refs, fail_on_stale_lists)?;
+    let planned_rule_count = rules.len();
+    let within_cap = max_rules.is_none_or(|max| planned_rule_count <= max);
+    let after_order = waf_rule_order(rules);
+    let changed_rule_ids = changed_rule_ids.into_iter().collect::<Vec<_>>();
+    Ok(PlannedWafRuleset {
+        planned_ruleset,
+        diff: json!({
+            "change_count": changes.len(),
+            "changes": changes,
+            "action_change_warnings": action_change_warnings,
+        }),
+        validation: json!({
+            "rule_cap": {
+                "max_rules": max_rules,
+                "planned_rule_count": planned_rule_count,
+                "within_cap": within_cap,
+            },
+            "lists": list_validation,
+        }),
+        ordering: json!({
+            "before": before_order,
+            "after": after_order,
+        }),
+        changed_rule_ids,
+    })
+}
+
+fn normalize_single_waf_phase(phase: Option<&str>) -> Result<String, CallToolResult> {
+    let values = phase
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| vec![value.to_string()])
+        .unwrap_or_else(|| vec!["custom".to_string()]);
+    let phases = normalize_waf_phases(&values)?;
+    if phases.len() != 1 {
+        return Err(invalid_argument_result(
+            "waf.single_phase_required",
+            "WAF lifecycle mutation requires exactly one phase",
+            "Pass phase=custom, managed, ratelimit, ddos_l7, or an explicit Ruleset Engine phase.",
+        ));
+    }
+    Ok(phases[0].clone())
+}
+
+fn waf_rule_from_add_edit(edit: &WafRuleEdit) -> Result<Value, CallToolResult> {
+    let expression = required_edit_string(edit.expression.as_deref(), "expression")?;
+    let description = required_edit_string(edit.description.as_deref(), "description")?;
+    let rule_action = required_edit_string(edit.rule_action.as_deref(), "rule_action")?;
+    validate_waf_rule_action(rule_action)?;
+    let mut rule = Map::new();
+    rule.insert("description".to_string(), json!(description));
+    rule.insert("expression".to_string(), json!(expression));
+    rule.insert("action".to_string(), json!(rule_action));
+    rule.insert("enabled".to_string(), json!(edit.enabled.unwrap_or(true)));
+    if let Some(rule_ref) = edit
+        .rule_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        rule.insert("ref".to_string(), json!(rule_ref));
+    }
+    if let Some(action_parameters) = edit.action_parameters.clone() {
+        rule.insert("action_parameters".to_string(), action_parameters);
+    }
+    Ok(Value::Object(rule))
+}
+
+fn apply_waf_rule_update(rule: &mut Value, edit: &WafRuleEdit) -> Result<(), CallToolResult> {
+    let Some(object) = rule.as_object_mut() else {
+        return Err(invalid_argument_result(
+            "waf.invalid_rule_shape",
+            "matched WAF rule is not an object",
+            "Verify the Rulesets API response before planning mutations.",
+        ));
+    };
+    if let Some(description) = edit
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        object.insert("description".to_string(), json!(description));
+    }
+    if let Some(expression) = edit
+        .expression
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        object.insert("expression".to_string(), json!(expression));
+    }
+    if let Some(rule_action) = edit
+        .rule_action
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        validate_waf_rule_action(rule_action)?;
+        object.insert("action".to_string(), json!(rule_action));
+    }
+    if let Some(enabled) = edit.enabled {
+        object.insert("enabled".to_string(), json!(enabled));
+    }
+    if let Some(action_parameters) = edit.action_parameters.clone() {
+        object.insert("action_parameters".to_string(), action_parameters);
+    }
+    Ok(())
+}
+
+fn required_edit_string<'a>(
+    value: Option<&'a str>,
+    field: &str,
+) -> Result<&'a str, CallToolResult> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            invalid_argument_result(
+                "waf.required_edit_field",
+                format!("{field} is required for this WAF rule edit"),
+                "For add operations pass description, expression, and rule_action.",
+            )
+        })
+}
+
+fn validate_waf_rule_action(action: &str) -> Result<(), CallToolResult> {
+    match normalize_action(action).as_str() {
+        "block" | "challenge" | "js_challenge" | "managed_challenge" | "log" | "skip"
+        | "execute" | "rewrite" | "redirect" | "set_config" => Ok(()),
+        _ => Err(invalid_argument_result(
+            "waf.invalid_rule_action",
+            format!("unsupported WAF rule action {action:?}"),
+            "Use a Cloudflare Rulesets action such as block, managed_challenge, log, skip, or execute.",
+        )),
+    }
+}
+
+fn find_waf_rule_index(rules: &[Value], edit: &WafRuleEdit) -> Option<usize> {
+    let rule_id = edit
+        .rule_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let rule_ref = edit
+        .rule_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    rules.iter().position(|rule| {
+        rule_id.is_some_and(|id| rule.get("id").and_then(Value::as_str) == Some(id))
+            || rule_ref
+                .is_some_and(|reference| rule.get("ref").and_then(Value::as_str) == Some(reference))
+    })
+}
+
+fn place_waf_rule(
+    rules: &mut Vec<Value>,
+    rule: &mut Value,
+    edit: &WafRuleEdit,
+) -> Result<(), CallToolResult> {
+    let position = waf_requested_position(edit).unwrap_or(WafRulePosition::End);
+    place_waf_rule_with_position(rules, rule, position)
+}
+
+fn place_waf_rule_with_position(
+    rules: &mut Vec<Value>,
+    rule: &mut Value,
+    position: WafRulePosition,
+) -> Result<(), CallToolResult> {
+    match position {
+        WafRulePosition::End => rules.push(rule.clone()),
+        WafRulePosition::Index(index) => {
+            let index = index.min(rules.len());
+            rules.insert(index, rule.clone());
+        }
+        WafRulePosition::Before(rule_id) => {
+            let index = rules
+                .iter()
+                .position(|rule| waf_rule_matches_label(rule, &rule_id))
+                .ok_or_else(|| {
+                    invalid_argument_result(
+                        "waf.position_rule_not_found",
+                        "before_rule_id did not match an existing WAF rule",
+                        "Pass an existing rule id or ref for ordering.",
+                    )
+                })?;
+            rules.insert(index, rule.clone());
+        }
+        WafRulePosition::After(rule_id) => {
+            let index = rules
+                .iter()
+                .position(|rule| waf_rule_matches_label(rule, &rule_id))
+                .ok_or_else(|| {
+                    invalid_argument_result(
+                        "waf.position_rule_not_found",
+                        "after_rule_id did not match an existing WAF rule",
+                        "Pass an existing rule id or ref for ordering.",
+                    )
+                })?;
+            rules.insert(index.saturating_add(1), rule.clone());
+        }
+    }
+    Ok(())
+}
+
+enum WafRulePosition {
+    End,
+    Index(usize),
+    Before(String),
+    After(String),
+}
+
+fn waf_requested_position(edit: &WafRuleEdit) -> Option<WafRulePosition> {
+    if let Some(index) = edit.index {
+        return Some(WafRulePosition::Index(index));
+    }
+    if let Some(rule_id) = edit
+        .before_rule_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(WafRulePosition::Before(rule_id.to_string()));
+    }
+    if let Some(rule_id) = edit
+        .after_rule_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(WafRulePosition::After(rule_id.to_string()));
+    }
+    None
+}
+
+fn waf_edit_position(edit: &WafRuleEdit) -> Value {
+    json!({
+        "index": edit.index,
+        "before_rule_id": edit.before_rule_id,
+        "after_rule_id": edit.after_rule_id,
+    })
+}
+
+fn waf_rule_matches_label(rule: &Value, label: &str) -> bool {
+    rule.get("id").and_then(Value::as_str) == Some(label)
+        || rule.get("ref").and_then(Value::as_str) == Some(label)
+}
+
+fn waf_rule_label(rule: &Value) -> String {
+    rule.get("id")
+        .and_then(Value::as_str)
+        .or_else(|| rule.get("ref").and_then(Value::as_str))
+        .or_else(|| rule.get("description").and_then(Value::as_str))
+        .unwrap_or("unnamed-rule")
+        .to_string()
+}
+
+fn waf_rule_order(rules: &[Value]) -> Vec<Value> {
+    rules
+        .iter()
+        .enumerate()
+        .map(|(index, rule)| {
+            json!({
+                "index": index,
+                "id": rule.get("id").cloned().unwrap_or(Value::Null),
+                "ref": rule.get("ref").cloned().unwrap_or(Value::Null),
+                "description": rule.get("description").cloned().unwrap_or(Value::Null),
+                "enabled": rule.get("enabled").cloned().unwrap_or(json!(true)),
+                "action": rule.get("action").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect()
+}
+
+fn waf_action_change_warning(before: &Value, after: &Value) -> Value {
+    let before_action = before.get("action").and_then(Value::as_str).unwrap_or("");
+    let after_action = after.get("action").and_then(Value::as_str).unwrap_or("");
+    let severity = match (
+        normalize_action(before_action).as_str(),
+        normalize_action(after_action).as_str(),
+    ) {
+        (_, "block") => "high",
+        ("block", "managed_challenge" | "challenge" | "js_challenge") => "medium",
+        ("managed_challenge" | "challenge" | "js_challenge", "log") => "medium",
+        _ => "info",
+    };
+    json!({
+        "rule": waf_rule_label(after),
+        "from": before_action,
+        "to": after_action,
+        "severity": severity,
+        "note": "Review false-positive risk before changing WAF enforcement action.",
+    })
+}
+
+fn validate_waf_list_references(
+    rules: &[Value],
+    stale_list_refs: &[String],
+    empty_list_refs: &[String],
+    fail_on_stale_lists: bool,
+) -> Result<Value, CallToolResult> {
+    let stale = normalized_set(stale_list_refs);
+    let empty = normalized_set(empty_list_refs);
+    let mut referenced = BTreeSet::new();
+    let mut stale_hits = Vec::new();
+    let mut empty_hits = Vec::new();
+    for rule in rules {
+        let expression = rule.get("expression").and_then(Value::as_str).unwrap_or("");
+        for list_ref in extract_waf_list_refs(expression) {
+            referenced.insert(list_ref.clone());
+            if stale.contains(&list_ref) {
+                stale_hits.push(json!({
+                    "rule": waf_rule_label(rule),
+                    "list": list_ref,
+                    "status": "stale",
+                }));
+            } else if empty.contains(&list_ref) {
+                empty_hits.push(json!({
+                    "rule": waf_rule_label(rule),
+                    "list": list_ref,
+                    "status": "empty",
+                }));
+            }
+        }
+    }
+    if fail_on_stale_lists && (!stale_hits.is_empty() || !empty_hits.is_empty()) {
+        return Err(invalid_argument_result(
+            "waf.stale_list_reference",
+            "planned WAF ruleset references stale or empty lists",
+            "Clean up the list or remove it from expressions before applying the WAF change.",
+        ));
+    }
+    Ok(json!({
+        "referenced_lists": referenced.into_iter().collect::<Vec<_>>(),
+        "stale_hits": stale_hits,
+        "empty_hits": empty_hits,
+        "fail_on_stale_lists": fail_on_stale_lists,
+    }))
+}
+
+fn normalized_set(values: &[String]) -> BTreeSet<String> {
+    values
+        .iter()
+        .map(|value| value.trim().trim_start_matches('$').to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn extract_waf_list_refs(expression: &str) -> Vec<String> {
+    let chars = expression.chars().collect::<Vec<_>>();
+    let mut refs = BTreeSet::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '$' {
+            let mut end = index + 1;
+            while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '_') {
+                end += 1;
+            }
+            if end > index + 1 {
+                refs.insert(
+                    chars[index + 1..end]
+                        .iter()
+                        .collect::<String>()
+                        .to_ascii_lowercase(),
+                );
+            }
+            index = end;
+        } else {
+            index += 1;
+        }
+    }
+    refs.into_iter().collect()
+}
+
+fn waf_ruleset_confirmation_token(path: &str, body: &Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"waf_ruleset_apply_change\n");
+    hasher.update(path.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(serde_json::to_vec(body).unwrap_or_default());
+    format!("waf-ruleset:{}", hex_prefix_local(&hasher.finalize(), 16))
+}
+
+fn hex_prefix_local(bytes: &[u8], nibbles: usize) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(nibbles);
+    for byte in bytes {
+        if out.len() >= nibbles {
+            break;
+        }
+        out.push(HEX[(byte >> 4) as usize] as char);
+        if out.len() >= nibbles {
+            break;
+        }
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+async fn waf_lifecycle_security_events_readback(
+    server: &CloudflareMcp,
+    zone_id: Option<&str>,
+    changed_rule_ids: &[String],
+    window_hours: u32,
+    sample_limit: u32,
+) -> Value {
+    let Some(zone_id) = zone_id else {
+        return json!({
+            "enabled": false,
+            "reason": "zone_id is required for firewallEventsAdaptive readback",
+        });
+    };
+    if changed_rule_ids.is_empty() {
+        return json!({
+            "enabled": false,
+            "reason": "no changed rule ids or refs were available for readback",
+        });
+    }
+    let window = waf_time_window(window_hours, None, None);
+    let sample_limit = sample_limit.clamp(1, 20);
+    let mut results = Vec::new();
+    for rule_id in changed_rule_ids.iter().take(5) {
+        let filter = waf_security_events_filter(
+            &window,
+            WafEventFilterInput {
+                action: None,
+                source: None,
+                host: None,
+                path: None,
+                client_ip: None,
+                rule_id: Some(rule_id),
+            },
+        );
+        let body = json!({
+            "query": build_waf_rule_activity_query(sample_limit),
+            "variables": {
+                "zoneTag": zone_id,
+                "filter": filter,
+            },
+        });
+        let result = match server.cloudflare.graphql_analytics_query(&body).await {
+            Ok(result) => json!({
+                "rule": rule_id,
+                "ok": !result.get("errors").and_then(Value::as_array).is_some_and(|errors| !errors.is_empty()),
+                "analytics": waf_security_events_projection(&result),
+            }),
+            Err(err) => json!({
+                "rule": rule_id,
+                "ok": false,
+                "error": err.payload(),
+            }),
+        };
+        results.push(result);
+    }
+    json!({
+        "enabled": true,
+        "zone_id": zone_id,
+        "window_utc": window,
+        "sample_limit": sample_limit,
+        "results": results,
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
