@@ -57,3 +57,14 @@ jobs:
           ' .tmp/release-provenance.json >/dev/null
           jq '{source, binary: {sha256: .binary.sha256, size_bytes: .binary.size_bytes}, tools, contracts, dependencies}' \
             .tmp/release-provenance.json
+
+      - name: Upload release binary bundle
+        # actions/upload-artifact v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: cloudflare-mcp-linux-x86_64-stdio-${{ github.sha }}
+          path: |
+            target/release/cloudflare-mcp
+            .tmp/release-provenance.json
+          if-no-files-found: error
+          retention-days: 14

@@ -101,7 +101,10 @@ descriptions, actions, enabled state, expressions, and deployment metadata.
 against the Security Events dataset, `firewallEventsAdaptive`, and returns
 grouped evidence plus recent samples. Security Events represent individual
 events, not unique HTTP requests, and Cloudflare may sample large windows; use
-narrower windows for spike triage.
+narrower windows for spike triage. When grouped GraphQL authz degrades, the
+response may include `diagnostics.authz_classification` so callers can tell
+whether the likely issue is wrong context, grouped-only access loss, or a
+broader entitlement or product restriction.
 
 `waf_rule_activity` combines the two: it looks for a rule ID in current WAF
 Rulesets and queries recent Security Events for that rule. Use it for questions

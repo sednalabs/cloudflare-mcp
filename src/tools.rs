@@ -2028,27 +2028,35 @@ impl CloudflareMcp {
                     .get("errors")
                     .and_then(Value::as_array)
                     .is_some_and(|errors| !errors.is_empty());
+                let diagnostics = graphql_authz_diagnostics(
+                    GraphqlAnalyticsShape::WafSecurityEvents,
+                    &body["variables"],
+                    &result,
+                );
                 let payload = truncate_api_payload(
-                    json!({
-                        "ok": !has_graphql_errors,
-                        "operation": "waf_security_events_summary",
-                        "zone_id": zone_id,
-                        "window_utc": window,
-                        "group_by": group_by,
-                        "limits": {
-                            "groups_per_dimension": limit,
-                            "samples": sample_limit,
-                        },
-                        "filter": body["variables"]["filter"].clone(),
-                        "analytics": waf_security_events_projection(&result),
-                        "graphql": {
-                            "endpoint": "/graphql",
-                            "query": if args.include_query { body["query"].clone() } else { Value::Null },
-                            "variables": body["variables"].clone(),
-                            "result": result,
-                        },
-                        "source": waf_source_notes(),
-                    }),
+                    with_graphql_diagnostics(
+                        json!({
+                            "ok": !has_graphql_errors,
+                            "operation": "waf_security_events_summary",
+                            "zone_id": zone_id,
+                            "window_utc": window,
+                            "group_by": group_by,
+                            "limits": {
+                                "groups_per_dimension": limit,
+                                "samples": sample_limit,
+                            },
+                            "filter": body["variables"]["filter"].clone(),
+                            "analytics": waf_security_events_projection(&result),
+                            "graphql": {
+                                "endpoint": "/graphql",
+                                "query": if args.include_query { body["query"].clone() } else { Value::Null },
+                                "variables": body["variables"].clone(),
+                                "result": result,
+                            },
+                            "source": waf_source_notes(),
+                        }),
+                        diagnostics,
+                    ),
                     args.max_bytes.unwrap_or(1_048_576).clamp(1, 10_485_760),
                 );
                 if has_graphql_errors {
@@ -2166,24 +2174,32 @@ impl CloudflareMcp {
                     .get("errors")
                     .and_then(Value::as_array)
                     .is_some_and(|errors| !errors.is_empty());
+                let diagnostics = graphql_authz_diagnostics(
+                    GraphqlAnalyticsShape::WafRuleActivity,
+                    &body["variables"],
+                    &result,
+                );
                 let payload = truncate_api_payload(
-                    json!({
-                        "ok": !has_graphql_errors,
-                        "operation": "waf_rule_activity",
-                        "target": target.to_json(),
-                        "rule_id": rule_id,
-                        "window_utc": window,
-                        "matching_rules": matching_rules,
-                        "rulesets": rulesets,
-                        "analytics": waf_security_events_projection(&result),
-                        "graphql": {
-                            "endpoint": "/graphql",
-                            "query": if args.include_query { body["query"].clone() } else { Value::Null },
-                            "variables": body["variables"].clone(),
-                            "result": result,
-                        },
-                        "source": waf_source_notes(),
-                    }),
+                    with_graphql_diagnostics(
+                        json!({
+                            "ok": !has_graphql_errors,
+                            "operation": "waf_rule_activity",
+                            "target": target.to_json(),
+                            "rule_id": rule_id,
+                            "window_utc": window,
+                            "matching_rules": matching_rules,
+                            "rulesets": rulesets,
+                            "analytics": waf_security_events_projection(&result),
+                            "graphql": {
+                                "endpoint": "/graphql",
+                                "query": if args.include_query { body["query"].clone() } else { Value::Null },
+                                "variables": body["variables"].clone(),
+                                "result": result,
+                            },
+                            "source": waf_source_notes(),
+                        }),
+                        diagnostics,
+                    ),
                     args.max_bytes.unwrap_or(1_048_576).clamp(1, 10_485_760),
                 );
                 if has_graphql_errors {
@@ -2425,17 +2441,25 @@ impl CloudflareMcp {
                     .get("errors")
                     .and_then(Value::as_array)
                     .is_some_and(|errors| !errors.is_empty());
+                let diagnostics = graphql_authz_diagnostics(
+                    GraphqlAnalyticsShape::Generic,
+                    &body["variables"],
+                    &result,
+                );
                 let payload = truncate_api_payload(
-                    json!({
-                        "ok": !has_graphql_errors,
-                        "operation": "graphql_analytics_query",
-                        "endpoint": "/graphql",
-                        "result": result,
-                        "source": {
-                            "kind": "cloudflare_graphql_analytics_api",
-                            "note": "Cloudflare Analytics GraphQL is useful for product analytics and attribution. Cloudflare documents that GraphQL analytics datasets are not a substitute for billing usage records.",
-                        },
-                    }),
+                    with_graphql_diagnostics(
+                        json!({
+                            "ok": !has_graphql_errors,
+                            "operation": "graphql_analytics_query",
+                            "endpoint": "/graphql",
+                            "result": result,
+                            "source": {
+                                "kind": "cloudflare_graphql_analytics_api",
+                                "note": "Cloudflare Analytics GraphQL is useful for product analytics and attribution. Cloudflare documents that GraphQL analytics datasets are not a substitute for billing usage records.",
+                            },
+                        }),
+                        diagnostics,
+                    ),
                     args.max_bytes.unwrap_or(1_048_576).clamp(1, 10_485_760),
                 );
                 if has_graphql_errors {
@@ -7891,6 +7915,285 @@ fn adapter_error_result(err: crate::cloudflare::AdapterError) -> CallToolResult 
     }))
 }
 
+#[derive(Debug, Clone, Copy)]
+enum GraphqlAnalyticsShape {
+    Generic,
+    WafSecurityEvents,
+    WafRuleActivity,
+}
+
+fn with_graphql_diagnostics(mut payload: Value, diagnostics: Option<Value>) -> Value {
+    if let (Some(diagnostics), Value::Object(map)) = (diagnostics, &mut payload) {
+        map.insert("diagnostics".to_string(), diagnostics);
+    }
+    payload
+}
+
+fn graphql_authz_diagnostics(
+    shape: GraphqlAnalyticsShape,
+    variables: &Value,
+    result: &Value,
+) -> Option<Value> {
+    let error_messages = graphql_error_messages(result);
+    let error_paths = graphql_error_paths(result);
+    let zone_filter_applied = variables
+        .get("zoneTag")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    let account_filter_applied = variables
+        .get("accountTag")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    let empty_zones = zone_filter_applied
+        && result
+            .pointer("/data/viewer/zones")
+            .and_then(Value::as_array)
+            .is_some_and(|zones| zones.is_empty());
+    let empty_accounts = account_filter_applied
+        && result
+            .pointer("/data/viewer/accounts")
+            .and_then(Value::as_array)
+            .is_some_and(|accounts| accounts.is_empty());
+    let raw_path_worked = match shape {
+        GraphqlAnalyticsShape::Generic => false,
+        GraphqlAnalyticsShape::WafSecurityEvents => {
+            path_pointer_is_nonempty(result, "/data/viewer/zones/0/samples")
+        }
+        GraphqlAnalyticsShape::WafRuleActivity => {
+            path_pointer_is_nonempty(result, "/data/viewer/zones/0/samples")
+        }
+    };
+    let grouped_path_worked = match shape {
+        GraphqlAnalyticsShape::Generic => false,
+        GraphqlAnalyticsShape::WafSecurityEvents => {
+            path_pointer_is_nonempty(result, "/data/viewer/zones/0/byAction")
+                || path_pointer_is_nonempty(result, "/data/viewer/zones/0/bySource")
+                || path_pointer_is_nonempty(result, "/data/viewer/zones/0/byHost")
+                || path_pointer_is_nonempty(result, "/data/viewer/zones/0/byPath")
+                || path_pointer_is_nonempty(result, "/data/viewer/zones/0/byCountry")
+                || path_pointer_is_nonempty(result, "/data/viewer/zones/0/byHour")
+                || path_pointer_is_nonempty(result, "/data/viewer/zones/0/byIp")
+                || path_pointer_is_nonempty(result, "/data/viewer/zones/0/byRule")
+        }
+        GraphqlAnalyticsShape::WafRuleActivity => {
+            path_pointer_is_nonempty(result, "/data/viewer/zones/0/byAction")
+                || path_pointer_is_nonempty(result, "/data/viewer/zones/0/bySource")
+        }
+    };
+    let grouped_path_mentioned =
+        graphql_authz_error_mentions_grouped_node(&error_paths, &error_messages);
+    let path_authz_denied = graphql_error_indicates_path_authz(&error_messages);
+    let partial_data_available = match shape {
+        GraphqlAnalyticsShape::Generic => {
+            result
+                .pointer("/data/viewer/accounts/0")
+                .is_some_and(graphql_object_has_non_grouped_payload)
+                || result
+                    .pointer("/data/viewer/zones/0")
+                    .is_some_and(graphql_object_has_non_grouped_payload)
+        }
+        GraphqlAnalyticsShape::WafSecurityEvents | GraphqlAnalyticsShape::WafRuleActivity => false,
+    };
+    let mut evidence = Map::new();
+    evidence.insert(
+        "zone_filter_applied".to_string(),
+        json!(zone_filter_applied),
+    );
+    evidence.insert(
+        "account_filter_applied".to_string(),
+        json!(account_filter_applied),
+    );
+    evidence.insert("raw_path_worked".to_string(), json!(raw_path_worked));
+    evidence.insert(
+        "grouped_path_worked".to_string(),
+        json!(grouped_path_worked),
+    );
+    evidence.insert(
+        "grouped_path_mentioned".to_string(),
+        json!(grouped_path_mentioned),
+    );
+    evidence.insert(
+        "partial_data_available".to_string(),
+        json!(partial_data_available),
+    );
+
+    if empty_zones || empty_accounts {
+        return Some(graphql_authz_diagnostic_payload(
+            "wrong_account_or_zone_context",
+            "Verify the accountTag or zoneTag filter values before retrying the same GraphQL query.",
+            error_messages,
+            error_paths,
+            evidence,
+        ));
+    }
+
+    if matches!(shape, GraphqlAnalyticsShape::Generic)
+        && path_authz_denied
+        && grouped_path_mentioned
+        && partial_data_available
+    {
+        return Some(graphql_authz_diagnostic_payload(
+            "grouped_path_blocked_partial_success",
+            "The GraphQL query returned other fields successfully while a grouped node was denied. Use the successful sibling data as context and treat the grouped node as degraded or entitlement-restricted until Cloudflare restores access.",
+            error_messages,
+            error_paths,
+            evidence,
+        ));
+    }
+
+    if path_authz_denied && raw_path_worked && grouped_path_mentioned {
+        return Some(graphql_authz_diagnostic_payload(
+            "grouped_path_blocked_raw_path_works",
+            "Keep the same token and context, fall back to the raw analytics path, and treat grouped analytics as provider-side degradation until Cloudflare restores access.",
+            error_messages,
+            error_paths,
+            evidence,
+        ));
+    }
+
+    if path_authz_denied {
+        return Some(graphql_authz_diagnostic_payload(
+            "likely_entitlement_or_product_restriction",
+            "Verify the token with account_api_tokens action=verify, then compare the same account or zone on a known raw analytics path before treating this as a Cloudflare entitlement or product restriction.",
+            error_messages,
+            error_paths,
+            evidence,
+        ));
+    }
+
+    None
+}
+
+fn graphql_authz_diagnostic_payload(
+    code: &str,
+    next_step: &str,
+    error_messages: Vec<String>,
+    error_paths: Vec<String>,
+    mut evidence: Map<String, Value>,
+) -> Value {
+    evidence.insert(
+        "graphql_error_count".to_string(),
+        json!(error_messages.len()),
+    );
+    evidence.insert("graphql_error_messages".to_string(), json!(error_messages));
+    evidence.insert("graphql_error_paths".to_string(), json!(error_paths));
+    json!({
+        "authz_classification": {
+            "code": code,
+            "next_step": next_step,
+            "evidence": Value::Object(evidence),
+        }
+    })
+}
+
+fn graphql_error_messages(result: &Value) -> Vec<String> {
+    result
+        .get("errors")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|error| error.get("message").and_then(Value::as_str))
+        .map(|message| message.trim().to_string())
+        .filter(|message| !message.is_empty())
+        .collect()
+}
+
+fn graphql_error_paths(result: &Value) -> Vec<String> {
+    result
+        .get("errors")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|error| error.get("path").and_then(Value::as_array))
+        .map(|path| graphql_error_path_string(path))
+        .filter(|path| !path.is_empty())
+        .collect()
+}
+
+fn graphql_error_path_string(path: &[Value]) -> String {
+    path.iter()
+        .filter_map(|segment| match segment {
+            Value::String(value) => Some(value.trim().to_string()),
+            Value::Number(value) => Some(value.to_string()),
+            _ => None,
+        })
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn graphql_error_indicates_path_authz(messages: &[String]) -> bool {
+    messages.iter().any(|message| {
+        let lower = message.to_ascii_lowercase();
+        lower.contains("does not have access to the path")
+            || lower.contains("access to the path")
+            || lower.contains("authorization")
+    })
+}
+
+fn graphql_authz_error_mentions_grouped_node(paths: &[String], messages: &[String]) -> bool {
+    const GROUP_ALIASES: [&str; 8] = [
+        "byAction",
+        "bySource",
+        "byHost",
+        "byPath",
+        "byCountry",
+        "byHour",
+        "byIp",
+        "byRule",
+    ];
+    paths.iter().any(|path| {
+        path.contains("Groups")
+            || GROUP_ALIASES
+                .iter()
+                .any(|alias| path.split('.').any(|segment| segment == *alias))
+    }) || messages.iter().any(|message| {
+        let lower = message.to_ascii_lowercase();
+        lower.contains("groups") || lower.contains("grouped")
+    })
+}
+
+fn graphql_object_has_non_grouped_payload(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object
+        .iter()
+        .any(|(key, value)| !graphql_key_looks_grouped(key) && json_value_is_nonempty(value))
+}
+
+fn graphql_key_looks_grouped(key: &str) -> bool {
+    key.ends_with("Groups")
+        || matches!(
+            key,
+            "byAction"
+                | "bySource"
+                | "byHost"
+                | "byPath"
+                | "byCountry"
+                | "byHour"
+                | "byIp"
+                | "byRule"
+        )
+}
+
+fn path_pointer_is_nonempty(value: &Value, pointer: &str) -> bool {
+    value.pointer(pointer).is_some_and(json_value_is_nonempty)
+}
+
+fn json_value_is_nonempty(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(_) => true,
+        Value::Number(_) => true,
+        Value::String(value) => !value.trim().is_empty(),
+        Value::Array(values) => !values.is_empty(),
+        Value::Object(values) => !values.is_empty(),
+    }
+}
+
 fn pages_project_has_git_source(source: &Option<Value>) -> bool {
     match source {
         Some(Value::Object(source)) if !source.is_empty() => source
@@ -9088,11 +9391,21 @@ async fn waf_lifecycle_security_events_readback(
             },
         });
         let result = match server.cloudflare.graphql_analytics_query(&body).await {
-            Ok(result) => json!({
-                "rule": rule_id,
-                "ok": !result.get("errors").and_then(Value::as_array).is_some_and(|errors| !errors.is_empty()),
-                "analytics": waf_security_events_projection(&result),
-            }),
+            Ok(result) => {
+                let diagnostics = graphql_authz_diagnostics(
+                    GraphqlAnalyticsShape::WafRuleActivity,
+                    &body["variables"],
+                    &result,
+                );
+                with_graphql_diagnostics(
+                    json!({
+                        "rule": rule_id,
+                        "ok": !result.get("errors").and_then(Value::as_array).is_some_and(|errors| !errors.is_empty()),
+                        "analytics": waf_security_events_projection(&result),
+                    }),
+                    diagnostics,
+                )
+            }
             Err(err) => json!({
                 "rule": rule_id,
                 "ok": false,
@@ -11814,8 +12127,8 @@ mod tests {
         EnsureTunnelArgs, FindToolsArgs, GenerateTunnelIngressArgs, GraphqlAnalyticsQueryArgs,
         LockFirstPublishArgs, PagesDeploymentActionArgs, PagesUpdateProjectArgs,
         PatchWorkerSettingsArgs, PortalAgentRequestArgs, QueueHealthArgs, UpsertAccessAppArgs,
-        UpsertDnsCnameArgs, VerifyHttpGateArgs, WafEventFilterInput, WafTimeWindow,
-        WorkersObservabilityListKeysArgs, WorkersObservabilityListValuesArgs,
+        UpsertDnsCnameArgs, VerifyHttpGateArgs, WafEventFilterInput, WafSecurityEventsSummaryArgs,
+        WafTimeWindow, WorkersObservabilityListKeysArgs, WorkersObservabilityListValuesArgs,
         WorkersObservabilityQueryEventsArgs, WorkersObservabilityTimeframe,
         build_waf_security_events_query, normalize_waf_group_by, normalize_waf_phases,
         query_mentions_waf, waf_security_events_filter,
@@ -13519,6 +13832,371 @@ mod tests {
         assert_eq!(
             payload["error"]["code"],
             json!("graphql_analytics.not_read_only")
+        );
+    }
+
+    #[tokio::test]
+    async fn graphql_analytics_query_classifies_wrong_account_context_from_empty_account_match() {
+        async fn graphql(Json(body): Json<Value>) -> Json<Value> {
+            assert_eq!(body["variables"]["accountTag"], json!("missing-acct"));
+            Json(json!({
+                "data": {
+                    "viewer": {
+                        "accounts": []
+                    }
+                }
+            }))
+        }
+
+        let router = Router::new().route("/graphql", post(graphql));
+        let server = test_server(spawn_router(router).await);
+        let result = server
+            .cloudflare_graphql_analytics_query(Parameters(GraphqlAnalyticsQueryArgs {
+                query: "query D1Usage($accountTag: string!) { viewer { accounts(filter: { accountTag: $accountTag }) { d1AnalyticsAdaptiveGroups(limit: 1) { sum { rowsRead } } } } }".to_string(),
+                variables: BTreeMap::from([("accountTag".to_string(), json!("missing-acct"))]),
+                max_bytes: None,
+            }))
+            .await
+            .expect("graphql query");
+        let payload = result.structured_content.expect("payload");
+
+        assert_eq!(payload["ok"], json!(true), "{payload}");
+        assert_eq!(
+            payload["diagnostics"]["authz_classification"]["code"],
+            json!("wrong_account_or_zone_context")
+        );
+    }
+
+    #[tokio::test]
+    async fn graphql_analytics_query_classifies_grouped_authz_without_raw_success_as_entitlement_or_product_restriction()
+     {
+        async fn graphql() -> Json<Value> {
+            Json(json!({
+                "data": {
+                    "viewer": {
+                        "accounts": [{}]
+                    }
+                },
+                "errors": [{
+                    "message": "does not have access to the path",
+                    "path": ["viewer", "accounts", 0, "d1AnalyticsAdaptiveGroups"]
+                }]
+            }))
+        }
+
+        let router = Router::new().route("/graphql", post(graphql));
+        let server = test_server(spawn_router(router).await);
+        let result = server
+            .cloudflare_graphql_analytics_query(Parameters(GraphqlAnalyticsQueryArgs {
+                query: "query D1Usage($accountTag: string!) { viewer { accounts(filter: { accountTag: $accountTag }) { d1AnalyticsAdaptiveGroups(limit: 1) { sum { rowsRead } } } } }".to_string(),
+                variables: BTreeMap::from([("accountTag".to_string(), json!("acct-1"))]),
+                max_bytes: None,
+            }))
+            .await
+            .expect("graphql query");
+        let payload = result.structured_content.expect("payload");
+
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            payload["diagnostics"]["authz_classification"]["code"],
+            json!("likely_entitlement_or_product_restriction")
+        );
+        assert_eq!(
+            payload["diagnostics"]["authz_classification"]["evidence"]["raw_path_worked"],
+            json!(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn graphql_analytics_query_classifies_grouped_authz_with_partial_account_success() {
+        async fn graphql() -> Json<Value> {
+            Json(json!({
+                "data": {
+                    "viewer": {
+                        "accounts": [{
+                            "accountTag": "acct-1"
+                        }]
+                    }
+                },
+                "errors": [{
+                    "message": "does not have access to the path",
+                    "path": ["viewer", "accounts", 0, "d1AnalyticsAdaptiveGroups"]
+                }]
+            }))
+        }
+
+        let router = Router::new().route("/graphql", post(graphql));
+        let server = test_server(spawn_router(router).await);
+        let result = server
+            .cloudflare_graphql_analytics_query(Parameters(GraphqlAnalyticsQueryArgs {
+                query: "query D1Usage($accountTag: string!) { viewer { accounts(filter: { accountTag: $accountTag }) { accountTag d1AnalyticsAdaptiveGroups(limit: 1) { sum { rowsRead } } } } }".to_string(),
+                variables: BTreeMap::from([("accountTag".to_string(), json!("acct-1"))]),
+                max_bytes: None,
+            }))
+            .await
+            .expect("graphql query");
+        let payload = result.structured_content.expect("payload");
+
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            payload["diagnostics"]["authz_classification"]["code"],
+            json!("grouped_path_blocked_partial_success")
+        );
+        assert_eq!(
+            payload["diagnostics"]["authz_classification"]["evidence"]["partial_data_available"],
+            json!(true)
+        );
+        assert_eq!(
+            payload["diagnostics"]["authz_classification"]["evidence"]["raw_path_worked"],
+            json!(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn graphql_analytics_query_treats_false_booleans_as_present_raw_payload() {
+        async fn graphql() -> Json<Value> {
+            Json(json!({
+                "data": {
+                    "viewer": {
+                        "accounts": [{
+                            "ssl": false
+                        }]
+                    }
+                },
+                "errors": [{
+                    "message": "does not have access to the path",
+                    "path": ["viewer", "accounts", 0, "d1AnalyticsAdaptiveGroups"]
+                }]
+            }))
+        }
+
+        let router = Router::new().route("/graphql", post(graphql));
+        let server = test_server(spawn_router(router).await);
+        let result = server
+            .cloudflare_graphql_analytics_query(Parameters(GraphqlAnalyticsQueryArgs {
+                query: "query D1Usage($accountTag: string!) { viewer { accounts(filter: { accountTag: $accountTag }) { ssl d1AnalyticsAdaptiveGroups(limit: 1) { sum { rowsRead } } } } }".to_string(),
+                variables: BTreeMap::from([("accountTag".to_string(), json!("acct-1"))]),
+                max_bytes: None,
+            }))
+            .await
+            .expect("graphql query");
+        let payload = result.structured_content.expect("payload");
+
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            payload["diagnostics"]["authz_classification"]["code"],
+            json!("grouped_path_blocked_partial_success")
+        );
+        assert_eq!(
+            payload["diagnostics"]["authz_classification"]["evidence"]["partial_data_available"],
+            json!(true)
+        );
+        assert_eq!(
+            payload["diagnostics"]["authz_classification"]["evidence"]["raw_path_worked"],
+            json!(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn waf_security_events_summary_classifies_grouped_authz_when_raw_samples_still_work() {
+        async fn graphql() -> Json<Value> {
+            Json(json!({
+                "data": {
+                    "viewer": {
+                        "zones": [{
+                            "settings": {
+                                "firewallEventsAdaptive": {
+                                    "maxDuration": 86400,
+                                    "maxPageSize": 100,
+                                    "notOlderThan": "2026-06-01T00:00:00Z"
+                                }
+                            },
+                            "samples": [{
+                                "action": "block",
+                                "clientRequestHTTPHost": "example.com",
+                                "clientRequestPath": "/admin",
+                                "datetime": "2026-06-04T01:02:03Z",
+                                "source": "waf",
+                                "ruleId": "rule-1"
+                            }]
+                        }]
+                    }
+                },
+                "errors": [{
+                    "message": "does not have access to the path",
+                    "path": ["viewer", "zones", 0, "byAction"]
+                }]
+            }))
+        }
+
+        let router = Router::new().route("/graphql", post(graphql));
+        let server = test_server(spawn_router(router).await);
+        let result = server
+            .cloudflare_waf_security_events_summary(Parameters(WafSecurityEventsSummaryArgs {
+                zone_id: Some("zone-1".to_string()),
+                window_hours: 1,
+                since: Some("2026-06-04T00:00:00Z".to_string()),
+                until: Some("2026-06-04T01:00:00Z".to_string()),
+                group_by: vec!["action".to_string()],
+                action: None,
+                source: None,
+                host: None,
+                path: None,
+                client_ip: None,
+                rule_id: None,
+                limit: 20,
+                sample_limit: 5,
+                include_query: false,
+                max_bytes: None,
+            }))
+            .await
+            .expect("waf summary");
+        let payload = result.structured_content.expect("payload");
+
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            payload["diagnostics"]["authz_classification"]["code"],
+            json!("grouped_path_blocked_raw_path_works")
+        );
+        assert_eq!(
+            payload["diagnostics"]["authz_classification"]["evidence"]["raw_path_worked"],
+            json!(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn waf_security_events_summary_does_not_treat_settings_only_as_raw_path_success() {
+        async fn graphql() -> Json<Value> {
+            Json(json!({
+                "data": {
+                    "viewer": {
+                        "zones": [{
+                            "settings": {
+                                "firewallEventsAdaptive": {
+                                    "maxDuration": 86400,
+                                    "maxPageSize": 100,
+                                    "notOlderThan": "2026-06-01T00:00:00Z"
+                                }
+                            },
+                            "samples": []
+                        }]
+                    }
+                },
+                "errors": [{
+                    "message": "does not have access to the path",
+                    "path": ["viewer", "zones", 0, "byAction"]
+                }]
+            }))
+        }
+
+        let router = Router::new().route("/graphql", post(graphql));
+        let server = test_server(spawn_router(router).await);
+        let result = server
+            .cloudflare_waf_security_events_summary(Parameters(WafSecurityEventsSummaryArgs {
+                zone_id: Some("zone-1".to_string()),
+                window_hours: 1,
+                since: Some("2026-06-04T00:00:00Z".to_string()),
+                until: Some("2026-06-04T01:00:00Z".to_string()),
+                group_by: vec!["action".to_string()],
+                action: None,
+                source: None,
+                host: None,
+                path: None,
+                client_ip: None,
+                rule_id: None,
+                limit: 20,
+                sample_limit: 0,
+                include_query: false,
+                max_bytes: None,
+            }))
+            .await
+            .expect("waf summary");
+        let payload = result.structured_content.expect("payload");
+
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            payload["diagnostics"]["authz_classification"]["code"],
+            json!("likely_entitlement_or_product_restriction")
+        );
+        assert_eq!(
+            payload["diagnostics"]["authz_classification"]["evidence"]["raw_path_worked"],
+            json!(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn waf_security_events_summary_requires_grouped_error_signal_for_grouped_only_classification()
+     {
+        async fn graphql() -> Json<Value> {
+            Json(json!({
+                "data": {
+                    "viewer": {
+                        "zones": [{
+                            "settings": {
+                                "firewallEventsAdaptive": {
+                                    "maxDuration": 86400,
+                                    "maxPageSize": 100,
+                                    "notOlderThan": "2026-06-01T00:00:00Z"
+                                }
+                            },
+                            "samples": [{
+                                "action": "block",
+                                "clientRequestHTTPHost": "example.com",
+                                "clientRequestPath": "/admin",
+                                "datetime": "2026-06-04T01:02:03Z",
+                                "source": "waf",
+                                "ruleId": "rule-1"
+                            }],
+                            "byAction": [{
+                                "count": 1,
+                                "dimensions": {"action": "block"}
+                            }]
+                        }]
+                    }
+                },
+                "errors": [{
+                    "message": "does not have access to the path",
+                    "path": ["viewer", "zones", 0, "samples"]
+                }]
+            }))
+        }
+
+        let router = Router::new().route("/graphql", post(graphql));
+        let server = test_server(spawn_router(router).await);
+        let result = server
+            .cloudflare_waf_security_events_summary(Parameters(WafSecurityEventsSummaryArgs {
+                zone_id: Some("zone-1".to_string()),
+                window_hours: 1,
+                since: Some("2026-06-04T00:00:00Z".to_string()),
+                until: Some("2026-06-04T01:00:00Z".to_string()),
+                group_by: vec!["action".to_string()],
+                action: None,
+                source: None,
+                host: None,
+                path: None,
+                client_ip: None,
+                rule_id: None,
+                limit: 20,
+                sample_limit: 5,
+                include_query: false,
+                max_bytes: None,
+            }))
+            .await
+            .expect("waf summary");
+        let payload = result.structured_content.expect("payload");
+
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            payload["diagnostics"]["authz_classification"]["code"],
+            json!("likely_entitlement_or_product_restriction")
+        );
+        assert_eq!(
+            payload["diagnostics"]["authz_classification"]["evidence"]["raw_path_worked"],
+            json!(true)
+        );
+        assert_eq!(
+            payload["diagnostics"]["authz_classification"]["evidence"]["grouped_path_mentioned"],
+            json!(false)
         );
     }
 
