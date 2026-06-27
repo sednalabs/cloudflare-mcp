@@ -32,6 +32,14 @@ pub struct AdapterErrorPayload {
     pub hint: &'static str,
     pub retryable: bool,
     pub status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classification: Option<ErrorClassificationPayload>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ErrorClassificationPayload {
+    pub code: &'static str,
+    pub next_step: &'static str,
 }
 
 #[derive(Debug, Clone, Error)]
@@ -43,6 +51,7 @@ pub struct AdapterError {
     pub retryable: bool,
     pub status: Option<u16>,
     cloudflare_api_error: Option<CloudflareApiError>,
+    classification: Option<ErrorClassificationPayload>,
 }
 
 impl AdapterError {
@@ -54,6 +63,7 @@ impl AdapterError {
             retryable: false,
             status: None,
             cloudflare_api_error: None,
+            classification: None,
         }
     }
 
@@ -72,6 +82,11 @@ impl AdapterError {
         self
     }
 
+    fn with_classification(mut self, classification: ErrorClassificationPayload) -> Self {
+        self.classification = Some(classification);
+        self
+    }
+
     pub fn payload(&self) -> AdapterErrorPayload {
         AdapterErrorPayload {
             code: self.code,
@@ -79,6 +94,7 @@ impl AdapterError {
             hint: self.hint,
             retryable: self.retryable,
             status: self.status,
+            classification: self.classification.clone(),
         }
     }
 
@@ -2784,13 +2800,24 @@ fn api_error(errors: &[CloudflareApiError]) -> AdapterError {
             "Cloudflare API returned success=false without error details".to_string()
         });
 
-    AdapterError::new(
+    let mut error = AdapterError::new(
         "cloudflare.api_error",
         detail,
         "Inspect account/zone permissions and Cloudflare API request payload.",
     )
     .with_cloudflare_api_error(cloudflare_api_error)
-    .with_status(Some(StatusCode::BAD_REQUEST.as_u16()))
+    .with_status(Some(StatusCode::BAD_REQUEST.as_u16()));
+    if error
+        .cloudflare_api_error_code()
+        .is_some_and(|code| code == 7003)
+        || error
+            .message
+            .to_ascii_lowercase()
+            .contains("resource not found")
+    {
+        error = error.with_classification(wrong_account_or_zone_context_classification());
+    }
+    error
 }
 
 fn http_status_error(status: StatusCode, body: &str) -> AdapterError {
@@ -2837,10 +2864,33 @@ fn http_status_error(status: StatusCode, body: &str) -> AdapterError {
         ),
     };
 
-    AdapterError::new(code, detail, hint)
+    let error = AdapterError::new(code, detail, hint)
         .with_cloudflare_api_error(envelope_error)
         .with_retryable(is_retryable_status(status))
-        .with_status(Some(status.as_u16()))
+        .with_status(Some(status.as_u16()));
+    match status {
+        StatusCode::UNAUTHORIZED => {
+            error.with_classification(invalid_or_expired_token_classification())
+        }
+        StatusCode::NOT_FOUND => {
+            error.with_classification(wrong_account_or_zone_context_classification())
+        }
+        _ => error,
+    }
+}
+
+fn invalid_or_expired_token_classification() -> ErrorClassificationPayload {
+    ErrorClassificationPayload {
+        code: "invalid_or_expired_token",
+        next_step: "Refresh the configured API token or run account_api_tokens action=verify to confirm the token is still active.",
+    }
+}
+
+fn wrong_account_or_zone_context_classification() -> ErrorClassificationPayload {
+    ErrorClassificationPayload {
+        code: "wrong_account_or_zone_context",
+        next_step: "Verify the account_id, zone_id, token_id, or GraphQL filter variables before retrying the same request.",
+    }
 }
 
 fn cloudflare_api_error_detail(error: &CloudflareApiError) -> String {
@@ -3372,8 +3422,49 @@ mod tests {
         assert_eq!(err.code, "cloudflare.api_error");
         assert!(err.message.contains("7003"));
         assert_eq!(
+            err.payload()
+                .classification
+                .as_ref()
+                .map(|classification| classification.code),
+            Some("wrong_account_or_zone_context")
+        );
+        assert_eq!(
             err.payload().hint,
             "Inspect account/zone permissions and Cloudflare API request payload."
+        );
+    }
+
+    #[tokio::test]
+    async fn classifies_http_unauthorized_as_invalid_or_expired_token() {
+        let router = Router::new().route(
+            "/accounts/acct-1/access/apps/app-1/policies",
+            get(|| async {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({
+                        "success": false,
+                        "errors": [{"code": 10000, "message": "authentication error"}],
+                        "messages": [],
+                        "result": null
+                    })),
+                )
+            }),
+        );
+
+        let base = spawn_router(router).await;
+        let client = CloudflareClient::new(test_config(base)).expect("client");
+        let err = client
+            .list_access_policies("acct-1", "app-1")
+            .await
+            .expect_err("expected http unauthorized");
+
+        assert_eq!(err.code, "cloudflare.http_unauthorized");
+        assert_eq!(
+            err.payload()
+                .classification
+                .as_ref()
+                .map(|classification| classification.code),
+            Some("invalid_or_expired_token")
         );
     }
 

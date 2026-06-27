@@ -825,6 +825,56 @@ fn spawn_fake_cloudflare_api() -> String {
     format!("http://{addr}")
 }
 
+fn spawn_fake_graphql_api(response_body: Value) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake GraphQL API");
+    let addr = listener.local_addr().expect("fake GraphQL API addr");
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.expect("fake GraphQL API stream");
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).expect("read request");
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let headers = String::from_utf8_lossy(&request);
+            let content_length = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .or_else(|| {
+                    headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Content-Length:"))
+                })
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            let mut body = vec![0u8; content_length];
+            if content_length > 0 {
+                stream.read_exact(&mut body).expect("read body");
+            }
+            let path = headers
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or_default()
+                .to_string();
+            assert!(path.ends_with("/graphql"), "unexpected path: {path}");
+            let response = serde_json::to_vec(&response_body).expect("serialize response");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                response.len()
+            )
+            .expect("write response headers");
+            stream.write_all(&response).expect("write response body");
+        }
+    });
+    format!("http://{addr}")
+}
+
 fn spawn_fake_d1_database_mutation_api(
     expected_requests: usize,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
@@ -2662,6 +2712,74 @@ fn billing_usage_and_graphql_analytics_work_through_stdio_boundary() {
 }
 
 #[test]
+fn graphql_analytics_query_reports_likely_entitlement_restriction_through_stdio_boundary() {
+    let base_url = spawn_fake_graphql_api(json!({
+        "data": {
+            "viewer": {
+                "accounts": [{}]
+            }
+        },
+        "errors": [{
+            "message": "does not have access to the path",
+            "path": ["viewer", "accounts", 0, "d1AnalyticsAdaptiveGroups"]
+        }]
+    }));
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+
+    let graphql = mcp.call_tool(
+        2,
+        "graphql_analytics_query",
+        json!({
+            "query": "query D1Usage($accountTag: string!) { viewer { accounts(filter: { accountTag: $accountTag }) { d1AnalyticsAdaptiveGroups(limit: 1) { sum { rowsRead rowsWritten } } } } }",
+            "variables": {"accountTag": "acct-1"}
+        }),
+    );
+    let graphql_content = structured_content(&graphql);
+    assert_eq!(graphql_content["ok"], json!(false), "{graphql_content}");
+    assert_eq!(
+        graphql_content["diagnostics"]["authz_classification"]["code"],
+        json!("likely_entitlement_or_product_restriction")
+    );
+}
+
+#[test]
+fn graphql_analytics_query_reports_grouped_partial_success_through_stdio_boundary() {
+    let base_url = spawn_fake_graphql_api(json!({
+        "data": {
+            "viewer": {
+                "accounts": [{
+                    "accountTag": "acct-1"
+                }]
+            }
+        },
+        "errors": [{
+            "message": "does not have access to the path",
+            "path": ["viewer", "accounts", 0, "d1AnalyticsAdaptiveGroups"]
+        }]
+    }));
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+
+    let graphql = mcp.call_tool(
+        2,
+        "graphql_analytics_query",
+        json!({
+            "query": "query D1Usage($accountTag: string!) { viewer { accounts(filter: { accountTag: $accountTag }) { accountTag d1AnalyticsAdaptiveGroups(limit: 1) { sum { rowsRead rowsWritten } } } } }",
+            "variables": {"accountTag": "acct-1"}
+        }),
+    );
+    let graphql_content = structured_content(&graphql);
+    assert_eq!(graphql_content["ok"], json!(false), "{graphql_content}");
+    assert_eq!(
+        graphql_content["diagnostics"]["authz_classification"]["code"],
+        json!("grouped_path_blocked_partial_success")
+    );
+    assert_eq!(
+        graphql_content["diagnostics"]["authz_classification"]["evidence"]["partial_data_available"],
+        json!(true)
+    );
+}
+
+#[test]
 fn waf_ruleset_and_security_events_work_through_stdio_boundary() {
     let base_url = spawn_fake_cloudflare_api();
     let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
@@ -2896,6 +3014,168 @@ fn waf_ruleset_and_security_events_work_through_stdio_boundary() {
     assert_eq!(
         applied_content["audit"]["action"],
         json!("waf_ruleset_apply_change")
+    );
+}
+
+#[test]
+fn waf_security_events_summary_reports_grouped_authz_diagnostics_through_stdio_boundary() {
+    let base_url = spawn_fake_graphql_api(json!({
+        "data": {
+            "viewer": {
+                "zones": [{
+                    "settings": {
+                        "firewallEventsAdaptive": {
+                            "maxDuration": 86400,
+                            "maxPageSize": 100,
+                            "notOlderThan": "2026-06-01T00:00:00Z"
+                        }
+                    },
+                    "samples": [{
+                        "action": "block",
+                        "clientIP": "203.0.113.10",
+                        "clientRequestHTTPHost": "example.com",
+                        "clientRequestPath": "/admin",
+                        "datetime": "2026-06-04T01:02:03Z",
+                        "source": "waf",
+                        "ruleId": "rule-1"
+                    }]
+                }]
+            }
+        },
+        "errors": [{
+            "message": "does not have access to the path",
+            "path": ["viewer", "zones", 0, "byAction"]
+        }]
+    }));
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+
+    let events = mcp.call_tool(
+        2,
+        "waf_security_events_summary",
+        json!({
+            "since": "2026-06-04T00:00:00Z",
+            "until": "2026-06-04T02:00:00Z",
+            "group_by": ["action"],
+            "sample_limit": 5
+        }),
+    );
+    let events_content = structured_content(&events);
+    assert_eq!(events_content["ok"], json!(false), "{events_content}");
+    assert_eq!(
+        events_content["diagnostics"]["authz_classification"]["code"],
+        json!("grouped_path_blocked_raw_path_works")
+    );
+    assert_eq!(
+        events_content["diagnostics"]["authz_classification"]["evidence"]["raw_path_worked"],
+        json!(true)
+    );
+}
+
+#[test]
+fn waf_security_events_summary_zero_sample_window_does_not_claim_raw_path_success() {
+    let base_url = spawn_fake_graphql_api(json!({
+        "data": {
+            "viewer": {
+                "zones": [{
+                    "settings": {
+                        "firewallEventsAdaptive": {
+                            "maxDuration": 86400,
+                            "maxPageSize": 100,
+                            "notOlderThan": "2026-06-01T00:00:00Z"
+                        }
+                    },
+                    "samples": []
+                }]
+            }
+        },
+        "errors": [{
+            "message": "does not have access to the path",
+            "path": ["viewer", "zones", 0, "byAction"]
+        }]
+    }));
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+
+    let events = mcp.call_tool(
+        2,
+        "waf_security_events_summary",
+        json!({
+            "since": "2026-06-04T00:00:00Z",
+            "until": "2026-06-04T02:00:00Z",
+            "group_by": ["action"],
+            "sample_limit": 0
+        }),
+    );
+    let events_content = structured_content(&events);
+    assert_eq!(events_content["ok"], json!(false), "{events_content}");
+    assert_eq!(
+        events_content["diagnostics"]["authz_classification"]["code"],
+        json!("likely_entitlement_or_product_restriction")
+    );
+    assert_eq!(
+        events_content["diagnostics"]["authz_classification"]["evidence"]["raw_path_worked"],
+        json!(false)
+    );
+}
+
+#[test]
+fn waf_security_events_summary_raw_field_authz_denial_is_not_mislabeled_as_grouped_only() {
+    let base_url = spawn_fake_graphql_api(json!({
+        "data": {
+            "viewer": {
+                "zones": [{
+                    "settings": {
+                        "firewallEventsAdaptive": {
+                            "maxDuration": 86400,
+                            "maxPageSize": 100,
+                            "notOlderThan": "2026-06-01T00:00:00Z"
+                        }
+                    },
+                    "samples": [{
+                        "action": "block",
+                        "clientIP": "203.0.113.10",
+                        "clientRequestHTTPHost": "example.com",
+                        "clientRequestPath": "/admin",
+                        "datetime": "2026-06-04T01:02:03Z",
+                        "source": "waf",
+                        "ruleId": "rule-1"
+                    }],
+                    "byAction": [{
+                        "count": 1,
+                        "dimensions": {"action": "block"}
+                    }]
+                }]
+            }
+        },
+        "errors": [{
+            "message": "does not have access to the path",
+            "path": ["viewer", "zones", 0, "samples"]
+        }]
+    }));
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+
+    let events = mcp.call_tool(
+        2,
+        "waf_security_events_summary",
+        json!({
+            "since": "2026-06-04T00:00:00Z",
+            "until": "2026-06-04T02:00:00Z",
+            "group_by": ["action"],
+            "sample_limit": 5
+        }),
+    );
+    let events_content = structured_content(&events);
+    assert_eq!(events_content["ok"], json!(false), "{events_content}");
+    assert_eq!(
+        events_content["diagnostics"]["authz_classification"]["code"],
+        json!("likely_entitlement_or_product_restriction")
+    );
+    assert_eq!(
+        events_content["diagnostics"]["authz_classification"]["evidence"]["raw_path_worked"],
+        json!(true)
+    );
+    assert_eq!(
+        events_content["diagnostics"]["authz_classification"]["evidence"]["grouped_path_mentioned"],
+        json!(false)
     );
 }
 

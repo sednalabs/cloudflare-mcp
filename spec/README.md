@@ -66,7 +66,12 @@ regression when fixing this class of catalog drift.
 
 Cloudflare Analytics GraphQL is not part of the REST catalog. Use the curated
 `graphql_analytics_query` tool for read-only `/client/v4/graphql` analytics
-queries and `account_billing_usage` for billing/usage REST records.
+queries and `account_billing_usage` for billing/usage REST records. GraphQL and
+curated WAF analytics responses may now include
+`diagnostics.authz_classification` when the MCP can distinguish likely cause
+classes such as invalid token, wrong account or zone context, grouped paths
+blocked while raw paths still work, or likely entitlement or product
+restriction.
 
 Note on read-only mode:
 - `CLOUDFLARE_MCP_READ_ONLY=1` intentionally filters tool exposure at runtime.
