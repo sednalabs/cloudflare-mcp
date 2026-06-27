@@ -75,6 +75,27 @@ release artifact bundle so agents can compare:
 - schema snapshot hash versus `spec/tool_schema_snapshot.v1.json`,
 - `/proc/<pid>/exe` hash for any already-running stdio process.
 
+For CI-built release bundles, the `Rust Validation` workflow uploads a
+downloadable artifact named `cloudflare-mcp-linux-x86_64-stdio-<git-sha>` that
+contains:
+
+- `target/release/cloudflare-mcp`
+- `.tmp/release-provenance.json`
+
+This is the preferred install source when the operator wants the local machine
+to run exactly the binary GitHub Actions validated. Example retrieval:
+
+```bash
+gh run download <run-id> \
+  --repo sednalabs/cloudflare-mcp \
+  --name cloudflare-mcp-linux-x86_64-stdio-<git-sha> \
+  --dir /tmp/cloudflare-mcp-release-<git-sha>
+```
+
+After download, compare the installed file and the artifact manifest before
+promoting a new `current` symlink or replacing the current binary in a versioned
+install directory.
+
 ## Safety Profiles
 
 ### Read-Only
