@@ -8186,7 +8186,7 @@ fn path_pointer_is_nonempty(value: &Value, pointer: &str) -> bool {
 fn json_value_is_nonempty(value: &Value) -> bool {
     match value {
         Value::Null => false,
-        Value::Bool(value) => *value,
+        Value::Bool(_) => true,
         Value::Number(_) => true,
         Value::String(value) => !value.trim().is_empty(),
         Value::Array(values) => !values.is_empty(),
@@ -13930,6 +13930,51 @@ mod tests {
         let result = server
             .cloudflare_graphql_analytics_query(Parameters(GraphqlAnalyticsQueryArgs {
                 query: "query D1Usage($accountTag: string!) { viewer { accounts(filter: { accountTag: $accountTag }) { accountTag d1AnalyticsAdaptiveGroups(limit: 1) { sum { rowsRead } } } } }".to_string(),
+                variables: BTreeMap::from([("accountTag".to_string(), json!("acct-1"))]),
+                max_bytes: None,
+            }))
+            .await
+            .expect("graphql query");
+        let payload = result.structured_content.expect("payload");
+
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            payload["diagnostics"]["authz_classification"]["code"],
+            json!("grouped_path_blocked_partial_success")
+        );
+        assert_eq!(
+            payload["diagnostics"]["authz_classification"]["evidence"]["partial_data_available"],
+            json!(true)
+        );
+        assert_eq!(
+            payload["diagnostics"]["authz_classification"]["evidence"]["raw_path_worked"],
+            json!(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn graphql_analytics_query_treats_false_booleans_as_present_raw_payload() {
+        async fn graphql() -> Json<Value> {
+            Json(json!({
+                "data": {
+                    "viewer": {
+                        "accounts": [{
+                            "ssl": false
+                        }]
+                    }
+                },
+                "errors": [{
+                    "message": "does not have access to the path",
+                    "path": ["viewer", "accounts", 0, "d1AnalyticsAdaptiveGroups"]
+                }]
+            }))
+        }
+
+        let router = Router::new().route("/graphql", post(graphql));
+        let server = test_server(spawn_router(router).await);
+        let result = server
+            .cloudflare_graphql_analytics_query(Parameters(GraphqlAnalyticsQueryArgs {
+                query: "query D1Usage($accountTag: string!) { viewer { accounts(filter: { accountTag: $accountTag }) { ssl d1AnalyticsAdaptiveGroups(limit: 1) { sum { rowsRead } } } } }".to_string(),
                 variables: BTreeMap::from([("accountTag".to_string(), json!("acct-1"))]),
                 max_bytes: None,
             }))
