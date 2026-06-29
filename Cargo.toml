@@ -19,7 +19,7 @@ mcp-toolkit-observability = { git = "https://github.com/sednalabs/mcp-toolkit-rs
 mcp-toolkit-policy-core = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "6cdc0ebdb7e1b2fb234d279c3725f85e5a1ce05f", package = "mcp-toolkit-policy-core" }
 mime_guess = "2.0.5"
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
-rmcp = { version = "=1.7.0", features = ["server", "transport-io", "transport-streamable-http-server", "macros", "elicitation", "schemars"] }
+rmcp = { version = "=2.0.0", features = ["server", "transport-io", "transport-streamable-http-server", "macros", "elicitation", "schemars"] }
 schemars = "1.2.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
