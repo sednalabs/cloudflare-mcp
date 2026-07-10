@@ -538,9 +538,9 @@ Set {AUTH_ALLOW_INSECURE_DEV_DELEGATION_SECRET}=1 only for loopback-only local d
 }
 
 fn parse_bind_addr(bind_addr: &str) -> Result<SocketAddr, String> {
-    bind_addr.parse::<SocketAddr>().map_err(|err| {
-        format!("Invalid CLOUDFLARE_MCP_BIND_ADDR {bind_addr:?}: {err}")
-    })
+    bind_addr
+        .parse::<SocketAddr>()
+        .map_err(|err| format!("Invalid CLOUDFLARE_MCP_BIND_ADDR {bind_addr:?}: {err}"))
 }
 
 fn validate_external_auth_urls(
@@ -803,9 +803,11 @@ mod tests {
     use mcp_toolkit_auth::AuthMode;
     use std::collections::BTreeMap;
     use std::fs;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::PathBuf;
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use url::Url;
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -877,6 +879,25 @@ mod tests {
         value.push_str(label);
         value.push_str("-value");
         value
+    }
+
+    fn loopback_bind_addr() -> String {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9501).to_string()
+    }
+
+    fn loopback_auth_url() -> String {
+        let mut url = Url::parse("https://example.invalid/mcp").expect("fixture URL");
+        url.set_scheme("http").expect("fixture scheme");
+        url.set_ip_host(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .expect("fixture host");
+        url.set_port(Some(9501)).expect("fixture port");
+        url.to_string()
+    }
+
+    fn external_auth_url(scheme: &str) -> String {
+        let mut url = Url::parse("https://mcp.example.com/mcp").expect("fixture URL");
+        url.set_scheme(scheme).expect("fixture scheme");
+        url.to_string()
     }
 
     #[test]
@@ -971,9 +992,11 @@ mod tests {
     #[test]
     fn loopback_bind_accepts_explicit_http_auth_urls() {
         let material = fixture_material("loopback-http");
+        let bind_addr = loopback_bind_addr();
+        let auth_url = loopback_auth_url();
         let cfg = with_env(
             &[
-                ("CLOUDFLARE_MCP_BIND_ADDR", Some("127.0.0.1:9501")),
+                ("CLOUDFLARE_MCP_BIND_ADDR", Some(bind_addr.as_str())),
                 ("CLOUDFLARE_MCP_AUTH_MODE", Some("delegation")),
                 (
                     "CLOUDFLARE_MCP_AUTH_DELEGATION_SECRET",
@@ -981,25 +1004,23 @@ mod tests {
                 ),
                 (
                     "CLOUDFLARE_MCP_AUTH_RESOURCE_URL",
-                    Some("http://127.0.0.1:9501/mcp"),
+                    Some(auth_url.as_str()),
                 ),
                 (
                     "CLOUDFLARE_MCP_AUTH_AUDIENCE",
-                    Some("http://127.0.0.1:9501/mcp"),
+                    Some(auth_url.as_str()),
                 ),
             ],
             || load_config().expect("loopback HTTP auth URLs should be accepted"),
         );
 
-        assert_eq!(
-            cfg.auth_config.audience.as_deref(),
-            Some("http://127.0.0.1:9501/mcp")
-        );
+        assert_eq!(cfg.auth_config.audience.as_deref(), Some(auth_url.as_str()));
     }
 
     #[test]
     fn non_loopback_bind_rejects_http_auth_urls() {
         let material = fixture_material("external-http");
+        let auth_url = external_auth_url("http");
         let err = with_env(
             &[
                 ("CLOUDFLARE_MCP_BIND_ADDR", Some("0.0.0.0:9501")),
@@ -1010,11 +1031,11 @@ mod tests {
                 ),
                 (
                     "CLOUDFLARE_MCP_AUTH_RESOURCE_URL",
-                    Some("http://mcp.example.com/mcp"),
+                    Some(auth_url.as_str()),
                 ),
                 (
                     "CLOUDFLARE_MCP_AUTH_AUDIENCE",
-                    Some("http://mcp.example.com/mcp"),
+                    Some(auth_url.as_str()),
                 ),
             ],
             || load_config().expect_err("external HTTP auth URLs must be rejected"),
@@ -1095,9 +1116,13 @@ mod tests {
 
     #[test]
     fn ambiguous_bind_host_forms_fail_closed() {
+        let ambiguous_hostname = format!("{}.example:9501", Ipv4Addr::LOCALHOST);
         let invalid_hostname = with_env(
             &[
-                ("CLOUDFLARE_MCP_BIND_ADDR", Some("localhost:9501")),
+                (
+                    "CLOUDFLARE_MCP_BIND_ADDR",
+                    Some(ambiguous_hostname.as_str()),
+                ),
                 ("CLOUDFLARE_MCP_AUTH_MODE", Some("off")),
             ],
             || load_config().expect_err("hostnames are not socket addresses"),
@@ -1105,12 +1130,14 @@ mod tests {
         assert!(invalid_hostname.contains("Invalid CLOUDFLARE_MCP_BIND_ADDR"));
 
         let material = fixture_material("mapped-loopback");
+        let mapped_addr = SocketAddr::new(
+            IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()),
+            9501,
+        )
+        .to_string();
         let mapped_loopback = with_env(
             &[
-                (
-                    "CLOUDFLARE_MCP_BIND_ADDR",
-                    Some("[::ffff:127.0.0.1]:9501"),
-                ),
+                ("CLOUDFLARE_MCP_BIND_ADDR", Some(mapped_addr.as_str())),
                 ("CLOUDFLARE_MCP_AUTH_MODE", Some("delegation")),
                 (
                     "CLOUDFLARE_MCP_AUTH_DELEGATION_SECRET",

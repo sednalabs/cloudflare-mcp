@@ -198,7 +198,7 @@ fn loopback_public_base_url_from_bind_addr(bind_addr: &SocketAddr) -> Result<Str
         );
     }
 
-    let mut parsed = Url::parse("https://localhost")
+    let mut parsed = Url::parse("https://example.invalid")
         .map_err(|err| format!("failed to initialize loopback auth URL: {err}"))?;
     parsed
         .set_scheme("http")
