@@ -18,7 +18,10 @@ the explicit mixed mode documented in [CLIENT-CONTRACT.md](CLIENT-CONTRACT.md).
 
 ## Bind and Host Safety
 
-The default bind address is loopback. Non-loopback bind requires auth enabled.
+The default bind address is loopback. Non-loopback bind requires auth enabled
+and explicit HTTPS values for `CLOUDFLARE_MCP_AUTH_RESOURCE_URL` and
+`CLOUDFLARE_MCP_AUTH_AUDIENCE`. Loopback development may continue to use local
+HTTP URLs or derive its audience from the local resource URL.
 
 The server also checks the HTTP `Host` header against
 `CLOUDFLARE_MCP_ALLOWED_HOSTS`. This reduces accidental exposure through

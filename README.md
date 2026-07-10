@@ -54,7 +54,8 @@ This project is not an official Cloudflare product.
 `cloudflare-mcp` is private by default and keeps safety controls in the runtime,
 not only in documentation:
 
-- Non-loopback HTTP bind requires MCP auth.
+- Non-loopback bind requires MCP auth plus explicit HTTPS resource and audience
+  URLs.
 - Strict tool inventory denies unregistered tools.
 - Read-only mode hides and denies mutating tools.
 - Curated tool workflows are preserved for operations with product-specific

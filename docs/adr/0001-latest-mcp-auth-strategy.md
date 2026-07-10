@@ -27,7 +27,9 @@ We adopt an OAuth-first, latest-spec posture with explicit compatibility modes.
    validation.
 2. Server protocol version is advertised as the latest MCP spec release (`2025-11-25`) by default.
 3. When auth is enabled, audience/resource binding is enforced by default:
-   - if `CLOUDFLARE_MCP_AUTH_AUDIENCE` is unset, it is derived from canonical resource URL.
+   - on loopback, if `CLOUDFLARE_MCP_AUTH_AUDIENCE` is unset, it is derived from the canonical
+     resource URL,
+   - non-loopback binds require explicit HTTPS resource and audience URLs.
 4. OAuth validation modes requiring external issuer semantics (`jwks`, `introspection`) require
    `CLOUDFLARE_MCP_AUTH_ISSUER`.
 5. Cloudflare upstream credentialing is explicit and configurable:
