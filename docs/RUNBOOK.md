@@ -26,7 +26,9 @@ Before using the server for production-like changes:
 - Configure account and zone defaults or pass IDs per call:
   - `CLOUDFLARE_MCP_DEFAULT_ACCOUNT_ID`
   - `CLOUDFLARE_MCP_DEFAULT_ZONE_ID`
-- Enable MCP auth before any non-loopback bind.
+- Enable MCP auth before any non-loopback bind. Set both
+  `CLOUDFLARE_MCP_AUTH_RESOURCE_URL` and `CLOUDFLARE_MCP_AUTH_AUDIENCE` to
+  explicit HTTPS URLs; non-loopback binds do not derive or accept HTTP values.
 - Use least-privilege Cloudflare API tokens.
 - Keep secrets in environment variables or protected files outside the
   repository.

@@ -150,6 +150,7 @@ pub fn load_config() -> Result<Config, String> {
 
 pub fn load_config_with_auth_default(auth_mode_default: &str) -> Result<Config, String> {
     let bind_addr = env_setting("CLOUDFLARE_MCP_BIND_ADDR", "127.0.0.1:9501");
+    let parsed_bind_addr = parse_bind_addr(&bind_addr)?;
     let allow_non_loopback = env_flag("CLOUDFLARE_MCP_ALLOW_NON_LOOPBACK", false)?;
     let allowed_hosts = env_csv("CLOUDFLARE_MCP_ALLOWED_HOSTS", "localhost,127.0.0.1,::1");
     let read_only_mode = env_flag("CLOUDFLARE_MCP_READ_ONLY", false)?;
@@ -239,12 +240,19 @@ pub fn load_config_with_auth_default(auth_mode_default: &str) -> Result<Config, 
         );
     }
 
+    apply_delegation_secret_policy(auth_mode, &parsed_bind_addr, &mut auth_config)?;
+    validate_external_auth_urls(
+        &parsed_bind_addr,
+        auth_mode,
+        auth_resource_url.as_deref(),
+        auth_config.audience.as_deref(),
+    )?;
+
     if auth_mode.is_some() && auth_config.audience.is_none() {
         let derived_audience =
             canonical_auth_resource_url(&bind_addr, auth_resource_url.as_deref())?;
         auth_config.audience = Some(derived_audience);
     }
-    apply_delegation_secret_policy(auth_mode, &bind_addr, &mut auth_config)?;
 
     let streamable_http = load_streamable_http_config()?;
     let elicitation = load_elicitation_config()?;
@@ -507,7 +515,7 @@ fn validate_elicitation_required_tools(required_tools: &[String]) -> Result<(), 
 
 fn apply_delegation_secret_policy(
     auth_mode: Option<AuthMode>,
-    bind_addr: &str,
+    bind_addr: &SocketAddr,
     auth_config: &mut AuthConfig,
 ) -> Result<(), String> {
     if !matches!(auth_mode, Some(AuthMode::Delegation)) {
@@ -518,7 +526,7 @@ fn apply_delegation_secret_policy(
     }
 
     let allow_insecure_dev_secret = env_flag(AUTH_ALLOW_INSECURE_DEV_DELEGATION_SECRET, false)?;
-    if allow_insecure_dev_secret && bind_addr_is_loopback(bind_addr) {
+    if allow_insecure_dev_secret && bind_addr.ip().is_loopback() {
         auth_config.delegation_secret = Some(INSECURE_DEV_DELEGATION_SECRET.to_string());
         return Ok(());
     }
@@ -529,17 +537,38 @@ Set {AUTH_ALLOW_INSECURE_DEV_DELEGATION_SECRET}=1 only for loopback-only local d
     ))
 }
 
-fn bind_addr_is_loopback(bind_addr: &str) -> bool {
-    if let Ok(addr) = bind_addr.parse::<SocketAddr>() {
-        return addr.ip().is_loopback();
+fn parse_bind_addr(bind_addr: &str) -> Result<SocketAddr, String> {
+    bind_addr.parse::<SocketAddr>().map_err(|err| {
+        format!("Invalid CLOUDFLARE_MCP_BIND_ADDR {bind_addr:?}: {err}")
+    })
+}
+
+fn validate_external_auth_urls(
+    bind_addr: &SocketAddr,
+    auth_mode: Option<AuthMode>,
+    auth_resource_url: Option<&str>,
+    auth_audience: Option<&str>,
+) -> Result<(), String> {
+    if bind_addr.ip().is_loopback() || auth_mode.is_none() {
+        return Ok(());
     }
-    let Some((host, _)) = bind_addr.rsplit_once(':') else {
-        return false;
-    };
-    matches!(
-        host.trim().trim_matches(['[', ']']),
-        "localhost" | "127.0.0.1" | "::1"
-    )
+
+    require_explicit_https_url("CLOUDFLARE_MCP_AUTH_RESOURCE_URL", auth_resource_url)?;
+    require_explicit_https_url("CLOUDFLARE_MCP_AUTH_AUDIENCE", auth_audience)?;
+    Ok(())
+}
+
+fn require_explicit_https_url(field: &str, value: Option<&str>) -> Result<(), String> {
+    let value = value.ok_or_else(|| {
+        format!("{field} must be set to an explicit HTTPS URL for a non-loopback bind.")
+    })?;
+    let parsed = Url::parse(value).map_err(|err| format!("Invalid {field}: {err}"))?;
+    if parsed.scheme() != "https" || parsed.host_str().is_none() {
+        return Err(format!(
+            "{field} must be set to an explicit HTTPS URL for a non-loopback bind."
+        ));
+    }
+    Ok(())
 }
 
 fn load_streamable_http_config() -> Result<StreamableHttpConfig, String> {
@@ -937,6 +966,162 @@ mod tests {
             cfg.auth_config.audience.as_deref(),
             Some("https://mcp.example.com/mcp")
         );
+    }
+
+    #[test]
+    fn loopback_bind_accepts_explicit_http_auth_urls() {
+        let material = fixture_material("loopback-http");
+        let cfg = with_env(
+            &[
+                ("CLOUDFLARE_MCP_BIND_ADDR", Some("127.0.0.1:9501")),
+                ("CLOUDFLARE_MCP_AUTH_MODE", Some("delegation")),
+                (
+                    "CLOUDFLARE_MCP_AUTH_DELEGATION_SECRET",
+                    Some(material.as_str()),
+                ),
+                (
+                    "CLOUDFLARE_MCP_AUTH_RESOURCE_URL",
+                    Some("http://127.0.0.1:9501/mcp"),
+                ),
+                (
+                    "CLOUDFLARE_MCP_AUTH_AUDIENCE",
+                    Some("http://127.0.0.1:9501/mcp"),
+                ),
+            ],
+            || load_config().expect("loopback HTTP auth URLs should be accepted"),
+        );
+
+        assert_eq!(
+            cfg.auth_config.audience.as_deref(),
+            Some("http://127.0.0.1:9501/mcp")
+        );
+    }
+
+    #[test]
+    fn non_loopback_bind_rejects_http_auth_urls() {
+        let material = fixture_material("external-http");
+        let err = with_env(
+            &[
+                ("CLOUDFLARE_MCP_BIND_ADDR", Some("0.0.0.0:9501")),
+                ("CLOUDFLARE_MCP_AUTH_MODE", Some("delegation")),
+                (
+                    "CLOUDFLARE_MCP_AUTH_DELEGATION_SECRET",
+                    Some(material.as_str()),
+                ),
+                (
+                    "CLOUDFLARE_MCP_AUTH_RESOURCE_URL",
+                    Some("http://mcp.example.com/mcp"),
+                ),
+                (
+                    "CLOUDFLARE_MCP_AUTH_AUDIENCE",
+                    Some("http://mcp.example.com/mcp"),
+                ),
+            ],
+            || load_config().expect_err("external HTTP auth URLs must be rejected"),
+        );
+
+        assert!(err.contains("CLOUDFLARE_MCP_AUTH_RESOURCE_URL"));
+        assert!(err.contains("explicit HTTPS URL"));
+    }
+
+    #[test]
+    fn non_loopback_bind_accepts_explicit_https_auth_urls() {
+        let material = fixture_material("external-https");
+        let cfg = with_env(
+            &[
+                ("CLOUDFLARE_MCP_BIND_ADDR", Some("0.0.0.0:9501")),
+                ("CLOUDFLARE_MCP_AUTH_MODE", Some("delegation")),
+                (
+                    "CLOUDFLARE_MCP_AUTH_DELEGATION_SECRET",
+                    Some(material.as_str()),
+                ),
+                (
+                    "CLOUDFLARE_MCP_AUTH_RESOURCE_URL",
+                    Some("https://mcp.example.com/mcp"),
+                ),
+                (
+                    "CLOUDFLARE_MCP_AUTH_AUDIENCE",
+                    Some("https://mcp.example.com/mcp"),
+                ),
+            ],
+            || load_config().expect("external HTTPS auth URLs should be accepted"),
+        );
+
+        assert_eq!(
+            cfg.auth_config.audience.as_deref(),
+            Some("https://mcp.example.com/mcp")
+        );
+    }
+
+    #[test]
+    fn non_loopback_bind_requires_explicit_resource_and_audience_urls() {
+        let material = fixture_material("external-missing-url");
+        let missing_resource = with_env(
+            &[
+                ("CLOUDFLARE_MCP_BIND_ADDR", Some("0.0.0.0:9501")),
+                ("CLOUDFLARE_MCP_AUTH_MODE", Some("delegation")),
+                (
+                    "CLOUDFLARE_MCP_AUTH_DELEGATION_SECRET",
+                    Some(material.as_str()),
+                ),
+                ("CLOUDFLARE_MCP_AUTH_RESOURCE_URL", None),
+                (
+                    "CLOUDFLARE_MCP_AUTH_AUDIENCE",
+                    Some("https://mcp.example.com/mcp"),
+                ),
+            ],
+            || load_config().expect_err("external resource URL must be explicit"),
+        );
+        assert!(missing_resource.contains("CLOUDFLARE_MCP_AUTH_RESOURCE_URL"));
+
+        let missing_audience = with_env(
+            &[
+                ("CLOUDFLARE_MCP_BIND_ADDR", Some("0.0.0.0:9501")),
+                ("CLOUDFLARE_MCP_AUTH_MODE", Some("delegation")),
+                (
+                    "CLOUDFLARE_MCP_AUTH_DELEGATION_SECRET",
+                    Some(material.as_str()),
+                ),
+                (
+                    "CLOUDFLARE_MCP_AUTH_RESOURCE_URL",
+                    Some("https://mcp.example.com/mcp"),
+                ),
+                ("CLOUDFLARE_MCP_AUTH_AUDIENCE", None),
+            ],
+            || load_config().expect_err("external audience URL must be explicit"),
+        );
+        assert!(missing_audience.contains("CLOUDFLARE_MCP_AUTH_AUDIENCE"));
+    }
+
+    #[test]
+    fn ambiguous_bind_host_forms_fail_closed() {
+        let invalid_hostname = with_env(
+            &[
+                ("CLOUDFLARE_MCP_BIND_ADDR", Some("localhost:9501")),
+                ("CLOUDFLARE_MCP_AUTH_MODE", Some("off")),
+            ],
+            || load_config().expect_err("hostnames are not socket addresses"),
+        );
+        assert!(invalid_hostname.contains("Invalid CLOUDFLARE_MCP_BIND_ADDR"));
+
+        let material = fixture_material("mapped-loopback");
+        let mapped_loopback = with_env(
+            &[
+                (
+                    "CLOUDFLARE_MCP_BIND_ADDR",
+                    Some("[::ffff:127.0.0.1]:9501"),
+                ),
+                ("CLOUDFLARE_MCP_AUTH_MODE", Some("delegation")),
+                (
+                    "CLOUDFLARE_MCP_AUTH_DELEGATION_SECRET",
+                    Some(material.as_str()),
+                ),
+                ("CLOUDFLARE_MCP_AUTH_RESOURCE_URL", None),
+                ("CLOUDFLARE_MCP_AUTH_AUDIENCE", None),
+            ],
+            || load_config().expect_err("mapped addresses must not receive loopback trust"),
+        );
+        assert!(mapped_loopback.contains("CLOUDFLARE_MCP_AUTH_RESOURCE_URL"));
     }
 
     #[test]

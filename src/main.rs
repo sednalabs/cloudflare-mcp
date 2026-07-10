@@ -190,8 +190,30 @@ async fn trim_trailing_slash(req: axum::extract::Request, next: Next) -> Respons
     next.run(req).await
 }
 
-fn public_base_url_from_bind_addr(bind_addr: &SocketAddr) -> String {
-    format!("http://{bind_addr}")
+fn loopback_public_base_url_from_bind_addr(bind_addr: &SocketAddr) -> Result<String, String> {
+    if !bind_addr.ip().is_loopback() {
+        return Err(
+            "an explicit HTTPS CLOUDFLARE_MCP_AUTH_RESOURCE_URL is required for a non-loopback bind"
+                .to_string(),
+        );
+    }
+
+    let mut parsed = Url::parse("https://localhost")
+        .map_err(|err| format!("failed to initialize loopback auth URL: {err}"))?;
+    parsed
+        .set_scheme("http")
+        .map_err(|_| "failed to configure loopback auth URL scheme".to_string())?;
+    parsed
+        .set_ip_host(bind_addr.ip())
+        .map_err(|_| "failed to configure loopback auth URL host".to_string())?;
+    parsed
+        .set_port(Some(bind_addr.port()))
+        .map_err(|_| "failed to configure loopback auth URL port".to_string())?;
+    let mut value = parsed.to_string();
+    while value.ends_with('/') {
+        value.pop();
+    }
+    Ok(value)
 }
 
 fn public_base_url_from_resource_url(resource_url: &str) -> Result<Option<String>, String> {
@@ -268,18 +290,26 @@ async fn build_auth_surface_layer(
 ) -> Result<AuthSurfaceLayer, String> {
     let optional_loopback = config.auth_optional_loopback && bind_addr.ip().is_loopback();
 
-    let mut public_base_url = public_base_url_from_bind_addr(bind_addr);
-    if let Some(resource_url) = config.auth_resource_url.as_deref() {
+    let public_base_url = if let Some(resource_url) = config.auth_resource_url.as_deref() {
         match public_base_url_from_resource_url(resource_url)? {
-            Some(derived) => public_base_url = derived,
+            Some(derived) => derived,
             None => {
+                if !bind_addr.ip().is_loopback() {
+                    return Err(
+                        "CLOUDFLARE_MCP_AUTH_RESOURCE_URL must end with /mcp for a non-loopback bind"
+                            .to_string(),
+                    );
+                }
                 tracing::warn!(
                     resource_url,
                     "CLOUDFLARE_MCP_AUTH_RESOURCE_URL does not end with /mcp; using bind address for auth surface base URL"
                 );
+                loopback_public_base_url_from_bind_addr(bind_addr)?
             }
         }
-    }
+    } else {
+        loopback_public_base_url_from_bind_addr(bind_addr)?
+    };
 
     let issuer = config
         .auth_issuer
