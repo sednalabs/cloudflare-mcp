@@ -1002,14 +1002,8 @@ mod tests {
                     "CLOUDFLARE_MCP_AUTH_DELEGATION_SECRET",
                     Some(material.as_str()),
                 ),
-                (
-                    "CLOUDFLARE_MCP_AUTH_RESOURCE_URL",
-                    Some(auth_url.as_str()),
-                ),
-                (
-                    "CLOUDFLARE_MCP_AUTH_AUDIENCE",
-                    Some(auth_url.as_str()),
-                ),
+                ("CLOUDFLARE_MCP_AUTH_RESOURCE_URL", Some(auth_url.as_str())),
+                ("CLOUDFLARE_MCP_AUTH_AUDIENCE", Some(auth_url.as_str())),
             ],
             || load_config().expect("loopback HTTP auth URLs should be accepted"),
         );
@@ -1029,14 +1023,8 @@ mod tests {
                     "CLOUDFLARE_MCP_AUTH_DELEGATION_SECRET",
                     Some(material.as_str()),
                 ),
-                (
-                    "CLOUDFLARE_MCP_AUTH_RESOURCE_URL",
-                    Some(auth_url.as_str()),
-                ),
-                (
-                    "CLOUDFLARE_MCP_AUTH_AUDIENCE",
-                    Some(auth_url.as_str()),
-                ),
+                ("CLOUDFLARE_MCP_AUTH_RESOURCE_URL", Some(auth_url.as_str())),
+                ("CLOUDFLARE_MCP_AUTH_AUDIENCE", Some(auth_url.as_str())),
             ],
             || load_config().expect_err("external HTTP auth URLs must be rejected"),
         );
@@ -1130,11 +1118,8 @@ mod tests {
         assert!(invalid_hostname.contains("Invalid CLOUDFLARE_MCP_BIND_ADDR"));
 
         let material = fixture_material("mapped-loopback");
-        let mapped_addr = SocketAddr::new(
-            IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()),
-            9501,
-        )
-        .to_string();
+        let mapped_addr =
+            SocketAddr::new(IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()), 9501).to_string();
         let mapped_loopback = with_env(
             &[
                 ("CLOUDFLARE_MCP_BIND_ADDR", Some(mapped_addr.as_str())),
