@@ -159,7 +159,10 @@ without copying an API token to the host:
 3. Start the service and call `cloudflare_auth_status`. It must report OAuth
    enabled, a configured client and callback, and no grant on first use.
 4. Call `cloudflare_auth_login`, open its short-lived authorization URL, and
-   complete Cloudflare consent. Do not paste or log the callback URL.
+   complete Cloudflare consent. For stdio on a remote desktop host, register a
+   fixed `http://127.0.0.1:<port>/oauth/cloudflare/callback` URI so the MCP
+   process can own the loopback listener. Do not paste or log the callback URL.
+   Poll status until `last_login_status=succeeded`.
 5. Call `cloudflare_auth_probe`. Continue only when it reports
    `credential_verified=true`.
 

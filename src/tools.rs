@@ -34,7 +34,7 @@ use crate::cache::{
 };
 use crate::cloudflare::{
     AccessAppUpsertRequest, AccessPolicyWrite, BulkRedirectItemWrite, CacheRule, CacheRuleset,
-    DnsRecordUpsertRequest, PagesDeploymentTriggerRequest,
+    DnsRecordUpsertRequest, PagesDeploymentTriggerRequest, with_request_api_token_override,
 };
 use crate::dns_route::{
     DnsRouteConflict, DnsRouteVerificationState, plan_dns_route_reconciliation, verify_dns_route,
@@ -1541,22 +1541,51 @@ impl CloudflareMcp {
     )]
     async fn cloudflare_auth_probe(
         &self,
+        Extension(parts): Extension<Parts>,
         Parameters(_): Parameters<CloudflareAuthProbeArgs>,
     ) -> Result<CallToolResult, crate::McpError> {
-        match self
-            .cloudflare
-            .api_request(
+        let Some(principal) = upstream_oauth_principal(&parts, self.auth_enabled) else {
+            return Ok(missing_upstream_oauth_principal_result());
+        };
+        let token = match self.cloudflare_oauth.access_token(&principal).await {
+            Ok(Some(token)) => token,
+            Ok(None) => {
+                return Ok(CallToolResult::structured(json!({
+                    "ok": false,
+                    "credential_verified": false,
+                    "error": {
+                        "code": "cloudflare.upstream_oauth_not_configured",
+                        "message": "Cloudflare upstream OAuth is not enabled."
+                    }
+                })));
+            }
+            Err(err) => {
+                return Ok(CallToolResult::structured(json!({
+                    "ok": false,
+                    "credential_verified": false,
+                    "error": {
+                        "code": "cloudflare.upstream_oauth_unavailable",
+                        "message": mcp_toolkit_observability::sanitize_error_message(&err.to_string(), 256)
+                    }
+                })));
+            }
+        };
+        let probe = with_request_api_token_override(
+            Some(token),
+            self.cloudflare.api_request(
                 "cloudflare.auth.verify",
                 reqwest::Method::GET,
                 "/user/tokens/verify",
                 &[],
                 None,
-            )
-            .await
-        {
+            ),
+        )
+        .await;
+        match probe {
             Ok(result) => Ok(CallToolResult::structured(json!({
                 "ok": true,
                 "credential_verified": true,
+                "credential_source": "upstream_oauth",
                 "result": result
             }))),
             Err(err) => Ok(CallToolResult::structured(json!({

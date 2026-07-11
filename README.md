@@ -149,12 +149,25 @@ The default Cloudflare endpoints are
 `client_secret_basic`. Public PKCE clients can set
 `CLOUDFLARE_MCP_UPSTREAM_OAUTH_TOKEN_AUTH_METHOD=none` and omit the secret.
 
+For a process-launched stdio server on a remote desktop or lab host, register a
+fixed loopback callback such as
+`http://127.0.0.1:9502/oauth/cloudflare/callback`. The login tool opens that
+listener inside the existing MCP process and completes the exchange in the
+background, so a browser on the same host can authorize without a second
+daemon. If the browser is elsewhere, forward the registered loopback port over
+SSH before starting login. Only one process can own a fixed loopback port at a
+time.
+
 After the service starts, call `cloudflare_auth_status`, then
 `cloudflare_auth_login`. Open the returned short-lived URL in a browser. The
 registered callback completes the exchange and stores only the refresh grant
 behind the toolkit storage boundary. Call `cloudflare_auth_probe` to verify the
 grant. `cloudflare_auth_logout` requires `confirm=true` and clears local state;
 it does not revoke the provider-side authorization.
+
+`cloudflare_auth_login` reports `completion_mode=loopback_callback` for the
+stdio path and `completion_mode=hosted_callback` for an HTTPS service callback.
+Poll `cloudflare_auth_status` until `last_login_status=succeeded` before probing.
 
 The configured token-cache value is a base path. The runtime appends a SHA-256
 principal key to the filename, keeping grants and cached access tokens isolated

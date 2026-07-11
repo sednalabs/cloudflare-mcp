@@ -873,6 +873,7 @@ impl ServerHandler for CloudflareMcp {
                     | "cloudflare_auth_status"
                     | "cloudflare_auth_login"
                     | "cloudflare_auth_logout"
+                    | "cloudflare_auth_probe"
             );
             let configured_token_is_effective = self.has_api_token
                 && matches!(
