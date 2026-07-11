@@ -76,6 +76,24 @@ use mcp_toolkit_policy_core::{RestrictedSqlError, classify_restricted_sql};
 #[derive(Debug, Deserialize, JsonSchema, Default)]
 pub struct HealthArgs {}
 
+#[derive(Debug, Deserialize, JsonSchema, Default)]
+pub struct CloudflareAuthStatusArgs {}
+
+#[derive(Debug, Deserialize, JsonSchema, Default)]
+pub struct CloudflareAuthLoginArgs {
+    #[serde(default)]
+    pub force_consent: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Default)]
+pub struct CloudflareAuthLogoutArgs {
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Default)]
+pub struct CloudflareAuthProbeArgs {}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindToolsArgs {
     #[serde(default)]
@@ -1385,6 +1403,7 @@ impl CloudflareMcp {
             .cloned()
             .collect::<Vec<_>>();
         elicitation_required_tools.sort();
+        let upstream_oauth = self.cloudflare_oauth.status().await;
         Ok(CallToolResult::structured(json!({
             "ok": true,
             "auth_enabled": self.auth_enabled,
@@ -1396,6 +1415,7 @@ impl CloudflareMcp {
                 "required_tools": elicitation_required_tools,
             },
             "has_api_token": self.has_api_token,
+            "upstream_oauth": upstream_oauth,
             "portal_agent": {
                 "has_agent_token": self.has_portal_agent_token,
                 "has_access_service_token": self.has_portal_access_service_token,
@@ -1406,6 +1426,120 @@ impl CloudflareMcp {
             "parity_target": "cloudflared",
             "non_goal": "third-party cloudflare mcp ecosystem parity"
         })))
+    }
+
+    #[tool(
+        name = "cloudflare_auth_status",
+        description = "Report Cloudflare upstream OAuth configuration and grant-cache status without returning credentials."
+    )]
+    async fn cloudflare_auth_status(
+        &self,
+        Parameters(_): Parameters<CloudflareAuthStatusArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        Ok(CallToolResult::structured(json!({
+            "ok": true,
+            "upstream_oauth": self.cloudflare_oauth.status().await,
+            "next_step": "Run cloudflare_auth_login when the token cache is absent."
+        })))
+    }
+
+    #[tool(
+        name = "cloudflare_auth_login",
+        description = "Create a short-lived PKCE Cloudflare authorization URL for this authenticated MCP operator."
+    )]
+    async fn cloudflare_auth_login(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<CloudflareAuthLoginArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let principal = mcp_toolkit_auth::context::auth_context_from_parts(&parts)
+            .map(|context| context.actor)
+            .filter(|actor| !actor.trim().is_empty())
+            .unwrap_or_else(|| "local-stdio-operator".to_string());
+        match self
+            .cloudflare_oauth
+            .start_login(&principal, args.force_consent)
+            .await
+        {
+            Ok(login) => Ok(CallToolResult::structured(json!({
+                "ok": true,
+                "login": login,
+                "instructions": "Open authorization_url in a browser. Cloudflare will return to the registered callback; do not paste the callback URL into chat or logs."
+            }))),
+            Err(err) => Ok(CallToolResult::structured(json!({
+                "ok": false,
+                "error": {
+                    "code": "cloudflare.upstream_oauth_login_failed",
+                    "message": mcp_toolkit_observability::sanitize_error_message(&err.to_string(), 256),
+                    "hint": "Check the upstream OAuth client id, callback URL, scopes, and token authentication method."
+                }
+            }))),
+        }
+    }
+
+    #[tool(
+        name = "cloudflare_auth_logout",
+        description = "Remove the locally stored Cloudflare OAuth grant. Set confirm=true to apply; this does not revoke the grant at Cloudflare."
+    )]
+    async fn cloudflare_auth_logout(
+        &self,
+        Parameters(args): Parameters<CloudflareAuthLogoutArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        if !args.confirm {
+            return Ok(CallToolResult::structured(json!({
+                "ok": true,
+                "applied": false,
+                "requires_confirmation": true,
+                "warning": "This removes the local refresh-token cache but does not revoke the provider-side grant."
+            })));
+        }
+        match self.cloudflare_oauth.clear().await {
+            Ok(existed) => Ok(CallToolResult::structured(json!({
+                "ok": true,
+                "applied": true,
+                "local_grant_existed": existed,
+                "provider_grant_revoked": false
+            }))),
+            Err(err) => Ok(CallToolResult::structured(json!({
+                "ok": false,
+                "error": {
+                    "code": "cloudflare.upstream_oauth_logout_failed",
+                    "message": mcp_toolkit_observability::sanitize_error_message(&err.to_string(), 256)
+                }
+            }))),
+        }
+    }
+
+    #[tool(
+        name = "cloudflare_auth_probe",
+        description = "Verify the selected Cloudflare credential with the read-only API token verification endpoint."
+    )]
+    async fn cloudflare_auth_probe(
+        &self,
+        Parameters(_): Parameters<CloudflareAuthProbeArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        match self
+            .cloudflare
+            .api_request(
+                "cloudflare.auth.verify",
+                reqwest::Method::GET,
+                "/user/tokens/verify",
+                &[],
+                None,
+            )
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::structured(json!({
+                "ok": true,
+                "credential_verified": true,
+                "result": result
+            }))),
+            Err(err) => Ok(CallToolResult::structured(json!({
+                "ok": false,
+                "credential_verified": false,
+                "error": err.payload()
+            }))),
+        }
     }
 
     #[tool(

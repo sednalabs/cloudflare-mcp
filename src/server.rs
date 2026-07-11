@@ -36,6 +36,7 @@ use crate::portal::PortalAgentClient;
 use crate::resources::{self, AdapterStatusView};
 use crate::tool_surface::API_PARITY_FEATURE_FLAG;
 use crate::tunnel::ConnectorRuntimeSnapshot;
+use crate::upstream_oauth::CloudflareOAuthManager;
 use crate::verification::VerificationStatus;
 
 const HEADER_X_CORRELATION_ID: &str = "x-correlation-id";
@@ -94,6 +95,7 @@ pub struct CloudflareMcp {
     pub default_account_id: Option<String>,
     pub default_zone_id: Option<String>,
     pub has_api_token: bool,
+    pub cloudflare_oauth: Arc<CloudflareOAuthManager>,
     pub api_token_source: ApiTokenSource,
     pub api_token_header: String,
     pub auth_enabled: bool,
@@ -147,6 +149,7 @@ impl CloudflareMcp {
             default_account_id,
             default_zone_id,
             has_api_token,
+            cloudflare_oauth: Arc::new(CloudflareOAuthManager::disabled()),
             api_token_source,
             api_token_header,
             auth_enabled,
@@ -165,6 +168,11 @@ impl CloudflareMcp {
             connector_runtime: Arc::new(Mutex::new(BTreeMap::new())),
             verification_status: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn with_cloudflare_oauth(mut self, manager: Arc<CloudflareOAuthManager>) -> Self {
+        self.cloudflare_oauth = manager;
+        self
     }
 
     fn resume_mode_label(&self) -> &'static str {
@@ -830,6 +838,7 @@ impl ServerHandler for CloudflareMcp {
         let session_id = session_id_from_context(&context);
         let peer = context.peer.clone();
         let approval_request = request.clone();
+        let tool_name = request.name.to_string();
         async move {
             if !call_allowed {
                 return Err(rmcp::ErrorData::method_not_found::<CallToolRequestMethod>());
@@ -845,9 +854,35 @@ impl ServerHandler for CloudflareMcp {
                 self.api_token_source,
                 &self.api_token_header,
             );
+            let setup_tool = tool_name.starts_with("cloudflare_auth_") || tool_name == "health";
+            let configured_token_is_effective = self.has_api_token
+                && matches!(
+                    self.api_token_source,
+                    ApiTokenSource::Config | ApiTokenSource::HeaderOrConfig
+                );
+            let oauth_api_token = if request_api_token.is_none()
+                && !configured_token_is_effective
+                && !setup_tool
+            {
+                match self.cloudflare_oauth.access_token().await {
+                    Ok(token) => token,
+                    Err(err) => {
+                        return Ok(CallToolResult::structured(json!({
+                            "ok": false,
+                            "error": {
+                                "code": "cloudflare.upstream_oauth_unavailable",
+                                "message": sanitize_error_message(&err.to_string(), 256),
+                                "hint": "Run cloudflare_auth_status, then cloudflare_auth_login when login is required."
+                            }
+                        })));
+                    }
+                }
+            } else {
+                None
+            };
             let tool_context = ToolCallContext::new(self, request, context);
             let result = with_request_api_token_override(
-                request_api_token,
+                request_api_token.or(oauth_api_token),
                 self.tool_router.call(tool_context),
             )
             .await;

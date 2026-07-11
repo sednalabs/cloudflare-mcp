@@ -45,6 +45,18 @@ pub(crate) fn validate_mutating_tool_subset(
 fn tool_capabilities() -> Vec<ToolCapability> {
     vec![
         cap("health").with_group("status").with_read_only(true),
+        cap("cloudflare_auth_status")
+            .with_group("auth")
+            .with_read_only(true),
+        cap("cloudflare_auth_login")
+            .with_group("auth")
+            .with_read_only(true),
+        cap("cloudflare_auth_logout")
+            .with_group("auth")
+            .with_read_only(false),
+        cap("cloudflare_auth_probe")
+            .with_group("auth")
+            .with_read_only(true),
         cap("find_tools")
             .with_group("discovery")
             .with_read_only(true),

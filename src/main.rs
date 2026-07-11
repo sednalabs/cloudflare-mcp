@@ -5,13 +5,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{
     HeaderMap, Method, Request, StatusCode,
     uri::{PathAndQuery, Uri},
 };
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Json, Router};
 use mcp_toolkit_auth::surface::{AuthSurfaceConfig, AuthSurfaceLayer, IssuerEntry};
@@ -31,6 +31,7 @@ use rmcp::transport::streamable_http_server::{
     session::SessionManager,
     session::local::{LocalSessionManager, SessionConfig},
 };
+use serde::Deserialize;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -42,6 +43,7 @@ use cloudflare_mcp::config::{
 };
 use cloudflare_mcp::portal::PortalAgentClient;
 use cloudflare_mcp::server::CloudflareMcp;
+use cloudflare_mcp::upstream_oauth::CloudflareOAuthManager;
 
 #[derive(Clone)]
 struct AppState {
@@ -60,6 +62,14 @@ struct AppState {
     api_token_header: String,
     default_account_id: Option<String>,
     default_zone_id: Option<String>,
+    cloudflare_oauth: Arc<CloudflareOAuthManager>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudflareOAuthCallback {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -95,6 +105,7 @@ impl Default for RuntimeOptions {
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let stats = state.session_manager.stats().await;
+    let upstream_oauth = state.cloudflare_oauth.status().await;
     Json(json!({
         "status": "ok",
         "auth_enabled": state.auth_enabled,
@@ -111,6 +122,7 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
             "api_token_header": state.api_token_header,
             "default_account_id": state.default_account_id,
             "default_zone_id": state.default_zone_id,
+            "upstream_oauth": upstream_oauth,
         },
         "session": {
             "active_sessions": stats.active_sessions,
@@ -122,6 +134,40 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
             "lifecycle_expired_sessions_total": stats.lifecycle_expired_sessions_total,
         }
     }))
+}
+
+async fn cloudflare_oauth_callback(
+    State(state): State<AppState>,
+    Query(callback): Query<CloudflareOAuthCallback>,
+) -> impl IntoResponse {
+    match state
+        .cloudflare_oauth
+        .finish_callback(
+            callback.code.as_deref(),
+            callback.state.as_deref(),
+            callback.error.as_deref(),
+        )
+        .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Html(
+                "<!doctype html><title>Cloudflare authorization complete</title><p>Authorization complete. You can close this tab and return to Codex.</p>",
+            ),
+        ),
+        Err(err) => {
+            tracing::warn!(
+                error = %sanitize_error_message(&err.to_string(), 256),
+                "Cloudflare upstream OAuth callback failed"
+            );
+            (
+                StatusCode::BAD_REQUEST,
+                Html(
+                    "<!doctype html><title>Cloudflare authorization failed</title><p>Authorization could not be completed. Return to Codex and start a fresh login.</p>",
+                ),
+            )
+        }
+    }
 }
 
 async fn attest() -> impl IntoResponse {
@@ -380,6 +426,9 @@ async fn build_auth_surface_layer(
     // Public endpoints by policy: health + attest should be reachable without auth.
     mcp_surface.public_paths.insert("/health".to_string());
     mcp_surface.public_paths.insert("/attest".to_string());
+    mcp_surface
+        .public_paths
+        .insert("/oauth/cloudflare/callback".to_string());
     if optional_loopback {
         mcp_surface.public_prefixes.push("/mcp".to_string());
     }
@@ -654,6 +703,7 @@ fn build_router(state: AppState, auth_layer: Option<AuthSurfaceLayer>) -> Router
     let base = Router::new()
         .route("/health", get(health))
         .route("/attest", get(attest))
+        .route("/oauth/cloudflare/callback", get(cloudflare_oauth_callback))
         .route("/mcp", any(handle_mcp))
         .route("/mcp/", any(handle_mcp))
         .layer(middleware::from_fn_with_state(state.clone(), host_guard))
@@ -807,6 +857,7 @@ async fn run_http(config: Config) -> Result<()> {
         api_token_header: config.cloudflare.api_token_header.clone(),
         default_account_id: config.cloudflare.default_account_id.clone(),
         default_zone_id: config.cloudflare.default_zone_id.clone(),
+        cloudflare_oauth: server_template.cloudflare_oauth.clone(),
     };
 
     if enable_background_session_sweeper {
@@ -900,6 +951,9 @@ fn build_cloudflare_server(
     let cloudflare = Arc::new(CloudflareClient::new(config.cloudflare.clone())?);
     let portal_agent = Arc::new(PortalAgentClient::new(config.portal_agent.clone())?);
     let tool_list_tracker = Arc::new(ToolListTracker::default());
+    let cloudflare_oauth = Arc::new(CloudflareOAuthManager::new(
+        config.cloudflare_oauth.clone(),
+    )?);
     Ok(CloudflareMcp::new(
         cloudflare,
         config.cloudflare.default_account_id.clone(),
@@ -915,7 +969,8 @@ fn build_cloudflare_server(
         tool_list_tracker,
         session_manager,
         config.streamable_http.resume_mode,
-    ))
+    )
+    .with_cloudflare_oauth(cloudflare_oauth))
 }
 
 fn log_runtime_posture(
@@ -987,8 +1042,8 @@ mod tests {
     };
     use cloudflare_mcp::cloudflare::CloudflareClient;
     use cloudflare_mcp::config::{
-        ApiTokenSource, CloudflareApiConfig, Config, ElicitationConfig, PortalAgentConfig,
-        ResumeMode, SessionLifecycleMode, StreamableHttpConfig,
+        ApiTokenSource, CloudflareApiConfig, CloudflareOAuthConfig, Config, ElicitationConfig,
+        PortalAgentConfig, ResumeMode, SessionLifecycleMode, StreamableHttpConfig,
     };
     use cloudflare_mcp::portal::PortalAgentClient;
     use cloudflare_mcp::server::CloudflareMcp;
@@ -1076,6 +1131,7 @@ mod tests {
                 retry_max_delay: Duration::from_millis(5),
                 user_agent: "cloudflare-mcp-test".to_string(),
             },
+            cloudflare_oauth: CloudflareOAuthConfig::default(),
             portal_agent: PortalAgentConfig {
                 allowed_url_prefixes: vec!["https://staff.example.com/api/agent/".to_string()],
                 agent_token: Some(fixture_material("portal-agent")),
@@ -1188,6 +1244,7 @@ mod tests {
             api_token_header: "x-cloudflare-api-token".to_string(),
             default_account_id: cfg.cloudflare.default_account_id.clone(),
             default_zone_id: cfg.cloudflare.default_zone_id.clone(),
+            cloudflare_oauth: server_template.cloudflare_oauth.clone(),
         };
 
         if auth_enabled {
