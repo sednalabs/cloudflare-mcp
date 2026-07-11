@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use mcp_toolkit_auth::upstream_oauth::{
@@ -68,9 +69,8 @@ impl std::fmt::Debug for PendingTransaction {
 pub struct CloudflareOAuthManager {
     config: CloudflareOAuthConfig,
     client: Option<OAuthClientConfig>,
-    store: RefreshTokenFileStore,
     pending: Mutex<HashMap<String, PendingTransaction>>,
-    token_provider: Mutex<Option<Arc<RefreshTokenProvider>>>,
+    token_providers: Mutex<HashMap<String, Arc<RefreshTokenProvider>>>,
 }
 
 impl std::fmt::Debug for CloudflareOAuthManager {
@@ -78,7 +78,6 @@ impl std::fmt::Debug for CloudflareOAuthManager {
         f.debug_struct("CloudflareOAuthManager")
             .field("config", &self.config)
             .field("client", &self.client)
-            .field("store", &self.store)
             .finish_non_exhaustive()
     }
 }
@@ -99,11 +98,10 @@ impl CloudflareOAuthManager {
             None
         };
         Ok(Self {
-            store: RefreshTokenFileStore::new(config.token_cache_path.clone()),
             config,
             client,
             pending: Mutex::new(HashMap::new()),
-            token_provider: Mutex::new(None),
+            token_providers: Mutex::new(HashMap::new()),
         })
     }
 
@@ -116,8 +114,11 @@ impl CloudflareOAuthManager {
         self.config.enabled
     }
 
-    pub async fn status(&self) -> CloudflareOAuthStatus {
-        let cache = self.store.load();
+    pub async fn status(&self, principal: Option<&str>) -> CloudflareOAuthStatus {
+        let cache = principal.map(|principal| {
+            self.store_for_principal_key(&principal_key(principal))
+                .load()
+        });
         let mut pending = self.pending.lock().await;
         pending.retain(|_, item| !item.authorization.is_expired());
         CloudflareOAuthStatus {
@@ -125,8 +126,10 @@ impl CloudflareOAuthManager {
             client_configured: self.client.is_some(),
             callback_configured: self.config.callback_url.is_some(),
             scopes: self.config.scopes.clone(),
-            token_cache_present: cache.as_ref().is_ok_and(Option::is_some),
-            token_cache_usable: cache.is_ok(),
+            token_cache_present: cache
+                .as_ref()
+                .is_some_and(|result| result.as_ref().is_ok_and(Option::is_some)),
+            token_cache_usable: cache.as_ref().is_none_or(Result::is_ok),
             pending_transactions: pending.len(),
             credential_precedence: "request_header_then_config_token_then_upstream_oauth",
         }
@@ -207,31 +210,39 @@ impl CloudflareOAuthManager {
             self.config.scopes.clone(),
             token_set,
         )?;
-        self.store.save(&stored)?;
-        *self.token_provider.lock().await = None;
+        self.store_for_principal_key(&transaction.principal_key)
+            .save(&stored)?;
+        self.token_providers
+            .lock()
+            .await
+            .remove(&transaction.principal_key);
         Ok(())
     }
 
-    pub async fn clear(&self) -> Result<bool, CloudflareOAuthError> {
-        let existed = self.store.load()?.is_some();
-        self.store.clear()?;
-        *self.token_provider.lock().await = None;
+    pub async fn clear(&self, principal: &str) -> Result<bool, CloudflareOAuthError> {
+        let principal_key = principal_key(principal);
+        let store = self.store_for_principal_key(&principal_key);
+        let existed = store.load()?.is_some();
+        store.clear()?;
+        self.token_providers.lock().await.remove(&principal_key);
         Ok(existed)
     }
 
-    pub async fn access_token(&self) -> Result<Option<String>, CloudflareOAuthError> {
+    pub async fn access_token(
+        &self,
+        principal: &str,
+    ) -> Result<Option<String>, CloudflareOAuthError> {
         if !self.config.enabled {
             return Ok(None);
         }
+        let principal_key = principal_key(principal);
+        let store = self.store_for_principal_key(&principal_key);
         let provider = {
-            let mut slot = self.token_provider.lock().await;
-            if let Some(provider) = slot.as_ref() {
+            let mut providers = self.token_providers.lock().await;
+            if let Some(provider) = providers.get(&principal_key) {
                 provider.clone()
             } else {
-                let stored = self
-                    .store
-                    .load()?
-                    .ok_or(CloudflareOAuthError::LoginRequired)?;
+                let stored = store.load()?.ok_or(CloudflareOAuthError::LoginRequired)?;
                 let client = self
                     .client
                     .clone()
@@ -245,7 +256,7 @@ impl CloudflareOAuthManager {
                 let refresh =
                     OAuthRefreshConfig::new(client, stored.refresh_token.clone(), stored.scopes)?;
                 let provider = Arc::new(RefreshTokenProvider::new(refresh)?);
-                *slot = Some(provider.clone());
+                providers.insert(principal_key.clone(), provider.clone());
                 provider
             }
         };
@@ -257,10 +268,23 @@ impl CloudflareOAuthManager {
                 .ok_or(CloudflareOAuthError::NotConfigured)?
                 .client_id()
                 .to_string();
-            self.store
-                .save(&replacement.into_stored_token(PROVIDER, client_id))?;
+            store.save(&replacement.into_stored_token(PROVIDER, client_id))?;
         }
         Ok(Some(access_token.expose_secret().to_string()))
+    }
+
+    fn store_for_principal_key(&self, principal_key: &str) -> RefreshTokenFileStore {
+        let base = &self.config.token_cache_path;
+        let file_name = base
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("upstream-oauth.json");
+        let isolated_name = format!("{file_name}.{principal_key}");
+        let path = base
+            .parent()
+            .map(|parent| parent.join(&isolated_name))
+            .unwrap_or_else(|| PathBuf::from(isolated_name));
+        RefreshTokenFileStore::new(path)
     }
 }
 
@@ -284,7 +308,7 @@ mod tests {
     #[tokio::test]
     async fn disabled_manager_reports_no_grant_and_refuses_login() {
         let manager = CloudflareOAuthManager::disabled();
-        let status = manager.status().await;
+        let status = manager.status(Some("operator")).await;
         assert!(!status.enabled);
         assert!(!status.token_cache_present);
         assert!(matches!(

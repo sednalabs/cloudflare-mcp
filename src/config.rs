@@ -451,6 +451,14 @@ fn load_cloudflare_oauth_config() -> Result<CloudflareOAuthConfig, String> {
                 .to_string(),
         );
     }
+    if matches!(config.token_auth_method, OAuthClientAuthMethod::Basic)
+        && config.client_secret.is_none()
+    {
+        return Err(
+            "CLOUDFLARE_MCP_UPSTREAM_OAUTH_CLIENT_SECRET is required for client_secret_basic; use token auth method none for a public PKCE client."
+                .to_string(),
+        );
+    }
     if config.callback_url.is_none() {
         return Err(
             "CLOUDFLARE_MCP_UPSTREAM_OAUTH_CALLBACK_URL is required when upstream OAuth is enabled."
@@ -459,7 +467,7 @@ fn load_cloudflare_oauth_config() -> Result<CloudflareOAuthConfig, String> {
     }
     if config.scopes.is_empty() {
         return Err(
-            "CLOUDFLARE_MCP_UPSTREAM_OAUTH_SCOPES must contain at least one dot-delimited Cloudflare OAuth scope."
+            "CLOUDFLARE_MCP_UPSTREAM_OAUTH_SCOPES must contain at least one Cloudflare OAuth scope."
                 .to_string(),
         );
     }
@@ -1389,6 +1397,10 @@ mod tests {
                 (
                     "CLOUDFLARE_MCP_UPSTREAM_OAUTH_SCOPES",
                     Some("cloudflare:read"),
+                ),
+                (
+                    "CLOUDFLARE_MCP_UPSTREAM_OAUTH_TOKEN_AUTH_METHOD",
+                    Some("none"),
                 ),
             ],
             || load_config().expect_err("colon-delimited provider scope must fail"),

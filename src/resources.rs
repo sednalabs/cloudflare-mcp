@@ -152,6 +152,10 @@ fn build_help_text() -> String {
         "",
         "Tools:",
         "- health",
+        "- cloudflare_auth_status",
+        "- cloudflare_auth_login",
+        "- cloudflare_auth_probe",
+        "- cloudflare_auth_logout",
         "- api_parity_status",
         "- api_find_operations",
         "- api_get_operation",
@@ -224,6 +228,8 @@ fn build_help_text() -> String {
 fn build_openai_tool_search_config() -> String {
     let read_only_auto_approval_tools = [
         "health",
+        "cloudflare_auth_status",
+        "cloudflare_auth_probe",
         "find_tools",
         "api_parity_status",
         "api_find_operations",

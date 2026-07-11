@@ -152,7 +152,9 @@ Refresh grants are persisted through the toolkit's provider-neutral storage
 boundary. The bundled single-host store rejects unsafe file types, symlinked
 paths, and non-owner-only token files on Unix. Deployments that require
 encryption at rest should replace that storage boundary with their platform
-secret service. Access tokens, refresh tokens, client secrets, authorization
+secret service. Cache filenames use one-way principal keys, and provider state
+and cached access tokens are isolated per authenticated MCP actor. Access
+tokens, refresh tokens, client secrets, authorization
 codes, and raw state are excluded from tool status and formatted debug output.
 
 ## Validation Expectations

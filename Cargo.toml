@@ -12,11 +12,11 @@ base64 = "0.22.1"
 blake3 = "1"
 futures = "0.3.31"
 hmac = "0.12.1"
-mcp-toolkit-auth = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "fe02d69f2fde99c1890b09540c7362d827a5a3f2", package = "mcp-toolkit-auth" }
-mcp-toolkit-core = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "fe02d69f2fde99c1890b09540c7362d827a5a3f2", package = "mcp-toolkit-core" }
-mcp-toolkit-http = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "fe02d69f2fde99c1890b09540c7362d827a5a3f2", package = "mcp-toolkit-http", features = ["session"] }
-mcp-toolkit-observability = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "fe02d69f2fde99c1890b09540c7362d827a5a3f2", package = "mcp-toolkit-observability" }
-mcp-toolkit-policy-core = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "fe02d69f2fde99c1890b09540c7362d827a5a3f2", package = "mcp-toolkit-policy-core" }
+mcp-toolkit-auth = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "144b399b955ada9a759c6df4bf95683f61181994", package = "mcp-toolkit-auth" }
+mcp-toolkit-core = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "144b399b955ada9a759c6df4bf95683f61181994", package = "mcp-toolkit-core" }
+mcp-toolkit-http = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "144b399b955ada9a759c6df4bf95683f61181994", package = "mcp-toolkit-http", features = ["session"] }
+mcp-toolkit-observability = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "144b399b955ada9a759c6df4bf95683f61181994", package = "mcp-toolkit-observability" }
+mcp-toolkit-policy-core = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "144b399b955ada9a759c6df4bf95683f61181994", package = "mcp-toolkit-policy-core" }
 mime_guess = "2.0.5"
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
 rmcp = { version = "=2.1.0", features = ["server", "transport-io", "transport-streamable-http-server", "macros", "elicitation", "schemars"] }
@@ -34,5 +34,5 @@ url = "2.5.7"
 
 [dev-dependencies]
 jsonwebtoken = "10.4.0"
-mcp-toolkit-testing = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "fe02d69f2fde99c1890b09540c7362d827a5a3f2", package = "mcp-toolkit-testing" }
+mcp-toolkit-testing = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "144b399b955ada9a759c6df4bf95683f61181994", package = "mcp-toolkit-testing" }
 tower = "0.5.2"

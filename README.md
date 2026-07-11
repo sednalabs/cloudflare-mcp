@@ -130,6 +130,10 @@ scopes the server needs. A private client is appropriate when only members of
 the owning Cloudflare account will authorize it; making the client public is
 not required for a private operator service.
 
+Cloudflare documents the registration and endpoint contracts in
+[Create your OAuth client](https://developers.cloudflare.com/fundamentals/oauth/create-an-oauth-client/)
+and [Integrate your OAuth client with Cloudflare](https://developers.cloudflare.com/fundamentals/oauth/integrate-with-cloudflare/).
+
 ```bash
 CLOUDFLARE_MCP_UPSTREAM_OAUTH_ENABLED=1
 CLOUDFLARE_MCP_UPSTREAM_OAUTH_CLIENT_ID=<client_id>
@@ -151,6 +155,10 @@ registered callback completes the exchange and stores only the refresh grant
 behind the toolkit storage boundary. Call `cloudflare_auth_probe` to verify the
 grant. `cloudflare_auth_logout` requires `confirm=true` and clears local state;
 it does not revoke the provider-side authorization.
+
+The configured token-cache value is a base path. The runtime appends a SHA-256
+principal key to the filename, keeping grants and cached access tokens isolated
+between authenticated MCP actors without exposing actor names on disk.
 
 Credential selection is deterministic: a configured per-request header wins,
 then a configured static token, then the OAuth grant. The OAuth callback is

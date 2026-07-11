@@ -522,6 +522,19 @@ fn api_token_override_from_context(
     })
 }
 
+fn upstream_oauth_principal_from_context(
+    context: &RequestContext<RoleServer>,
+    auth_enabled: bool,
+) -> Option<String> {
+    let principal = context
+        .extensions
+        .get::<Parts>()
+        .and_then(mcp_toolkit_auth::auth_context_from_parts)
+        .map(|auth| auth.actor)
+        .filter(|actor| !actor.trim().is_empty());
+    principal.or_else(|| (!auth_enabled).then(|| "local-stdio-operator".to_string()))
+}
+
 fn ensure_request_parts_extension(extensions: &mut rmcp::model::Extensions) {
     if extensions.get::<Parts>().is_some() {
         return;
@@ -854,7 +867,13 @@ impl ServerHandler for CloudflareMcp {
                 self.api_token_source,
                 &self.api_token_header,
             );
-            let setup_tool = tool_name.starts_with("cloudflare_auth_") || tool_name == "health";
+            let setup_tool = matches!(
+                tool_name.as_str(),
+                "health"
+                    | "cloudflare_auth_status"
+                    | "cloudflare_auth_login"
+                    | "cloudflare_auth_logout"
+            );
             let configured_token_is_effective = self.has_api_token
                 && matches!(
                     self.api_token_source,
@@ -864,7 +883,19 @@ impl ServerHandler for CloudflareMcp {
                 && !configured_token_is_effective
                 && !setup_tool
             {
-                match self.cloudflare_oauth.access_token().await {
+                let Some(principal) =
+                    upstream_oauth_principal_from_context(&context, self.auth_enabled)
+                else {
+                    return Ok(CallToolResult::structured(json!({
+                        "ok": false,
+                        "error": {
+                            "code": "cloudflare.upstream_oauth_principal_missing",
+                            "message": "The authenticated MCP principal is unavailable for the Cloudflare OAuth grant.",
+                            "hint": "Reconnect through the configured MCP authentication surface and retry."
+                        }
+                    })));
+                };
+                match self.cloudflare_oauth.access_token(&principal).await {
                     Ok(token) => token,
                     Err(err) => {
                         return Ok(CallToolResult::structured(json!({

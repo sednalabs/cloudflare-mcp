@@ -1413,6 +1413,54 @@
       "name": "capabilities_check"
     },
     {
+      "description": "Create a short-lived PKCE Cloudflare authorization URL for this authenticated MCP operator.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "force_consent": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "title": "CloudflareAuthLoginArgs",
+        "type": "object"
+      },
+      "name": "cloudflare_auth_login"
+    },
+    {
+      "description": "Remove the locally stored Cloudflare OAuth grant. Set confirm=true to apply; this does not revoke the grant at Cloudflare.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "confirm": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "title": "CloudflareAuthLogoutArgs",
+        "type": "object"
+      },
+      "name": "cloudflare_auth_logout"
+    },
+    {
+      "description": "Verify the selected Cloudflare credential with the read-only API token verification endpoint.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "CloudflareAuthProbeArgs",
+        "type": "object"
+      },
+      "name": "cloudflare_auth_probe"
+    },
+    {
+      "description": "Report Cloudflare upstream OAuth configuration and grant-cache status without returning credentials.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "CloudflareAuthStatusArgs",
+        "type": "object"
+      },
+      "name": "cloudflare_auth_status"
+    },
+    {
       "description": "Idempotent connector run-control hook for tunnel runtime state (start/stop/restart).",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",

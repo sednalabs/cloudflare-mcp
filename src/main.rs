@@ -105,7 +105,7 @@ impl Default for RuntimeOptions {
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     let stats = state.session_manager.stats().await;
-    let upstream_oauth = state.cloudflare_oauth.status().await;
+    let upstream_oauth = state.cloudflare_oauth.status(None).await;
     Json(json!({
         "status": "ok",
         "auth_enabled": state.auth_enabled,

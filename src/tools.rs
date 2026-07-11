@@ -1386,6 +1386,24 @@ fn default_expected_probe_state() -> String {
     "access_gated".to_string()
 }
 
+fn upstream_oauth_principal(parts: &Parts, auth_enabled: bool) -> Option<String> {
+    let principal = mcp_toolkit_auth::auth_context_from_parts(parts)
+        .map(|context| context.actor)
+        .filter(|actor| !actor.trim().is_empty());
+    principal.or_else(|| (!auth_enabled).then(|| "local-stdio-operator".to_string()))
+}
+
+fn missing_upstream_oauth_principal_result() -> CallToolResult {
+    CallToolResult::structured(json!({
+        "ok": false,
+        "error": {
+            "code": "cloudflare.upstream_oauth_principal_missing",
+            "message": "The authenticated MCP principal is unavailable for the Cloudflare OAuth grant.",
+            "hint": "Reconnect through the configured MCP authentication surface and retry."
+        }
+    }))
+}
+
 #[tool_router(router = tool_router_cloudflare, vis = "pub")]
 impl CloudflareMcp {
     #[tool(
@@ -1403,7 +1421,7 @@ impl CloudflareMcp {
             .cloned()
             .collect::<Vec<_>>();
         elicitation_required_tools.sort();
-        let upstream_oauth = self.cloudflare_oauth.status().await;
+        let upstream_oauth = self.cloudflare_oauth.status(None).await;
         Ok(CallToolResult::structured(json!({
             "ok": true,
             "auth_enabled": self.auth_enabled,
@@ -1434,11 +1452,15 @@ impl CloudflareMcp {
     )]
     async fn cloudflare_auth_status(
         &self,
+        Extension(parts): Extension<Parts>,
         Parameters(_): Parameters<CloudflareAuthStatusArgs>,
     ) -> Result<CallToolResult, crate::McpError> {
+        let Some(principal) = upstream_oauth_principal(&parts, self.auth_enabled) else {
+            return Ok(missing_upstream_oauth_principal_result());
+        };
         Ok(CallToolResult::structured(json!({
             "ok": true,
-            "upstream_oauth": self.cloudflare_oauth.status().await,
+            "upstream_oauth": self.cloudflare_oauth.status(Some(&principal)).await,
             "next_step": "Run cloudflare_auth_login when the token cache is absent."
         })))
     }
@@ -1452,10 +1474,9 @@ impl CloudflareMcp {
         Extension(parts): Extension<Parts>,
         Parameters(args): Parameters<CloudflareAuthLoginArgs>,
     ) -> Result<CallToolResult, crate::McpError> {
-        let principal = mcp_toolkit_auth::auth_context_from_parts(&parts)
-            .map(|context| context.actor)
-            .filter(|actor| !actor.trim().is_empty())
-            .unwrap_or_else(|| "local-stdio-operator".to_string());
+        let Some(principal) = upstream_oauth_principal(&parts, self.auth_enabled) else {
+            return Ok(missing_upstream_oauth_principal_result());
+        };
         match self
             .cloudflare_oauth
             .start_login(&principal, args.force_consent)
@@ -1483,8 +1504,12 @@ impl CloudflareMcp {
     )]
     async fn cloudflare_auth_logout(
         &self,
+        Extension(parts): Extension<Parts>,
         Parameters(args): Parameters<CloudflareAuthLogoutArgs>,
     ) -> Result<CallToolResult, crate::McpError> {
+        let Some(principal) = upstream_oauth_principal(&parts, self.auth_enabled) else {
+            return Ok(missing_upstream_oauth_principal_result());
+        };
         if !args.confirm {
             return Ok(CallToolResult::structured(json!({
                 "ok": true,
@@ -1493,7 +1518,7 @@ impl CloudflareMcp {
                 "warning": "This removes the local refresh-token cache but does not revoke the provider-side grant."
             })));
         }
-        match self.cloudflare_oauth.clear().await {
+        match self.cloudflare_oauth.clear(&principal).await {
             Ok(existed) => Ok(CallToolResult::structured(json!({
                 "ok": true,
                 "applied": true,
