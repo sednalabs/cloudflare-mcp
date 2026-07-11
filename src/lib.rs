@@ -19,6 +19,7 @@ pub(crate) mod sql_preflight;
 pub(crate) mod tool_surface;
 pub mod tools;
 pub mod tunnel;
+pub mod upstream_oauth;
 pub mod verification;
 pub(crate) mod worker_upload;
 

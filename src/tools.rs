@@ -34,7 +34,7 @@ use crate::cache::{
 };
 use crate::cloudflare::{
     AccessAppUpsertRequest, AccessPolicyWrite, BulkRedirectItemWrite, CacheRule, CacheRuleset,
-    DnsRecordUpsertRequest, PagesDeploymentTriggerRequest,
+    DnsRecordUpsertRequest, PagesDeploymentTriggerRequest, with_request_api_token_override,
 };
 use crate::dns_route::{
     DnsRouteConflict, DnsRouteVerificationState, plan_dns_route_reconciliation, verify_dns_route,
@@ -75,6 +75,24 @@ use mcp_toolkit_policy_core::{RestrictedSqlError, classify_restricted_sql};
 
 #[derive(Debug, Deserialize, JsonSchema, Default)]
 pub struct HealthArgs {}
+
+#[derive(Debug, Deserialize, JsonSchema, Default)]
+pub struct CloudflareAuthStatusArgs {}
+
+#[derive(Debug, Deserialize, JsonSchema, Default)]
+pub struct CloudflareAuthLoginArgs {
+    #[serde(default)]
+    pub force_consent: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Default)]
+pub struct CloudflareAuthLogoutArgs {
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema, Default)]
+pub struct CloudflareAuthProbeArgs {}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindToolsArgs {
@@ -1368,6 +1386,24 @@ fn default_expected_probe_state() -> String {
     "access_gated".to_string()
 }
 
+fn upstream_oauth_principal(parts: &Parts, auth_enabled: bool) -> Option<String> {
+    let principal = mcp_toolkit_auth::auth_context_from_parts(parts)
+        .map(|context| context.actor)
+        .filter(|actor| !actor.trim().is_empty());
+    principal.or_else(|| (!auth_enabled).then(|| "local-stdio-operator".to_string()))
+}
+
+fn missing_upstream_oauth_principal_result() -> CallToolResult {
+    CallToolResult::structured(json!({
+        "ok": false,
+        "error": {
+            "code": "cloudflare.upstream_oauth_principal_missing",
+            "message": "The authenticated MCP principal is unavailable for the Cloudflare OAuth grant.",
+            "hint": "Reconnect through the configured MCP authentication surface and retry."
+        }
+    }))
+}
+
 #[tool_router(router = tool_router_cloudflare, vis = "pub")]
 impl CloudflareMcp {
     #[tool(
@@ -1385,6 +1421,7 @@ impl CloudflareMcp {
             .cloned()
             .collect::<Vec<_>>();
         elicitation_required_tools.sort();
+        let upstream_oauth = self.cloudflare_oauth.status(None).await;
         Ok(CallToolResult::structured(json!({
             "ok": true,
             "auth_enabled": self.auth_enabled,
@@ -1396,6 +1433,7 @@ impl CloudflareMcp {
                 "required_tools": elicitation_required_tools,
             },
             "has_api_token": self.has_api_token,
+            "upstream_oauth": upstream_oauth,
             "portal_agent": {
                 "has_agent_token": self.has_portal_agent_token,
                 "has_access_service_token": self.has_portal_access_service_token,
@@ -1406,6 +1444,156 @@ impl CloudflareMcp {
             "parity_target": "cloudflared",
             "non_goal": "third-party cloudflare mcp ecosystem parity"
         })))
+    }
+
+    #[tool(
+        name = "cloudflare_auth_status",
+        description = "Report Cloudflare upstream OAuth configuration and grant-cache status without returning credentials."
+    )]
+    async fn cloudflare_auth_status(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(_): Parameters<CloudflareAuthStatusArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let Some(principal) = upstream_oauth_principal(&parts, self.auth_enabled) else {
+            return Ok(missing_upstream_oauth_principal_result());
+        };
+        Ok(CallToolResult::structured(json!({
+            "ok": true,
+            "upstream_oauth": self.cloudflare_oauth.status(Some(&principal)).await,
+            "next_step": "Run cloudflare_auth_login when the token cache is absent."
+        })))
+    }
+
+    #[tool(
+        name = "cloudflare_auth_login",
+        description = "Create a short-lived PKCE Cloudflare authorization URL for this authenticated MCP operator."
+    )]
+    async fn cloudflare_auth_login(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<CloudflareAuthLoginArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let Some(principal) = upstream_oauth_principal(&parts, self.auth_enabled) else {
+            return Ok(missing_upstream_oauth_principal_result());
+        };
+        match self
+            .cloudflare_oauth
+            .start_login(&principal, args.force_consent)
+            .await
+        {
+            Ok(login) => Ok(CallToolResult::structured(json!({
+                "ok": true,
+                "login": login,
+                "instructions": "Open authorization_url in a browser. Cloudflare will return to the registered callback; do not paste the callback URL into chat or logs."
+            }))),
+            Err(err) => Ok(CallToolResult::structured(json!({
+                "ok": false,
+                "error": {
+                    "code": "cloudflare.upstream_oauth_login_failed",
+                    "message": mcp_toolkit_observability::sanitize_error_message(&err.to_string(), 256),
+                    "hint": "Check the upstream OAuth client id, callback URL, scopes, and token authentication method."
+                }
+            }))),
+        }
+    }
+
+    #[tool(
+        name = "cloudflare_auth_logout",
+        description = "Remove the locally stored Cloudflare OAuth grant. Set confirm=true to apply; this does not revoke the grant at Cloudflare."
+    )]
+    async fn cloudflare_auth_logout(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<CloudflareAuthLogoutArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let Some(principal) = upstream_oauth_principal(&parts, self.auth_enabled) else {
+            return Ok(missing_upstream_oauth_principal_result());
+        };
+        if !args.confirm {
+            return Ok(CallToolResult::structured(json!({
+                "ok": true,
+                "applied": false,
+                "requires_confirmation": true,
+                "warning": "This removes the local refresh-token cache but does not revoke the provider-side grant."
+            })));
+        }
+        match self.cloudflare_oauth.clear(&principal).await {
+            Ok(existed) => Ok(CallToolResult::structured(json!({
+                "ok": true,
+                "applied": true,
+                "local_grant_existed": existed,
+                "provider_grant_revoked": false
+            }))),
+            Err(err) => Ok(CallToolResult::structured(json!({
+                "ok": false,
+                "error": {
+                    "code": "cloudflare.upstream_oauth_logout_failed",
+                    "message": mcp_toolkit_observability::sanitize_error_message(&err.to_string(), 256)
+                }
+            }))),
+        }
+    }
+
+    #[tool(
+        name = "cloudflare_auth_probe",
+        description = "Verify the selected Cloudflare credential with the read-only API token verification endpoint."
+    )]
+    async fn cloudflare_auth_probe(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(_): Parameters<CloudflareAuthProbeArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let Some(principal) = upstream_oauth_principal(&parts, self.auth_enabled) else {
+            return Ok(missing_upstream_oauth_principal_result());
+        };
+        let token = match self.cloudflare_oauth.access_token(&principal).await {
+            Ok(Some(token)) => token,
+            Ok(None) => {
+                return Ok(CallToolResult::structured(json!({
+                    "ok": false,
+                    "credential_verified": false,
+                    "error": {
+                        "code": "cloudflare.upstream_oauth_not_configured",
+                        "message": "Cloudflare upstream OAuth is not enabled."
+                    }
+                })));
+            }
+            Err(err) => {
+                return Ok(CallToolResult::structured(json!({
+                    "ok": false,
+                    "credential_verified": false,
+                    "error": {
+                        "code": "cloudflare.upstream_oauth_unavailable",
+                        "message": mcp_toolkit_observability::sanitize_error_message(&err.to_string(), 256)
+                    }
+                })));
+            }
+        };
+        let probe = with_request_api_token_override(
+            Some(token),
+            self.cloudflare.api_request(
+                "cloudflare.auth.verify",
+                reqwest::Method::GET,
+                "/user/tokens/verify",
+                &[],
+                None,
+            ),
+        )
+        .await;
+        match probe {
+            Ok(result) => Ok(CallToolResult::structured(json!({
+                "ok": true,
+                "credential_verified": true,
+                "credential_source": "upstream_oauth",
+                "result": result
+            }))),
+            Err(err) => Ok(CallToolResult::structured(json!({
+                "ok": false,
+                "credential_verified": false,
+                "error": err.payload()
+            }))),
+        }
     }
 
     #[tool(

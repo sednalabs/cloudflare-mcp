@@ -2,12 +2,13 @@ use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+use mcp_toolkit_auth::upstream_oauth::OAuthClientAuthMethod;
 use mcp_toolkit_auth::{AuthConfig, AuthMode, AuthSecurityProfile, ClientAuthMethod};
 use url::Url;
 
@@ -88,6 +89,57 @@ pub struct CloudflareApiConfig {
 }
 
 #[derive(Clone)]
+pub struct CloudflareOAuthConfig {
+    pub enabled: bool,
+    pub client_id: Option<String>,
+    pub client_secret: Option<String>,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    pub token_auth_method: OAuthClientAuthMethod,
+    pub callback_url: Option<String>,
+    pub scopes: Vec<String>,
+    pub token_cache_path: PathBuf,
+    pub transaction_timeout: Duration,
+    pub max_pending_transactions: usize,
+}
+
+impl std::fmt::Debug for CloudflareOAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloudflareOAuthConfig")
+            .field("enabled", &self.enabled)
+            .field("client_id_present", &self.client_id.is_some())
+            .field("client_secret_present", &self.client_secret.is_some())
+            .field("authorization_endpoint", &self.authorization_endpoint)
+            .field("token_endpoint", &self.token_endpoint)
+            .field("token_auth_method", &self.token_auth_method)
+            .field("callback_url", &self.callback_url)
+            .field("scopes", &self.scopes)
+            .field("token_cache_path", &self.token_cache_path)
+            .field("transaction_timeout", &self.transaction_timeout)
+            .field("max_pending_transactions", &self.max_pending_transactions)
+            .finish()
+    }
+}
+
+impl Default for CloudflareOAuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            client_id: None,
+            client_secret: None,
+            authorization_endpoint: "https://dash.cloudflare.com/oauth2/auth".to_string(),
+            token_endpoint: "https://dash.cloudflare.com/oauth2/token".to_string(),
+            token_auth_method: OAuthClientAuthMethod::Basic,
+            callback_url: None,
+            scopes: Vec::new(),
+            token_cache_path: ".cloudflare-mcp/upstream-oauth.json".into(),
+            transaction_timeout: Duration::from_secs(300),
+            max_pending_transactions: 16,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct PortalAgentConfig {
     pub allowed_url_prefixes: Vec<String>,
     pub agent_token: Option<String>,
@@ -141,6 +193,7 @@ pub struct Config {
     pub auth_allowed_client_ids: Vec<String>,
     pub auth_config: AuthConfig,
     pub cloudflare: CloudflareApiConfig,
+    pub cloudflare_oauth: CloudflareOAuthConfig,
     pub portal_agent: PortalAgentConfig,
 }
 
@@ -306,6 +359,7 @@ pub fn load_config_with_auth_default(auth_mode_default: &str) -> Result<Config, 
         "CLOUDFLARE_MCP_R2_ENDPOINT",
         cloudflare.r2_endpoint.as_deref(),
     )?;
+    let cloudflare_oauth = load_cloudflare_oauth_config()?;
     let portal_agent = load_portal_agent_config()?;
 
     Ok(Config {
@@ -330,8 +384,109 @@ pub fn load_config_with_auth_default(auth_mode_default: &str) -> Result<Config, 
         auth_allowed_client_ids: env_csv("CLOUDFLARE_MCP_AUTH_ALLOWED_CLIENT_IDS", ""),
         auth_config,
         cloudflare,
+        cloudflare_oauth,
         portal_agent,
     })
+}
+
+fn load_cloudflare_oauth_config() -> Result<CloudflareOAuthConfig, String> {
+    let enabled = env_flag("CLOUDFLARE_MCP_UPSTREAM_OAUTH_ENABLED", false)?;
+    let client_id = env_secret_or_file(
+        "CLOUDFLARE_MCP_UPSTREAM_OAUTH_CLIENT_ID",
+        "CLOUDFLARE_MCP_UPSTREAM_OAUTH_CLIENT_ID_FILE",
+    )?;
+    let client_secret = env_secret_or_file(
+        "CLOUDFLARE_MCP_UPSTREAM_OAUTH_CLIENT_SECRET",
+        "CLOUDFLARE_MCP_UPSTREAM_OAUTH_CLIENT_SECRET_FILE",
+    )?;
+    let callback_url = env_optional_string("CLOUDFLARE_MCP_UPSTREAM_OAUTH_CALLBACK_URL");
+    let scopes = env_csv("CLOUDFLARE_MCP_UPSTREAM_OAUTH_SCOPES", "");
+    let token_auth_method = match env_setting(
+        "CLOUDFLARE_MCP_UPSTREAM_OAUTH_TOKEN_AUTH_METHOD",
+        "client_secret_basic",
+    )
+    .trim()
+    .to_ascii_lowercase()
+    .as_str()
+    {
+        "client_secret_basic" | "basic" => OAuthClientAuthMethod::Basic,
+        "client_secret_post" | "post" | "none" => OAuthClientAuthMethod::RequestBody,
+        value => {
+            return Err(format!(
+                "Unsupported CLOUDFLARE_MCP_UPSTREAM_OAUTH_TOKEN_AUTH_METHOD={value:?}; use client_secret_basic, client_secret_post, or none."
+            ));
+        }
+    };
+    let config = CloudflareOAuthConfig {
+        enabled,
+        client_id,
+        client_secret,
+        authorization_endpoint: env_setting(
+            "CLOUDFLARE_MCP_UPSTREAM_OAUTH_AUTHORIZATION_ENDPOINT",
+            "https://dash.cloudflare.com/oauth2/auth",
+        ),
+        token_endpoint: env_setting(
+            "CLOUDFLARE_MCP_UPSTREAM_OAUTH_TOKEN_ENDPOINT",
+            "https://dash.cloudflare.com/oauth2/token",
+        ),
+        token_auth_method,
+        callback_url,
+        scopes,
+        token_cache_path: PathBuf::from(env_setting(
+            "CLOUDFLARE_MCP_UPSTREAM_OAUTH_TOKEN_CACHE",
+            ".cloudflare-mcp/upstream-oauth.json",
+        )),
+        transaction_timeout: Duration::from_secs(env_u64(
+            "CLOUDFLARE_MCP_UPSTREAM_OAUTH_TRANSACTION_TIMEOUT_S",
+            300,
+        )?),
+        max_pending_transactions: env_usize("CLOUDFLARE_MCP_UPSTREAM_OAUTH_MAX_PENDING", 16)?,
+    };
+    if !enabled {
+        return Ok(config);
+    }
+    if config.client_id.is_none() {
+        return Err(
+            "CLOUDFLARE_MCP_UPSTREAM_OAUTH_CLIENT_ID is required when upstream OAuth is enabled."
+                .to_string(),
+        );
+    }
+    if matches!(config.token_auth_method, OAuthClientAuthMethod::Basic)
+        && config.client_secret.is_none()
+    {
+        return Err(
+            "CLOUDFLARE_MCP_UPSTREAM_OAUTH_CLIENT_SECRET is required for client_secret_basic; use token auth method none for a public PKCE client."
+                .to_string(),
+        );
+    }
+    if config.callback_url.is_none() {
+        return Err(
+            "CLOUDFLARE_MCP_UPSTREAM_OAUTH_CALLBACK_URL is required when upstream OAuth is enabled."
+                .to_string(),
+        );
+    }
+    if config.scopes.is_empty() {
+        return Err(
+            "CLOUDFLARE_MCP_UPSTREAM_OAUTH_SCOPES must contain at least one Cloudflare OAuth scope."
+                .to_string(),
+        );
+    }
+    if config.scopes.iter().any(|scope| scope.contains(':')) {
+        return Err(
+            "CLOUDFLARE_MCP_UPSTREAM_OAUTH_SCOPES must use Cloudflare dot-delimited scopes, not colon-delimited MCP scopes."
+                .to_string(),
+        );
+    }
+    if config.max_pending_transactions == 0 {
+        return Err(
+            "CLOUDFLARE_MCP_UPSTREAM_OAUTH_MAX_PENDING must be greater than zero.".to_string(),
+        );
+    }
+    validate_url(
+        "CLOUDFLARE_MCP_UPSTREAM_OAUTH_CALLBACK_URL",
+        config.callback_url.as_deref(),
+    )?;
+    Ok(config)
 }
 
 fn load_portal_agent_config() -> Result<PortalAgentConfig, String> {
@@ -1186,6 +1341,71 @@ mod tests {
         assert_eq!(cfg.cloudflare.max_retries, 5);
         assert_eq!(cfg.cloudflare.retry_base_delay.as_millis(), 50);
         assert_eq!(cfg.cloudflare.retry_max_delay.as_millis(), 400);
+    }
+
+    #[test]
+    fn parses_upstream_oauth_without_exposing_client_secret() {
+        let client_secret = fixture_material("oauth-client-secret");
+        let cfg = with_env(
+            &[
+                ("CLOUDFLARE_MCP_AUTH_MODE", Some("off")),
+                ("CLOUDFLARE_MCP_UPSTREAM_OAUTH_ENABLED", Some("1")),
+                (
+                    "CLOUDFLARE_MCP_UPSTREAM_OAUTH_CLIENT_ID",
+                    Some("oauth-client-id"),
+                ),
+                (
+                    "CLOUDFLARE_MCP_UPSTREAM_OAUTH_CLIENT_SECRET",
+                    Some(client_secret.as_str()),
+                ),
+                (
+                    "CLOUDFLARE_MCP_UPSTREAM_OAUTH_CALLBACK_URL",
+                    Some("https://mcp.example.com/oauth/cloudflare/callback"),
+                ),
+                (
+                    "CLOUDFLARE_MCP_UPSTREAM_OAUTH_SCOPES",
+                    Some("account.read,workers-platform.read"),
+                ),
+            ],
+            || load_config().expect("load upstream OAuth config"),
+        );
+
+        assert!(cfg.cloudflare_oauth.enabled);
+        assert_eq!(
+            cfg.cloudflare_oauth.scopes,
+            vec!["account.read", "workers-platform.read"]
+        );
+        let debug = format!("{:?}", cfg.cloudflare_oauth);
+        assert!(debug.contains("client_secret_present: true"));
+        assert!(!debug.contains(client_secret.as_str()));
+    }
+
+    #[test]
+    fn upstream_oauth_rejects_inbound_mcp_scope_syntax() {
+        let err = with_env(
+            &[
+                ("CLOUDFLARE_MCP_AUTH_MODE", Some("off")),
+                ("CLOUDFLARE_MCP_UPSTREAM_OAUTH_ENABLED", Some("1")),
+                (
+                    "CLOUDFLARE_MCP_UPSTREAM_OAUTH_CLIENT_ID",
+                    Some("oauth-client-id"),
+                ),
+                (
+                    "CLOUDFLARE_MCP_UPSTREAM_OAUTH_CALLBACK_URL",
+                    Some("https://mcp.example.com/oauth/cloudflare/callback"),
+                ),
+                (
+                    "CLOUDFLARE_MCP_UPSTREAM_OAUTH_SCOPES",
+                    Some("cloudflare:read"),
+                ),
+                (
+                    "CLOUDFLARE_MCP_UPSTREAM_OAUTH_TOKEN_AUTH_METHOD",
+                    Some("none"),
+                ),
+            ],
+            || load_config().expect_err("colon-delimited provider scope must fail"),
+        );
+        assert!(err.contains("dot-delimited"));
     }
 
     #[test]

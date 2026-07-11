@@ -4,7 +4,7 @@ use mcp_toolkit_core::{
     },
     rmcp_models,
 };
-use rmcp::model::{Annotated, RawResource, ReadResourceResult, Resource, ResourceContents};
+use rmcp::model::{ReadResourceResult, Resource, ResourceContents};
 use serde_json::{Value, json};
 
 use crate::verification::{VerificationStatus, now_unix_ms};
@@ -152,6 +152,10 @@ fn build_help_text() -> String {
         "",
         "Tools:",
         "- health",
+        "- cloudflare_auth_status",
+        "- cloudflare_auth_login",
+        "- cloudflare_auth_probe",
+        "- cloudflare_auth_logout",
         "- api_parity_status",
         "- api_find_operations",
         "- api_get_operation",
@@ -224,6 +228,8 @@ fn build_help_text() -> String {
 fn build_openai_tool_search_config() -> String {
     let read_only_auto_approval_tools = [
         "health",
+        "cloudflare_auth_status",
+        "cloudflare_auth_probe",
         "find_tools",
         "api_parity_status",
         "api_find_operations",
@@ -424,19 +430,14 @@ fn resource_for_text(
     mime_type: &str,
     size: Option<usize>,
 ) -> Resource {
-    Annotated::new(
-        RawResource {
-            uri: uri.to_string(),
-            name: name.to_string(),
-            title: Some(title.to_string()),
-            description: Some(description.to_string()),
-            mime_type: Some(mime_type.to_string()),
-            size: size.map(|size| size.min(u32::MAX as usize) as u32),
-            icons: None,
-            meta: None,
-        },
-        None,
-    )
+    let resource = Resource::new(uri, name)
+        .with_title(title)
+        .with_description(description)
+        .with_mime_type(mime_type);
+    match size {
+        Some(size) => resource.with_size(size.min(u64::MAX as usize) as u64),
+        None => resource,
+    }
 }
 
 #[cfg(test)]

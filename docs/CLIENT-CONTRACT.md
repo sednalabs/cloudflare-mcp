@@ -11,7 +11,8 @@ Related docs:
 - Transport: MCP Streamable HTTP.
 - MCP endpoint: `POST|GET|DELETE /mcp`.
 - `/mcp/` is accepted and normalized to `/mcp`.
-- Public endpoints (no auth by policy): `GET /health`, `GET /attest`.
+- Public endpoints (no MCP bearer auth by policy): `GET /health`, `GET /attest`,
+  and `GET /oauth/cloudflare/callback`. All remain subject to the Host allowlist.
 
 ## Required headers and envelope
 
@@ -63,8 +64,17 @@ JSON-RPC envelope shape:
   `CLOUDFLARE_MCP_AUTH_ALLOW_INSECURE_DEV_DELEGATION_SECRET=1`. Delegation is an
   delegated-token mode, not a self-hosted end-user login flow.
 - Required token scopes default to `cloudflare:read,cloudflare:write` and can be overridden with `CLOUDFLARE_MCP_AUTH_REQUIRED_SCOPES`.
-- Cloudflare upstream API credentials are independent from MCP bearer auth:
-  set `CLOUDFLARE_MCP_API_TOKEN_SOURCE` to `config`, `header`, or `header_or_config`.
+- Cloudflare upstream API credentials are independent from MCP bearer auth.
+  Static credentials use `CLOUDFLARE_MCP_API_TOKEN_SOURCE` values `config`,
+  `header`, or `header_or_config`. Hosted authorization can instead use the
+  `CLOUDFLARE_MCP_UPSTREAM_OAUTH_*` settings and the
+  `cloudflare_auth_status`, `cloudflare_auth_login`,
+  `cloudflare_auth_probe`, and `cloudflare_auth_logout` tools.
+- Credential precedence is request header, configured static token, then the
+  hosted OAuth grant. Setup tools remain callable before a provider grant is
+  present.
+- The OAuth callback consumes a bounded, expiring, single-use PKCE transaction.
+  Clients must never log or copy its `code` or `state` query values.
 - R2 object reads use independent S3-compatible R2 credentials:
   set `CLOUDFLARE_MCP_R2_ACCESS_KEY_ID` and `CLOUDFLARE_MCP_R2_SECRET_ACCESS_KEY`,
   or their `_FILE` variants. `CLOUDFLARE_MCP_R2_ENDPOINT` is optional and
