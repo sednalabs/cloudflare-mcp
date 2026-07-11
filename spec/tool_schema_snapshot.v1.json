@@ -1422,7 +1422,6 @@
             "type": "boolean"
           }
         },
-        "title": "CloudflareAuthLoginArgs",
         "type": "object"
       },
       "name": "cloudflare_auth_login"
@@ -1437,7 +1436,6 @@
             "type": "boolean"
           }
         },
-        "title": "CloudflareAuthLogoutArgs",
         "type": "object"
       },
       "name": "cloudflare_auth_logout"
@@ -1446,7 +1444,6 @@
       "description": "Verify the selected Cloudflare credential with the read-only API token verification endpoint.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "title": "CloudflareAuthProbeArgs",
         "type": "object"
       },
       "name": "cloudflare_auth_probe"
@@ -1455,7 +1452,6 @@
       "description": "Report Cloudflare upstream OAuth configuration and grant-cache status without returning credentials.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "title": "CloudflareAuthStatusArgs",
         "type": "object"
       },
       "name": "cloudflare_auth_status"
