@@ -20,7 +20,6 @@
         "required": [
           "app_id"
         ],
-        "title": "GetAccessAppArgs",
         "type": "object"
       },
       "name": "access_get_app"
@@ -44,7 +43,6 @@
         "required": [
           "hostname"
         ],
-        "title": "VerifyAccessHostnameGateArgs",
         "type": "object"
       },
       "name": "access_verify_hostname_gate"
@@ -118,7 +116,6 @@
             ]
           }
         },
-        "title": "AccountApiTokenPermissionPlanArgs",
         "type": "object"
       },
       "name": "account_api_token_permission_plan"
@@ -184,7 +181,6 @@
         "required": [
           "action"
         ],
-        "title": "AccountApiTokensArgs",
         "type": "object"
       },
       "name": "account_api_tokens"
@@ -239,7 +235,6 @@
             ]
           }
         },
-        "title": "AccountBillingUsageArgs",
         "type": "object"
       },
       "name": "account_billing_usage"
@@ -266,7 +261,6 @@
             ]
           }
         },
-        "title": "AnalyticsEngineListDatasetsArgs",
         "type": "object"
       },
       "name": "analytics_engine_describe_schema"
@@ -293,7 +287,6 @@
             ]
           }
         },
-        "title": "AnalyticsEngineListDatasetsArgs",
         "type": "object"
       },
       "name": "analytics_engine_list_datasets"
@@ -326,7 +319,6 @@
         "required": [
           "sql"
         ],
-        "title": "AnalyticsEngineQueryArgs",
         "type": "object"
       },
       "name": "analytics_engine_query"
@@ -354,7 +346,6 @@
         "required": [
           "sql"
         ],
-        "title": "AnalyticsEngineValidateQueryArgs",
         "type": "object"
       },
       "name": "analytics_engine_validate_query"
@@ -413,7 +404,6 @@
             ]
           }
         },
-        "title": "ApiFindOperationsArgs",
         "type": "object"
       },
       "name": "api_find_operations"
@@ -430,7 +420,6 @@
         "required": [
           "operation_id"
         ],
-        "title": "ApiGetOperationArgs",
         "type": "object"
       },
       "name": "api_get_operation"
@@ -480,7 +469,6 @@
         "required": [
           "operation_id"
         ],
-        "title": "ApiMutateArgs",
         "type": "object"
       },
       "name": "api_mutate"
@@ -489,7 +477,6 @@
       "description": "Summarize the local Cloudflare REST API v4 parity catalog and generic executor coverage.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "title": "ApiParityStatusArgs",
         "type": "object"
       },
       "name": "api_parity_status"
@@ -570,7 +557,6 @@
             ]
           }
         },
-        "title": "ApiPrepareCallArgs",
         "type": "object"
       },
       "name": "api_prepare_call"
@@ -608,7 +594,6 @@
         "required": [
           "operation_id"
         ],
-        "title": "ApiReadArgs",
         "type": "object"
       },
       "name": "api_read"
@@ -647,7 +632,6 @@
           "app_id",
           "requested_principals"
         ],
-        "title": "ApplyAccessAllowlistArgs",
         "type": "object"
       },
       "name": "apply_access_allowlist"
@@ -680,7 +664,6 @@
             ]
           }
         },
-        "title": "BindingsDiscoverArgs",
         "type": "object"
       },
       "name": "bindings_discover"
@@ -719,7 +702,6 @@
         "required": [
           "list_name"
         ],
-        "title": "BulkRedirectAttachListArgs",
         "type": "object"
       },
       "name": "bulk_redirects_attach_list_to_ruleset"
@@ -754,7 +736,6 @@
         "required": [
           "name"
         ],
-        "title": "BulkRedirectCreateListArgs",
         "type": "object"
       },
       "name": "bulk_redirects_create_list"
@@ -778,7 +759,6 @@
         "required": [
           "list_id"
         ],
-        "title": "BulkRedirectListArgs",
         "type": "object"
       },
       "name": "bulk_redirects_get_list"
@@ -802,7 +782,6 @@
         "required": [
           "operation_id"
         ],
-        "title": "BulkRedirectOperationArgs",
         "type": "object"
       },
       "name": "bulk_redirects_get_operation"
@@ -820,7 +799,6 @@
             ]
           }
         },
-        "title": "BulkRedirectRulesetArgs",
         "type": "object"
       },
       "name": "bulk_redirects_get_ruleset"
@@ -914,7 +892,6 @@
           "list_id",
           "redirects"
         ],
-        "title": "BulkRedirectImportItemsArgs",
         "type": "object"
       },
       "name": "bulk_redirects_import_items"
@@ -954,7 +931,6 @@
         "required": [
           "list_id"
         ],
-        "title": "BulkRedirectListItemsArgs",
         "type": "object"
       },
       "name": "bulk_redirects_list_items"
@@ -976,7 +952,6 @@
             "type": "boolean"
           }
         },
-        "title": "BulkRedirectsListArgs",
         "type": "object"
       },
       "name": "bulk_redirects_list_lists"
@@ -1018,7 +993,6 @@
         "required": [
           "list_id"
         ],
-        "title": "BulkRedirectUpdateListArgs",
         "type": "object"
       },
       "name": "bulk_redirects_update_list"
@@ -1056,7 +1030,6 @@
         "required": [
           "action"
         ],
-        "title": "CacheResourceArgs",
         "type": "object"
       },
       "name": "cache_origin_regions"
@@ -1151,7 +1124,6 @@
             ]
           }
         },
-        "title": "CachePurgeArgs",
         "type": "object"
       },
       "name": "cache_purge"
@@ -1189,7 +1161,6 @@
         "required": [
           "action"
         ],
-        "title": "CacheResourceArgs",
         "type": "object"
       },
       "name": "cache_reserve"
@@ -1246,7 +1217,6 @@
         "required": [
           "action"
         ],
-        "title": "CacheRulesArgs",
         "type": "object"
       },
       "name": "cache_rules"
@@ -1284,7 +1254,6 @@
         "required": [
           "action"
         ],
-        "title": "CacheResourceArgs",
         "type": "object"
       },
       "name": "cache_tiered"
@@ -1322,7 +1291,6 @@
         "required": [
           "action"
         ],
-        "title": "CacheResourceArgs",
         "type": "object"
       },
       "name": "cache_variants"
@@ -1357,7 +1325,6 @@
           "action",
           "setting_id"
         ],
-        "title": "CacheZoneSettingArgs",
         "type": "object"
       },
       "name": "cache_zone_setting"
@@ -1407,7 +1374,6 @@
             ]
           }
         },
-        "title": "CapabilitiesCheckArgs",
         "type": "object"
       },
       "name": "capabilities_check"
@@ -1476,7 +1442,6 @@
           "connector_key",
           "action"
         ],
-        "title": "ConnectorControlArgs",
         "type": "object"
       },
       "name": "connector_control"
@@ -1524,7 +1489,6 @@
           "database_id",
           "migrations_directory"
         ],
-        "title": "D1ApplyMigrationsArgs",
         "type": "object"
       },
       "name": "d1_apply_migrations"
@@ -1566,7 +1530,6 @@
         "required": [
           "database_id"
         ],
-        "title": "D1DeleteDatabaseArgs",
         "type": "object"
       },
       "name": "d1_delete_database"
@@ -1612,7 +1575,6 @@
           "database_id",
           "sql"
         ],
-        "title": "D1ExecuteWriteArgs",
         "type": "object"
       },
       "name": "d1_execute_write"
@@ -1636,7 +1598,6 @@
         "required": [
           "database_id"
         ],
-        "title": "D1DatabaseArgs",
         "type": "object"
       },
       "name": "d1_get_database"
@@ -1678,7 +1639,6 @@
         "required": [
           "database_id"
         ],
-        "title": "D1InspectSchemaArgs",
         "type": "object"
       },
       "name": "d1_inspect_schema"
@@ -1721,7 +1681,6 @@
             ]
           }
         },
-        "title": "D1ListDatabasesArgs",
         "type": "object"
       },
       "name": "d1_list_databases"
@@ -1763,7 +1722,6 @@
           "database_id",
           "sql"
         ],
-        "title": "D1QueryArgs",
         "type": "object"
       },
       "name": "d1_query_read_only"
@@ -1795,7 +1753,6 @@
           "database_id",
           "name"
         ],
-        "title": "D1RenameDatabaseArgs",
         "type": "object"
       },
       "name": "d1_rename_database"
@@ -1827,7 +1784,6 @@
           "database_id",
           "sql"
         ],
-        "title": "D1ValidateQueryArgs",
         "type": "object"
       },
       "name": "d1_validate_query"
@@ -1851,7 +1807,6 @@
         "required": [
           "destination_address_identifier"
         ],
-        "title": "EmailRoutingAddressArgs",
         "type": "object"
       },
       "name": "email_routing_get_address"
@@ -1869,7 +1824,6 @@
             ]
           }
         },
-        "title": "EmailRoutingZoneArgs",
         "type": "object"
       },
       "name": "email_routing_get_catch_all"
@@ -1887,7 +1841,6 @@
             ]
           }
         },
-        "title": "EmailRoutingZoneArgs",
         "type": "object"
       },
       "name": "email_routing_get_dns"
@@ -1911,7 +1864,6 @@
         "required": [
           "rule_identifier"
         ],
-        "title": "EmailRoutingRuleArgs",
         "type": "object"
       },
       "name": "email_routing_get_rule"
@@ -1929,7 +1881,6 @@
             ]
           }
         },
-        "title": "EmailRoutingZoneArgs",
         "type": "object"
       },
       "name": "email_routing_get_settings"
@@ -1965,7 +1916,6 @@
             ]
           }
         },
-        "title": "EmailRoutingListAddressesArgs",
         "type": "object"
       },
       "name": "email_routing_list_addresses"
@@ -2001,7 +1951,6 @@
             ]
           }
         },
-        "title": "EmailRoutingListRulesArgs",
         "type": "object"
       },
       "name": "email_routing_list_rules"
@@ -2036,7 +1985,6 @@
         "required": [
           "hostname"
         ],
-        "title": "EmergencyUnpublishArgs",
         "type": "object"
       },
       "name": "emergency_unpublish"
@@ -2064,7 +2012,6 @@
         "required": [
           "tunnel_name"
         ],
-        "title": "EnsureTunnelArgs",
         "type": "object"
       },
       "name": "ensure_tunnel"
@@ -2109,7 +2056,6 @@
             ]
           }
         },
-        "title": "FindToolsArgs",
         "type": "object"
       },
       "name": "find_tools"
@@ -2167,7 +2113,6 @@
           "tunnel_name",
           "rules"
         ],
-        "title": "GenerateTunnelIngressArgs",
         "type": "object"
       },
       "name": "generate_tunnel_ingress"
@@ -2198,7 +2143,6 @@
         "required": [
           "script_name"
         ],
-        "title": "GetWorkerSettingsArgs",
         "type": "object"
       },
       "name": "get_worker_settings"
@@ -2229,7 +2173,6 @@
         "required": [
           "query"
         ],
-        "title": "GraphqlAnalyticsQueryArgs",
         "type": "object"
       },
       "name": "graphql_analytics_query"
@@ -2238,7 +2181,6 @@
       "description": "Return cloudflare-mcp runtime health summary.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "title": "HealthArgs",
         "type": "object"
       },
       "name": "health"
@@ -2263,7 +2205,6 @@
             ]
           }
         },
-        "title": "ListAccessAppsArgs",
         "type": "object"
       },
       "name": "list_access_apps"
@@ -2287,7 +2228,6 @@
         "required": [
           "app_id"
         ],
-        "title": "ListAccessPoliciesArgs",
         "type": "object"
       },
       "name": "list_access_policies"
@@ -2312,7 +2252,6 @@
             ]
           }
         },
-        "title": "ListDnsRecordsArgs",
         "type": "object"
       },
       "name": "list_dns_records"
@@ -2348,7 +2287,6 @@
             ]
           }
         },
-        "title": "ListTunnelsArgs",
         "type": "object"
       },
       "name": "list_tunnels"
@@ -2373,7 +2311,6 @@
             ]
           }
         },
-        "title": "ListWorkersArgs",
         "type": "object"
       },
       "name": "list_workers"
@@ -2439,7 +2376,6 @@
           "hostname",
           "target"
         ],
-        "title": "LockFirstPublishArgs",
         "type": "object"
       },
       "name": "lock_first_publish"
@@ -2519,7 +2455,6 @@
           "project_name",
           "directory"
         ],
-        "title": "PagesDeployDirectoryArgs",
         "type": "object"
       },
       "name": "pages_deploy_directory"
@@ -2551,7 +2486,6 @@
           "project_name",
           "domain_name"
         ],
-        "title": "PagesEnsureDomainArgs",
         "type": "object"
       },
       "name": "pages_ensure_domain"
@@ -2579,7 +2513,6 @@
           "project_name",
           "deployment_id"
         ],
-        "title": "PagesDeploymentArgs",
         "type": "object"
       },
       "name": "pages_get_deployment"
@@ -2607,7 +2540,6 @@
           "project_name",
           "domain_name"
         ],
-        "title": "PagesDomainArgs",
         "type": "object"
       },
       "name": "pages_get_domain"
@@ -2631,7 +2563,6 @@
         "required": [
           "project_name"
         ],
-        "title": "PagesProjectArgs",
         "type": "object"
       },
       "name": "pages_get_project"
@@ -2680,7 +2611,6 @@
         "required": [
           "project_name"
         ],
-        "title": "PagesListDeploymentsArgs",
         "type": "object"
       },
       "name": "pages_list_deployments"
@@ -2704,7 +2634,6 @@
         "required": [
           "project_name"
         ],
-        "title": "PagesProjectArgs",
         "type": "object"
       },
       "name": "pages_list_domains"
@@ -2740,7 +2669,6 @@
             ]
           }
         },
-        "title": "PagesListProjectsArgs",
         "type": "object"
       },
       "name": "pages_list_projects"
@@ -2772,7 +2700,6 @@
           "project_name",
           "deployment_id"
         ],
-        "title": "PagesDeploymentActionArgs",
         "type": "object"
       },
       "name": "pages_retry_deployment"
@@ -2804,7 +2731,6 @@
           "project_name",
           "domain_name"
         ],
-        "title": "PagesEnsureDomainArgs",
         "type": "object"
       },
       "name": "pages_retry_domain_validation"
@@ -2836,7 +2762,6 @@
           "project_name",
           "deployment_id"
         ],
-        "title": "PagesDeploymentActionArgs",
         "type": "object"
       },
       "name": "pages_rollback_deployment"
@@ -2892,7 +2817,6 @@
         "required": [
           "project_name"
         ],
-        "title": "PagesTriggerDeploymentArgs",
         "type": "object"
       },
       "name": "pages_trigger_deployment"
@@ -2922,7 +2846,6 @@
           "project_name",
           "settings"
         ],
-        "title": "PagesUpdateProjectArgs",
         "type": "object"
       },
       "name": "pages_update_project"
@@ -2989,7 +2912,6 @@
           "script_name",
           "settings_patch"
         ],
-        "title": "PatchWorkerSettingsArgs",
         "type": "object"
       },
       "name": "patch_worker_settings"
@@ -3025,7 +2947,6 @@
         "required": [
           "url"
         ],
-        "title": "PortalAgentRequestArgs",
         "type": "object"
       },
       "name": "portal_agent_request"
@@ -3060,7 +2981,6 @@
         "required": [
           "hostname"
         ],
-        "title": "PublishPreflightArgs",
         "type": "object"
       },
       "name": "publish_preflight"
@@ -3084,7 +3004,6 @@
         "required": [
           "queue_id"
         ],
-        "title": "QueueArgs",
         "type": "object"
       },
       "name": "queues_get"
@@ -3108,7 +3027,6 @@
         "required": [
           "queue_id"
         ],
-        "title": "QueueArgs",
         "type": "object"
       },
       "name": "queues_get_metrics"
@@ -3136,7 +3054,6 @@
         "required": [
           "queue_id"
         ],
-        "title": "QueueHealthArgs",
         "type": "object"
       },
       "name": "queues_health"
@@ -3154,7 +3071,6 @@
             ]
           }
         },
-        "title": "QueuesListArgs",
         "type": "object"
       },
       "name": "queues_list"
@@ -3178,7 +3094,6 @@
         "required": [
           "queue_id"
         ],
-        "title": "QueueArgs",
         "type": "object"
       },
       "name": "queues_list_consumers"
@@ -3245,7 +3160,6 @@
           "bucket_name",
           "object_key"
         ],
-        "title": "R2GetObjectArgs",
         "type": "object"
       },
       "name": "r2_get_object"
@@ -3273,7 +3187,6 @@
           "bucket_name",
           "object_key"
         ],
-        "title": "R2InspectObjectArgs",
         "type": "object"
       },
       "name": "r2_inspect_object"
@@ -3333,7 +3246,6 @@
           "bucket_name",
           "object_key"
         ],
-        "title": "R2PutObjectArgs",
         "type": "object"
       },
       "name": "r2_put_object"
@@ -3403,7 +3315,6 @@
           "app_id",
           "policies"
         ],
-        "title": "ReplaceAccessPoliciesArgs",
         "type": "object"
       },
       "name": "replace_access_policies"
@@ -3435,7 +3346,6 @@
           "hostname",
           "app_name"
         ],
-        "title": "UpsertAccessAppArgs",
         "type": "object"
       },
       "name": "upsert_access_app"
@@ -3501,7 +3411,6 @@
           "hostname",
           "target"
         ],
-        "title": "UpsertDnsCnameArgs",
         "type": "object"
       },
       "name": "upsert_dns_cname"
@@ -3545,7 +3454,6 @@
           "hostname",
           "target"
         ],
-        "title": "VerifyDnsRouteArgs",
         "type": "object"
       },
       "name": "verify_dns_route"
@@ -3575,7 +3483,6 @@
         "required": [
           "url"
         ],
-        "title": "VerifyHttpGateArgs",
         "type": "object"
       },
       "name": "verify_http_gate"
@@ -3663,7 +3570,6 @@
         "required": [
           "rule_id"
         ],
-        "title": "WafRuleActivityArgs",
         "type": "object"
       },
       "name": "waf_rule_activity"
@@ -3854,7 +3760,6 @@
         "required": [
           "confirmation_token"
         ],
-        "title": "WafRulesetApplyArgs",
         "type": "object"
       },
       "name": "waf_ruleset_apply_change"
@@ -4023,7 +3928,6 @@
             ]
           }
         },
-        "title": "WafRulesetChangeArgs",
         "type": "object"
       },
       "name": "waf_ruleset_plan_change"
@@ -4079,7 +3983,6 @@
             ]
           }
         },
-        "title": "WafRulesetSummaryArgs",
         "type": "object"
       },
       "name": "waf_ruleset_summary"
@@ -4198,7 +4101,6 @@
             ]
           }
         },
-        "title": "WafSecurityEventsSummaryArgs",
         "type": "object"
       },
       "name": "waf_security_events_summary"
@@ -4229,7 +4131,6 @@
         "required": [
           "script_name"
         ],
-        "title": "GetWorkerSettingsArgs",
         "type": "object"
       },
       "name": "workers_get_script_settings"
@@ -4247,7 +4148,6 @@
             ]
           }
         },
-        "title": "QueuesListArgs",
         "type": "object"
       },
       "name": "workers_list_scripts"
@@ -4271,7 +4171,6 @@
         "required": [
           "script_name"
         ],
-        "title": "WorkersListTailsArgs",
         "type": "object"
       },
       "name": "workers_list_tails"
@@ -4363,7 +4262,6 @@
             ]
           }
         },
-        "title": "WorkersObservabilityListKeysArgs",
         "type": "object"
       },
       "name": "workers_observability_list_keys"
@@ -4465,7 +4363,6 @@
         "required": [
           "key"
         ],
-        "title": "WorkersObservabilityListValuesArgs",
         "type": "object"
       },
       "name": "workers_observability_list_values"
@@ -4575,7 +4472,6 @@
             ]
           }
         },
-        "title": "WorkersObservabilityQueryEventsArgs",
         "type": "object"
       },
       "name": "workers_observability_query_events"
@@ -4662,7 +4558,6 @@
         "required": [
           "script_name"
         ],
-        "title": "WorkersUploadScriptArgs",
         "type": "object"
       },
       "name": "workers_upload_script"
