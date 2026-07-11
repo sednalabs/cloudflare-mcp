@@ -249,7 +249,7 @@ impl CloudflareOAuthManager {
         pending.insert(
             correlation_key,
             PendingTransaction {
-                principal_key,
+                principal_key: principal_key.clone(),
                 authorization,
                 _permit: permit,
             },
@@ -424,6 +424,9 @@ fn loopback_options(
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
+    use std::sync::Arc;
+
     use super::{CloudflareOAuthError, CloudflareOAuthManager, loopback_options, principal_key};
 
     #[test]
@@ -436,7 +439,7 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_manager_reports_no_grant_and_refuses_login() {
-        let manager = CloudflareOAuthManager::disabled();
+        let manager = Arc::new(CloudflareOAuthManager::disabled());
         let status = manager.status(Some("operator")).await;
         assert!(!status.enabled);
         assert!(!status.token_cache_present);
@@ -454,7 +457,10 @@ mod tests {
         )
         .expect("parse callback")
         .expect("loopback options");
-        assert_eq!(options.bind_addr, "127.0.0.1".parse().expect("ip"));
+        assert_eq!(
+            options.bind_addr,
+            "127.0.0.1".parse::<IpAddr>().expect("ip")
+        );
         assert_eq!(options.port, Some(9502));
         assert_eq!(options.callback_path, "/oauth/cloudflare/callback");
     }
