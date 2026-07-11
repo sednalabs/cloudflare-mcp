@@ -120,6 +120,44 @@ Print the registered tool inventory without starting the server loop:
 CLOUDFLARE_MCP_AUTH_MODE=off cargo run -- --print-tools
 ```
 
+### Cloudflare browser authorization
+
+Hosted deployments can replace a long-lived configured Cloudflare API token
+with Cloudflare's authorization-code flow. Register a Cloudflare OAuth client
+with both `authorization_code` and `refresh_token` grants, the exact callback
+URL `https://<host>/oauth/cloudflare/callback`, and only the dot-delimited API
+scopes the server needs. A private client is appropriate when only members of
+the owning Cloudflare account will authorize it; making the client public is
+not required for a private operator service.
+
+```bash
+CLOUDFLARE_MCP_UPSTREAM_OAUTH_ENABLED=1
+CLOUDFLARE_MCP_UPSTREAM_OAUTH_CLIENT_ID=<client_id>
+CLOUDFLARE_MCP_UPSTREAM_OAUTH_CLIENT_SECRET_FILE=/run/secrets/cloudflare-oauth-client-secret
+CLOUDFLARE_MCP_UPSTREAM_OAUTH_CALLBACK_URL=https://<host>/oauth/cloudflare/callback
+CLOUDFLARE_MCP_UPSTREAM_OAUTH_SCOPES=<scope.one>,<scope.two>
+CLOUDFLARE_MCP_UPSTREAM_OAUTH_TOKEN_CACHE=/var/lib/cloudflare-mcp/upstream-oauth.json
+```
+
+The default Cloudflare endpoints are
+`https://dash.cloudflare.com/oauth2/auth` and
+`https://dash.cloudflare.com/oauth2/token`; private clients default to
+`client_secret_basic`. Public PKCE clients can set
+`CLOUDFLARE_MCP_UPSTREAM_OAUTH_TOKEN_AUTH_METHOD=none` and omit the secret.
+
+After the service starts, call `cloudflare_auth_status`, then
+`cloudflare_auth_login`. Open the returned short-lived URL in a browser. The
+registered callback completes the exchange and stores only the refresh grant
+behind the toolkit storage boundary. Call `cloudflare_auth_probe` to verify the
+grant. `cloudflare_auth_logout` requires `confirm=true` and clears local state;
+it does not revoke the provider-side authorization.
+
+Credential selection is deterministic: a configured per-request header wins,
+then a configured static token, then the OAuth grant. The OAuth callback is
+public so Cloudflare can reach it, but remains subject to the server's Host
+allowlist. Never paste callback URLs into chat or logs because they contain a
+short-lived authorization code and state.
+
 See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for client setup,
 configuration profiles, and validation examples.
 
@@ -136,7 +174,8 @@ The server supports:
 
 - Streamable HTTP at `POST|GET|DELETE /mcp`.
 - Local stdio with `--stdio`.
-- Public health endpoints at `GET /health` and `GET /attest`.
+- Public endpoints at `GET /health`, `GET /attest`, and the narrowly scoped
+  `GET /oauth/cloudflare/callback` OAuth return route.
 - MCP resources:
   - `cloudflare-mcp://about`
   - `cloudflare-mcp://help`

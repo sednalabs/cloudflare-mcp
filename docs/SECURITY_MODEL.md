@@ -136,6 +136,25 @@ Do not commit:
 Prefer environment variables or protected files outside the repository. On Unix
 systems, secret files should be regular owner-only files.
 
+## Hosted Upstream OAuth
+
+Inbound MCP authorization and Cloudflare provider authorization are separate
+trust boundaries. The hosted provider flow uses authorization code + PKCE and a
+narrow public callback. The callback remains behind the Host allowlist and
+returns only generic success or failure HTML.
+
+Pending transactions are bounded, expire, are replaced per authenticated
+principal, are indexed by a digest of state, and are removed before code
+exchange. They are process-local; horizontally scaled deployments must keep a
+transaction on one instance or provide encrypted shared coordination.
+
+Refresh grants are persisted through the toolkit's provider-neutral storage
+boundary. The bundled single-host store rejects unsafe file types, symlinked
+paths, and non-owner-only token files on Unix. Deployments that require
+encryption at rest should replace that storage boundary with their platform
+secret service. Access tokens, refresh tokens, client secrets, authorization
+codes, and raw state are excluded from tool status and formatted debug output.
+
 ## Validation Expectations
 
 For behavior changes affecting safety controls, run:

@@ -147,6 +147,27 @@ Expected behavior:
 
 ## Baseline Read-Only Audit
 
+Before the baseline audit, a hosted deployment may enroll its Cloudflare grant
+without copying an API token to the host:
+
+1. Register a private Cloudflare OAuth client for the owning account with
+   `authorization_code` and `refresh_token` grants, the exact HTTPS callback
+   `https://<host>/oauth/cloudflare/callback`, and reviewed dot-delimited scopes.
+2. Put the client secret in an owner-only secret file and configure the
+   `CLOUDFLARE_MCP_UPSTREAM_OAUTH_*` environment values documented in the
+   README. Leave the refresh-token cache outside the source checkout.
+3. Start the service and call `cloudflare_auth_status`. It must report OAuth
+   enabled, a configured client and callback, and no grant on first use.
+4. Call `cloudflare_auth_login`, open its short-lived authorization URL, and
+   complete Cloudflare consent. Do not paste or log the callback URL.
+5. Call `cloudflare_auth_probe`. Continue only when it reports
+   `credential_verified=true`.
+
+If enrollment fails, start a fresh login rather than replaying an old callback.
+To remove local custody, call `cloudflare_auth_logout` first without and then
+with `confirm=true`; revoke the application separately in Cloudflare when full
+revocation is required.
+
 When the task needs broad or current Cloudflare discovery before a guarded
 operator action, add the relevant managed MCP endpoints from
 `packaging/codex/cloudflare-managed-mcp.example.toml` to the agent profile.

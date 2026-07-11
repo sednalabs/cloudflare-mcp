@@ -1364,6 +1364,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upstream_oauth_callback_is_public_but_host_guarded() {
+        let router = test_router().await;
+        let callback = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/oauth/cloudflare/callback?code=test&state=test")
+                    .header("host", "127.0.0.1")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(callback.status(), StatusCode::BAD_REQUEST);
+
+        let rejected_host = router
+            .oneshot(
+                Request::builder()
+                    .uri("/oauth/cloudflare/callback?code=test&state=test")
+                    .header("host", "attacker.example")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(rejected_host.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn host_guard_rejects_disallowed_host_header() {
         let router = test_router().await;
         let response = router

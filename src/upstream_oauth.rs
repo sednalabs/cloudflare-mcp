@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use mcp_toolkit_auth::upstream_oauth::{
     OAuthAuthorizationOptions, OAuthClientConfig, OAuthRefreshConfig, PendingOAuthAuthorization,
-    RefreshTokenFileStore, RefreshTokenProvider, RefreshTokenStore, SecretString,
-    StoredRefreshToken, UpstreamOAuthError, oauth_callback_correlation_key, prepare_authorization,
+    RefreshTokenFileStore, RefreshTokenProvider, SecretString, StoredRefreshToken,
+    UpstreamOAuthError, oauth_callback_correlation_key, prepare_authorization,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -271,7 +271,7 @@ fn principal_key(principal: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::principal_key;
+    use super::{CloudflareOAuthError, CloudflareOAuthManager, principal_key};
 
     #[test]
     fn principal_keys_are_stable_and_do_not_expose_principal() {
@@ -279,5 +279,17 @@ mod tests {
         assert_eq!(key.len(), 64);
         assert_eq!(key, principal_key("operator@example.test"));
         assert!(!key.contains("operator"));
+    }
+
+    #[tokio::test]
+    async fn disabled_manager_reports_no_grant_and_refuses_login() {
+        let manager = CloudflareOAuthManager::disabled();
+        let status = manager.status().await;
+        assert!(!status.enabled);
+        assert!(!status.token_cache_present);
+        assert!(matches!(
+            manager.start_login("operator", false).await,
+            Err(CloudflareOAuthError::NotConfigured)
+        ));
     }
 }

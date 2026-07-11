@@ -1452,7 +1452,7 @@ impl CloudflareMcp {
         Extension(parts): Extension<Parts>,
         Parameters(args): Parameters<CloudflareAuthLoginArgs>,
     ) -> Result<CallToolResult, crate::McpError> {
-        let principal = mcp_toolkit_auth::context::auth_context_from_parts(&parts)
+        let principal = mcp_toolkit_auth::auth_context_from_parts(&parts)
             .map(|context| context.actor)
             .filter(|actor| !actor.trim().is_empty())
             .unwrap_or_else(|| "local-stdio-operator".to_string());

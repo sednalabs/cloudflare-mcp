@@ -1336,6 +1336,67 @@ mod tests {
     }
 
     #[test]
+    fn parses_upstream_oauth_without_exposing_client_secret() {
+        let client_secret = fixture_material("oauth-client-secret");
+        let cfg = with_env(
+            &[
+                ("CLOUDFLARE_MCP_AUTH_MODE", Some("off")),
+                ("CLOUDFLARE_MCP_UPSTREAM_OAUTH_ENABLED", Some("1")),
+                (
+                    "CLOUDFLARE_MCP_UPSTREAM_OAUTH_CLIENT_ID",
+                    Some("oauth-client-id"),
+                ),
+                (
+                    "CLOUDFLARE_MCP_UPSTREAM_OAUTH_CLIENT_SECRET",
+                    Some(client_secret.as_str()),
+                ),
+                (
+                    "CLOUDFLARE_MCP_UPSTREAM_OAUTH_CALLBACK_URL",
+                    Some("https://mcp.example.com/oauth/cloudflare/callback"),
+                ),
+                (
+                    "CLOUDFLARE_MCP_UPSTREAM_OAUTH_SCOPES",
+                    Some("account.read,workers-platform.read"),
+                ),
+            ],
+            || load_config().expect("load upstream OAuth config"),
+        );
+
+        assert!(cfg.cloudflare_oauth.enabled);
+        assert_eq!(
+            cfg.cloudflare_oauth.scopes,
+            vec!["account.read", "workers-platform.read"]
+        );
+        let debug = format!("{:?}", cfg.cloudflare_oauth);
+        assert!(debug.contains("client_secret_present: true"));
+        assert!(!debug.contains(client_secret.as_str()));
+    }
+
+    #[test]
+    fn upstream_oauth_rejects_inbound_mcp_scope_syntax() {
+        let err = with_env(
+            &[
+                ("CLOUDFLARE_MCP_AUTH_MODE", Some("off")),
+                ("CLOUDFLARE_MCP_UPSTREAM_OAUTH_ENABLED", Some("1")),
+                (
+                    "CLOUDFLARE_MCP_UPSTREAM_OAUTH_CLIENT_ID",
+                    Some("oauth-client-id"),
+                ),
+                (
+                    "CLOUDFLARE_MCP_UPSTREAM_OAUTH_CALLBACK_URL",
+                    Some("https://mcp.example.com/oauth/cloudflare/callback"),
+                ),
+                (
+                    "CLOUDFLARE_MCP_UPSTREAM_OAUTH_SCOPES",
+                    Some("cloudflare:read"),
+                ),
+            ],
+            || load_config().expect_err("colon-delimited provider scope must fail"),
+        );
+        assert!(err.contains("dot-delimited"));
+    }
+
+    #[test]
     fn parses_portal_agent_configuration_without_exposing_secret_debug() {
         let agent_material = fixture_material("portal-agent");
         let access_material = fixture_material("access-material");
