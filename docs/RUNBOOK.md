@@ -349,6 +349,27 @@ Inspect before reading or writing:
 tools/call name=r2_inspect_object arguments='{"bucket_name":"<bucket>","object_key":"<key>"}'
 ```
 
+The R2 helpers use S3-compatible credentials, not the general Cloudflare API
+token. A `403 Forbidden` on an existing object usually means the configured R2
+token does not include that bucket. Treat the configured R2 access-key id as
+the account-owned token id and inspect it without exposing the secret:
+
+```text
+tools/call name=account_api_tokens arguments='{
+  "action":"get",
+  "token_id":"<configured-r2-access-key-id>"
+}'
+```
+
+If the bucket is absent from `policies[].resources`, preserve every existing
+resource and the `Workers R2 Storage Bucket Item Read` permission, add only the
+missing bucket resource, then use `account_api_tokens action=update` with the
+normal dry-run and confirmation-token flow. Updating that policy retains the
+existing S3 key material, so no secret rotation or MCP restart is required.
+Re-run both `r2_inspect_object` and a bounded `r2_get_object` byte-range after
+the change. Do not broaden the token to write access merely to solve a read
+failure.
+
 For large or binary objects, use file response mode:
 
 ```text
