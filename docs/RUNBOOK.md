@@ -350,8 +350,12 @@ tools/call name=r2_inspect_object arguments='{"bucket_name":"<bucket>","object_k
 ```
 
 The R2 helpers use S3-compatible credentials, not the general Cloudflare API
-token. A `403 Forbidden` on an existing object usually means the configured R2
-token does not include that bucket. Treat the configured R2 access-key id as
+token. R2 access is capability-specific: `r2_inspect_object` and
+`r2_get_object` require `Workers R2 Storage Bucket Item Read`, while
+`r2_put_object` requires `Workers R2 Storage Bucket Item Write`. A credential
+that passes readback is not necessarily a deployment credential. A `403
+Forbidden` usually means the configured R2 token lacks the target bucket or the
+permission required by that HTTP verb. Treat the configured R2 access-key id as
 the account-owned token id and inspect it without exposing the secret:
 
 ```text
@@ -361,14 +365,23 @@ tools/call name=account_api_tokens arguments='{
 }'
 ```
 
-If the bucket is absent from `policies[].resources`, preserve every existing
-resource and the `Workers R2 Storage Bucket Item Read` permission, add only the
-missing bucket resource, then use `account_api_tokens action=update` with the
-normal dry-run and confirmation-token flow. Updating that policy retains the
-existing S3 key material, so no secret rotation or MCP restart is required.
-Re-run both `r2_inspect_object` and a bounded `r2_get_object` byte-range after
-the change. Do not broaden the token to write access merely to solve a read
-failure.
+Preserve every existing resource and permission, then add only the missing
+bucket and operation-specific permission through `account_api_tokens
+action=update` with the normal dry-run and confirmation-token flow. Grant write
+only to buckets that the workflow must mutate; do not broaden read-only buckets
+merely because the same credential serves both workflows. Updating the policy
+retains existing S3 key material, so no MCP restart is required unless key
+material or environment/file references also change.
+
+Before relying on a credential:
+
+1. Record whether the workflow needs read, write, or both for each bucket.
+2. Inspect the access-key token policy and confirm the exact bucket resources
+   and operation-specific permissions.
+3. For read, prove `r2_inspect_object` and a bounded `r2_get_object`.
+4. For write, run `r2_put_object` dry-run, apply an immutable probe object, then
+   prove it with `r2_inspect_object` and hash metadata or a downloaded hash.
+5. Re-check one unrelated read-only bucket when a shared credential changed.
 
 For large or binary objects, use file response mode:
 
@@ -392,6 +405,10 @@ tools/call name=r2_put_object arguments='{
   "dry_run":true
 }'
 ```
+
+The dry-run proves request planning only; it cannot prove that the configured
+S3 credential has bucket-item write permission. Complete the immutable PUT and
+HEAD proof before starting a deployment batch.
 
 ## External Service Bridge Workflow
 
