@@ -1595,10 +1595,13 @@ impl CloudflareClient {
         };
 
         envelope.result.ok_or_else(|| {
-            AdapterError::new(
-                "cloudflare.empty_result",
-                "Cloudflare returned success without uploaded Worker script details",
-                "Verify Worker script upload endpoint and response schema.",
+            classify_worker_upload_error(
+                AdapterError::new(
+                    "cloudflare.empty_result",
+                    "Cloudflare returned success without uploaded Worker script details",
+                    "Verify Worker script upload endpoint and response schema.",
+                ),
+                create_only,
             )
         })
     }
@@ -1644,10 +1647,13 @@ impl CloudflareClient {
         };
 
         envelope.result.ok_or_else(|| {
-            AdapterError::new(
-                "cloudflare.empty_result",
-                "Cloudflare returned success without uploaded Worker script details",
-                "Verify Worker script upload endpoint and response schema.",
+            classify_worker_upload_error(
+                AdapterError::new(
+                    "cloudflare.empty_result",
+                    "Cloudflare returned success without uploaded Worker script details",
+                    "Verify Worker script upload endpoint and response schema.",
+                ),
+                create_only,
             )
         })
     }
@@ -2814,6 +2820,7 @@ fn classify_worker_upload_error(err: AdapterError, create_only: bool) -> Adapter
                 | "cloudflare.transport_error"
                 | "cloudflare.response_read_failed"
                 | "cloudflare.decode_error"
+                | "cloudflare.empty_result"
         ) || err
             .status
             .is_some_and(|status| (500..=599).contains(&status)))
@@ -3229,6 +3236,20 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
+    #[test]
+    fn worker_create_only_classifier_preserves_legacy_empty_result() {
+        let err = AdapterError::new(
+            "cloudflare.empty_result",
+            "Cloudflare returned success without uploaded Worker script details",
+            "Verify Worker script upload endpoint and response schema.",
+        );
+        let classified = super::classify_worker_upload_error(err, false);
+
+        assert_eq!(classified.code, "cloudflare.empty_result");
+        assert!(!classified.retryable);
+        assert_eq!(classified.status, None);
+    }
+
     #[tokio::test]
     async fn worker_create_only_module_response_loss_is_uncertain_without_retry() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -3284,6 +3305,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_create_only_module_empty_result_is_uncertain_without_retry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = Router::new().route(
+            "/accounts/acct-1/workers/scripts/worker-a",
+            put({
+                let calls = calls.clone();
+                move |headers: HeaderMap, _body: Bytes| {
+                    let calls = calls.clone();
+                    async move {
+                        assert_eq!(
+                            headers
+                                .get(reqwest::header::IF_NONE_MATCH)
+                                .and_then(|value| value.to_str().ok()),
+                            Some("*")
+                        );
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "success": true,
+                                "errors": [],
+                                "messages": [],
+                                "result": null,
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+
+        let base = spawn_router(router).await;
+        let client = CloudflareClient::new(test_config(base)).expect("client");
+        let err = client
+            .upload_worker_module(
+                "acct-1",
+                "worker-a",
+                &json!({"main_module": "worker.js"}),
+                "worker.js",
+                "worker.js",
+                "application/javascript+module",
+                b"export default {}".to_vec(),
+                true,
+            )
+            .await
+            .expect_err("empty result must be uncertain");
+
+        assert_eq!(err.code, "workers.upload_create_only_outcome_uncertain");
+        assert!(!err.retryable);
+        assert!(err.hint.contains("reconcile"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn worker_create_only_multipart_response_loss_is_uncertain_without_retry() {
         let calls = Arc::new(AtomicUsize::new(0));
         let router = Router::new().route(
@@ -3331,6 +3405,56 @@ mod tests {
         assert_eq!(err.code, "workers.upload_create_only_outcome_uncertain");
         assert!(!err.retryable);
         assert!(err.hint.contains("reconcile"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn worker_create_only_multipart_empty_result_is_uncertain_without_retry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = Router::new().route(
+            "/accounts/acct-1/workers/scripts/worker-a",
+            put({
+                let calls = calls.clone();
+                move |headers: HeaderMap, _body: Bytes| {
+                    let calls = calls.clone();
+                    async move {
+                        assert_eq!(
+                            headers
+                                .get(reqwest::header::IF_NONE_MATCH)
+                                .and_then(|value| value.to_str().ok()),
+                            Some("*")
+                        );
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "success": true,
+                                "errors": [],
+                                "messages": [],
+                                "result": null,
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+
+        let base = spawn_router(router).await;
+        let client = CloudflareClient::new(test_config(base)).expect("client");
+        let err = client
+            .upload_worker_multipart(
+                "acct-1",
+                "worker-a",
+                "multipart/form-data; boundary=fixture",
+                b"--fixture\r\n--fixture--\r\n".to_vec(),
+                true,
+            )
+            .await
+            .expect_err("empty result must be uncertain");
+
+        assert_eq!(err.code, "workers.upload_create_only_outcome_uncertain");
+        assert!(!err.retryable);
+        assert!(err.hint.contains("read back"));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 

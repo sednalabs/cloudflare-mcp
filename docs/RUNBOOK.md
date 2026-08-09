@@ -281,10 +281,11 @@ For a first-install-only deployment, add `"create_only":true` to both the
 dry-run and apply calls. The confirmation token binds this flag, and apply sends
 Cloudflare's atomic `If-None-Match: *` precondition. A pre-existing script must
 end with `workers.upload_create_only_conflict`; do not retry or fall back to an
-unconditional upload. Timeout, transport, response-read/decoding, and retryable
-5xx outcomes end with `workers.upload_create_only_outcome_uncertain` and
-`retryable:false`; read back the Worker and reconcile provider evidence before
-deciding whether to continue or claim creation.
+unconditional upload. Timeout, transport, response-read/decoding, retryable 5xx,
+and success envelopes with a missing or null result end with
+`workers.upload_create_only_outcome_uncertain` and `retryable:false`; read back
+the Worker and reconcile provider evidence before deciding whether to continue
+or claim creation.
 
 For projects that already use Wrangler to build a multipart Worker bundle, pass
 `multipart_path` instead of `script_path`/`script_content`/`main_module`.

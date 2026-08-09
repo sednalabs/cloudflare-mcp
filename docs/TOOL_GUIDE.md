@@ -144,7 +144,8 @@ uses Cloudflare's atomic `If-None-Match: *` precondition, and a pre-existing
 script returns `workers.upload_create_only_conflict` without retrying or
 overwriting it. The create-only flag is included in the dry-run confirmation
 authority; omit it (the default) for the existing update behavior. Transport,
-timeout, response-read/decoding, and retryable 5xx failures return
+timeout, response-read/decoding, retryable 5xx, and success-without-result
+responses return
 `workers.upload_create_only_outcome_uncertain` with `retryable:false`; read back
 the Worker and reconcile provider evidence before retrying or claiming
 creation. These guards apply only when `create_only:true`.
