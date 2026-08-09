@@ -2806,6 +2806,30 @@ fn classify_worker_upload_error(err: AdapterError, create_only: bool) -> Adapter
         )
         .with_status(Some(StatusCode::PRECONDITION_FAILED.as_u16()));
     }
+
+    if create_only
+        && (matches!(
+            err.code,
+            "cloudflare.timeout"
+                | "cloudflare.transport_error"
+                | "cloudflare.response_read_failed"
+                | "cloudflare.decode_error"
+        ) || err
+            .status
+            .is_some_and(|status| (500..=599).contains(&status)))
+    {
+        return AdapterError::new(
+            "workers.upload_create_only_outcome_uncertain",
+            format!(
+                "Worker create-only upload outcome is uncertain after request dispatch: {}",
+                err.message
+            ),
+            "Do not retry or claim creation; read back the Worker script and reconcile provider evidence before deciding whether to continue.",
+        )
+        .with_retryable(false)
+        .with_status(err.status);
+    }
+
     err
 }
 
@@ -2938,9 +2962,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use axum::body::Bytes;
+    use axum::body::{Body, Bytes};
     use axum::extract::{Path, State};
     use axum::http::{HeaderMap, StatusCode};
+    use axum::response::Response;
     use axum::routing::{get, post, put};
     use axum::{Json, Router};
     use serde_json::{Value, json};
@@ -3201,6 +3226,234 @@ mod tests {
             )
             .await
             .expect("legacy update upload");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn worker_create_only_module_response_loss_is_uncertain_without_retry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = Router::new().route(
+            "/accounts/acct-1/workers/scripts/worker-a",
+            put({
+                let calls = calls.clone();
+                move |headers: HeaderMap, _body: Bytes| {
+                    let calls = calls.clone();
+                    async move {
+                        assert_eq!(
+                            headers
+                                .get(reqwest::header::IF_NONE_MATCH)
+                                .and_then(|value| value.to_str().ok()),
+                            Some("*")
+                        );
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let body = Body::from_stream(futures::stream::once(async {
+                            Err::<Bytes, std::io::Error>(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                "response connection reset after upload acceptance",
+                            ))
+                        }));
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(body)
+                            .expect("response")
+                    }
+                }
+            }),
+        );
+
+        let base = spawn_router(router).await;
+        let client = CloudflareClient::new(test_config(base)).expect("client");
+        let err = client
+            .upload_worker_module(
+                "acct-1",
+                "worker-a",
+                &json!({"main_module": "worker.js"}),
+                "worker.js",
+                "worker.js",
+                "application/javascript+module",
+                b"export default {}".to_vec(),
+                true,
+            )
+            .await
+            .expect_err("response loss must be uncertain");
+
+        assert_eq!(err.code, "workers.upload_create_only_outcome_uncertain");
+        assert!(!err.retryable);
+        assert!(err.hint.contains("read back"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn worker_create_only_multipart_response_loss_is_uncertain_without_retry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = Router::new().route(
+            "/accounts/acct-1/workers/scripts/worker-a",
+            put({
+                let calls = calls.clone();
+                move |headers: HeaderMap, _body: Bytes| {
+                    let calls = calls.clone();
+                    async move {
+                        assert_eq!(
+                            headers
+                                .get(reqwest::header::IF_NONE_MATCH)
+                                .and_then(|value| value.to_str().ok()),
+                            Some("*")
+                        );
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let body = Body::from_stream(futures::stream::once(async {
+                            Err::<Bytes, std::io::Error>(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                "response connection reset after upload acceptance",
+                            ))
+                        }));
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(body)
+                            .expect("response")
+                    }
+                }
+            }),
+        );
+
+        let base = spawn_router(router).await;
+        let client = CloudflareClient::new(test_config(base)).expect("client");
+        let err = client
+            .upload_worker_multipart(
+                "acct-1",
+                "worker-a",
+                "multipart/form-data; boundary=fixture",
+                b"--fixture\r\n--fixture--\r\n".to_vec(),
+                true,
+            )
+            .await
+            .expect_err("response loss must be uncertain");
+
+        assert_eq!(err.code, "workers.upload_create_only_outcome_uncertain");
+        assert!(!err.retryable);
+        assert!(err.hint.contains("reconcile"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn worker_create_only_multipart_conflict_uses_atomic_precondition_without_retry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = Router::new().route(
+            "/accounts/acct-1/workers/scripts/worker-a",
+            put({
+                let calls = calls.clone();
+                move |headers: HeaderMap, _body: Bytes| {
+                    let calls = calls.clone();
+                    async move {
+                        assert_eq!(
+                            headers
+                                .get(reqwest::header::IF_NONE_MATCH)
+                                .and_then(|value| value.to_str().ok()),
+                            Some("*")
+                        );
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::PRECONDITION_FAILED,
+                            Json(json!({
+                                "success": false,
+                                "errors": [{"code": 1001, "message": "script already exists"}],
+                                "messages": [],
+                                "result": null,
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+
+        let base = spawn_router(router).await;
+        let client = CloudflareClient::new(test_config(base)).expect("client");
+        let err = client
+            .upload_worker_multipart(
+                "acct-1",
+                "worker-a",
+                "multipart/form-data; boundary=fixture",
+                b"--fixture\r\n--fixture--\r\n".to_vec(),
+                true,
+            )
+            .await
+            .expect_err("existing Worker must conflict");
+
+        assert_eq!(err.code, "workers.upload_create_only_conflict");
+        assert_eq!(err.status, Some(412));
+        assert!(!err.retryable);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn worker_create_only_server_error_is_uncertain_without_retry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = Router::new().route(
+            "/accounts/acct-1/workers/scripts/worker-a",
+            put({
+                let calls = calls.clone();
+                move |headers: HeaderMap, _body: Bytes| {
+                    let calls = calls.clone();
+                    async move {
+                        let attempt = calls.fetch_add(1, Ordering::SeqCst);
+                        if attempt == 0 {
+                            assert_eq!(
+                                headers
+                                    .get(reqwest::header::IF_NONE_MATCH)
+                                    .and_then(|value| value.to_str().ok()),
+                                Some("*")
+                            );
+                        } else {
+                            assert!(headers.get(reqwest::header::IF_NONE_MATCH).is_none());
+                        }
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({
+                                "success": false,
+                                "errors": [{"code": 1000, "message": "temporary outage"}],
+                                "messages": [],
+                                "result": null,
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+
+        let base = spawn_router(router).await;
+        let client = CloudflareClient::new(test_config(base)).expect("client");
+        let err = client
+            .upload_worker_module(
+                "acct-1",
+                "worker-a",
+                &json!({"main_module": "worker.js"}),
+                "worker.js",
+                "worker.js",
+                "application/javascript+module",
+                b"export default {}".to_vec(),
+                true,
+            )
+            .await
+            .expect_err("server error must be uncertain");
+
+        assert_eq!(err.code, "workers.upload_create_only_outcome_uncertain");
+        assert_eq!(err.status, Some(503));
+        assert!(!err.retryable);
+
+        let legacy_err = client
+            .upload_worker_module(
+                "acct-1",
+                "worker-a",
+                &json!({"main_module": "worker.js"}),
+                "worker.js",
+                "worker.js",
+                "application/javascript+module",
+                b"export default {}".to_vec(),
+                false,
+            )
+            .await
+            .expect_err("legacy update must retain generic server error");
+        assert_eq!(legacy_err.code, "cloudflare.http_server_error");
+        assert!(legacy_err.retryable);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
