@@ -1041,6 +1041,109 @@ fn spawn_fake_worker_upload_api_with_readback(
     (format!("http://{addr}"), requests)
 }
 
+fn spawn_fake_worker_upload_version_attestation_api() -> (String, Arc<Mutex<Vec<Value>>>) {
+    spawn_fake_worker_upload_version_attestation_api_with_identity(false)
+}
+
+fn spawn_fake_worker_upload_version_attestation_cross_target_api(
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    spawn_fake_worker_upload_version_attestation_api_with_identity(true)
+}
+
+fn spawn_fake_worker_upload_version_attestation_api_with_identity(
+    cross_target: bool,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake Worker attestation API");
+    let addr = listener.local_addr().expect("fake Worker attestation API addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().take(7) {
+            let mut stream = stream.expect("fake Worker attestation API stream");
+            let (headers, body) = read_http_request(&mut stream);
+            let request_line = headers.lines().next().unwrap_or_default().to_string();
+            let mut request_parts = request_line.split_whitespace();
+            let method = request_parts.next().unwrap_or_default().to_string();
+            let path = request_parts
+                .next()
+                .unwrap_or_default()
+                .split('?')
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let body_text = String::from_utf8_lossy(&body).to_string();
+            requests_for_thread
+                .lock()
+                .expect("request log lock")
+                .push(json!({"method": method, "path": path, "body_text": body_text}));
+
+            let response = match (method.as_str(), path.as_str()) {
+                ("PUT", "/accounts/acct-1/workers/scripts/worker-a") => json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": {
+                        "id": if cross_target { "worker-other" } else { "worker-a" },
+                        "script_name": "worker-a",
+                        "etag": "etag-1"
+                    },
+                }),
+                ("GET", "/accounts/acct-1/workers/scripts/worker-a/settings") => json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": {"main_module": null, "bindings": []},
+                }),
+                ("GET", "/accounts/acct-1/workers/scripts") => json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": [{"id": "worker-a", "etag": "etag-1"}],
+                }),
+                ("GET", "/accounts/acct-1/workers/scripts/worker-a/versions") => json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": {"items": [{"id": "version-1"}]},
+                    "result_info": {"page": 1, "per_page": 100, "count": 1, "total_count": 1},
+                }),
+                (
+                    "GET",
+                    "/accounts/acct-1/workers/scripts/worker-a/versions/version-1",
+                ) => json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": {
+                        "id": "version-1",
+                        "author_email": "redacted-author",
+                        "resources": {"script": {
+                            "etag": "etag-1",
+                            "handlers": ["fetch"],
+                            "named_handlers": []
+                        }}
+                    },
+                }),
+                _ => json!({
+                    "success": false,
+                    "errors": [{"code": 7000, "message": format!("unexpected request: {method} {path}")}],
+                    "messages": [],
+                    "result": null,
+                }),
+            };
+            let response = serde_json::to_vec(&response).expect("serialize response");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                response.len()
+            )
+            .expect("write response headers");
+            stream.write_all(&response).expect("write response body");
+        }
+    });
+    (format!("http://{addr}"), requests)
+}
+
 fn spawn_fake_access_policy_api() -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake Access policy API");
     let addr = listener.local_addr().expect("fake API addr");
@@ -2577,6 +2680,132 @@ fn workers_upload_script_create_only_binds_token_and_sends_atomic_precondition()
     let requests = requests.lock().expect("request log lock");
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0]["if_none_match"], json!("*"));
+}
+
+#[test]
+fn workers_upload_script_create_only_version_attestation_is_sanitized_through_stdio() {
+    let (base_url, requests) = spawn_fake_worker_upload_version_attestation_api();
+    let mut mcp = McpStdioProcess::start_with_env(vec![(
+        "CLOUDFLARE_MCP_API_BASE_URL",
+        base_url,
+    )]);
+    let dry_run = mcp.call_tool(
+        2,
+        "workers_upload_script",
+        json!({
+            "script_name": "worker-a",
+            "main_module": "worker.js",
+            "script_content": "export default { fetch() { return new Response('ok'); } };",
+            "metadata": {"compatibility_date": "2026-06-03"},
+            "create_only": true,
+            "dry_run": true,
+            "reason": "stdio version attestation regression"
+        }),
+    );
+    let dry_content = structured_content(&dry_run);
+    assert_eq!(dry_content["ok"], json!(true), "{dry_content}");
+    let token = dry_content["required_confirmation_token"]
+        .as_str()
+        .expect("confirmation token")
+        .to_string();
+
+    let response = mcp.call_tool(
+        3,
+        "workers_upload_script",
+        json!({
+            "script_name": "worker-a",
+            "main_module": "worker.js",
+            "script_content": "export default { fetch() { return new Response('ok'); } };",
+            "metadata": {"compatibility_date": "2026-06-03"},
+            "create_only": true,
+            "dry_run": false,
+            "confirmation_token": token,
+            "reason": "stdio version attestation regression"
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(true), "{content}");
+    assert_eq!(content["readback_settings"]["main_module"], Value::Null);
+    assert_eq!(
+        content["readback_verification"]["code"],
+        json!("workers.upload_version_readback_matched")
+    );
+    assert!(content.get("version_evidence").is_none());
+    let serialized = content.to_string();
+    assert!(!serialized.contains("version-1"));
+    assert!(!serialized.contains("redacted-author"));
+
+    let requests = requests.lock().expect("request log lock");
+    assert_eq!(requests.len(), 7);
+    assert_eq!(requests[0]["method"], json!("PUT"));
+    assert_eq!(requests[1]["path"], json!(
+        "/accounts/acct-1/workers/scripts/worker-a/settings"
+    ));
+    assert_eq!(requests[2]["path"], json!("/accounts/acct-1/workers/scripts"));
+    assert_eq!(requests[3]["path"], json!(
+        "/accounts/acct-1/workers/scripts/worker-a/versions"
+    ));
+    assert_eq!(requests[4]["path"], json!(
+        "/accounts/acct-1/workers/scripts/worker-a/versions/version-1"
+    ));
+    assert_eq!(requests[5]["path"], json!("/accounts/acct-1/workers/scripts"));
+    assert_eq!(requests[6]["path"], json!(
+        "/accounts/acct-1/workers/scripts/worker-a/versions"
+    ));
+}
+
+#[test]
+fn workers_upload_script_create_only_rejects_cross_target_identity_through_stdio() {
+    let (base_url, requests) = spawn_fake_worker_upload_version_attestation_cross_target_api();
+    let mut mcp = McpStdioProcess::start_with_env(vec![(
+        "CLOUDFLARE_MCP_API_BASE_URL",
+        base_url,
+    )]);
+    let dry_run = mcp.call_tool(
+        2,
+        "workers_upload_script",
+        json!({
+            "script_name": "worker-a",
+            "main_module": "worker.js",
+            "script_content": "export default { fetch() { return new Response('ok'); } };",
+            "metadata": {"compatibility_date": "2026-06-03"},
+            "create_only": true,
+            "dry_run": true,
+            "reason": "stdio cross-target regression"
+        }),
+    );
+    let token = structured_content(&dry_run)["required_confirmation_token"]
+        .as_str()
+        .expect("confirmation token")
+        .to_string();
+    let response = mcp.call_tool(
+        3,
+        "workers_upload_script",
+        json!({
+            "script_name": "worker-a",
+            "main_module": "worker.js",
+            "script_content": "export default { fetch() { return new Response('ok'); } };",
+            "metadata": {"compatibility_date": "2026-06-03"},
+            "create_only": true,
+            "dry_run": false,
+            "confirmation_token": token,
+            "reason": "stdio cross-target regression"
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(
+        content["error"]["code"],
+        json!("workers.upload_version_readback_mismatch")
+    );
+    assert_eq!(
+        content["readback_verification"]["code"],
+        json!("workers.upload_script_identity_invalid")
+    );
+    let serialized = content.to_string();
+    assert!(!serialized.contains("version-1"));
+    assert!(!serialized.contains("redacted-author"));
+    assert_eq!(requests.lock().expect("request log lock").len(), 7);
 }
 
 #[test]

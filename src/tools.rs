@@ -36,6 +36,7 @@ use crate::cloudflare::{
     AccessAppUpsertRequest, AccessPolicyWrite, BulkRedirectItemWrite, CacheRule, CacheRuleset,
     DnsRecordUpsertRequest, PagesDeploymentTriggerRequest, with_request_api_token_override,
 };
+use crate::cloudflare::model::WorkerScript;
 use crate::dns_route::{
     DnsRouteConflict, DnsRouteVerificationState, plan_dns_route_reconciliation, verify_dns_route,
 };
@@ -6397,8 +6398,75 @@ impl CloudflareMcp {
                     .await
                 {
                     Ok(readback_settings) => {
-                        let readback_verification =
+                        let mut readback_verification =
                             verify_worker_upload_readback(&upload_summary, &readback_settings);
+                        let settings_main_module_absent = readback_verification["code"]
+                            == json!("workers.upload_main_module_absent");
+                        if settings_main_module_absent && args.create_only {
+                            match self
+                                .cloudflare
+                                .get_worker_initial_version_evidence(account_id, script_name)
+                                .await
+                            {
+                                Ok(evidence) => {
+                                    let verification = verify_worker_upload_version_readback(
+                                        script_name,
+                                        &upload_summary,
+                                        &script,
+                                        &evidence,
+                                    );
+                                    if verification["matched"] == json!(true) {
+                                        readback_verification = verification;
+                                    } else {
+                                        return Ok(finalize_mutation_result(
+                                            CallToolResult::structured_error(json!({
+                                                "ok": false,
+                                                "operation": "workers_upload_script",
+                                                "error": {
+                                                    "code": "workers.upload_version_readback_mismatch",
+                                                    "message": "Worker create-only upload settings omitted main_module and provider version evidence did not match the uploaded script.",
+                                                    "hint": "Reconcile the exact version detail and etag before retrying or continuing.",
+                                                },
+                                                "account_id": account_id,
+                                                "script_name": script_name,
+                                                "upload": upload_summary,
+                                                "create_only": args.create_only,
+                                                "script": script,
+                                                "readback_settings": readback_settings,
+                                                "readback_verification": verification,
+                                            })),
+                                            &plan,
+                                            audit,
+                                            args.dry_run,
+                                        ));
+                                    }
+                                }
+                                Err(err) => {
+                                    return Ok(finalize_mutation_result(
+                                        CallToolResult::structured_error(json!({
+                                            "ok": false,
+                                            "operation": "workers_upload_script",
+                                            "error": {
+                                                "code": "workers.upload_version_readback_failed",
+                                                "message": "Worker create-only upload settings omitted main_module and provider version evidence could not be read back.",
+                                                "hint": "Reconcile the exact Worker version before retrying or continuing.",
+                                                "readback_error": err.payload(),
+                                            },
+                                            "account_id": account_id,
+                                            "script_name": script_name,
+                                            "upload": upload_summary,
+                                            "create_only": args.create_only,
+                                            "script": script,
+                                            "readback_settings": readback_settings,
+                                            "readback_verification": readback_verification,
+                                        })),
+                                        &plan,
+                                        audit,
+                                        args.dry_run,
+                                    ));
+                                }
+                            }
+                        }
                         let ok = readback_verification
                             .get("matched")
                             .and_then(Value::as_bool)
@@ -10607,6 +10675,223 @@ fn verify_worker_upload_readback(
     }
 }
 
+fn verify_worker_upload_version_readback(
+    expected_script_name: &str,
+    upload_summary: &Value,
+    uploaded: &WorkerScript,
+    evidence: &Value,
+) -> Value {
+    let expected_script_name_valid =
+        !expected_script_name.is_empty() && expected_script_name.trim() == expected_script_name;
+    let mut identity_aliases = Vec::new();
+    let mut uploaded_identity_valid = expected_script_name_valid;
+    for identity in [uploaded.id.as_deref(), uploaded.script_name.as_deref()] {
+        if let Some(identity) = identity {
+            if identity.is_empty() || identity.trim() != identity {
+                uploaded_identity_valid = false;
+            } else {
+                identity_aliases.push(identity);
+            }
+        }
+    }
+    if let Some(identity) = uploaded.extra.get("name") {
+        match identity.as_str() {
+            Some(identity) if !identity.is_empty() && identity.trim() == identity => {
+                identity_aliases.push(identity)
+            }
+            _ => uploaded_identity_valid = false,
+        }
+    }
+    let Some(first_identity) = identity_aliases.first().copied() else {
+        // Keep the verifier response sanitized and deterministic; no provider
+        // identity is emitted when the upload response omitted all aliases.
+        return json!({
+            "matched": false,
+            "code": "workers.upload_script_identity_invalid",
+            "script_identity_valid": false,
+            "message": "create-only upload response did not contain a valid Worker script identity",
+        });
+    };
+    uploaded_identity_valid = uploaded_identity_valid
+        && identity_aliases.iter().all(|identity| {
+            *identity == first_identity && *identity == expected_script_name
+        });
+    if !uploaded_identity_valid {
+        return json!({
+            "matched": false,
+            "code": "workers.upload_script_identity_invalid",
+            "script_identity_valid": false,
+            "message": "create-only upload response did not contain one exact Worker script identity",
+        });
+    }
+    let expected_etag = uploaded
+        .extra
+        .get("etag")
+        .and_then(|value| exact_provider_string(Some(value)));
+    let Some(expected_etag) = expected_etag else {
+        return json!({
+            "matched": false,
+            "code": "workers.upload_version_etag_absent",
+            "message": "create-only upload response did not include an etag to bind version evidence",
+        });
+    };
+    let listing_etag = evidence
+        .pointer("/listing/etag")
+        .and_then(|value| exact_provider_string(Some(value)));
+    let Some(versions) = evidence.get("versions").and_then(Value::as_array) else {
+        return json!({
+            "matched": false,
+            "code": "workers.upload_version_inventory_invalid",
+            "message": "provider version evidence did not include an array inventory",
+        });
+    };
+    if versions.len() != 1 {
+        return json!({
+            "matched": false,
+            "code": "workers.upload_version_inventory_ambiguous",
+            "version_count": versions.len(),
+            "message": "provider version evidence did not contain exactly one initial version",
+        });
+    }
+    let Some(versions_after) = evidence.get("versions_after").and_then(Value::as_array) else {
+        return json!({
+            "matched": false,
+            "code": "workers.upload_version_stable_readback_missing",
+            "message": "provider version evidence did not include the stable reread",
+        });
+    };
+    if versions_after.len() != 1 {
+        return json!({
+            "matched": false,
+            "code": "workers.upload_version_inventory_ambiguous",
+            "version_count_after": versions_after.len(),
+            "message": "stable provider version evidence did not contain exactly one version",
+        });
+    }
+    let version = &versions[0];
+    let version_id = version
+        .get("id")
+        .and_then(|value| exact_provider_string(Some(value)));
+    let detail = evidence.get("detail");
+    let detail_id = detail
+        .and_then(|value| value.get("id"))
+        .and_then(|value| exact_provider_string(Some(value)));
+    let version_id_after = versions_after[0]
+        .get("id")
+        .and_then(|value| exact_provider_string(Some(value)));
+    let listing_after_etag = evidence
+        .pointer("/listing_after/etag")
+        .and_then(|value| exact_provider_string(Some(value)));
+    let script = detail
+        .and_then(|value| value.pointer("/resources/script"));
+    let observed_etag = script
+        .and_then(|value| value.get("etag"))
+        .and_then(|value| exact_provider_string(Some(value)));
+    let handlers = script
+        .and_then(|value| value.get("handlers"))
+        .and_then(Value::as_array);
+    let handlers_valid = handlers
+        .is_some_and(|handlers| {
+            let mut seen = BTreeSet::new();
+            handlers.iter().all(|handler| {
+                handler.as_str().is_some_and(|value| {
+                    let value = value.trim();
+                    !value.is_empty() && seen.insert(value.to_string())
+                })
+            })
+        });
+    let named_handlers = script
+        .and_then(|value| value.get("named_handlers"))
+        .and_then(Value::as_array);
+    let named_handlers_valid = named_handlers
+        .is_some_and(|handlers| {
+            let mut seen_names = BTreeSet::new();
+            handlers.iter().all(|handler| {
+                let name = handler
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty());
+                let Some(name) = name else {
+                    return false;
+                };
+                if !seen_names.insert(name.to_string()) {
+                    return false;
+                }
+                let Some(exports) = handler.get("handlers").and_then(Value::as_array) else {
+                    return false;
+                };
+                let mut seen_exports = BTreeSet::new();
+                !exports.is_empty()
+                    && exports.iter().all(|export| {
+                        export.as_str().is_some_and(|value| {
+                            let value = value.trim();
+                            !value.is_empty() && seen_exports.insert(value.to_string())
+                        })
+                    })
+            })
+        });
+    let entrypoint_present = handlers
+        .is_some_and(|handlers| !handlers.is_empty())
+        || named_handlers.is_some_and(|handlers| !handlers.is_empty());
+    let matched = version_id.is_some()
+        && detail_id == version_id
+        && version_id_after == version_id
+        && listing_etag == Some(expected_etag)
+        && listing_after_etag == Some(expected_etag)
+        && observed_etag == Some(expected_etag)
+        && uploaded_identity_valid
+        && handlers_valid
+        && named_handlers_valid
+        && entrypoint_present
+        && upload_summary
+            .get("main_module")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+    if matched {
+        json!({
+            "matched": true,
+            "code": "workers.upload_version_readback_matched",
+            "version_id_sha256": provider_value_sha256(version_id),
+            "etag_sha256": provider_value_sha256(Some(expected_etag)),
+            "listing_etag_sha256": provider_value_sha256(listing_etag),
+            "listing_after_etag_sha256": provider_value_sha256(listing_after_etag),
+            "script_identity_valid": true,
+            "handlers_present": true,
+            "named_handlers_present": true,
+            "entrypoint_present": true,
+            "settings_main_module_not_authoritative": true,
+        })
+    } else {
+        json!({
+            "matched": false,
+            "code": "workers.upload_version_readback_mismatch",
+            "expected_etag_sha256": provider_value_sha256(Some(expected_etag)),
+            "observed_etag_sha256": provider_value_sha256(observed_etag),
+            "listing_etag_sha256": provider_value_sha256(listing_etag),
+            "listing_after_etag_sha256": provider_value_sha256(listing_after_etag),
+            "script_identity_valid": uploaded_identity_valid,
+            "version_id_sha256": provider_value_sha256(version_id),
+            "detail_id_sha256": provider_value_sha256(detail_id),
+            "version_id_after_sha256": provider_value_sha256(version_id_after),
+            "handlers_present": handlers_valid,
+            "named_handlers_present": named_handlers_valid,
+            "entrypoint_present": entrypoint_present,
+            "message": "provider version detail did not prove the exact uploaded Worker module",
+        })
+    }
+}
+
+fn exact_provider_string<'a>(value: Option<&'a Value>) -> Option<&'a str> {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.trim() == *value)
+}
+
+fn provider_value_sha256(value: Option<&str>) -> Option<String> {
+    value.map(|value| format!("sha256:{}", sha256_hex(value)))
+}
+
 fn is_pages_generated_worker_settings_error(err: &crate::cloudflare::AdapterError) -> bool {
     let message = err
         .cloudflare_api_error_message()
@@ -12312,7 +12597,7 @@ mod tests {
 
     use axum::extract::{Path, Query, State};
     use axum::http::{HeaderMap, Request, StatusCode};
-    use axum::routing::{any, get, post};
+    use axum::routing::{any, get, post, put};
     use axum::{Json, Router};
     use mcp_toolkit_auth::AuthContext;
     use mcp_toolkit_core::notifications::ToolListTracker;
@@ -12339,10 +12624,12 @@ mod tests {
         UpsertDnsCnameArgs, VerifyHttpGateArgs, WafEventFilterInput, WafSecurityEventsSummaryArgs,
         WafTimeWindow, WorkersObservabilityListKeysArgs, WorkersObservabilityListValuesArgs,
         WorkersObservabilityQueryEventsArgs, WorkersObservabilityTimeframe,
+        WorkersUploadScriptArgs,
         build_waf_security_events_query, normalize_waf_group_by, normalize_waf_phases,
         query_mentions_waf, waf_security_events_filter,
     };
     use crate::cloudflare::CloudflareClient;
+    use crate::cloudflare::model::WorkerScript;
     use crate::config::PortalAgentConfig;
     use crate::config::{ApiTokenSource, CloudflareApiConfig, ElicitationConfig, ResumeMode};
     use crate::portal::PortalAgentClient;
@@ -12586,6 +12873,558 @@ mod tests {
         assert_eq!(result["code"], json!("workers.upload_main_module_mismatch"));
         assert_eq!(result["expected_main_module"], json!("worker.js"));
         assert_eq!(result["observed_main_module"], json!("unexpected.js"));
+    }
+
+    #[tokio::test]
+    async fn workers_upload_script_create_only_uses_version_attestation_when_settings_omit_main_module() {
+        let router = Router::new()
+            .route(
+                "/accounts/acct-1/workers/scripts/worker-a",
+                put(|| async {
+                    Json(json!({
+                        "success": true,
+                        "errors": [],
+                        "messages": [],
+                        "result": {"id": "worker-a", "etag": "etag-1"},
+                    }))
+                }),
+            )
+            .route(
+                "/accounts/acct-1/workers/scripts/worker-a/settings",
+                get(|| async {
+                    Json(json!({
+                        "success": true,
+                        "errors": [],
+                        "messages": [],
+                        "result": {"main_module": null, "bindings": []},
+                    }))
+                }),
+            )
+            .route(
+                "/accounts/acct-1/workers/scripts",
+                get(|| async {
+                    Json(json!({
+                        "success": true,
+                        "errors": [],
+                        "messages": [],
+                        "result": [{"id": "worker-a", "etag": "etag-1"}],
+                    }))
+                }),
+            )
+            .route(
+                "/accounts/acct-1/workers/scripts/worker-a/versions",
+                get(|| async {
+                    Json(json!({
+                        "success": true,
+                        "errors": [],
+                        "messages": [],
+                        "result": {
+                            "items": [{"id": "version-1"}]
+                        },
+                        "result_info": {"page": 1, "per_page": 100, "count": 1, "total_count": 1},
+                    }))
+                }),
+            )
+            .route(
+                "/accounts/acct-1/workers/scripts/worker-a/versions/version-1",
+                get(|| async {
+                    Json(json!({
+                        "success": true,
+                        "errors": [],
+                        "messages": [],
+                        "result": {
+                            "id": "version-1",
+                            "author_email": "redacted-author",
+                            "resources": {"script": {
+                                "etag": "etag-1",
+                                "handlers": ["fetch"],
+                                "named_handlers": []
+                            }}
+                        },
+                    }))
+                }),
+            );
+        let server = test_server(spawn_router(router).await);
+        let dry_run = server
+            .cloudflare_workers_upload_script(
+                Parameters(WorkersUploadScriptArgs {
+                    account_id: None,
+                    script_name: "worker-a".to_string(),
+                    main_module: Some("worker.js".to_string()),
+                    script_path: None,
+                    script_content: Some("export default {}".to_string()),
+                    script_content_base64: None,
+                    multipart_path: None,
+                    metadata: json!({"compatibility_date": "2026-08-09"}),
+                    content_type: None,
+                    create_only: true,
+                    dry_run: true,
+                    confirmation_token: None,
+                    reason: Some("version attestation regression".to_string()),
+                }),
+                Extension(test_tool_parts()),
+            )
+            .await
+            .expect("dry run");
+        let dry_payload = dry_run.structured_content.expect("dry payload");
+        let token = dry_payload["required_confirmation_token"]
+            .as_str()
+            .expect("confirmation token")
+            .to_string();
+        let applied = server
+            .cloudflare_workers_upload_script(
+                Parameters(WorkersUploadScriptArgs {
+                    account_id: None,
+                    script_name: "worker-a".to_string(),
+                    main_module: Some("worker.js".to_string()),
+                    script_path: None,
+                    script_content: Some("export default {}".to_string()),
+                    script_content_base64: None,
+                    multipart_path: None,
+                    metadata: json!({"compatibility_date": "2026-08-09"}),
+                    content_type: None,
+                    create_only: true,
+                    dry_run: false,
+                    confirmation_token: Some(token),
+                    reason: Some("version attestation regression".to_string()),
+                }),
+                Extension(test_tool_parts()),
+            )
+            .await
+            .expect("apply");
+        let payload = applied.structured_content.expect("apply payload");
+        assert_eq!(payload["ok"], json!(true));
+        assert_eq!(
+            payload["readback_verification"]["code"],
+            json!("workers.upload_version_readback_matched")
+        );
+        assert!(payload.get("version_evidence").is_none());
+    }
+
+    #[test]
+    fn worker_upload_version_readback_accepts_etag_bound_initial_version() {
+        let uploaded: WorkerScript = serde_json::from_value(json!({
+            "id": "worker-a",
+            "etag": "etag-1"
+        }))
+        .expect("uploaded Worker");
+        let evidence = json!({
+            "listing": {"id": "worker-a", "etag": "etag-1"},
+            "listing_after": {"id": "worker-a", "etag": "etag-1"},
+            "versions": [{"id": "version-1"}],
+            "versions_after": [{"id": "version-1"}],
+            "detail": {
+                "id": "version-1",
+                "resources": {
+                    "script": {
+                        "etag": "etag-1",
+                        "handlers": ["fetch", "scheduled"],
+                        "named_handlers": [{"name": "handler", "handlers": ["class"]}]
+                    }
+                }
+            }
+        });
+        let result = super::verify_worker_upload_version_readback(
+            "worker-a",
+            &json!({"main_module": "worker.js"}),
+            &uploaded,
+            &evidence,
+        );
+
+        assert_eq!(result["matched"], json!(true));
+        assert_eq!(result["code"], json!("workers.upload_version_readback_matched"));
+        assert_eq!(result["named_handlers_present"], json!(true));
+    }
+
+    #[test]
+    fn worker_upload_version_readback_rejects_etag_mismatch() {
+        let uploaded: WorkerScript = serde_json::from_value(json!({
+            "id": "worker-a",
+            "etag": "etag-1"
+        }))
+        .expect("uploaded Worker");
+        let evidence = json!({
+            "listing": {"id": "worker-a", "etag": "etag-1"},
+            "listing_after": {"id": "worker-a", "etag": "etag-1"},
+            "versions": [{"id": "version-1"}],
+            "versions_after": [{"id": "version-1"}],
+            "detail": {
+                "id": "version-1",
+                "resources": {
+                    "script": {
+                        "etag": "etag-2",
+                        "handlers": ["fetch"],
+                        "named_handlers": []
+                    }
+                }
+            }
+        });
+        let result = super::verify_worker_upload_version_readback(
+            "worker-a",
+            &json!({"main_module": "worker.js"}),
+            &uploaded,
+            &evidence,
+        );
+
+        assert_eq!(result["matched"], json!(false));
+        assert_eq!(result["code"], json!("workers.upload_version_readback_mismatch"));
+    }
+
+    #[test]
+    fn worker_upload_version_readback_rejects_whitespace_version_ids() {
+        let uploaded: WorkerScript = serde_json::from_value(json!({
+            "id": "worker-a",
+            "etag": "etag-1"
+        }))
+        .expect("uploaded Worker");
+        let base = json!({
+            "listing": {"id": "worker-a", "etag": "etag-1"},
+            "listing_after": {"id": "worker-a", "etag": "etag-1"},
+            "versions": [{"id": "version-1"}],
+            "versions_after": [{"id": "version-1"}],
+            "detail": {
+                "id": "version-1",
+                "resources": {"script": {
+                    "etag": "etag-1",
+                    "handlers": ["fetch"],
+                    "named_handlers": []
+                }}
+            }
+        });
+        for field in ["listed", "detail", "stable"] {
+            let mut evidence = base.clone();
+            match field {
+                "listed" => evidence["versions"][0]["id"] = json!(" version-1"),
+                "detail" => evidence["detail"]["id"] = json!("version-1 "),
+                "stable" => evidence["versions_after"][0]["id"] = json!(" version-1 "),
+                _ => unreachable!(),
+            }
+            let result = super::verify_worker_upload_version_readback(
+                "worker-a",
+                &json!({"main_module": "worker.js"}),
+                &uploaded,
+                &evidence,
+            );
+            assert_eq!(result["matched"], json!(false), "{field}");
+        }
+    }
+
+    #[test]
+    fn worker_upload_version_readback_rejects_whitespace_upload_listing_and_detail_etags() {
+        let base_uploaded = json!({"id": "worker-a", "etag": "etag-1"});
+        let base_evidence = json!({
+            "listing": {"id": "worker-a", "etag": "etag-1"},
+            "listing_after": {"id": "worker-a", "etag": "etag-1"},
+            "versions": [{"id": "version-1"}],
+            "versions_after": [{"id": "version-1"}],
+            "detail": {
+                "id": "version-1",
+                "resources": {"script": {
+                    "etag": "etag-1",
+                    "handlers": ["fetch"],
+                    "named_handlers": []
+                }}
+            }
+        });
+        for field in ["upload", "listing", "detail"] {
+            let uploaded: WorkerScript = serde_json::from_value({
+                let mut value = base_uploaded.clone();
+                if field == "upload" {
+                    value["etag"] = json!(" etag-1");
+                }
+                value
+            })
+            .expect("uploaded Worker");
+            let mut evidence = base_evidence.clone();
+            match field {
+                "listing" => evidence["listing"]["etag"] = json!(" etag-1"),
+                "detail" => evidence["detail"]["resources"]["script"]["etag"] =
+                    json!("etag-1 "),
+                "upload" => {}
+                _ => unreachable!(),
+            }
+            let result = super::verify_worker_upload_version_readback(
+                "worker-a",
+                &json!({"main_module": "worker.js"}),
+                &uploaded,
+                &evidence,
+            );
+            assert_eq!(result["matched"], json!(false), "{field}");
+        }
+    }
+
+    #[test]
+    fn worker_upload_version_readback_rejects_cross_target_upload_identity() {
+        let uploaded: WorkerScript = serde_json::from_value(json!({
+            "id": "worker-other",
+            "script_name": "worker-other",
+            "etag": "etag-1"
+        }))
+        .expect("uploaded Worker");
+        let evidence = json!({
+            "listing": {"id": "worker-other", "etag": "etag-1"},
+            "listing_after": {"id": "worker-other", "etag": "etag-1"},
+            "versions": [{"id": "version-1"}],
+            "versions_after": [{"id": "version-1"}],
+            "detail": {
+                "id": "version-1",
+                "resources": {"script": {
+                    "etag": "etag-1",
+                    "handlers": ["fetch"],
+                    "named_handlers": []
+                }}
+            }
+        });
+        let result = super::verify_worker_upload_version_readback(
+            "worker-a",
+            &json!({"main_module": "worker.js"}),
+            &uploaded,
+            &evidence,
+        );
+
+        assert_eq!(result["matched"], json!(false));
+        assert_eq!(result["code"], json!("workers.upload_script_identity_invalid"));
+        assert_eq!(result["script_identity_valid"], json!(false));
+    }
+
+    #[test]
+    fn worker_upload_version_readback_rejects_whitespace_script_identity() {
+        let uploaded: WorkerScript = serde_json::from_value(json!({
+            "id": "worker-a",
+            "etag": "etag-1"
+        }))
+        .expect("uploaded Worker");
+        let evidence = json!({
+            "listing": {"id": "worker-a", "etag": "etag-1"},
+            "listing_after": {"id": "worker-a", "etag": "etag-1"},
+            "versions": [{"id": "version-1"}],
+            "versions_after": [{"id": "version-1"}],
+            "detail": {
+                "id": "version-1",
+                "resources": {"script": {
+                    "etag": "etag-1",
+                    "handlers": ["fetch"],
+                    "named_handlers": []
+                }}
+            }
+        });
+        let result = super::verify_worker_upload_version_readback(
+            " worker-a",
+            &json!({"main_module": "worker.js"}),
+            &uploaded,
+            &evidence,
+        );
+
+        assert_eq!(result["matched"], json!(false));
+        assert_eq!(result["script_identity_valid"], json!(false));
+    }
+
+    #[test]
+    fn worker_upload_version_readback_accepts_named_only_entrypoint() {
+        let uploaded: WorkerScript = serde_json::from_value(json!({
+            "id": "worker-a",
+            "etag": "etag-1"
+        }))
+        .expect("uploaded Worker");
+        let evidence = json!({
+            "listing": {"id": "worker-a", "etag": "etag-1"},
+            "listing_after": {"id": "worker-a", "etag": "etag-1"},
+            "versions": [{"id": "version-1"}],
+            "versions_after": [{"id": "version-1"}],
+            "detail": {
+                "id": "version-1",
+                "resources": {"script": {
+                    "etag": "etag-1",
+                    "handlers": [],
+                    "named_handlers": [{"name": "handler", "handlers": ["class"]}]
+                }}
+            }
+        });
+        let result = super::verify_worker_upload_version_readback(
+            "worker-a",
+            &json!({"main_module": "worker.js"}),
+            &uploaded,
+            &evidence,
+        );
+
+        assert_eq!(result["matched"], json!(true));
+        assert_eq!(result["entrypoint_present"], json!(true));
+    }
+
+    #[test]
+    fn worker_upload_version_readback_rejects_detail_id_drift() {
+        let uploaded: WorkerScript = serde_json::from_value(json!({"id": "worker-a", "etag": "etag-1"}))
+            .expect("uploaded Worker");
+        let evidence = json!({
+            "listing": {"etag": "etag-1"},
+            "listing_after": {"etag": "etag-1"},
+            "versions": [{"id": "version-1"}],
+            "versions_after": [{"id": "version-1"}],
+            "detail": {
+                "id": "version-2",
+                "resources": {"script": {
+                    "etag": "etag-1",
+                    "handlers": ["fetch"],
+                    "named_handlers": []
+                }}
+            }
+        });
+        let result = super::verify_worker_upload_version_readback(
+            "worker-a",
+            &json!({"main_module": "worker.js"}),
+            &uploaded,
+            &evidence,
+        );
+
+        assert_eq!(result["matched"], json!(false));
+        assert_eq!(result["code"], json!("workers.upload_version_readback_mismatch"));
+    }
+
+    #[test]
+    fn worker_upload_version_readback_rejects_missing_entrypoint() {
+        let uploaded: WorkerScript = serde_json::from_value(json!({"id": "worker-a", "etag": "etag-1"}))
+            .expect("uploaded Worker");
+        let evidence = json!({
+            "listing": {"etag": "etag-1"},
+            "listing_after": {"etag": "etag-1"},
+            "versions": [{"id": "version-1"}],
+            "versions_after": [{"id": "version-1"}],
+            "detail": {
+                "id": "version-1",
+                "resources": {"script": {
+                    "etag": "etag-1",
+                    "handlers": [],
+                    "named_handlers": []
+                }}
+            }
+        });
+        let result = super::verify_worker_upload_version_readback(
+            "worker-a",
+            &json!({"main_module": "worker.js"}),
+            &uploaded,
+            &evidence,
+        );
+
+        assert_eq!(result["matched"], json!(false));
+        assert_eq!(result["handlers_present"], json!(true));
+        assert_eq!(result["named_handlers_present"], json!(true));
+        assert_eq!(result["entrypoint_present"], json!(false));
+    }
+
+    #[test]
+    fn worker_upload_version_readback_rejects_missing_named_handlers() {
+        let uploaded: WorkerScript = serde_json::from_value(json!({"id": "worker-a", "etag": "etag-1"}))
+            .expect("uploaded Worker");
+        let evidence = json!({
+            "listing": {"etag": "etag-1"},
+            "listing_after": {"etag": "etag-1"},
+            "versions": [{"id": "version-1"}],
+            "versions_after": [{"id": "version-1"}],
+            "detail": {
+                "id": "version-1",
+                "resources": {"script": {
+                    "etag": "etag-1",
+                    "handlers": ["fetch"]
+                }}
+            }
+        });
+        let result = super::verify_worker_upload_version_readback(
+            "worker-a",
+            &json!({"main_module": "worker.js"}),
+            &uploaded,
+            &evidence,
+        );
+
+        assert_eq!(result["matched"], json!(false));
+        assert_eq!(result["named_handlers_present"], json!(false));
+    }
+
+    #[test]
+    fn worker_upload_version_readback_rejects_non_array_named_handlers() {
+        let uploaded: WorkerScript = serde_json::from_value(json!({"id": "worker-a", "etag": "etag-1"}))
+            .expect("uploaded Worker");
+        let evidence = json!({
+            "listing": {"etag": "etag-1"},
+            "listing_after": {"etag": "etag-1"},
+            "versions": [{"id": "version-1"}],
+            "versions_after": [{"id": "version-1"}],
+            "detail": {
+                "id": "version-1",
+                "resources": {"script": {
+                    "etag": "etag-1",
+                    "handlers": ["fetch"],
+                    "named_handlers": {"name": "handler"}
+                }}
+            }
+        });
+        let result = super::verify_worker_upload_version_readback(
+            "worker-a",
+            &json!({"main_module": "worker.js"}),
+            &uploaded,
+            &evidence,
+        );
+
+        assert_eq!(result["matched"], json!(false));
+        assert_eq!(result["named_handlers_present"], json!(false));
+    }
+
+    #[test]
+    fn worker_upload_version_readback_rejects_duplicate_handler_members() {
+        let uploaded: WorkerScript = serde_json::from_value(json!({"id": "worker-a", "etag": "etag-1"}))
+            .expect("uploaded Worker");
+        let evidence = json!({
+            "listing": {"etag": "etag-1"},
+            "listing_after": {"etag": "etag-1"},
+            "versions": [{"id": "version-1"}],
+            "versions_after": [{"id": "version-1"}],
+            "detail": {
+                "id": "version-1",
+                "resources": {"script": {
+                    "etag": "etag-1",
+                    "handlers": ["fetch", "fetch"],
+                    "named_handlers": [{"name": "handler", "handlers": ["class"]}, {"name": "handler", "handlers": ["class"]}]
+                }}
+            }
+        });
+        let result = super::verify_worker_upload_version_readback(
+            "worker-a",
+            &json!({"main_module": "worker.js"}),
+            &uploaded,
+            &evidence,
+        );
+
+        assert_eq!(result["matched"], json!(false));
+        assert_eq!(result["handlers_present"], json!(false));
+        assert_eq!(result["named_handlers_present"], json!(false));
+    }
+
+    #[test]
+    fn worker_upload_version_readback_rejects_stable_version_drift() {
+        let uploaded: WorkerScript = serde_json::from_value(json!({"id": "worker-a", "etag": "etag-1"}))
+            .expect("uploaded Worker");
+        let evidence = json!({
+            "listing": {"etag": "etag-1"},
+            "listing_after": {"etag": "etag-1"},
+            "versions": [{"id": "version-1"}],
+            "versions_after": [{"id": "version-2"}],
+            "detail": {
+                "id": "version-1",
+                "resources": {"script": {
+                    "etag": "etag-1",
+                    "handlers": ["fetch"],
+                    "named_handlers": []
+                }}
+            }
+        });
+        let result = super::verify_worker_upload_version_readback(
+            "worker-a",
+            &json!({"main_module": "worker.js"}),
+            &uploaded,
+            &evidence,
+        );
+
+        assert_eq!(result["matched"], json!(false));
+        assert!(result["version_id_after_sha256"].as_str().is_some());
     }
 
     #[test]

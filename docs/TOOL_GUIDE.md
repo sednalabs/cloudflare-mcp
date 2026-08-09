@@ -135,9 +135,18 @@ itself. It accepts a single module file/content or a prebuilt multipart Worker
 bundle, returns a dry-run confirmation token, and summarizes script/metadata
 evidence with SHA-256 digests plus metadata keys rather than raw metadata
 values. Apply requires the dry-run token, reads back Worker settings, and
-reports `readback_verification`; module uploads fail closed when readback shows
-a different `main_module`. Use Wrangler only to generate a bundle when the
-project already documents that build path.
+reports `readback_verification`; a different non-empty `main_module` fails
+closed. For create-only module uploads, settings may legitimately return a
+null `main_module`; the tool then requires exhaustive, stable, etag-bound
+Worker listing/version-detail evidence with a present named-handler array;
+any named handlers and their export members must be unique and nonblank.
+The default and named handler arrays may each be empty, but at least one valid
+entrypoint must exist overall.
+Version pagination is read from the outer `result_info` envelope metadata; an
+optional nested `pagination` object must agree when present.
+Malformed, incomplete, ambiguous, or conflicting evidence fails closed. Use
+Wrangler only to generate a bundle when the project already documents that
+build path.
 
 Pass `create_only: true` when the script name must be unused: the apply request
 uses Cloudflare's atomic `If-None-Match: *` precondition, and a pre-existing
