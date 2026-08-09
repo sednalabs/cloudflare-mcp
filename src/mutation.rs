@@ -494,6 +494,7 @@ pub fn plan_upload_worker_script(
     account_id: &str,
     script_name: &str,
     upload: Value,
+    create_only: bool,
 ) -> MutationPlan {
     MutationPlan::new("workers_upload_script")
         .step(
@@ -503,6 +504,7 @@ pub fn plan_upload_worker_script(
                 "account_id": account_id,
                 "script_name": script_name,
                 "upload": upload,
+                "create_only": create_only,
             }),
         )
         .step(
@@ -511,6 +513,7 @@ pub fn plan_upload_worker_script(
             json!({
                 "account_id": account_id,
                 "script_name": script_name,
+                "create_only": create_only,
             }),
         )
         .step(
