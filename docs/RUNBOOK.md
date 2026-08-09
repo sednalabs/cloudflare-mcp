@@ -277,6 +277,13 @@ values. Apply by echoing `required_confirmation_token` in
 deployment proof even when Cloudflare accepted the upload request, because the
 settings readback did not match the requested module.
 
+For a first-install-only deployment, add `"create_only":true` to both the
+dry-run and apply calls. The confirmation token binds this flag, and apply sends
+Cloudflare's atomic `If-None-Match: *` precondition. A pre-existing script must
+end with `workers.upload_create_only_conflict`; do not retry or fall back to an
+unconditional upload. Timeout, transport, and response-decoding errors are
+uncertain outcomes and require reconciliation rather than a creation claim.
+
 For projects that already use Wrangler to build a multipart Worker bundle, pass
 `multipart_path` instead of `script_path`/`script_content`/`main_module`.
 The MCP infers `content_type` from a leading multipart boundary when possible;

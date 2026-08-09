@@ -971,6 +971,17 @@ fn spawn_fake_worker_upload_api_with_readback(
                 .map(str::trim)
                 .unwrap_or_default()
                 .to_string();
+            let if_none_match = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("if-none-match:"))
+                .or_else(|| {
+                    headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("If-None-Match:"))
+                })
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string();
             let body_text = String::from_utf8_lossy(&body).to_string();
             requests_for_thread
                 .lock()
@@ -979,6 +990,7 @@ fn spawn_fake_worker_upload_api_with_readback(
                     "method": method,
                     "path": path,
                     "content_type": content_type,
+                    "if_none_match": if_none_match,
                     "body_text": body_text,
                 }));
 
@@ -2495,6 +2507,76 @@ fn workers_upload_script_requires_token_and_reads_back_through_stdio_boundary() 
         requests[1]["path"],
         json!("/accounts/acct-1/workers/scripts/worker-a/settings")
     );
+    assert_eq!(requests[0]["if_none_match"], json!(""));
+}
+
+#[test]
+fn workers_upload_script_create_only_binds_token_and_sends_atomic_precondition() {
+    let (base_url, requests) = spawn_fake_worker_upload_api(2);
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let dry_run = mcp.call_tool(
+        2,
+        "workers_upload_script",
+        json!({
+            "script_name": "worker-a",
+            "main_module": "worker.js",
+            "script_content": "export default { fetch() { return new Response('ok'); } };",
+            "metadata": {"compatibility_date": "2026-06-03"},
+            "create_only": true,
+            "dry_run": true,
+            "reason": "stdio create-only regression"
+        }),
+    );
+    let dry_run_content = structured_content(&dry_run);
+    assert_eq!(dry_run_content["ok"], json!(true), "{dry_run_content}");
+    assert_eq!(dry_run_content["create_only"], json!(true));
+    let token = dry_run_content["required_confirmation_token"]
+        .as_str()
+        .expect("confirmation token")
+        .to_string();
+
+    let mismatched_apply = mcp.call_tool(
+        3,
+        "workers_upload_script",
+        json!({
+            "script_name": "worker-a",
+            "main_module": "worker.js",
+            "script_content": "export default { fetch() { return new Response('ok'); } };",
+            "metadata": {"compatibility_date": "2026-06-03"},
+            "create_only": false,
+            "dry_run": false,
+            "confirmation_token": token,
+            "reason": "stdio create-only mismatch regression"
+        }),
+    );
+    let mismatched_content = structured_content(&mismatched_apply);
+    assert_eq!(mismatched_content["ok"], json!(false));
+    assert_eq!(
+        mismatched_content["error"]["code"],
+        json!("workers.upload_confirmation_required")
+    );
+    assert_eq!(requests.lock().expect("request log lock").len(), 0);
+
+    let response = mcp.call_tool(
+        4,
+        "workers_upload_script",
+        json!({
+            "script_name": "worker-a",
+            "main_module": "worker.js",
+            "script_content": "export default { fetch() { return new Response('ok'); } };",
+            "metadata": {"compatibility_date": "2026-06-03"},
+            "create_only": true,
+            "dry_run": false,
+            "confirmation_token": token,
+            "reason": "stdio create-only regression"
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(true), "{content}");
+    assert_eq!(content["create_only"], json!(true));
+    let requests = requests.lock().expect("request log lock");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["if_none_match"], json!("*"));
 }
 
 #[test]

@@ -139,6 +139,14 @@ reports `readback_verification`; module uploads fail closed when readback shows
 a different `main_module`. Use Wrangler only to generate a bundle when the
 project already documents that build path.
 
+Pass `create_only: true` when the script name must be unused: the apply request
+uses Cloudflare's atomic `If-None-Match: *` precondition, and a pre-existing
+script returns `workers.upload_create_only_conflict` without retrying or
+overwriting it. The create-only flag is included in the dry-run confirmation
+authority; omit it (the default) for the existing update behavior. Transport,
+timeout, and response-decoding failures remain uncertain and are returned as
+errors rather than treated as a successful creation.
+
 Use `bindings_discover` to find D1, Queues, Worker, and Pages resources that
 may need to be wired into an application.
 

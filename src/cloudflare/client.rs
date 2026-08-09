@@ -1536,6 +1536,7 @@ impl CloudflareClient {
         file_name: &str,
         content_type: &str,
         bytes: Vec<u8>,
+        create_only: bool,
     ) -> Result<WorkerScript, AdapterError> {
         let account_id = require_non_empty("account_id", account_id)?;
         let script_name = require_non_empty("script_name", script_name)?;
@@ -1561,7 +1562,7 @@ impl CloudflareClient {
         let file_name = file_name.to_string();
         let content_type = content_type.to_string();
 
-        let envelope: CloudflareEnvelope<WorkerScript> = self
+        let envelope: CloudflareEnvelope<WorkerScript> = match self
             .send_envelope(
                 "cloudflare.workers.script.upload_module",
                 RetryPolicy::NonIdempotent,
@@ -1576,14 +1577,22 @@ impl CloudflareClient {
                     let form = reqwest::multipart::Form::new()
                         .part("metadata", metadata_part)
                         .part(module_name.clone(), module_part);
-                    self.http
+                    let mut request = self
+                        .http
                         .put(url.clone())
                         .bearer_auth(&token)
-                        .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone())
-                        .multipart(form)
+                        .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone());
+                    if create_only {
+                        request = request.header(reqwest::header::IF_NONE_MATCH, "*");
+                    }
+                    request.multipart(form)
                 },
             )
-            .await?;
+            .await
+        {
+            Ok(envelope) => envelope,
+            Err(err) => return Err(classify_worker_upload_error(err, create_only)),
+        };
 
         envelope.result.ok_or_else(|| {
             AdapterError::new(
@@ -1600,6 +1609,7 @@ impl CloudflareClient {
         script_name: &str,
         content_type: &str,
         bytes: Vec<u8>,
+        create_only: bool,
     ) -> Result<WorkerScript, AdapterError> {
         let account_id = require_non_empty("account_id", account_id)?;
         let script_name = require_non_empty("script_name", script_name)?;
@@ -1610,20 +1620,28 @@ impl CloudflareClient {
             "/accounts/{account_id}/workers/scripts/{script_name}"
         ));
 
-        let envelope: CloudflareEnvelope<WorkerScript> = self
+        let envelope: CloudflareEnvelope<WorkerScript> = match self
             .send_envelope(
                 "cloudflare.workers.script.upload_multipart",
                 RetryPolicy::NonIdempotent,
                 || {
-                    self.http
+                    let mut request = self
+                        .http
                         .put(url.clone())
                         .bearer_auth(&token)
                         .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone())
-                        .header(reqwest::header::CONTENT_TYPE, content_type_header.clone())
-                        .body(bytes.clone())
+                        .header(reqwest::header::CONTENT_TYPE, content_type_header.clone());
+                    if create_only {
+                        request = request.header(reqwest::header::IF_NONE_MATCH, "*");
+                    }
+                    request.body(bytes.clone())
                 },
             )
-            .await?;
+            .await
+        {
+            Ok(envelope) => envelope,
+            Err(err) => return Err(classify_worker_upload_error(err, create_only)),
+        };
 
         envelope.result.ok_or_else(|| {
             AdapterError::new(
@@ -2779,6 +2797,18 @@ fn is_retryable_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
+fn classify_worker_upload_error(err: AdapterError, create_only: bool) -> AdapterError {
+    if create_only && err.status == Some(StatusCode::PRECONDITION_FAILED.as_u16()) {
+        return AdapterError::new(
+            "workers.upload_create_only_conflict",
+            "Worker script already exists; create_only upload was not applied",
+            "Use a new script name, or omit create_only when an update is intentional.",
+        )
+        .with_status(Some(StatusCode::PRECONDITION_FAILED.as_u16()));
+    }
+    err
+}
+
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
     let seconds = raw.trim().parse::<u64>().ok()?;
@@ -2911,7 +2941,7 @@ mod tests {
     use axum::body::Bytes;
     use axum::extract::{Path, State};
     use axum::http::{HeaderMap, StatusCode};
-    use axum::routing::{get, post};
+    use axum::routing::{get, post, put};
     use axum::{Json, Router};
     use serde_json::{Value, json};
     use tokio::net::TcpListener;
@@ -3089,6 +3119,89 @@ mod tests {
         assert_eq!(download.range.as_deref(), Some("bytes 0-12/128"));
 
         let _ = std::fs::remove_file(output_path);
+    }
+
+    #[tokio::test]
+    async fn worker_create_only_upload_uses_atomic_precondition_without_retry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = Router::new()
+            .route(
+                "/accounts/acct-1/workers/scripts/worker-a",
+                put({
+                    let calls = calls.clone();
+                    move |headers: HeaderMap, _body: Bytes| {
+                        let calls = calls.clone();
+                        async move {
+                            let attempt = calls.fetch_add(1, Ordering::SeqCst);
+                            if attempt == 0 {
+                                assert_eq!(
+                                    headers
+                                        .get(reqwest::header::IF_NONE_MATCH)
+                                        .and_then(|value| value.to_str().ok()),
+                                    Some("*")
+                                );
+                                return (
+                                    StatusCode::PRECONDITION_FAILED,
+                                    Json(json!({
+                                        "success": false,
+                                        "errors": [{"code": 1001, "message": "script already exists"}],
+                                        "messages": [],
+                                        "result": null,
+                                    })),
+                                );
+                            }
+
+                            assert!(headers.get(reqwest::header::IF_NONE_MATCH).is_none());
+                            (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "success": true,
+                                    "errors": [],
+                                    "messages": [],
+                                    "result": {"id": "worker-a", "script_name": "worker-a"},
+                                })),
+                            )
+                        }
+                    }
+                }),
+            )
+            .with_state(());
+
+        let base = spawn_router(router).await;
+        let client = CloudflareClient::new(test_config(base)).expect("client");
+        let err = client
+            .upload_worker_module(
+                "acct-1",
+                "worker-a",
+                &json!({"main_module": "worker.js"}),
+                "worker.js",
+                "worker.js",
+                "application/javascript+module",
+                b"export default {}".to_vec(),
+                true,
+            )
+            .await
+            .expect_err("existing Worker must conflict");
+
+        assert_eq!(err.code, "workers.upload_create_only_conflict");
+        assert_eq!(err.status, Some(412));
+        assert!(!err.retryable);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        client
+            .upload_worker_module(
+                "acct-1",
+                "worker-a",
+                &json!({"main_module": "worker.js"}),
+                "worker.js",
+                "worker.js",
+                "application/javascript+module",
+                b"export default {}".to_vec(),
+                false,
+            )
+            .await
+            .expect("legacy update upload");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

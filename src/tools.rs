@@ -721,6 +721,8 @@ pub struct WorkersUploadScriptArgs {
     #[serde(default)]
     pub content_type: Option<String>,
     #[serde(default)]
+    pub create_only: bool,
+    #[serde(default)]
     pub dry_run: bool,
     #[serde(default)]
     pub confirmation_token: Option<String>,
@@ -6298,10 +6300,16 @@ impl CloudflareMcp {
         let token_body = Some(json!({
             "script_name": script_name,
             "upload": upload_summary,
+            "create_only": args.create_only,
         }));
         let required_confirmation_token =
             mutation_confirmation_token(upload_operation, &rendered_path, &token_body);
-        let plan = plan_upload_worker_script(account_id, script_name, upload_summary.clone());
+        let plan = plan_upload_worker_script(
+            account_id,
+            script_name,
+            upload_summary.clone(),
+            args.create_only,
+        );
         let audit = MutationAuditSession::start(
             Some(&parts),
             "workers_upload_script",
@@ -6311,6 +6319,7 @@ impl CloudflareMcp {
                 "source_kind": upload.summary.source_kind,
                 "source_label": upload.summary.source_label,
                 "sha256": upload.summary.sha256,
+                "create_only": args.create_only,
                 "reason": args.reason.as_deref().map(str::trim),
             }),
             args.dry_run,
@@ -6325,6 +6334,7 @@ impl CloudflareMcp {
                 "script_name": script_name,
                 "request_path": rendered_path,
                 "upload": upload_summary,
+                "create_only": args.create_only,
                 "required_confirmation_token": required_confirmation_token,
                 "dry_run_note": "No Worker script upload applied.",
             }))
@@ -6340,6 +6350,7 @@ impl CloudflareMcp {
                 "account_id": account_id,
                 "script_name": script_name,
                 "upload": upload_summary,
+                "create_only": args.create_only,
                 "required_confirmation_token": required_confirmation_token,
             }))
         } else {
@@ -6360,6 +6371,7 @@ impl CloudflareMcp {
                             &file_name,
                             &content_type,
                             bytes,
+                            args.create_only,
                         )
                         .await
                 }
@@ -6368,7 +6380,13 @@ impl CloudflareMcp {
                     bytes,
                 } => {
                     self.cloudflare
-                        .upload_worker_multipart(account_id, script_name, &content_type, bytes)
+                        .upload_worker_multipart(
+                            account_id,
+                            script_name,
+                            &content_type,
+                            bytes,
+                            args.create_only,
+                        )
                         .await
                 }
             };
@@ -6392,6 +6410,7 @@ impl CloudflareMcp {
                                 "account_id": account_id,
                                 "script_name": script_name,
                                 "upload": upload_summary,
+                                "create_only": args.create_only,
                                 "script": script,
                                 "readback_settings": readback_settings,
                                 "readback_verification": readback_verification,
@@ -6408,6 +6427,7 @@ impl CloudflareMcp {
                                 "account_id": account_id,
                                 "script_name": script_name,
                                 "upload": upload_summary,
+                                "create_only": args.create_only,
                                 "script": script,
                                 "readback_settings": readback_settings,
                                 "readback_verification": readback_verification,
@@ -6426,6 +6446,7 @@ impl CloudflareMcp {
                         "account_id": account_id,
                         "script_name": script_name,
                         "upload": upload_summary,
+                        "create_only": args.create_only,
                         "script": script,
                     })),
                 },
