@@ -57,13 +57,11 @@ jobs:
         # actions/upload-code-coverage v1
         uses: actions/upload-code-coverage@abb5995db9e0199b0e2bb9dbd136fce4cb1ec4d3
         id: upload-code-quality
+        continue-on-error: true
         with:
           file: coverage/rust.xml
           language: Rust
           label: code-coverage/rust
-          # Code Quality is optional; disabled repository entitlements must not
-          # fail the required coverage job.
-          fail-on-error: false
 
       - name: Upload Cobertura report
         # actions/upload-artifact v7
