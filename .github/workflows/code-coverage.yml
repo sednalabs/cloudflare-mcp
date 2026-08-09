@@ -56,10 +56,14 @@ jobs:
       - name: Upload Rust coverage to GitHub Code Quality
         # actions/upload-code-coverage v1
         uses: actions/upload-code-coverage@abb5995db9e0199b0e2bb9dbd136fce4cb1ec4d3
+        id: upload-code-quality
         with:
           file: coverage/rust.xml
           language: Rust
           label: code-coverage/rust
+          # Code Quality is optional; disabled repository entitlements must not
+          # fail the required coverage job.
+          fail-on-error: false
 
       - name: Upload Cobertura report
         # actions/upload-artifact v7
@@ -75,6 +79,7 @@ jobs:
           set -euo pipefail
           echo "### Rust coverage report" >> "$GITHUB_STEP_SUMMARY"
           echo >> "$GITHUB_STEP_SUMMARY"
+          echo "- Code Quality publication step outcome: `${{ steps.upload-code-quality.outcome }}` (optional)" >> "$GITHUB_STEP_SUMMARY"
           python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
           from pathlib import Path
           from xml.etree import ElementTree
