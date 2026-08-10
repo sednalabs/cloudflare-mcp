@@ -3631,8 +3631,28 @@ fn api_mutate_denies_generic_worker_script_upload_and_names_curated_path() {
         json!("workers_upload_script")
     );
 
-    let response = mcp.call_tool(
+    let generic_denial = mcp.call_tool(
         3,
+        "api_prepare_call",
+        json!({
+            "operation_id": "account-subscriptions-create-subscription"
+        }),
+    );
+    let generic_denial_content = structured_content(&generic_denial);
+    assert_eq!(generic_denial_content["ok"], json!(false));
+    assert_eq!(
+        generic_denial_content["error"]["code"],
+        json!("api_catalog.denied_by_default")
+    );
+    assert_eq!(
+        generic_denial_content["error"]["hint"],
+        json!(
+            "Use a curated safe tool when available, or explicitly allow this operation in a future policy profile."
+        )
+    );
+
+    let response = mcp.call_tool(
+        4,
         "api_mutate",
         json!({
             "operation_id": "worker-script-put-content",

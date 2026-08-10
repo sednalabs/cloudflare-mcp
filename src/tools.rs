@@ -1914,6 +1914,9 @@ impl CloudflareMcp {
                     },
                 })));
             }
+            return Ok(api_catalog_error_result(ApiCatalogError::DeniedByDefault(
+                selected.operation_id.clone(),
+            )));
         }
 
         let resolved_path_params = resolved_path_params(
