@@ -3573,7 +3573,8 @@ mod tests {
 
     use super::{
         AdapterError, CloudflareApiError, CloudflareClient, is_d1_sqlite_auth_error, path_segment,
-        with_request_api_token_override, worker_listing_identity, worker_version_page_metadata,
+        with_request_api_token_override, worker_listing_identity, worker_version_id,
+        worker_version_page_metadata,
     };
     use crate::cloudflare::model::{AccessPolicyWrite, PageInfo, WorkerScript};
     use crate::config::{ApiTokenSource, CloudflareApiConfig};
