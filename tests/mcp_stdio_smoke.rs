@@ -3652,7 +3652,9 @@ fn api_mutate_denies_generic_worker_script_upload_and_names_curated_path() {
     );
     assert_eq!(
         content["error"]["hint"],
-        json!("Use the curated workers_upload_script tool for this operation; generic api_mutate remains denied.")
+        json!(
+            "Use the curated workers_upload_script tool for this operation; generic api_mutate remains denied."
+        )
     );
     assert_eq!(content["preferred_tool"], json!("workers_upload_script"));
 }
