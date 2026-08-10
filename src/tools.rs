@@ -1893,6 +1893,29 @@ impl CloudflareMcp {
             find_operation(operation_id).expect("search result must refer to catalog operation")
         };
 
+        if !selected.method.eq_ignore_ascii_case("GET") && !operation_allowed_by_default(selected) {
+            if let Some(preferred_tool) = selected.preferred_tool.as_deref() {
+                return Ok(CallToolResult::structured_error(json!({
+                    "ok": false,
+                    "operation": "api_prepare_call",
+                    "status": "denied_by_default",
+                    "api_operation": operation_detail(selected),
+                    "executor": "api_mutate",
+                    "preferred_tool": preferred_tool,
+                    "error": {
+                        "code": "api_catalog.denied_by_default",
+                        "message": format!(
+                            "operation '{}' is denied by default by the generic API executor",
+                            selected.operation_id,
+                        ),
+                        "hint": format!(
+                            "Use the curated {preferred_tool} tool for this operation; generic api_mutate remains denied.",
+                        ),
+                    },
+                })));
+            }
+        }
+
         let resolved_path_params = resolved_path_params(
             selected,
             &args.path_params,
@@ -2683,6 +2706,24 @@ impl CloudflareMcp {
             }));
         }
         if !operation_allowed_by_default(operation) {
+            if let Some(preferred_tool) = operation.preferred_tool.as_deref() {
+                return Ok(CallToolResult::structured_error(json!({
+                    "ok": false,
+                    "operation": "api_mutate",
+                    "api_operation": operation_detail(operation),
+                    "error": {
+                        "code": "api_catalog.denied_by_default",
+                        "message": format!(
+                            "operation '{}' is denied by default by the generic API executor",
+                            operation.operation_id,
+                        ),
+                        "hint": format!(
+                            "Use the curated {preferred_tool} tool for this operation; generic api_mutate remains denied.",
+                        ),
+                    },
+                    "preferred_tool": preferred_tool,
+                })));
+            }
             return Ok(api_catalog_error_result(ApiCatalogError::DeniedByDefault(
                 operation.operation_id.clone(),
             )));

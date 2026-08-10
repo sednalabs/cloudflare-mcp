@@ -265,6 +265,10 @@ If `api_get_operation` reports a preferred curated tool, use that curated tool.
 Curated tools encode workflow-specific safety, dry-run shape, and readback
 verification.
 
+The generic `worker-script-put-content` operation is denied by default. Use
+`workers_upload_script` for Worker module or multipart bundle uploads so the
+upload digest, confirmation token, and post-upload readback stay bound together.
+
 ## External Service Bridge
 
 `portal_agent_request` is an allowlisted external service bridge. It is useful
