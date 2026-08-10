@@ -1528,17 +1528,10 @@ impl CloudflareClient {
             ));
         }
         let version = versions_before.items[0].clone();
-        let version_id = version
-            .get("id")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty() && value.trim() == *value)
-            .ok_or_else(|| {
-                AdapterError::new(
-                    "workers.upload_version_readback_invalid",
-                    "Worker version readback omitted a canonical version id",
-                    "Reconcile the provider response; no create-only upload may continue from malformed version evidence.",
-                )
-            })?;
+        let version_id = worker_version_id(
+            &version,
+            "Worker version readback omitted a canonical version id",
+        )?;
         let detail_path = format!(
             "/accounts/{account_id}/workers/scripts/{}/versions/{}",
             path_segment(script_name),
@@ -1553,17 +1546,10 @@ impl CloudflareClient {
                 None,
             )
             .await?;
-        let detail_id = detail
-            .get("id")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty() && value.trim() == *value)
-            .ok_or_else(|| {
-                AdapterError::new(
-                    "workers.upload_version_readback_invalid",
-                    "Worker version detail omitted a canonical version id",
-                    "Reconcile the provider response; no create-only upload may continue from malformed version evidence.",
-                )
-            })?;
+        let detail_id = worker_version_id(
+            &detail,
+            "Worker version detail omitted a canonical version id",
+        )?;
         if detail_id != version_id {
             return Err(AdapterError::new(
                 "workers.upload_version_readback_conflict",
@@ -1577,7 +1563,8 @@ impl CloudflareClient {
             worker_listing_target(&listing_after_page.items, script_name)?.clone();
         let listing_etag_before = worker_script_etag(&listing_before)?;
         let listing_etag_after = worker_script_etag(&listing_after_item)?;
-        if worker_listing_identity(&listing_before)? != worker_listing_identity(&listing_after_item)?
+        if worker_listing_identity(&listing_before)?
+            != worker_listing_identity(&listing_after_item)?
             || listing_etag_before != listing_etag_after
         {
             return Err(AdapterError::new(
@@ -1599,17 +1586,10 @@ impl CloudflareClient {
                 "Reconcile the provider version inventory before retrying or continuing the create-only sequence.",
             ));
         }
-        let version_id_after = versions_after.items[0]
-            .get("id")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty() && value.trim() == *value)
-            .ok_or_else(|| {
-                AdapterError::new(
-                    "workers.upload_version_readback_invalid",
-                    "Stable Worker version readback omitted a canonical version id",
-                    "Reconcile the provider response; no create-only upload may continue from malformed version evidence.",
-                )
-            })?;
+        let version_id_after = worker_version_id(
+            &versions_after.items[0],
+            "Stable Worker version readback omitted a canonical version id",
+        )?;
         if version_id_after != version_id {
             return Err(AdapterError::new(
                 "workers.upload_version_readback_drift",
@@ -1654,12 +1634,7 @@ impl CloudflareClient {
                 ));
             }
             let (result, result_info) = self
-                .get_worker_versions_page(
-                    account_id,
-                    script_name,
-                    page,
-                    WORKER_VERSION_PAGE_SIZE,
-                )
+                .get_worker_versions_page(account_id, script_name, page, WORKER_VERSION_PAGE_SIZE)
                 .await?;
             let page_items = result
                 .get("items")
@@ -1672,7 +1647,9 @@ impl CloudflareClient {
                     )
                 })?;
             let metadata = worker_version_page_metadata(&result, result_info.as_ref(), page)?;
-            if expected_total_count.replace(metadata.total_count).is_some_and(|old| old != metadata.total_count)
+            if expected_total_count
+                .replace(metadata.total_count)
+                .is_some_and(|old| old != metadata.total_count)
                 || expected_total_pages
                     .replace(metadata.total_pages)
                     .is_some_and(|old| old != metadata.total_pages)
@@ -1701,17 +1678,10 @@ impl CloudflareClient {
                 ));
             }
             for item in page_items {
-                let id = item
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty() && value.trim() == *value)
-                    .ok_or_else(|| {
-                        AdapterError::new(
-                            "workers.upload_version_readback_invalid",
-                            "Worker version page contained an item without a canonical id",
-                            "Reconcile the provider response before retrying or continuing the create-only sequence.",
-                        )
-                    })?;
+                let id = worker_version_id(
+                    item,
+                    "Worker version page contained an item without a canonical id",
+                )?;
                 if !seen_ids.insert(id.to_string()) {
                     return Err(AdapterError::new(
                         "workers.upload_version_readback_duplicate",
@@ -1768,13 +1738,17 @@ impl CloudflareClient {
             path_segment(script_name),
         ));
         let envelope: CloudflareEnvelope<Value> = self
-            .send_envelope("cloudflare.workers.versions.list", RetryPolicy::Idempotent, || {
-                self.http
-                    .get(url.clone())
-                    .query(&[("page", page), ("per_page", per_page)])
-                    .bearer_auth(&token)
-                    .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone())
-            })
+            .send_envelope(
+                "cloudflare.workers.versions.list",
+                RetryPolicy::Idempotent,
+                || {
+                    self.http
+                        .get(url.clone())
+                        .query(&[("page", page), ("per_page", per_page)])
+                        .bearer_auth(&token)
+                        .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone())
+                },
+            )
             .await?;
         let result = envelope.result.ok_or_else(|| {
             AdapterError::new(
@@ -3232,7 +3206,11 @@ fn worker_version_page_metadata(
             1
         } else {
             nested_total_count / nested_per_page
-                + if nested_total_count % nested_per_page != 0 { 1 } else { 0 }
+                + if nested_total_count % nested_per_page != 0 {
+                    1
+                } else {
+                    0
+                }
         };
         let nested = WorkerVersionPageMetadata {
             page: nested_page,
@@ -3291,7 +3269,11 @@ fn worker_version_page_metadata(
                 1
             } else {
                 outer.total_count / outer.per_page
-                    + if outer.total_count % outer.per_page != 0 { 1 } else { 0 }
+                    + if outer.total_count % outer.per_page != 0 {
+                        1
+                    } else {
+                        0
+                    }
             }
     {
         return Err(AdapterError::new(
@@ -3310,6 +3292,20 @@ fn worker_version_page_metadata(
         }
     }
     Ok(outer)
+}
+
+fn worker_version_id<'a>(value: &'a Value, message: &'static str) -> Result<&'a str, AdapterError> {
+    value
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty() && id.trim() == *id)
+        .ok_or_else(|| {
+            AdapterError::new(
+                "workers.upload_version_readback_invalid",
+                message,
+                "Reconcile the provider response; no create-only upload may continue from malformed version evidence.",
+            )
+        })
 }
 
 fn worker_listing_target<'a>(
@@ -3576,9 +3572,8 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{
-        AdapterError, CloudflareApiError, CloudflareClient, is_d1_sqlite_auth_error,
-        path_segment, with_request_api_token_override, worker_listing_identity,
-        worker_version_page_metadata,
+        AdapterError, CloudflareApiError, CloudflareClient, is_d1_sqlite_auth_error, path_segment,
+        with_request_api_token_override, worker_listing_identity, worker_version_page_metadata,
     };
     use crate::cloudflare::model::{AccessPolicyWrite, PageInfo, WorkerScript};
     use crate::config::{ApiTokenSource, CloudflareApiConfig};
@@ -3928,8 +3923,8 @@ mod tests {
             "/accounts/acct-1/workers/scripts/worker-a/versions",
             get(list_versions),
         );
-        let client = CloudflareClient::new(test_config(spawn_router(router).await))
-            .expect("client");
+        let client =
+            CloudflareClient::new(test_config(spawn_router(router).await)).expect("client");
         let inventory = client
             .list_worker_versions_exhaustive("acct-1", "worker-a")
             .await
@@ -3951,7 +3946,10 @@ mod tests {
     fn worker_version_page_metadata_rejects_missing_outer_result_info() {
         let err = worker_version_page_metadata(&json!({"items": []}), None, 1)
             .expect_err("missing result_info must fail closed");
-        assert_eq!(err.code, "workers.upload_version_readback_pagination_invalid");
+        assert_eq!(
+            err.code,
+            "workers.upload_version_readback_pagination_invalid"
+        );
     }
 
     #[test]
@@ -4011,13 +4009,24 @@ mod tests {
             total_count: Some(0),
             total_pages: Some(1),
         };
-        let metadata = worker_version_page_metadata(
-            &json!({"items": []}),
-            Some(&result_info),
-            1,
-        )
-        .expect("zero total_count is a valid exhaustive page");
+        let metadata = worker_version_page_metadata(&json!({"items": []}), Some(&result_info), 1)
+            .expect("zero total_count is a valid exhaustive page");
         assert_eq!(metadata.total_count, 0);
+    }
+
+    #[test]
+    fn worker_version_id_rejects_whitespace_aliases() {
+        let valid = json!({"id": "version-1"});
+        assert_eq!(
+            worker_version_id(&valid, "test version id").expect("canonical id"),
+            "version-1"
+        );
+
+        for invalid in [json!({"id": " version-1"}), json!({"id": "version-1 "})] {
+            let err = worker_version_id(&invalid, "test version id")
+                .expect_err("whitespace aliases must fail closed");
+            assert_eq!(err.code, "workers.upload_version_readback_invalid");
+        }
     }
 
     #[tokio::test]
@@ -4029,28 +4038,39 @@ mod tests {
                     .get("page")
                     .and_then(|value| value.parse::<u32>().ok())
                     .expect("page query");
-                let (items, count) = if page == 1 {
-                    (json!([{ "id": "version-1" }]), 1)
-                } else {
-                    (json!([]), 0)
-                };
-                Json(json!({
-                    "success": true,
-                    "errors": [],
-                    "messages": [],
-                    "result": {"items": items},
-                    "result_info": {
-                        "page": page,
-                        "per_page": 1,
-                        "count": count,
-                        "total_count": 2,
-                        "total_pages": 2
-                    }
-                }))
+                Json(match page {
+                    1 => json!({
+                        "success": true,
+                        "errors": [],
+                        "messages": [],
+                        "result": {"items": [{"id": "version-1"}]},
+                        "result_info": {
+                            "page": 1,
+                            "per_page": 1,
+                            "count": 1,
+                            "total_count": 2,
+                            "total_pages": 2
+                        }
+                    }),
+                    2 => json!({
+                        "success": true,
+                        "errors": [],
+                        "messages": [],
+                        "result": {"items": []},
+                        "result_info": {
+                            "page": 2,
+                            "per_page": 1,
+                            "count": 0,
+                            "total_count": 2,
+                            "total_pages": 2
+                        }
+                    }),
+                    _ => panic!("unexpected page {page}"),
+                })
             }),
         );
-        let client = CloudflareClient::new(test_config(spawn_router(router).await))
-            .expect("client");
+        let client =
+            CloudflareClient::new(test_config(spawn_router(router).await)).expect("client");
         let err = client
             .list_worker_versions_exhaustive("acct-1", "worker-a")
             .await
@@ -4208,8 +4228,8 @@ mod tests {
             "name": 42
         }))
         .expect("Worker listing fixture");
-        let err = worker_listing_identity(&script)
-            .expect_err("non-string name alias must fail closed");
+        let err =
+            worker_listing_identity(&script).expect_err("non-string name alias must fail closed");
         assert_eq!(err.code, "workers.upload_listing_readback_invalid");
     }
 
@@ -4220,8 +4240,8 @@ mod tests {
             "script_name": " worker-a "
         }))
         .expect("Worker listing fixture");
-        let err = worker_listing_identity(&script)
-            .expect_err("non-identical aliases must fail closed");
+        let err =
+            worker_listing_identity(&script).expect_err("non-identical aliases must fail closed");
         assert_eq!(err.code, "workers.upload_listing_readback_conflict");
     }
 

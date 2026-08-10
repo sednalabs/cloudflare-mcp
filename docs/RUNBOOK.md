@@ -281,7 +281,8 @@ When a create-only module upload returns `main_module:null` in settings, that
 field is not treated as creation proof. The tool binds the upload response etag
 to one exact listing entry and one version detail's `resources.script.etag`,
 handlers, and a structurally valid named-handler array (which may be empty).
-Any named handlers and export members must be unique and nonblank. The default
+Any handler names and export members must be unique, nonblank, and byte-exact;
+leading or trailing whitespace fails closed. The default
 and named handler arrays may each be empty, but at least one valid entrypoint
 must exist overall. Version lists must carry exhaustive authoritative
 pagination metadata and are reread after the detail; missing, truncated,

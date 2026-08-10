@@ -32,11 +32,11 @@ use crate::cache::{
     CachePurgePayload, CacheResourceAction, CacheRulePhase, CacheRulesAction, CacheValidationError,
     CacheZoneSettingAction, purge_confirmation_token, replace_rules_confirmation_token,
 };
+use crate::cloudflare::model::WorkerScript;
 use crate::cloudflare::{
     AccessAppUpsertRequest, AccessPolicyWrite, BulkRedirectItemWrite, CacheRule, CacheRuleset,
     DnsRecordUpsertRequest, PagesDeploymentTriggerRequest, with_request_api_token_override,
 };
-use crate::cloudflare::model::WorkerScript;
 use crate::dns_route::{
     DnsRouteConflict, DnsRouteVerificationState, plan_dns_route_reconciliation, verify_dns_route,
 };
@@ -6400,8 +6400,8 @@ impl CloudflareMcp {
                     Ok(readback_settings) => {
                         let mut readback_verification =
                             verify_worker_upload_readback(&upload_summary, &readback_settings);
-                        let settings_main_module_absent = readback_verification["code"]
-                            == json!("workers.upload_main_module_absent");
+                        let settings_main_module_absent =
+                            readback_verification["code"] == "workers.upload_main_module_absent";
                         if settings_main_module_absent && args.create_only {
                             match self
                                 .cloudflare
@@ -6415,7 +6415,7 @@ impl CloudflareMcp {
                                         &script,
                                         &evidence,
                                     );
-                                    if verification["matched"] == json!(true) {
+                                    if verification["matched"] == true {
                                         readback_verification = verification;
                                     } else {
                                         return Ok(finalize_mutation_result(
@@ -10713,9 +10713,9 @@ fn verify_worker_upload_version_readback(
         });
     };
     uploaded_identity_valid = uploaded_identity_valid
-        && identity_aliases.iter().all(|identity| {
-            *identity == first_identity && *identity == expected_script_name
-        });
+        && identity_aliases
+            .iter()
+            .all(|identity| *identity == first_identity && *identity == expected_script_name);
     if !uploaded_identity_valid {
         return json!({
             "matched": false,
@@ -10782,57 +10782,46 @@ fn verify_worker_upload_version_readback(
     let listing_after_etag = evidence
         .pointer("/listing_after/etag")
         .and_then(|value| exact_provider_string(Some(value)));
-    let script = detail
-        .and_then(|value| value.pointer("/resources/script"));
+    let script = detail.and_then(|value| value.pointer("/resources/script"));
     let observed_etag = script
         .and_then(|value| value.get("etag"))
         .and_then(|value| exact_provider_string(Some(value)));
     let handlers = script
         .and_then(|value| value.get("handlers"))
         .and_then(Value::as_array);
-    let handlers_valid = handlers
-        .is_some_and(|handlers| {
-            let mut seen = BTreeSet::new();
-            handlers.iter().all(|handler| {
-                handler.as_str().is_some_and(|value| {
-                    let value = value.trim();
-                    !value.is_empty() && seen.insert(value.to_string())
-                })
-            })
-        });
+    let handlers_valid = handlers.is_some_and(|handlers| {
+        let mut seen = BTreeSet::new();
+        handlers.iter().all(|handler| {
+            exact_provider_string(Some(handler)).is_some_and(|value| seen.insert(value.to_string()))
+        })
+    });
     let named_handlers = script
         .and_then(|value| value.get("named_handlers"))
         .and_then(Value::as_array);
-    let named_handlers_valid = named_handlers
-        .is_some_and(|handlers| {
-            let mut seen_names = BTreeSet::new();
-            handlers.iter().all(|handler| {
-                let name = handler
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|name| !name.is_empty());
-                let Some(name) = name else {
-                    return false;
-                };
-                if !seen_names.insert(name.to_string()) {
-                    return false;
-                }
-                let Some(exports) = handler.get("handlers").and_then(Value::as_array) else {
-                    return false;
-                };
-                let mut seen_exports = BTreeSet::new();
-                !exports.is_empty()
-                    && exports.iter().all(|export| {
-                        export.as_str().is_some_and(|value| {
-                            let value = value.trim();
-                            !value.is_empty() && seen_exports.insert(value.to_string())
-                        })
-                    })
-            })
-        });
-    let entrypoint_present = handlers
-        .is_some_and(|handlers| !handlers.is_empty())
+    let named_handlers_valid = named_handlers.is_some_and(|handlers| {
+        let mut seen_names = BTreeSet::new();
+        handlers.iter().all(|handler| {
+            let name = handler
+                .get("name")
+                .and_then(|value| exact_provider_string(Some(value)));
+            let Some(name) = name else {
+                return false;
+            };
+            if !seen_names.insert(name.to_string()) {
+                return false;
+            }
+            let Some(exports) = handler.get("handlers").and_then(Value::as_array) else {
+                return false;
+            };
+            let mut seen_exports = BTreeSet::new();
+            !exports.is_empty()
+                && exports.iter().all(|export| {
+                    exact_provider_string(Some(export))
+                        .is_some_and(|value| seen_exports.insert(value.to_string()))
+                })
+        })
+    });
+    let entrypoint_present = handlers.is_some_and(|handlers| !handlers.is_empty())
         || named_handlers.is_some_and(|handlers| !handlers.is_empty());
     let matched = version_id.is_some()
         && detail_id == version_id
@@ -12624,9 +12613,8 @@ mod tests {
         UpsertDnsCnameArgs, VerifyHttpGateArgs, WafEventFilterInput, WafSecurityEventsSummaryArgs,
         WafTimeWindow, WorkersObservabilityListKeysArgs, WorkersObservabilityListValuesArgs,
         WorkersObservabilityQueryEventsArgs, WorkersObservabilityTimeframe,
-        WorkersUploadScriptArgs,
-        build_waf_security_events_query, normalize_waf_group_by, normalize_waf_phases,
-        query_mentions_waf, waf_security_events_filter,
+        WorkersUploadScriptArgs, build_waf_security_events_query, normalize_waf_group_by,
+        normalize_waf_phases, query_mentions_waf, waf_security_events_filter,
     };
     use crate::cloudflare::CloudflareClient;
     use crate::cloudflare::model::WorkerScript;
@@ -12876,7 +12864,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workers_upload_script_create_only_uses_version_attestation_when_settings_omit_main_module() {
+    async fn workers_upload_script_create_only_uses_version_attestation_when_settings_omit_main_module()
+     {
         let router = Router::new()
             .route(
                 "/accounts/acct-1/workers/scripts/worker-a",
@@ -13032,7 +13021,10 @@ mod tests {
         );
 
         assert_eq!(result["matched"], json!(true));
-        assert_eq!(result["code"], json!("workers.upload_version_readback_matched"));
+        assert_eq!(
+            result["code"],
+            json!("workers.upload_version_readback_matched")
+        );
         assert_eq!(result["named_handlers_present"], json!(true));
     }
 
@@ -13067,7 +13059,10 @@ mod tests {
         );
 
         assert_eq!(result["matched"], json!(false));
-        assert_eq!(result["code"], json!("workers.upload_version_readback_mismatch"));
+        assert_eq!(
+            result["code"],
+            json!("workers.upload_version_readback_mismatch")
+        );
     }
 
     #[test]
@@ -13138,8 +13133,7 @@ mod tests {
             let mut evidence = base_evidence.clone();
             match field {
                 "listing" => evidence["listing"]["etag"] = json!(" etag-1"),
-                "detail" => evidence["detail"]["resources"]["script"]["etag"] =
-                    json!("etag-1 "),
+                "detail" => evidence["detail"]["resources"]["script"]["etag"] = json!("etag-1 "),
                 "upload" => {}
                 _ => unreachable!(),
             }
@@ -13183,7 +13177,10 @@ mod tests {
         );
 
         assert_eq!(result["matched"], json!(false));
-        assert_eq!(result["code"], json!("workers.upload_script_identity_invalid"));
+        assert_eq!(
+            result["code"],
+            json!("workers.upload_script_identity_invalid")
+        );
         assert_eq!(result["script_identity_valid"], json!(false));
     }
 
@@ -13253,8 +13250,9 @@ mod tests {
 
     #[test]
     fn worker_upload_version_readback_rejects_detail_id_drift() {
-        let uploaded: WorkerScript = serde_json::from_value(json!({"id": "worker-a", "etag": "etag-1"}))
-            .expect("uploaded Worker");
+        let uploaded: WorkerScript =
+            serde_json::from_value(json!({"id": "worker-a", "etag": "etag-1"}))
+                .expect("uploaded Worker");
         let evidence = json!({
             "listing": {"etag": "etag-1"},
             "listing_after": {"etag": "etag-1"},
@@ -13277,13 +13275,17 @@ mod tests {
         );
 
         assert_eq!(result["matched"], json!(false));
-        assert_eq!(result["code"], json!("workers.upload_version_readback_mismatch"));
+        assert_eq!(
+            result["code"],
+            json!("workers.upload_version_readback_mismatch")
+        );
     }
 
     #[test]
     fn worker_upload_version_readback_rejects_missing_entrypoint() {
-        let uploaded: WorkerScript = serde_json::from_value(json!({"id": "worker-a", "etag": "etag-1"}))
-            .expect("uploaded Worker");
+        let uploaded: WorkerScript =
+            serde_json::from_value(json!({"id": "worker-a", "etag": "etag-1"}))
+                .expect("uploaded Worker");
         let evidence = json!({
             "listing": {"etag": "etag-1"},
             "listing_after": {"etag": "etag-1"},
@@ -13313,8 +13315,9 @@ mod tests {
 
     #[test]
     fn worker_upload_version_readback_rejects_missing_named_handlers() {
-        let uploaded: WorkerScript = serde_json::from_value(json!({"id": "worker-a", "etag": "etag-1"}))
-            .expect("uploaded Worker");
+        let uploaded: WorkerScript =
+            serde_json::from_value(json!({"id": "worker-a", "etag": "etag-1"}))
+                .expect("uploaded Worker");
         let evidence = json!({
             "listing": {"etag": "etag-1"},
             "listing_after": {"etag": "etag-1"},
@@ -13341,8 +13344,9 @@ mod tests {
 
     #[test]
     fn worker_upload_version_readback_rejects_non_array_named_handlers() {
-        let uploaded: WorkerScript = serde_json::from_value(json!({"id": "worker-a", "etag": "etag-1"}))
-            .expect("uploaded Worker");
+        let uploaded: WorkerScript =
+            serde_json::from_value(json!({"id": "worker-a", "etag": "etag-1"}))
+                .expect("uploaded Worker");
         let evidence = json!({
             "listing": {"etag": "etag-1"},
             "listing_after": {"etag": "etag-1"},
@@ -13370,8 +13374,9 @@ mod tests {
 
     #[test]
     fn worker_upload_version_readback_rejects_duplicate_handler_members() {
-        let uploaded: WorkerScript = serde_json::from_value(json!({"id": "worker-a", "etag": "etag-1"}))
-            .expect("uploaded Worker");
+        let uploaded: WorkerScript =
+            serde_json::from_value(json!({"id": "worker-a", "etag": "etag-1"}))
+                .expect("uploaded Worker");
         let evidence = json!({
             "listing": {"etag": "etag-1"},
             "listing_after": {"etag": "etag-1"},
@@ -13399,9 +13404,56 @@ mod tests {
     }
 
     #[test]
+    fn worker_upload_version_readback_rejects_whitespace_handler_aliases() {
+        let uploaded: WorkerScript =
+            serde_json::from_value(json!({"id": "worker-a", "etag": "etag-1"}))
+                .expect("uploaded Worker");
+        let base_evidence = json!({
+            "listing": {"id": "worker-a", "etag": "etag-1"},
+            "listing_after": {"id": "worker-a", "etag": "etag-1"},
+            "versions": [{"id": "version-1"}],
+            "versions_after": [{"id": "version-1"}],
+            "detail": {
+                "id": "version-1",
+                "resources": {"script": {
+                    "etag": "etag-1",
+                    "handlers": ["fetch"],
+                    "named_handlers": [{"name": "handler", "handlers": ["class"]}]
+                }}
+            }
+        });
+
+        for field in ["handler", "name", "export"] {
+            let mut evidence = base_evidence.clone();
+            match field {
+                "handler" => {
+                    evidence["detail"]["resources"]["script"]["handlers"][0] = json!(" fetch")
+                }
+                "name" => {
+                    evidence["detail"]["resources"]["script"]["named_handlers"][0]["name"] =
+                        json!(" handler")
+                }
+                "export" => {
+                    evidence["detail"]["resources"]["script"]["named_handlers"][0]["handlers"][0] =
+                        json!(" class")
+                }
+                _ => unreachable!(),
+            }
+            let result = super::verify_worker_upload_version_readback(
+                "worker-a",
+                &json!({"main_module": "worker.js"}),
+                &uploaded,
+                &evidence,
+            );
+            assert_eq!(result["matched"], json!(false), "{field}");
+        }
+    }
+
+    #[test]
     fn worker_upload_version_readback_rejects_stable_version_drift() {
-        let uploaded: WorkerScript = serde_json::from_value(json!({"id": "worker-a", "etag": "etag-1"}))
-            .expect("uploaded Worker");
+        let uploaded: WorkerScript =
+            serde_json::from_value(json!({"id": "worker-a", "etag": "etag-1"}))
+                .expect("uploaded Worker");
         let evidence = json!({
             "listing": {"etag": "etag-1"},
             "listing_after": {"etag": "etag-1"},

@@ -318,7 +318,8 @@ different `main_module` than the requested upload. For create-only module
 uploads, Cloudflare settings may legitimately omit `main_module`; the tool
 then requires an authenticated listing, exactly one initial version, and
 version-detail `resources.script` evidence whose etag matches the upload
-response and whose handler shape is valid. The version inventory must be
+response and whose handler shape is valid with byte-exact, nonblank handler
+names and export members. The version inventory must be
 exhaustively paginated from the endpoint's outer `result_info` metadata and
 stable across a second read; an optional nested `pagination` object must agree
 with it when present. Ambiguous, malformed,

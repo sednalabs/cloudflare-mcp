@@ -139,7 +139,8 @@ reports `readback_verification`; a different non-empty `main_module` fails
 closed. For create-only module uploads, settings may legitimately return a
 null `main_module`; the tool then requires exhaustive, stable, etag-bound
 Worker listing/version-detail evidence with a present named-handler array;
-any named handlers and their export members must be unique and nonblank.
+handler names and export members must be unique, nonblank, and byte-exact
+(leading or trailing whitespace fails closed).
 The default and named handler arrays may each be empty, but at least one valid
 entrypoint must exist overall.
 Version pagination is read from the outer `result_info` envelope metadata; an

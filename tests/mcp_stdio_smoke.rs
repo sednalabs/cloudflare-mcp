@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
@@ -1045,16 +1045,19 @@ fn spawn_fake_worker_upload_version_attestation_api() -> (String, Arc<Mutex<Vec<
     spawn_fake_worker_upload_version_attestation_api_with_identity(false)
 }
 
-fn spawn_fake_worker_upload_version_attestation_cross_target_api(
-) -> (String, Arc<Mutex<Vec<Value>>>) {
+fn spawn_fake_worker_upload_version_attestation_cross_target_api()
+-> (String, Arc<Mutex<Vec<Value>>>) {
     spawn_fake_worker_upload_version_attestation_api_with_identity(true)
 }
 
 fn spawn_fake_worker_upload_version_attestation_api_with_identity(
     cross_target: bool,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake Worker attestation API");
-    let addr = listener.local_addr().expect("fake Worker attestation API addr");
+    let listener =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind fake Worker attestation API");
+    let addr = listener
+        .local_addr()
+        .expect("fake Worker attestation API addr");
     let requests = Arc::new(Mutex::new(Vec::new()));
     let requests_for_thread = requests.clone();
     thread::spawn(move || {
@@ -1107,10 +1110,7 @@ fn spawn_fake_worker_upload_version_attestation_api_with_identity(
                     "result": {"items": [{"id": "version-1"}]},
                     "result_info": {"page": 1, "per_page": 100, "count": 1, "total_count": 1},
                 }),
-                (
-                    "GET",
-                    "/accounts/acct-1/workers/scripts/worker-a/versions/version-1",
-                ) => json!({
+                ("GET", "/accounts/acct-1/workers/scripts/worker-a/versions/version-1") => json!({
                     "success": true,
                     "errors": [],
                     "messages": [],
@@ -2685,10 +2685,7 @@ fn workers_upload_script_create_only_binds_token_and_sends_atomic_precondition()
 #[test]
 fn workers_upload_script_create_only_version_attestation_is_sanitized_through_stdio() {
     let (base_url, requests) = spawn_fake_worker_upload_version_attestation_api();
-    let mut mcp = McpStdioProcess::start_with_env(vec![(
-        "CLOUDFLARE_MCP_API_BASE_URL",
-        base_url,
-    )]);
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
     let dry_run = mcp.call_tool(
         2,
         "workers_upload_script",
@@ -2738,29 +2735,36 @@ fn workers_upload_script_create_only_version_attestation_is_sanitized_through_st
     let requests = requests.lock().expect("request log lock");
     assert_eq!(requests.len(), 7);
     assert_eq!(requests[0]["method"], json!("PUT"));
-    assert_eq!(requests[1]["path"], json!(
-        "/accounts/acct-1/workers/scripts/worker-a/settings"
-    ));
-    assert_eq!(requests[2]["path"], json!("/accounts/acct-1/workers/scripts"));
-    assert_eq!(requests[3]["path"], json!(
-        "/accounts/acct-1/workers/scripts/worker-a/versions"
-    ));
-    assert_eq!(requests[4]["path"], json!(
-        "/accounts/acct-1/workers/scripts/worker-a/versions/version-1"
-    ));
-    assert_eq!(requests[5]["path"], json!("/accounts/acct-1/workers/scripts"));
-    assert_eq!(requests[6]["path"], json!(
-        "/accounts/acct-1/workers/scripts/worker-a/versions"
-    ));
+    assert_eq!(
+        requests[1]["path"],
+        json!("/accounts/acct-1/workers/scripts/worker-a/settings")
+    );
+    assert_eq!(
+        requests[2]["path"],
+        json!("/accounts/acct-1/workers/scripts")
+    );
+    assert_eq!(
+        requests[3]["path"],
+        json!("/accounts/acct-1/workers/scripts/worker-a/versions")
+    );
+    assert_eq!(
+        requests[4]["path"],
+        json!("/accounts/acct-1/workers/scripts/worker-a/versions/version-1")
+    );
+    assert_eq!(
+        requests[5]["path"],
+        json!("/accounts/acct-1/workers/scripts")
+    );
+    assert_eq!(
+        requests[6]["path"],
+        json!("/accounts/acct-1/workers/scripts/worker-a/versions")
+    );
 }
 
 #[test]
 fn workers_upload_script_create_only_rejects_cross_target_identity_through_stdio() {
     let (base_url, requests) = spawn_fake_worker_upload_version_attestation_cross_target_api();
-    let mut mcp = McpStdioProcess::start_with_env(vec![(
-        "CLOUDFLARE_MCP_API_BASE_URL",
-        base_url,
-    )]);
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
     let dry_run = mcp.call_tool(
         2,
         "workers_upload_script",
