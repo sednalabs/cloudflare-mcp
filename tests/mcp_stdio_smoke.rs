@@ -3611,6 +3611,75 @@ fn api_mutate_keeps_invalid_json_strings_as_strings_in_dry_run_plan() {
 }
 
 #[test]
+fn api_mutate_denies_generic_worker_script_upload_and_names_curated_path() {
+    let mut mcp = McpStdioProcess::start();
+    let prepared = mcp.call_tool(
+        2,
+        "api_prepare_call",
+        json!({
+            "operation_id": "worker-script-put-content"
+        }),
+    );
+    let prepared_content = structured_content(&prepared);
+    assert_eq!(prepared_content["ok"], json!(false));
+    assert_eq!(
+        prepared_content["error"]["code"],
+        json!("api_catalog.denied_by_default")
+    );
+    assert_eq!(
+        prepared_content["preferred_tool"],
+        json!("workers_upload_script")
+    );
+
+    let generic_denial = mcp.call_tool(
+        3,
+        "api_prepare_call",
+        json!({
+            "operation_id": "account-subscriptions-create-subscription"
+        }),
+    );
+    let generic_denial_content = structured_content(&generic_denial);
+    assert_eq!(generic_denial_content["ok"], json!(false));
+    assert_eq!(
+        generic_denial_content["error"]["code"],
+        json!("api_catalog.denied_by_default")
+    );
+    assert_eq!(
+        generic_denial_content["error"]["hint"],
+        json!(
+            "Use a curated safe tool when available, or explicitly allow this operation in a future policy profile."
+        )
+    );
+
+    let response = mcp.call_tool(
+        4,
+        "api_mutate",
+        json!({
+            "operation_id": "worker-script-put-content",
+            "path_params": {
+                "account_id": "acct-1",
+                "script_name": "worker-fixture"
+            },
+            "body": {"main_module": "worker.js"},
+            "dry_run": true
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false));
+    assert_eq!(
+        content["error"]["code"],
+        json!("api_catalog.denied_by_default")
+    );
+    assert_eq!(
+        content["error"]["hint"],
+        json!(
+            "Use the curated workers_upload_script tool for this operation; generic api_mutate remains denied."
+        )
+    );
+    assert_eq!(content["preferred_tool"], json!("workers_upload_script"));
+}
+
+#[test]
 fn api_mutate_preserves_non_string_body_shapes_in_dry_run_plan() {
     let mut mcp = McpStdioProcess::start();
     let shapes = BTreeMap::from([

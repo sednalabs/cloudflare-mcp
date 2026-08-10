@@ -45531,7 +45531,7 @@
       "summary": "Put script content",
       "deprecated": false,
       "scope": "account",
-      "risk": "mutating",
+      "risk": "denied_by_default",
       "path_params": [
         "account_id",
         "script_name"
@@ -45539,7 +45539,7 @@
       "query_params": [],
       "required_query_params": [],
       "has_request_body": true,
-      "preferred_tool": null
+      "preferred_tool": "workers_upload_script"
     },
     {
       "operation_id": "worker-script-search-workers",

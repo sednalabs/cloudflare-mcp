@@ -735,6 +735,19 @@ mod tests {
     }
 
     #[test]
+    fn generic_worker_script_content_upload_is_denied_and_prefers_curated_upload() {
+        let operation =
+            find_operation("worker-script-put-content").expect("Worker script upload operation");
+
+        assert_eq!(operation.risk, ApiRisk::DeniedByDefault);
+        assert!(!operation_allowed_by_default(operation));
+        assert_eq!(
+            operation.preferred_tool.as_deref(),
+            Some("workers_upload_script")
+        );
+    }
+
+    #[test]
     fn confirmation_token_is_stable() {
         let operation = find_operation("accounts-list-accounts").expect("operation");
         let first = mutation_confirmation_token(operation, "/accounts", &None);
