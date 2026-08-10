@@ -172,6 +172,17 @@ pub struct R2PutObjectResult {
 
 type HmacSha256 = Hmac<Sha256>;
 
+const WORKER_VERSION_PAGE_SIZE: u32 = 100;
+const WORKER_VERSION_MAX_PAGES: u32 = 32;
+const WORKER_VERSION_MAX_ITEMS: usize = 1024;
+
+#[derive(Debug, Clone)]
+struct WorkerVersionInventory {
+    items: Vec<Value>,
+    total_count: u32,
+    total_pages: u32,
+}
+
 struct R2RequestOptions<'a> {
     range: Option<&'a str>,
     content_type: Option<&'a str>,
@@ -1485,6 +1496,268 @@ impl CloudflareClient {
                 "Verify Worker script name and Cloudflare Workers API response schema.",
             )
         })
+    }
+
+    /// Read the complete initial Worker version evidence after a create-only
+    /// upload.  Settings are not authoritative for module uploads (Cloudflare
+    /// may legitimately return `main_module: null`), so bind the readback to
+    /// the sole version returned for this newly-created script and fetch that
+    /// version's detail separately.  Any ambiguous or malformed version
+    /// inventory fails closed before the caller can continue.
+    pub async fn get_worker_initial_version_evidence(
+        &self,
+        account_id: &str,
+        script_name: &str,
+    ) -> Result<Value, AdapterError> {
+        let account_id = require_non_empty("account_id", account_id)?;
+        let script_name = require_non_empty("script_name", script_name)?;
+        let listing_before_page = self.list_workers(account_id, None).await?;
+        let listing_before =
+            worker_listing_target(&listing_before_page.items, script_name)?.clone();
+        let versions_before = self
+            .list_worker_versions_exhaustive(account_id, script_name)
+            .await?;
+        if versions_before.items.len() != 1 {
+            return Err(AdapterError::new(
+                "workers.upload_version_readback_ambiguous",
+                format!(
+                    "Worker version readback returned {} versions; expected exactly one",
+                    versions_before.items.len()
+                ),
+                "Reconcile the provider version inventory before retrying or continuing the create-only sequence.",
+            ));
+        }
+        let version = versions_before.items[0].clone();
+        let version_id = worker_version_id(
+            &version,
+            "Worker version readback omitted a canonical version id",
+        )?;
+        let detail_path = format!(
+            "/accounts/{account_id}/workers/scripts/{}/versions/{}",
+            path_segment(script_name),
+            path_segment(version_id),
+        );
+        let detail = self
+            .api_request(
+                "cloudflare.workers.versions.detail",
+                reqwest::Method::GET,
+                &detail_path,
+                &[],
+                None,
+            )
+            .await?;
+        let detail_id = worker_version_id(
+            &detail,
+            "Worker version detail omitted a canonical version id",
+        )?;
+        if detail_id != version_id {
+            return Err(AdapterError::new(
+                "workers.upload_version_readback_conflict",
+                "Worker version detail id did not match the sole listed version",
+                "Reconcile the provider response; conflicting version evidence is not authoritative.",
+            ));
+        }
+
+        let listing_after_page = self.list_workers(account_id, None).await?;
+        let listing_after_item =
+            worker_listing_target(&listing_after_page.items, script_name)?.clone();
+        let listing_etag_before = worker_script_etag(&listing_before)?;
+        let listing_etag_after = worker_script_etag(&listing_after_item)?;
+        if worker_listing_identity(&listing_before)?
+            != worker_listing_identity(&listing_after_item)?
+            || listing_etag_before != listing_etag_after
+        {
+            return Err(AdapterError::new(
+                "workers.upload_listing_readback_drift",
+                "Worker listing identity or etag changed during version readback",
+                "Reconcile the Worker listing and version detail before retrying or continuing the create-only sequence.",
+            ));
+        }
+        let versions_after = self
+            .list_worker_versions_exhaustive(account_id, script_name)
+            .await?;
+        if versions_after.items.len() != 1 {
+            return Err(AdapterError::new(
+                "workers.upload_version_readback_ambiguous",
+                format!(
+                    "Worker stable version readback returned {} versions; expected exactly one",
+                    versions_after.items.len()
+                ),
+                "Reconcile the provider version inventory before retrying or continuing the create-only sequence.",
+            ));
+        }
+        let version_id_after = worker_version_id(
+            &versions_after.items[0],
+            "Stable Worker version readback omitted a canonical version id",
+        )?;
+        if version_id_after != version_id {
+            return Err(AdapterError::new(
+                "workers.upload_version_readback_drift",
+                "Worker version id changed during version detail readback",
+                "Reconcile the Worker version inventory before retrying or continuing the create-only sequence.",
+            ));
+        }
+        Ok(json!({
+            "listing": listing_before,
+            "listing_after": listing_after_item,
+            "versions": versions_before.items,
+            "versions_after": versions_after.items,
+            "version_pagination": {
+                "total_count": versions_before.total_count,
+                "total_pages": versions_before.total_pages,
+                "stable_total_count": versions_after.total_count,
+                "stable_total_pages": versions_after.total_pages,
+            },
+            "version": version,
+            "detail": detail,
+        }))
+    }
+
+    async fn list_worker_versions_exhaustive(
+        &self,
+        account_id: &str,
+        script_name: &str,
+    ) -> Result<WorkerVersionInventory, AdapterError> {
+        let mut page = 1u32;
+        let mut seen_pages = BTreeSet::new();
+        let mut items = Vec::new();
+        let mut seen_ids = BTreeSet::new();
+        let mut expected_total_count = None;
+        let mut expected_total_pages = None;
+
+        loop {
+            if page > WORKER_VERSION_MAX_PAGES || !seen_pages.insert(page) {
+                return Err(AdapterError::new(
+                    "workers.upload_version_readback_pagination_invalid",
+                    "Worker version pagination exceeded the bounded page contract or repeated a page",
+                    "Reconcile the provider version inventory before retrying or continuing the create-only sequence.",
+                ));
+            }
+            let (result, result_info) = self
+                .get_worker_versions_page(account_id, script_name, page, WORKER_VERSION_PAGE_SIZE)
+                .await?;
+            let page_items = result
+                .get("items")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    AdapterError::new(
+                        "workers.upload_version_readback_invalid",
+                        "Worker version readback did not contain the expected items array",
+                        "Reconcile the provider response; no create-only upload may continue from malformed version evidence.",
+                    )
+                })?;
+            let metadata = worker_version_page_metadata(&result, result_info.as_ref(), page)?;
+            if expected_total_count
+                .replace(metadata.total_count)
+                .is_some_and(|old| old != metadata.total_count)
+                || expected_total_pages
+                    .replace(metadata.total_pages)
+                    .is_some_and(|old| old != metadata.total_pages)
+            {
+                return Err(AdapterError::new(
+                    "workers.upload_version_readback_pagination_drift",
+                    "Worker version pagination metadata changed between pages",
+                    "Reconcile the provider version inventory before retrying or continuing the create-only sequence.",
+                ));
+            }
+            if page_items.len() as u32 > metadata.per_page {
+                return Err(AdapterError::new(
+                    "workers.upload_version_readback_pagination_invalid",
+                    "Worker version page contained more items than its authoritative page size",
+                    "Reconcile the provider response before retrying or continuing the create-only sequence.",
+                ));
+            }
+            if metadata
+                .count
+                .is_some_and(|count| count as usize != page_items.len())
+            {
+                return Err(AdapterError::new(
+                    "workers.upload_version_readback_pagination_conflict",
+                    "Worker version page count did not match its authoritative result_info count",
+                    "Reconcile the provider response before retrying or continuing the create-only sequence.",
+                ));
+            }
+            for item in page_items {
+                let id = worker_version_id(
+                    item,
+                    "Worker version page contained an item without a canonical id",
+                )?;
+                if !seen_ids.insert(id.to_string()) {
+                    return Err(AdapterError::new(
+                        "workers.upload_version_readback_duplicate",
+                        "Worker version pagination contained a duplicate version id",
+                        "Reconcile the provider version inventory before retrying or continuing the create-only sequence.",
+                    ));
+                }
+                items.push(item.clone());
+                if items.len() > WORKER_VERSION_MAX_ITEMS {
+                    return Err(AdapterError::new(
+                        "workers.upload_version_readback_pagination_invalid",
+                        "Worker version pagination exceeded the bounded item contract",
+                        "Reconcile the provider version inventory before retrying or continuing the create-only sequence.",
+                    ));
+                }
+            }
+            if page == metadata.total_pages {
+                if items.len() as u32 != metadata.total_count {
+                    return Err(AdapterError::new(
+                        "workers.upload_version_readback_truncated",
+                        "Worker version pagination did not exhaust the authoritative total count",
+                        "Reconcile the provider version inventory before retrying or continuing the create-only sequence.",
+                    ));
+                }
+                return Ok(WorkerVersionInventory {
+                    items,
+                    total_count: metadata.total_count,
+                    total_pages: metadata.total_pages,
+                });
+            }
+            if page_items.is_empty() {
+                return Err(AdapterError::new(
+                    "workers.upload_version_readback_truncated",
+                    "Worker version pagination returned an empty non-terminal page",
+                    "Reconcile the provider version inventory before retrying or continuing the create-only sequence.",
+                ));
+            }
+            page += 1;
+        }
+    }
+
+    async fn get_worker_versions_page(
+        &self,
+        account_id: &str,
+        script_name: &str,
+        page: u32,
+        per_page: u32,
+    ) -> Result<(Value, Option<PageInfo>), AdapterError> {
+        let account_id = require_non_empty("account_id", account_id)?;
+        let script_name = require_non_empty("script_name", script_name)?;
+        let token = self.bearer_token()?;
+        let url = self.endpoint(&format!(
+            "/accounts/{account_id}/workers/scripts/{}/versions",
+            path_segment(script_name),
+        ));
+        let envelope: CloudflareEnvelope<Value> = self
+            .send_envelope(
+                "cloudflare.workers.versions.list",
+                RetryPolicy::Idempotent,
+                || {
+                    self.http
+                        .get(url.clone())
+                        .query(&[("page", page), ("per_page", per_page)])
+                        .bearer_auth(&token)
+                        .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone())
+                },
+            )
+            .await?;
+        let result = envelope.result.ok_or_else(|| {
+            AdapterError::new(
+                "workers.upload_version_readback_invalid",
+                "Worker version readback omitted its result payload",
+                "Reconcile the provider response before retrying or continuing the create-only sequence.",
+            )
+        })?;
+        Ok((result, envelope.result_info))
     }
 
     pub async fn patch_worker_settings(
@@ -2803,6 +3076,325 @@ fn is_retryable_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
+#[derive(Debug, Clone, Copy)]
+struct WorkerVersionPageMetadata {
+    page: u32,
+    per_page: u32,
+    count: Option<u32>,
+    total_count: u32,
+    total_pages: u32,
+}
+
+fn worker_version_page_metadata(
+    value: &Value,
+    result_info: Option<&PageInfo>,
+    expected_page: u32,
+) -> Result<WorkerVersionPageMetadata, AdapterError> {
+    let pagination_value = value.get("pagination");
+    let result_info = result_info.ok_or_else(|| {
+        AdapterError::new(
+            "workers.upload_version_readback_pagination_invalid",
+            "Worker version readback omitted authoritative result_info pagination metadata",
+            "Reconcile the provider response before retrying or continuing the create-only sequence.",
+        )
+    })?;
+    let page = result_info.page.ok_or_else(|| {
+        AdapterError::new(
+            "workers.upload_version_readback_pagination_invalid",
+            "Worker version result_info omitted page",
+            "Reconcile the provider response before retrying or continuing the create-only sequence.",
+        )
+    })?;
+    let per_page = result_info.per_page.ok_or_else(|| {
+        AdapterError::new(
+            "workers.upload_version_readback_pagination_invalid",
+            "Worker version result_info omitted per_page",
+            "Reconcile the provider response before retrying or continuing the create-only sequence.",
+        )
+    })?;
+    let total_count = result_info.total_count.ok_or_else(|| {
+        AdapterError::new(
+            "workers.upload_version_readback_pagination_invalid",
+            "Worker version result_info omitted total_count",
+            "Reconcile the provider response before retrying or continuing the create-only sequence.",
+        )
+    })?;
+    let derived_total_pages = if total_count == 0 {
+        1
+    } else if per_page == 0 {
+        0
+    } else {
+        total_count / per_page + if total_count % per_page != 0 { 1 } else { 0 }
+    };
+    let outer = WorkerVersionPageMetadata {
+        page,
+        per_page,
+        count: result_info.count,
+        total_count,
+        total_pages: result_info.total_pages.unwrap_or(derived_total_pages),
+    };
+    let page_item_count = value
+        .get("items")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .ok_or_else(|| {
+            AdapterError::new(
+                "workers.upload_version_readback_invalid",
+                "Worker version readback did not contain an items array for pagination validation",
+                "Reconcile the provider response before retrying or continuing the create-only sequence.",
+            )
+        })?;
+    if outer
+        .count
+        .is_some_and(|count| count as usize != page_item_count)
+    {
+        return Err(AdapterError::new(
+            "workers.upload_version_readback_pagination_conflict",
+            "Worker version page count did not match its authoritative result_info count",
+            "Reconcile the provider response before retrying or continuing the create-only sequence.",
+        ));
+    }
+    if let Some(pagination) = pagination_value {
+        let pagination = pagination.as_object().ok_or_else(|| {
+            AdapterError::new(
+                "workers.upload_version_readback_pagination_invalid",
+                "Worker version nested pagination metadata was not an object",
+                "Reconcile the provider response before retrying or continuing the create-only sequence.",
+            )
+        })?;
+        let number = |name: &str| {
+            pagination
+                .get(name)
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| {
+                    AdapterError::new(
+                        "workers.upload_version_readback_pagination_invalid",
+                        format!("Worker version nested pagination field {name} was missing or invalid"),
+                        "Reconcile the provider response before retrying or continuing the create-only sequence.",
+                    )
+                })
+        };
+        let optional_number = |name: &str| {
+            pagination
+                .get(name)
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .and_then(|value| u32::try_from(value).ok())
+                        .ok_or_else(|| {
+                            AdapterError::new(
+                                "workers.upload_version_readback_pagination_invalid",
+                                format!("Worker version nested pagination field {name} was invalid"),
+                                "Reconcile the provider response before retrying or continuing the create-only sequence.",
+                            )
+                        })
+                })
+                .transpose()
+        };
+        let nested_page = number("page")?;
+        let nested_per_page = number("per_page")?;
+        let nested_total_count = number("total_count")?;
+        if nested_page == 0 || nested_per_page == 0 {
+            return Err(AdapterError::new(
+                "workers.upload_version_readback_pagination_invalid",
+                "Worker version nested pagination page or per_page was zero",
+                "Reconcile the provider response before retrying or continuing the create-only sequence.",
+            ));
+        }
+        let nested_derived_total_pages = if nested_total_count == 0 {
+            1
+        } else {
+            nested_total_count / nested_per_page
+                + if nested_total_count % nested_per_page != 0 {
+                    1
+                } else {
+                    0
+                }
+        };
+        let nested = WorkerVersionPageMetadata {
+            page: nested_page,
+            per_page: nested_per_page,
+            count: optional_number("count")?,
+            total_count: nested_total_count,
+            total_pages: pagination
+                .get("total_pages")
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .and_then(|value| u32::try_from(value).ok())
+                        .ok_or_else(|| {
+                            AdapterError::new(
+                                "workers.upload_version_readback_pagination_invalid",
+                                "Worker version nested pagination total_pages was invalid",
+                                "Reconcile the provider response before retrying or continuing the create-only sequence.",
+                            )
+                        })
+                })
+                .transpose()?
+                .unwrap_or(nested_derived_total_pages),
+        };
+        if nested
+            .count
+            .is_some_and(|count| count as usize != page_item_count)
+        {
+            return Err(AdapterError::new(
+                "workers.upload_version_readback_pagination_conflict",
+                "Worker version nested pagination count did not match its page items",
+                "Reconcile the provider response before retrying or continuing the create-only sequence.",
+            ));
+        }
+        if outer.page != nested.page
+            || outer.per_page != nested.per_page
+            || outer.total_count != nested.total_count
+            || outer.total_pages != nested.total_pages
+            || matches!((outer.count, nested.count), (Some(a), Some(b)) if a != b)
+        {
+            return Err(AdapterError::new(
+                "workers.upload_version_readback_pagination_conflict",
+                "Worker version readback contained conflicting pagination metadata",
+                "Reconcile the provider response before retrying or continuing the create-only sequence.",
+            ));
+        }
+    }
+    if outer.page != expected_page
+        || outer.page == 0
+        || outer.per_page == 0
+        || outer.total_pages == 0
+        || outer.total_pages > WORKER_VERSION_MAX_PAGES
+        || outer.total_count as usize > WORKER_VERSION_MAX_ITEMS
+        || outer.page > outer.total_pages
+        || outer.total_pages
+            != if outer.total_count == 0 {
+                1
+            } else {
+                outer.total_count / outer.per_page
+                    + if outer.total_count % outer.per_page != 0 {
+                        1
+                    } else {
+                        0
+                    }
+            }
+    {
+        return Err(AdapterError::new(
+            "workers.upload_version_readback_pagination_invalid",
+            "Worker version pagination metadata violated the bounded page contract",
+            "Reconcile the provider response before retrying or continuing the create-only sequence.",
+        ));
+    }
+    if let Some(count) = outer.count {
+        if count as usize > WORKER_VERSION_MAX_ITEMS {
+            return Err(AdapterError::new(
+                "workers.upload_version_readback_pagination_invalid",
+                "Worker version page count exceeded the bounded item contract",
+                "Reconcile the provider response before retrying or continuing the create-only sequence.",
+            ));
+        }
+    }
+    Ok(outer)
+}
+
+fn worker_version_id<'a>(value: &'a Value, message: &'static str) -> Result<&'a str, AdapterError> {
+    value
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty() && id.trim() == *id)
+        .ok_or_else(|| {
+            AdapterError::new(
+                "workers.upload_version_readback_invalid",
+                message,
+                "Reconcile the provider response; no create-only upload may continue from malformed version evidence.",
+            )
+        })
+}
+
+fn worker_listing_target<'a>(
+    items: &'a [WorkerScript],
+    script_name: &str,
+) -> Result<&'a WorkerScript, AdapterError> {
+    let mut matches = Vec::new();
+    for item in items {
+        if worker_listing_identity(item)? == script_name {
+            matches.push(item);
+        }
+    }
+    if matches.len() != 1 {
+        return Err(AdapterError::new(
+            "workers.upload_listing_readback_ambiguous",
+            format!(
+                "Worker listing readback returned {} canonical matches for the created script; expected exactly one",
+                matches.len()
+            ),
+            "Reconcile the authenticated Worker listing before retrying or continuing the create-only sequence.",
+        ));
+    }
+    Ok(matches[0])
+}
+
+fn worker_listing_identity(script: &WorkerScript) -> Result<&str, AdapterError> {
+    let mut identities = Vec::new();
+    for identity in [script.script_name.as_deref(), script.id.as_deref()] {
+        if let Some(identity) = identity {
+            if identity.trim().is_empty() {
+                return Err(AdapterError::new(
+                    "workers.upload_listing_readback_invalid",
+                    "Worker listing item contained a blank identity/name",
+                    "Reconcile the authenticated Worker listing before retrying or continuing the create-only sequence.",
+                ));
+            }
+            identities.push(identity);
+        }
+    }
+    if let Some(identity) = script.extra.get("name") {
+        let identity = identity.as_str().ok_or_else(|| {
+            AdapterError::new(
+                "workers.upload_listing_readback_invalid",
+                "Worker listing item contained a non-string identity/name",
+                "Reconcile the authenticated Worker listing before retrying or continuing the create-only sequence.",
+            )
+        })?;
+        if identity.trim().is_empty() {
+            return Err(AdapterError::new(
+                "workers.upload_listing_readback_invalid",
+                "Worker listing item contained a blank identity/name",
+                "Reconcile the authenticated Worker listing before retrying or continuing the create-only sequence.",
+            ));
+        }
+        identities.push(identity);
+    }
+    let Some(first) = identities.first().copied() else {
+        return Err(AdapterError::new(
+            "workers.upload_listing_readback_invalid",
+            "Worker listing item omitted a canonical identity/name",
+            "Reconcile the authenticated Worker listing before retrying or continuing the create-only sequence.",
+        ));
+    };
+    if identities.iter().any(|identity| *identity != first) {
+        return Err(AdapterError::new(
+            "workers.upload_listing_readback_conflict",
+            "Worker listing item contained conflicting identity/name fields",
+            "Reconcile the authenticated Worker listing before retrying or continuing the create-only sequence.",
+        ));
+    }
+    Ok(first)
+}
+
+fn worker_script_etag(script: &WorkerScript) -> Result<&str, AdapterError> {
+    let etag = script
+        .extra
+        .get("etag")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.trim() == *value)
+        .ok_or_else(|| {
+            AdapterError::new(
+                "workers.upload_listing_readback_invalid",
+                "Worker listing item omitted a canonical non-whitespace etag",
+                "Reconcile the authenticated Worker listing before retrying or continuing the create-only sequence.",
+            )
+        })?;
+    Ok(etag)
+}
+
 fn classify_worker_upload_error(err: AdapterError, create_only: bool) -> AdapterError {
     if create_only && err.status == Some(StatusCode::PRECONDITION_FAILED.as_u16()) {
         return AdapterError::new(
@@ -2965,12 +3557,13 @@ fn cloudflare_api_error_detail(error: &CloudflareApiError) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use axum::body::{Body, Bytes};
-    use axum::extract::{Path, State};
+    use axum::extract::{Path, Query, State};
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::Response;
     use axum::routing::{get, post, put};
@@ -2980,9 +3573,10 @@ mod tests {
 
     use super::{
         AdapterError, CloudflareApiError, CloudflareClient, is_d1_sqlite_auth_error, path_segment,
-        with_request_api_token_override,
+        with_request_api_token_override, worker_listing_identity, worker_version_id,
+        worker_version_page_metadata,
     };
-    use crate::cloudflare::model::AccessPolicyWrite;
+    use crate::cloudflare::model::{AccessPolicyWrite, PageInfo, WorkerScript};
     use crate::config::{ApiTokenSource, CloudflareApiConfig};
 
     fn fixture_material(label: &str) -> String {
@@ -3234,6 +3828,422 @@ mod tests {
             .await
             .expect("legacy update upload");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn worker_initial_version_evidence_binds_sole_version_to_detail() {
+        let router = Router::new()
+            .route(
+                "/accounts/acct-1/workers/scripts",
+                get(|| async {
+                    Json(json!({
+                        "success": true,
+                        "errors": [],
+                        "messages": [],
+                        "result": [{"id": "worker-a", "etag": "etag-1"}],
+                        "result_info": {"page": 1, "per_page": 1000, "count": 1, "total_count": 1},
+                    }))
+                }),
+            )
+            .route(
+                "/accounts/acct-1/workers/scripts/worker-a/versions",
+                get(|| async {
+                    Json(json!({
+                        "success": true,
+                        "errors": [],
+                        "messages": [],
+                        "result": {
+                            "items": [{"id": "version-1", "number": 1}]
+                        },
+                        "result_info": {"page": 1, "per_page": 100, "count": 1, "total_count": 1},
+                    }))
+                }),
+            )
+            .route(
+                "/accounts/acct-1/workers/scripts/worker-a/versions/version-1",
+                get(|| async {
+                    Json(json!({
+                        "success": true,
+                        "errors": [],
+                        "messages": [],
+                        "result": {
+                            "id": "version-1",
+                            "resources": {
+                                "script": {
+                                    "etag": "etag-1",
+                                    "handlers": ["fetch", "scheduled"],
+                                    "named_handlers": [{"name": "handler", "handlers": ["class"]}],
+                                }
+                            }
+                        },
+                    }))
+                }),
+            );
+
+        let base = spawn_router(router).await;
+        let client = CloudflareClient::new(test_config(base)).expect("client");
+        let evidence = client
+            .get_worker_initial_version_evidence("acct-1", "worker-a")
+            .await
+            .expect("version evidence");
+
+        assert_eq!(evidence["versions"][0]["id"], json!("version-1"));
+        assert_eq!(
+            evidence["detail"]["resources"]["script"]["etag"],
+            json!("etag-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_version_inventory_exhausts_outer_result_info_pages() {
+        async fn list_versions(Query(query): Query<HashMap<String, String>>) -> Json<Value> {
+            let page = query
+                .get("page")
+                .and_then(|value| value.parse::<u32>().ok())
+                .expect("page query");
+            let (items, count) = match page {
+                1 => (json!([{ "id": "version-1" }]), 1),
+                2 => (json!([{ "id": "version-2" }]), 1),
+                _ => panic!("unexpected page {page}"),
+            };
+            Json(json!({
+                "success": true,
+                "errors": [],
+                "messages": [],
+                "result": {"items": items},
+                "result_info": {
+                    "page": page,
+                    "per_page": 1,
+                    "count": count,
+                    "total_count": 2
+                }
+            }))
+        }
+
+        let router = Router::new().route(
+            "/accounts/acct-1/workers/scripts/worker-a/versions",
+            get(list_versions),
+        );
+        let client =
+            CloudflareClient::new(test_config(spawn_router(router).await)).expect("client");
+        let inventory = client
+            .list_worker_versions_exhaustive("acct-1", "worker-a")
+            .await
+            .expect("exhaustive inventory");
+
+        assert_eq!(inventory.total_count, 2);
+        assert_eq!(inventory.total_pages, 2);
+        assert_eq!(
+            inventory
+                .items
+                .iter()
+                .map(|item| item["id"].as_str().expect("version id"))
+                .collect::<Vec<_>>(),
+            vec!["version-1", "version-2"]
+        );
+    }
+
+    #[test]
+    fn worker_version_page_metadata_rejects_missing_outer_result_info() {
+        let err = worker_version_page_metadata(&json!({"items": []}), None, 1)
+            .expect_err("missing result_info must fail closed");
+        assert_eq!(
+            err.code,
+            "workers.upload_version_readback_pagination_invalid"
+        );
+    }
+
+    #[test]
+    fn worker_version_page_metadata_rejects_conflicting_nested_pagination() {
+        let result_info = PageInfo {
+            page: Some(1),
+            per_page: Some(1),
+            count: Some(1),
+            total_count: Some(2),
+            total_pages: Some(2),
+        };
+        let err = worker_version_page_metadata(
+            &json!({
+                "items": [{"id": "version-1"}],
+                "pagination": {"page": 1, "per_page": 1, "count": 1, "total_count": 3, "total_pages": 3}
+            }),
+            Some(&result_info),
+            1,
+        )
+        .expect_err("conflicting nested metadata must fail closed");
+        assert_eq!(
+            err.code,
+            "workers.upload_version_readback_pagination_conflict"
+        );
+    }
+
+    #[test]
+    fn worker_version_page_metadata_rejects_nested_count_without_outer_count() {
+        let result_info = PageInfo {
+            page: Some(1),
+            per_page: Some(100),
+            count: None,
+            total_count: Some(1),
+            total_pages: Some(1),
+        };
+        let err = worker_version_page_metadata(
+            &json!({
+                "items": [{"id": "version-1"}],
+                "pagination": {"page": 1, "per_page": 100, "count": 2, "total_count": 1, "total_pages": 1}
+            }),
+            Some(&result_info),
+            1,
+        )
+        .expect_err("nested count must match page items even without outer count");
+        assert_eq!(
+            err.code,
+            "workers.upload_version_readback_pagination_conflict"
+        );
+    }
+
+    #[test]
+    fn worker_version_page_metadata_allows_empty_inventory_total_count() {
+        let result_info = PageInfo {
+            page: Some(1),
+            per_page: Some(100),
+            count: Some(0),
+            total_count: Some(0),
+            total_pages: Some(1),
+        };
+        let metadata = worker_version_page_metadata(&json!({"items": []}), Some(&result_info), 1)
+            .expect("zero total_count is a valid exhaustive page");
+        assert_eq!(metadata.total_count, 0);
+    }
+
+    #[test]
+    fn worker_version_id_rejects_whitespace_aliases() {
+        let valid = json!({"id": "version-1"});
+        assert_eq!(
+            worker_version_id(&valid, "test version id").expect("canonical id"),
+            "version-1"
+        );
+
+        for invalid in [json!({"id": " version-1"}), json!({"id": "version-1 "})] {
+            let err = worker_version_id(&invalid, "test version id")
+                .expect_err("whitespace aliases must fail closed");
+            assert_eq!(err.code, "workers.upload_version_readback_invalid");
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_version_inventory_rejects_truncated_outer_result_info_pages() {
+        let router = Router::new().route(
+            "/accounts/acct-1/workers/scripts/worker-a/versions",
+            get(|Query(query): Query<HashMap<String, String>>| async move {
+                let page = query
+                    .get("page")
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .expect("page query");
+                Json(match page {
+                    1 => json!({
+                        "success": true,
+                        "errors": [],
+                        "messages": [],
+                        "result": {"items": [{"id": "version-1"}]},
+                        "result_info": {
+                            "page": 1,
+                            "per_page": 1,
+                            "count": 1,
+                            "total_count": 2,
+                            "total_pages": 2
+                        }
+                    }),
+                    2 => json!({
+                        "success": true,
+                        "errors": [],
+                        "messages": [],
+                        "result": {"items": []},
+                        "result_info": {
+                            "page": 2,
+                            "per_page": 1,
+                            "count": 0,
+                            "total_count": 2,
+                            "total_pages": 2
+                        }
+                    }),
+                    _ => panic!("unexpected page {page}"),
+                })
+            }),
+        );
+        let client =
+            CloudflareClient::new(test_config(spawn_router(router).await)).expect("client");
+        let err = client
+            .list_worker_versions_exhaustive("acct-1", "worker-a")
+            .await
+            .expect_err("truncated inventory must fail closed");
+        assert_eq!(err.code, "workers.upload_version_readback_truncated");
+    }
+
+    #[tokio::test]
+    async fn worker_initial_version_evidence_rejects_multiple_versions() {
+        let router = Router::new()
+            .route(
+                "/accounts/acct-1/workers/scripts",
+                get(|| async {
+                    Json(json!({
+                        "success": true,
+                        "errors": [],
+                        "messages": [],
+                        "result": [{"id": "worker-a", "etag": "etag-1"}],
+                    }))
+                }),
+            )
+            .route(
+                "/accounts/acct-1/workers/scripts/worker-a/versions",
+                get(|| async {
+                    Json(json!({
+                        "success": true,
+                        "errors": [],
+                        "messages": [],
+                        "result": {
+                            "items": [{"id": "version-1"}, {"id": "version-2"}]
+                        },
+                        "result_info": {"page": 1, "per_page": 100, "count": 2, "total_count": 2},
+                    }))
+                }),
+            );
+        let base = spawn_router(router).await;
+        let client = CloudflareClient::new(test_config(base)).expect("client");
+        let err = client
+            .get_worker_initial_version_evidence("acct-1", "worker-a")
+            .await
+            .expect_err("ambiguous version inventory");
+
+        assert_eq!(err.code, "workers.upload_version_readback_ambiguous");
+    }
+
+    #[tokio::test]
+    async fn worker_initial_version_evidence_rejects_malformed_version_shape() {
+        let router = Router::new()
+            .route(
+                "/accounts/acct-1/workers/scripts",
+                get(|| async {
+                    Json(json!({
+                        "success": true,
+                        "errors": [],
+                        "messages": [],
+                        "result": [{"id": "worker-a", "etag": "etag-1"}],
+                    }))
+                }),
+            )
+            .route(
+                "/accounts/acct-1/workers/scripts/worker-a/versions",
+                get(|| async {
+                    Json(json!({
+                        "success": true,
+                        "errors": [],
+                        "messages": [],
+                        "result": [{"id": "version-1"}],
+                    }))
+                }),
+            );
+        let base = spawn_router(router).await;
+        let client = CloudflareClient::new(test_config(base)).expect("client");
+        let err = client
+            .get_worker_initial_version_evidence("acct-1", "worker-a")
+            .await
+            .expect_err("bare version array must be rejected");
+
+        assert_eq!(err.code, "workers.upload_version_readback_invalid");
+    }
+
+    #[tokio::test]
+    async fn worker_initial_version_evidence_rejects_listing_etag_drift() {
+        let listing_calls = Arc::new(AtomicUsize::new(0));
+        let listing_calls_for_route = listing_calls.clone();
+        let router = Router::new()
+            .route(
+                "/accounts/acct-1/workers/scripts",
+                get(move || {
+                    let listing_calls = listing_calls_for_route.clone();
+                    async move {
+                        let etag = if listing_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            "etag-1"
+                        } else {
+                            "etag-2"
+                        };
+                        Json(json!({
+                            "success": true,
+                            "errors": [],
+                            "messages": [],
+                            "result": [{"id": "worker-a", "etag": etag}],
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/accounts/acct-1/workers/scripts/worker-a/versions",
+                get(|| async {
+                    Json(json!({
+                        "success": true,
+                        "errors": [],
+                        "messages": [],
+                        "result": {
+                            "items": [{"id": "version-1"}]
+                        },
+                        "result_info": {"page": 1, "per_page": 100, "count": 1, "total_count": 1},
+                    }))
+                }),
+            )
+            .route(
+                "/accounts/acct-1/workers/scripts/worker-a/versions/version-1",
+                get(|| async {
+                    Json(json!({
+                        "success": true,
+                        "errors": [],
+                        "messages": [],
+                        "result": {"id": "version-1"},
+                    }))
+                }),
+            );
+        let base = spawn_router(router).await;
+        let client = CloudflareClient::new(test_config(base)).expect("client");
+        let err = client
+            .get_worker_initial_version_evidence("acct-1", "worker-a")
+            .await
+            .expect_err("listing drift must stop readback");
+
+        assert_eq!(err.code, "workers.upload_listing_readback_drift");
+    }
+
+    #[test]
+    fn worker_listing_identity_rejects_blank_alias() {
+        let script: WorkerScript = serde_json::from_value(json!({
+            "id": "worker-a",
+            "script_name": ""
+        }))
+        .expect("Worker listing fixture");
+        let err = worker_listing_identity(&script).expect_err("blank alias must fail closed");
+        assert_eq!(err.code, "workers.upload_listing_readback_invalid");
+    }
+
+    #[test]
+    fn worker_listing_identity_rejects_non_string_name_alias() {
+        let script: WorkerScript = serde_json::from_value(json!({
+            "id": "worker-a",
+            "name": 42
+        }))
+        .expect("Worker listing fixture");
+        let err =
+            worker_listing_identity(&script).expect_err("non-string name alias must fail closed");
+        assert_eq!(err.code, "workers.upload_listing_readback_invalid");
+    }
+
+    #[test]
+    fn worker_listing_identity_requires_byte_identical_aliases() {
+        let script: WorkerScript = serde_json::from_value(json!({
+            "id": "worker-a",
+            "script_name": " worker-a "
+        }))
+        .expect("Worker listing fixture");
+        let err =
+            worker_listing_identity(&script).expect_err("non-identical aliases must fail closed");
+        assert_eq!(err.code, "workers.upload_listing_readback_conflict");
     }
 
     #[test]
