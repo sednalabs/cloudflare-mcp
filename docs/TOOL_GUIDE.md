@@ -67,6 +67,10 @@ as `_worker.bundle`, and its JavaScript modules are excluded from the static
 asset manifest. Source maps are omitted. Symlinks, unsafe names, a missing
 entrypoint, unsupported module types, and conflicting worker artifacts fail
 closed before provider access; dry-run makes no Cloudflare calls.
+Every discovered module is canonicalized, required to remain beneath the
+canonical `_worker.js` root, restated after reading, and bounded by the complete
+25 MiB module-graph limit. Generated bundles use an exclusively created
+directory beneath the canonical temporary root and a create-new file.
 
 ## D1
 
@@ -146,7 +150,11 @@ binding, and schedule preservation contract. Apply repeats those reads, uses
 the content-only endpoint, and reports success only when exact upload identity
 and post-apply preservation match. Binding values and secrets are never
 returned; changed or incomplete preservation state fails closed before
-mutation. For create-only module uploads, settings may legitimately return a
+mutation. Transport-only `bindings` and `parts` upload metadata is not compared
+to server-enriched or redacted binding objects; exact pre/post settings digests
+prove preservation instead. Cron formatting whitespace is normalized before
+schedule identity and duplicate checks. For create-only module uploads,
+settings may legitimately return a
 null `main_module`; the tool then requires exhaustive, stable, etag-bound
 Worker listing/version-detail evidence with a present named-handler array;
 handler names and export members must be unique, nonblank, and byte-exact

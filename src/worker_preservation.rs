@@ -111,8 +111,8 @@ impl WorkerPreservationSnapshot {
                     "Do not upload until every binding has an unambiguous name and type.",
                 )
             })?;
-            let name = required_string(object, "name", "binding", index)?;
-            let binding_type = required_string(object, "type", "binding", index)?;
+            let name = required_binding_string(object, "name", index)?;
+            let binding_type = required_binding_string(object, "type", index)?;
             if !binding_names.insert(name.to_string()) {
                 return Err(WorkerPreservationError::new(
                     "workers.upload_preservation_binding_ambiguous",
@@ -136,10 +136,10 @@ impl WorkerPreservationSnapshot {
         let mut unique_crons = BTreeSet::new();
         for (index, schedule) in schedules.iter().enumerate() {
             let cron = schedule.cron.trim();
-            if cron.is_empty() || cron != schedule.cron {
+            if cron.is_empty() {
                 return Err(WorkerPreservationError::new(
                     "workers.upload_preservation_schedule_invalid",
-                    format!("Worker schedule at index {index} had an invalid cron expression"),
+                    format!("Worker schedule at index {index} had an empty cron expression"),
                     "Do not upload until the Worker schedule inventory is canonical.",
                 ));
             }
@@ -210,7 +210,10 @@ impl WorkerPreservationSnapshot {
             )
         })?;
         for (key, requested) in metadata {
-            if key == "main_module" || key == "body_part" {
+            if matches!(
+                key.as_str(),
+                "main_module" | "body_part" | "parts" | "bindings"
+            ) {
                 continue;
             }
             let Some(current) = settings.get(key) else {
@@ -279,24 +282,24 @@ impl WorkerPreservationSnapshot {
     }
 }
 
-fn required_string<'a>(
+fn required_binding_string<'a>(
     object: &'a Map<String, Value>,
     field: &str,
-    product: &str,
     index: usize,
 ) -> Result<&'a str, WorkerPreservationError> {
-    object
+    let value = object
         .get(field)
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            WorkerPreservationError::new(
-                "workers.upload_preservation_binding_invalid",
-                format!("Worker {product} at index {index} omitted a canonical {field}"),
-                "Do not upload until every binding has an unambiguous name and type.",
-            )
-        })
+        .filter(|value| !value.is_empty());
+    match value {
+        Some(value) => Ok(value),
+        None => Err(WorkerPreservationError::new(
+            "workers.upload_preservation_binding_invalid",
+            format!("Worker binding at index {index} omitted a canonical {field}"),
+            "Do not upload until every binding has an unambiguous name and type.",
+        )),
+    }
 }
 
 fn canonicalize_json(value: Value) -> Value {
@@ -416,5 +419,65 @@ mod tests {
         )
         .expect("after");
         assert!(before.matches(&after));
+    }
+
+    #[test]
+    fn binding_transport_metadata_does_not_compare_redacted_provider_fields() {
+        let snapshot = WorkerPreservationSnapshot::from_readback(&settings(), &[])
+            .expect("preservation snapshot");
+
+        snapshot
+            .validate_requested_metadata(&json!({
+                "main_module": "index.js",
+                "bindings": [
+                    {"type": "d1", "name": "DB"},
+                    {"type": "secret_text", "name": "TOKEN", "text": "upload-only-secret"}
+                ],
+                "parts": ["index.js"],
+                "compatibility_date": "2026-08-11"
+            }))
+            .expect("binding and parts transport metadata must not compare redacted readback");
+    }
+
+    #[test]
+    fn non_transport_metadata_change_remains_denied() {
+        let snapshot = WorkerPreservationSnapshot::from_readback(&settings(), &[])
+            .expect("preservation snapshot");
+
+        let error = snapshot
+            .validate_requested_metadata(&json!({"compatibility_date": "2026-08-12"}))
+            .expect_err("settings change must remain separate");
+        assert_eq!(
+            error.code,
+            "workers.upload_preservation_metadata_change_denied"
+        );
+    }
+
+    #[test]
+    fn schedule_whitespace_is_normalized_for_preservation_identity() {
+        let canonical = WorkerPreservationSnapshot::from_readback(
+            &settings(),
+            &[WorkerSchedule {
+                cron: "*/5 * * * *".to_string(),
+                created_on: None,
+                modified_on: None,
+            }],
+        )
+        .expect("canonical schedule");
+        let padded = WorkerPreservationSnapshot::from_readback(
+            &settings(),
+            &[WorkerSchedule {
+                cron: "  */5 * * * *  ".to_string(),
+                created_on: None,
+                modified_on: None,
+            }],
+        )
+        .expect("padded schedule");
+
+        assert!(canonical.matches(&padded));
+        assert_eq!(
+            padded.public_summary()["schedule_crons"],
+            json!(["*/5 * * * *"])
+        );
     }
 }

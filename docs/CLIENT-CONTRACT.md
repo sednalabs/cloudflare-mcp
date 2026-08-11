@@ -317,10 +317,15 @@ digests; binding and secret values remain inside the adapter. Apply repeats
 those reads, so a stale dry-run token cannot authorize a changed Worker, and
 sends code through Cloudflare's `/content` endpoint. Post-apply settings,
 bindings, and schedules must match the pre-apply digests and the upload response
-must identify the exact script with a nonblank etag. Metadata supplied for an
-existing Worker must select the module part or match the current setting
-exactly; use `patch_worker_settings` separately for intentional settings
-changes. A null settings `main_module` is not a false failure when this complete
+must identify the exact script with a nonblank etag. Transport-only module
+metadata (`main_module`, `body_part`, `parts`, and `bindings`) is not compared
+field-for-field with server-enriched or redacted settings readback. Bindings
+remain protected by exact pre/post settings digests, while every other supplied
+metadata key must match the current setting exactly; use
+`patch_worker_settings` separately for intentional settings changes. Cron
+expressions are trimmed before schedule identity and duplicate detection, so
+provider formatting whitespace does not create a false mismatch. A null
+settings `main_module` is not a false failure when this complete
 content-only preservation proof passes. For create-only module
 uploads, Cloudflare settings may legitimately omit `main_module`; the tool
 then requires an authenticated listing, exactly one initial version, and

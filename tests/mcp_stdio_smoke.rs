@@ -1363,27 +1363,6 @@ fn create_pages_dir_with_worker(name: &str) -> PathBuf {
     root
 }
 
-fn create_pages_dir_with_worker_directory(name: &str) -> PathBuf {
-    let root = create_static_pages_dir(name);
-    fs::create_dir_all(root.join("_worker.js/chunks")).expect("create worker chunks");
-    fs::write(
-        root.join("_worker.js/index.js"),
-        "import { message } from './chunks/message.mjs'; export default { fetch() { return new Response(message); } };",
-    )
-    .expect("write worker entrypoint");
-    fs::write(
-        root.join("_worker.js/chunks/message.mjs"),
-        "export const message = 'hello';",
-    )
-    .expect("write worker module");
-    fs::write(
-        root.join("_routes.json"),
-        r#"{"version":1,"include":["/*"],"exclude":[]}"#,
-    )
-    .expect("write routes");
-    root
-}
-
 fn create_pages_dir_with_worker_bundle(name: &str) -> PathBuf {
     let root = create_static_pages_dir(name);
     fs::write(
@@ -2229,7 +2208,8 @@ fn pages_deploy_directory_live_apply_uploads_advanced_mode_worker_through_stdio_
 
 #[test]
 fn pages_deploy_directory_packages_advanced_mode_worker_directory_through_stdio_boundary() {
-    let directory = create_pages_dir_with_worker_directory("worker-directory-apply");
+    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/pages-worker-directory");
     let (base_url, requests) = spawn_fake_pages_direct_upload_api_with_options(
         true,
         ExpectedWorkerUpload::AdvancedDirectoryBundle,
@@ -2281,7 +2261,6 @@ fn pages_deploy_directory_packages_advanced_mode_worker_directory_through_stdio_
             "POST /accounts/acct-1/pages/projects/site/deployments",
         ]
     );
-    let _ = fs::remove_dir_all(directory);
 }
 
 #[test]
@@ -2728,7 +2707,14 @@ fn workers_upload_script_requires_token_and_reads_back_through_stdio_boundary() 
             "script_name": "worker-a",
             "main_module": "worker.js",
             "script_content": "export default { fetch() { return new Response('ok'); } };",
-            "metadata": {"compatibility_date": "2026-06-03"},
+            "metadata": {
+                "compatibility_date": "2026-06-03",
+                "bindings": [
+                    {"type": "d1", "name": "DB"},
+                    {"type": "secret_text", "name": "TOKEN", "text": "fixture-upload-secret"}
+                ],
+                "parts": ["worker.js"]
+            },
             "dry_run": true,
             "reason": "stdio regression"
         }),
@@ -2740,7 +2726,7 @@ fn workers_upload_script_requires_token_and_reads_back_through_stdio_boundary() 
     assert_eq!(dry_run_content["upload"]["metadata"], Value::Null);
     assert_eq!(
         dry_run_content["upload"]["metadata_keys"],
-        json!(["compatibility_date", "main_module"])
+        json!(["bindings", "compatibility_date", "main_module", "parts"])
     );
     assert!(dry_run_content["upload"]["metadata_sha256"].is_string());
     {
@@ -2771,6 +2757,7 @@ fn workers_upload_script_requires_token_and_reads_back_through_stdio_boundary() 
     let dry_serialized = dry_run_content.to_string();
     assert!(!dry_serialized.contains("db-1"));
     assert!(!dry_serialized.contains("super-secret"));
+    assert!(!dry_serialized.contains("fixture-upload-secret"));
     let token = dry_run_content["required_confirmation_token"]
         .as_str()
         .expect("confirmation token")
@@ -2783,7 +2770,14 @@ fn workers_upload_script_requires_token_and_reads_back_through_stdio_boundary() 
             "script_name": "worker-a",
             "main_module": "worker.js",
             "script_content": "export default { fetch() { return new Response('ok'); } };",
-            "metadata": {"compatibility_date": "2026-06-03"},
+            "metadata": {
+                "compatibility_date": "2026-06-03",
+                "bindings": [
+                    {"type": "d1", "name": "DB"},
+                    {"type": "secret_text", "name": "TOKEN", "text": "fixture-upload-secret"}
+                ],
+                "parts": ["worker.js"]
+            },
             "dry_run": false,
             "confirmation_token": token,
             "reason": "stdio regression"
@@ -2807,6 +2801,7 @@ fn workers_upload_script_requires_token_and_reads_back_through_stdio_boundary() 
     let serialized = content.to_string();
     assert!(!serialized.contains("db-1"));
     assert!(!serialized.contains("super-secret"));
+    assert!(!serialized.contains("fixture-upload-secret"));
     let requests = requests.lock().expect("request log lock");
     assert_eq!(requests.len(), 7);
     assert_eq!(requests[4]["method"], json!("PUT"));
