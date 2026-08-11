@@ -635,46 +635,13 @@ fn collect_advanced_worker_modules(
                     "Reduce or bundle the advanced-mode Worker module graph before deployment.",
                 ));
             }
-            let bytes = fs::read(&canonical_path).map_err(|err| {
-                PagesDirectoryError::new(
-                    "pages.asset_read_failed",
-                    format!("failed reading advanced-mode Worker module {relative_path}: {err}"),
-                    "Check the canonical advanced-mode Worker module permissions and retry.",
-                )
-            })?;
-            let readback_path = fs::canonicalize(&canonical_path).map_err(|err| {
-                PagesDirectoryError::new(
-                    "pages.worker_directory_module_changed",
-                    format!(
-                        "advanced-mode Worker module {relative_path} could not be resolved after reading: {err}"
-                    ),
-                    "Rebuild a stable artifact and rerun the dry-run before deployment.",
-                )
-            })?;
-            let readback_metadata = fs::symlink_metadata(&canonical_path).map_err(|err| {
-                PagesDirectoryError::new(
-                    "pages.worker_directory_module_changed",
-                    format!(
-                        "advanced-mode Worker module {relative_path} could not be restated after reading: {err}"
-                    ),
-                    "Rebuild a stable artifact and rerun the dry-run before deployment.",
-                )
-            })?;
-            if readback_path != canonical_path
-                || !readback_path.starts_with(root)
-                || readback_metadata.file_type().is_symlink()
-                || !readback_metadata.is_file()
-                || readback_metadata.len() != canonical_metadata.len()
-                || bytes.len() as u64 != canonical_metadata.len()
-            {
-                return Err(PagesDirectoryError::new(
-                    "pages.worker_directory_module_changed",
-                    format!(
-                        "advanced-mode Worker module {relative_path} changed while it was being inspected"
-                    ),
-                    "Rebuild a stable artifact and rerun the dry-run before deployment.",
-                ));
-            }
+            let bytes = read_stable_advanced_worker_module(
+                root,
+                &canonical_path,
+                &relative_path,
+                canonical_metadata.len(),
+                fs::read,
+            )?;
             modules.push(AdvancedWorkerModule {
                 relative_path,
                 bytes,
@@ -706,6 +673,65 @@ fn collect_advanced_worker_modules(
         ));
     }
     Ok(modules)
+}
+
+fn read_stable_advanced_worker_module<F>(
+    root: &Path,
+    canonical_path: &Path,
+    relative_path: &str,
+    expected_len: u64,
+    mut read_file: F,
+) -> Result<Vec<u8>, PagesDirectoryError>
+where
+    F: FnMut(&Path) -> std::io::Result<Vec<u8>>,
+{
+    let changed = || {
+        PagesDirectoryError::new(
+            "pages.worker_directory_module_changed",
+            format!(
+                "advanced-mode Worker module {relative_path} changed while it was being inspected"
+            ),
+            "Rebuild a stable artifact and rerun the dry-run before deployment.",
+        )
+    };
+    let read = |reader: &mut F| {
+        reader(canonical_path).map_err(|err| {
+            PagesDirectoryError::new(
+                "pages.asset_read_failed",
+                format!("failed reading advanced-mode Worker module {relative_path}: {err}"),
+                "Check the canonical advanced-mode Worker module permissions and retry.",
+            )
+        })
+    };
+
+    let bytes = read(&mut read_file)?;
+    let first_readback_path = fs::canonicalize(canonical_path).map_err(|_| changed())?;
+    let first_readback_metadata = fs::symlink_metadata(canonical_path).map_err(|_| changed())?;
+    if first_readback_path != canonical_path
+        || !first_readback_path.starts_with(root)
+        || first_readback_metadata.file_type().is_symlink()
+        || !first_readback_metadata.is_file()
+        || first_readback_metadata.len() != expected_len
+        || bytes.len() as u64 != expected_len
+    {
+        return Err(changed());
+    }
+
+    let reread_bytes = read(&mut read_file)?;
+    let final_path = fs::canonicalize(canonical_path).map_err(|_| changed())?;
+    let final_metadata = fs::symlink_metadata(canonical_path).map_err(|_| changed())?;
+    if final_path != canonical_path
+        || !final_path.starts_with(root)
+        || final_metadata.file_type().is_symlink()
+        || !final_metadata.is_file()
+        || final_metadata.len() != expected_len
+        || reread_bytes.len() as u64 != expected_len
+        || reread_bytes != bytes
+    {
+        return Err(changed());
+    }
+
+    Ok(bytes)
 }
 
 fn advanced_worker_module_name(relative: &Path) -> Result<String, PagesDirectoryError> {
@@ -1534,6 +1560,34 @@ test -z "$config" || printf '%s' '{"routes":[{"routePath":"/api/ping","mountPath
                 .code,
             "pages.worker_directory_module_name_invalid"
         );
+    }
+
+    #[test]
+    fn stable_module_read_rejects_same_length_content_change() {
+        let worker_root = fs::canonicalize(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/pages-worker-directory/_worker.js"),
+        )
+        .expect("canonical worker root");
+        let module_path = fs::canonicalize(worker_root.join("index.js"))
+            .expect("canonical worker module");
+        let original = fs::read(&module_path).expect("fixture module");
+        let mut changed = original.clone();
+        changed[0] ^= 1;
+        assert_eq!(changed.len(), original.len());
+        let expected_len = original.len() as u64;
+        let mut reads = [original, changed].into_iter();
+
+        let error = read_stable_advanced_worker_module(
+            &worker_root,
+            &module_path,
+            "index.js",
+            expected_len,
+            |_| Ok(reads.next().expect("two bounded reads")),
+        )
+        .expect_err("same-length mutation must be rejected");
+
+        assert_eq!(error.code, "pages.worker_directory_module_changed");
     }
 
     #[test]

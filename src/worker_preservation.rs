@@ -11,8 +11,9 @@ use crate::cloudflare::{AdapterError, CloudflareClient};
 pub(crate) struct WorkerPreservationSnapshot {
     canonical_settings: Value,
     schedule_crons: Vec<String>,
-    settings_sha256: String,
-    schedules_sha256: String,
+    internal_settings_sha256: String,
+    internal_schedules_sha256: String,
+    outward_projection_sha256: String,
     binding_descriptors: Vec<Value>,
     setting_keys: Vec<String>,
     main_module: Option<String>,
@@ -162,8 +163,8 @@ impl WorkerPreservationSnapshot {
             )
         })?;
         let canonical_settings = canonicalize_json(settings_value);
-        let settings_sha256 = stable_json_sha256(&canonical_settings)?;
-        let schedules_sha256 = stable_json_sha256(&schedule_crons)?;
+        let internal_settings_sha256 = stable_json_sha256(&canonical_settings)?;
+        let internal_schedules_sha256 = stable_json_sha256(&schedule_crons)?;
         let setting_keys = canonical_settings
             .as_object()
             .map(|object| {
@@ -175,19 +176,28 @@ impl WorkerPreservationSnapshot {
             })
             .unwrap_or_default();
 
+        let main_module = settings
+            .main_module
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let outward_projection_sha256 = stable_json_sha256(&json!({
+            "setting_keys": setting_keys,
+            "bindings": binding_descriptors,
+            "schedule_crons": schedule_crons,
+            "main_module_reported": main_module.is_some(),
+        }))?;
+
         Ok(Self {
             canonical_settings,
             schedule_crons,
-            settings_sha256,
-            schedules_sha256,
+            internal_settings_sha256,
+            internal_schedules_sha256,
+            outward_projection_sha256,
             binding_descriptors,
             setting_keys,
-            main_module: settings
-                .main_module
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string),
+            main_module,
         })
     }
 
@@ -252,8 +262,8 @@ impl WorkerPreservationSnapshot {
     }
 
     pub(crate) fn matches(&self, other: &Self) -> bool {
-        self.settings_sha256 == other.settings_sha256
-            && self.schedules_sha256 == other.schedules_sha256
+        self.internal_settings_sha256 == other.internal_settings_sha256
+            && self.internal_schedules_sha256 == other.internal_schedules_sha256
     }
 
     pub(crate) fn main_module_reported(&self) -> bool {
@@ -262,15 +272,13 @@ impl WorkerPreservationSnapshot {
 
     pub(crate) fn token_binding(&self) -> Value {
         json!({
-            "settings_sha256": self.settings_sha256,
-            "schedules_sha256": self.schedules_sha256,
+            "redacted_preservation_projection_sha256": self.outward_projection_sha256,
         })
     }
 
     pub(crate) fn public_summary(&self) -> Value {
         json!({
-            "settings_sha256": self.settings_sha256,
-            "schedules_sha256": self.schedules_sha256,
+            "redacted_projection_sha256": self.outward_projection_sha256,
             "setting_keys": self.setting_keys,
             "bindings": self.binding_descriptors,
             "binding_count": self.binding_descriptors.len(),
@@ -366,9 +374,51 @@ mod tests {
         );
         assert_eq!(summary["schedule_crons"], json!(["*/5 * * * *"]));
         assert_eq!(summary["secret_values_included"], json!(false));
+        assert!(summary.get("settings_sha256").is_none());
+        assert!(summary.get("schedules_sha256").is_none());
         let serialized = summary.to_string();
         assert!(!serialized.contains("db-1"));
         assert!(!serialized.contains("secret-value"));
+    }
+
+    #[test]
+    fn outward_projection_does_not_bind_secret_or_resource_values() {
+        let snapshot = |database_id: &str, secret: &str| {
+            let settings = serde_json::from_value::<WorkerSettings>(json!({
+                "main_module": "index.js",
+                "compatibility_date": "2026-08-11",
+                "bindings": [
+                    {"type": "d1", "name": "DB", "id": database_id},
+                    {"type": "secret_text", "name": "TOKEN", "text": secret}
+                ],
+                "observability": {"enabled": true}
+            }))
+            .expect("settings");
+            WorkerPreservationSnapshot::from_readback(
+                &settings,
+                &[WorkerSchedule {
+                    cron: "*/5 * * * *".to_string(),
+                    created_on: None,
+                    modified_on: None,
+                }],
+            )
+            .expect("snapshot")
+        };
+
+        let before = snapshot("resource-one", "low-entropy-one");
+        let after = snapshot("resource-two", "low-entropy-two");
+
+        assert!(!before.matches(&after));
+        assert_eq!(before.public_summary(), after.public_summary());
+        assert_eq!(before.token_binding(), after.token_binding());
+        let outward = json!({
+            "summary": before.public_summary(),
+            "token_binding": before.token_binding(),
+        })
+        .to_string();
+        assert!(!outward.contains("resource-one"));
+        assert!(!outward.contains("low-entropy-one"));
+        assert!(!outward.contains(&before.internal_settings_sha256));
     }
 
     #[test]

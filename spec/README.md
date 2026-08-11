@@ -46,13 +46,16 @@ cannot hide behind direct Rust handler tests.
 | workflow | tool | class | source and proof | redaction | negative coverage | status |
 | --- | --- | --- | --- | --- | --- | --- |
 | Create an absent Worker | `workers_upload_script` with `create_only=true` | preview/apply | Provider-call-free preview; atomic `If-None-Match: *`; exact listing/version/etag attestation when settings omit `main_module` | Upload and metadata digests only; raw metadata and version detail omitted | Existing target, uncertain response, malformed or ambiguous version evidence | implemented |
-| Update code on an existing Worker | `workers_upload_script` with `create_only=false` | read-backed preview/apply | Preflight settings, bindings, and schedules; content-only upload; exact script/etag plus post-apply digest equality; transport-only binding/parts metadata excluded from field comparison | Binding names/types and normalized cron strings only; no binding or secret values | Missing or duplicate bindings, empty schedules, non-transport metadata drift, stale token, post-apply mismatch | implemented |
+| Update code on an existing Worker | `workers_upload_script` with `create_only=false` | read-backed preview/apply | Preflight settings, bindings, and schedules; content-only upload; exact script/etag plus internal full-state post-apply equality; transport-only binding/parts metadata excluded from field comparison | Binding names/types, setting keys, normalized cron strings, and a redacted-projection digest only; no secret-bearing digest, resource identifier, binding value, or secret value | Missing or duplicate bindings, empty schedules, non-transport metadata drift, stale redacted projection, post-apply mismatch | implemented |
 | Intentionally change Worker settings | `patch_worker_settings` | preview/apply | Separate settings patch and authoritative readback | Existing settings redaction contract | Never combined with code upload | unchanged |
 
-The existing-worker confirmation token is bound to current preservation
-digests. Dry-run can therefore make read-only provider calls while remaining
-mutation-free, and a later settings, binding, or schedule change invalidates
-apply before the content upload request.
+The existing-worker confirmation token is bound to the current redacted,
+nonsecret preservation projection. Dry-run can therefore make read-only
+provider calls while remaining mutation-free, and a later projection-shape
+change invalidates apply before the content upload request. Secret-bearing
+values and their digests are deliberately excluded from the outward manifest
+and token. Apply rereads current full state immediately before mutation and
+requires the exact internal post-apply state to match it.
 
 When changing tool argument shape or required fields, update both:
 - `spec/tool_schema_snapshot.v1.json` (machine contract),
