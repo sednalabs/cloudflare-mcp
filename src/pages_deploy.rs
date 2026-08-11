@@ -640,7 +640,7 @@ fn collect_advanced_worker_modules(
                 &canonical_path,
                 &relative_path,
                 canonical_metadata.len(),
-                fs::read,
+                |path: &Path| fs::read(path),
             )?;
             modules.push(AdvancedWorkerModule {
                 relative_path,
@@ -1569,8 +1569,8 @@ test -z "$config" || printf '%s' '{"routes":[{"routePath":"/api/ping","mountPath
                 .join("tests/fixtures/pages-worker-directory/_worker.js"),
         )
         .expect("canonical worker root");
-        let module_path = fs::canonicalize(worker_root.join("index.js"))
-            .expect("canonical worker module");
+        let module_path =
+            fs::canonicalize(worker_root.join("index.js")).expect("canonical worker module");
         let original = fs::read(&module_path).expect("fixture module");
         let mut changed = original.clone();
         changed[0] ^= 1;
