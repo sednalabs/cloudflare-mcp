@@ -1059,7 +1059,11 @@ fn spawn_fake_worker_settings_api() -> (String, Arc<Mutex<Vec<Value>>>) {
             let content_type = headers
                 .lines()
                 .find_map(|line| line.strip_prefix("content-type:"))
-                .or_else(|| headers.lines().find_map(|line| line.strip_prefix("Content-Type:")))
+                .or_else(|| {
+                    headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Content-Type:"))
+                })
                 .map(str::trim)
                 .unwrap_or_default()
                 .to_string();
@@ -1087,7 +1091,9 @@ fn spawn_fake_worker_settings_api() -> (String, Arc<Mutex<Vec<Value>>>) {
                 ("PATCH", "/accounts/acct-1/workers/scripts/worker-a/settings") => {
                     assert!(content_type.starts_with("multipart/form-data;"));
                     assert!(body_text.contains("name=\"settings\""));
-                    assert!(body_text.contains(r#""bindings":[{"name":"DESTINATION","text":"new","type":"plain_text"}]"#));
+                    assert!(body_text.contains(
+                        r#""bindings":[{"name":"DESTINATION","text":"new","type":"plain_text"}]"#
+                    ));
                     json!({
                         "success": true,
                         "errors": [],
@@ -2970,7 +2976,10 @@ fn patch_worker_settings_uses_object_schema_and_multipart_through_stdio_boundary
     );
     let dry_content = structured_content(&dry_run);
     assert_eq!(dry_content["ok"], json!(true), "{dry_content}");
-    assert_eq!(dry_content["dry_run_note"], json!("No Cloudflare mutation applied."));
+    assert_eq!(
+        dry_content["dry_run_note"],
+        json!("No Cloudflare mutation applied.")
+    );
     assert_eq!(requests.lock().expect("request log lock").len(), 1);
 
     let response = mcp.call_tool(
@@ -2991,9 +3000,11 @@ fn patch_worker_settings_uses_object_schema_and_multipart_through_stdio_boundary
     assert_eq!(requests[1]["method"], json!("GET"));
     assert_eq!(requests[2]["method"], json!("PATCH"));
     assert_eq!(requests[3]["method"], json!("GET"));
-    assert!(requests[2]["content_type"]
-        .as_str()
-        .is_some_and(|value| value.starts_with("multipart/form-data;")));
+    assert!(
+        requests[2]["content_type"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("multipart/form-data;"))
+    );
 }
 
 #[test]
