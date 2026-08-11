@@ -1042,7 +1042,8 @@ fn spawn_fake_worker_upload_api_with_readback(
 }
 
 fn spawn_fake_worker_settings_api() -> (String, Arc<Mutex<Vec<Value>>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake Worker settings API");
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .expect("bind fake Worker settings API");
     let addr = listener
         .local_addr()
         .expect("fake Worker settings API addr");

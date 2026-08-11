@@ -7237,7 +7237,7 @@ impl CloudflareMcp {
             return Ok(finalize_mutation_result(base, &plan, audit, args.dry_run));
         }
         let patch_keys = args.settings_patch.keys().cloned().collect::<Vec<_>>();
-        let settings_patch = Value::Object(args.settings_patch.clone().into_iter().collect());
+        let settings_patch = Value::Object(args.settings_patch.into_iter().collect());
         let plan = plan_patch_worker_settings(account_id, script_name, &patch_keys);
         let audit = MutationAuditSession::start(
             Some(&parts),
