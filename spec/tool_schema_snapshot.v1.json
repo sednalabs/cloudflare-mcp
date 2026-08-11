@@ -2906,7 +2906,11 @@
           "script_name": {
             "type": "string"
           },
-          "settings_patch": true
+          "settings_patch": {
+            "additionalProperties": true,
+            "description": "Worker settings is a JSON object.  Model it as a map rather than a\ncatch-all JSON value so the published MCP schema rejects arrays,\nscalars, and null before the curated handler runs.",
+            "type": "object"
+          }
         },
         "required": [
           "script_name",
