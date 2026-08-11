@@ -689,7 +689,8 @@ where
         PagesDirectoryError::new(
             "pages.worker_directory_module_changed",
             format!(
-                "advanced-mode Worker module {relative_path} changed while it was being inspected"
+                "advanced-mode Worker module {} changed while it was being inspected",
+                relative_path
             ),
             "Rebuild a stable artifact and rerun the dry-run before deployment.",
         )
@@ -698,7 +699,10 @@ where
         reader(canonical_path).map_err(|err| {
             PagesDirectoryError::new(
                 "pages.asset_read_failed",
-                format!("failed reading advanced-mode Worker module {relative_path}: {err}"),
+                format!(
+                    "failed reading advanced-mode Worker module {}: {err}",
+                    relative_path
+                ),
                 "Check the canonical advanced-mode Worker module permissions and retry.",
             )
         })
