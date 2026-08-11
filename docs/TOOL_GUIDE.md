@@ -61,6 +61,13 @@ Use Pages tools for project inspection, domain management, and direct uploads:
 Use `pages_deploy_directory` for direct-upload projects. Use
 `pages_trigger_deployment` for Git-backed projects.
 
+Advanced-mode output may contain either a `_worker.js` file or a `_worker.js/`
+module directory rooted at `index.js`. The directory form is packaged locally
+as `_worker.bundle`, and its JavaScript modules are excluded from the static
+asset manifest. Source maps are omitted. Symlinks, unsafe names, a missing
+entrypoint, unsupported module types, and conflicting worker artifacts fail
+closed before provider access; dry-run makes no Cloudflare calls.
+
 ## D1
 
 Use curated D1 tools instead of generic API calls for database workflows:

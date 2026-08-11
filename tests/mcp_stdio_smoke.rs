@@ -1363,6 +1363,27 @@ fn create_pages_dir_with_worker(name: &str) -> PathBuf {
     root
 }
 
+fn create_pages_dir_with_worker_directory(name: &str) -> PathBuf {
+    let root = create_static_pages_dir(name);
+    fs::create_dir_all(root.join("_worker.js/chunks")).expect("create worker chunks");
+    fs::write(
+        root.join("_worker.js/index.js"),
+        "import { message } from './chunks/message.mjs'; export default { fetch() { return new Response(message); } };",
+    )
+    .expect("write worker entrypoint");
+    fs::write(
+        root.join("_worker.js/chunks/message.mjs"),
+        "export const message = 'hello';",
+    )
+    .expect("write worker module");
+    fs::write(
+        root.join("_routes.json"),
+        r#"{"version":1,"include":["/*"],"exclude":[]}"#,
+    )
+    .expect("write routes");
+    root
+}
+
 fn create_pages_dir_with_worker_bundle(name: &str) -> PathBuf {
     let root = create_static_pages_dir(name);
     fs::write(
@@ -1473,6 +1494,7 @@ enum ExpectedWorkerUpload {
     None,
     Script,
     Bundle,
+    AdvancedDirectoryBundle,
     FunctionsBundle,
 }
 
@@ -1562,7 +1584,9 @@ fn spawn_fake_pages_direct_upload_api_with_options(
                             assert!(body_text.contains("name=\"_worker.js\""), "{body_text}");
                             assert!(body_text.contains("env.ASSETS.fetch"), "{body_text}");
                         }
-                        ExpectedWorkerUpload::Bundle | ExpectedWorkerUpload::FunctionsBundle => {
+                        ExpectedWorkerUpload::Bundle
+                        | ExpectedWorkerUpload::AdvancedDirectoryBundle
+                        | ExpectedWorkerUpload::FunctionsBundle => {
                             assert!(body_text.contains("name=\"_worker.bundle\""), "{body_text}");
                             assert!(
                                 body_text.contains("------formdata-worker-bundle"),
@@ -1576,6 +1600,19 @@ fn spawn_fake_pages_direct_upload_api_with_options(
                                 assert!(
                                     body_text.contains(
                                         "name=\"functions-filepath-routing-config.json\""
+                                    ),
+                                    "{body_text}"
+                                );
+                                assert!(body_text.contains("name=\"_routes.json\""), "{body_text}");
+                            }
+                            if matches!(
+                                expected_worker,
+                                ExpectedWorkerUpload::AdvancedDirectoryBundle
+                            ) {
+                                assert!(body_text.contains("main_module\":\"index.js"), "{body_text}");
+                                assert!(
+                                    body_text.contains(
+                                        "name=\"chunks/message.mjs\"; filename=\"chunks/message.mjs\""
                                     ),
                                     "{body_text}"
                                 );
@@ -2173,6 +2210,63 @@ fn pages_deploy_directory_live_apply_uploads_advanced_mode_worker_through_stdio_
         content["directory"]["special_files"]["worker"]["name"],
         json!("_worker.js")
     );
+    assert_eq!(content["directory"]["asset_count"], json!(2));
+    assert_eq!(
+        requests.lock().expect("request log lock").as_slice(),
+        [
+            "GET /accounts/acct-1/pages/projects/site/upload-token",
+            "POST /pages/assets/check-missing",
+            "POST /pages/assets/upload",
+            "POST /pages/assets/upsert-hashes",
+            "POST /accounts/acct-1/pages/projects/site/deployments",
+        ]
+    );
+    let _ = fs::remove_dir_all(directory);
+}
+
+#[test]
+fn pages_deploy_directory_packages_advanced_mode_worker_directory_through_stdio_boundary() {
+    let directory = create_pages_dir_with_worker_directory("worker-directory-apply");
+    let (base_url, requests) = spawn_fake_pages_direct_upload_api_with_options(
+        true,
+        ExpectedWorkerUpload::AdvancedDirectoryBundle,
+    );
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+
+    let dry_run = mcp.call_tool(
+        2,
+        "pages_deploy_directory",
+        json!({
+            "project_name": "site",
+            "directory": directory.to_string_lossy(),
+            "branch": "preview",
+            "dry_run": true
+        }),
+    );
+    let dry_content = structured_content(&dry_run);
+    assert_eq!(dry_content["ok"], json!(true), "{dry_content}");
+    assert_eq!(dry_content["directory"]["asset_count"], json!(2));
+    assert_eq!(
+        dry_content["directory"]["special_files"]["worker_bundle"]["name"],
+        json!("_worker.bundle")
+    );
+    assert!(requests.lock().expect("request log lock").is_empty());
+
+    let response = mcp.call_tool(
+        3,
+        "pages_deploy_directory",
+        json!({
+            "project_name": "site",
+            "directory": directory.to_string_lossy(),
+            "branch": "preview",
+            "commit_hash": "abc123",
+            "commit_message": "deploy _worker.js directory via stdio smoke",
+            "dry_run": false
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(true), "{content}");
+    assert_eq!(content["deployment"]["id"], json!("deployment-1"));
     assert_eq!(content["directory"]["asset_count"], json!(2));
     assert_eq!(
         requests.lock().expect("request log lock").as_slice(),

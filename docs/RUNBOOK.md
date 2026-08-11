@@ -269,6 +269,15 @@ tools/call name=workers_upload_script arguments='{
 }'
 ```
 
+For `pages_deploy_directory`, framework output may represent advanced mode as
+either a `_worker.js` file or a `_worker.js/` module directory whose entry point
+is `index.js`. The directory form is packaged locally as `_worker.bundle`;
+dry-run reports that generated special file without contacting Cloudflare, and
+the directory is never included in the static asset manifest. A missing entry
+point, symlink, unsafe name, unsupported module type, or conflicting worker
+artifact is a stop condition. Rebuild the artifact or use the reviewed Wrangler
+path rather than bypassing the validator.
+
 Review the plan and policy output before apply. For `workers_upload_script`,
 review `upload.sha256`, `upload.metadata_sha256`, and `upload.metadata_keys`;
 the tool intentionally reports digests and keys instead of raw Worker metadata
