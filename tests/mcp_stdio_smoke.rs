@@ -2734,7 +2734,7 @@ fn workers_upload_script_requires_token_and_reads_back_through_stdio_boundary() 
 
 #[test]
 fn workers_upload_script_create_only_binds_token_and_sends_atomic_precondition() {
-    let (base_url, requests) = spawn_fake_worker_upload_api(2);
+    let (base_url, requests) = spawn_fake_worker_upload_api(4);
     let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
     let dry_run = mcp.call_tool(
         2,
@@ -2777,7 +2777,11 @@ fn workers_upload_script_create_only_binds_token_and_sends_atomic_precondition()
         mismatched_content["error"]["code"],
         json!("workers.upload_confirmation_required")
     );
-    assert_eq!(requests.lock().expect("request log lock").len(), 0);
+    {
+        let requests = requests.lock().expect("request log lock");
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request["method"] == "GET"));
+    }
 
     let response = mcp.call_tool(
         4,
@@ -2797,8 +2801,8 @@ fn workers_upload_script_create_only_binds_token_and_sends_atomic_precondition()
     assert_eq!(content["ok"], json!(true), "{content}");
     assert_eq!(content["create_only"], json!(true));
     let requests = requests.lock().expect("request log lock");
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0]["if_none_match"], json!("*"));
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[2]["if_none_match"], json!("*"));
 }
 
 #[test]
