@@ -41,6 +41,19 @@ restored, hidden, or behaviorally changed, add or update MCP stdio smoke
 coverage so the executable is called through JSON-RPC and rmcp extraction errors
 cannot hide behind direct Rust handler tests.
 
+## Worker upload preservation capability matrix
+
+| workflow | tool | class | source and proof | redaction | negative coverage | status |
+| --- | --- | --- | --- | --- | --- | --- |
+| Create an absent Worker | `workers_upload_script` with `create_only=true` | preview/apply | Provider-call-free preview; atomic `If-None-Match: *`; exact listing/version/etag attestation when settings omit `main_module` | Upload and metadata digests only; raw metadata and version detail omitted | Existing target, uncertain response, malformed or ambiguous version evidence | implemented |
+| Update code on an existing Worker | `workers_upload_script` with `create_only=false` | read-backed preview/apply | Preflight settings, bindings, and schedules; content-only upload; exact script/etag plus post-apply digest equality | Binding names/types and cron strings only; no binding or secret values | Missing or duplicate bindings, malformed schedules, metadata drift, stale token, post-apply mismatch | implemented |
+| Intentionally change Worker settings | `patch_worker_settings` | preview/apply | Separate settings patch and authoritative readback | Existing settings redaction contract | Never combined with code upload | unchanged |
+
+The existing-worker confirmation token is bound to current preservation
+digests. Dry-run can therefore make read-only provider calls while remaining
+mutation-free, and a later settings, binding, or schedule change invalidates
+apply before the content upload request.
+
 When changing tool argument shape or required fields, update both:
 - `spec/tool_schema_snapshot.v1.json` (machine contract),
 - `../docs/CLIENT-CONTRACT.md` (human-readable client contract).

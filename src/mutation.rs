@@ -498,6 +498,16 @@ pub fn plan_upload_worker_script(
 ) -> MutationPlan {
     MutationPlan::new("workers_upload_script")
         .step(
+            "read_existing_worker_preservation_state",
+            false,
+            json!({
+                "account_id": account_id,
+                "script_name": script_name,
+                "required": !create_only,
+                "products": ["settings", "bindings", "schedules"],
+            }),
+        )
+        .step(
             "prepare_worker_script_upload",
             false,
             json!({
@@ -514,6 +524,7 @@ pub fn plan_upload_worker_script(
                 "account_id": account_id,
                 "script_name": script_name,
                 "create_only": create_only,
+                "mode": if create_only { "create" } else { "content_only_update" },
             }),
         )
         .step(
@@ -529,6 +540,7 @@ pub fn plan_upload_worker_script(
             false,
             json!({
                 "script_name": script_name,
+                "verify_preserved_settings_bindings_and_schedules": !create_only,
             }),
         )
 }

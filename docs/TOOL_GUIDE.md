@@ -134,9 +134,12 @@ Use `workers_upload_script` when the deploy boundary is the Worker script body
 itself. It accepts a single module file/content or a prebuilt multipart Worker
 bundle, returns a dry-run confirmation token, and summarizes script/metadata
 evidence with SHA-256 digests plus metadata keys rather than raw metadata
-values. Apply requires the dry-run token, reads back Worker settings, and
-reports `readback_verification`; a different non-empty `main_module` fails
-closed. For create-only module uploads, settings may legitimately return a
+values. Existing-worker dry-run also reads and redacts the complete settings,
+binding, and schedule preservation contract. Apply repeats those reads, uses
+the content-only endpoint, and reports success only when exact upload identity
+and post-apply preservation match. Binding values and secrets are never
+returned; changed or incomplete preservation state fails closed before
+mutation. For create-only module uploads, settings may legitimately return a
 null `main_module`; the tool then requires exhaustive, stable, etag-bound
 Worker listing/version-detail evidence with a present named-handler array;
 handler names and export members must be unique, nonblank, and byte-exact

@@ -272,10 +272,15 @@ tools/call name=workers_upload_script arguments='{
 Review the plan and policy output before apply. For `workers_upload_script`,
 review `upload.sha256`, `upload.metadata_sha256`, and `upload.metadata_keys`;
 the tool intentionally reports digests and keys instead of raw Worker metadata
-values. Apply by echoing `required_confirmation_token` in
-`confirmation_token`. Treat `workers.upload_readback_mismatch` as a failed
-deployment proof even when Cloudflare accepted the upload request, because the
-settings readback did not match the requested module.
+values. For an existing Worker, also review the redacted `preservation`
+manifest: expected setting keys, binding names/types, cron strings, and
+nonblank settings/schedule digests must be present. Binding and secret values
+are deliberately absent. Apply rereads the same products before mutation, so a
+change invalidates the dry-run token, then uses Cloudflare's content-only
+endpoint. Treat any preservation mismatch or post-apply readback failure as an
+unproven deployment even if Cloudflare accepted the upload. A missing settings
+`main_module` is acceptable only when exact upload identity, etag, settings,
+bindings, and schedules are all proven preserved.
 
 When a create-only module upload returns `main_module:null` in settings, that
 field is not treated as creation proof. The tool binds the upload response etag

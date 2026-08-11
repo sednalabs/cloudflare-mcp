@@ -204,7 +204,7 @@ contains the current template plus a read-only-only optional approval override.
 | `get_worker_settings` | `script_name`; `account_id` unless default account configured | `binding_name` | Reads Worker settings and optionally reports binding presence/readback. |
 | `workers_list_scripts` | `account_id` unless default account configured | none | Lists Worker scripts using the newer Workers scripts endpoint. |
 | `workers_get_script_settings` | `script_name`; `account_id` unless default account configured | none | Reads script settings from the Workers script settings endpoint. |
-| `workers_upload_script` | `script_name`; `account_id` unless default account configured; exactly one of `script_path`, `script_content`, `script_content_base64`, or `multipart_path` | `main_module`, `metadata`, `content_type`, `create_only`, `dry_run`, `confirmation_token`, `reason` | Uploads a Worker module script or prebuilt multipart bundle through Cloudflare's Worker script endpoint. Dry-run prepares the upload and returns `required_confirmation_token` without calling Cloudflare; visible upload summaries include script/metadata SHA-256 digests and metadata keys, not raw metadata values. Apply requires that token, uploads the script or multipart bundle, then reads back Worker settings and returns `readback_verification`; a different non-empty `main_module` fails closed. For create-only module uploads, a null settings `main_module` is resolved only by exhaustive, stable, etag-bound listing/version-detail evidence; malformed, incomplete, ambiguous, or conflicting evidence fails closed. When `create_only` is true, the apply request sends Cloudflare's atomic `If-None-Match: *` precondition; an existing script returns `workers.upload_create_only_conflict` without overwrite or retry. Timeout, transport, response-read/decoding, retryable 5xx, and success envelopes with a missing or null result return `workers.upload_create_only_outcome_uncertain` with `retryable:false`; read back the Worker and reconcile provider evidence before retrying or claiming creation. The default elicitation configuration treats this as an action-time approval tool. |
+| `workers_upload_script` | `script_name`; `account_id` unless default account configured; exactly one of `script_path`, `script_content`, `script_content_base64`, or `multipart_path` | `main_module`, `metadata`, `content_type`, `create_only`, `dry_run`, `confirmation_token`, `reason` | Uploads a Worker module script or prebuilt multipart bundle. Existing-worker dry-run reads settings, bindings, and schedules, returns a redacted preservation manifest, and binds its digests into the confirmation token. Apply rereads that state before mutation, uses Cloudflare's content-only endpoint, and succeeds only when upload identity plus post-apply preservation readback match. Secret and binding values are never returned; missing, malformed, ambiguous, or changed preservation evidence fails closed before mutation. An omitted settings `main_module` is accepted only when this complete content-only proof passes. Create-only upload keeps the atomic `If-None-Match: *` and exhaustive version-attestation contract. The default elicitation configuration treats this as an action-time approval tool. |
 | `workers_list_tails` | `script_name`; `account_id` unless default account configured | none | Lists configured Worker tail consumers for a script. |
 | `patch_worker_settings` | `script_name`, `settings_patch`; `account_id` unless default account configured | `expect_binding`, `dry_run` | Patches Worker settings, reads back, and can verify a named binding/value. If Cloudflare reports that a Pages-generated Worker has no versions/versioned settings, the MCP returns `workers.pages_generated_worker_settings_immutable` and points the operator to update Pages project settings followed by a fresh `pages_deploy_directory` deployment. |
 | `bindings_discover` | `account_id` unless default account configured | `include_workers`, `include_pages`, `name_contains` | Discovers Workers, Pages projects, and binding/resource references for wiring audits. |
@@ -310,11 +310,18 @@ module upload, pass `script_path` or `script_content` plus `main_module` and any
 Cloudflare metadata such as `compatibility_date` in `metadata`. For projects
 that already use Wrangler to produce a multipart Worker bundle, pass
 `multipart_path`; the MCP infers the multipart boundary when the file starts
-with `--<boundary>`. Apply requires the dry-run token and returns both the
-Cloudflare upload response and `readback_settings`. The visible upload summary
-reports script and metadata SHA-256 digests plus metadata keys rather than raw
-metadata values, and module uploads fail closed if settings readback reports a
-different `main_module` than the requested upload. For create-only module
+with `--<boundary>`. For an existing Worker, dry-run reads settings, binding
+descriptors, and cron triggers without mutation. It returns only binding
+names/types, cron strings, setting keys, counts, and SHA-256 preservation
+digests; binding and secret values remain inside the adapter. Apply repeats
+those reads, so a stale dry-run token cannot authorize a changed Worker, and
+sends code through Cloudflare's `/content` endpoint. Post-apply settings,
+bindings, and schedules must match the pre-apply digests and the upload response
+must identify the exact script with a nonblank etag. Metadata supplied for an
+existing Worker must select the module part or match the current setting
+exactly; use `patch_worker_settings` separately for intentional settings
+changes. A null settings `main_module` is not a false failure when this complete
+content-only preservation proof passes. For create-only module
 uploads, Cloudflare settings may legitimately omit `main_module`; the tool
 then requires an authenticated listing, exactly one initial version, and
 version-detail `resources.script` evidence whose etag matches the upload
