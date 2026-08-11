@@ -2208,8 +2208,8 @@ fn pages_deploy_directory_live_apply_uploads_advanced_mode_worker_through_stdio_
 
 #[test]
 fn pages_deploy_directory_packages_advanced_mode_worker_directory_through_stdio_boundary() {
-    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/pages-worker-directory");
+    let directory =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pages-worker-directory");
     let (base_url, requests) = spawn_fake_pages_direct_upload_api_with_options(
         true,
         ExpectedWorkerUpload::AdvancedDirectoryBundle,

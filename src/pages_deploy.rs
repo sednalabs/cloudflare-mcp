@@ -685,12 +685,7 @@ fn collect_advanced_worker_modules(
 
     let mut modules = Vec::new();
     let mut total_bytes = 0u64;
-    collect(
-        &worker_root,
-        &worker_root,
-        &mut modules,
-        &mut total_bytes,
-    )?;
+    collect(&worker_root, &worker_root, &mut modules, &mut total_bytes)?;
     modules.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     if modules.is_empty() {
         return Err(PagesDirectoryError::new(
@@ -771,12 +766,12 @@ fn write_advanced_worker_bundle(
         .create_new(true)
         .open(bundle_path)
         .map_err(|err| {
-        PagesDirectoryError::new(
-            "pages.worker_directory_bundle_failed",
-            format!("failed creating advanced-mode Worker bundle: {err}"),
-            "Check local temporary directory permissions and retry.",
-        )
-    })?;
+            PagesDirectoryError::new(
+                "pages.worker_directory_bundle_failed",
+                format!("failed creating advanced-mode Worker bundle: {err}"),
+                "Check local temporary directory permissions and retry.",
+            )
+        })?;
     write!(
         file,
         "--{boundary}\r\nContent-Disposition: form-data; name=\"metadata\"\r\n\r\n{{\"main_module\":\"index.js\"}}\r\n"
@@ -1473,8 +1468,8 @@ test -z "$config" || printf '%s' '{"routes":[{"routePath":"/api/ping","mountPath
 
     #[test]
     fn inspect_pages_directory_packages_advanced_mode_worker_directory() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/pages-worker-directory");
+        let root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pages-worker-directory");
 
         let package = inspect_pages_directory(root.to_str().unwrap(), 20).expect("inspect pages");
 
@@ -1495,9 +1490,7 @@ test -z "$config" || printf '%s' '{"routes":[{"routePath":"/api/ping","mountPath
             String::from_utf8(bundle.read_bytes().expect("read bundle")).expect("bundle is utf-8");
         assert!(body.contains(r#"{"main_module":"index.js"}"#));
         assert!(body.contains("name=\"index.js\"; filename=\"index.js\""));
-        assert!(body.contains(
-            "name=\"chunks/message.mjs\"; filename=\"chunks/message.mjs\""
-        ));
+        assert!(body.contains("name=\"chunks/message.mjs\"; filename=\"chunks/message.mjs\""));
         assert!(!package.manifest.contains_key("/_worker.js/index.js"));
         assert!(!package.manifest.contains_key("/_worker.js/index.js.map"));
         assert!(
