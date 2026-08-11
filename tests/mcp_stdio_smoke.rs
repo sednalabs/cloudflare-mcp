@@ -1090,8 +1090,15 @@ fn spawn_fake_worker_upload_unsafe_preservation_api(
                             "messages": [],
                             "result": {
                                 "main_module": null,
-                                "bindings": [{"type": "d1", "name": "DB", "id": "db-1"}],
-                                "observability": {"enabled": settings_reads == 1}
+                                "bindings": if settings_reads == 1 {
+                                    json!([{"type": "d1", "name": "DB", "id": "db-1"}])
+                                } else {
+                                    json!([
+                                        {"type": "d1", "name": "DB", "id": "db-1"},
+                                        {"type": "kv_namespace", "name": "CACHE", "namespace_id": "kv-1"}
+                                    ])
+                                },
+                                "observability": {"enabled": true}
                             }
                         })
                     } else {
@@ -3128,7 +3135,7 @@ fn workers_upload_script_fails_closed_on_incomplete_preservation_without_mutatio
 }
 
 #[test]
-fn workers_upload_script_rejects_stale_dry_run_token_before_mutation() {
+fn workers_upload_script_rejects_stale_redacted_projection_token_before_mutation() {
     let (base_url, requests) = spawn_fake_worker_upload_unsafe_preservation_api(true);
     let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
     let dry_run = mcp.call_tool(
