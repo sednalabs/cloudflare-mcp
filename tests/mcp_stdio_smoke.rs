@@ -1041,6 +1041,83 @@ fn spawn_fake_worker_upload_api_with_readback(
     (format!("http://{addr}"), requests)
 }
 
+fn spawn_fake_worker_settings_api() -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake Worker settings API");
+    let addr = listener
+        .local_addr()
+        .expect("fake Worker settings API addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().take(4) {
+            let mut stream = stream.expect("fake Worker settings API stream");
+            let (headers, body) = read_http_request(&mut stream);
+            let request_line = headers.lines().next().unwrap_or_default().to_string();
+            let mut request_parts = request_line.split_whitespace();
+            let method = request_parts.next().unwrap_or_default().to_string();
+            let path = request_parts.next().unwrap_or_default().to_string();
+            let content_type = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-type:"))
+                .or_else(|| headers.lines().find_map(|line| line.strip_prefix("Content-Type:")))
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string();
+            let body_text = String::from_utf8_lossy(&body).to_string();
+            requests_for_thread
+                .lock()
+                .expect("request log lock")
+                .push(json!({
+                    "method": method,
+                    "path": path,
+                    "content_type": content_type,
+                    "body_text": body_text,
+                }));
+
+            let response = match (method.as_str(), path.as_str()) {
+                ("GET", "/accounts/acct-1/workers/scripts/worker-a/settings") => json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": {
+                        "bindings": [{"type": "plain_text", "name": "DESTINATION", "text": "new"}],
+                        "compatibility_date": "2026-06-03"
+                    },
+                }),
+                ("PATCH", "/accounts/acct-1/workers/scripts/worker-a/settings") => {
+                    assert!(content_type.starts_with("multipart/form-data;"));
+                    assert!(body_text.contains("name=\"settings\""));
+                    assert!(body_text.contains(r#""bindings":[{"name":"DESTINATION","text":"new","type":"plain_text"}]"#));
+                    json!({
+                        "success": true,
+                        "errors": [],
+                        "messages": [],
+                        "result": {
+                            "bindings": [{"type": "plain_text", "name": "DESTINATION", "text": "new"}],
+                            "compatibility_date": "2026-06-03"
+                        },
+                    })
+                }
+                _ => json!({
+                    "success": false,
+                    "errors": [{"code": 7000, "message": format!("unexpected request: {method} {path}")}],
+                    "messages": [],
+                    "result": null,
+                }),
+            };
+            let response = serde_json::to_vec(&response).expect("serialize response");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                response.len()
+            )
+            .expect("write response headers");
+            stream.write_all(&response).expect("write response body");
+        }
+    });
+    (format!("http://{addr}"), requests)
+}
+
 fn spawn_fake_worker_upload_version_attestation_api() -> (String, Arc<Mutex<Vec<Value>>>) {
     spawn_fake_worker_upload_version_attestation_api_with_identity(false)
 }
@@ -2862,6 +2939,61 @@ fn workers_upload_script_reports_readback_mismatch_through_stdio_boundary() {
         json!("unexpected.js")
     );
     assert_eq!(requests.lock().expect("request log lock").len(), 2);
+}
+
+#[test]
+fn patch_worker_settings_uses_object_schema_and_multipart_through_stdio_boundary() {
+    let (base_url, requests) = spawn_fake_worker_settings_api();
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let patch = json!({
+        "bindings": [{"type": "plain_text", "name": "DESTINATION", "text": "new"}]
+    });
+
+    let tools = mcp.request(2, "tools/list", json!({}));
+    let tool = tools["result"]["tools"]
+        .as_array()
+        .and_then(|tools| {
+            tools
+                .iter()
+                .find(|tool| tool["name"] == json!("patch_worker_settings"))
+        })
+        .expect("patch_worker_settings tool schema");
+    assert_eq!(
+        tool["inputSchema"]["properties"]["settings_patch"]["type"],
+        json!("object")
+    );
+
+    let dry_run = mcp.call_tool(
+        3,
+        "patch_worker_settings",
+        json!({"script_name": "worker-a", "settings_patch": patch, "dry_run": true}),
+    );
+    let dry_content = structured_content(&dry_run);
+    assert_eq!(dry_content["ok"], json!(true), "{dry_content}");
+    assert_eq!(dry_content["dry_run_note"], json!("No Cloudflare mutation applied."));
+    assert_eq!(requests.lock().expect("request log lock").len(), 1);
+
+    let response = mcp.call_tool(
+        4,
+        "patch_worker_settings",
+        json!({
+            "script_name": "worker-a",
+            "settings_patch": {"bindings": [{"type": "plain_text", "name": "DESTINATION", "text": "new"}]},
+            "expect_binding": {"name": "DESTINATION", "binding_type": "plain_text", "field": "text", "value": "new"}
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(true), "{content}");
+    assert_eq!(content["binding_verification"]["matched"], json!(true));
+    let requests = requests.lock().expect("request log lock");
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[0]["method"], json!("GET"));
+    assert_eq!(requests[1]["method"], json!("GET"));
+    assert_eq!(requests[2]["method"], json!("PATCH"));
+    assert_eq!(requests[3]["method"], json!("GET"));
+    assert!(requests[2]["content_type"]
+        .as_str()
+        .is_some_and(|value| value.starts_with("multipart/form-data;")));
 }
 
 #[test]

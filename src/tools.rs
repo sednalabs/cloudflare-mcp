@@ -1188,7 +1188,10 @@ pub struct PatchWorkerSettingsArgs {
     #[serde(default)]
     pub account_id: Option<String>,
     pub script_name: String,
-    pub settings_patch: Value,
+    /// Worker settings is a JSON object.  Model it as a map rather than a
+    /// catch-all JSON value so the published MCP schema rejects arrays,
+    /// scalars, and null before the curated handler runs.
+    pub settings_patch: BTreeMap<String, Value>,
     #[serde(default)]
     pub expect_binding: Option<WorkerBindingExpectation>,
     #[serde(default)]
@@ -7233,25 +7236,8 @@ impl CloudflareMcp {
             );
             return Ok(finalize_mutation_result(base, &plan, audit, args.dry_run));
         }
-        let Some(settings_patch) = args.settings_patch.as_object() else {
-            let plan = MutationPlan::new("patch_worker_settings");
-            let audit = MutationAuditSession::start(
-                Some(&parts),
-                "patch_worker_settings",
-                json!({
-                    "account_id": account_id,
-                    "script_name": script_name,
-                }),
-                args.dry_run,
-            );
-            let base = invalid_argument_result(
-                "workers.invalid_settings_patch",
-                "settings_patch must be a JSON object",
-                "Provide a JSON object accepted by the Cloudflare Worker settings endpoint.",
-            );
-            return Ok(finalize_mutation_result(base, &plan, audit, args.dry_run));
-        };
-        let patch_keys = settings_patch.keys().cloned().collect::<Vec<_>>();
+        let patch_keys = args.settings_patch.keys().cloned().collect::<Vec<_>>();
+        let settings_patch = Value::Object(args.settings_patch.clone().into_iter().collect());
         let plan = plan_patch_worker_settings(account_id, script_name, &patch_keys);
         let audit = MutationAuditSession::start(
             Some(&parts),
@@ -7294,7 +7280,7 @@ impl CloudflareMcp {
         } else {
             match self
                 .cloudflare
-                .patch_worker_settings(account_id, script_name, &args.settings_patch)
+                .patch_worker_settings(account_id, script_name, &settings_patch)
                 .await
             {
                 Ok(patched) => match self
@@ -13788,13 +13774,14 @@ mod tests {
                 Parameters(PatchWorkerSettingsArgs {
                     account_id: None,
                     script_name: "pages-worker--13414231-production".to_string(),
-                    settings_patch: json!({
+                    settings_patch: serde_json::from_value(json!({
                         "bindings": [{
                             "type": "plain_text",
                             "name": "CLOUDFLARE_AI_SEARCH_MODE",
                             "text": "off"
                         }]
-                    }),
+                    }))
+                    .expect("settings patch object"),
                     expect_binding: None,
                     dry_run: false,
                 }),

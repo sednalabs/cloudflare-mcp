@@ -292,8 +292,10 @@ semantic. The catch-all rule must be last. If no catch-all rule is provided,
 the planner appends `service: http_status:404`.
 
 `patch_worker_settings` expects `settings_patch` to be a JSON object
-accepted by Cloudflare's Worker script settings endpoint. For binding
-verification, pass `expect_binding`:
+accepted by Cloudflare's Worker script settings endpoint; the MCP input schema
+rejects non-object JSON before the curated mutation path runs. Its apply path
+sends Cloudflare's required `multipart/form-data` `settings` part, then reads
+back the settings. For binding verification, pass `expect_binding`:
 
 ```json
 {
