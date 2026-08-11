@@ -83,8 +83,10 @@ registrar purchase/delete/transfer, API token/key management, membership/role
 management, zone deletion, and similar account-level destructive operations.
 The generic `worker-script-put-content` operation is also denied: use the
 curated `workers_upload_script` flow, which binds its upload digest to dry-run
-confirmation and post-upload readback instead of treating executable code
-upload as a raw REST body.
+confirmation. Existing-worker updates additionally bind a redacted
+settings/binding/schedule preservation snapshot, use the content-only endpoint,
+and require authoritative post-upload preservation readback instead of treating
+executable code upload as a raw REST body.
 
 ## Catalog refresh
 

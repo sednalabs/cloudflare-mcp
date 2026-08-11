@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -242,6 +242,11 @@ pub(crate) fn inspect_pages_directory_with_options(
 
     let mut temporary_directories = Vec::new();
     let mut special_files = inspect_special_files(&root)?;
+    include_advanced_worker_directory_if_present(
+        &root,
+        &mut special_files,
+        &mut temporary_directories,
+    )?;
     let functions = include_pages_functions_if_present(
         &root,
         &mut special_files,
@@ -412,6 +417,428 @@ fn inspect_special_files(root: &Path) -> Result<PagesSpecialFiles, PagesDirector
         worker_bundle: inspect_special_file(root, "_worker.bundle", "_worker.bundle")?,
         functions_filepath_routing_config: None,
     })
+}
+
+fn include_advanced_worker_directory_if_present(
+    output_root: &Path,
+    special_files: &mut PagesSpecialFiles,
+    temporary_directories: &mut Vec<PathBuf>,
+) -> Result<(), PagesDirectoryError> {
+    let worker_directory = output_root.join("_worker.js");
+    let metadata = match fs::symlink_metadata(&worker_directory) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(PagesDirectoryError::new(
+                "pages.directory_read_failed",
+                format!("failed reading _worker.js metadata: {err}"),
+                "Check the Pages deployment directory permissions and retry.",
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(PagesDirectoryError::new(
+            "pages.worker_directory_invalid",
+            "_worker.js must not be a symbolic link",
+            "Provide a regular _worker.js file or a real _worker.js directory rooted at index.js.",
+        ));
+    }
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+    if special_files.worker_bundle.is_some() {
+        return Err(PagesDirectoryError::new(
+            "pages.worker_conflict",
+            "_worker.js is a module directory but _worker.bundle is also present; Cloudflare Pages accepts only one worker upload artifact",
+            "Remove _worker.bundle or replace the _worker.js directory with one reviewed worker artifact.",
+        ));
+    }
+
+    let modules = collect_advanced_worker_modules(&worker_directory)?;
+    if !modules
+        .iter()
+        .any(|module| module.relative_path == "index.js")
+    {
+        return Err(PagesDirectoryError::new(
+            "pages.worker_directory_entrypoint_missing",
+            "_worker.js is a module directory but index.js is missing",
+            "Build the Pages artifact so _worker.js/index.js is the advanced-mode entry point.",
+        ));
+    }
+
+    let build_dir = create_temporary_pages_build_dir()?;
+    let bundle_path = build_dir.join("_worker.bundle");
+    write_advanced_worker_bundle(&bundle_path, &modules)?;
+    let worker_bundle = inspect_existing_special_file(
+        bundle_path,
+        "_worker.bundle",
+        "_worker.bundle",
+    )?
+    .ok_or_else(|| {
+        PagesDirectoryError::new(
+            "pages.worker_directory_bundle_missing",
+            "advanced-mode _worker.js directory could not be converted to an upload bundle",
+            "Use Wrangler fallback until the advanced-mode bundle can be generated locally.",
+        )
+    })?;
+    special_files.worker_bundle = Some(worker_bundle);
+    temporary_directories.push(build_dir);
+    Ok(())
+}
+
+#[derive(Debug)]
+struct AdvancedWorkerModule {
+    relative_path: String,
+    bytes: Vec<u8>,
+}
+
+fn collect_advanced_worker_modules(
+    worker_directory: &Path,
+) -> Result<Vec<AdvancedWorkerModule>, PagesDirectoryError> {
+    let worker_root = fs::canonicalize(worker_directory).map_err(|err| {
+        PagesDirectoryError::new(
+            "pages.worker_directory_invalid",
+            format!("failed resolving _worker.js module directory: {err}"),
+            "Provide a readable advanced-mode Worker directory rooted at index.js.",
+        )
+    })?;
+    if !worker_root.is_dir() {
+        return Err(PagesDirectoryError::new(
+            "pages.worker_directory_invalid",
+            "_worker.js module directory did not resolve to a directory",
+            "Provide a real advanced-mode Worker directory rooted at index.js.",
+        ));
+    }
+
+    fn collect(
+        root: &Path,
+        current: &Path,
+        modules: &mut Vec<AdvancedWorkerModule>,
+        total_bytes: &mut u64,
+    ) -> Result<(), PagesDirectoryError> {
+        if !current.starts_with(root) {
+            return Err(PagesDirectoryError::new(
+                "pages.worker_directory_escape_denied",
+                "_worker.js module traversal escaped its canonical root",
+                "Materialize every module as a regular file inside the canonical _worker.js directory.",
+            ));
+        }
+        let entries = fs::read_dir(current).map_err(|err| {
+            PagesDirectoryError::new(
+                "pages.directory_read_failed",
+                format!("failed reading _worker.js module directory: {err}"),
+                "Check the advanced-mode Worker directory permissions and retry.",
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|err| {
+                PagesDirectoryError::new(
+                    "pages.directory_read_failed",
+                    format!("failed reading _worker.js module entry: {err}"),
+                    "Check the advanced-mode Worker directory permissions and retry.",
+                )
+            })?;
+            let discovered_path = entry.path();
+            let discovered_metadata = fs::symlink_metadata(&discovered_path).map_err(|err| {
+                PagesDirectoryError::new(
+                    "pages.directory_read_failed",
+                    format!("failed reading _worker.js module metadata: {err}"),
+                    "Check the advanced-mode Worker directory permissions and retry.",
+                )
+            })?;
+            if discovered_metadata.file_type().is_symlink() {
+                return Err(PagesDirectoryError::new(
+                    "pages.worker_directory_symlink_denied",
+                    "_worker.js module directories must not contain symbolic links",
+                    "Materialize every advanced-mode Worker module as a regular file inside _worker.js.",
+                ));
+            }
+            let canonical_path = fs::canonicalize(&discovered_path).map_err(|err| {
+                PagesDirectoryError::new(
+                    "pages.directory_read_failed",
+                    format!("failed resolving _worker.js module path: {err}"),
+                    "Keep every advanced-mode Worker module inside the canonical _worker.js directory.",
+                )
+            })?;
+            if !canonical_path.starts_with(root) {
+                return Err(PagesDirectoryError::new(
+                    "pages.worker_directory_escape_denied",
+                    "_worker.js contained a module path outside its canonical root",
+                    "Materialize every module as a regular file inside the canonical _worker.js directory.",
+                ));
+            }
+            let canonical_metadata = fs::symlink_metadata(&canonical_path).map_err(|err| {
+                PagesDirectoryError::new(
+                    "pages.directory_read_failed",
+                    format!("failed reading canonical _worker.js module metadata: {err}"),
+                    "Keep every advanced-mode Worker module readable inside _worker.js.",
+                )
+            })?;
+            if canonical_metadata.file_type().is_symlink() {
+                return Err(PagesDirectoryError::new(
+                    "pages.worker_directory_symlink_denied",
+                    "_worker.js canonical module path resolved to a symbolic link",
+                    "Materialize every advanced-mode Worker module as a regular file inside _worker.js.",
+                ));
+            }
+            if canonical_metadata.is_dir() {
+                collect(root, &canonical_path, modules, total_bytes)?;
+                continue;
+            }
+            if !canonical_metadata.is_file() {
+                continue;
+            }
+            let relative = canonical_path.strip_prefix(root).map_err(|err| {
+                PagesDirectoryError::new(
+                    "pages.directory_read_failed",
+                    format!("failed computing _worker.js module path: {err}"),
+                    "Retry with a normal local advanced-mode Worker directory.",
+                )
+            })?;
+            let relative_path = advanced_worker_module_name(relative)?;
+            if relative_path.ends_with(".map") {
+                continue;
+            }
+            if !(relative_path.ends_with(".js") || relative_path.ends_with(".mjs")) {
+                return Err(PagesDirectoryError::new(
+                    "pages.worker_directory_module_unsupported",
+                    format!("_worker.js contains unsupported module {relative_path}"),
+                    "Prebundle non-JavaScript dependencies or use Wrangler fallback for this deployment.",
+                ));
+            }
+            if canonical_metadata.len() > MAX_PAGES_ASSET_BYTES {
+                return Err(PagesDirectoryError::new(
+                    "pages.asset_too_large",
+                    format!(
+                        "advanced-mode Worker module {relative_path} is {} bytes, above Cloudflare's 25 MiB direct-upload limit",
+                        canonical_metadata.len()
+                    ),
+                    "Reduce the generated Worker module size or use Wrangler fallback.",
+                ));
+            }
+            *total_bytes = (*total_bytes)
+                .checked_add(canonical_metadata.len())
+                .ok_or_else(|| {
+                    PagesDirectoryError::new(
+                        "pages.asset_too_large",
+                        "advanced-mode Worker module size overflowed the upload counter",
+                        "Reduce or bundle the advanced-mode Worker module graph.",
+                    )
+                })?;
+            if *total_bytes > MAX_PAGES_ASSET_BYTES {
+                return Err(PagesDirectoryError::new(
+                    "pages.asset_too_large",
+                    format!(
+                        "advanced-mode Worker modules total {} bytes, above Cloudflare's 25 MiB direct-upload limit",
+                        *total_bytes
+                    ),
+                    "Reduce or bundle the advanced-mode Worker module graph before deployment.",
+                ));
+            }
+            let bytes = read_stable_advanced_worker_module(
+                root,
+                &canonical_path,
+                &relative_path,
+                canonical_metadata.len(),
+                |path: &Path| fs::read(path),
+            )?;
+            modules.push(AdvancedWorkerModule {
+                relative_path,
+                bytes,
+            });
+        }
+        Ok(())
+    }
+
+    let mut modules = Vec::new();
+    let mut total_bytes = 0u64;
+    collect(&worker_root, &worker_root, &mut modules, &mut total_bytes)?;
+    modules.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    if modules.is_empty() {
+        return Err(PagesDirectoryError::new(
+            "pages.worker_directory_empty",
+            "_worker.js module directory contains no JavaScript modules",
+            "Build the advanced-mode Worker so _worker.js/index.js and its modules are present.",
+        ));
+    }
+    if modules.len() > MAX_PAGES_ASSET_COUNT_DEFAULT {
+        return Err(PagesDirectoryError::new(
+            "pages.worker_directory_too_many_modules",
+            format!(
+                "_worker.js contains {} modules, above the configured safety limit {}",
+                modules.len(),
+                MAX_PAGES_ASSET_COUNT_DEFAULT
+            ),
+            "Reduce or bundle the advanced-mode Worker module graph before deployment.",
+        ));
+    }
+    Ok(modules)
+}
+
+fn read_stable_advanced_worker_module<F>(
+    root: &Path,
+    canonical_path: &Path,
+    relative_path: &str,
+    expected_len: u64,
+    mut read_file: F,
+) -> Result<Vec<u8>, PagesDirectoryError>
+where
+    F: FnMut(&Path) -> std::io::Result<Vec<u8>>,
+{
+    let changed = || {
+        PagesDirectoryError::new(
+            "pages.worker_directory_module_changed",
+            format!(
+                "advanced-mode Worker module {} changed while it was being inspected",
+                relative_path
+            ),
+            "Rebuild a stable artifact and rerun the dry-run before deployment.",
+        )
+    };
+    let read = |reader: &mut F| {
+        reader(canonical_path).map_err(|err| {
+            PagesDirectoryError::new(
+                "pages.asset_read_failed",
+                format!(
+                    "failed reading advanced-mode Worker module {}: {err}",
+                    relative_path
+                ),
+                "Check the canonical advanced-mode Worker module permissions and retry.",
+            )
+        })
+    };
+
+    let bytes = read(&mut read_file)?;
+    let first_readback_path = fs::canonicalize(canonical_path).map_err(|_| changed())?;
+    let first_readback_metadata = fs::symlink_metadata(canonical_path).map_err(|_| changed())?;
+    if first_readback_path != canonical_path
+        || !first_readback_path.starts_with(root)
+        || first_readback_metadata.file_type().is_symlink()
+        || !first_readback_metadata.is_file()
+        || first_readback_metadata.len() != expected_len
+        || bytes.len() as u64 != expected_len
+    {
+        return Err(changed());
+    }
+
+    let reread_bytes = read(&mut read_file)?;
+    let final_path = fs::canonicalize(canonical_path).map_err(|_| changed())?;
+    let final_metadata = fs::symlink_metadata(canonical_path).map_err(|_| changed())?;
+    if final_path != canonical_path
+        || !final_path.starts_with(root)
+        || final_metadata.file_type().is_symlink()
+        || !final_metadata.is_file()
+        || final_metadata.len() != expected_len
+        || reread_bytes.len() as u64 != expected_len
+        || reread_bytes != bytes
+    {
+        return Err(changed());
+    }
+
+    Ok(bytes)
+}
+
+fn advanced_worker_module_name(relative: &Path) -> Result<String, PagesDirectoryError> {
+    let mut components = Vec::new();
+    for component in relative.components() {
+        let Component::Normal(value) = component else {
+            return Err(PagesDirectoryError::new(
+                "pages.worker_directory_module_name_invalid",
+                "_worker.js contains a non-normal module path",
+                "Use ordinary relative JavaScript module paths inside _worker.js.",
+            ));
+        };
+        let value = value.to_str().ok_or_else(|| {
+            PagesDirectoryError::new(
+                "pages.worker_directory_module_name_invalid",
+                "_worker.js contains a module path that is not valid UTF-8",
+                "Use UTF-8 relative JavaScript module names inside _worker.js.",
+            )
+        })?;
+        if value.is_empty()
+            || value.contains('"')
+            || value.contains('\r')
+            || value.contains('\n')
+            || value.chars().any(char::is_control)
+        {
+            return Err(PagesDirectoryError::new(
+                "pages.worker_directory_module_name_invalid",
+                "_worker.js contains a module name unsafe for multipart upload",
+                "Use ordinary relative JavaScript module names without quotes or control characters.",
+            ));
+        }
+        components.push(value);
+    }
+    Ok(components.join("/"))
+}
+
+fn write_advanced_worker_bundle(
+    bundle_path: &Path,
+    modules: &[AdvancedWorkerModule],
+) -> Result<(), PagesDirectoryError> {
+    let mut identity = Sha256::new();
+    for module in modules {
+        identity.update(module.relative_path.as_bytes());
+        identity.update((module.bytes.len() as u64).to_le_bytes());
+        identity.update(Sha256::digest(&module.bytes));
+    }
+    let mut boundary = format!("----formdata-worker-bundle-{:x}", identity.finalize());
+    while modules.iter().any(|module| {
+        module
+            .bytes
+            .windows(boundary.len())
+            .any(|window| window == boundary.as_bytes())
+    }) {
+        boundary.push('x');
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(bundle_path)
+        .map_err(|err| {
+            PagesDirectoryError::new(
+                "pages.worker_directory_bundle_failed",
+                format!("failed creating advanced-mode Worker bundle: {err}"),
+                "Check local temporary directory permissions and retry.",
+            )
+        })?;
+    write!(
+        file,
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"metadata\"\r\n\r\n{{\"main_module\":\"index.js\"}}\r\n"
+    )
+    .map_err(worker_bundle_write_error)?;
+    for module in modules {
+        write!(
+            file,
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\nContent-Type: application/javascript+module\r\n\r\n",
+            module.relative_path, module.relative_path
+        )
+        .map_err(worker_bundle_write_error)?;
+        file.write_all(&module.bytes)
+            .map_err(worker_bundle_write_error)?;
+        file.write_all(b"\r\n").map_err(worker_bundle_write_error)?;
+    }
+    write!(file, "--{boundary}--\r\n").map_err(worker_bundle_write_error)?;
+    file.flush().map_err(worker_bundle_write_error)?;
+    let size = file.metadata().map_err(worker_bundle_write_error)?.len();
+    if size > MAX_PAGES_ASSET_BYTES {
+        return Err(PagesDirectoryError::new(
+            "pages.asset_too_large",
+            format!(
+                "generated advanced-mode Worker bundle is {size} bytes, above Cloudflare's 25 MiB direct-upload limit"
+            ),
+            "Reduce the generated Worker modules or use Wrangler fallback.",
+        ));
+    }
+    Ok(())
+}
+
+fn worker_bundle_write_error(err: std::io::Error) -> PagesDirectoryError {
+    PagesDirectoryError::new(
+        "pages.worker_directory_bundle_failed",
+        format!("failed writing advanced-mode Worker bundle: {err}"),
+        "Check local temporary directory permissions and retry.",
+    )
 }
 
 fn inspect_special_file(
@@ -776,22 +1203,72 @@ fn resolve_wrangler_command(project_root: &Path, wrangler_bin: Option<&Path>) ->
 }
 
 fn create_temporary_pages_build_dir() -> Result<PathBuf, PagesDirectoryError> {
+    let temp_root = fs::canonicalize(std::env::temp_dir()).map_err(|err| {
+        PagesDirectoryError::new(
+            "pages.functions_bundle_failed",
+            format!("failed resolving the temporary directory root: {err}"),
+            "Configure a real, writable temporary directory and retry.",
+        )
+    })?;
+    if !temp_root.is_dir() {
+        return Err(PagesDirectoryError::new(
+            "pages.functions_bundle_failed",
+            "temporary directory root did not resolve to a directory",
+            "Configure a real, writable temporary directory and retry.",
+        ));
+    }
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    let path = std::env::temp_dir().join(format!(
-        "cloudflare-mcp-pages-functions-{}-{nonce}",
-        std::process::id()
-    ));
-    fs::create_dir_all(&path).map_err(|err| {
-        PagesDirectoryError::new(
-            "pages.functions_bundle_failed",
-            format!("failed creating temporary Pages Functions build directory: {err}"),
-            "Check local temporary directory permissions and retry.",
-        )
-    })?;
-    Ok(path)
+    for attempt in 0..32u8 {
+        let path = temp_root.join(format!(
+            "cloudflare-mcp-pages-functions-{}-{nonce}-{attempt}",
+            std::process::id()
+        ));
+        match fs::create_dir(&path) {
+            Ok(()) => {
+                let canonical = fs::canonicalize(&path).map_err(|err| {
+                    PagesDirectoryError::new(
+                        "pages.functions_bundle_failed",
+                        format!("failed resolving the new temporary directory: {err}"),
+                        "Check temporary directory permissions and retry.",
+                    )
+                })?;
+                let metadata = fs::symlink_metadata(&canonical).map_err(|err| {
+                    PagesDirectoryError::new(
+                        "pages.functions_bundle_failed",
+                        format!("failed checking the new temporary directory: {err}"),
+                        "Check temporary directory permissions and retry.",
+                    )
+                })?;
+                if canonical.parent() != Some(temp_root.as_path())
+                    || metadata.file_type().is_symlink()
+                    || !metadata.is_dir()
+                {
+                    return Err(PagesDirectoryError::new(
+                        "pages.functions_bundle_failed",
+                        "new temporary directory escaped its canonical root",
+                        "Configure a trustworthy local temporary directory and retry.",
+                    ));
+                }
+                return Ok(canonical);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(PagesDirectoryError::new(
+                    "pages.functions_bundle_failed",
+                    format!("failed creating an exclusive temporary directory: {err}"),
+                    "Check local temporary directory permissions and retry.",
+                ));
+            }
+        }
+    }
+    Err(PagesDirectoryError::new(
+        "pages.functions_bundle_failed",
+        "could not allocate an exclusive temporary directory after repeated collisions",
+        "Clear stale local temporary artifacts and retry.",
+    ))
 }
 
 fn inspect_existing_special_file(
@@ -847,7 +1324,7 @@ fn should_ignore_directory(relative: &Path) -> bool {
         .map(|component| {
             matches!(
                 component,
-                ".git" | "node_modules" | ".wrangler" | "functions"
+                ".git" | "node_modules" | ".wrangler" | "functions" | "_worker.js"
             )
         })
         .unwrap_or(false)
@@ -1017,6 +1494,104 @@ test -z "$config" || printf '%s' '{"routes":[{"routePath":"/api/ping","mountPath
         assert!(!package.manifest.contains_key("/_worker.js"));
 
         fs::remove_dir_all(root).expect("cleanup temp pages dir");
+    }
+
+    #[test]
+    fn inspect_pages_directory_packages_advanced_mode_worker_directory() {
+        let root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pages-worker-directory");
+
+        let package = inspect_pages_directory(root.to_str().unwrap(), 20).expect("inspect pages");
+
+        assert_eq!(package.assets.len(), 2);
+        assert!(
+            package
+                .assets
+                .iter()
+                .any(|asset| asset.relative_path == "index.html")
+        );
+        assert!(package.special_files.worker.is_none());
+        let bundle = package
+            .special_files
+            .worker_bundle
+            .as_ref()
+            .expect("generated worker bundle");
+        let body =
+            String::from_utf8(bundle.read_bytes().expect("read bundle")).expect("bundle is utf-8");
+        assert!(body.contains(r#"{"main_module":"index.js"}"#));
+        assert!(body.contains("name=\"index.js\"; filename=\"index.js\""));
+        assert!(body.contains("name=\"chunks/message.mjs\"; filename=\"chunks/message.mjs\""));
+        assert!(!package.manifest.contains_key("/_worker.js/index.js"));
+        assert!(!package.manifest.contains_key("/_worker.js/index.js.map"));
+        assert!(
+            !package
+                .manifest
+                .contains_key("/_worker.js/chunks/message.mjs")
+        );
+    }
+
+    #[test]
+    fn inspect_pages_directory_rejects_advanced_mode_worker_directory_without_entrypoint() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/pages-worker-directory-missing-entry");
+
+        let error = inspect_pages_directory(root.to_str().unwrap(), 20).expect_err("reject");
+
+        assert_eq!(error.code, "pages.worker_directory_entrypoint_missing");
+    }
+
+    #[test]
+    fn inspect_pages_directory_rejects_worker_directory_and_bundle_together() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/pages-worker-directory-conflict");
+
+        let error = inspect_pages_directory(root.to_str().unwrap(), 20).expect_err("reject");
+
+        assert_eq!(error.code, "pages.worker_conflict");
+    }
+
+    #[test]
+    fn advanced_worker_module_names_reject_escape_and_header_injection() {
+        assert_eq!(
+            advanced_worker_module_name(Path::new("../escape.js"))
+                .expect_err("parent traversal must fail")
+                .code,
+            "pages.worker_directory_module_name_invalid"
+        );
+        assert_eq!(
+            advanced_worker_module_name(Path::new("chunks/bad\"name.js"))
+                .expect_err("multipart header injection must fail")
+                .code,
+            "pages.worker_directory_module_name_invalid"
+        );
+    }
+
+    #[test]
+    fn stable_module_read_rejects_same_length_content_change() {
+        let worker_root = fs::canonicalize(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/pages-worker-directory/_worker.js"),
+        )
+        .expect("canonical worker root");
+        let module_path =
+            fs::canonicalize(worker_root.join("index.js")).expect("canonical worker module");
+        let original = fs::read(&module_path).expect("fixture module");
+        let mut changed = original.clone();
+        changed[0] ^= 1;
+        assert_eq!(changed.len(), original.len());
+        let expected_len = original.len() as u64;
+        let mut reads = [original, changed].into_iter();
+
+        let error = read_stable_advanced_worker_module(
+            &worker_root,
+            &module_path,
+            "index.js",
+            expected_len,
+            |_| Ok(reads.next().expect("two bounded reads")),
+        )
+        .expect_err("same-length mutation must be rejected");
+
+        assert_eq!(error.code, "pages.worker_directory_module_changed");
     }
 
     #[test]

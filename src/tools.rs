@@ -68,6 +68,10 @@ use crate::verification::{
     ExpectedVerificationState, VerificationState, classify_http_result, now_unix_ms,
     timeout_result, transport_error_result,
 };
+use crate::worker_preservation::{
+    WorkerPreservationError, WorkerPreservationReadError, WorkerPreservationSnapshot,
+    read_worker_preservation,
+};
 use crate::worker_upload::{
     WorkerUploadBody, WorkerUploadError, WorkerUploadInput, build_worker_upload,
 };
@@ -6342,13 +6346,6 @@ impl CloudflareMcp {
         };
 
         let upload_summary = json!(upload.summary);
-        let token_body = Some(json!({
-            "script_name": script_name,
-            "upload": upload_summary,
-            "create_only": args.create_only,
-        }));
-        let required_confirmation_token =
-            mutation_confirmation_token(upload_operation, &rendered_path, &token_body);
         let plan = plan_upload_worker_script(
             account_id,
             script_name,
@@ -6370,6 +6367,79 @@ impl CloudflareMcp {
             args.dry_run,
         );
 
+        let preservation_before = if args.create_only {
+            None
+        } else {
+            let snapshot =
+                match read_worker_preservation(&self.cloudflare, account_id, script_name).await {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        return Ok(finalize_mutation_result(
+                            worker_upload_preservation_read_error_result(
+                                account_id,
+                                script_name,
+                                &upload_summary,
+                                &err,
+                            ),
+                            &plan,
+                            audit,
+                            args.dry_run,
+                        ));
+                    }
+                };
+            if let WorkerUploadBody::Module { metadata, .. } = &upload.body {
+                if let Err(err) = snapshot.validate_requested_metadata(metadata) {
+                    return Ok(finalize_mutation_result(
+                        worker_upload_preservation_error_result(
+                            account_id,
+                            script_name,
+                            &upload_summary,
+                            &err,
+                        ),
+                        &plan,
+                        audit,
+                        args.dry_run,
+                    ));
+                }
+                if let Err(err) =
+                    snapshot.validate_requested_main_module(upload.summary.main_module.as_deref())
+                {
+                    return Ok(finalize_mutation_result(
+                        worker_upload_preservation_error_result(
+                            account_id,
+                            script_name,
+                            &upload_summary,
+                            &err,
+                        ),
+                        &plan,
+                        audit,
+                        args.dry_run,
+                    ));
+                }
+            }
+            Some(snapshot)
+        };
+
+        let request_path = if args.create_only {
+            rendered_path.clone()
+        } else {
+            format!("{rendered_path}/content")
+        };
+        let preservation_token_binding = preservation_before
+            .as_ref()
+            .map(WorkerPreservationSnapshot::token_binding);
+        let token_body = Some(json!({
+            "script_name": script_name,
+            "upload": upload_summary,
+            "create_only": args.create_only,
+            "preservation": preservation_token_binding,
+        }));
+        let required_confirmation_token =
+            mutation_confirmation_token(upload_operation, &request_path, &token_body);
+        let preservation_summary = preservation_before
+            .as_ref()
+            .map(WorkerPreservationSnapshot::public_summary);
+
         let base = if args.dry_run {
             CallToolResult::structured(json!({
                 "ok": true,
@@ -6377,11 +6447,13 @@ impl CloudflareMcp {
                 "operation": "workers_upload_script",
                 "account_id": account_id,
                 "script_name": script_name,
-                "request_path": rendered_path,
+                "request_path": request_path,
                 "upload": upload_summary,
                 "create_only": args.create_only,
+                "update_mode": if args.create_only { "create_only" } else { "content_only_preserving_settings_bindings_and_schedules" },
+                "preservation": preservation_summary,
                 "required_confirmation_token": required_confirmation_token,
-                "dry_run_note": "No Worker script upload applied.",
+                "dry_run_note": "No Worker script upload applied. Existing-worker reads are read-only preservation evidence.",
             }))
         } else if args.confirmation_token.as_deref() != Some(required_confirmation_token.as_str()) {
             CallToolResult::structured_error(json!({
@@ -6396,6 +6468,7 @@ impl CloudflareMcp {
                 "script_name": script_name,
                 "upload": upload_summary,
                 "create_only": args.create_only,
+                "preservation": preservation_summary,
                 "required_confirmation_token": required_confirmation_token,
             }))
         } else {
@@ -6436,6 +6509,83 @@ impl CloudflareMcp {
                 }
             };
             match uploaded {
+                Ok(script) if !args.create_only => {
+                    let preservation_after = match read_worker_preservation(
+                        &self.cloudflare,
+                        account_id,
+                        script_name,
+                    )
+                    .await
+                    {
+                        Ok(snapshot) => snapshot,
+                        Err(err) => {
+                            return Ok(finalize_mutation_result(
+                                CallToolResult::structured_error(json!({
+                                    "ok": false,
+                                    "operation": "workers_upload_script",
+                                    "error": {
+                                        "code": "workers.upload_preservation_readback_invalid",
+                                        "message": "Worker code update returned success, but preservation readback was incomplete or ambiguous.",
+                                        "hint": "Treat the update as unproven and reconcile the exact Worker before continuing.",
+                                        "readback_error": err.payload(),
+                                    },
+                                    "account_id": account_id,
+                                    "script_name": script_name,
+                                    "upload": upload_summary,
+                                    "create_only": false,
+                                    "script": script,
+                                    "preservation_before": preservation_summary,
+                                    "mutation_performed": true,
+                                })),
+                                &plan,
+                                audit,
+                                args.dry_run,
+                            ));
+                        }
+                    };
+                    let readback_verification = verify_existing_worker_content_update(
+                        script_name,
+                        &script,
+                        preservation_before
+                            .as_ref()
+                            .expect("existing Worker preservation was read before apply"),
+                        &preservation_after,
+                        preservation_after.main_module_reported(),
+                    );
+                    if readback_verification["matched"] == true {
+                        CallToolResult::structured(json!({
+                            "ok": true,
+                            "operation": "workers_upload_script",
+                            "account_id": account_id,
+                            "script_name": script_name,
+                            "upload": upload_summary,
+                            "create_only": false,
+                            "update_mode": "content_only_preserving_settings_bindings_and_schedules",
+                            "script": script,
+                            "preservation_before": preservation_summary,
+                            "preservation_after": preservation_after.public_summary(),
+                            "readback_verification": readback_verification,
+                        }))
+                    } else {
+                        CallToolResult::structured_error(json!({
+                            "ok": false,
+                            "operation": "workers_upload_script",
+                            "error": {
+                                "code": "workers.upload_preservation_mismatch",
+                                "message": "Worker code update returned success, but authoritative preservation readback did not match the dry-run state.",
+                                "hint": "Reconcile the exact Worker settings, bindings, schedules, and upload identity before continuing.",
+                            },
+                            "account_id": account_id,
+                            "script_name": script_name,
+                            "upload": upload_summary,
+                            "create_only": false,
+                            "script": script,
+                            "preservation_before": preservation_summary,
+                            "preservation_after": preservation_after.public_summary(),
+                            "readback_verification": readback_verification,
+                        }))
+                    }
+                }
                 Ok(script) => match self
                     .cloudflare
                     .get_worker_settings(account_id, script_name)
@@ -10677,6 +10827,90 @@ fn worker_binding_presence(bindings: Option<&[Value]>, binding_name: &str) -> Va
         value: None,
     };
     verify_worker_binding(bindings, &expectation)
+}
+
+fn worker_upload_preservation_error_result(
+    account_id: &str,
+    script_name: &str,
+    upload_summary: &Value,
+    error: &WorkerPreservationError,
+) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": "workers_upload_script",
+        "error": error.payload(),
+        "account_id": account_id,
+        "script_name": script_name,
+        "upload": upload_summary,
+        "create_only": false,
+        "mutation_performed": false,
+    }))
+}
+
+fn worker_upload_preservation_read_error_result(
+    account_id: &str,
+    script_name: &str,
+    upload_summary: &Value,
+    error: &WorkerPreservationReadError,
+) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": "workers_upload_script",
+        "error": error.payload(),
+        "account_id": account_id,
+        "script_name": script_name,
+        "upload": upload_summary,
+        "create_only": false,
+        "mutation_performed": false,
+    }))
+}
+
+fn verify_existing_worker_content_update(
+    expected_script_name: &str,
+    uploaded: &WorkerScript,
+    before: &WorkerPreservationSnapshot,
+    after: &WorkerPreservationSnapshot,
+    main_module_reported: bool,
+) -> Value {
+    let identities = [uploaded.id.as_deref(), uploaded.script_name.as_deref()];
+    let identity_reported = identities.into_iter().flatten().next().is_some();
+    let identity_matched = identity_reported
+        && identities.into_iter().flatten().all(|identity| {
+            !identity.is_empty() && identity.trim() == identity && identity == expected_script_name
+        });
+    let etag_matched = uploaded
+        .extra
+        .get("etag")
+        .and_then(Value::as_str)
+        .is_some_and(|etag| !etag.is_empty() && etag.trim() == etag);
+    let preservation_matched = before.matches(after);
+    let matched = identity_matched && etag_matched && preservation_matched;
+
+    json!({
+        "matched": matched,
+        "code": if matched {
+            "workers.upload_content_preservation_matched"
+        } else if !identity_matched {
+            "workers.upload_script_identity_invalid"
+        } else if !etag_matched {
+            "workers.upload_etag_absent"
+        } else {
+            "workers.upload_preservation_state_changed"
+        },
+        "script_identity_matched": identity_matched,
+        "upload_etag_reported": etag_matched,
+        "settings_bindings_schedules_preserved": preservation_matched,
+        "main_module_evidence": if main_module_reported {
+            "settings_readback"
+        } else {
+            "content_only_endpoint_with_preservation_readback"
+        },
+        "message": if matched {
+            "Worker code was updated through the content-only endpoint and settings, bindings, and schedules matched the guarded pre-apply state."
+        } else {
+            "Worker content update proof was incomplete or contradicted by authoritative readback."
+        },
+    })
 }
 
 fn verify_worker_upload_readback(

@@ -269,13 +269,45 @@ tools/call name=workers_upload_script arguments='{
 }'
 ```
 
+For `pages_deploy_directory`, framework output may represent advanced mode as
+either a `_worker.js` file or a `_worker.js/` module directory whose entry point
+is `index.js`. The directory form is packaged locally as `_worker.bundle`;
+dry-run reports that generated special file without contacting Cloudflare, and
+the directory is never included in the static asset manifest. A missing entry
+point, symlink, unsafe name, unsupported module type, or conflicting worker
+artifact is a stop condition. Rebuild the artifact or use the reviewed Wrangler
+path rather than bypassing the validator.
+
+The module walk canonicalizes every discovered path and requires containment
+beneath the canonical `_worker.js` root before and after reading. It also checks
+regular-file type, stable size, a bounded second byte-for-byte read, aggregate
+size, and multipart-safe relative names. Temporary bundle directories are
+created exclusively beneath the
+canonical temporary root and the bundle file uses create-new semantics. Treat a
+containment, symlink, type, stability, or allocation failure as a hard stop.
+
 Review the plan and policy output before apply. For `workers_upload_script`,
 review `upload.sha256`, `upload.metadata_sha256`, and `upload.metadata_keys`;
 the tool intentionally reports digests and keys instead of raw Worker metadata
-values. Apply by echoing `required_confirmation_token` in
-`confirmation_token`. Treat `workers.upload_readback_mismatch` as a failed
-deployment proof even when Cloudflare accepted the upload request, because the
-settings readback did not match the requested module.
+values. For an existing Worker, also review the redacted `preservation`
+manifest: expected setting keys, binding names/types, cron strings, and
+one nonblank redacted-projection digest must be present. Secret-bearing
+settings digests, resource identifiers, binding values, and secret values are
+deliberately absent. A redacted preservation-shape change invalidates the
+dry-run token; the token deliberately does not bind secret-bearing values.
+Apply rereads current full state immediately before mutation, then uses
+Cloudflare's content-only endpoint. Treat any internal pre/post preservation
+mismatch or post-apply readback failure as an unproven deployment even if
+Cloudflare accepted the upload. A missing settings
+`main_module` is acceptable only when exact upload identity, etag, settings,
+bindings, and schedules are all proven preserved.
+
+For module uploads, `bindings` and `parts` are transport metadata and may omit
+server-generated identifiers or contain upload-only secret material. Do not
+compare them with redacted readback objects or return them. Preservation is
+instead proven by an exact internal pre/post settings comparison. Other
+metadata must remain byte-semantically equal to current settings. Schedule cron strings are trimmed
+before hashing and duplicate detection; an empty cron still fails closed.
 
 When a create-only module upload returns `main_module:null` in settings, that
 field is not treated as creation proof. The tool binds the upload response etag

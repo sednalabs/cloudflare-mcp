@@ -136,6 +136,18 @@ pub struct WorkerSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerSchedule {
+    pub cron: String,
+    pub created_on: Option<String>,
+    pub modified_on: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerSchedules {
+    pub schedules: Vec<WorkerSchedule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct D1Database {
     #[serde(default)]
     pub uuid: Option<String>,

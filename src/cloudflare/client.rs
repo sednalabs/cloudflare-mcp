@@ -20,7 +20,7 @@ use url::Url;
 use crate::cloudflare::model::{
     AccessAppUpsertRequest, AccessApplication, AccessPolicy, AccessPolicyWrite, CacheRuleset,
     D1Database, DnsRecord, DnsRecordUpsertRequest, DnsRouteDisableResult, Page, PageInfo, Tunnel,
-    WorkerScript, WorkerSettings, ZoneIdentity,
+    WorkerSchedule, WorkerSchedules, WorkerScript, WorkerSettings, ZoneIdentity,
 };
 use crate::config::{ApiTokenSource, CloudflareApiConfig};
 use mcp_toolkit_observability::sanitize_error_message;
@@ -1498,6 +1498,43 @@ impl CloudflareClient {
         })
     }
 
+    pub async fn get_worker_schedules(
+        &self,
+        account_id: &str,
+        script_name: &str,
+    ) -> Result<Vec<WorkerSchedule>, AdapterError> {
+        let account_id = require_non_empty("account_id", account_id)?;
+        let script_name = require_non_empty("script_name", script_name)?;
+        let token = self.bearer_token()?;
+        let url = self.endpoint(&format!(
+            "/accounts/{account_id}/workers/scripts/{script_name}/schedules"
+        ));
+
+        let envelope: CloudflareEnvelope<WorkerSchedules> = self
+            .send_envelope(
+                "cloudflare.workers.schedules.get",
+                RetryPolicy::Idempotent,
+                || {
+                    self.http
+                        .get(url.clone())
+                        .bearer_auth(&token)
+                        .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone())
+                },
+            )
+            .await?;
+
+        envelope
+            .result
+            .map(|result| result.schedules)
+            .ok_or_else(|| {
+                AdapterError::new(
+                    "cloudflare.empty_result",
+                    "Cloudflare returned success without Worker schedules",
+                    "Verify Worker script name and Cloudflare Workers schedules response schema.",
+                )
+            })
+    }
+
     /// Read the complete initial Worker version evidence after a create-only
     /// upload.  Settings are not authoritative for module uploads (Cloudflare
     /// may legitimately return `main_module: null`), so bind the readback to
@@ -1827,9 +1864,15 @@ impl CloudflareClient {
             })?;
 
         let token = self.bearer_token()?;
-        let url = self.endpoint(&format!(
-            "/accounts/{account_id}/workers/scripts/{script_name}"
-        ));
+        let url = if create_only {
+            self.endpoint(&format!(
+                "/accounts/{account_id}/workers/scripts/{script_name}"
+            ))
+        } else {
+            self.endpoint(&format!(
+                "/accounts/{account_id}/workers/scripts/{script_name}/content"
+            ))
+        };
         let metadata_text = metadata.to_string();
         let module_name = module_name.to_string();
         let file_name = file_name.to_string();
@@ -1837,7 +1880,11 @@ impl CloudflareClient {
 
         let envelope: CloudflareEnvelope<WorkerScript> = match self
             .send_envelope(
-                "cloudflare.workers.script.upload_module",
+                if create_only {
+                    "cloudflare.workers.script.create_module"
+                } else {
+                    "cloudflare.workers.script.update_content_module"
+                },
                 RetryPolicy::NonIdempotent,
                 || {
                     let metadata_part = reqwest::multipart::Part::text(metadata_text.clone())
@@ -1892,13 +1939,23 @@ impl CloudflareClient {
         let content_type = require_non_empty("content_type", content_type)?;
         let content_type_header = header_value("content-type", content_type)?;
         let token = self.bearer_token()?;
-        let url = self.endpoint(&format!(
-            "/accounts/{account_id}/workers/scripts/{script_name}"
-        ));
+        let url = if create_only {
+            self.endpoint(&format!(
+                "/accounts/{account_id}/workers/scripts/{script_name}"
+            ))
+        } else {
+            self.endpoint(&format!(
+                "/accounts/{account_id}/workers/scripts/{script_name}/content"
+            ))
+        };
 
         let envelope: CloudflareEnvelope<WorkerScript> = match self
             .send_envelope(
-                "cloudflare.workers.script.upload_multipart",
+                if create_only {
+                    "cloudflare.workers.script.create_multipart"
+                } else {
+                    "cloudflare.workers.script.update_content_multipart"
+                },
                 RetryPolicy::NonIdempotent,
                 || {
                     let mut request = self
@@ -3791,6 +3848,25 @@ mod tests {
                     }
                 }),
             )
+            .route(
+                "/accounts/acct-1/workers/scripts/worker-a/content",
+                put({
+                    let calls = calls.clone();
+                    move |headers: HeaderMap, _body: Bytes| {
+                        let calls = calls.clone();
+                        async move {
+                            assert!(headers.get(reqwest::header::IF_NONE_MATCH).is_none());
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            Json(json!({
+                                "success": true,
+                                "errors": [],
+                                "messages": [],
+                                "result": {"id": "worker-a", "script_name": "worker-a"},
+                            }))
+                        }
+                    }
+                }),
+            )
             .with_state(());
 
         let base = spawn_router(router).await;
@@ -4521,37 +4597,43 @@ mod tests {
     #[tokio::test]
     async fn worker_create_only_server_error_is_uncertain_without_retry() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let router = Router::new().route(
-            "/accounts/acct-1/workers/scripts/worker-a",
-            put({
+        let server_error = {
+            let calls = calls.clone();
+            move |headers: HeaderMap, _body: Bytes| {
                 let calls = calls.clone();
-                move |headers: HeaderMap, _body: Bytes| {
-                    let calls = calls.clone();
-                    async move {
-                        let attempt = calls.fetch_add(1, Ordering::SeqCst);
-                        if attempt == 0 {
-                            assert_eq!(
-                                headers
-                                    .get(reqwest::header::IF_NONE_MATCH)
-                                    .and_then(|value| value.to_str().ok()),
-                                Some("*")
-                            );
-                        } else {
-                            assert!(headers.get(reqwest::header::IF_NONE_MATCH).is_none());
-                        }
-                        (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            Json(json!({
-                                "success": false,
-                                "errors": [{"code": 1000, "message": "temporary outage"}],
-                                "messages": [],
-                                "result": null,
-                            })),
-                        )
+                async move {
+                    let attempt = calls.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        assert_eq!(
+                            headers
+                                .get(reqwest::header::IF_NONE_MATCH)
+                                .and_then(|value| value.to_str().ok()),
+                            Some("*")
+                        );
+                    } else {
+                        assert!(headers.get(reqwest::header::IF_NONE_MATCH).is_none());
                     }
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({
+                            "success": false,
+                            "errors": [{"code": 1000, "message": "temporary outage"}],
+                            "messages": [],
+                            "result": null,
+                        })),
+                    )
                 }
-            }),
-        );
+            }
+        };
+        let router = Router::new()
+            .route(
+                "/accounts/acct-1/workers/scripts/worker-a",
+                put(server_error.clone()),
+            )
+            .route(
+                "/accounts/acct-1/workers/scripts/worker-a/content",
+                put(server_error),
+            );
 
         let base = spawn_router(router).await;
         let client = CloudflareClient::new(test_config(base)).expect("client");

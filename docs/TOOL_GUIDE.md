@@ -61,6 +61,18 @@ Use Pages tools for project inspection, domain management, and direct uploads:
 Use `pages_deploy_directory` for direct-upload projects. Use
 `pages_trigger_deployment` for Git-backed projects.
 
+Advanced-mode output may contain either a `_worker.js` file or a `_worker.js/`
+module directory rooted at `index.js`. The directory form is packaged locally
+as `_worker.bundle`, and its JavaScript modules are excluded from the static
+asset manifest. Source maps are omitted. Symlinks, unsafe names, a missing
+entrypoint, unsupported module types, and conflicting worker artifacts fail
+closed before provider access; dry-run makes no Cloudflare calls.
+Every discovered module is canonicalized, required to remain beneath the
+canonical `_worker.js` root, reread and byte-compared before admission, and
+bounded by the complete 25 MiB module-graph limit. Generated bundles use an
+exclusively created directory beneath the canonical temporary root and a
+create-new file.
+
 ## D1
 
 Use curated D1 tools instead of generic API calls for database workflows:
@@ -134,9 +146,18 @@ Use `workers_upload_script` when the deploy boundary is the Worker script body
 itself. It accepts a single module file/content or a prebuilt multipart Worker
 bundle, returns a dry-run confirmation token, and summarizes script/metadata
 evidence with SHA-256 digests plus metadata keys rather than raw metadata
-values. Apply requires the dry-run token, reads back Worker settings, and
-reports `readback_verification`; a different non-empty `main_module` fails
-closed. For create-only module uploads, settings may legitimately return a
+values. Existing-worker dry-run also reads the complete settings,
+binding, and schedule preservation contract. Apply repeats those reads, uses
+the content-only endpoint, and reports success only when exact upload identity
+and post-apply preservation match. The outward manifest and confirmation token
+contain only a digest of the redacted nonsecret projection; secret-bearing
+settings digests, resource identifiers, binding values, and secrets are never
+returned or token-bound. Incomplete preservation state fails closed before
+mutation. Transport-only `bindings` and `parts` upload metadata is not compared
+to server-enriched or redacted binding objects; an exact internal pre/post
+comparison proves preservation instead. Cron formatting whitespace is
+normalized before schedule identity and duplicate checks. For create-only module uploads,
+settings may legitimately return a
 null `main_module`; the tool then requires exhaustive, stable, etag-bound
 Worker listing/version-detail evidence with a present named-handler array;
 handler names and export members must be unique, nonblank, and byte-exact
