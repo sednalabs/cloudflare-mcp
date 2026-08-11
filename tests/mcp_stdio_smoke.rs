@@ -2703,7 +2703,10 @@ fn workers_upload_script_requires_token_and_reads_back_through_stdio_boundary() 
         content["readback_verification"]["settings_bindings_schedules_preserved"],
         json!(true)
     );
-    assert_eq!(content["preservation_before"], content["preservation_after"]);
+    assert_eq!(
+        content["preservation_before"],
+        content["preservation_after"]
+    );
     let serialized = content.to_string();
     assert!(!serialized.contains("db-1"));
     assert!(!serialized.contains("super-secret"));
@@ -2930,8 +2933,7 @@ fn workers_upload_script_create_only_rejects_cross_target_identity_through_stdio
 
 #[test]
 fn workers_upload_script_reports_readback_mismatch_through_stdio_boundary() {
-    let (base_url, requests) =
-        spawn_fake_worker_upload_api_with_readback(2, Some("unexpected.js"));
+    let (base_url, requests) = spawn_fake_worker_upload_api_with_readback(2, Some("unexpected.js"));
     let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
     let dry_run = mcp.call_tool(
         2,

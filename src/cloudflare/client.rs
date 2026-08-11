@@ -1523,13 +1523,16 @@ impl CloudflareClient {
             )
             .await?;
 
-        envelope.result.map(|result| result.schedules).ok_or_else(|| {
-            AdapterError::new(
-                "cloudflare.empty_result",
-                "Cloudflare returned success without Worker schedules",
-                "Verify Worker script name and Cloudflare Workers schedules response schema.",
-            )
-        })
+        envelope
+            .result
+            .map(|result| result.schedules)
+            .ok_or_else(|| {
+                AdapterError::new(
+                    "cloudflare.empty_result",
+                    "Cloudflare returned success without Worker schedules",
+                    "Verify Worker script name and Cloudflare Workers schedules response schema.",
+                )
+            })
     }
 
     /// Read the complete initial Worker version evidence after a create-only

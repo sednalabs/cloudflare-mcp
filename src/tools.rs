@@ -68,12 +68,12 @@ use crate::verification::{
     ExpectedVerificationState, VerificationState, classify_http_result, now_unix_ms,
     timeout_result, transport_error_result,
 };
-use crate::worker_upload::{
-    WorkerUploadBody, WorkerUploadError, WorkerUploadInput, build_worker_upload,
-};
 use crate::worker_preservation::{
     WorkerPreservationError, WorkerPreservationReadError, WorkerPreservationSnapshot,
     read_worker_preservation,
+};
+use crate::worker_upload::{
+    WorkerUploadBody, WorkerUploadError, WorkerUploadInput, build_worker_upload,
 };
 use mcp_toolkit_core::tool_inventory::{ToolOperation, ToolSearchFilter, ToolSearchResponse};
 use mcp_toolkit_policy_core::{RestrictedSqlError, classify_restricted_sql};
@@ -6370,25 +6370,23 @@ impl CloudflareMcp {
         let preservation_before = if args.create_only {
             None
         } else {
-            let snapshot = match read_worker_preservation(
-                &self.cloudflare,
-                account_id,
-                script_name,
-            )
-            .await
-            {
-                Ok(snapshot) => snapshot,
-                Err(err) => {
-                    return Ok(finalize_mutation_result(
-                        worker_upload_preservation_read_error_result(
-                            account_id, script_name, &upload_summary, &err,
-                        ),
-                        &plan,
-                        audit,
-                        args.dry_run,
-                    ));
-                }
-            };
+            let snapshot =
+                match read_worker_preservation(&self.cloudflare, account_id, script_name).await {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        return Ok(finalize_mutation_result(
+                            worker_upload_preservation_read_error_result(
+                                account_id,
+                                script_name,
+                                &upload_summary,
+                                &err,
+                            ),
+                            &plan,
+                            audit,
+                            args.dry_run,
+                        ));
+                    }
+                };
             if let WorkerUploadBody::Module { metadata, .. } = &upload.body {
                 if let Err(err) = snapshot.validate_requested_metadata(metadata) {
                     return Ok(finalize_mutation_result(
@@ -6403,9 +6401,9 @@ impl CloudflareMcp {
                         args.dry_run,
                     ));
                 }
-                if let Err(err) = snapshot.validate_requested_main_module(
-                    upload.summary.main_module.as_deref(),
-                ) {
+                if let Err(err) =
+                    snapshot.validate_requested_main_module(upload.summary.main_module.as_deref())
+                {
                     return Ok(finalize_mutation_result(
                         worker_upload_preservation_error_result(
                             account_id,
@@ -10878,9 +10876,7 @@ fn verify_existing_worker_content_update(
     let identity_reported = identities.into_iter().flatten().next().is_some();
     let identity_matched = identity_reported
         && identities.into_iter().flatten().all(|identity| {
-            !identity.is_empty()
-                && identity.trim() == identity
-                && identity == expected_script_name
+            !identity.is_empty() && identity.trim() == identity && identity == expected_script_name
         });
     let etag_matched = uploaded
         .extra

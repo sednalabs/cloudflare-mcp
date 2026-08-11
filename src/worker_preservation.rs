@@ -72,11 +72,7 @@ pub(crate) async fn read_worker_preservation(
 }
 
 impl WorkerPreservationError {
-    fn new(
-        code: &'static str,
-        message: impl Into<String>,
-        hint: &'static str,
-    ) -> Self {
+    fn new(code: &'static str, message: impl Into<String>, hint: &'static str) -> Self {
         Self {
             code,
             message: message.into(),
@@ -312,9 +308,7 @@ fn canonicalize_json(value: Value) -> Value {
                 .collect::<BTreeMap<_, _>>();
             Value::Object(sorted.into_iter().collect())
         }
-        Value::Array(values) => {
-            Value::Array(values.into_iter().map(canonicalize_json).collect())
-        }
+        Value::Array(values) => Value::Array(values.into_iter().map(canonicalize_json).collect()),
         other => other,
     }
 }
@@ -363,7 +357,10 @@ mod tests {
         let summary = snapshot.public_summary();
         assert_eq!(summary["binding_count"], json!(2));
         assert_eq!(summary["bindings"][0], json!({"name": "DB", "type": "d1"}));
-        assert_eq!(summary["bindings"][1], json!({"name": "TOKEN", "type": "secret_text"}));
+        assert_eq!(
+            summary["bindings"][1],
+            json!({"name": "TOKEN", "type": "secret_text"})
+        );
         assert_eq!(summary["schedule_crons"], json!(["*/5 * * * *"]));
         assert_eq!(summary["secret_values_included"], json!(false));
         let serialized = summary.to_string();
