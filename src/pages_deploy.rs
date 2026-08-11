@@ -455,7 +455,10 @@ fn include_advanced_worker_directory_if_present(
     }
 
     let modules = collect_advanced_worker_modules(&worker_directory)?;
-    if !modules.iter().any(|module| module.relative_path == "index.js") {
+    if !modules
+        .iter()
+        .any(|module| module.relative_path == "index.js")
+    {
         return Err(PagesDirectoryError::new(
             "pages.worker_directory_entrypoint_missing",
             "_worker.js is a module directory but index.js is missing",
@@ -653,7 +656,11 @@ fn write_advanced_worker_bundle(
     let mut boundary = format!("----formdata-worker-bundle-{:x}", identity.finalize());
     while modules.iter().any(|module| {
         fs::read(&module.absolute_path)
-            .map(|bytes| bytes.windows(boundary.len()).any(|window| window == boundary.as_bytes()))
+            .map(|bytes| {
+                bytes
+                    .windows(boundary.len())
+                    .any(|window| window == boundary.as_bytes())
+            })
             .unwrap_or(false)
     }) {
         boundary.push('x');
@@ -1349,15 +1356,17 @@ test -z "$config" || printf '%s' '{"routes":[{"routePath":"/api/ping","mountPath
             .worker_bundle
             .as_ref()
             .expect("generated worker bundle");
-        let body = String::from_utf8(bundle.read_bytes().expect("read bundle"))
-            .expect("bundle is utf-8");
+        let body =
+            String::from_utf8(bundle.read_bytes().expect("read bundle")).expect("bundle is utf-8");
         assert!(body.contains(r#"{"main_module":"index.js"}"#));
         assert!(body.contains("name=\"index.js\"; filename=\"index.js\""));
-        assert!(body.contains(
-            "name=\"chunks/value.mjs\"; filename=\"chunks/value.mjs\""
-        ));
+        assert!(body.contains("name=\"chunks/value.mjs\"; filename=\"chunks/value.mjs\""));
         assert!(!package.manifest.contains_key("/_worker.js/index.js"));
-        assert!(!package.manifest.contains_key("/_worker.js/chunks/value.mjs"));
+        assert!(
+            !package
+                .manifest
+                .contains_key("/_worker.js/chunks/value.mjs")
+        );
 
         fs::remove_dir_all(root).expect("cleanup temp pages dir");
     }

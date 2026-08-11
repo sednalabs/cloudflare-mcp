@@ -1609,7 +1609,10 @@ fn spawn_fake_pages_direct_upload_api_with_options(
                                 expected_worker,
                                 ExpectedWorkerUpload::AdvancedDirectoryBundle
                             ) {
-                                assert!(body_text.contains("main_module\":\"index.js"), "{body_text}");
+                                assert!(
+                                    body_text.contains("main_module\":\"index.js"),
+                                    "{body_text}"
+                                );
                                 assert!(
                                     body_text.contains(
                                         "name=\"chunks/message.mjs\"; filename=\"chunks/message.mjs\""
