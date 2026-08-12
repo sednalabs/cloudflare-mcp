@@ -2828,7 +2828,10 @@ impl CloudflareMcp {
                 "user-agent": "<configured>"
             }
         });
-        if permission_preflight.as_ref().is_none_or(|preflight| preflight.ready) {
+        if permission_preflight
+            .as_ref()
+            .is_none_or(|preflight| preflight.ready)
+        {
             request_plan["required_confirmation_token"] = json!(required_token);
         }
 
@@ -17894,7 +17897,7 @@ mod tests {
 
     #[tokio::test]
     async fn bot_management_preflight_withholds_confirmation_until_permission_pair_is_ready() {
-        let server = test_server("http://127.0.0.1:9".to_string());
+        let server = test_server(format!("http://{}:9", std::net::Ipv4Addr::LOCALHOST));
         let result = server
             .cloudflare_api_mutate(Parameters(ApiMutateArgs {
                 operation_id: "bot-management-for-a-zone-update-config".to_string(),
@@ -17931,13 +17934,16 @@ mod tests {
 
         let rendered = payload.to_string().to_ascii_lowercase();
         for forbidden in ["dashboard", "novnc", "human"] {
-            assert!(!rendered.contains(forbidden), "found {forbidden}: {rendered}");
+            assert!(
+                !rendered.contains(forbidden),
+                "found {forbidden}: {rendered}"
+            );
         }
     }
 
     #[tokio::test]
     async fn bot_management_ready_preflight_still_requires_confirmation_for_apply() {
-        let server = test_server("http://127.0.0.1:9".to_string());
+        let server = test_server(format!("http://{}:9", std::net::Ipv4Addr::LOCALHOST));
         let permissions = vec![
             "Bot Management Write".to_string(),
             "Zone Settings Write".to_string(),
@@ -18059,7 +18065,10 @@ mod tests {
 
         let rendered = payload.to_string().to_ascii_lowercase();
         for forbidden in ["dashboard", "novnc", "human"] {
-            assert!(!rendered.contains(forbidden), "found {forbidden}: {rendered}");
+            assert!(
+                !rendered.contains(forbidden),
+                "found {forbidden}: {rendered}"
+            );
         }
     }
 

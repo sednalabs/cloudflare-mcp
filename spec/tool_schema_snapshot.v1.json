@@ -467,7 +467,7 @@
           },
           "token_permissions": {
             "default": [],
-            "description": "Permission-group names from a fresh account_api_tokens action=get readback.\nOperations with an explicit multi-permission contract withhold their confirmation token until this readback contains the complete set.",
+            "description": "Permission-group names from a fresh account_api_tokens action=get readback.\nOperations with an explicit multi-permission contract withhold their\nconfirmation token until this readback contains the complete set.",
             "items": {
               "type": "string"
             },

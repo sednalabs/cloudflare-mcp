@@ -3760,10 +3760,7 @@ fn bot_management_permission_pair_preflight_works_through_stdio_boundary() {
     );
 
     let mut ready_arguments = base_arguments.clone();
-    ready_arguments["token_permissions"] = json!([
-        "Bot Management Write",
-        "Zone Settings Write"
-    ]);
+    ready_arguments["token_permissions"] = json!(["Bot Management Write", "Zone Settings Write"]);
     let ready = mcp.call_tool(3, "api_mutate", ready_arguments.clone());
     assert!(
         ready.get("error").is_none(),
@@ -3794,7 +3791,10 @@ fn bot_management_permission_pair_preflight_works_through_stdio_boundary() {
 
     let rendered = incomplete_content.to_string().to_ascii_lowercase();
     for forbidden in ["dashboard", "novnc", "human"] {
-        assert!(!rendered.contains(forbidden), "found {forbidden}: {rendered}");
+        assert!(
+            !rendered.contains(forbidden),
+            "found {forbidden}: {rendered}"
+        );
     }
 }
 

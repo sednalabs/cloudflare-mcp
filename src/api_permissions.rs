@@ -3,8 +3,7 @@ use std::collections::BTreeSet;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-pub const BOT_MANAGEMENT_UPDATE_OPERATION_ID: &str =
-    "bot-management-for-a-zone-update-config";
+pub const BOT_MANAGEMENT_UPDATE_OPERATION_ID: &str = "bot-management-for-a-zone-update-config";
 pub const BOT_MANAGEMENT_READ_OPERATION_ID: &str = "bot-management-for-a-zone-get-config";
 
 const BOT_MANAGEMENT_UPDATE_PERMISSIONS: [&str; 2] =
@@ -186,10 +185,7 @@ mod tests {
             preflight.required_permissions,
             vec!["Bot Management Write", "Zone Settings Write"]
         );
-        assert_eq!(
-            preflight.missing_permissions,
-            vec!["Zone Settings Write"]
-        );
+        assert_eq!(preflight.missing_permissions, vec!["Zone Settings Write"]);
     }
 
     #[test]
@@ -223,7 +219,10 @@ mod tests {
         assert!(rendered.contains("account_api_token_permission_plan"));
         assert!(rendered.contains("api_read"));
         for forbidden in ["dashboard", "novnc", "human"] {
-            assert!(!rendered.contains(forbidden), "found {forbidden}: {rendered}");
+            assert!(
+                !rendered.contains(forbidden),
+                "found {forbidden}: {rendered}"
+            );
         }
     }
 }
