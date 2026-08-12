@@ -28,6 +28,7 @@ use crate::api_catalog::{
     query_pairs, render_path, resolved_path_params, search_operations,
     status as api_catalog_status, validate_required_query,
 };
+use crate::api_permissions::mutation_permission_preflight;
 use crate::cache::{
     CachePurgePayload, CacheResourceAction, CacheRulePhase, CacheRulesAction, CacheValidationError,
     CacheZoneSettingAction, purge_confirmation_token, replace_rules_confirmation_token,
@@ -187,6 +188,11 @@ pub struct ApiMutateArgs {
     pub confirmation_token: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
+    /// Permission-group names from a fresh account_api_tokens action=get readback.
+    /// Operations with an explicit multi-permission contract withhold their
+    /// confirmation token until this readback contains the complete set.
+    #[serde(default)]
+    pub token_permissions: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2694,7 +2700,7 @@ impl CloudflareMcp {
 
     #[tool(
         name = "api_mutate",
-        description = "Dry-run or execute a guarded mutating operation from the Cloudflare REST API v4 catalog."
+        description = "Dry-run or execute a guarded mutating operation from the Cloudflare REST API v4 catalog. Known multi-permission operations must pass their token preflight before confirmation."
     )]
     async fn cloudflare_api_mutate(
         &self,
@@ -2761,28 +2767,43 @@ impl CloudflareMcp {
             }
         };
         let normalized_body = normalize_json_string_body(args.body.clone());
+        let permission_preflight =
+            mutation_permission_preflight(operation.operation_id.as_str(), &args.token_permissions);
         let required_token = mutation_confirmation_token(operation, &path, &normalized_body.value);
         let legacy_confirmation_token = normalized_body
             .normalized
             .then(|| mutation_confirmation_token(operation, &path, &args.body));
-        let plan = MutationPlan::new("api_mutate")
-            .step(
-                "validate_api_operation",
+        let mut plan = MutationPlan::new("api_mutate").step(
+            "validate_api_operation",
+            false,
+            json!({
+                "operation_id": operation.operation_id,
+                "method": operation.method,
+                "risk": operation.risk,
+            }),
+        );
+        if let Some(preflight) = permission_preflight.as_ref() {
+            plan = plan.step(
+                "validate_operation_permission_preflight",
                 false,
                 json!({
-                    "operation_id": operation.operation_id,
-                    "method": operation.method,
-                    "risk": operation.risk,
-                }),
-            )
-            .step(
-                "apply_cloudflare_api_request",
-                true,
-                json!({
-                    "path": path,
-                    "query": args.query.clone(),
+                    "operation_id": preflight.operation_id,
+                    "status": preflight.status,
+                    "ready": preflight.ready,
+                    "required_permissions": preflight.required_permissions,
+                    "missing_permissions": preflight.missing_permissions,
+                    "unverified_permissions": preflight.unverified_permissions,
                 }),
             );
+        }
+        plan = plan.step(
+            "apply_cloudflare_api_request",
+            true,
+            json!({
+                "path": path,
+                "query": args.query.clone(),
+            }),
+        );
         let audit = MutationAuditSession::start(
             None,
             "api_mutate",
@@ -2796,7 +2817,7 @@ impl CloudflareMcp {
             args.dry_run,
         );
 
-        let request_plan = json!({
+        let mut request_plan = json!({
             "method": operation.method,
             "path": path,
             "query": args.query.clone(),
@@ -2805,25 +2826,54 @@ impl CloudflareMcp {
             "headers": {
                 "authorization": "Bearer <redacted>",
                 "user-agent": "<configured>"
-            },
-            "required_confirmation_token": required_token,
+            }
         });
-        let base = if args.dry_run {
-            CallToolResult::structured(json!({
+        if permission_preflight.as_ref().is_none_or(|preflight| preflight.ready) {
+            request_plan["required_confirmation_token"] = json!(required_token);
+        }
+
+        let base = if let Some(preflight) = permission_preflight
+            .as_ref()
+            .filter(|preflight| !preflight.ready)
+        {
+            CallToolResult::structured_error(json!({
+                "ok": false,
+                "operation": "api_mutate",
+                "planned": false,
+                "error": {
+                    "code": if preflight.status == "verification_required" {
+                        "api_mutate.permission_preflight_required"
+                    } else {
+                        "api_mutate.permission_repair_required"
+                    },
+                    "message": "The configured token permission readback is not ready for this mutation.",
+                    "hint": "Follow recovery.steps through guarded MCP token inspection, repair, and fresh readback; then rerun this dry-run.",
+                },
+                "permission_preflight": preflight,
+                "recovery": preflight.guarded_recovery(),
+                "request_plan": request_plan,
+                "dry_run_note": "No Cloudflare API mutation applied and no confirmation token issued.",
+            }))
+        } else if args.dry_run {
+            let mut payload = json!({
                 "ok": true,
                 "operation": "api_mutate",
                 "api_operation": operation_detail(operation),
                 "planned": true,
                 "request_plan": request_plan,
                 "dry_run_note": "No Cloudflare API mutation applied.",
-            }))
+            });
+            if let Some(preflight) = permission_preflight.as_ref() {
+                payload["permission_preflight"] = json!(preflight);
+            }
+            CallToolResult::structured(payload)
         } else if !args.confirmation_token.as_deref().is_some_and(|token| {
             token == required_token
                 || legacy_confirmation_token
                     .as_deref()
                     .is_some_and(|legacy_token| token == legacy_token)
         }) {
-            CallToolResult::structured_error(json!({
+            let mut payload = json!({
                 "ok": false,
                 "operation": "api_mutate",
                 "error": {
@@ -2833,7 +2883,11 @@ impl CloudflareMcp {
                 },
                 "required_confirmation_token": required_token,
                 "request_plan": request_plan,
-            }))
+            });
+            if let Some(preflight) = permission_preflight.as_ref() {
+                payload["permission_preflight"] = json!(preflight);
+            }
+            CallToolResult::structured_error(payload)
         } else {
             match self
                 .cloudflare
@@ -2860,6 +2914,19 @@ impl CloudflareMcp {
                     },
                     "result": result,
                 })),
+                Err(err) if err.status == Some(403) && permission_preflight.is_some() => {
+                    let preflight = permission_preflight
+                        .as_ref()
+                        .expect("guarded by permission_preflight.is_some");
+                    CallToolResult::structured_error(json!({
+                        "ok": false,
+                        "operation": "api_mutate",
+                        "api_operation": operation_detail(operation),
+                        "error": err.payload(),
+                        "permission_preflight": preflight,
+                        "recovery": preflight.guarded_recovery(),
+                    }))
+                }
                 Err(err) => adapter_error_result(err),
             }
         };
@@ -17698,6 +17765,7 @@ mod tests {
             dry_run: true,
             confirmation_token: None,
             reason: Some("test".to_string()),
+            token_permissions: Vec::new(),
         };
         let dry_run = server
             .cloudflare_api_mutate(Parameters(args))
@@ -17720,6 +17788,7 @@ mod tests {
                 dry_run: false,
                 confirmation_token: None,
                 reason: Some("test".to_string()),
+                token_permissions: Vec::new(),
             }))
             .await
             .expect("api mutate apply");
@@ -17777,6 +17846,7 @@ mod tests {
                 dry_run: true,
                 confirmation_token: None,
                 reason: Some("acknowledge ticket".to_string()),
+                token_permissions: Vec::new(),
             }))
             .await
             .expect("api mutate dry run");
@@ -17806,6 +17876,7 @@ mod tests {
                 dry_run: false,
                 confirmation_token: Some(token),
                 reason: Some("acknowledge ticket".to_string()),
+                token_permissions: Vec::new(),
             }))
             .await
             .expect("api mutate apply");
@@ -17819,6 +17890,177 @@ mod tests {
             json!("UPDATE submissions SET status = ? WHERE id = ?")
         );
         assert_eq!(posted_body["params"], json!(["in_progress", "sub-1"]));
+    }
+
+    #[tokio::test]
+    async fn bot_management_preflight_withholds_confirmation_until_permission_pair_is_ready() {
+        let server = test_server("http://127.0.0.1:9".to_string());
+        let result = server
+            .cloudflare_api_mutate(Parameters(ApiMutateArgs {
+                operation_id: "bot-management-for-a-zone-update-config".to_string(),
+                path_params: BTreeMap::from([("zone_id".to_string(), "zone-1".to_string())]),
+                query: BTreeMap::new(),
+                body: Some(json!({"fight_mode": true})),
+                dry_run: true,
+                confirmation_token: None,
+                reason: Some("enable Bot Fight Mode".to_string()),
+                token_permissions: vec!["Bot Management Write".to_string()],
+            }))
+            .await
+            .expect("Bot Management preflight");
+
+        assert_eq!(result.is_error, Some(true));
+        let payload = result.structured_content.expect("preflight payload");
+        assert_eq!(
+            payload["error"]["code"],
+            json!("api_mutate.permission_repair_required")
+        );
+        assert_eq!(
+            payload["permission_preflight"]["required_permissions"],
+            json!(["Bot Management Write", "Zone Settings Write"])
+        );
+        assert_eq!(
+            payload["permission_preflight"]["missing_permissions"],
+            json!(["Zone Settings Write"])
+        );
+        assert!(
+            payload["request_plan"]
+                .get("required_confirmation_token")
+                .is_none()
+        );
+
+        let rendered = payload.to_string().to_ascii_lowercase();
+        for forbidden in ["dashboard", "novnc", "human"] {
+            assert!(!rendered.contains(forbidden), "found {forbidden}: {rendered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bot_management_ready_preflight_still_requires_confirmation_for_apply() {
+        let server = test_server("http://127.0.0.1:9".to_string());
+        let permissions = vec![
+            "Bot Management Write".to_string(),
+            "Zone Settings Write".to_string(),
+        ];
+        let dry_run = server
+            .cloudflare_api_mutate(Parameters(ApiMutateArgs {
+                operation_id: "bot-management-for-a-zone-update-config".to_string(),
+                path_params: BTreeMap::from([("zone_id".to_string(), "zone-1".to_string())]),
+                query: BTreeMap::new(),
+                body: Some(json!({"fight_mode": true})),
+                dry_run: true,
+                confirmation_token: None,
+                reason: Some("enable Bot Fight Mode".to_string()),
+                token_permissions: permissions.clone(),
+            }))
+            .await
+            .expect("Bot Management dry-run");
+
+        assert_eq!(dry_run.is_error, Some(false));
+        let dry_run_payload = dry_run.structured_content.expect("dry-run payload");
+        assert_eq!(
+            dry_run_payload["permission_preflight"]["status"],
+            json!("ready")
+        );
+        assert!(
+            dry_run_payload["request_plan"]["required_confirmation_token"]
+                .as_str()
+                .is_some_and(|token| token.starts_with("cf-api-"))
+        );
+
+        let apply = server
+            .cloudflare_api_mutate(Parameters(ApiMutateArgs {
+                operation_id: "bot-management-for-a-zone-update-config".to_string(),
+                path_params: BTreeMap::from([("zone_id".to_string(), "zone-1".to_string())]),
+                query: BTreeMap::new(),
+                body: Some(json!({"fight_mode": true})),
+                dry_run: false,
+                confirmation_token: None,
+                reason: Some("enable Bot Fight Mode".to_string()),
+                token_permissions: permissions,
+            }))
+            .await
+            .expect("Bot Management apply without confirmation");
+
+        assert_eq!(apply.is_error, Some(true));
+        let apply_payload = apply.structured_content.expect("apply payload");
+        assert_eq!(
+            apply_payload["error"]["code"],
+            json!("api_mutate.confirmation_required")
+        );
+    }
+
+    #[tokio::test]
+    async fn bot_management_first_forbidden_returns_guarded_mcp_recovery_without_blocking() {
+        async fn forbidden() -> (StatusCode, Json<Value>) {
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "success": false,
+                    "errors": [{"code": 10000, "message": "authentication error"}],
+                    "messages": [],
+                    "result": null
+                })),
+            )
+        }
+
+        let router = Router::new().route("/zones/zone-1/bot_management", put(forbidden));
+        let server = test_server(spawn_router(router).await);
+        let permissions = vec![
+            "Bot Management Write".to_string(),
+            "Zone Settings Write".to_string(),
+        ];
+        let dry_run = server
+            .cloudflare_api_mutate(Parameters(ApiMutateArgs {
+                operation_id: "bot-management-for-a-zone-update-config".to_string(),
+                path_params: BTreeMap::from([("zone_id".to_string(), "zone-1".to_string())]),
+                query: BTreeMap::new(),
+                body: Some(json!({"fight_mode": true})),
+                dry_run: true,
+                confirmation_token: None,
+                reason: Some("enable Bot Fight Mode".to_string()),
+                token_permissions: permissions.clone(),
+            }))
+            .await
+            .expect("Bot Management dry-run");
+        let confirmation_token = dry_run
+            .structured_content
+            .expect("dry-run payload")["request_plan"]["required_confirmation_token"]
+            .as_str()
+            .expect("confirmation token")
+            .to_string();
+
+        let apply = server
+            .cloudflare_api_mutate(Parameters(ApiMutateArgs {
+                operation_id: "bot-management-for-a-zone-update-config".to_string(),
+                path_params: BTreeMap::from([("zone_id".to_string(), "zone-1".to_string())]),
+                query: BTreeMap::new(),
+                body: Some(json!({"fight_mode": true})),
+                dry_run: false,
+                confirmation_token: Some(confirmation_token),
+                reason: Some("enable Bot Fight Mode".to_string()),
+                token_permissions: permissions,
+            }))
+            .await
+            .expect("Bot Management forbidden response");
+
+        assert_eq!(apply.is_error, Some(true));
+        let payload = apply.structured_content.expect("forbidden payload");
+        assert_eq!(payload["error"]["status"], json!(403));
+        assert_eq!(
+            payload["recovery"]["first_forbidden_goal_blocking"],
+            json!(false)
+        );
+        assert_eq!(
+            payload["recovery"]["steps"][1]["tool"],
+            json!("account_api_token_permission_plan")
+        );
+        assert_eq!(payload["recovery"]["steps"][5]["tool"], json!("api_read"));
+
+        let rendered = payload.to_string().to_ascii_lowercase();
+        for forbidden in ["dashboard", "novnc", "human"] {
+            assert!(!rendered.contains(forbidden), "found {forbidden}: {rendered}");
+        }
     }
 
     #[tokio::test]

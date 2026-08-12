@@ -425,7 +425,7 @@
       "name": "api_get_operation"
     },
     {
-      "description": "Dry-run or execute a guarded mutating operation from the Cloudflare REST API v4 catalog.",
+      "description": "Dry-run or execute a guarded mutating operation from the Cloudflare REST API v4 catalog. Known multi-permission operations must pass their token preflight before confirmation.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
@@ -464,6 +464,14 @@
               "string",
               "null"
             ]
+          },
+          "token_permissions": {
+            "default": [],
+            "description": "Permission-group names from a fresh account_api_tokens action=get readback.\nOperations with an explicit multi-permission contract withhold their confirmation token until this readback contains the complete set.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "required": [

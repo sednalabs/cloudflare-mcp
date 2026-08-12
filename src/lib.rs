@@ -4,6 +4,7 @@
 
 pub mod access_app;
 pub mod api_catalog;
+pub(crate) mod api_permissions;
 pub mod cache;
 pub mod cloudflare;
 pub mod config;
