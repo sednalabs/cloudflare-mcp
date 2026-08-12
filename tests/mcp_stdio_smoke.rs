@@ -3731,6 +3731,74 @@ fn analytics_engine_validate_and_describe_schema_work_through_stdio_boundary() {
 }
 
 #[test]
+fn bot_management_permission_pair_preflight_works_through_stdio_boundary() {
+    let mut mcp = McpStdioProcess::start();
+    let base_arguments = json!({
+        "operation_id": "bot-management-for-a-zone-update-config",
+        "path_params": {"zone_id": "zone-1"},
+        "body": {"fight_mode": true},
+        "dry_run": true,
+        "reason": "fixture Bot Fight Mode update"
+    });
+
+    let mut incomplete_arguments = base_arguments.clone();
+    incomplete_arguments["token_permissions"] = json!(["Bot Management Write"]);
+    let incomplete = mcp.call_tool(2, "api_mutate", incomplete_arguments);
+    assert!(
+        incomplete.get("error").is_none(),
+        "api_mutate preflight failed before tool body: {incomplete}"
+    );
+    let incomplete_content = structured_content(&incomplete);
+    assert_eq!(
+        incomplete_content["permission_preflight"]["missing_permissions"],
+        json!(["Zone Settings Write"])
+    );
+    assert!(
+        incomplete_content["request_plan"]
+            .get("required_confirmation_token")
+            .is_none()
+    );
+
+    let mut ready_arguments = base_arguments.clone();
+    ready_arguments["token_permissions"] = json!(["Bot Management Write", "Zone Settings Write"]);
+    let ready = mcp.call_tool(3, "api_mutate", ready_arguments.clone());
+    assert!(
+        ready.get("error").is_none(),
+        "api_mutate ready preflight failed before tool body: {ready}"
+    );
+    let ready_content = structured_content(&ready);
+    assert_eq!(
+        ready_content["permission_preflight"]["status"],
+        json!("ready")
+    );
+    assert!(
+        ready_content["request_plan"]["required_confirmation_token"]
+            .as_str()
+            .is_some_and(|token| token.starts_with("cf-api-"))
+    );
+
+    ready_arguments["dry_run"] = json!(false);
+    let apply_without_confirmation = mcp.call_tool(4, "api_mutate", ready_arguments);
+    assert!(
+        apply_without_confirmation.get("error").is_none(),
+        "api_mutate apply gate failed before tool body: {apply_without_confirmation}"
+    );
+    let apply_content = structured_content(&apply_without_confirmation);
+    assert_eq!(
+        apply_content["error"]["code"],
+        json!("api_mutate.confirmation_required")
+    );
+
+    let rendered = incomplete_content.to_string().to_ascii_lowercase();
+    for forbidden in ["dashboard", "novnc", "human"] {
+        assert!(
+            !rendered.contains(forbidden),
+            "found {forbidden}: {rendered}"
+        );
+    }
+}
+
+#[test]
 fn api_mutate_keeps_invalid_json_strings_as_strings_in_dry_run_plan() {
     let mut mcp = McpStdioProcess::start();
     let response = mcp.call_tool(

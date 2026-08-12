@@ -338,6 +338,36 @@ tools/call name=api_mutate arguments='{"operation_id":"<mutating-operation-id>",
 `api_mutate` apply calls require the dry-run confirmation token. Denied
 high-risk categories fail closed.
 
+### Bot Management permission preflight and 403 recovery
+
+The zone Bot Management update operation requires the complete permission pair
+`Bot Management Write` and `Zone Settings Write`. Do not infer readiness from
+one member of the pair or from a successful token-verification status alone.
+
+Before requesting a mutation confirmation token:
+
+1. Read the account-owned token with `account_api_tokens action=get`.
+2. Pass the fresh permission-group names as `api_mutate.token_permissions` on
+   the Bot Management update dry-run.
+3. If the response names missing permissions, run its
+   `account_api_token_permission_plan` call, review the preserved-policy delta,
+   then run the returned `account_api_tokens` update as dry-run followed by one
+   exact confirmation-gated apply.
+4. Read the token back and confirm both permission names are present.
+5. Rerun the original Bot Management mutation dry-run, apply it once with that
+   new confirmation token, then use
+   `bot-management-for-a-zone-get-config` through `api_read` for authoritative
+   configuration readback.
+
+A first HTTP 403, including Cloudflare error 10000, is a recoverable
+permission/preflight signal, not proof that interactive authentication is
+required, and is not a goal-blocking condition. Do not switch to a dashboard,
+remote desktop/noVNC, or human authentication after that first response.
+Escalate to a person only when account-token inspection or the guarded update
+path is positively unavailable through the MCP, or when exact provider evidence
+proves a distinct external authority requirement. Record the specific
+unavailable tool or provider authority; do not report a generic auth blocker.
+
 For billing or D1 usage-spike investigations:
 
 ```text

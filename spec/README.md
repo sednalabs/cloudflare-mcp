@@ -83,7 +83,14 @@ Note on elicitation mode:
 - `account_api_token_permission_plan` is read-only and returns a safe
   `account_api_tokens` update dry-run payload for permission deltas; it does
   not mutate token scopes itself.
-- This does not change tool argument schemas; it changes pre-execution policy behavior.
+- `api_mutate` enforces the named Bot Management zone-update permission
+  preflight: fresh `token_permissions` must contain both `Bot Management Write`
+  and `Zone Settings Write` before the dry-run exposes a confirmation token.
+  Missing or unverified permissions return guarded token inspection and repair
+  calls instead of an interactive-login recommendation.
+- Apart from the explicit `api_mutate.token_permissions` field above,
+  elicitation does not alter tool argument schemas; it changes pre-execution
+  policy behavior.
 
 Preserved curated tool families:
 - D1 read tools (`d1_list_databases`, `d1_get_database`, `d1_inspect_schema`, `d1_query_read_only`, `d1_validate_query`) are first-class contract tools and must remain present even when broad API parity is available.

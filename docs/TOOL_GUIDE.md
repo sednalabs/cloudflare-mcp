@@ -251,6 +251,14 @@ an operator accidentally submits only the new scopes and drops existing ones.
 If a token has multiple policies, the planner refuses to guess and asks for a
 zero-based `policy_index`.
 
+For `bot-management-for-a-zone-update-config`, read the account-owned token
+first and pass its fresh permission-group names in `api_mutate.token_permissions`.
+The operation requires the complete pair `Bot Management Write` and
+`Zone Settings Write`. The mutation dry-run does not emit a confirmation token
+until that pair is present. If one is missing, follow the returned
+`account_api_token_permission_plan` and guarded `account_api_tokens` calls,
+read the token back, then rerun the mutation dry-run.
+
 ## Generic Cloudflare REST API Tools
 
 Use generic parity tools when no curated tool exists:
