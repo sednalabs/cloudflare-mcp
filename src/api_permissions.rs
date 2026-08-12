@@ -22,7 +22,9 @@ pub struct MutationPermissionPreflight {
 
 impl MutationPermissionPreflight {
     pub fn guarded_recovery(&self) -> Value {
-        let permissions_to_plan = if self.missing_permissions.is_empty() {
+        let permissions_to_plan = if self.ready {
+            Vec::new()
+        } else if self.missing_permissions.is_empty() {
             self.required_permissions.clone()
         } else {
             self.missing_permissions.clone()
@@ -51,12 +53,14 @@ impl MutationPermissionPreflight {
                         "add_permissions": permissions_to_plan,
                         "remove_permissions": []
                     },
+                    "applicable_when": "missing_permissions is non-empty",
                     "proof": "permission delta that preserves unrelated token policy"
                 },
                 {
                     "order": 3,
                     "tool": "account_api_tokens",
                     "arguments_from": "account_api_token_permission_plan.next_call.arguments",
+                    "applicable_when": "step 2 returned a non-empty permission delta",
                     "contract": "run dry_run first, then echo its exact required_confirmation_token once"
                 },
                 {
@@ -224,5 +228,30 @@ mod tests {
                 "found {forbidden}: {rendered}"
             );
         }
+    }
+
+    #[test]
+    fn ready_forbidden_recovery_does_not_recommend_readding_present_permissions() {
+        let preflight = mutation_permission_preflight(
+            BOT_MANAGEMENT_UPDATE_OPERATION_ID,
+            &[
+                "Bot Management Write".to_string(),
+                "Zone Settings Write".to_string(),
+            ],
+        )
+        .expect("Bot Management preflight");
+        let recovery = preflight.guarded_recovery();
+
+        assert!(preflight.ready);
+        assert_eq!(
+            recovery["steps"][1]["arguments"]["add_permissions"],
+            json!([])
+        );
+        assert_eq!(
+            recovery["steps"][4]["contract"],
+            json!(
+                "retry the mutation at most once after repair using a new dry-run confirmation token"
+            )
+        );
     }
 }

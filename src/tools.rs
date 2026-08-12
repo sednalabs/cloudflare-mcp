@@ -17897,7 +17897,7 @@ mod tests {
 
     #[tokio::test]
     async fn bot_management_preflight_withholds_confirmation_until_permission_pair_is_ready() {
-        let server = test_server(format!("http://{}:9", std::net::Ipv4Addr::LOCALHOST));
+        let server = test_server("https://unused.invalid".to_string());
         let result = server
             .cloudflare_api_mutate(Parameters(ApiMutateArgs {
                 operation_id: "bot-management-for-a-zone-update-config".to_string(),
@@ -17943,7 +17943,7 @@ mod tests {
 
     #[tokio::test]
     async fn bot_management_ready_preflight_still_requires_confirmation_for_apply() {
-        let server = test_server(format!("http://{}:9", std::net::Ipv4Addr::LOCALHOST));
+        let server = test_server("https://unused.invalid".to_string());
         let permissions = vec![
             "Bot Management Write".to_string(),
             "Zone Settings Write".to_string(),
