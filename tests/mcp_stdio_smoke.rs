@@ -449,7 +449,9 @@ fn spawn_fake_manifest_apply_api() -> (String, Arc<Mutex<Vec<Value>>>) {
             };
             let response = if sql == "SELECT * FROM \"d1_migrations\" ORDER BY id" {
                 json!({"success": true, "errors": [], "messages": [], "result": [{"success": true, "results": ledger}]})
-            } else if sql.contains("INSERT INTO \"d1_migrations\" (name) VALUES ('0002_second.sql')") {
+            } else if sql
+                .contains("INSERT INTO \"d1_migrations\" (name) VALUES ('0002_second.sql')")
+            {
                 apply_seen = true;
                 json!({"success": true, "errors": [], "messages": [], "result": [{"success": true, "results": [{"ok": true}]}]})
             } else {
@@ -457,7 +459,9 @@ fn spawn_fake_manifest_apply_api() -> (String, Arc<Mutex<Vec<Value>>>) {
             };
             let response = serde_json::to_vec(&response).expect("serialize response");
             write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write manifest headers");
-            stream.write_all(&response).expect("write manifest response");
+            stream
+                .write_all(&response)
+                .expect("write manifest response");
         }
     });
     (format!("http://{addr}"), requests)
@@ -474,7 +478,10 @@ fn spawn_fake_manifest_ambiguous_api() -> (String, Arc<Mutex<Vec<Value>>>) {
             let (headers, body) = read_http_request(&mut stream);
             assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
             let body_json: Value = serde_json::from_slice(&body).expect("ambiguous request JSON");
-            requests_for_thread.lock().expect("request log lock").push(body_json.clone());
+            requests_for_thread
+                .lock()
+                .expect("request log lock")
+                .push(body_json.clone());
             let sql = body_json["sql"].as_str().unwrap_or_default();
             if sql.contains("INSERT INTO \"d1_migrations\"") {
                 write!(stream, "HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-length: 0\r\n\r\n").expect("write ambiguous response");
@@ -484,7 +491,8 @@ fn spawn_fake_manifest_ambiguous_api() -> (String, Arc<Mutex<Vec<Value>>>) {
             let response = serde_json::to_vec(&json!({
                 "success": true, "errors": [], "messages": [],
                 "result": [{"success": true, "results": [{"id": 1, "name": "0001_initial.sql"}]}]
-            })).expect("serialize response");
+            }))
+            .expect("serialize response");
             write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write headers");
             stream.write_all(&response).expect("write response");
         }
@@ -2705,10 +2713,17 @@ fn d1_apply_migration_manifest_dry_run_reaches_stdio_and_never_sends_sql_bytes()
     );
     let content = structured_content(&response);
     assert_eq!(content["ok"], json!(true), "{content}");
-    assert_eq!(content["pending_migrations"][0]["name"], json!("0002_second.sql"));
+    assert_eq!(
+        content["pending_migrations"][0]["name"],
+        json!("0002_second.sql")
+    );
     assert_eq!(content["plan_sha256"].as_str().map(str::len), Some(64));
     assert_eq!(requests.lock().expect("requests lock").len(), 1);
-    assert!(!serde_json::to_string(content).expect("content json").contains(second_sql));
+    assert!(
+        !serde_json::to_string(content)
+            .expect("content json")
+            .contains(second_sql)
+    );
 }
 
 #[test]
@@ -2720,6 +2735,12 @@ fn d1_apply_migration_manifest_live_rechecks_plan_and_stably_reads_back_before_r
     ));
     let _ = fs::remove_dir_all(&lease_root);
     fs::create_dir_all(&lease_root).expect("create lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make lease root private");
+    }
     let mut mcp = McpStdioProcess::start_with_env(vec![
         ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
         (
@@ -2737,20 +2758,49 @@ fn d1_apply_migration_manifest_live_rechecks_plan_and_stably_reads_back_before_r
         "database_id": "db-1", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
     }));
     let dry_content = structured_content(&dry);
-    let plan = dry_content["plan_sha256"].as_str().expect("plan digest").to_string();
-    let live = mcp.call_tool(5, "d1_apply_migration_manifest", json!({
-        "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest,
-        "approved_plan_sha256": plan,
-    }));
+    let plan = dry_content["plan_sha256"]
+        .as_str()
+        .expect("plan digest")
+        .to_string();
+    let live = mcp.call_tool(
+        5,
+        "d1_apply_migration_manifest",
+        json!({
+            "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest,
+            "approved_plan_sha256": plan,
+        }),
+    );
     let content = structured_content(&live);
     assert_eq!(content["ok"], json!(true), "{content}");
     assert_eq!(content["status"], json!("applied"));
-    assert_eq!(content["applied_migrations"][0]["sql_sha256"], json!(sha256_hex(second_sql)));
-    assert!(fs::read_dir(&lease_root).expect("read released lease root").next().is_none());
+    assert_eq!(
+        content["applied_migrations"][0]["sql_sha256"],
+        json!(sha256_hex(second_sql))
+    );
+    assert!(
+        fs::read_dir(&lease_root)
+            .expect("read released lease root")
+            .next()
+            .is_none()
+    );
     let requests = requests.lock().expect("requests lock").clone();
-    assert_eq!(requests.len(), 6, "dry, stable re-read, apply, stable post-apply reads");
-    assert!(requests[3]["sql"].as_str().expect("apply SQL").contains(second_sql));
-    assert!(!requests[3]["sql"].as_str().expect("apply SQL").contains(first_sql));
+    assert_eq!(
+        requests.len(),
+        6,
+        "dry, stable re-read, apply, stable post-apply reads"
+    );
+    assert!(
+        requests[3]["sql"]
+            .as_str()
+            .expect("apply SQL")
+            .contains(second_sql)
+    );
+    assert!(
+        !requests[3]["sql"]
+            .as_str()
+            .expect("apply SQL")
+            .contains(first_sql)
+    );
     let _ = fs::remove_dir_all(lease_root);
 }
 
@@ -2763,6 +2813,12 @@ fn d1_apply_migration_manifest_response_loss_stops_without_retry_and_retains_lea
     ));
     let _ = fs::remove_dir_all(&lease_root);
     fs::create_dir_all(&lease_root).expect("create lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make lease root private");
+    }
     let mut mcp = McpStdioProcess::start_with_env(vec![
         ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
         (
@@ -2779,18 +2835,37 @@ fn d1_apply_migration_manifest_response_loss_stops_without_retry_and_retains_lea
     let dry = mcp.call_tool(6, "d1_apply_migration_manifest", json!({
         "database_id": "db-1", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
     }));
-    let plan = structured_content(&dry)["plan_sha256"].as_str().expect("plan").to_string();
-    let live = mcp.call_tool(7, "d1_apply_migration_manifest", json!({
-        "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest,
-        "approved_plan_sha256": plan,
-    }));
+    let plan = structured_content(&dry)["plan_sha256"]
+        .as_str()
+        .expect("plan")
+        .to_string();
+    let live = mcp.call_tool(
+        7,
+        "d1_apply_migration_manifest",
+        json!({
+            "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest,
+            "approved_plan_sha256": plan,
+        }),
+    );
     let content = structured_content(&live);
     assert_eq!(content["ok"], json!(false), "{content}");
     assert_eq!(content["status"], json!("reconciliation_required"));
-    assert_eq!(content["error"]["code"], json!("d1.migration_apply_outcome_unknown"));
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.migration_apply_outcome_unknown")
+    );
     assert_eq!(content["lease_retained"], json!(true));
-    assert_eq!(requests.lock().expect("requests lock").len(), 6, "dry, stable re-read, one apply, stable reconciliation reads; no retry");
-    assert!(fs::read_dir(&lease_root).expect("read retained lease root").next().is_some());
+    assert_eq!(
+        requests.lock().expect("requests lock").len(),
+        6,
+        "dry, stable re-read, one apply, stable reconciliation reads; no retry"
+    );
+    assert!(
+        fs::read_dir(&lease_root)
+            .expect("read retained lease root")
+            .next()
+            .is_some()
+    );
     let _ = fs::remove_dir_all(lease_root);
 }
 

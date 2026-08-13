@@ -4503,7 +4503,8 @@ impl CloudflareMcp {
         Parameters(args): Parameters<D1ApplyMigrationManifestArgs>,
     ) -> Result<CallToolResult, crate::McpError> {
         let account_id = resolve_account_id(self, args.account_id.as_deref())?;
-        let migrations_table = match normalize_d1_migrations_table(args.migrations_table.as_deref()) {
+        let migrations_table = match normalize_d1_migrations_table(args.migrations_table.as_deref())
+        {
             Ok(table) => table,
             Err(result) => return Ok(result),
         };
@@ -4633,7 +4634,8 @@ impl CloudflareMcp {
 
         let mut applied = Vec::new();
         for migration in &classification.pending {
-            let statement = d1_migration_apply_sql(&migration.sql, &migrations_table, &migration.name);
+            let statement =
+                d1_migration_apply_sql(&migration.sql, &migrations_table, &migration.name);
             match self
                 .cloudflare
                 .execute_d1_database_write(account_id, &args.database_id, &statement, &[])
@@ -12481,7 +12483,7 @@ fn d1_migration_unknown_ledger_result(
 
 const D1_MANIFEST_LEASE_ROOT_ENV: &str = "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT";
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct D1ManifestLedgerRow {
     id: i64,
     name: String,
@@ -12591,7 +12593,10 @@ fn validate_d1_migration_manifest(
         }
         let expected = sha256_hex(&migration.sql);
         if migration.sql_sha256.len() != 64
-            || !migration.sql_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !migration
+                .sql_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
             || !migration.sql_sha256.eq_ignore_ascii_case(&expected)
         {
             return Err(invalid_argument_result(
@@ -12606,30 +12611,47 @@ fn validate_d1_migration_manifest(
 }
 
 fn parse_d1_migration_ledger(value: &Value) -> Result<Vec<D1ManifestLedgerRow>, CallToolResult> {
-    let results = value
-        .get("result")
+    // CloudflareClient unwraps the v4 envelope's `result`, while direct test
+    // fixtures may retain it. Accept exactly one D1 result set in either shape.
+    let result_sets = value
+        .is_array()
+        .then_some(value)
+        .or_else(|| value.get("result"));
+    let results = result_sets
         .and_then(Value::as_array)
         .and_then(|items| (items.len() == 1).then_some(&items[0]))
         .and_then(|item| item.get("results"))
         .and_then(Value::as_array)
-        .ok_or_else(|| d1_manifest_malformed_ledger_result("provider ledger response did not contain one result set"))?;
+        .ok_or_else(|| {
+            d1_manifest_malformed_ledger_result(
+                "provider ledger response did not contain one result set",
+            )
+        })?;
     let mut ledger = Vec::with_capacity(results.len());
     let mut previous_id = None;
     let mut names = BTreeSet::new();
     for row in results {
-        let object = row
-            .as_object()
-            .ok_or_else(|| d1_manifest_malformed_ledger_result("provider ledger row was not an object"))?;
+        let object = row.as_object().ok_or_else(|| {
+            d1_manifest_malformed_ledger_result("provider ledger row was not an object")
+        })?;
         let id = object
             .get("id")
             .and_then(Value::as_i64)
             .filter(|id| *id >= 0)
-            .ok_or_else(|| d1_manifest_malformed_ledger_result("provider ledger row had no non-negative integer id"))?;
+            .ok_or_else(|| {
+                d1_manifest_malformed_ledger_result(
+                    "provider ledger row had no non-negative integer id",
+                )
+            })?;
         let name = object
             .get("name")
             .and_then(Value::as_str)
             .filter(|name| !name.is_empty() && name.len() <= 255 && !name.contains('\0'))
-            .ok_or_else(|| d1_manifest_malformed_ledger_result("provider ledger row had no valid migration name"))?
+            .ok_or_else(|| {
+                d1_manifest_malformed_ledger_result(
+                    "provider ledger row had no valid migration name",
+                )
+            })?
             .to_string();
         if previous_id.is_some_and(|previous| previous >= id) || !names.insert(name.clone()) {
             return Err(d1_manifest_malformed_ledger_result(
@@ -12791,11 +12813,13 @@ fn acquire_d1_migration_lease(
     let plan_sha256 = approved_plan_sha256
         .map(str::trim)
         .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .ok_or_else(|| invalid_argument_result(
-            "d1.approved_plan_sha256_required",
-            "approved_plan_sha256 is required for live apply and must be a SHA-256 hex digest",
-            "Use the exact plan_sha256 from a successful manifest dry run.",
-        ))?;
+        .ok_or_else(|| {
+            invalid_argument_result(
+                "d1.approved_plan_sha256_required",
+                "approved_plan_sha256 is required for live apply and must be a SHA-256 hex digest",
+                "Use the exact plan_sha256 from a successful manifest dry run.",
+            )
+        })?;
     let root = std::env::var(D1_MANIFEST_LEASE_ROOT_ENV)
         .ok()
         .map(PathBuf::from)
@@ -12854,7 +12878,11 @@ fn acquire_d1_migration_lease_at(
     let encoded = serde_json::to_vec(&payload).expect("serializing lease payload is infallible");
     match OpenOptions::new().write(true).create_new(true).open(&path) {
         Ok(mut file) => {
-            if file.write_all(&encoded).and_then(|()| file.sync_all()).is_err() {
+            if file
+                .write_all(&encoded)
+                .and_then(|()| file.sync_all())
+                .is_err()
+            {
                 return Err(CallToolResult::structured_error(json!({
                     "ok": false,
                     "operation": "d1_apply_migration_manifest",
@@ -12863,12 +12891,14 @@ fn acquire_d1_migration_lease_at(
             }
             Ok(D1MigrationLease { path })
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(CallToolResult::structured_error(json!({
-            "ok": false,
-            "operation": "d1_apply_migration_manifest",
-            "status": "lease_held",
-            "error": {"code": "d1.migration_target_lease_held", "message": "another migration operation holds this account/database target lease", "hint": "Wait for terminal provider readback or reconcile the retained lease; do not start another family against this target."},
-        }))),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(CallToolResult::structured_error(json!({
+                "ok": false,
+                "operation": "d1_apply_migration_manifest",
+                "status": "lease_held",
+                "error": {"code": "d1.migration_target_lease_held", "message": "another migration operation holds this account/database target lease", "hint": "Wait for terminal provider readback or reconcile the retained lease; do not start another family against this target."},
+            })))
+        }
         Err(_) => Err(CallToolResult::structured_error(json!({
             "ok": false,
             "operation": "d1_apply_migration_manifest",
@@ -12885,15 +12915,43 @@ async fn read_stable_d1_migration_ledger(
 ) -> Result<Vec<D1ManifestLedgerRow>, CallToolResult> {
     let first = server
         .cloudflare
-        .query_d1_database(account_id, database_id, &d1_applied_migrations_sql(migrations_table), &[])
+        .query_d1_database(
+            account_id,
+            database_id,
+            &d1_applied_migrations_sql(migrations_table),
+            &[],
+        )
         .await
-        .map_err(|error| d1_manifest_unknown_ledger_result(account_id, database_id, "", migrations_table, &[], error.payload()))
+        .map_err(|error| {
+            d1_manifest_unknown_ledger_result(
+                account_id,
+                database_id,
+                "",
+                migrations_table,
+                &[],
+                error.payload(),
+            )
+        })
         .and_then(|value| parse_d1_migration_ledger(&value))?;
     let second = server
         .cloudflare
-        .query_d1_database(account_id, database_id, &d1_applied_migrations_sql(migrations_table), &[])
+        .query_d1_database(
+            account_id,
+            database_id,
+            &d1_applied_migrations_sql(migrations_table),
+            &[],
+        )
         .await
-        .map_err(|error| d1_manifest_unknown_ledger_result(account_id, database_id, "", migrations_table, &[], error.payload()))
+        .map_err(|error| {
+            d1_manifest_unknown_ledger_result(
+                account_id,
+                database_id,
+                "",
+                migrations_table,
+                &[],
+                error.payload(),
+            )
+        })
         .and_then(|value| parse_d1_migration_ledger(&value))?;
     if first != second {
         return Err(CallToolResult::structured_error(json!({
@@ -13499,19 +13557,18 @@ mod tests {
         AnalyticsEngineListDatasetsArgs, AnalyticsEngineQueryArgs,
         AnalyticsEngineValidateQueryArgs, ApiFindOperationsArgs, ApiMutateArgs, ApiPrepareCallArgs,
         ApiReadArgs, ApplyAccessAllowlistArgs, BindingsDiscoverArgs, CapabilitiesCheckArgs,
-        CloudflareMcp, ConnectorControlArgs, D1ApplyMigrationManifestArgs,
-        D1ApplyMigrationsArgs, D1InspectSchemaArgs, D1MigrationManifestEntry,
-        D1ListDatabasesArgs, D1QueryArgs, D1ValidateQueryArgs, EmergencyUnpublishArgs,
-        EnsureTunnelArgs, FindToolsArgs, GenerateTunnelIngressArgs, GraphqlAnalyticsQueryArgs,
-        LockFirstPublishArgs, PagesDeploymentActionArgs, PagesUpdateProjectArgs,
-        PatchWorkerSettingsArgs, PortalAgentRequestArgs, QueueHealthArgs, UpsertAccessAppArgs,
-        UpsertDnsCnameArgs, VerifyHttpGateArgs, WafEventFilterInput, WafSecurityEventsSummaryArgs,
-        WafTimeWindow, WorkersObservabilityListKeysArgs, WorkersObservabilityListValuesArgs,
+        CloudflareMcp, ConnectorControlArgs, D1ApplyMigrationManifestArgs, D1ApplyMigrationsArgs,
+        D1InspectSchemaArgs, D1ListDatabasesArgs, D1MigrationManifestEntry, D1QueryArgs,
+        D1ValidateQueryArgs, EmergencyUnpublishArgs, EnsureTunnelArgs, FindToolsArgs,
+        GenerateTunnelIngressArgs, GraphqlAnalyticsQueryArgs, LockFirstPublishArgs,
+        PagesDeploymentActionArgs, PagesUpdateProjectArgs, PatchWorkerSettingsArgs,
+        PortalAgentRequestArgs, QueueHealthArgs, UpsertAccessAppArgs, UpsertDnsCnameArgs,
+        VerifyHttpGateArgs, WafEventFilterInput, WafSecurityEventsSummaryArgs, WafTimeWindow,
+        WorkersObservabilityListKeysArgs, WorkersObservabilityListValuesArgs,
         WorkersObservabilityQueryEventsArgs, WorkersObservabilityTimeframe,
-        WorkersUploadScriptArgs, acquire_d1_migration_lease_at,
-        build_waf_security_events_query, classify_d1_manifest_ledger, d1_manifest_plan_sha256,
-        normalize_waf_group_by, parse_d1_migration_ledger,
-        normalize_waf_phases, query_mentions_waf, waf_security_events_filter,
+        WorkersUploadScriptArgs, acquire_d1_migration_lease_at, build_waf_security_events_query,
+        classify_d1_manifest_ledger, normalize_waf_group_by, normalize_waf_phases,
+        parse_d1_migration_ledger, query_mentions_waf, waf_security_events_filter,
     };
     use crate::cloudflare::CloudflareClient;
     use crate::cloudflare::model::WorkerScript;
@@ -16436,23 +16493,19 @@ mod tests {
     #[test]
     fn d1_manifest_target_lease_serializes_families_for_one_database() {
         let root = d1_migration_test_dir("d1-manifest-target-lease");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                .expect("make lease root private");
+        }
         let digest = "a".repeat(64);
-        let first = acquire_d1_migration_lease_at(
-            root.clone(),
-            "acct-1",
-            "db-1",
-            "audience",
-            &digest,
-        )
-        .expect("first family lease");
-        let second = acquire_d1_migration_lease_at(
-            root.clone(),
-            "acct-1",
-            "db-1",
-            "control",
-            &digest,
-        )
-        .expect_err("family must not split one target lease");
+        let first =
+            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "audience", &digest)
+                .expect("first family lease");
+        let second =
+            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "control", &digest)
+                .expect_err("family must not split one target lease");
         assert_eq!(
             second.structured_content.expect("structured error")["error"]["code"],
             json!("d1.migration_target_lease_held")
@@ -16476,7 +16529,9 @@ mod tests {
                 "result": [{"success": true, "results": [{"id": 1, "name": "0001_initial.sql"}]}]
             }))
         }
-        let state = CallState { bodies: Arc::new(Mutex::new(Vec::new())) };
+        let state = CallState {
+            bodies: Arc::new(Mutex::new(Vec::new())),
+        };
         let router = Router::new()
             .route("/accounts/acct-1/d1/database/db-1/query", post(query_d1))
             .with_state(state.clone());
@@ -16512,10 +16567,17 @@ mod tests {
             .expect("manifest dry run");
         let payload = result.structured_content.expect("payload");
         assert_eq!(payload["ok"], json!(true));
-        assert_eq!(payload["pending_migrations"][0]["name"], json!("0002_status.sql"));
+        assert_eq!(
+            payload["pending_migrations"][0]["name"],
+            json!("0002_status.sql")
+        );
         assert_eq!(payload["plan_sha256"].as_str().map(str::len), Some(64));
         assert_eq!(state.bodies.lock().expect("bodies lock").len(), 1);
-        assert!(!serde_json::to_string(&payload).expect("json").contains("ALTER TABLE"));
+        assert!(
+            !serde_json::to_string(&payload)
+                .expect("json")
+                .contains("ALTER TABLE")
+        );
     }
 
     #[tokio::test]
