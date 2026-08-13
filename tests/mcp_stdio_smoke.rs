@@ -559,7 +559,7 @@ fn spawn_fake_manifest_outer_error_api(
             envelope.insert("messages".to_string(), json!([]));
             envelope.insert("result".to_string(), Value::Array(result));
             let response = serde_json::to_vec(&Value::Object(envelope))
-            .expect("serialize outer-error manifest response");
+                .expect("serialize outer-error manifest response");
             write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write outer-error manifest headers");
             stream
                 .write_all(&response)
