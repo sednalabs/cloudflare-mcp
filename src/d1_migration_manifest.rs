@@ -186,20 +186,75 @@ pub(crate) fn validate_d1_migration_manifest(
 pub(crate) fn parse_d1_migration_ledger(
     value: &Value,
 ) -> Result<Vec<D1ManifestLedgerRow>, CallToolResult> {
-    // CloudflareClient unwraps the v4 envelope's `result`, while direct test
-    // fixtures may retain it. Accept exactly one D1 result set in either shape.
-    let result_sets = value
-        .is_array()
-        .then_some(value)
-        .or_else(|| value.get("result"));
-    let results = result_sets
-        .and_then(Value::as_array)
+    // CloudflareClient unwraps the v4 envelope's `result`, while callers that
+    // preserve raw provider evidence retain that envelope. Accept exactly one
+    // D1 result set in either shape, but never let a retained unsuccessful or
+    // contradictory envelope be mistaken for a clean ledger read.
+    let result_sets = if value.is_array() {
+        value
+    } else {
+        let envelope = value.as_object().ok_or_else(|| {
+            d1_manifest_malformed_ledger_result(
+                "provider ledger response was neither an unwrapped result-set array nor an envelope object",
+            )
+        })?;
+        if envelope.get("success").and_then(Value::as_bool) != Some(true) {
+            return Err(d1_manifest_malformed_ledger_result(
+                "provider ledger envelope did not explicitly prove success",
+            ));
+        }
+        match envelope.get("errors") {
+            Some(Value::Array(errors)) if !errors.is_empty() => {
+                return Err(d1_manifest_malformed_ledger_result(
+                    "provider ledger envelope included contradictory errors",
+                ));
+            }
+            None | Some(Value::Array(_)) => {}
+            _ => {
+                return Err(d1_manifest_malformed_ledger_result(
+                    "provider ledger envelope had malformed errors",
+                ));
+            }
+        }
+        envelope.get("result").ok_or_else(|| {
+            d1_manifest_malformed_ledger_result(
+                "provider ledger envelope did not contain a result-set array",
+            )
+        })?
+    };
+    let result_set = result_sets
+        .as_array()
         .and_then(|items| (items.len() == 1).then_some(&items[0]))
-        .and_then(|item| item.get("results"))
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            d1_manifest_malformed_ledger_result(
+                "provider ledger response did not contain one result-set object",
+            )
+        })?;
+    if result_set.get("success").and_then(Value::as_bool) != Some(true) {
+        return Err(d1_manifest_malformed_ledger_result(
+            "provider ledger result set did not explicitly prove success",
+        ));
+    }
+    match result_set.get("errors") {
+        Some(Value::Array(errors)) if !errors.is_empty() => {
+            return Err(d1_manifest_malformed_ledger_result(
+                "provider ledger result set included contradictory statement errors",
+            ));
+        }
+        None | Some(Value::Array(_)) => {}
+        _ => {
+            return Err(d1_manifest_malformed_ledger_result(
+                "provider ledger result set had malformed statement errors",
+            ));
+        }
+    }
+    let results = result_set
+        .get("results")
         .and_then(Value::as_array)
         .ok_or_else(|| {
             d1_manifest_malformed_ledger_result(
-                "provider ledger response did not contain one result set",
+                "provider ledger result set did not contain a results array",
             )
         })?;
     let mut ledger = Vec::with_capacity(results.len());
@@ -310,7 +365,7 @@ fn d1_manifest_ambiguous_write_evidence(
 mod tests {
     use serde_json::json;
 
-    use super::validate_d1_manifest_write_result;
+    use super::{parse_d1_migration_ledger, validate_d1_manifest_write_result};
 
     #[test]
     fn manifest_write_result_requires_non_empty_complete_successful_inner_results() {
@@ -375,6 +430,67 @@ mod tests {
                 .expect_err("{name} must leave the write outcome unknown");
             assert_eq!(error["code"], "d1.migration_apply_result_ambiguous");
             assert_eq!(error["classification"], classification, "{name}");
+        }
+    }
+
+    #[test]
+    fn manifest_ledger_requires_explicit_success_clean_errors_and_results_array() {
+        let valid = json!([
+            {"success": true, "errors": [], "results": [{"id": 1, "name": "0001_initial.sql"}]}
+        ]);
+        assert!(parse_d1_migration_ledger(&valid).is_ok());
+        let wrapped = json!({"success": true, "errors": [], "result": valid});
+        assert!(parse_d1_migration_ledger(&wrapped).is_ok());
+
+        for (label, value) in [
+            ("missing success", json!([{"results": []}])),
+            ("false success", json!([{"success": false, "results": []}])),
+            (
+                "nonboolean success",
+                json!([{"success": "true", "results": []}]),
+            ),
+            ("missing results", json!([{"success": true}])),
+            ("null results", json!([{"success": true, "results": null}])),
+            (
+                "nonarray results",
+                json!([{"success": true, "results": {}}]),
+            ),
+            (
+                "contradictory errors",
+                json!([{"success": true, "errors": [{"code": 1}], "results": []}]),
+            ),
+            (
+                "malformed errors",
+                json!([{"success": true, "errors": {}, "results": []}]),
+            ),
+            (
+                "wrapped missing envelope success",
+                json!({"errors": [], "result": [{"success": true, "results": []}]}),
+            ),
+            (
+                "wrapped false envelope success",
+                json!({"success": false, "errors": [], "result": [{"success": true, "results": []}]}),
+            ),
+            (
+                "wrapped nonboolean envelope success",
+                json!({"success": "true", "errors": [], "result": [{"success": true, "results": []}]}),
+            ),
+            (
+                "wrapped contradictory envelope errors",
+                json!({"success": true, "errors": [{"code": 1}], "result": [{"success": true, "results": []}]}),
+            ),
+            (
+                "wrapped malformed envelope errors",
+                json!({"success": true, "errors": {}, "result": [{"success": true, "results": []}]}),
+            ),
+        ] {
+            let error = parse_d1_migration_ledger(&value)
+                .expect_err("{label} must fail closed before migration SQL");
+            assert_eq!(
+                error.structured_content.expect("structured error")["error"]["code"],
+                "d1.migration_ledger_malformed",
+                "{label}"
+            );
         }
     }
 }

@@ -467,6 +467,42 @@ fn spawn_fake_manifest_apply_api() -> (String, Arc<Mutex<Vec<Value>>>) {
     (format!("http://{addr}"), requests)
 }
 
+fn spawn_fake_manifest_malformed_ledger_api(result_set: Value) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind malformed ledger D1 API");
+    let addr = listener.local_addr().expect("malformed ledger D1 address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().take(1) {
+            let mut stream = stream.expect("fake malformed ledger D1 stream");
+            let (headers, body) = read_http_request(&mut stream);
+            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            let body_json: Value =
+                serde_json::from_slice(&body).expect("malformed ledger request JSON");
+            requests_for_thread
+                .lock()
+                .expect("request log lock")
+                .push(body_json.clone());
+            assert_eq!(
+                body_json["sql"],
+                json!("SELECT * FROM \"d1_migrations\" ORDER BY id")
+            );
+            let response = serde_json::to_vec(&json!({
+                "success": true,
+                "errors": [],
+                "messages": [],
+                "result": [result_set],
+            }))
+            .expect("serialize malformed ledger response");
+            write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write malformed ledger headers");
+            stream
+                .write_all(&response)
+                .expect("write malformed ledger response");
+        }
+    });
+    (format!("http://{addr}"), requests)
+}
+
 fn spawn_fake_manifest_ambiguous_api(
     ledger_names_commit_after_ambiguous_response: bool,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
@@ -2864,6 +2900,89 @@ fn d1_apply_migration_manifest_dry_run_reaches_stdio_and_never_sends_sql_bytes()
             .expect("content json")
             .contains(second_sql)
     );
+}
+
+#[test]
+fn d1_apply_migration_manifest_rejects_malformed_ledger_before_any_provider_write() {
+    for (index, (label, result_set)) in [
+        ("missing success", json!({"results": []})),
+        ("false success", json!({"success": false, "results": []})),
+        (
+            "nonboolean success",
+            json!({"success": "true", "results": []}),
+        ),
+        ("missing results", json!({"success": true})),
+        ("null results", json!({"success": true, "results": null})),
+        ("nonarray results", json!({"success": true, "results": {}})),
+        (
+            "contradictory errors",
+            json!({"success": true, "errors": [{"code": 1}], "results": []}),
+        ),
+        (
+            "malformed errors",
+            json!({"success": true, "errors": {}, "results": []}),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (base_url, requests) = spawn_fake_manifest_malformed_ledger_api(result_set);
+        let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+            "cloudflare-mcp-malformed-ledger-manifest-{index}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&lease_root);
+        fs::create_dir_all(&lease_root).expect("create lease root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+                .expect("make lease root private");
+        }
+        let mut mcp = McpStdioProcess::start_with_env(vec![
+            ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+            (
+                "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+                lease_root.to_string_lossy().to_string(),
+            ),
+        ]);
+        let sql = "ALTER TABLE submissions ADD COLUMN status TEXT;";
+        let manifest = json!([
+            {"name": "0001_initial.sql", "size_bytes": "CREATE TABLE submissions(id TEXT);".len(), "sql_sha256": sha256_hex("CREATE TABLE submissions(id TEXT);"), "sql": "CREATE TABLE submissions(id TEXT);"},
+            {"name": "0002_second.sql", "size_bytes": sql.len(), "sql_sha256": sha256_hex(sql), "sql": sql}
+        ]);
+        let response = mcp.call_tool(
+            40 + index as u64,
+            "d1_apply_migration_manifest",
+            json!({
+                "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest,
+                "approved_plan_sha256": "a".repeat(64),
+            }),
+        );
+        let content = structured_content(&response);
+        assert_eq!(content["ok"], json!(false), "{label}: {content}");
+        assert_eq!(
+            content["error"]["code"],
+            json!("d1.migration_ledger_malformed"),
+            "{label}"
+        );
+        let observed = requests.lock().expect("requests lock").clone();
+        assert_eq!(observed.len(), 1, "{label}");
+        assert!(
+            observed.iter().all(|request| !request["sql"]
+                .as_str()
+                .is_some_and(|sql| sql.contains("INSERT INTO \"d1_migrations\""))),
+            "{label} must never reach a provider write"
+        );
+        assert!(
+            fs::read_dir(&lease_root)
+                .expect("read released lease root")
+                .next()
+                .is_none(),
+            "{label} must release the pre-write lease"
+        );
+        let _ = fs::remove_dir_all(lease_root);
+    }
 }
 
 #[test]

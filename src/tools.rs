@@ -16213,7 +16213,9 @@ mod tests {
             sql: "CREATE TABLE t(id TEXT);".to_string(),
         }];
         let ledger = parse_d1_migration_ledger(&json!({
-            "result": [{"results": [{"id": 1, "name": "9999_external.sql"}]}]
+            "success": true,
+            "errors": [],
+            "result": [{"success": true, "results": [{"id": 1, "name": "9999_external.sql"}]}]
         }))
         .expect("parse ledger");
         let error = classify_d1_manifest_ledger(&manifest, &ledger)
@@ -16339,7 +16341,9 @@ mod tests {
             sql,
         }];
         let ledger = parse_d1_migration_ledger(&json!({
-            "result": [{"results": [{"id": 1, "name": "9999_external.sql"}]}]
+            "success": true,
+            "errors": [],
+            "result": [{"success": true, "results": [{"id": 1, "name": "9999_external.sql"}]}]
         }))
         .expect("known contradictory ledger");
         let root = d1_migration_test_dir("d1-manifest-evidence");
