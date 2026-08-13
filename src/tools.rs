@@ -44,7 +44,8 @@ use crate::d1_migration_manifest::{
     d1_ledger_summaries, d1_manifest_contextualize_failure, d1_manifest_plan_mismatch_result,
     d1_manifest_plan_sha256, d1_manifest_reconciliation_required_result, d1_manifest_summaries,
     d1_manifest_unknown_ledger_result, normalize_d1_manifest_target, normalize_d1_migration_family,
-    parse_d1_migration_ledger, read_stable_d1_migration_ledger, validate_d1_migration_manifest,
+    parse_d1_migration_ledger, read_stable_d1_migration_ledger, validate_d1_manifest_write_result,
+    validate_d1_migration_manifest,
 };
 use crate::dns_route::{
     DnsRouteConflict, DnsRouteVerificationState, plan_dns_route_reconciliation, verify_dns_route,
@@ -4507,6 +4508,7 @@ impl CloudflareMcp {
     async fn cloudflare_d1_apply_migration_manifest(
         &self,
         Parameters(args): Parameters<D1ApplyMigrationManifestArgs>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, crate::McpError> {
         let D1ApplyMigrationManifestArgs {
             account_id: requested_account_id,
@@ -4581,7 +4583,7 @@ impl CloudflareMcp {
                 mutation_target.clone(),
             );
         let audit = MutationAuditSession::start(
-            None,
+            Some(&parts),
             "d1_apply_migration_manifest",
             mutation_target,
             dry_run,
@@ -4827,11 +4829,17 @@ impl CloudflareMcp {
         for migration in &classification.pending {
             let statement =
                 d1_migration_apply_sql(&migration.sql, &migrations_table, &migration.name);
-            match self
+            let write_result = self
                 .cloudflare
                 .execute_d1_database_write(account_id, &args.database_id, &statement, &[])
                 .await
-            {
+                .map_err(|error| json!({"kind": "transport", "detail": error.payload()}))
+                .and_then(|result| {
+                    validate_d1_manifest_write_result(&result)
+                        .map_err(|detail| json!({"kind": "provider_result", "detail": detail}))?;
+                    Ok(result)
+                });
+            match write_result {
                 Ok(result) => {
                     let (result, truncated) = limit_d1_result_rows(result, max_rows);
                     applied.push(json!({
@@ -4868,7 +4876,7 @@ impl CloudflareMcp {
                         &ledger,
                         reconciliation.as_deref(),
                         &lease,
-                        err.payload(),
+                        err,
                     );
                     // Preserve the shared lease when outcome remains unknown. This prevents
                     // another process from re-entering the target before an operator
@@ -13258,6 +13266,7 @@ mod tests {
         d1_manifest_contextualize_failure, d1_manifest_plan_mismatch_result,
         normalize_d1_manifest_target, parse_d1_migration_ledger, validate_d1_migration_manifest,
     };
+    use crate::mutation::MutationApprovalAudit;
     use crate::portal::PortalAgentClient;
 
     fn fixture_material(label: &str) -> String {
@@ -13379,6 +13388,22 @@ mod tests {
             subject: None,
             token_ref: "token-ref".to_string(),
             raw_token: "raw-token".to_string(),
+        });
+        parts
+    }
+
+    fn test_manifest_tool_parts() -> axum::http::request::Parts {
+        let mut parts = test_tool_parts();
+        parts.headers.insert(
+            "mcp-session-id",
+            "manifest-session-1".parse().expect("session header"),
+        );
+        parts.extensions.insert(MutationApprovalAudit {
+            required: true,
+            decision: "approved",
+            request_digest: "manifest-approval-digest".to_string(),
+            client_supports_elicitation: true,
+            fail_open_unsupported_client: false,
         });
         parts
     }
@@ -16194,21 +16219,24 @@ mod tests {
     async fn d1_manifest_rejects_raw_account_whitespace_before_resolution() {
         let sql = "CREATE TABLE t(id TEXT);".to_string();
         let result = test_server("http://127.0.0.1:9".to_string())
-            .cloudflare_d1_apply_migration_manifest(Parameters(D1ApplyMigrationManifestArgs {
-                account_id: Some(" acct-1".to_string()),
-                database_id: "db-1".to_string(),
-                migration_family: "audience".to_string(),
-                migrations_table: None,
-                manifest: vec![D1MigrationManifestEntry {
-                    name: "0001_initial.sql".to_string(),
-                    size_bytes: sql.len() as u64,
-                    sql_sha256: super::sha256_hex(&sql),
-                    sql,
-                }],
-                dry_run: true,
-                approved_plan_sha256: None,
-                max_rows: None,
-            }))
+            .cloudflare_d1_apply_migration_manifest(
+                Parameters(D1ApplyMigrationManifestArgs {
+                    account_id: Some(" acct-1".to_string()),
+                    database_id: "db-1".to_string(),
+                    migration_family: "audience".to_string(),
+                    migrations_table: None,
+                    manifest: vec![D1MigrationManifestEntry {
+                        name: "0001_initial.sql".to_string(),
+                        size_bytes: sql.len() as u64,
+                        sql_sha256: super::sha256_hex(&sql),
+                        sql,
+                    }],
+                    dry_run: true,
+                    approved_plan_sha256: None,
+                    max_rows: None,
+                }),
+                Extension(test_tool_parts()),
+            )
             .await
             .expect("MCP result");
         assert_eq!(
@@ -16227,21 +16255,24 @@ mod tests {
             ("acct-1", "..", "database parent-directory segment"),
         ] {
             let result = test_server("http://127.0.0.1:9".to_string())
-                .cloudflare_d1_apply_migration_manifest(Parameters(D1ApplyMigrationManifestArgs {
-                    account_id: Some(account_id.to_string()),
-                    database_id: database_id.to_string(),
-                    migration_family: "audience".to_string(),
-                    migrations_table: None,
-                    manifest: vec![D1MigrationManifestEntry {
-                        name: "0001_initial.sql".to_string(),
-                        size_bytes: sql.len() as u64,
-                        sql_sha256: super::sha256_hex(&sql),
-                        sql: sql.clone(),
-                    }],
-                    dry_run: true,
-                    approved_plan_sha256: None,
-                    max_rows: None,
-                }))
+                .cloudflare_d1_apply_migration_manifest(
+                    Parameters(D1ApplyMigrationManifestArgs {
+                        account_id: Some(account_id.to_string()),
+                        database_id: database_id.to_string(),
+                        migration_family: "audience".to_string(),
+                        migrations_table: None,
+                        manifest: vec![D1MigrationManifestEntry {
+                            name: "0001_initial.sql".to_string(),
+                            size_bytes: sql.len() as u64,
+                            sql_sha256: super::sha256_hex(&sql),
+                            sql: sql.clone(),
+                        }],
+                        dry_run: true,
+                        approved_plan_sha256: None,
+                        max_rows: None,
+                    }),
+                    Extension(test_tool_parts()),
+                )
                 .await
                 .expect("MCP result");
             assert_eq!(
@@ -16486,16 +16517,19 @@ mod tests {
             },
         ];
         let result = server
-            .cloudflare_d1_apply_migration_manifest(Parameters(D1ApplyMigrationManifestArgs {
-                account_id: None,
-                database_id: "db-1".to_string(),
-                migration_family: "newsletter-core".to_string(),
-                migrations_table: None,
-                manifest,
-                dry_run: true,
-                approved_plan_sha256: None,
-                max_rows: None,
-            }))
+            .cloudflare_d1_apply_migration_manifest(
+                Parameters(D1ApplyMigrationManifestArgs {
+                    account_id: None,
+                    database_id: "db-1".to_string(),
+                    migration_family: "newsletter-core".to_string(),
+                    migrations_table: None,
+                    manifest,
+                    dry_run: true,
+                    approved_plan_sha256: None,
+                    max_rows: None,
+                }),
+                Extension(test_manifest_tool_parts()),
+            )
             .await
             .expect("manifest dry run");
         let payload = result.structured_content.expect("payload");
@@ -16505,6 +16539,24 @@ mod tests {
             json!("0002_status.sql")
         );
         assert_eq!(payload["plan_sha256"].as_str().map(str::len), Some(64));
+        assert_eq!(
+            payload["audit"]["correlation"]["request_id"],
+            json!("req-test-1")
+        );
+        assert_eq!(
+            payload["audit"]["correlation"]["correlation_id"],
+            json!("corr-test-1")
+        );
+        assert_eq!(
+            payload["audit"]["correlation"]["session_id"],
+            json!("manifest-session-1")
+        );
+        assert_eq!(payload["audit"]["actor"], json!("agent-test"));
+        assert_eq!(payload["audit"]["approval"]["decision"], json!("approved"));
+        assert_eq!(
+            payload["audit"]["approval"]["request_digest"],
+            json!("manifest-approval-digest")
+        );
         assert_eq!(state.bodies.lock().expect("bodies lock").len(), 1);
         assert!(
             !serde_json::to_string(&payload)
