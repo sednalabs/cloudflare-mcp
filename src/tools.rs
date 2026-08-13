@@ -1,9 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::http::request::Parts;
@@ -40,6 +37,14 @@ use crate::cloudflare::model::WorkerScript;
 use crate::cloudflare::{
     AccessAppUpsertRequest, AccessPolicyWrite, BulkRedirectItemWrite, CacheRule, CacheRuleset,
     DnsRecordUpsertRequest, PagesDeploymentTriggerRequest, with_request_api_token_override,
+};
+use crate::d1_migration_lease::{acquire_d1_migration_lease, d1_migration_lease_requirements};
+use crate::d1_migration_manifest::{
+    D1ManifestReconciliationEvidence, approved_d1_plan_digest_matches, classify_d1_manifest_ledger,
+    d1_ledger_summaries, d1_manifest_contextualize_failure, d1_manifest_plan_mismatch_result,
+    d1_manifest_plan_sha256, d1_manifest_reconciliation_required_result, d1_manifest_summaries,
+    d1_manifest_unknown_ledger_result, normalize_d1_manifest_target, normalize_d1_migration_family,
+    parse_d1_migration_ledger, read_stable_d1_migration_ledger, validate_d1_migration_manifest,
 };
 use crate::dns_route::{
     DnsRouteConflict, DnsRouteVerificationState, plan_dns_route_reconciliation, verify_dns_route,
@@ -4513,6 +4518,17 @@ impl CloudflareMcp {
             max_rows,
             migration_family,
         } = args;
+        // `resolve_account_id` is intentionally permissive for the broad MCP
+        // surface. This exact-byte manifest boundary is not: an explicitly
+        // supplied account alias must not be silently trimmed before it is
+        // bound into the reviewed plan and lease key.
+        if let Some(requested_account_id) = requested_account_id.as_deref() {
+            if let Err(result) =
+                normalize_d1_manifest_target(requested_account_id, &requested_database_id)
+            {
+                return Ok(result);
+            }
+        }
         let resolved_account_id = resolve_account_id(self, requested_account_id.as_deref())?;
         let target = match normalize_d1_manifest_target(resolved_account_id, &requested_database_id)
         {
@@ -4637,7 +4653,12 @@ impl CloudflareMcp {
                         &family,
                         &migrations_table,
                         &manifest,
-                        args.approved_plan_sha256.as_deref(),
+                        D1ManifestReconciliationEvidence::new(
+                            args.approved_plan_sha256.as_deref(),
+                            None,
+                            None,
+                            true,
+                        ),
                         &lease,
                         false,
                     ),
@@ -4648,7 +4669,12 @@ impl CloudflareMcp {
                         &family,
                         &migrations_table,
                         &manifest,
-                        args.approved_plan_sha256.as_deref(),
+                        D1ManifestReconciliationEvidence::new(
+                            args.approved_plan_sha256.as_deref(),
+                            None,
+                            None,
+                            true,
+                        ),
                         &lease,
                         true,
                     ),
@@ -4666,7 +4692,12 @@ impl CloudflareMcp {
                         &family,
                         &migrations_table,
                         &manifest,
-                        args.approved_plan_sha256.as_deref(),
+                        D1ManifestReconciliationEvidence::new(
+                            args.approved_plan_sha256.as_deref(),
+                            None,
+                            Some(&ledger),
+                            false,
+                        ),
                         &lease,
                         true,
                     ));
@@ -4678,7 +4709,12 @@ impl CloudflareMcp {
                     &family,
                     &migrations_table,
                     &manifest,
-                    args.approved_plan_sha256.as_deref(),
+                    D1ManifestReconciliationEvidence::new(
+                        args.approved_plan_sha256.as_deref(),
+                        None,
+                        Some(&ledger),
+                        false,
+                    ),
                     &lease,
                     false,
                 ));
@@ -4701,7 +4737,12 @@ impl CloudflareMcp {
                     &family,
                     &migrations_table,
                     &manifest,
-                    Some(&plan_sha256),
+                    D1ManifestReconciliationEvidence::new(
+                        args.approved_plan_sha256.as_deref(),
+                        Some(&plan_sha256),
+                        Some(&ledger),
+                        false,
+                    ),
                     &lease,
                     true,
                 ));
@@ -4721,7 +4762,12 @@ impl CloudflareMcp {
                 &family,
                 &migrations_table,
                 &manifest,
-                Some(&plan_sha256),
+                D1ManifestReconciliationEvidence::new(
+                    args.approved_plan_sha256.as_deref(),
+                    Some(&plan_sha256),
+                    Some(&ledger),
+                    false,
+                ),
                 &lease,
                 false,
             ));
@@ -4759,7 +4805,7 @@ impl CloudflareMcp {
                     )
                     .await
                     .ok();
-                    if let Some(observed) = reconciliation {
+                    if let Some(observed) = reconciliation.as_ref() {
                         if classify_d1_manifest_ledger(&manifest, &observed).is_ok()
                             && observed.iter().any(|row| row.name == migration.name)
                         {
@@ -4779,7 +4825,12 @@ impl CloudflareMcp {
                                     &family,
                                     &migrations_table,
                                     &manifest,
-                                    Some(&plan_sha256),
+                                    D1ManifestReconciliationEvidence::new(
+                                        args.approved_plan_sha256.as_deref(),
+                                        Some(&plan_sha256),
+                                        Some(&observed),
+                                        false,
+                                    ),
                                     &lease,
                                     true,
                                 ));
@@ -4792,8 +4843,11 @@ impl CloudflareMcp {
                                 "database_id": &args.database_id,
                                 "migration_family": family,
                                 "migrations_table": migrations_table,
-                                "approved_plan_sha256": plan_sha256,
+                                "supplied_plan_sha256": args.approved_plan_sha256,
+                                "computed_plan_sha256": plan_sha256,
                                 "applied_migrations": applied,
+                                "ledger": d1_ledger_summaries(observed),
+                                "ledger_evidence": {"state": "known", "ledger": d1_ledger_summaries(observed)},
                                 "unknown_ledger": false,
                                 "lease_retained": false,
                                 "error": {
@@ -4814,6 +4868,8 @@ impl CloudflareMcp {
                         &plan_sha256,
                         migration,
                         &applied,
+                        &ledger,
+                        reconciliation.as_deref(),
                         &lease,
                         err.payload(),
                     );
@@ -4844,7 +4900,12 @@ impl CloudflareMcp {
                     &family,
                     &migrations_table,
                     &manifest,
-                    Some(&plan_sha256),
+                    D1ManifestReconciliationEvidence::new(
+                        args.approved_plan_sha256.as_deref(),
+                        Some(&plan_sha256),
+                        Some(&ledger),
+                        true,
+                    ),
                     &lease,
                     true,
                 ));
@@ -4861,7 +4922,12 @@ impl CloudflareMcp {
                     &family,
                     &migrations_table,
                     &manifest,
-                    Some(&plan_sha256),
+                    D1ManifestReconciliationEvidence::new(
+                        args.approved_plan_sha256.as_deref(),
+                        Some(&plan_sha256),
+                        Some(&final_ledger),
+                        false,
+                    ),
                     &lease,
                     true,
                 ));
@@ -4877,9 +4943,11 @@ impl CloudflareMcp {
                 "database_id": &args.database_id,
                 "migration_family": family,
                 "migrations_table": migrations_table,
-                "approved_plan_sha256": plan_sha256,
+                "supplied_plan_sha256": args.approved_plan_sha256,
+                "computed_plan_sha256": plan_sha256,
                 "applied_migrations": applied,
                 "ledger": d1_ledger_summaries(&final_ledger),
+                "ledger_evidence": {"state": "known", "ledger": d1_ledger_summaries(&final_ledger)},
                 "unknown_ledger": false,
                 "lease_retained": true,
                 "lease": lease.identity,
@@ -4899,7 +4967,12 @@ impl CloudflareMcp {
                 &family,
                 &migrations_table,
                 &manifest,
-                Some(&plan_sha256),
+                D1ManifestReconciliationEvidence::new(
+                    args.approved_plan_sha256.as_deref(),
+                    Some(&plan_sha256),
+                    Some(&final_ledger),
+                    false,
+                ),
                 &lease,
                 true,
             ));
@@ -4912,7 +4985,8 @@ impl CloudflareMcp {
             "database_id": &args.database_id,
             "migration_family": family,
             "migrations_table": migrations_table,
-            "approved_plan_sha256": plan_sha256,
+            "supplied_plan_sha256": args.approved_plan_sha256,
+            "computed_plan_sha256": plan_sha256,
             "manifest": d1_manifest_summaries(&manifest),
             "ledger": d1_ledger_summaries(&final_ledger),
             "applied_migrations": applied,
@@ -10844,7 +10918,7 @@ fn policy_violation_result(violation: crate::policy::PolicyInvariantViolation) -
     }))
 }
 
-fn invalid_argument_result(
+pub(crate) fn invalid_argument_result(
     code: &'static str,
     message: impl Into<String>,
     hint: &'static str,
@@ -11948,8 +12022,8 @@ fn queue_consumer_dlq_name(consumer: &Value) -> Option<String> {
 
 const D1_WRITE_ALLOWED_KINDS: &[&str] = &["INSERT", "UPDATE", "DELETE", "REPLACE"];
 const DEFAULT_D1_MIGRATIONS_TABLE: &str = "d1_migrations";
-const MAX_D1_MIGRATION_BYTES: u64 = 5 * 1024 * 1024;
-const MAX_D1_MIGRATION_COUNT: usize = 1_000;
+pub(crate) const MAX_D1_MIGRATION_BYTES: u64 = 5 * 1024 * 1024;
+pub(crate) const MAX_D1_MIGRATION_COUNT: usize = 1_000;
 
 #[derive(Debug, Clone)]
 struct D1MigrationFile {
@@ -12006,7 +12080,7 @@ fn d1_write_policy_result(code: &'static str, message: &'static str) -> CallTool
     }))
 }
 
-fn sha256_hex(value: &str) -> String {
+pub(crate) fn sha256_hex(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.as_bytes());
     hasher
@@ -12016,7 +12090,7 @@ fn sha256_hex(value: &str) -> String {
         .collect()
 }
 
-fn sha256_bytes_hex(value: &[u8]) -> String {
+pub(crate) fn sha256_bytes_hex(value: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value);
     hasher
@@ -12479,7 +12553,7 @@ fn d1_migrations_table_init_sql(table: &str) -> String {
     )
 }
 
-fn d1_applied_migrations_sql(table: &str) -> String {
+pub(crate) fn d1_applied_migrations_sql(table: &str) -> String {
     format!("SELECT * FROM {} ORDER BY id", quote_sql_identifier(table))
 }
 
@@ -12580,7 +12654,7 @@ fn d1_migration_numeric_prefix(name: &str) -> Option<u64> {
     name.split('_').next()?.parse::<u64>().ok()
 }
 
-fn d1_call_tool_error_value(result: CallToolResult) -> Value {
+pub(crate) fn d1_call_tool_error_value(result: CallToolResult) -> Value {
     result
         .structured_content
         .and_then(|value| value.get("error").cloned())
@@ -12616,804 +12690,6 @@ fn d1_migration_unknown_ledger_result(
             "hint": "Verify the Wrangler migration table name and D1 read permissions before applying migrations.",
             "cause": error,
         },
-    }))
-}
-
-const D1_MANIFEST_LEASE_ROOT_ENV: &str = "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT";
-static D1_MANIFEST_LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Debug, Clone)]
-struct D1ManifestTarget {
-    account_id: String,
-    database_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct D1ManifestLedgerRow {
-    id: i64,
-    name: String,
-}
-
-#[derive(Debug, Clone)]
-struct D1ManifestClassification {
-    applied_names: Vec<String>,
-    pending: Vec<D1MigrationManifestEntry>,
-}
-
-#[derive(Debug)]
-struct D1MigrationLease {
-    path: PathBuf,
-    identity: D1MigrationLeaseIdentity,
-    file_identity: D1LeaseFileIdentity,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct D1MigrationLeaseIdentity {
-    target_key_sha256: String,
-    nonce: String,
-    payload_sha256: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct D1LeaseFileIdentity {
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-}
-
-impl D1MigrationLease {
-    fn release(&self) -> Result<(), CallToolResult> {
-        let observed = d1_lease_file_identity(&self.path)
-            .ok_or_else(|| self.release_failure("lease file is unavailable or changed"))?;
-        let bytes =
-            fs::read(&self.path).map_err(|_| self.release_failure("lease file cannot be read"))?;
-        if observed != self.file_identity
-            || sha256_bytes_hex(&bytes) != self.identity.payload_sha256
-        {
-            return Err(self.release_failure("lease ownership no longer matches this operation"));
-        }
-        if !d1_remove_owned_lease_file(&self.path, &self.file_identity) {
-            return Err(self.release_failure("lease file cannot be removed safely"));
-        }
-        Ok(())
-    }
-
-    fn release_failure(&self, message: &'static str) -> CallToolResult {
-        CallToolResult::structured_error(json!({
-            "ok": false,
-            "operation": "d1_apply_migration_manifest",
-            "status": "reconciliation_required",
-            "lease_retained": true,
-            "lease": self.identity,
-            "error": {"code": "d1.migration_lease_release_failed", "message": message, "hint": "Inspect the shared lease root and reconcile the owner identity before another migration apply."},
-        }))
-    }
-
-    fn retain(&self) {
-        // Deliberately no-op. An unknown provider outcome must retain the
-        // cross-process target lease until an operator reconciles it.
-    }
-}
-
-fn normalize_d1_manifest_target(
-    account_id: &str,
-    database_id: &str,
-) -> Result<D1ManifestTarget, CallToolResult> {
-    fn normalize(label: &'static str, value: &str) -> Result<String, CallToolResult> {
-        let trimmed = value.trim();
-        if trimmed.is_empty() || trimmed != value || trimmed.len() > 256 || trimmed.contains('\0') {
-            return Err(invalid_argument_result(
-                "d1.invalid_manifest_target_identity",
-                format!(
-                    "{label} must be a non-empty canonical identifier without surrounding whitespace"
-                ),
-                "Use the exact account_id and database_id read from the intended Cloudflare resource.",
-            ));
-        }
-        Ok(trimmed.to_string())
-    }
-    Ok(D1ManifestTarget {
-        account_id: normalize("account_id", account_id)?,
-        database_id: normalize("database_id", database_id)?,
-    })
-}
-
-fn d1_lease_file_identity_from_metadata(metadata: &fs::Metadata) -> Option<D1LeaseFileIdentity> {
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return None;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Some(D1LeaseFileIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        Some(D1LeaseFileIdentity {})
-    }
-}
-
-fn d1_lease_file_identity(path: &Path) -> Option<D1LeaseFileIdentity> {
-    let metadata = fs::symlink_metadata(path).ok()?;
-    d1_lease_file_identity_from_metadata(&metadata)
-}
-
-fn d1_remove_owned_lease_file(path: &Path, expected: &D1LeaseFileIdentity) -> bool {
-    d1_lease_file_identity(path).as_ref() == Some(expected) && fs::remove_file(path).is_ok()
-}
-
-#[cfg(unix)]
-fn set_d1_lease_file_mode(file: &fs::File) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    file.set_permissions(fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn set_d1_lease_file_mode(_: &fs::File) -> std::io::Result<()> {
-    Ok(())
-}
-
-fn d1_lease_root_error(code: &'static str, message: &'static str) -> CallToolResult {
-    CallToolResult::structured_error(json!({
-        "ok": false,
-        "operation": "d1_apply_migration_manifest",
-        "status": "reconciliation_required",
-        "lease_retained": false,
-        "error": {"code": code, "message": message, "hint": "Use an absolute, operator-owned 0700 lease root with safe ancestors."},
-    }))
-}
-
-fn d1_migration_lease_nonce(target_hash: &str, plan_sha256: &str) -> String {
-    let sequence = D1_MANIFEST_LEASE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let material = format!(
-        "{target_hash}\0{plan_sha256}\0{}\0{sequence}",
-        now_unix_ms()
-    );
-    blake3::hash(material.as_bytes()).to_hex().to_string()
-}
-
-#[cfg(unix)]
-fn current_effective_uid() -> u32 {
-    unsafe extern "C" {
-        fn geteuid() -> u32;
-    }
-    // SAFETY: geteuid has no arguments and no side effects beyond reading the
-    // current process credential.
-    unsafe { geteuid() }
-}
-
-fn normalize_d1_migration_family(value: &str) -> Result<String, CallToolResult> {
-    let value = value.trim();
-    let valid = !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'));
-    if valid {
-        Ok(value.to_string())
-    } else {
-        Err(invalid_argument_result(
-            "d1.invalid_migration_family",
-            "migration_family must be 1..128 ASCII letters, digits, '.', '_', '-', or ':' characters",
-            "Use a stable operator-facing family label such as newsletter-core.",
-        ))
-    }
-}
-
-fn validate_d1_migration_manifest(
-    manifest: Vec<D1MigrationManifestEntry>,
-) -> Result<Vec<D1MigrationManifestEntry>, CallToolResult> {
-    if manifest.is_empty() {
-        return Err(invalid_argument_result(
-            "d1.empty_migration_manifest",
-            "manifest must contain at least one exact migration",
-            "Provide the complete approved migration manifest in lexical Wrangler order.",
-        ));
-    }
-    if manifest.len() > MAX_D1_MIGRATION_COUNT {
-        return Err(invalid_argument_result(
-            "d1.too_many_migrations",
-            format!("manifest contains more than {MAX_D1_MIGRATION_COUNT} migrations"),
-            "Apply a smaller complete migration family.",
-        ));
-    }
-    let mut previous = None::<String>;
-    for migration in &manifest {
-        let name = migration.name.trim();
-        if name != migration.name
-            || name.is_empty()
-            || name.len() > 255
-            || !name.ends_with(".sql")
-            || name.contains('/')
-            || name.contains('\\')
-            || name.contains('\0')
-        {
-            return Err(invalid_argument_result(
-                "d1.invalid_manifest_migration_name",
-                "manifest migration names must be non-empty .sql basenames of at most 255 bytes without path separators",
-                "Use the exact Wrangler migration filename, for example 0001_initial.sql.",
-            ));
-        }
-        if previous.as_deref().is_some_and(|prior| prior >= name) {
-            return Err(invalid_argument_result(
-                "d1.manifest_not_lexical",
-                "manifest migration names must be unique and strictly lexical",
-                "Supply the complete manifest in the same lexical order that Wrangler uses.",
-            ));
-        }
-        if migration.size_bytes > MAX_D1_MIGRATION_BYTES
-            || migration.size_bytes != migration.sql.as_bytes().len() as u64
-        {
-            return Err(invalid_argument_result(
-                "d1.manifest_size_mismatch",
-                "manifest size_bytes must equal the exact UTF-8 SQL byte length and stay within the migration limit",
-                "Rebuild the manifest from the reviewed SQL bytes.",
-            ));
-        }
-        if migration.sql.trim().is_empty() {
-            return Err(invalid_argument_result(
-                "d1.manifest_empty_sql",
-                "manifest migration SQL must not be empty",
-                "Provide the complete reviewed migration SQL bytes.",
-            ));
-        }
-        let expected = sha256_hex(&migration.sql);
-        if migration.sql_sha256.len() != 64
-            || !migration
-                .sql_sha256
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-            || !migration.sql_sha256.eq_ignore_ascii_case(&expected)
-        {
-            return Err(invalid_argument_result(
-                "d1.manifest_sha256_mismatch",
-                "manifest sql_sha256 does not match the supplied exact SQL bytes",
-                "Recompute SHA-256 from the same SQL string that will be applied.",
-            ));
-        }
-        previous = Some(name.to_string());
-    }
-    Ok(manifest)
-}
-
-fn parse_d1_migration_ledger(value: &Value) -> Result<Vec<D1ManifestLedgerRow>, CallToolResult> {
-    // CloudflareClient unwraps the v4 envelope's `result`, while direct test
-    // fixtures may retain it. Accept exactly one D1 result set in either shape.
-    let result_sets = value
-        .is_array()
-        .then_some(value)
-        .or_else(|| value.get("result"));
-    let results = result_sets
-        .and_then(Value::as_array)
-        .and_then(|items| (items.len() == 1).then_some(&items[0]))
-        .and_then(|item| item.get("results"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            d1_manifest_malformed_ledger_result(
-                "provider ledger response did not contain one result set",
-            )
-        })?;
-    let mut ledger = Vec::with_capacity(results.len());
-    let mut previous_id = None;
-    let mut names = BTreeSet::new();
-    for row in results {
-        let object = row.as_object().ok_or_else(|| {
-            d1_manifest_malformed_ledger_result("provider ledger row was not an object")
-        })?;
-        let id = object
-            .get("id")
-            .and_then(Value::as_i64)
-            .filter(|id| *id >= 0)
-            .ok_or_else(|| {
-                d1_manifest_malformed_ledger_result(
-                    "provider ledger row had no non-negative integer id",
-                )
-            })?;
-        let name = object
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|name| !name.is_empty() && name.len() <= 255 && !name.contains('\0'))
-            .ok_or_else(|| {
-                d1_manifest_malformed_ledger_result(
-                    "provider ledger row had no valid migration name",
-                )
-            })?
-            .to_string();
-        if previous_id.is_some_and(|previous| previous >= id) || !names.insert(name.clone()) {
-            return Err(d1_manifest_malformed_ledger_result(
-                "provider ledger ids or migration names were duplicate or out of order",
-            ));
-        }
-        previous_id = Some(id);
-        ledger.push(D1ManifestLedgerRow { id, name });
-    }
-    Ok(ledger)
-}
-
-fn d1_manifest_malformed_ledger_result(message: &'static str) -> CallToolResult {
-    CallToolResult::structured_error(json!({
-        "ok": false,
-        "operation": "d1_apply_migration_manifest",
-        "status": "reconciliation_required",
-        "unknown_ledger": true,
-        "error": {
-            "code": "d1.migration_ledger_malformed",
-            "message": message,
-            "hint": "Reconcile the exact provider migration ledger before applying migration SQL.",
-        },
-    }))
-}
-
-fn classify_d1_manifest_ledger(
-    manifest: &[D1MigrationManifestEntry],
-    ledger: &[D1ManifestLedgerRow],
-) -> Result<D1ManifestClassification, CallToolResult> {
-    if ledger.len() > manifest.len()
-        || ledger
-            .iter()
-            .zip(manifest)
-            .any(|(ledger_row, migration)| ledger_row.name != migration.name)
-    {
-        return Err(CallToolResult::structured_error(json!({
-            "ok": false,
-            "operation": "d1_apply_migration_manifest",
-            "status": "reconciliation_required",
-            "unknown_ledger": false,
-            "error": {
-                "code": "d1.migration_ledger_not_manifest_prefix",
-                "message": "provider migration ledger is not an exact prefix of the approved manifest",
-                "hint": "Do not apply or skip migrations. Reconcile the provider ledger and use a complete matching manifest.",
-            },
-        })));
-    }
-    Ok(D1ManifestClassification {
-        applied_names: ledger.iter().map(|row| row.name.clone()).collect(),
-        pending: manifest[ledger.len()..].to_vec(),
-    })
-}
-
-fn d1_manifest_summaries(manifest: &[D1MigrationManifestEntry]) -> Vec<Value> {
-    manifest
-        .iter()
-        .map(|migration| {
-            json!({
-                "name": migration.name,
-                "size_bytes": migration.size_bytes,
-                "sql_sha256": migration.sql_sha256.to_ascii_lowercase(),
-            })
-        })
-        .collect()
-}
-
-fn d1_ledger_summaries(ledger: &[D1ManifestLedgerRow]) -> Vec<Value> {
-    ledger
-        .iter()
-        .map(|row| json!({"id": row.id, "name": row.name}))
-        .collect()
-}
-
-fn d1_manifest_plan_sha256(
-    account_id: &str,
-    database_id: &str,
-    family: &str,
-    migrations_table: &str,
-    manifest: &[D1MigrationManifestEntry],
-    ledger: &[D1ManifestLedgerRow],
-) -> String {
-    #[derive(Serialize)]
-    struct Plan<'a> {
-        version: u8,
-        operation: &'static str,
-        account_id: &'a str,
-        database_id: &'a str,
-        migration_family: &'a str,
-        migrations_table: &'a str,
-        manifest: Vec<Value>,
-        ledger: Vec<Value>,
-    }
-    let bytes = serde_json::to_vec(&Plan {
-        version: 1,
-        operation: "d1_apply_migration_manifest",
-        account_id,
-        database_id,
-        migration_family: family,
-        migrations_table,
-        manifest: d1_manifest_summaries(manifest),
-        ledger: d1_ledger_summaries(ledger),
-    })
-    .expect("serializing D1 manifest plan is infallible");
-    sha256_bytes_hex(&bytes)
-}
-
-fn approved_d1_plan_digest_matches(provided: Option<&str>, expected: &str) -> bool {
-    provided
-        .map(str::trim)
-        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .is_some_and(|value| value.eq_ignore_ascii_case(expected))
-}
-
-fn d1_manifest_plan_mismatch_result(
-    account_id: &str,
-    database_id: &str,
-    family: &str,
-    migrations_table: &str,
-    manifest: &[D1MigrationManifestEntry],
-    ledger: &[D1ManifestLedgerRow],
-    computed_plan_sha256: &str,
-) -> CallToolResult {
-    CallToolResult::structured_error(json!({
-        "ok": false,
-        "operation": "d1_apply_migration_manifest",
-        "account_id": account_id,
-        "database_id": database_id,
-        "migration_family": family,
-        "migrations_table": migrations_table,
-        "manifest": d1_manifest_summaries(manifest),
-        "ledger": d1_ledger_summaries(ledger),
-        "computed_plan_sha256": computed_plan_sha256,
-        "error": {
-            "code": "d1.migration_plan_digest_mismatch",
-            "message": "live apply requires the exact approved plan_sha256 from a dry run against this current ledger",
-            "hint": "Run dry_run=true, record its plan_sha256, then use that exact value for one live apply under the shared target lease.",
-        },
-    }))
-}
-
-fn d1_migration_lease_requirements(account_id: &str, database_id: &str, family: &str) -> Value {
-    json!({
-        "required_for_live_apply": true,
-        "environment": D1_MANIFEST_LEASE_ROOT_ENV,
-        "target_key_sha256": sha256_bytes_hex(format!("{account_id}\0{database_id}").as_bytes()),
-        "migration_family": family,
-        "scope": "one lease per account/database target; family is evidence only and cannot split target serialization",
-        "cross_host_limitation": "Cross-process serialization covers only hosts sharing the same configured operator-owned lease root. It is not a Cloudflare/provider-distributed lease.",
-    })
-}
-
-fn acquire_d1_migration_lease(
-    account_id: &str,
-    database_id: &str,
-    family: &str,
-    approved_plan_sha256: Option<&str>,
-) -> Result<D1MigrationLease, CallToolResult> {
-    let plan_sha256 = approved_plan_sha256
-        .map(str::trim)
-        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .ok_or_else(|| {
-            invalid_argument_result(
-                "d1.approved_plan_sha256_required",
-                "approved_plan_sha256 is required for live apply and must be a SHA-256 hex digest",
-                "Use the exact plan_sha256 from a successful manifest dry run.",
-            )
-        })?;
-    let root = std::env::var(D1_MANIFEST_LEASE_ROOT_ENV)
-        .ok()
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-        .ok_or_else(|| CallToolResult::structured_error(json!({
-            "ok": false,
-            "operation": "d1_apply_migration_manifest",
-            "error": {
-                "code": "d1.migration_lease_root_unconfigured",
-                "message": "live migration apply requires a configured operator-owned shared lease root",
-                "hint": format!("Set {D1_MANIFEST_LEASE_ROOT_ENV} to a pre-created private directory shared by all MCP processes that can target this D1 database."),
-            },
-        })))?;
-    acquire_d1_migration_lease_at(root, account_id, database_id, family, plan_sha256)
-}
-
-fn acquire_d1_migration_lease_at(
-    root: PathBuf,
-    account_id: &str,
-    database_id: &str,
-    family: &str,
-    plan_sha256: &str,
-) -> Result<D1MigrationLease, CallToolResult> {
-    if !root.is_absolute() {
-        return Err(d1_lease_root_error(
-            "d1.migration_lease_root_invalid",
-            "migration lease root must be an absolute path",
-        ));
-    }
-    let metadata = fs::symlink_metadata(&root).map_err(|_| CallToolResult::structured_error(json!({
-        "ok": false,
-        "operation": "d1_apply_migration_manifest",
-        "error": {"code": "d1.migration_lease_root_invalid", "message": "configured migration lease root is unavailable", "hint": "Create a private operator-owned directory and configure every relevant MCP process with the same path."},
-    })))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(CallToolResult::structured_error(json!({
-            "ok": false,
-            "operation": "d1_apply_migration_manifest",
-            "error": {"code": "d1.migration_lease_root_invalid", "message": "migration lease root must be a real directory, not a symlink", "hint": "Use a private operator-owned directory."},
-        })));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.uid() != current_effective_uid() || metadata.mode() & 0o077 != 0 {
-            return Err(d1_lease_root_error(
-                "d1.migration_lease_root_unsafe",
-                "migration lease root must be owned by the current operator and mode 0700 or stricter",
-            ));
-        }
-        for ancestor in root.ancestors().skip(1) {
-            let ancestor_metadata = fs::symlink_metadata(ancestor).map_err(|_| {
-                d1_lease_root_error(
-                    "d1.migration_lease_root_invalid",
-                    "migration lease root ancestor is unavailable",
-                )
-            })?;
-            if ancestor_metadata.file_type().is_symlink() {
-                return Err(d1_lease_root_error(
-                    "d1.migration_lease_root_invalid",
-                    "migration lease root has a symlink ancestor",
-                ));
-            }
-            let mode = ancestor_metadata.mode();
-            if mode & 0o022 != 0 && mode & 0o1000 == 0 && ancestor_metadata.uid() != metadata.uid()
-            {
-                return Err(d1_lease_root_error(
-                    "d1.migration_lease_root_unsafe",
-                    "migration lease root has a writable non-sticky ancestor",
-                ));
-            }
-        }
-    }
-    let target_hash = sha256_bytes_hex(format!("{account_id}\0{database_id}").as_bytes());
-    let path = root.join(format!("d1-migration-target-{target_hash}.lease.json"));
-    let nonce = d1_migration_lease_nonce(&target_hash, plan_sha256);
-    let payload = json!({
-        "version": 1,
-        "target_key_sha256": &target_hash,
-        "nonce": &nonce,
-        "account_id": account_id,
-        "database_id": database_id,
-        "migration_family": family,
-        "approved_plan_sha256": plan_sha256.to_ascii_lowercase(),
-    });
-    let encoded = serde_json::to_vec(&payload).expect("serializing lease payload is infallible");
-    let identity = D1MigrationLeaseIdentity {
-        target_key_sha256: target_hash,
-        nonce,
-        payload_sha256: sha256_bytes_hex(&encoded),
-    };
-    let mut open_options = OpenOptions::new();
-    open_options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        open_options.mode(0o600);
-    }
-    match open_options.open(&path) {
-        Ok(mut file) => {
-            let created_file_identity = match file
-                .metadata()
-                .ok()
-                .and_then(|metadata| d1_lease_file_identity_from_metadata(&metadata))
-            {
-                Some(file_identity) => file_identity,
-                None => {
-                    return Err(CallToolResult::structured_error(json!({
-                        "ok": false, "operation": "d1_apply_migration_manifest", "status": "reconciliation_required",
-                        "lease_retained": true, "lease": identity,
-                        "operator_handoff": "Reconcile the newly created lease root entry before any subsequent apply.",
-                        "error": {"code": "d1.migration_lease_identity_unreadable", "message": "new lease file could not be identified as an owned regular file", "hint": "Do not start another apply until the lease root has been reconciled."},
-                    })));
-                }
-            };
-            if set_d1_lease_file_mode(&file).is_err() {
-                let cleanup = d1_remove_owned_lease_file(&path, &created_file_identity);
-                return Err(CallToolResult::structured_error(json!({
-                    "ok": false, "operation": "d1_apply_migration_manifest", "status": "reconciliation_required",
-                    "lease_retained": !cleanup, "lease": identity,
-                    "operator_handoff": "Reconcile the named lease owner identity before any subsequent apply.",
-                    "error": {"code": "d1.migration_lease_mode_failed", "message": "new lease file could not be set to mode 0600", "hint": "Reconcile the lease identity if cleanup was incomplete before another apply."},
-                })));
-            }
-            if file
-                .write_all(&encoded)
-                .and_then(|()| file.sync_all())
-                .is_err()
-            {
-                let cleanup = d1_remove_owned_lease_file(&path, &created_file_identity);
-                return Err(CallToolResult::structured_error(json!({
-                    "ok": false,
-                    "operation": "d1_apply_migration_manifest",
-                    "status": "reconciliation_required",
-                    "lease_retained": !cleanup,
-                    "lease": identity,
-                    "operator_handoff": "Reconcile the named lease owner identity before any subsequent apply.",
-                    "error": {"code": "d1.migration_lease_write_failed", "message": "migration lease payload could not be durably written", "hint": "Reconcile the lease identity if cleanup was incomplete before another apply."},
-                })));
-            }
-            let file_identity = match d1_lease_file_identity(&path) {
-                Some(file_identity) if file_identity == created_file_identity => file_identity,
-                None => {
-                    let cleanup = d1_remove_owned_lease_file(&path, &created_file_identity);
-                    return Err(CallToolResult::structured_error(json!({
-                        "ok": false, "operation": "d1_apply_migration_manifest", "status": "reconciliation_required",
-                        "lease_retained": !cleanup, "lease": identity,
-                        "operator_handoff": "Reconcile the named lease owner identity before any subsequent apply.",
-                        "error": {"code": "d1.migration_lease_identity_unreadable", "message": "new lease file could not be read back as an owned regular file", "hint": "Reconcile the lease identity if cleanup was incomplete before another apply."},
-                    })));
-                }
-                Some(_) => {
-                    return Err(CallToolResult::structured_error(json!({
-                        "ok": false, "operation": "d1_apply_migration_manifest", "status": "reconciliation_required",
-                        "lease_retained": true, "lease": identity,
-                        "operator_handoff": "Reconcile the named lease owner identity before any subsequent apply.",
-                        "error": {"code": "d1.migration_lease_identity_changed", "message": "new lease pathname no longer resolves to the created lease file", "hint": "Do not start another apply until the lease root has been reconciled."},
-                    })));
-                }
-            };
-            Ok(D1MigrationLease {
-                path,
-                identity,
-                file_identity,
-            })
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err(CallToolResult::structured_error(json!({
-                "ok": false,
-                "operation": "d1_apply_migration_manifest",
-                "status": "lease_held",
-                "lease_retained": true,
-                "lease": {"target_key_sha256": identity.target_key_sha256, "ownership": "other_or_unreadable"},
-                "operator_handoff": "Reconcile the target lease holder or its terminal provider evidence before any subsequent apply.",
-                "error": {"code": "d1.migration_target_lease_held", "message": "another migration operation holds this account/database target lease", "hint": "Wait for terminal provider readback or reconcile the retained lease; do not start another family against this target."},
-            })))
-        }
-        Err(_) => Err(CallToolResult::structured_error(json!({
-            "ok": false,
-            "operation": "d1_apply_migration_manifest",
-            "error": {"code": "d1.migration_lease_acquire_failed", "message": "could not atomically acquire the target migration lease", "hint": "Verify the configured lease root and retry only after no active target lease remains."},
-        }))),
-    }
-}
-
-async fn read_stable_d1_migration_ledger(
-    server: &CloudflareMcp,
-    account_id: &str,
-    database_id: &str,
-    migrations_table: &str,
-) -> Result<Vec<D1ManifestLedgerRow>, CallToolResult> {
-    let first = server
-        .cloudflare
-        .query_d1_database(
-            account_id,
-            database_id,
-            &d1_applied_migrations_sql(migrations_table),
-            &[],
-        )
-        .await
-        .map_err(|error| {
-            d1_manifest_unknown_ledger_result(
-                account_id,
-                database_id,
-                "",
-                migrations_table,
-                &[],
-                error.payload(),
-            )
-        })
-        .and_then(|value| parse_d1_migration_ledger(&value))?;
-    let second = server
-        .cloudflare
-        .query_d1_database(
-            account_id,
-            database_id,
-            &d1_applied_migrations_sql(migrations_table),
-            &[],
-        )
-        .await
-        .map_err(|error| {
-            d1_manifest_unknown_ledger_result(
-                account_id,
-                database_id,
-                "",
-                migrations_table,
-                &[],
-                error.payload(),
-            )
-        })
-        .and_then(|value| parse_d1_migration_ledger(&value))?;
-    if first != second {
-        return Err(CallToolResult::structured_error(json!({
-            "ok": false,
-            "operation": "d1_apply_migration_manifest",
-            "status": "reconciliation_required",
-            "unknown_ledger": true,
-            "error": {"code": "d1.migration_ledger_unstable", "message": "two terminal provider ledger readbacks disagreed", "hint": "Reconcile concurrent or external migration activity before clearing the retained lease."},
-        })));
-    }
-    Ok(first)
-}
-
-fn d1_manifest_unknown_ledger_result(
-    account_id: &str,
-    database_id: &str,
-    family: &str,
-    migrations_table: &str,
-    manifest: &[D1MigrationManifestEntry],
-    error: crate::cloudflare::AdapterErrorPayload,
-) -> CallToolResult {
-    CallToolResult::structured_error(json!({
-        "ok": false,
-        "operation": "d1_apply_migration_manifest",
-        "account_id": account_id,
-        "database_id": database_id,
-        "migration_family": family,
-        "migrations_table": migrations_table,
-        "manifest": d1_manifest_summaries(manifest),
-        "status": "reconciliation_required",
-        "unknown_ledger": true,
-        "error": {"code": "d1.migration_ledger_unreadable", "message": "could not read the D1 migration ledger; migration SQL was not executed", "hint": "Reconcile provider ledger access and state before applying migration SQL.", "cause": error},
-    }))
-}
-
-fn d1_manifest_reconciliation_required_result(
-    account_id: &str,
-    database_id: &str,
-    family: &str,
-    migrations_table: &str,
-    manifest: &[D1MigrationManifestEntry],
-    plan_sha256: &str,
-    migration: &D1MigrationManifestEntry,
-    applied: &[Value],
-    lease: &D1MigrationLease,
-    error: crate::cloudflare::AdapterErrorPayload,
-) -> CallToolResult {
-    CallToolResult::structured_error(json!({
-        "ok": false,
-        "operation": "d1_apply_migration_manifest",
-        "account_id": account_id,
-        "database_id": database_id,
-        "migration_family": family,
-        "migrations_table": migrations_table,
-        "manifest": d1_manifest_summaries(manifest),
-        "approved_plan_sha256": plan_sha256,
-        "status": "reconciliation_required",
-        "unknown_ledger": true,
-        "migration": {"name": migration.name, "sql_sha256": migration.sql_sha256.to_ascii_lowercase()},
-        "applied_migrations": applied,
-        "lease_retained": true,
-        "lease": lease.identity,
-        "operator_handoff": "Reconcile the named provider ledger and this lease owner identity before any subsequent apply. Do not replay a migration from this response.",
-        "error": {"code": "d1.migration_apply_outcome_unknown", "message": "provider response after a migration apply was ambiguous; no retry or later migration was attempted", "hint": "Reconcile provider evidence and the exact ledger before clearing the retained target lease.", "cause": error},
-    }))
-}
-
-fn d1_manifest_contextualize_failure(
-    result: CallToolResult,
-    account_id: &str,
-    database_id: &str,
-    family: &str,
-    migrations_table: &str,
-    manifest: &[D1MigrationManifestEntry],
-    plan_sha256: Option<&str>,
-    lease: &D1MigrationLease,
-    lease_retained: bool,
-) -> CallToolResult {
-    let error = d1_call_tool_error_value(result);
-    CallToolResult::structured_error(json!({
-        "ok": false,
-        "operation": "d1_apply_migration_manifest",
-        "account_id": account_id,
-        "database_id": database_id,
-        "migration_family": family,
-        "migrations_table": migrations_table,
-        "manifest": d1_manifest_summaries(manifest),
-        "approved_plan_sha256": plan_sha256,
-        "status": "reconciliation_required",
-        "unknown_ledger": true,
-        "lease_retained": lease_retained,
-        "lease": lease.identity,
-        "operator_handoff": "Reconcile the named provider ledger and this lease owner identity before any subsequent apply. Do not replay a migration from this response.",
-        "error": error,
     }))
 }
 
@@ -13967,14 +13243,19 @@ mod tests {
         VerifyHttpGateArgs, WafEventFilterInput, WafSecurityEventsSummaryArgs, WafTimeWindow,
         WorkersObservabilityListKeysArgs, WorkersObservabilityListValuesArgs,
         WorkersObservabilityQueryEventsArgs, WorkersObservabilityTimeframe,
-        WorkersUploadScriptArgs, acquire_d1_migration_lease_at, build_waf_security_events_query,
-        classify_d1_manifest_ledger, normalize_waf_group_by, normalize_waf_phases,
-        parse_d1_migration_ledger, query_mentions_waf, waf_security_events_filter,
+        WorkersUploadScriptArgs, build_waf_security_events_query, normalize_waf_group_by,
+        normalize_waf_phases, query_mentions_waf, waf_security_events_filter,
     };
     use crate::cloudflare::CloudflareClient;
     use crate::cloudflare::model::WorkerScript;
     use crate::config::PortalAgentConfig;
     use crate::config::{ApiTokenSource, CloudflareApiConfig, ElicitationConfig, ResumeMode};
+    use crate::d1_migration_lease::acquire_d1_migration_lease_at;
+    use crate::d1_migration_manifest::{
+        D1ManifestReconciliationEvidence, classify_d1_manifest_ledger,
+        d1_manifest_contextualize_failure, d1_manifest_plan_mismatch_result,
+        normalize_d1_manifest_target, parse_d1_migration_ledger, validate_d1_migration_manifest,
+    };
     use crate::portal::PortalAgentClient;
 
     fn fixture_material(label: &str) -> String {
@@ -14058,7 +13339,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_millis();
-        let dir = std::env::temp_dir().join(format!(
+        // Lease-custody fixtures require a non-writable or sticky ancestor.
+        // `TMPDIR` may deliberately point at a shared build workspace, so use
+        // the Unix sticky temporary root for this local-only test fixture.
+        let dir = std::path::PathBuf::from("/tmp").join(format!(
             "cloudflare-mcp-{name}-{}-{millis}",
             std::process::id()
         ));
@@ -16866,7 +16150,7 @@ mod tests {
             sql_sha256: "0".repeat(64),
             sql: "CREATE TABLE t(id TEXT);".to_string(),
         }];
-        let error = super::validate_d1_migration_manifest(manifest)
+        let error = validate_d1_migration_manifest(manifest)
             .expect_err("wrong digest must fail before any provider call");
         assert_eq!(
             error.structured_content.expect("structured error")["error"]["code"],
@@ -16891,7 +16175,7 @@ mod tests {
         );
 
         let sql = "CREATE TABLE too_long(id TEXT);".to_string();
-        let error = super::validate_d1_migration_manifest(vec![D1MigrationManifestEntry {
+        let error = validate_d1_migration_manifest(vec![D1MigrationManifestEntry {
             name: format!("{}.sql", "a".repeat(252)),
             size_bytes: sql.len() as u64,
             sql_sha256: super::sha256_hex(&sql),
@@ -16901,6 +16185,33 @@ mod tests {
         assert_eq!(
             error.structured_content.expect("structured error")["error"]["code"],
             json!("d1.invalid_manifest_migration_name")
+        );
+    }
+
+    #[tokio::test]
+    async fn d1_manifest_rejects_raw_account_whitespace_before_resolution() {
+        let sql = "CREATE TABLE t(id TEXT);".to_string();
+        let result = test_server("http://127.0.0.1:9".to_string())
+            .cloudflare_d1_apply_migration_manifest(Parameters(D1ApplyMigrationManifestArgs {
+                account_id: Some(" acct-1".to_string()),
+                database_id: "db-1".to_string(),
+                migration_family: "audience".to_string(),
+                migrations_table: None,
+                manifest: vec![D1MigrationManifestEntry {
+                    name: "0001_initial.sql".to_string(),
+                    size_bytes: sql.len() as u64,
+                    sql_sha256: super::sha256_hex(&sql),
+                    sql,
+                }],
+                dry_run: true,
+                approved_plan_sha256: None,
+                max_rows: None,
+            }))
+            .await
+            .expect("MCP result");
+        assert_eq!(
+            result.structured_content.expect("error")["error"]["code"],
+            json!("d1.invalid_manifest_target_identity")
         );
     }
 
@@ -16929,14 +16240,129 @@ mod tests {
     }
 
     #[test]
+    fn d1_manifest_reconciliation_preserves_known_ledger_and_plan_evidence() {
+        let sql = "CREATE TABLE t(id TEXT);".to_string();
+        let manifest = vec![D1MigrationManifestEntry {
+            name: "0001_initial.sql".to_string(),
+            size_bytes: sql.len() as u64,
+            sql_sha256: super::sha256_hex(&sql),
+            sql,
+        }];
+        let ledger = parse_d1_migration_ledger(&json!({
+            "result": [{"results": [{"id": 1, "name": "9999_external.sql"}]}]
+        }))
+        .expect("known contradictory ledger");
+        let root = d1_migration_test_dir("d1-manifest-evidence");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                .expect("make lease root private");
+        }
+        let lease = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "db-1",
+            "audience",
+            &"a".repeat(64),
+        )
+        .expect("lease");
+        let prefix =
+            classify_d1_manifest_ledger(&manifest, &ledger).expect_err("known non-prefix ledger");
+        let supplied = "a".repeat(64);
+        let payload = d1_manifest_contextualize_failure(
+            prefix,
+            "acct-1",
+            "db-1",
+            "audience",
+            "d1_migrations",
+            &manifest,
+            D1ManifestReconciliationEvidence::new(Some(&supplied), None, Some(&ledger), false),
+            &lease,
+            false,
+        )
+        .structured_content
+        .expect("prefix evidence");
+        assert_eq!(payload["unknown_ledger"], json!(false));
+        assert_eq!(payload["ledger_evidence"]["state"], json!("known"));
+        assert_eq!(
+            payload["error"]["code"],
+            json!("d1.migration_ledger_not_manifest_prefix")
+        );
+        assert!(payload["computed_plan_sha256"].is_null());
+
+        let computed = "b".repeat(64);
+        let payload = d1_manifest_contextualize_failure(
+            d1_manifest_plan_mismatch_result(
+                "acct-1",
+                "db-1",
+                "audience",
+                "d1_migrations",
+                &manifest,
+                &ledger,
+                &computed,
+            ),
+            "acct-1",
+            "db-1",
+            "audience",
+            "d1_migrations",
+            &manifest,
+            D1ManifestReconciliationEvidence::new(
+                Some(&supplied),
+                Some(&computed),
+                Some(&ledger),
+                false,
+            ),
+            &lease,
+            false,
+        )
+        .structured_content
+        .expect("digest evidence");
+        assert_eq!(payload["supplied_plan_sha256"], json!(supplied));
+        assert_eq!(payload["computed_plan_sha256"], json!(computed));
+        assert_eq!(payload["ledger_evidence"]["state"], json!("known"));
+        assert_eq!(
+            payload["error"]["code"],
+            json!("d1.migration_plan_digest_mismatch")
+        );
+        lease.release().expect("release lease");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn d1_manifest_lease_rejects_same_owner_writable_non_sticky_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let ancestor = d1_migration_test_dir("d1-manifest-unsafe-ancestor");
+        let root = ancestor.join("private-lease-root");
+        fs::create_dir(&root).expect("create private lease root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .expect("make lease root private");
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o770))
+            .expect("make same-owner ancestor writable");
+
+        let error =
+            acquire_d1_migration_lease_at(root, "acct-1", "db-1", "audience", &"a".repeat(64))
+                .expect_err("same-owner writable non-sticky ancestor must fail closed");
+        assert_eq!(
+            error.structured_content.expect("unsafe root error")["error"]["code"],
+            json!("d1.migration_lease_root_unsafe")
+        );
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o700))
+            .expect("restore private test parent");
+        let _ = fs::remove_dir_all(ancestor);
+    }
+
+    #[test]
     fn d1_manifest_target_rejects_whitespace_aliases_and_lease_release_cannot_remove_replacement() {
-        let error = super::normalize_d1_manifest_target(" acct-1", "db-1")
+        let error = normalize_d1_manifest_target(" acct-1", "db-1")
             .expect_err("account whitespace alias must fail");
         assert_eq!(
             error.structured_content.expect("error")["error"]["code"],
             json!("d1.invalid_manifest_target_identity")
         );
-        let error = super::normalize_d1_manifest_target("acct-1", "db-1 ")
+        let error = normalize_d1_manifest_target("acct-1", "db-1 ")
             .expect_err("database whitespace alias must fail");
         assert_eq!(
             error.structured_content.expect("error")["error"]["code"],

@@ -314,7 +314,10 @@ impl CloudflareClient {
     ) -> Result<Page<D1Database>, AdapterError> {
         let account_id = require_non_empty("account_id", account_id)?;
         let token = self.bearer_token()?;
-        let url = self.endpoint(&format!("/accounts/{account_id}/d1/database"));
+        let url = self.endpoint(&format!(
+            "/accounts/{}/d1/database",
+            path_segment(account_id)
+        ));
         let name = name.map(str::trim).filter(|value| !value.is_empty());
 
         let envelope: CloudflareEnvelope<Vec<D1Database>> = self
@@ -351,8 +354,9 @@ impl CloudflareClient {
         let database_id = require_non_empty("database_id", database_id)?;
         let token = self.bearer_token()?;
         let url = self.endpoint(&format!(
-            "/accounts/{account_id}/d1/database/{}",
-            path_segment(database_id)
+            "/accounts/{}/d1/database/{}",
+            path_segment(account_id),
+            path_segment(database_id),
         ));
 
         let envelope: CloudflareEnvelope<D1Database> = self
@@ -388,8 +392,9 @@ impl CloudflareClient {
         let name = require_non_empty("name", name)?;
         let token = self.bearer_token()?;
         let url = self.endpoint(&format!(
-            "/accounts/{account_id}/d1/database/{}",
-            path_segment(database_id)
+            "/accounts/{}/d1/database/{}",
+            path_segment(account_id),
+            path_segment(database_id),
         ));
         let body = json!({ "name": name });
 
@@ -425,8 +430,9 @@ impl CloudflareClient {
         let database_id = require_non_empty("database_id", database_id)?;
         let token = self.bearer_token()?;
         let url = self.endpoint(&format!(
-            "/accounts/{account_id}/d1/database/{}",
-            path_segment(database_id)
+            "/accounts/{}/d1/database/{}",
+            path_segment(account_id),
+            path_segment(database_id),
         ));
 
         let envelope: CloudflareEnvelope<Value> = self
@@ -532,8 +538,9 @@ impl CloudflareClient {
         let sql = require_non_empty("sql", sql)?;
         let token = self.bearer_token()?;
         let url = self.endpoint(&format!(
-            "/accounts/{account_id}/d1/database/{}/query",
-            path_segment(database_id)
+            "/accounts/{}/d1/database/{}/query",
+            path_segment(account_id),
+            path_segment(database_id),
         ));
         let mut body = Map::new();
         body.insert("sql".to_string(), Value::String(sql.to_string()));
@@ -3563,7 +3570,7 @@ mod tests {
     use std::time::Duration;
 
     use axum::body::{Body, Bytes};
-    use axum::extract::{Path, Query, State};
+    use axum::extract::{OriginalUri, Path, Query, State};
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::Response;
     use axum::routing::{get, post, put};
@@ -3623,6 +3630,29 @@ mod tests {
     #[test]
     fn path_segment_encodes_separators() {
         assert_eq!(path_segment("zone/one two"), "zone%2Fone%20two");
+    }
+
+    #[tokio::test]
+    async fn d1_account_and_database_path_segments_cannot_inject_path_query_or_fragment() {
+        async fn query(OriginalUri(uri): OriginalUri) -> Json<Value> {
+            assert_eq!(
+                uri.to_string(),
+                "/accounts/acct%2Fone%3Fnext%3D1%23fragment/d1/database/db%2Fone%3Fnext%3D1%23fragment/query"
+            );
+            Json(json!({"success": true, "errors": [], "messages": [], "result": []}))
+        }
+
+        let base = spawn_router(Router::new().route("/{*path}", post(query))).await;
+        let client = CloudflareClient::new(test_config(base)).expect("client");
+        client
+            .query_d1_database(
+                "acct/one?next=1#fragment",
+                "db/one?next=1#fragment",
+                "SELECT 1",
+                &[],
+            )
+            .await
+            .expect("encoded D1 query");
     }
 
     #[tokio::test]

@@ -86,10 +86,11 @@ must submit that value as `approved_plan_sha256` and configure
 `CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT` to a pre-created, operator-owned,
 non-group/world-writable directory shared by every MCP process that can target
 the database. On Unix the root must be an absolute real directory owned by the
-current operator with mode `0700` (or stricter); its lease entries are created
-with mode `0600`. Do not use a shared writable directory or manually remove a
-lease by pathname: terminal errors report the target hash, nonce and payload
-hash needed to reconcile the specific owner safely. The manifest tool never
+current operator with mode `0700` (or stricter); every non-sticky ancestor must
+also be non-writable, and its lease entries are created with mode `0600`. Do
+not use a shared writable directory or manually remove a lease by pathname:
+terminal errors report the target hash, nonce and payload hash needed to
+reconcile the specific owner safely. The manifest tool never
 reopens a directory after review and never retries an ambiguous provider write.
 An unknown outcome retains the target lease: reconcile provider ledger evidence
 and the reported lease identity before clearing it and begin again with a fresh

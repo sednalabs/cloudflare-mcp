@@ -2729,7 +2729,9 @@ fn d1_apply_migration_manifest_dry_run_reaches_stdio_and_never_sends_sql_bytes()
 #[test]
 fn d1_apply_migration_manifest_live_rechecks_plan_and_stably_reads_back_before_release() {
     let (base_url, requests) = spawn_fake_manifest_apply_api();
-    let lease_root = std::env::temp_dir().join(format!(
+    // The custody contract rejects the shared build TMPDIR's writable ancestor.
+    // `/tmp` is sticky on Unix and therefore a safe parent for this fixture.
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-manifest-lease-{}",
         std::process::id()
     ));
@@ -2807,7 +2809,8 @@ fn d1_apply_migration_manifest_live_rechecks_plan_and_stably_reads_back_before_r
 #[test]
 fn d1_apply_migration_manifest_response_loss_stops_without_retry_and_retains_lease() {
     let (base_url, requests) = spawn_fake_manifest_ambiguous_api();
-    let lease_root = std::env::temp_dir().join(format!(
+    // Keep this retained-lease fixture under the sticky system temporary root.
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-ambiguous-manifest-lease-{}",
         std::process::id()
     ));
