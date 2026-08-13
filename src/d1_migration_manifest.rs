@@ -239,8 +239,8 @@ pub(crate) fn parse_d1_migration_ledger(
     Ok(ledger)
 }
 
-/// Accept only the complete, single-statement success shape that lets the
-/// manifest coordinator claim a migration was applied. This is deliberately
+/// Accept only a non-empty sequence of complete, successful D1 query results
+/// that lets the manifest coordinator claim a migration was applied. This is deliberately
 /// stricter than the generic D1 query helper: a non-idempotent migration write
 /// must treat a missing, malformed, or failed inner D1 result as an unknown
 /// external outcome, rather than as a safe no-op or an applied statement.
@@ -251,44 +251,46 @@ pub(crate) fn validate_d1_manifest_write_result(value: &Value) -> Result<(), Val
             "provider write response did not contain a D1 result-set array",
         )
     })?;
-    let [result_set] = result_sets.as_slice() else {
+    if result_sets.is_empty() {
         return Err(d1_manifest_ambiguous_write_evidence(
-            "result_set_cardinality",
-            "provider write response did not contain exactly one D1 result set",
-        ));
-    };
-    let result_set = result_set.as_object().ok_or_else(|| {
-        d1_manifest_ambiguous_write_evidence(
-            "malformed_result_set",
-            "provider write response result set was not an object",
-        )
-    })?;
-    if result_set.get("success").and_then(Value::as_bool) != Some(true) {
-        return Err(d1_manifest_ambiguous_write_evidence(
-            "inner_statement_failure_or_missing_success",
-            "provider write response did not prove a successful inner D1 statement",
+            "empty_result_set_sequence",
+            "provider write response did not contain any D1 result set",
         ));
     }
-    match result_set.get("errors") {
-        Some(Value::Array(errors)) if !errors.is_empty() => {
+    for result_set in result_sets {
+        let result_set = result_set.as_object().ok_or_else(|| {
+            d1_manifest_ambiguous_write_evidence(
+                "malformed_result_set",
+                "provider write response result set was not an object",
+            )
+        })?;
+        if result_set.get("success").and_then(Value::as_bool) != Some(true) {
             return Err(d1_manifest_ambiguous_write_evidence(
-                "inner_statement_error",
-                "provider write response included an inner D1 statement error",
+                "inner_statement_failure_or_missing_success",
+                "provider write response did not prove a successful inner D1 statement",
             ));
         }
-        None | Some(Value::Array(_)) => {}
-        _ => {
+        match result_set.get("errors") {
+            Some(Value::Array(errors)) if !errors.is_empty() => {
+                return Err(d1_manifest_ambiguous_write_evidence(
+                    "inner_statement_error",
+                    "provider write response included an inner D1 statement error",
+                ));
+            }
+            None | Some(Value::Array(_)) => {}
+            _ => {
+                return Err(d1_manifest_ambiguous_write_evidence(
+                    "malformed_inner_errors",
+                    "provider write response contained a malformed inner D1 errors value",
+                ));
+            }
+        }
+        if !matches!(result_set.get("results"), Some(Value::Array(_))) {
             return Err(d1_manifest_ambiguous_write_evidence(
-                "malformed_inner_errors",
-                "provider write response contained a malformed inner D1 errors value",
+                "missing_or_malformed_inner_results",
+                "provider write response did not contain an inner D1 results array",
             ));
         }
-    }
-    if !matches!(result_set.get("results"), Some(Value::Array(_))) {
-        return Err(d1_manifest_ambiguous_write_evidence(
-            "missing_or_malformed_inner_results",
-            "provider write response did not contain an inner D1 results array",
-        ));
     }
     Ok(())
 }
@@ -311,9 +313,16 @@ mod tests {
     use super::validate_d1_manifest_write_result;
 
     #[test]
-    fn manifest_write_result_requires_one_complete_successful_inner_statement() {
+    fn manifest_write_result_requires_non_empty_complete_successful_inner_results() {
         assert!(
             validate_d1_manifest_write_result(&json!([
+                {"success": true, "errors": [], "results": []}
+            ]))
+            .is_ok()
+        );
+        assert!(
+            validate_d1_manifest_write_result(&json!([
+                {"success": true, "errors": [], "results": []},
                 {"success": true, "errors": [], "results": []}
             ]))
             .is_ok()
@@ -321,7 +330,7 @@ mod tests {
 
         for (name, value, classification) in [
             ("missing", json!(null), "missing_or_non_array_result"),
-            ("empty", json!([]), "result_set_cardinality"),
+            ("empty", json!([]), "empty_result_set_sequence"),
             ("null inner", json!([null]), "malformed_result_set"),
             (
                 "missing inner results",
@@ -346,6 +355,14 @@ mod tests {
             (
                 "inner failure",
                 json!([{"success": false, "errors": [], "results": []}]),
+                "inner_statement_failure_or_missing_success",
+            ),
+            (
+                "mixed inner success and failure",
+                json!([
+                    {"success": true, "errors": [], "results": []},
+                    {"success": false, "errors": [], "results": []}
+                ]),
                 "inner_statement_failure_or_missing_success",
             ),
             (

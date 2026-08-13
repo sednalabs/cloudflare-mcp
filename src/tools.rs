@@ -4574,6 +4574,8 @@ impl CloudflareMcp {
             "migration_family": family,
             "migrations_table": migrations_table,
             "manifest": d1_manifest_summaries(&manifest),
+            "supplied_plan_sha256": args.approved_plan_sha256,
+            "computed_plan_sha256": Value::Null,
         });
         let mut mutation_plan = MutationPlan::new("d1_apply_migration_manifest")
             .step("validate_exact_manifest", false, mutation_target.clone())
@@ -4582,7 +4584,7 @@ impl CloudflareMcp {
                 false,
                 mutation_target.clone(),
             );
-        let audit = MutationAuditSession::start(
+        let mut audit = MutationAuditSession::start(
             Some(&parts),
             "d1_apply_migration_manifest",
             mutation_target,
@@ -4637,6 +4639,16 @@ impl CloudflareMcp {
                 &manifest,
                 &ledger,
             );
+            audit.set_target(json!({
+                "target_key_sha256": sha256_bytes_hex(
+                    format!("{account_id}\0{database_id}").as_bytes()
+                ),
+                "migration_family": family,
+                "migrations_table": migrations_table,
+                "manifest": d1_manifest_summaries(&manifest),
+                "supplied_plan_sha256": args.approved_plan_sha256,
+                "computed_plan_sha256": plan_sha256,
+            }));
             finish_manifest!(CallToolResult::structured(json!({
                 "ok": true,
                 "operation": "d1_apply_migration_manifest",
@@ -4652,7 +4664,7 @@ impl CloudflareMcp {
                 "plan_sha256": plan_sha256,
                 "lease": d1_migration_lease_requirements(account_id, &args.database_id, &family),
                 "max_rows": max_rows,
-                "dry_run_note": "No D1 writes were issued. A live call must supply this exact plan_sha256 and use the configured shared migration lease root.",
+                "dry_run_note": "No D1 writes were issued. This dry run performed one ledger read; a live call independently performs stable pre- and post-apply ledger readback, must supply this exact plan_sha256, and uses the configured shared migration lease root.",
             })));
         }
 
@@ -4761,6 +4773,16 @@ impl CloudflareMcp {
             &manifest,
             &ledger,
         );
+        audit.set_target(json!({
+            "target_key_sha256": sha256_bytes_hex(
+                format!("{account_id}\0{database_id}").as_bytes()
+            ),
+            "migration_family": family,
+            "migrations_table": migrations_table,
+            "manifest": d1_manifest_summaries(&manifest),
+            "supplied_plan_sha256": args.approved_plan_sha256,
+            "computed_plan_sha256": plan_sha256,
+        }));
         mutation_plan = mutation_plan
             .step(
                 "bind_exact_reviewed_plan",
@@ -16539,6 +16561,11 @@ mod tests {
             json!("0002_status.sql")
         );
         assert_eq!(payload["plan_sha256"].as_str().map(str::len), Some(64));
+        assert!(payload["audit"]["target"]["supplied_plan_sha256"].is_null());
+        assert_eq!(
+            payload["audit"]["target"]["computed_plan_sha256"],
+            payload["plan_sha256"]
+        );
         assert_eq!(
             payload["audit"]["correlation"]["request_id"],
             json!("req-test-1")

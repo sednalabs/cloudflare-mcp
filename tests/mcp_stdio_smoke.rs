@@ -522,6 +522,15 @@ fn spawn_fake_manifest_ambiguous_result_api(
     let requests = Arc::new(Mutex::new(Vec::new()));
     let requests_for_thread = requests.clone();
     thread::spawn(move || {
+        let write_commits = write_result.as_array().is_some_and(|result_sets| {
+            !result_sets.is_empty()
+                && result_sets.iter().all(|result_set| {
+                    result_set["success"] == json!(true)
+                        && result_set["errors"].as_array().is_none_or(Vec::is_empty)
+                        && result_set["results"].is_array()
+                })
+        });
+        let mut apply_seen = false;
         for stream in listener.incoming().take(6) {
             let mut stream = stream.expect("fake ambiguous result manifest D1 stream");
             let (headers, body) = read_http_request(&mut stream);
@@ -534,6 +543,7 @@ fn spawn_fake_manifest_ambiguous_result_api(
                 .push(body_json.clone());
             let sql = body_json["sql"].as_str().unwrap_or_default();
             let response = if sql.contains("INSERT INTO \"d1_migrations\"") {
+                apply_seen = write_commits;
                 json!({
                     "success": true,
                     "errors": [],
@@ -546,7 +556,14 @@ fn spawn_fake_manifest_ambiguous_result_api(
                     "success": true,
                     "errors": [],
                     "messages": [],
-                    "result": [{"success": true, "results": [{"id": 1, "name": "0001_initial.sql"}]}],
+                    "result": [{"success": true, "results": if apply_seen {
+                        vec![
+                            json!({"id": 1, "name": "0001_initial.sql"}),
+                            json!({"id": 2, "name": "0002_second.sql"}),
+                        ]
+                    } else {
+                        vec![json!({"id": 1, "name": "0001_initial.sql"})]
+                    }}],
                 })
             };
             let response =
@@ -3084,7 +3101,7 @@ fn d1_apply_migration_manifest_same_name_after_response_loss_stays_unknown_and_r
 fn d1_apply_migration_manifest_ambiguous_inner_result_shapes_retain_lease_without_retry() {
     for (index, (label, write_result, classification)) in [
         ("missing", Value::Null, "missing_or_non_array_result"),
-        ("empty", json!([]), "result_set_cardinality"),
+        ("empty", json!([]), "empty_result_set_sequence"),
         ("null", json!([null]), "malformed_result_set"),
         (
             "malformed",
@@ -3092,8 +3109,11 @@ fn d1_apply_migration_manifest_ambiguous_inner_result_shapes_retain_lease_withou
             "missing_or_malformed_inner_results",
         ),
         (
-            "inner failure",
-            json!([{"success": false, "errors": [], "results": []}]),
+            "mixed success and failure",
+            json!([
+                {"success": true, "errors": [], "results": []},
+                {"success": false, "errors": [], "results": []}
+            ]),
             "inner_statement_failure_or_missing_success",
         ),
         (
@@ -3191,6 +3211,68 @@ fn d1_apply_migration_manifest_ambiguous_inner_result_shapes_retain_lease_withou
         );
         let _ = fs::remove_dir_all(lease_root);
     }
+}
+
+#[test]
+fn d1_apply_migration_manifest_multiple_successful_query_results_apply_once() {
+    let (base_url, requests) = spawn_fake_manifest_ambiguous_result_api(json!([
+        {"success": true, "errors": [], "results": []},
+        {"success": true, "errors": [], "results": []}
+    ]));
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-multi-result-manifest-lease-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make lease root private");
+    }
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let sql = "ALTER TABLE submissions ADD COLUMN status TEXT;";
+    let manifest = json!([
+        {"name": "0001_initial.sql", "size_bytes": "CREATE TABLE submissions(id TEXT);".len(), "sql_sha256": sha256_hex("CREATE TABLE submissions(id TEXT);"), "sql": "CREATE TABLE submissions(id TEXT);"},
+        {"name": "0002_second.sql", "size_bytes": sql.len(), "sql_sha256": sha256_hex(sql), "sql": sql}
+    ]);
+    let dry = mcp.call_tool(30, "d1_apply_migration_manifest", json!({
+        "database_id": "db-1", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
+    }));
+    let plan = structured_content(&dry)["plan_sha256"]
+        .as_str()
+        .expect("plan")
+        .to_string();
+    let live = mcp.call_tool(
+        31,
+        "d1_apply_migration_manifest",
+        json!({
+            "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest,
+            "approved_plan_sha256": plan,
+        }),
+    );
+    let content = structured_content(&live);
+    assert_eq!(content["ok"], json!(true), "{content}");
+    assert_eq!(content["status"], json!("applied"));
+    assert_eq!(
+        content["applied_migrations"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(requests.lock().expect("requests lock").len(), 6);
+    assert!(
+        fs::read_dir(&lease_root)
+            .expect("read released lease root")
+            .next()
+            .is_none()
+    );
+    let _ = fs::remove_dir_all(lease_root);
 }
 
 #[test]
