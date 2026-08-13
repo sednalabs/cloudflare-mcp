@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -1363,20 +1363,8 @@ fn create_pages_dir_with_worker(name: &str) -> PathBuf {
     root
 }
 
-fn create_pages_dir_with_worker_directory(name: &str) -> PathBuf {
-    let root = create_static_pages_dir(name);
-    fs::create_dir(root.join("_worker.js")).expect("create _worker.js directory");
-    fs::write(
-        root.join("_worker.js/index.js"),
-        "export default { fetch(request, env) { return env.ASSETS.fetch(request); } };",
-    )
-    .expect("write _worker.js/index.js");
-    fs::write(
-        root.join("_routes.json"),
-        r#"{"version":1,"include":["/*"],"exclude":[]}"#,
-    )
-    .expect("write _routes.json");
-    root
+fn pages_dir_with_worker_directory() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pages-single-module-worker")
 }
 
 fn create_pages_dir_with_worker_bundle(name: &str) -> PathBuf {
@@ -2210,7 +2198,7 @@ fn pages_deploy_directory_live_apply_uploads_advanced_mode_worker_through_stdio_
 #[test]
 fn pages_deploy_directory_live_apply_uploads_single_module_worker_directory_through_stdio_boundary()
 {
-    let directory = create_pages_dir_with_worker_directory("worker-directory-apply");
+    let directory = pages_dir_with_worker_directory();
     let (base_url, requests) = spawn_fake_pages_direct_upload_api_with_options(
         true,
         ExpectedWorkerUpload::ScriptWithRoutes,
@@ -2245,7 +2233,6 @@ fn pages_deploy_directory_live_apply_uploads_single_module_worker_directory_thro
             "POST /accounts/acct-1/pages/projects/site/deployments",
         ]
     );
-    let _ = fs::remove_dir_all(directory);
 }
 
 #[test]

@@ -1105,24 +1105,14 @@ test -z "$config" || printf '%s' '{"routes":[{"routePath":"/api/ping","mountPath
 
     #[test]
     fn inspect_pages_directory_accepts_single_module_worker_directory_as_special_file() {
-        let root = temp_pages_dir("worker-directory");
-        fs::write(root.join("index.html"), "<h1>ok</h1>").expect("write index");
-        fs::create_dir(root.join("_worker.js")).expect("create worker directory");
-        fs::write(
-            root.join("_worker.js/index.js"),
-            "export default { fetch(request, env) { return env.ASSETS.fetch(request); } };",
-        )
-        .expect("write worker entry module");
-        fs::write(
-            root.join("_routes.json"),
-            r#"{"version":1,"include":["/*"],"exclude":[]}"#,
-        )
-        .expect("write routes");
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pages-single-module-worker");
 
         let package = inspect_pages_directory(root.to_str().unwrap(), 20).expect("inspect pages");
 
-        assert_eq!(package.assets.len(), 1);
-        assert_eq!(package.assets[0].relative_path, "index.html");
+        assert_eq!(package.assets.len(), 2);
+        assert_eq!(package.assets[0].relative_path, "assets/app.css");
+        assert_eq!(package.assets[1].relative_path, "index.html");
         assert_eq!(
             package
                 .special_files
@@ -1133,26 +1123,17 @@ test -z "$config" || printf '%s' '{"routes":[{"routePath":"/api/ping","mountPath
         );
         assert!(package.special_files.routes.is_some());
         assert!(!package.manifest.contains_key("/_worker.js/index.js"));
-
-        fs::remove_dir_all(root).expect("cleanup temp pages dir");
     }
 
     #[test]
     fn inspect_pages_directory_rejects_multi_module_worker_directory() {
-        let root = temp_pages_dir("worker-directory-multi-module");
-        fs::write(root.join("index.html"), "<h1>ok</h1>").expect("write index");
-        fs::create_dir(root.join("_worker.js")).expect("create worker directory");
-        fs::write(root.join("_worker.js/index.js"), "export default {};")
-            .expect("write worker entry module");
-        fs::write(root.join("_worker.js/helper.js"), "export const value = 1;")
-            .expect("write worker helper module");
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pages-multi-module-worker");
 
         let error = inspect_pages_directory(root.to_str().unwrap(), 20).expect_err("reject");
 
         assert_eq!(error.code, "pages.worker_directory_unsupported_shape");
         assert!(error.message.contains("single-module"));
-
-        fs::remove_dir_all(root).expect("cleanup temp pages dir");
     }
 
     #[test]
