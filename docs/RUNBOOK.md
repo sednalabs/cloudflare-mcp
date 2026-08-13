@@ -87,7 +87,8 @@ must submit that value as `approved_plan_sha256` and configure
 non-group/world-writable directory shared by every MCP process that can target
 the database. On Unix the root must be an absolute real directory owned by the
 current operator with mode `0700` (or stricter); every non-sticky ancestor must
-also be non-writable, and its lease entries are created with mode `0600`. Do
+also be non-writable, and its lease entries are created with mode `0600` then
+the parent directory is synchronized. Do
 not use a shared writable directory or manually remove a lease by pathname:
 terminal errors report the target hash, nonce and payload hash needed to
 reconcile the specific owner safely. The manifest tool never

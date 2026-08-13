@@ -16215,6 +16215,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn d1_manifest_rejects_dot_segments_before_provider_url_construction() {
+        let sql = "CREATE TABLE t(id TEXT);".to_string();
+        for (account_id, database_id, label) in [
+            (".", "db-1", "account current-directory segment"),
+            ("..", "db-1", "account parent-directory segment"),
+            ("acct-1", ".", "database current-directory segment"),
+            ("acct-1", "..", "database parent-directory segment"),
+        ] {
+            let result = test_server("http://127.0.0.1:9".to_string())
+                .cloudflare_d1_apply_migration_manifest(Parameters(D1ApplyMigrationManifestArgs {
+                    account_id: Some(account_id.to_string()),
+                    database_id: database_id.to_string(),
+                    migration_family: "audience".to_string(),
+                    migrations_table: None,
+                    manifest: vec![D1MigrationManifestEntry {
+                        name: "0001_initial.sql".to_string(),
+                        size_bytes: sql.len() as u64,
+                        sql_sha256: super::sha256_hex(&sql),
+                        sql: sql.clone(),
+                    }],
+                    dry_run: true,
+                    approved_plan_sha256: None,
+                    max_rows: None,
+                }))
+                .await
+                .expect("MCP result");
+            assert_eq!(
+                result.structured_content.expect("error")["error"]["code"],
+                json!("d1.invalid_manifest_target_identity"),
+                "{label} must be rejected before the URL parser sees it"
+            );
+        }
+    }
+
     #[test]
     fn d1_manifest_target_lease_serializes_families_for_one_database() {
         let root = d1_migration_test_dir("d1-manifest-target-lease");
@@ -16355,7 +16390,7 @@ mod tests {
     }
 
     #[test]
-    fn d1_manifest_target_rejects_whitespace_aliases_and_lease_release_cannot_remove_replacement() {
+    fn d1_manifest_target_rejects_aliases_and_preserves_replacement_lease() {
         let error = normalize_d1_manifest_target(" acct-1", "db-1")
             .expect_err("account whitespace alias must fail");
         assert_eq!(
@@ -16368,7 +16403,6 @@ mod tests {
             error.structured_content.expect("error")["error"]["code"],
             json!("d1.invalid_manifest_target_identity")
         );
-
         let root = d1_migration_test_dir("d1-manifest-lease-replacement");
         #[cfg(unix)]
         {

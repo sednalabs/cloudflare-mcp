@@ -99,7 +99,21 @@ fn d1_lease_file_identity(path: &Path) -> Option<D1LeaseFileIdentity> {
 }
 
 fn d1_remove_owned_lease_file(path: &Path, expected: &D1LeaseFileIdentity) -> bool {
-    d1_lease_file_identity(path).as_ref() == Some(expected) && fs::remove_file(path).is_ok()
+    d1_lease_file_identity(path).as_ref() == Some(expected)
+        && fs::remove_file(path).is_ok()
+        && path
+            .parent()
+            .is_some_and(|parent| sync_d1_lease_parent_directory(parent).is_ok())
+}
+
+#[cfg(unix)]
+fn sync_d1_lease_parent_directory(root: &Path) -> std::io::Result<()> {
+    fs::File::open(root)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_d1_lease_parent_directory(_: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -309,6 +323,18 @@ pub(crate) fn acquire_d1_migration_lease_at(
                     "lease": identity,
                     "operator_handoff": "Reconcile the named lease owner identity before any subsequent apply.",
                     "error": {"code": "d1.migration_lease_write_failed", "message": "migration lease payload could not be durably written", "hint": "Reconcile the lease identity if cleanup was incomplete before another apply."},
+                })));
+            }
+            if sync_d1_lease_parent_directory(&root).is_err() {
+                let cleanup = d1_remove_owned_lease_file(&path, &created_file_identity);
+                return Err(CallToolResult::structured_error(json!({
+                    "ok": false,
+                    "operation": "d1_apply_migration_manifest",
+                    "status": "reconciliation_required",
+                    "lease_retained": !cleanup,
+                    "lease": identity,
+                    "operator_handoff": "Reconcile the named lease owner identity before any subsequent apply.",
+                    "error": {"code": "d1.migration_lease_parent_sync_failed", "message": "new lease entry was written but its parent directory could not be durably synchronized", "hint": "Reconcile the lease identity if cleanup was incomplete before another apply."},
                 })));
             }
             let file_identity = match d1_lease_file_identity(&path) {

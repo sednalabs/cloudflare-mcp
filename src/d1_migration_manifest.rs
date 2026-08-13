@@ -67,11 +67,16 @@ pub(crate) fn normalize_d1_manifest_target(
 ) -> Result<D1ManifestTarget, CallToolResult> {
     fn normalize(label: &'static str, value: &str) -> Result<String, CallToolResult> {
         let trimmed = value.trim();
-        if trimmed.is_empty() || trimmed != value || trimmed.len() > 256 || trimmed.contains('\0') {
+        if trimmed.is_empty()
+            || trimmed != value
+            || matches!(trimmed, "." | "..")
+            || trimmed.len() > 256
+            || trimmed.contains('\0')
+        {
             return Err(invalid_argument_result(
                 "d1.invalid_manifest_target_identity",
                 format!(
-                    "{label} must be a non-empty canonical identifier without surrounding whitespace"
+                    "{label} must be a non-empty canonical identifier, not a dot path segment, and without surrounding whitespace"
                 ),
                 "Use the exact account_id and database_id read from the intended Cloudflare resource.",
             ));
