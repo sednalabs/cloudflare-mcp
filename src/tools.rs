@@ -4811,7 +4811,7 @@ impl CloudflareMcp {
 
     #[tool(
         name = "pages_deploy_directory",
-        description = "Inspect and direct-upload a local Pages output directory, including static assets, advanced-mode _worker.js, and Wrangler-built Pages Functions _worker.bundle payloads, as a Cloudflare Pages deployment."
+        description = "Inspect and direct-upload a local Pages output directory, including static assets, advanced-mode _worker.js files or single-module _worker.js/index.js directories, and Wrangler-built Pages Functions _worker.bundle payloads, as a Cloudflare Pages deployment."
     )]
     async fn cloudflare_pages_deploy_directory(
         &self,
