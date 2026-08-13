@@ -85,12 +85,17 @@ bound to the exact SQL bytes and current Wrangler ledger prefix. A live call
 must submit that value as `approved_plan_sha256` and configure
 `CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT` to a pre-created, operator-owned,
 non-group/world-writable directory shared by every MCP process that can target
-the database. The manifest tool never reopens a directory after review and
-never retries an ambiguous provider write. An unknown outcome retains the
-target lease: reconcile provider ledger evidence before clearing it and begin
-again with a fresh dry run. This is an atomic shared-filesystem lease, not a
-Cloudflare-distributed lock; separate provider/distributed coordination remains
-required when MCP instances do not share that lease root.
+the database. On Unix the root must be an absolute real directory owned by the
+current operator with mode `0700` (or stricter); its lease entries are created
+with mode `0600`. Do not use a shared writable directory or manually remove a
+lease by pathname: terminal errors report the target hash, nonce and payload
+hash needed to reconcile the specific owner safely. The manifest tool never
+reopens a directory after review and never retries an ambiguous provider write.
+An unknown outcome retains the target lease: reconcile provider ledger evidence
+and the reported lease identity before clearing it and begin again with a fresh
+dry run. This is an atomic shared-filesystem lease, not a Cloudflare-distributed
+lock; separate provider/distributed coordination remains required when MCP
+instances do not share that lease root.
 
 For CI-built release bundles, the `Rust Validation` workflow uploads a
 downloadable artifact named `cloudflare-mcp-linux-x86_64-stdio-<git-sha>` that
