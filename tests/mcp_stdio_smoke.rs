@@ -3584,9 +3584,14 @@ fn d1_apply_migration_manifest_ambiguous_inner_result_shapes_retain_lease_withou
             "{label}"
         );
         assert_eq!(
-            content["error"]["cause"]["detail"]["classification"],
+            content["error"]["cause"]["classification"],
             json!(classification),
             "{label}"
+        );
+        assert!(
+            content["error"]["cause"].get("detail").is_none()
+                && content["error"]["cause"].get("hint").is_none(),
+            "{label} must not expose raw provider detail or inherited guidance"
         );
         assert!(
             content["applied_migrations"]

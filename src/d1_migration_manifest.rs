@@ -365,7 +365,26 @@ fn d1_manifest_ambiguous_write_evidence(
 mod tests {
     use serde_json::json;
 
-    use super::{parse_d1_migration_ledger, validate_d1_manifest_write_result};
+    use super::{
+        d1_manifest_write_result_classification, parse_d1_migration_ledger,
+        validate_d1_manifest_write_result,
+    };
+
+    #[test]
+    fn manifest_write_result_classification_is_closed() {
+        for value in [
+            "missing_or_non_array_result",
+            "empty_result_set_sequence",
+            "malformed_result_set",
+            "inner_statement_failure_or_missing_success",
+            "inner_statement_error",
+            "malformed_inner_errors",
+            "missing_or_malformed_inner_results",
+        ] {
+            assert_eq!(d1_manifest_write_result_classification(value), Some(value));
+        }
+        assert_eq!(d1_manifest_write_result_classification("retry_now"), None);
+    }
 
     #[test]
     fn manifest_write_result_requires_non_empty_complete_successful_inner_results() {
@@ -757,14 +776,15 @@ pub(crate) fn d1_manifest_reconciliation_required_result(
 fn d1_manifest_nonretryable_cause(error: Value) -> Value {
     let mut cause = Map::new();
     let detail = error.get("detail").and_then(Value::as_object);
-
-    if let Some(kind) = error.get("kind").and_then(Value::as_str).filter(|value| {
+    let kind = error.get("kind").and_then(Value::as_str).filter(|value| {
         !value.is_empty()
             && value.len() <= 64
             && value
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-    }) {
+    });
+
+    if let Some(kind) = kind {
         cause.insert("kind".to_string(), Value::String(kind.to_string()));
     }
     if let Some(code) = detail
@@ -806,12 +826,42 @@ fn d1_manifest_nonretryable_cause(error: Value) -> Value {
             Value::String(correlation_id.to_string()),
         );
     }
+    if kind == Some("provider_result") {
+        if let Some(classification) = detail
+            .and_then(|detail| detail.get("classification"))
+            .and_then(Value::as_str)
+            .and_then(d1_manifest_write_result_classification)
+        {
+            cause.insert(
+                "classification".to_string(),
+                Value::String(classification.to_string()),
+            );
+        }
+    }
     cause.insert("retryable".to_string(), Value::Bool(false));
     cause.insert(
         "operator_guidance".to_string(),
         Value::String("reconciliation_only".to_string()),
     );
     Value::Object(cause)
+}
+
+/// Only classifications produced by `validate_d1_manifest_write_result` may
+/// cross the provider-result boundary. This keeps the diagnostic finite while
+/// preventing arbitrary nested provider detail from becoming operator guidance.
+fn d1_manifest_write_result_classification(value: &str) -> Option<&'static str> {
+    match value {
+        "missing_or_non_array_result" => Some("missing_or_non_array_result"),
+        "empty_result_set_sequence" => Some("empty_result_set_sequence"),
+        "malformed_result_set" => Some("malformed_result_set"),
+        "inner_statement_failure_or_missing_success" => {
+            Some("inner_statement_failure_or_missing_success")
+        }
+        "inner_statement_error" => Some("inner_statement_error"),
+        "malformed_inner_errors" => Some("malformed_inner_errors"),
+        "missing_or_malformed_inner_results" => Some("missing_or_malformed_inner_results"),
+        _ => None,
+    }
 }
 
 pub(crate) fn d1_manifest_contextualize_failure(
