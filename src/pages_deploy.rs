@@ -408,10 +408,94 @@ fn inspect_special_files(root: &Path) -> Result<PagesSpecialFiles, PagesDirector
         headers: inspect_special_file(root, "_headers", "_headers")?,
         redirects: inspect_special_file(root, "_redirects", "_redirects")?,
         routes: inspect_special_file(root, "_routes.json", "_routes.json")?,
-        worker: inspect_special_file(root, "_worker.js", "_worker.js")?,
+        worker: inspect_worker_special_file(root)?,
         worker_bundle: inspect_special_file(root, "_worker.bundle", "_worker.bundle")?,
         functions_filepath_routing_config: None,
     })
+}
+
+fn inspect_worker_special_file(
+    root: &Path,
+) -> Result<Option<PagesSpecialFile>, PagesDirectoryError> {
+    let worker_path = root.join("_worker.js");
+    let metadata = match fs::symlink_metadata(&worker_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(PagesDirectoryError::new(
+                "pages.directory_read_failed",
+                format!("failed reading _worker.js metadata: {err}"),
+                "Check the Pages deployment directory permissions and retry.",
+            ));
+        }
+    };
+
+    if metadata.is_file() && !metadata.file_type().is_symlink() {
+        return inspect_existing_special_file(worker_path, "_worker.js", "_worker.js");
+    }
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(None);
+    }
+
+    let entries = fs::read_dir(&worker_path).map_err(|err| {
+        PagesDirectoryError::new(
+            "pages.directory_read_failed",
+            format!("failed reading _worker.js directory: {err}"),
+            "Check the Pages deployment directory permissions and retry.",
+        )
+    })?;
+    let mut entry_names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| {
+            PagesDirectoryError::new(
+                "pages.directory_read_failed",
+                format!("failed reading _worker.js directory entry: {err}"),
+                "Check the Pages deployment directory permissions and retry.",
+            )
+        })?;
+        entry_names.push(entry.file_name());
+    }
+
+    if entry_names.len() != 1 || entry_names[0] != OsString::from("index.js") {
+        return Err(PagesDirectoryError::new(
+            "pages.worker_directory_unsupported_shape",
+            "_worker.js is a directory, but it is not the supported single-module _worker.js/index.js artifact",
+            "Provide a _worker.js directory containing only a regular index.js file, or use Wrangler to upload a multi-module advanced-mode Worker.",
+        ));
+    }
+
+    let index_path = worker_path.join("index.js");
+    let index_metadata = fs::symlink_metadata(&index_path).map_err(|err| {
+        PagesDirectoryError::new(
+            "pages.directory_read_failed",
+            format!("failed reading _worker.js/index.js metadata: {err}"),
+            "Check the Pages deployment directory permissions and retry.",
+        )
+    })?;
+    if index_metadata.file_type().is_symlink() || !index_metadata.is_file() {
+        return Err(PagesDirectoryError::new(
+            "pages.worker_directory_unsupported_shape",
+            "_worker.js/index.js must be a regular file",
+            "Replace the symlink or special entry with a regular index.js file before deploying.",
+        ));
+    }
+    if index_metadata.len() > MAX_PAGES_ASSET_BYTES {
+        return Err(PagesDirectoryError::new(
+            "pages.asset_too_large",
+            format!(
+                "_worker.js/index.js is {} bytes, above Cloudflare's 25 MiB direct-upload limit",
+                index_metadata.len()
+            ),
+            "Shorten the advanced-mode Worker before deploying this directory.",
+        ));
+    }
+
+    Ok(Some(PagesSpecialFile {
+        form_name: "_worker.js",
+        file_name: "_worker.js",
+        path: index_path,
+        size_bytes: index_metadata.len(),
+    }))
 }
 
 fn inspect_special_file(
@@ -847,7 +931,7 @@ fn should_ignore_directory(relative: &Path) -> bool {
         .map(|component| {
             matches!(
                 component,
-                ".git" | "node_modules" | ".wrangler" | "functions"
+                ".git" | "node_modules" | ".wrangler" | "functions" | "_worker.js"
             )
         })
         .unwrap_or(false)
@@ -1017,6 +1101,39 @@ test -z "$config" || printf '%s' '{"routes":[{"routePath":"/api/ping","mountPath
         assert!(!package.manifest.contains_key("/_worker.js"));
 
         fs::remove_dir_all(root).expect("cleanup temp pages dir");
+    }
+
+    #[test]
+    fn inspect_pages_directory_accepts_single_module_worker_directory_as_special_file() {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pages-single-module-worker");
+
+        let package = inspect_pages_directory(root.to_str().unwrap(), 20).expect("inspect pages");
+
+        assert_eq!(package.assets.len(), 2);
+        assert_eq!(package.assets[0].relative_path, "assets/app.css");
+        assert_eq!(package.assets[1].relative_path, "index.html");
+        assert_eq!(
+            package
+                .special_files
+                .worker
+                .as_ref()
+                .map(|worker| worker.path.as_path()),
+            Some(root.join("_worker.js/index.js").as_path())
+        );
+        assert!(package.special_files.routes.is_some());
+        assert!(!package.manifest.contains_key("/_worker.js/index.js"));
+    }
+
+    #[test]
+    fn inspect_pages_directory_rejects_multi_module_worker_directory() {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pages-multi-module-worker");
+
+        let error = inspect_pages_directory(root.to_str().unwrap(), 20).expect_err("reject");
+
+        assert_eq!(error.code, "pages.worker_directory_unsupported_shape");
+        assert!(error.message.contains("single-module"));
     }
 
     #[test]
