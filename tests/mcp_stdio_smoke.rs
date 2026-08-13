@@ -3370,6 +3370,26 @@ fn d1_apply_migration_manifest_response_loss_stops_without_retry_and_retains_lea
         content["error"]["code"],
         json!("d1.migration_apply_outcome_unknown")
     );
+    assert_eq!(
+        content["error"]["cause"]["kind"],
+        json!("transport"),
+        "the provider category remains available for diagnosis"
+    );
+    assert_eq!(
+        content["error"]["cause"]["code"],
+        json!("cloudflare.http_server_error")
+    );
+    assert_eq!(content["error"]["cause"]["status"], json!(503));
+    assert_eq!(content["error"]["cause"]["retryable"], json!(false));
+    assert_eq!(
+        content["error"]["cause"]["operator_guidance"],
+        json!("reconciliation_only")
+    );
+    assert!(
+        content["error"]["cause"].get("hint").is_none()
+            && content["error"]["cause"].get("classification").is_none(),
+        "nested provider guidance must not advise retry after the non-idempotent write"
+    );
     assert_eq!(content["lease_retained"], json!(true));
     assert_eq!(content["outcome"], json!("unknown"));
     assert_eq!(
@@ -3383,10 +3403,21 @@ fn d1_apply_migration_manifest_response_loss_stops_without_retry_and_retains_lea
     );
     assert!(content["plan"]["steps"].is_array());
     assert!(content["audit"]["target"]["target_key_sha256"].is_string());
+    let observed = requests.lock().expect("requests lock").clone();
     assert_eq!(
-        requests.lock().expect("requests lock").len(),
+        observed.len(),
         6,
         "dry, stable re-read, one apply, stable reconciliation reads; no retry"
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|request| request["sql"]
+                .as_str()
+                .is_some_and(|sql| sql.contains("INSERT INTO \"d1_migrations\"")))
+            .count(),
+        1,
+        "a retryable HTTP status after a non-idempotent write must not issue a second write"
     );
     assert!(
         fs::read_dir(&lease_root)

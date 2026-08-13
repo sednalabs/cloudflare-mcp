@@ -6,7 +6,7 @@
 
 use rmcp::model::CallToolResult;
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
 
 use crate::d1_migration_lease::D1MigrationLease;
@@ -746,8 +746,72 @@ pub(crate) fn d1_manifest_reconciliation_required_result(
         "lease_retained": true,
         "lease": lease.identity,
         "operator_handoff": "Reconcile the named provider ledger and this lease owner identity before any subsequent apply. Do not replay a migration from this response.",
-        "error": {"code": "d1.migration_apply_outcome_unknown", "message": "provider response after a migration apply was ambiguous; no retry or later migration was attempted", "hint": "Reconcile provider evidence and the exact ledger before clearing the retained target lease.", "cause": error},
+        "error": {"code": "d1.migration_apply_outcome_unknown", "message": "provider response after a migration apply was ambiguous; no retry or later migration was attempted", "hint": "Reconcile provider evidence and the exact ledger before clearing the retained target lease.", "cause": d1_manifest_nonretryable_cause(error)},
     }))
+}
+
+/// A provider result can be diagnostically useful while still being unsafe to
+/// expose verbatim at this boundary. In particular, a retryable HTTP response
+/// after a non-idempotent write must not leak an instruction that contradicts
+/// the manifest state machine's reconciliation-only rule.
+fn d1_manifest_nonretryable_cause(error: Value) -> Value {
+    let mut cause = Map::new();
+    let detail = error.get("detail").and_then(Value::as_object);
+
+    if let Some(kind) = error.get("kind").and_then(Value::as_str).filter(|value| {
+        !value.is_empty()
+            && value.len() <= 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    }) {
+        cause.insert("kind".to_string(), Value::String(kind.to_string()));
+    }
+    if let Some(code) = detail
+        .and_then(|detail| detail.get("code"))
+        .or_else(|| error.get("code"))
+        .and_then(Value::as_str)
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':')
+                })
+        })
+    {
+        cause.insert("code".to_string(), Value::String(code.to_string()));
+    }
+    if let Some(status) = detail
+        .and_then(|detail| detail.get("status"))
+        .or_else(|| error.get("status"))
+        .and_then(Value::as_u64)
+        .filter(|status| (100..=599).contains(status))
+    {
+        cause.insert("status".to_string(), json!(status));
+    }
+    if let Some(correlation_id) = detail
+        .and_then(|detail| detail.get("correlation_id"))
+        .or_else(|| error.get("correlation_id"))
+        .and_then(Value::as_str)
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 256
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_graphic() && byte != b'"' && byte != b'\\')
+        })
+    {
+        cause.insert(
+            "correlation_id".to_string(),
+            Value::String(correlation_id.to_string()),
+        );
+    }
+    cause.insert("retryable".to_string(), Value::Bool(false));
+    cause.insert(
+        "operator_guidance".to_string(),
+        Value::String("reconciliation_only".to_string()),
+    );
+    Value::Object(cause)
 }
 
 pub(crate) fn d1_manifest_contextualize_failure(
