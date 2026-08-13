@@ -561,6 +561,16 @@ pub const TOOL_DISCOVERY: &[ToolDiscoveryEntry] = &[
         ],
     },
     ToolDiscoveryEntry {
+        name: "d1_apply_migration_manifest",
+        group: "d1",
+        read_only: false,
+        description: "Apply an exact-byte D1 migration manifest under an approved plan and shared target lease.",
+        keywords: &[
+            "d1", "database", "migration", "manifest", "sql", "apply", "lease", "wrangler",
+            "exact", "reconcile", "mutate",
+        ],
+    },
+    ToolDiscoveryEntry {
         name: "analytics_engine_query",
         group: "analytics_engine",
         read_only: true,

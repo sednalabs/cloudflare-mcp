@@ -77,6 +77,21 @@ release artifact bundle so agents can compare:
 - schema snapshot hash versus `spec/tool_schema_snapshot.v1.json`,
 - `/proc/<pid>/exe` hash for any already-running stdio process.
 
+## Exact-byte D1 migration manifests
+
+Use `d1_apply_migration_manifest` for an approval-gated D1 migration family.
+First run it with `dry_run=true`; retain the returned `plan_sha256`, which is
+bound to the exact SQL bytes and current Wrangler ledger prefix. A live call
+must submit that value as `approved_plan_sha256` and configure
+`CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT` to a pre-created, operator-owned,
+non-group/world-writable directory shared by every MCP process that can target
+the database. The manifest tool never reopens a directory after review and
+never retries an ambiguous provider write. An unknown outcome retains the
+target lease: reconcile provider ledger evidence before clearing it and begin
+again with a fresh dry run. This is an atomic shared-filesystem lease, not a
+Cloudflare-distributed lock; separate provider/distributed coordination remains
+required when MCP instances do not share that lease root.
+
 For CI-built release bundles, the `Rust Validation` workflow uploads a
 downloadable artifact named `cloudflare-mcp-linux-x86_64-stdio-<git-sha>` that
 contains:

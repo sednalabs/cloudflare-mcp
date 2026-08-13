@@ -1502,6 +1502,89 @@
       "name": "d1_apply_migrations"
     },
     {
+      "description": "Apply a caller-supplied exact-byte D1 migration manifest under a target lease and approved dry-run plan.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "approved_plan_sha256": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "database_id": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "manifest": {
+            "items": {
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "size_bytes": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "sql": {
+                  "type": "string"
+                },
+                "sql_sha256": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "name",
+                "size_bytes",
+                "sql_sha256",
+                "sql"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "max_rows": {
+            "default": null,
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "migration_family": {
+            "type": "string"
+          },
+          "migrations_table": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "database_id",
+          "migration_family",
+          "manifest"
+        ],
+        "type": "object"
+      },
+      "name": "d1_apply_migration_manifest"
+    },
+    {
       "description": "Delete a Cloudflare D1 database through the curated high-risk endpoint. Dry-run emits a required confirmation token.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
