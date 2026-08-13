@@ -504,7 +504,7 @@ fn spawn_fake_manifest_malformed_ledger_api(result_set: Value) -> (String, Arc<M
 }
 
 fn spawn_fake_manifest_outer_error_api(
-    outer_errors: Value,
+    outer_errors: Option<Value>,
     error_on_write: bool,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind outer-error manifest D1 API");
@@ -544,12 +544,21 @@ fn spawn_fake_manifest_outer_error_api(
                     "results": [{"id": 1, "name": "0001_initial.sql"}],
                 })]
             };
-            let response = serde_json::to_vec(&json!({
-                "success": true,
-                "errors": if has_outer_error { outer_errors.clone() } else { json!([]) },
-                "messages": [],
-                "result": result,
-            }))
+            let mut envelope = serde_json::Map::new();
+            envelope.insert("success".to_string(), json!(true));
+            if !has_outer_error || outer_errors.is_some() {
+                envelope.insert(
+                    "errors".to_string(),
+                    if has_outer_error {
+                        outer_errors.clone().expect("outer error field present")
+                    } else {
+                        json!([])
+                    },
+                );
+            }
+            envelope.insert("messages".to_string(), json!([]));
+            envelope.insert("result".to_string(), Value::Array(result));
+            let response = serde_json::to_vec(&Value::Object(envelope))
             .expect("serialize outer-error manifest response");
             write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write outer-error manifest headers");
             stream
@@ -3047,9 +3056,14 @@ fn d1_apply_migration_manifest_outer_ledger_errors_release_pre_write_lease() {
     for (index, (label, outer_errors)) in [
         (
             "contradictory",
-            json!([{"code": 1, "message": "contradictory"}]),
+            Some(json!([{"code": 1, "message": "contradictory"}])),
         ),
-        ("malformed", json!({"code": 1, "message": "malformed"})),
+        (
+            "malformed",
+            Some(json!({"code": 1, "message": "malformed"})),
+        ),
+        ("omitted", None),
+        ("null", Some(Value::Null)),
     ]
     .into_iter()
     .enumerate()
@@ -3131,9 +3145,14 @@ fn d1_apply_migration_manifest_outer_write_errors_remain_unknown_and_retain_leas
     for (index, (label, outer_errors)) in [
         (
             "contradictory",
-            json!([{"code": 1, "message": "contradictory"}]),
+            Some(json!([{"code": 1, "message": "contradictory"}])),
         ),
-        ("malformed", json!({"code": 1, "message": "malformed"})),
+        (
+            "malformed",
+            Some(json!({"code": 1, "message": "malformed"})),
+        ),
+        ("omitted", None),
+        ("null", Some(Value::Null)),
     ]
     .into_iter()
     .enumerate()
