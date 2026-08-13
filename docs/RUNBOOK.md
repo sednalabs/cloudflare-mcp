@@ -95,9 +95,12 @@ reconcile the specific owner safely. The manifest tool never
 reopens a directory after review and never retries an ambiguous provider write.
 An unknown outcome retains the target lease: reconcile provider ledger evidence
 and the reported lease identity before clearing it and begin again with a fresh
-dry run. This is an atomic shared-filesystem lease, not a Cloudflare-distributed
-lock; separate provider/distributed coordination remains required when MCP
-instances do not share that lease root.
+dry run. A matching ledger filename is only an observation: it does not attest
+to the reviewed SQL bytes or complete provider transaction, and therefore never
+authorizes lease release after an ambiguous apply. This is an atomic
+shared-filesystem lease, not a Cloudflare-distributed lock; separate
+provider/distributed coordination remains required when MCP instances do not
+share that lease root.
 
 For CI-built release bundles, the `Rust Validation` workflow uploads a
 downloadable artifact named `cloudflare-mcp-linux-x86_64-stdio-<git-sha>` that

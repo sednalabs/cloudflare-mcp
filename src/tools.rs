@@ -4565,6 +4565,37 @@ impl CloudflareMcp {
             Err(result) => return Ok(result),
         };
         let max_rows = max_rows.unwrap_or(100).clamp(1, 1000);
+        let mutation_target = json!({
+            "target_key_sha256": sha256_bytes_hex(
+                format!("{account_id}\0{database_id}").as_bytes()
+            ),
+            "migration_family": family,
+            "migrations_table": migrations_table,
+            "manifest": d1_manifest_summaries(&manifest),
+        });
+        let mut mutation_plan = MutationPlan::new("d1_apply_migration_manifest")
+            .step("validate_exact_manifest", false, mutation_target.clone())
+            .step(
+                "read_stable_migration_ledger",
+                false,
+                mutation_target.clone(),
+            );
+        let audit = MutationAuditSession::start(
+            None,
+            "d1_apply_migration_manifest",
+            mutation_target,
+            dry_run,
+        );
+        macro_rules! finish_manifest {
+            ($base:expr) => {{
+                return Ok(finalize_mutation_result(
+                    $base,
+                    &mutation_plan,
+                    audit,
+                    dry_run,
+                ));
+            }};
+        }
 
         if dry_run {
             let ledger = match self
@@ -4579,10 +4610,10 @@ impl CloudflareMcp {
             {
                 Ok(value) => match parse_d1_migration_ledger(&value) {
                     Ok(ledger) => ledger,
-                    Err(result) => return Ok(result),
+                    Err(result) => finish_manifest!(result),
                 },
                 Err(err) => {
-                    return Ok(d1_manifest_unknown_ledger_result(
+                    finish_manifest!(d1_manifest_unknown_ledger_result(
                         account_id,
                         &args.database_id,
                         &family,
@@ -4594,7 +4625,7 @@ impl CloudflareMcp {
             };
             let classification = match classify_d1_manifest_ledger(&manifest, &ledger) {
                 Ok(classification) => classification,
-                Err(result) => return Ok(result),
+                Err(result) => finish_manifest!(result),
             };
             let plan_sha256 = d1_manifest_plan_sha256(
                 account_id,
@@ -4604,7 +4635,7 @@ impl CloudflareMcp {
                 &manifest,
                 &ledger,
             );
-            return Ok(CallToolResult::structured(json!({
+            finish_manifest!(CallToolResult::structured(json!({
                 "ok": true,
                 "operation": "d1_apply_migration_manifest",
                 "dry_run": true,
@@ -4630,7 +4661,7 @@ impl CloudflareMcp {
             args.approved_plan_sha256.as_deref(),
         ) {
             Ok(lease) => lease,
-            Err(result) => return Ok(result),
+            Err(result) => finish_manifest!(result),
         };
 
         let ledger = match read_stable_d1_migration_ledger(
@@ -4645,7 +4676,7 @@ impl CloudflareMcp {
             Err(result) => {
                 // No migration SQL was attempted; release the owned lease after the
                 // failed read and return complete reconciliation context.
-                return Ok(match lease.release() {
+                finish_manifest!(match lease.release() {
                     Ok(()) => d1_manifest_contextualize_failure(
                         result,
                         account_id,
@@ -4685,7 +4716,7 @@ impl CloudflareMcp {
             Ok(classification) => classification,
             Err(result) => {
                 if let Err(release) = lease.release() {
-                    return Ok(d1_manifest_contextualize_failure(
+                    finish_manifest!(d1_manifest_contextualize_failure(
                         release,
                         account_id,
                         database_id,
@@ -4702,7 +4733,7 @@ impl CloudflareMcp {
                         true,
                     ));
                 }
-                return Ok(d1_manifest_contextualize_failure(
+                finish_manifest!(d1_manifest_contextualize_failure(
                     result,
                     account_id,
                     database_id,
@@ -4728,9 +4759,28 @@ impl CloudflareMcp {
             &manifest,
             &ledger,
         );
+        mutation_plan = mutation_plan
+            .step(
+                "bind_exact_reviewed_plan",
+                false,
+                json!({
+                    "supplied_plan_sha256": args.approved_plan_sha256,
+                    "computed_plan_sha256": plan_sha256,
+                }),
+            )
+            .step(
+                "apply_pending_migration_statements",
+                true,
+                json!({"pending_migrations": d1_manifest_summaries(&classification.pending)}),
+            )
+            .step(
+                "readback_complete_migration_ledger",
+                false,
+                json!({"computed_plan_sha256": plan_sha256}),
+            );
         if !approved_d1_plan_digest_matches(args.approved_plan_sha256.as_deref(), &plan_sha256) {
             if let Err(release) = lease.release() {
-                return Ok(d1_manifest_contextualize_failure(
+                finish_manifest!(d1_manifest_contextualize_failure(
                     release,
                     account_id,
                     database_id,
@@ -4747,7 +4797,7 @@ impl CloudflareMcp {
                     true,
                 ));
             }
-            return Ok(d1_manifest_contextualize_failure(
+            finish_manifest!(d1_manifest_contextualize_failure(
                 d1_manifest_plan_mismatch_result(
                     account_id,
                     database_id,
@@ -4805,66 +4855,13 @@ impl CloudflareMcp {
                     )
                     .await
                     .ok();
-                    if let Some(observed) = reconciliation.as_ref() {
-                        if classify_d1_manifest_ledger(&manifest, &observed).is_ok()
-                            && observed.iter().any(|row| row.name == migration.name)
-                        {
-                            applied.push(json!({
-                                "name": &migration.name,
-                                "size_bytes": migration.size_bytes,
-                                "sql_sha256": &migration.sql_sha256,
-                                "outcome": "reconciled_committed_after_ambiguous_response",
-                            }));
-                            // Do not proceed to another migration after an ambiguous response.
-                            // The caller must start a new dry-run/apply cycle from this evidence.
-                            if let Err(result) = lease.release() {
-                                return Ok(d1_manifest_contextualize_failure(
-                                    result,
-                                    account_id,
-                                    database_id,
-                                    &family,
-                                    &migrations_table,
-                                    &manifest,
-                                    D1ManifestReconciliationEvidence::new(
-                                        args.approved_plan_sha256.as_deref(),
-                                        Some(&plan_sha256),
-                                        Some(&observed),
-                                        false,
-                                    ),
-                                    &lease,
-                                    true,
-                                ));
-                            }
-                            return Ok(CallToolResult::structured_error(json!({
-                                "ok": false,
-                                "operation": "d1_apply_migration_manifest",
-                                "status": "reconciliation_required",
-                                "account_id": account_id,
-                                "database_id": &args.database_id,
-                                "migration_family": family,
-                                "migrations_table": migrations_table,
-                                "supplied_plan_sha256": args.approved_plan_sha256,
-                                "computed_plan_sha256": plan_sha256,
-                                "applied_migrations": applied,
-                                "ledger": d1_ledger_summaries(observed),
-                                "ledger_evidence": {"state": "known", "ledger": d1_ledger_summaries(observed)},
-                                "unknown_ledger": false,
-                                "lease_retained": false,
-                                "error": {
-                                    "code": "d1.migration_response_ambiguous_reconciled",
-                                    "message": "provider response was ambiguous; stable ledger readback proves this migration committed. No later migration was attempted.",
-                                    "hint": "Run a new dry-run and obtain a new explicit plan approval before continuing.",
-                                    "cause": err.payload(),
-                                },
-                            })));
-                        }
-                    }
                     let payload = d1_manifest_reconciliation_required_result(
                         account_id,
                         &args.database_id,
                         &family,
                         &migrations_table,
                         &manifest,
+                        args.approved_plan_sha256.as_deref(),
                         &plan_sha256,
                         migration,
                         &applied,
@@ -4877,7 +4874,7 @@ impl CloudflareMcp {
                     // another process from re-entering the target before an operator
                     // reconciles provider evidence and deliberately clears the stale lease.
                     lease.retain();
-                    return Ok(payload);
+                    finish_manifest!(payload);
                 }
             }
         }
@@ -4893,7 +4890,7 @@ impl CloudflareMcp {
             Ok(ledger) => ledger,
             Err(result) => {
                 lease.retain();
-                return Ok(d1_manifest_contextualize_failure(
+                finish_manifest!(d1_manifest_contextualize_failure(
                     result,
                     account_id,
                     database_id,
@@ -4915,7 +4912,7 @@ impl CloudflareMcp {
             Ok(classification) => classification,
             Err(result) => {
                 lease.retain();
-                return Ok(d1_manifest_contextualize_failure(
+                finish_manifest!(d1_manifest_contextualize_failure(
                     result,
                     account_id,
                     database_id,
@@ -4935,7 +4932,7 @@ impl CloudflareMcp {
         };
         if !final_classification.pending.is_empty() {
             lease.retain();
-            return Ok(CallToolResult::structured_error(json!({
+            finish_manifest!(CallToolResult::structured_error(json!({
                 "ok": false,
                 "operation": "d1_apply_migration_manifest",
                 "status": "reconciliation_required",
@@ -4960,7 +4957,7 @@ impl CloudflareMcp {
             })));
         }
         if let Err(result) = lease.release() {
-            return Ok(d1_manifest_contextualize_failure(
+            finish_manifest!(d1_manifest_contextualize_failure(
                 result,
                 account_id,
                 database_id,
@@ -4977,23 +4974,28 @@ impl CloudflareMcp {
                 true,
             ));
         }
-        Ok(CallToolResult::structured(json!({
-            "ok": true,
-            "operation": "d1_apply_migration_manifest",
-            "status": "applied",
-            "account_id": account_id,
-            "database_id": &args.database_id,
-            "migration_family": family,
-            "migrations_table": migrations_table,
-            "supplied_plan_sha256": args.approved_plan_sha256,
-            "computed_plan_sha256": plan_sha256,
-            "manifest": d1_manifest_summaries(&manifest),
-            "ledger": d1_ledger_summaries(&final_ledger),
-            "applied_migrations": applied,
-            "lease": d1_migration_lease_requirements(account_id, &args.database_id, &family),
-            "cross_process_serialization": "shared_operator_lease_root",
-            "cross_host_limitation": "The lease serializes only processes and hosts that share the same configured operator-owned lease root. It is not a provider-distributed lease.",
-        })))
+        Ok(finalize_mutation_result(
+            CallToolResult::structured(json!({
+                "ok": true,
+                "operation": "d1_apply_migration_manifest",
+                "status": "applied",
+                "account_id": account_id,
+                "database_id": &args.database_id,
+                "migration_family": family,
+                "migrations_table": migrations_table,
+                "supplied_plan_sha256": args.approved_plan_sha256,
+                "computed_plan_sha256": plan_sha256,
+                "manifest": d1_manifest_summaries(&manifest),
+                "ledger": d1_ledger_summaries(&final_ledger),
+                "applied_migrations": applied,
+                "lease": d1_migration_lease_requirements(account_id, &args.database_id, &family),
+                "cross_process_serialization": "shared_operator_lease_root",
+                "cross_host_limitation": "The lease serializes only processes and hosts that share the same configured operator-owned lease root. It is not a provider-distributed lease.",
+            })),
+            &mutation_plan,
+            audit,
+            dry_run,
+        ))
     }
 
     #[tool(

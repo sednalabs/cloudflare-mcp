@@ -467,12 +467,15 @@ fn spawn_fake_manifest_apply_api() -> (String, Arc<Mutex<Vec<Value>>>) {
     (format!("http://{addr}"), requests)
 }
 
-fn spawn_fake_manifest_ambiguous_api() -> (String, Arc<Mutex<Vec<Value>>>) {
+fn spawn_fake_manifest_ambiguous_api(
+    ledger_names_commit_after_ambiguous_response: bool,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ambiguous manifest D1 API");
     let addr = listener.local_addr().expect("ambiguous manifest D1 addr");
     let requests = Arc::new(Mutex::new(Vec::new()));
     let requests_for_thread = requests.clone();
     thread::spawn(move || {
+        let mut apply_seen = false;
         for stream in listener.incoming().take(6) {
             let mut stream = stream.expect("fake ambiguous manifest D1 stream");
             let (headers, body) = read_http_request(&mut stream);
@@ -484,17 +487,89 @@ fn spawn_fake_manifest_ambiguous_api() -> (String, Arc<Mutex<Vec<Value>>>) {
                 .push(body_json.clone());
             let sql = body_json["sql"].as_str().unwrap_or_default();
             if sql.contains("INSERT INTO \"d1_migrations\"") {
+                apply_seen = ledger_names_commit_after_ambiguous_response;
                 write!(stream, "HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-length: 0\r\n\r\n").expect("write ambiguous response");
                 continue;
             }
             assert_eq!(sql, "SELECT * FROM \"d1_migrations\" ORDER BY id");
+            let ledger = if apply_seen {
+                vec![
+                    json!({"id": 1, "name": "0001_initial.sql"}),
+                    json!({"id": 2, "name": "0002_second.sql"}),
+                ]
+            } else {
+                vec![json!({"id": 1, "name": "0001_initial.sql"})]
+            };
             let response = serde_json::to_vec(&json!({
                 "success": true, "errors": [], "messages": [],
-                "result": [{"success": true, "results": [{"id": 1, "name": "0001_initial.sql"}]}]
+                "result": [{"success": true, "results": ledger}]
             }))
             .expect("serialize response");
             write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write headers");
             stream.write_all(&response).expect("write response");
+        }
+    });
+    (format!("http://{addr}"), requests)
+}
+
+fn spawn_fake_partial_manifest_ambiguous_api() -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").expect("bind partial ambiguous manifest D1 API");
+    let addr = listener
+        .local_addr()
+        .expect("partial ambiguous manifest D1 addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        let mut first_apply_seen = false;
+        let mut ambiguous_second_apply_seen = false;
+        for stream in listener.incoming().take(7) {
+            let mut stream = stream.expect("fake partial ambiguous manifest D1 stream");
+            let (headers, body) = read_http_request(&mut stream);
+            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            let body_json: Value =
+                serde_json::from_slice(&body).expect("partial ambiguous request JSON");
+            requests_for_thread
+                .lock()
+                .expect("request log lock")
+                .push(body_json.clone());
+            let sql = body_json["sql"].as_str().unwrap_or_default();
+            if sql.contains("INSERT INTO \"d1_migrations\" (name) VALUES ('0001_initial.sql')") {
+                first_apply_seen = true;
+                let response = serde_json::to_vec(&json!({
+                    "success": true, "errors": [], "messages": [],
+                    "result": [{"success": true, "results": [{"ok": true}]}]
+                }))
+                .expect("serialize first apply response");
+                write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write first apply headers");
+                stream
+                    .write_all(&response)
+                    .expect("write first apply response");
+                continue;
+            }
+            if sql.contains("INSERT INTO \"d1_migrations\" (name) VALUES ('0002_second.sql')") {
+                ambiguous_second_apply_seen = true;
+                write!(stream, "HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-length: 0\r\n\r\n").expect("write second ambiguous response");
+                continue;
+            }
+            assert_eq!(sql, "SELECT * FROM \"d1_migrations\" ORDER BY id");
+            let ledger = if ambiguous_second_apply_seen {
+                vec![
+                    json!({"id": 1, "name": "0001_initial.sql"}),
+                    json!({"id": 2, "name": "0002_second.sql"}),
+                ]
+            } else if first_apply_seen {
+                vec![json!({"id": 1, "name": "0001_initial.sql"})]
+            } else {
+                Vec::new()
+            };
+            let response = serde_json::to_vec(&json!({
+                "success": true, "errors": [], "messages": [],
+                "result": [{"success": true, "results": ledger}]
+            }))
+            .expect("serialize ledger response");
+            write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write ledger headers");
+            stream.write_all(&response).expect("write ledger response");
         }
     });
     (format!("http://{addr}"), requests)
@@ -2808,7 +2883,7 @@ fn d1_apply_migration_manifest_live_rechecks_plan_and_stably_reads_back_before_r
 
 #[test]
 fn d1_apply_migration_manifest_response_loss_stops_without_retry_and_retains_lease() {
-    let (base_url, requests) = spawn_fake_manifest_ambiguous_api();
+    let (base_url, requests) = spawn_fake_manifest_ambiguous_api(false);
     // Keep this retained-lease fixture under the sticky system temporary root.
     let lease_root = std::path::PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-ambiguous-manifest-lease-{}",
@@ -2858,10 +2933,165 @@ fn d1_apply_migration_manifest_response_loss_stops_without_retry_and_retains_lea
         json!("d1.migration_apply_outcome_unknown")
     );
     assert_eq!(content["lease_retained"], json!(true));
+    assert_eq!(content["outcome"], json!("unknown"));
+    assert_eq!(
+        content["audit"]["action"],
+        json!("d1_apply_migration_manifest")
+    );
+    assert!(content["audit"]["correlation"]["correlation_id"].is_string());
+    assert_eq!(
+        content["plan"]["operation"],
+        json!("d1_apply_migration_manifest")
+    );
+    assert!(content["plan"]["steps"].is_array());
+    assert!(content["audit"]["target"]["target_key_sha256"].is_string());
     assert_eq!(
         requests.lock().expect("requests lock").len(),
         6,
         "dry, stable re-read, one apply, stable reconciliation reads; no retry"
+    );
+    assert!(
+        fs::read_dir(&lease_root)
+            .expect("read retained lease root")
+            .next()
+            .is_some()
+    );
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_apply_migration_manifest_same_name_after_response_loss_stays_unknown_and_retains_lease() {
+    let (base_url, requests) = spawn_fake_manifest_ambiguous_api(true);
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-ambiguous-manifest-same-name-lease-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make lease root private");
+    }
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let first_sql = "CREATE TABLE submissions(id TEXT);";
+    let second_sql = "ALTER TABLE submissions ADD COLUMN status TEXT;";
+    let manifest = json!([
+        {"name": "0001_initial.sql", "size_bytes": first_sql.len(), "sql_sha256": sha256_hex(first_sql), "sql": first_sql},
+        {"name": "0002_second.sql", "size_bytes": second_sql.len(), "sql_sha256": sha256_hex(second_sql), "sql": second_sql}
+    ]);
+    let dry = mcp.call_tool(8, "d1_apply_migration_manifest", json!({
+        "database_id": "db-1", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
+    }));
+    let plan = structured_content(&dry)["plan_sha256"]
+        .as_str()
+        .expect("plan")
+        .to_string();
+    let live = mcp.call_tool(
+        9,
+        "d1_apply_migration_manifest",
+        json!({
+            "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest,
+            "approved_plan_sha256": plan,
+        }),
+    );
+    let content = structured_content(&live);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["status"], json!("reconciliation_required"));
+    assert_eq!(content["outcome"], json!("unknown"));
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.migration_apply_outcome_unknown")
+    );
+    assert_eq!(content["lease_retained"], json!(true));
+    assert_eq!(content["migration"]["name"], json!("0002_second.sql"));
+    assert_eq!(content["ledger_evidence"]["state"], json!("known"));
+    assert!(
+        content["applied_migrations"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    );
+    assert_eq!(
+        requests.lock().expect("requests lock").len(),
+        6,
+        "same-name ledger evidence must neither release the lease nor apply the next statement"
+    );
+    assert!(
+        fs::read_dir(&lease_root)
+            .expect("read retained lease root")
+            .next()
+            .is_some()
+    );
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_apply_migration_manifest_partial_multi_statement_response_loss_stays_unknown() {
+    let (base_url, requests) = spawn_fake_partial_manifest_ambiguous_api();
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-partial-ambiguous-manifest-lease-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make lease root private");
+    }
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let first_sql = "CREATE TABLE submissions(id TEXT);";
+    let second_sql = "ALTER TABLE submissions ADD COLUMN status TEXT;";
+    let manifest = json!([
+        {"name": "0001_initial.sql", "size_bytes": first_sql.len(), "sql_sha256": sha256_hex(first_sql), "sql": first_sql},
+        {"name": "0002_second.sql", "size_bytes": second_sql.len(), "sql_sha256": sha256_hex(second_sql), "sql": second_sql}
+    ]);
+    let dry = mcp.call_tool(10, "d1_apply_migration_manifest", json!({
+        "database_id": "db-1", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
+    }));
+    let plan = structured_content(&dry)["plan_sha256"]
+        .as_str()
+        .expect("plan")
+        .to_string();
+    let live = mcp.call_tool(
+        11,
+        "d1_apply_migration_manifest",
+        json!({
+            "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest,
+            "approved_plan_sha256": plan,
+        }),
+    );
+    let content = structured_content(&live);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["outcome"], json!("unknown"));
+    assert_eq!(content["lease_retained"], json!(true));
+    assert_eq!(content["migration"]["name"], json!("0002_second.sql"));
+    assert_eq!(
+        content["applied_migrations"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        content["applied_migrations"][0]["name"],
+        json!("0001_initial.sql")
+    );
+    assert_eq!(
+        requests.lock().expect("requests lock").len(),
+        7,
+        "first statement may have committed; second ambiguity must stop the batch without any retry"
     );
     assert!(
         fs::read_dir(&lease_root)
