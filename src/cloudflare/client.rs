@@ -225,6 +225,12 @@ impl RetryPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum D1EnvelopePolicy {
+    Generic,
+    RequireEmptyErrors,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct CloudflareEnvelope<T> {
     pub(crate) success: bool,
@@ -461,6 +467,7 @@ impl CloudflareClient {
         self.execute_d1_query(
             "cloudflare.d1.databases.query",
             RetryPolicy::Idempotent,
+            D1EnvelopePolicy::Generic,
             account_id,
             database_id,
             sql,
@@ -516,6 +523,52 @@ impl CloudflareClient {
         self.execute_d1_query(
             "cloudflare.d1.databases.write",
             RetryPolicy::NonIdempotent,
+            D1EnvelopePolicy::Generic,
+            account_id,
+            database_id,
+            sql,
+            params,
+        )
+        .await
+    }
+
+    /// Query a D1 migration ledger without discarding contradictory outer
+    /// Cloudflare-envelope error evidence. This is intentionally narrower than
+    /// the general D1 query surface: manifest application treats every provider
+    /// ambiguity as a reconciliation boundary.
+    pub async fn query_d1_migration_manifest(
+        &self,
+        account_id: &str,
+        database_id: &str,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Value, AdapterError> {
+        self.execute_d1_query(
+            "cloudflare.d1.migration_manifest.query",
+            RetryPolicy::Idempotent,
+            D1EnvelopePolicy::RequireEmptyErrors,
+            account_id,
+            database_id,
+            sql,
+            params,
+        )
+        .await
+    }
+
+    /// Submit one manifest-owned migration statement. The non-idempotent
+    /// transport policy and strict outer-envelope evidence are both required:
+    /// callers must reconcile rather than retry an ambiguous result.
+    pub async fn execute_d1_migration_manifest_write(
+        &self,
+        account_id: &str,
+        database_id: &str,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Value, AdapterError> {
+        self.execute_d1_query(
+            "cloudflare.d1.migration_manifest.write",
+            RetryPolicy::NonIdempotent,
+            D1EnvelopePolicy::RequireEmptyErrors,
             account_id,
             database_id,
             sql,
@@ -528,6 +581,7 @@ impl CloudflareClient {
         &self,
         operation: &'static str,
         retry_policy: RetryPolicy,
+        envelope_policy: D1EnvelopePolicy,
         account_id: &str,
         database_id: &str,
         sql: &str,
@@ -557,6 +611,16 @@ impl CloudflareClient {
                     .json(&Value::Object(body.clone()))
             })
             .await?;
+
+        if matches!(envelope_policy, D1EnvelopePolicy::RequireEmptyErrors)
+            && !envelope.errors.is_empty()
+        {
+            return Err(AdapterError::new(
+                "cloudflare.d1.migration_manifest_contradictory_envelope",
+                "Cloudflare D1 envelope reported success together with non-empty errors",
+                "Treat the manifest operation as ambiguous and reconcile the exact provider ledger before another apply.",
+            ));
+        }
 
         Ok(envelope.result.unwrap_or_else(|| json!(null)))
     }

@@ -632,7 +632,7 @@ pub(crate) async fn read_stable_d1_migration_ledger(
 ) -> Result<Vec<D1ManifestLedgerRow>, CallToolResult> {
     let first = server
         .cloudflare
-        .query_d1_database(
+        .query_d1_migration_manifest(
             account_id,
             database_id,
             &d1_applied_migrations_sql(migrations_table),
@@ -652,7 +652,7 @@ pub(crate) async fn read_stable_d1_migration_ledger(
         .and_then(|value| parse_d1_migration_ledger(&value))?;
     let second = server
         .cloudflare
-        .query_d1_database(
+        .query_d1_migration_manifest(
             account_id,
             database_id,
             &d1_applied_migrations_sql(migrations_table),

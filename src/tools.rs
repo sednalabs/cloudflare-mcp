@@ -4604,7 +4604,7 @@ impl CloudflareMcp {
         if dry_run {
             let ledger = match self
                 .cloudflare
-                .query_d1_database(
+                .query_d1_migration_manifest(
                     account_id,
                     &args.database_id,
                     &d1_applied_migrations_sql(&migrations_table),
@@ -4853,7 +4853,7 @@ impl CloudflareMcp {
                 d1_migration_apply_sql(&migration.sql, &migrations_table, &migration.name);
             let write_result = self
                 .cloudflare
-                .execute_d1_database_write(account_id, &args.database_id, &statement, &[])
+                .execute_d1_migration_manifest_write(account_id, &args.database_id, &statement, &[])
                 .await
                 .map_err(|error| json!({"kind": "transport", "detail": error.payload()}))
                 .and_then(|result| {
