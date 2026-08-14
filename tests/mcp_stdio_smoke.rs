@@ -879,6 +879,10 @@ enum ReconciliationFault {
     None,
     WrongStatementMarker,
     MalformedReadOnlyMetadata,
+    Redirect,
+    MalformedUtf8HttpStatus(u16),
+    MalformedJsonStatus(u16),
+    TruncatedHttpStatus(u16),
     OversizedResponse,
     HttpStatus(u16),
     HttpStatusCustodyDrift(u16, PathBuf),
@@ -1011,6 +1015,40 @@ fn spawn_fake_reconciliation_api_with_fault(
                 .lock()
                 .expect("request log lock")
                 .push(body_json);
+            if matches!(&fault, ReconciliationFault::Redirect) {
+                let response = b"redirect refused";
+                let redirect_location =
+                    format!("http://{}:9/must-not-be-followed", Ipv4Addr::LOCALHOST); // DevSkim: ignore DS137138 -- loopback-only no-follow fixture
+                write!(stream, "HTTP/1.1 302 Found\r\nconnection: close\r\nlocation: {redirect_location}\r\ncontent-type: text/plain\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write reconciliation redirect headers");
+                stream
+                    .write_all(response)
+                    .expect("write reconciliation redirect body");
+                continue;
+            }
+            if let ReconciliationFault::MalformedUtf8HttpStatus(status) = &fault {
+                let response = [0xff, 0xfe];
+                write!(stream, "HTTP/1.1 {status} Synthetic\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write malformed UTF-8 reconciliation headers");
+                stream
+                    .write_all(&response)
+                    .expect("write malformed UTF-8 reconciliation body");
+                continue;
+            }
+            if let ReconciliationFault::MalformedJsonStatus(status) = &fault {
+                let response = b"{";
+                write!(stream, "HTTP/1.1 {status} Synthetic\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write malformed JSON reconciliation headers");
+                stream
+                    .write_all(response)
+                    .expect("write malformed JSON reconciliation body");
+                continue;
+            }
+            if let ReconciliationFault::TruncatedHttpStatus(status) = &fault {
+                let response = b"{";
+                write!(stream, "HTTP/1.1 {status} Synthetic\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 64\r\n\r\n").expect("write truncated reconciliation headers");
+                stream
+                    .write_all(response)
+                    .expect("write truncated reconciliation body");
+                continue;
+            }
             if let ReconciliationFault::HttpStatusCustodyDrift(status, path) = &fault {
                 fs::write(path, b"tampered retained evidence")
                     .expect("tamper retained evidence before provider error");
@@ -1145,6 +1183,10 @@ fn spawn_fake_reconciliation_api_with_fault(
                         json!("CREATE TABLE items(id INTEGER PRIMARY KEY, changed TEXT)");
                 }
                 ReconciliationFault::None
+                | ReconciliationFault::Redirect
+                | ReconciliationFault::MalformedUtf8HttpStatus(_)
+                | ReconciliationFault::MalformedJsonStatus(_)
+                | ReconciliationFault::TruncatedHttpStatus(_)
                 | ReconciliationFault::OversizedResponse
                 | ReconciliationFault::HttpStatus(_)
                 | ReconciliationFault::HttpStatusCustodyDrift(_, _)
@@ -4154,6 +4196,23 @@ fn d1_reconcile_migration_manifest_proves_stable_full_state_without_retry_or_mut
     );
     assert_eq!(content["lease_decision"], json!("retain"));
     assert_eq!(content["provider_calls"], json!(2));
+    assert_eq!(
+        content["provider_read_lifecycle"],
+        json!([
+            {
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 200,
+            },
+            {
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 200,
+            }
+        ])
+    );
     assert_eq!(content["provider_mutations"], json!(0));
     assert_eq!(content["local_namespace_mutations"], json!(0));
     assert!(content["query_sha256"].as_str().is_some());
@@ -4392,6 +4451,136 @@ fn d1_reconcile_migration_manifest_stdio_requires_primary_current_evidence_for_e
 }
 
 #[test]
+fn d1_reconcile_migration_manifest_stdio_reports_pre_dispatch_without_provider_call() {
+    let (manifest, expectations) = one_table_reconciliation_case();
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-reconcile-no-token-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create no-token reconciliation root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make no-token reconciliation root private");
+    }
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&lease_root, &manifest);
+    let (base_url, requests) = spawn_fake_reconciliation_api();
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        ("CLOUDFLARE_MCP_API_TOKEN", String::new()),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let response = mcp.call_tool(
+        738,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest,
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_only_v1",
+            "state_expectations": expectations,
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["capability_state"], json!("capability_gap"));
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.migration_reconciliation_query_capability_gap")
+    );
+    assert_eq!(content["provider_calls"], json!(0), "{content}");
+    assert_eq!(
+        content["provider_read_lifecycle"],
+        json!([{
+            "dispatch_stage": "pre_dispatch",
+            "response_stage": "not_received",
+            "body_stage": "not_read",
+            "http_status": null,
+        }]),
+        "{content}"
+    );
+    assert_eq!(
+        content["response_evidence"].as_array().map(Vec::len),
+        Some(0),
+        "{content}"
+    );
+    assert_eq!(requests.lock().expect("request log").len(), 0);
+    assert_private_regular_active_lease(&lease_root);
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_reconcile_migration_manifest_stdio_does_not_follow_redirects() {
+    let (manifest, expectations) = one_table_reconciliation_case();
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-reconcile-redirect-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create redirect reconciliation root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make redirect reconciliation root private");
+    }
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&lease_root, &manifest);
+    let (base_url, requests) =
+        spawn_fake_reconciliation_api_with_fault(ReconciliationFault::Redirect);
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let response = mcp.call_tool(
+        739,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest,
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_only_v1",
+            "state_expectations": expectations,
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["capability_state"], json!("contradictory"));
+    assert_eq!(content["provider_cause"]["status"], json!(302));
+    assert_eq!(content["provider_calls"], json!(1));
+    assert_eq!(
+        content["provider_read_lifecycle"],
+        json!([{
+            "dispatch_stage": "attempted",
+            "response_stage": "received",
+            "body_stage": "completely_read",
+            "http_status": 302,
+        }]),
+        "{content}"
+    );
+    assert_eq!(requests.lock().expect("request log").len(), 1);
+    assert_private_regular_active_lease(&lease_root);
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
 fn d1_reconcile_migration_manifest_stdio_rejects_marker_metadata_and_oversized_provider_evidence() {
     let migration_sql = "CREATE TABLE items(id INTEGER PRIMARY KEY);";
     let manifest = json!([{
@@ -4433,6 +4622,10 @@ fn d1_reconcile_migration_manifest_stdio_rejects_marker_metadata_and_oversized_p
         (
             ReconciliationFault::MalformedReadOnlyMetadata,
             "d1.migration_reconciliation_read_only_meta_contradictory",
+        ),
+        (
+            ReconciliationFault::MalformedJsonStatus(200),
+            "d1.migration_reconciliation_provider_evidence_contradictory",
         ),
         (
             ReconciliationFault::OversizedResponse,
@@ -4746,6 +4939,24 @@ fn d1_reconcile_migration_manifest_stdio_preserves_both_batches_when_second_call
         "{content}"
     );
     assert_eq!(content["provider_calls"], json!(2), "{content}");
+    assert_eq!(
+        content["provider_read_lifecycle"],
+        json!([
+            {
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 200,
+            },
+            {
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 503,
+            }
+        ]),
+        "{content}"
+    );
     let evidence = content["response_evidence"]
         .as_array()
         .expect("chronological response evidence");
@@ -4766,14 +4977,39 @@ fn d1_reconcile_migration_manifest_stdio_preserves_both_batches_when_second_call
 }
 
 #[test]
-fn d1_reconcile_migration_manifest_stdio_treats_429_and_5xx_including_oversized_as_unavailable_without_retry()
+fn d1_reconcile_migration_manifest_stdio_treats_auth_rate_limit_and_5xx_evidence_as_unavailable_without_retry()
  {
     let (manifest, expectations) = one_table_reconciliation_case();
-    for (index, (fault, status)) in [
-        (ReconciliationFault::HttpStatus(429), 429),
-        (ReconciliationFault::HttpStatus(503), 503),
-        (ReconciliationFault::OversizedHttpStatus(429), 429),
-        (ReconciliationFault::OversizedHttpStatus(503), 503),
+    for (index, (fault, status, body_stage)) in [
+        (ReconciliationFault::HttpStatus(401), 401, "completely_read"),
+        (ReconciliationFault::HttpStatus(403), 403, "completely_read"),
+        (ReconciliationFault::HttpStatus(429), 429, "completely_read"),
+        (ReconciliationFault::HttpStatus(503), 503, "completely_read"),
+        (
+            ReconciliationFault::MalformedUtf8HttpStatus(429),
+            429,
+            "completely_read",
+        ),
+        (
+            ReconciliationFault::MalformedUtf8HttpStatus(503),
+            503,
+            "completely_read",
+        ),
+        (
+            ReconciliationFault::TruncatedHttpStatus(503),
+            503,
+            "partially_read",
+        ),
+        (
+            ReconciliationFault::OversizedHttpStatus(429),
+            429,
+            "not_read",
+        ),
+        (
+            ReconciliationFault::OversizedHttpStatus(503),
+            503,
+            "not_read",
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -4826,6 +5062,21 @@ fn d1_reconcile_migration_manifest_stdio_treats_429_and_5xx_including_oversized_
             json!("do_not_retry_same_attempt")
         );
         assert_eq!(content["provider_calls"], json!(1));
+        assert_eq!(
+            content["provider_cause"]["status"],
+            json!(status),
+            "{content}"
+        );
+        assert_eq!(
+            content["provider_read_lifecycle"],
+            json!([{
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": body_stage,
+                "http_status": status,
+            }]),
+            "{content}"
+        );
         assert_eq!(requests.lock().expect("request log").len(), 1);
         assert_private_regular_active_lease(&lease_root);
         mcp.terminate();

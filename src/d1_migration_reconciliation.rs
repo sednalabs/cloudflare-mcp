@@ -15,6 +15,7 @@ use serde_json::{Map, Value, json};
 
 use crate::cloudflare::client::{
     D1MigrationReconciliationBatch, D1MigrationReconciliationBatchError,
+    D1MigrationReconciliationReadLifecycle,
 };
 use crate::d1_migration_lease::{D1RetainedMigrationLease, inspect_retained_d1_migration_lease};
 use crate::d1_migration_manifest::{
@@ -438,6 +439,7 @@ pub(crate) async fn reconcile_d1_migration_manifest(
         "expectation_proof_sha256": validated.proof_sha256,
         "query_sha256s": [&query.sha256, &query.sha256],
         "response_evidence": [response_digest_summary(&first), response_digest_summary(&second)],
+        "provider_read_lifecycle": [first.lifecycle, second.lifecycle],
         "canonical_snapshot_sha256": snapshot_sha256,
         "scope_completeness": {
             "ledger": "complete_bounded_manifest_prefix",
@@ -465,6 +467,7 @@ struct ParsedBatch {
     snapshot: CanonicalSnapshot,
     response_body_sha256: String,
     response_body_size_bytes: usize,
+    lifecycle: D1MigrationReconciliationReadLifecycle,
 }
 
 async fn read_complete_batch(
@@ -485,14 +488,15 @@ async fn read_complete_batch(
     {
         Ok(batch) => batch,
         Err(error) => {
+            let provider_calls = error.lifecycle.provider_calls();
             let provider_error = adapter_batch_error(error, &query.sha256);
             return Err(match lease.revalidate() {
-                Ok(()) => contextualize_error(provider_error, Some(&query.sha256), &[], 1),
+                Ok(()) => contextualize_error(provider_error, Some(&query.sha256), &[], 0),
                 Err(custody_error) => contextualize_provider_error_with_unverified_custody(
                     provider_error,
                     custody_error,
                     Some(&query.sha256),
-                    1,
+                    provider_calls,
                 ),
             });
         }
@@ -523,6 +527,7 @@ async fn read_complete_batch(
         snapshot,
         response_body_sha256: batch.response_body_sha256,
         response_body_size_bytes: batch.response_body_size_bytes,
+        lifecycle: batch.lifecycle,
     })
 }
 
@@ -1813,6 +1818,7 @@ fn response_digest_summary(batch: &ParsedBatch) -> Value {
     json!({
         "response_body_sha256": batch.response_body_sha256,
         "response_body_size_bytes": batch.response_body_size_bytes,
+        "lifecycle": batch.lifecycle,
     })
 }
 
@@ -1820,6 +1826,7 @@ fn response_digest_summary_from_adapter(batch: &D1MigrationReconciliationBatch) 
     json!({
         "response_body_sha256": batch.response_body_sha256,
         "response_body_size_bytes": batch.response_body_size_bytes,
+        "lifecycle": batch.lifecycle,
     })
 }
 
@@ -1827,6 +1834,7 @@ fn adapter_batch_error(
     failure: D1MigrationReconciliationBatchError,
     query_sha256: &str,
 ) -> CallToolResult {
+    let lifecycle = failure.lifecycle;
     let capability_state =
         if failure.error.status.is_some_and(|status| {
             matches!(status, 401 | 403 | 429) || (500..=599).contains(&status)
@@ -1835,7 +1843,8 @@ fn adapter_batch_error(
             "cloudflare.timeout" | "cloudflare.transport_error" | "cloudflare.response_read_failed"
         ) {
             "unavailable"
-        } else if failure.error.message.contains("pragma_")
+        } else if failure.error.code == "cloudflare.config_missing_token"
+            || failure.error.message.contains("pragma_")
             || failure.error.message.contains("not authorized")
             || failure.error.message.contains("SQLITE_AUTH")
         {
@@ -1851,11 +1860,13 @@ fn adapter_batch_error(
             "response_body_sha256": sha256,
             "response_body_size_bytes": size,
             "complete_body_digest": true,
+            "lifecycle": lifecycle,
         })],
         (None, Some(size)) => vec![json!({
             "response_body_sha256": null,
             "response_body_size_bytes": size,
             "complete_body_digest": false,
+            "lifecycle": lifecycle,
         })],
         _ => Vec::new(),
     };
@@ -1871,6 +1882,11 @@ fn adapter_batch_error(
         &response,
     );
     if let Some(Value::Object(content)) = result.structured_content.as_mut() {
+        content.insert("provider_read_lifecycle".to_string(), json!([lifecycle]));
+        content.insert(
+            "provider_calls".to_string(),
+            json!(lifecycle.provider_calls()),
+        );
         content.insert(
             "provider_cause".to_string(),
             json!({
@@ -1950,6 +1966,7 @@ fn contextualize_error(
         }
         content.insert("query_sha256".to_string(), json!(query_sha256));
         prepend_response_evidence(content, response_evidence);
+        prepend_provider_lifecycle(content, response_evidence);
         content.insert("provider_mutations".to_string(), json!(0));
         content.insert("local_namespace_mutations".to_string(), json!(0));
         let provider_calls = content
@@ -1987,6 +2004,7 @@ fn contextualize_unverified_custody_error(
         );
         content.insert("query_sha256".to_string(), json!(query_sha256));
         prepend_response_evidence(content, response_evidence);
+        prepend_provider_lifecycle(content, response_evidence);
         content.insert("provider_calls".to_string(), json!(provider_calls));
         content.insert("provider_mutations".to_string(), json!(0));
         content.insert("local_namespace_mutations".to_string(), json!(0));
@@ -2031,6 +2049,26 @@ fn prepend_response_evidence(content: &mut serde_json::Map<String, Value>, prior
         merged.extend(current.iter().cloned());
     }
     content.insert("response_evidence".to_string(), Value::Array(merged));
+}
+
+fn prepend_provider_lifecycle(content: &mut serde_json::Map<String, Value>, prior: &[Value]) {
+    let mut lifecycle = prior
+        .iter()
+        .filter_map(|evidence| evidence.get("lifecycle").cloned())
+        .collect::<Vec<_>>();
+    if lifecycle.is_empty() {
+        content
+            .entry("provider_read_lifecycle".to_string())
+            .or_insert_with(|| json!([]));
+        return;
+    }
+    if let Some(Value::Array(current)) = content.get("provider_read_lifecycle") {
+        lifecycle.extend(current.iter().cloned());
+    }
+    content.insert(
+        "provider_read_lifecycle".to_string(),
+        Value::Array(lifecycle),
+    );
 }
 
 fn prelease_error(
@@ -2391,6 +2429,12 @@ mod tests {
                 },
                 response_body_sha256: Some(PROOF.to_string()),
                 response_body_size_bytes: Some(31),
+                lifecycle: D1MigrationReconciliationReadLifecycle {
+                    dispatch_stage: "attempted",
+                    response_stage: "received",
+                    body_stage: "completely_read",
+                    http_status: Some(503),
+                },
             },
             PROOF,
         );
@@ -2480,7 +2524,7 @@ mod tests {
 
     #[test]
     fn rate_limit_and_server_statuses_are_unavailable_without_retry() {
-        for status in [429, 500, 503, 599] {
+        for status in [401, 403, 429, 500, 503, 599] {
             let result = adapter_batch_error(
                 D1MigrationReconciliationBatchError {
                     error: crate::cloudflare::client::AdapterErrorPayload {
@@ -2493,6 +2537,12 @@ mod tests {
                     },
                     response_body_sha256: Some(PROOF.to_string()),
                     response_body_size_bytes: Some(2),
+                    lifecycle: D1MigrationReconciliationReadLifecycle {
+                        dispatch_stage: "attempted",
+                        response_stage: "received",
+                        body_stage: "completely_read",
+                        http_status: Some(status),
+                    },
                 },
                 PROOF,
             );
@@ -2504,6 +2554,16 @@ mod tests {
             );
             assert_eq!(content["retry_decision"], "do_not_retry_same_attempt");
             assert_eq!(content["provider_cause"]["retryable"], false);
+            assert_eq!(content["provider_calls"], 1);
+            assert_eq!(
+                content["provider_read_lifecycle"],
+                json!([{
+                    "dispatch_stage": "attempted",
+                    "response_stage": "received",
+                    "body_stage": "completely_read",
+                    "http_status": status,
+                }])
+            );
         }
     }
 

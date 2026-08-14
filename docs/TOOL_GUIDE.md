@@ -91,13 +91,20 @@ also requires every fixed result set in both batches to carry exact
 `meta.served_by_primary=true` evidence; absent, false, null, non-boolean, or
 mixed primary markers are contradictory and cannot support positive
 reconciliation. It performs two bounded read-only batches and never retires
-custody evidence or authorizes an apply retry. A null `lease_retained` with
+custody evidence or authorizes an apply retry. The boundary does not follow
+HTTP redirects and returns one chronological `provider_read_lifecycle` entry
+per invocation, distinguishing pre-dispatch, attempted-without-response,
+response received, partial/complete body read, and captured HTTP status. Local
+token/config failure therefore reports zero provider calls. A null `lease_retained` with
 `custody_status=not_inspected` or `inspection_failed` means no retained lease
 was acquired or proven by that call; it is not evidence that custody was
 removed. Likewise, `custody_status=retained_evidence_unverified` after a
 revalidation failure means retain and inspect the named evidence manually;
 HTTP 429 and 5xx reads are unavailable evidence and are not retried, even when
-their response body exceeds the byte bound. Post-read ledger/schema/evidence
+their response body is malformed, truncated, or exceeds the byte bound; 401
+and 403 are unavailable under the same no-retry rule. HTTP status remains
+attached to invalid UTF-8, malformed JSON, partial-read, and oversized evidence.
+Post-read ledger/schema/evidence
 contradictions keep verified custody and exact provider-call accounting unless
 custody itself fails revalidation. Custody is revalidated after every attempted
 provider call, including an unavailable/error response; a simultaneous custody

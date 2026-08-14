@@ -171,6 +171,14 @@ or mixed primary marker fails closed as contradictory evidence. Response bodies
 are capped at 16 MiB from the HTTP stream; the adapter stops before buffering a
 body beyond that bound.
 
+The reconciliation HTTP client does not follow redirects. Interpret
+`provider_read_lifecycle` in order: `pre_dispatch` means no provider call;
+`attempted` with `not_received` means transport outcome without a response;
+`received` plus `not_read`, `partially_read`, or `completely_read` records the
+body boundary and exact captured HTTP status. Preserve that status for invalid
+UTF-8, malformed JSON, truncated streams, and oversized bodies. Treat 401,
+403, 429, and every 5xx as unavailable and never retry the same attempt.
+
 Interpret custody fields literally. Validation failures before custody lookup
 return `lease_retained=null` and `custody_status=not_inspected`. Inspection
 failures return `lease_retained=null` and `custody_status=inspection_failed`.

@@ -115,6 +115,7 @@ impl AdapterError {
 pub struct CloudflareClient {
     pub(crate) cfg: CloudflareApiConfig,
     pub(crate) http: reqwest::Client,
+    reconciliation_http: reqwest::Client,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -230,6 +231,7 @@ pub(crate) struct D1MigrationReconciliationBatch {
     pub(crate) result: Value,
     pub(crate) response_body_sha256: String,
     pub(crate) response_body_size_bytes: usize,
+    pub(crate) lifecycle: D1MigrationReconciliationReadLifecycle,
 }
 
 #[derive(Debug, Clone)]
@@ -237,6 +239,70 @@ pub(crate) struct D1MigrationReconciliationBatchError {
     pub(crate) error: AdapterErrorPayload,
     pub(crate) response_body_sha256: Option<String>,
     pub(crate) response_body_size_bytes: Option<usize>,
+    pub(crate) lifecycle: D1MigrationReconciliationReadLifecycle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct D1MigrationReconciliationReadLifecycle {
+    pub(crate) dispatch_stage: &'static str,
+    pub(crate) response_stage: &'static str,
+    pub(crate) body_stage: &'static str,
+    pub(crate) http_status: Option<u16>,
+}
+
+impl D1MigrationReconciliationReadLifecycle {
+    const fn pre_dispatch() -> Self {
+        Self {
+            dispatch_stage: "pre_dispatch",
+            response_stage: "not_received",
+            body_stage: "not_read",
+            http_status: None,
+        }
+    }
+
+    const fn attempted_without_response() -> Self {
+        Self {
+            dispatch_stage: "attempted",
+            response_stage: "not_received",
+            body_stage: "not_read",
+            http_status: None,
+        }
+    }
+
+    const fn response_received(http_status: u16) -> Self {
+        Self {
+            dispatch_stage: "attempted",
+            response_stage: "received",
+            body_stage: "not_read",
+            http_status: Some(http_status),
+        }
+    }
+
+    const fn body_partially_read(http_status: u16) -> Self {
+        Self {
+            dispatch_stage: "attempted",
+            response_stage: "received",
+            body_stage: "partially_read",
+            http_status: Some(http_status),
+        }
+    }
+
+    const fn body_completely_read(http_status: u16) -> Self {
+        Self {
+            dispatch_stage: "attempted",
+            response_stage: "received",
+            body_stage: "completely_read",
+            http_status: Some(http_status),
+        }
+    }
+
+    pub(crate) fn provider_calls(self) -> usize {
+        if self.dispatch_stage == "attempted" {
+            1
+        } else {
+            0
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,7 +361,22 @@ impl CloudflareClient {
                     "Verify TLS/runtime dependencies and CLOUDFLARE_MCP_API_TIMEOUT_MS settings.",
                 )
             })?;
-        Ok(Self { cfg, http })
+        let reconciliation_http = reqwest::Client::builder()
+            .timeout(cfg.request_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|err| {
+                AdapterError::new(
+                    "cloudflare.client_init_failed",
+                    format!("failed to create reconciliation HTTP client: {err}"),
+                    "Verify TLS/runtime dependencies and CLOUDFLARE_MCP_API_TIMEOUT_MS settings.",
+                )
+            })?;
+        Ok(Self {
+            cfg,
+            http,
+            reconciliation_http,
+        })
     }
 
     pub fn default_account_id(&self) -> Option<&str> {
@@ -600,6 +681,7 @@ impl CloudflareClient {
                 error: error.payload(),
                 response_body_sha256: None,
                 response_body_size_bytes: None,
+                lifecycle: D1MigrationReconciliationReadLifecycle::pre_dispatch(),
             }
         })?;
         let database_id = require_non_empty("database_id", database_id).map_err(|error| {
@@ -607,6 +689,7 @@ impl CloudflareClient {
                 error: error.payload(),
                 response_body_sha256: None,
                 response_body_size_bytes: None,
+                lifecycle: D1MigrationReconciliationReadLifecycle::pre_dispatch(),
             }
         })?;
         let sql =
@@ -614,6 +697,7 @@ impl CloudflareClient {
                 error: error.payload(),
                 response_body_sha256: None,
                 response_body_size_bytes: None,
+                lifecycle: D1MigrationReconciliationReadLifecycle::pre_dispatch(),
             })?;
         let token = self
             .bearer_token()
@@ -621,6 +705,7 @@ impl CloudflareClient {
                 error: error.payload(),
                 response_body_sha256: None,
                 response_body_size_bytes: None,
+                lifecycle: D1MigrationReconciliationReadLifecycle::pre_dispatch(),
             })?;
         let url = self.endpoint(&format!(
             "/accounts/{}/d1/database/{}/query",
@@ -628,7 +713,7 @@ impl CloudflareClient {
             path_segment(database_id),
         ));
         let response = self
-            .http
+            .reconciliation_http
             .post(url)
             .bearer_auth(&token)
             .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone())
@@ -654,9 +739,12 @@ impl CloudflareClient {
                     .payload(),
                     response_body_sha256: None,
                     response_body_size_bytes: None,
+                    lifecycle:
+                        D1MigrationReconciliationReadLifecycle::attempted_without_response(),
                 }
             })?;
         let status = response.status();
+        let status_code = status.as_u16();
         if response
             .content_length()
             .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
@@ -671,6 +759,7 @@ impl CloudflareClient {
                 .payload(),
                 response_body_sha256: None,
                 response_body_size_bytes: response.content_length().map(|length| length as usize),
+                lifecycle: D1MigrationReconciliationReadLifecycle::response_received(status_code),
             });
         }
         let initial_capacity = response
@@ -687,9 +776,12 @@ impl CloudflareClient {
                     format!("failed reading Cloudflare reconciliation response body: {error}"),
                     "Treat reconciliation evidence as unavailable; do not retry the retained migration attempt.",
                 )
+                .with_status(Some(status_code))
                 .payload(),
                 response_body_sha256: None,
                 response_body_size_bytes: Some(bytes.len()),
+                lifecycle:
+                    D1MigrationReconciliationReadLifecycle::body_partially_read(status_code),
             })?;
             let observed_size = bytes.len().saturating_add(chunk.len());
             if observed_size > MAX_RESPONSE_BYTES {
@@ -703,6 +795,8 @@ impl CloudflareClient {
                     .payload(),
                     response_body_sha256: None,
                     response_body_size_bytes: Some(observed_size),
+                    lifecycle:
+                        D1MigrationReconciliationReadLifecycle::body_partially_read(status_code),
                 });
             }
             hasher.update(&chunk);
@@ -714,23 +808,28 @@ impl CloudflareClient {
             error: error.payload(),
             response_body_sha256: Some(response_body_sha256.clone()),
             response_body_size_bytes: Some(response_body_size_bytes),
+            lifecycle: D1MigrationReconciliationReadLifecycle::body_completely_read(status_code),
         };
         let body = std::str::from_utf8(&bytes).map_err(|error| {
-            evidence_error(AdapterError::new(
-                "cloudflare.d1.migration_reconciliation_malformed_utf8",
-                format!("Cloudflare reconciliation response was not valid UTF-8: {error}"),
-                "Treat the provider evidence as contradictory and retain the lease.",
-            ))
+            evidence_error(
+                AdapterError::new(
+                    "cloudflare.d1.migration_reconciliation_malformed_utf8",
+                    format!("Cloudflare reconciliation response was not valid UTF-8: {error}"),
+                    "Treat the provider evidence as contradictory and retain the lease.",
+                )
+                .with_status(Some(status_code)),
+            )
         })?;
         if !status.is_success() {
             return Err(evidence_error(http_status_error(status, body)));
         }
-        let envelope =
-            decode_strict_d1_migration_manifest_envelope(body).map_err(evidence_error)?;
+        let envelope = decode_strict_d1_migration_manifest_envelope(body)
+            .map_err(|error| evidence_error(error.with_status(Some(status_code))))?;
         Ok(D1MigrationReconciliationBatch {
             result: envelope.result.unwrap_or(Value::Null),
             response_body_sha256,
             response_body_size_bytes,
+            lifecycle: D1MigrationReconciliationReadLifecycle::body_completely_read(status_code),
         })
     }
 
@@ -3961,6 +4060,10 @@ mod tests {
         format!("http://{}", addr)
     }
 
+    fn refused_loopback_url(path: &str) -> String {
+        format!("http://{}:9/{path}", std::net::Ipv4Addr::LOCALHOST) // DevSkim: ignore DS137138 -- loopback-only transport fixture
+    }
+
     #[test]
     fn path_segment_encodes_separators() {
         assert_eq!(path_segment("zone/one two"), "zone%2Fone%20two");
@@ -4018,7 +4121,130 @@ mod tests {
             );
             assert_eq!(error.error.status, Some(status.as_u16()));
             assert_eq!(error.response_body_sha256, None);
+            assert_eq!(error.lifecycle.provider_calls(), 1);
+            assert_eq!(
+                error.lifecycle,
+                D1MigrationReconciliationReadLifecycle::response_received(status.as_u16())
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn reconciliation_pre_dispatch_failure_has_zero_provider_calls() {
+        let mut cfg = test_config(refused_loopback_url("pre-dispatch"));
+        cfg.api_token = None;
+        let client = CloudflareClient::new(cfg).expect("client");
+        let error = client
+            .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+            .await
+            .expect_err("missing token must fail before dispatch");
+        assert_eq!(error.error.code, "cloudflare.config_missing_token");
+        assert_eq!(error.error.status, None);
+        assert_eq!(error.lifecycle.provider_calls(), 0);
+        assert_eq!(
+            error.lifecycle,
+            D1MigrationReconciliationReadLifecycle::pre_dispatch()
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_transport_failure_records_attempt_without_response() {
+        let client =
+            CloudflareClient::new(test_config(refused_loopback_url("attempted"))).expect("client");
+        let error = client
+            .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+            .await
+            .expect_err("closed loopback port must fail after dispatch attempt");
+        assert_eq!(error.error.status, None);
+        assert_eq!(error.lifecycle.provider_calls(), 1);
+        assert_eq!(
+            error.lifecycle,
+            D1MigrationReconciliationReadLifecycle::attempted_without_response()
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_redirect_is_not_followed() {
+        let redirect_location = refused_loopback_url("must-not-be-followed");
+        let router = Router::new().route(
+            "/accounts/acct-1/d1/database/db-1/query",
+            post(move || {
+                let redirect_location = redirect_location.clone();
+                async move {
+                    Response::builder()
+                        .status(StatusCode::FOUND)
+                        .header("location", redirect_location)
+                        .body(Body::empty())
+                        .expect("redirect response")
+                }
+            }),
+        );
+        let base = spawn_router(router).await;
+        let client = CloudflareClient::new(test_config(base)).expect("client");
+        let error = client
+            .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+            .await
+            .expect_err("redirect is contradictory evidence");
+        assert_eq!(error.error.status, Some(302));
+        assert_eq!(error.lifecycle.provider_calls(), 1);
+        assert_eq!(
+            error.lifecycle,
+            D1MigrationReconciliationReadLifecycle::body_completely_read(302)
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_reconciliation_bodies_preserve_http_status() {
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let router = Router::new().route(
+                "/accounts/acct-1/d1/database/db-1/query",
+                post(move || async move {
+                    Response::builder()
+                        .status(status)
+                        .body(Body::from(vec![0xff, 0xfe]))
+                        .expect("malformed UTF-8 response")
+                }),
+            );
+            let base = spawn_router(router).await;
+            let client = CloudflareClient::new(test_config(base)).expect("client");
+            let error = client
+                .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+                .await
+                .expect_err("malformed UTF-8 must fail closed");
+            assert_eq!(
+                error.error.code,
+                "cloudflare.d1.migration_reconciliation_malformed_utf8"
+            );
+            assert_eq!(error.error.status, Some(status.as_u16()));
+            assert_eq!(
+                error.lifecycle,
+                D1MigrationReconciliationReadLifecycle::body_completely_read(status.as_u16())
+            );
+        }
+
+        let router = Router::new().route(
+            "/accounts/acct-1/d1/database/db-1/query",
+            post(|| async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from("{"))
+                    .expect("malformed JSON response")
+            }),
+        );
+        let base = spawn_router(router).await;
+        let client = CloudflareClient::new(test_config(base)).expect("client");
+        let error = client
+            .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+            .await
+            .expect_err("malformed JSON must fail closed");
+        assert_eq!(error.error.status, Some(200));
+        assert_eq!(
+            error.lifecycle,
+            D1MigrationReconciliationReadLifecycle::body_completely_read(200)
+        );
     }
 
     #[tokio::test]
