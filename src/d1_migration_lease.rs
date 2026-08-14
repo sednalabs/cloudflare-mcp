@@ -15,7 +15,7 @@ use std::fs;
 use std::io::Write;
 
 use rmcp::model::CallToolResult;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::tools::{invalid_argument_result, sha256_bytes_hex};
@@ -63,6 +63,56 @@ pub(crate) struct D1MigrationLeaseIdentity {
     pub(crate) target_key_sha256: String,
     pub(crate) nonce: String,
     pub(crate) payload_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct D1RetainedMigrationLeaseIdentity {
+    pub(crate) target_key_sha256: String,
+    pub(crate) namespace: &'static str,
+    pub(crate) nonce: String,
+    pub(crate) payload_sha256: String,
+    pub(crate) approved_plan_sha256: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct D1RetainedMigrationLeasePayload {
+    approved_plan_sha256: String,
+    created_at_unix_ms: u64,
+    migration_family: String,
+    nonce: String,
+    target_key_sha256: String,
+    version: u8,
+}
+
+/// A guard-held, descriptor-bound view of retained migration evidence.
+/// Dropping this value releases only the advisory guard. It never renames,
+/// unlinks, rewrites, or otherwise mutates the retained namespace.
+#[derive(Debug)]
+pub(crate) struct D1RetainedMigrationLease {
+    #[cfg(target_os = "linux")]
+    root_path: PathBuf,
+    #[cfg(target_os = "linux")]
+    root: fs::File,
+    #[cfg(target_os = "linux")]
+    root_identity: D1LeaseFileIdentity,
+    #[cfg(target_os = "linux")]
+    target_name: String,
+    #[cfg(target_os = "linux")]
+    target: fs::File,
+    #[cfg(target_os = "linux")]
+    target_identity: D1LeaseFileIdentity,
+    #[cfg(target_os = "linux")]
+    guard: fs::File,
+    #[cfg(target_os = "linux")]
+    guard_identity: D1LeaseFileIdentity,
+    #[cfg(target_os = "linux")]
+    evidence: fs::File,
+    #[cfg(target_os = "linux")]
+    evidence_file_identity: D1LeaseFileIdentity,
+    #[cfg(target_os = "linux")]
+    evidence_name: &'static str,
+    pub(crate) identity: D1RetainedMigrationLeaseIdentity,
 }
 
 #[cfg(target_os = "linux")]
@@ -254,6 +304,149 @@ impl D1MigrationLease {
                 "hint": "Do not issue provider SQL. Reconcile the permanent target custody evidence through the governed recovery path first."}
         }))
     }
+}
+
+impl D1RetainedMigrationLease {
+    /// Rebind every held descriptor and require the exact retained namespace
+    /// and payload to remain unchanged before or after a provider read.
+    pub(crate) fn revalidate(&self) -> Result<(), CallToolResult> {
+        #[cfg(target_os = "linux")]
+        {
+            validate_d1_lease_custody(
+                &self.root_path,
+                &self.root,
+                &self.root_identity,
+                &self.target_name,
+                &self.target,
+                &self.target_identity,
+                &self.guard,
+                &self.guard_identity,
+            )
+            .map_err(d1_retained_lease_revalidation_error)?;
+            let other_name = if self.evidence_name == ACTIVE_LEASE_NAME {
+                RETIRING_LEASE_NAME
+            } else {
+                ACTIVE_LEASE_NAME
+            };
+            match retained_entry_present(&self.target, other_name) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return Err(d1_retained_lease_revalidation_error(
+                        "both active and retiring migration evidence are present",
+                    ));
+                }
+                Err(message) => return Err(d1_retained_lease_revalidation_error(message)),
+            }
+            validate_retained_named_lease(
+                &self.target,
+                self.evidence_name,
+                &self.evidence,
+                &self.evidence_file_identity,
+                &self.identity,
+            )
+            .map_err(d1_retained_lease_revalidation_error)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(d1_retained_lease_platform_unsupported())
+        }
+    }
+}
+
+pub(crate) fn inspect_retained_d1_migration_lease(
+    account_id: &str,
+    database_id: &str,
+    family: &str,
+    approved_plan_sha256: &str,
+    nonce: &str,
+    payload_sha256: &str,
+) -> Result<D1RetainedMigrationLease, CallToolResult> {
+    let root = std::env::var(D1_MANIFEST_LEASE_ROOT_ENV)
+        .ok()
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| {
+            d1_retained_lease_error(
+                "d1.migration_reconciliation_lease_root_unconfigured",
+                "read-only reconciliation requires the configured operator-owned migration lease root",
+            )
+        })?;
+    inspect_retained_d1_migration_lease_at(
+        root,
+        account_id,
+        database_id,
+        family,
+        approved_plan_sha256,
+        nonce,
+        payload_sha256,
+    )
+}
+
+pub(crate) fn inspect_retained_d1_migration_lease_at(
+    root: PathBuf,
+    account_id: &str,
+    database_id: &str,
+    family: &str,
+    approved_plan_sha256: &str,
+    nonce: &str,
+    payload_sha256: &str,
+) -> Result<D1RetainedMigrationLease, CallToolResult> {
+    #[cfg(target_os = "linux")]
+    {
+        inspect_retained_d1_migration_lease_at_linux(
+            root,
+            account_id,
+            database_id,
+            family,
+            approved_plan_sha256,
+            nonce,
+            payload_sha256,
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (
+            root,
+            account_id,
+            database_id,
+            family,
+            approved_plan_sha256,
+            nonce,
+            payload_sha256,
+        );
+        Err(d1_retained_lease_platform_unsupported())
+    }
+}
+
+fn d1_retained_lease_platform_unsupported() -> CallToolResult {
+    d1_retained_lease_error(
+        "d1.migration_reconciliation_platform_unsupported",
+        "read-only retained-lease reconciliation requires the Linux dirfd-bound custody implementation",
+    )
+}
+
+fn d1_retained_lease_revalidation_error(message: &'static str) -> CallToolResult {
+    d1_retained_lease_error("d1.migration_reconciliation_lease_changed", message)
+}
+
+fn d1_retained_lease_error(code: &'static str, message: &'static str) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": "d1_reconcile_migration_manifest",
+        "dry_run": true,
+        "read_only": true,
+        "status": "reconciliation_required",
+        "retry_decision": "do_not_retry_same_attempt",
+        "lease_decision": "not_acquired",
+        "lease_retained": null,
+        "custody_status": "inspection_failed",
+        "provider_calls": 0,
+        "error": {
+            "code": code,
+            "message": message,
+            "hint": "Retain the exact custody evidence and resolve this boundary before any provider read or migration retry."
+        }
+    }))
 }
 
 pub(crate) fn d1_migration_lease_requirements(
@@ -616,6 +809,35 @@ mod linux {
         Ok((guard, expected))
     }
 
+    fn open_existing_guard(
+        target: &fs::File,
+    ) -> Result<(fs::File, D1LeaseFileIdentity), &'static str> {
+        let named = open_named_entry(target, GUARD_NAME)
+            .map_err(|_| "permanent target guard is absent or unavailable")?;
+        let metadata = named
+            .metadata()
+            .map_err(|_| "permanent target guard metadata is unavailable")?;
+        if !private_file(&metadata) {
+            return Err("permanent target guard is not a private regular file");
+        }
+        let expected = identity(&metadata);
+        let name = c_string_name(GUARD_NAME)?;
+        let guard = open_at(
+            target.as_raw_fd(),
+            &name,
+            O_RDONLY | O_NOFOLLOW | O_CLOEXEC,
+            0,
+        )
+        .map_err(|_| "permanent target guard could not be rebound")?;
+        let held = guard
+            .metadata()
+            .map_err(|_| "held permanent target guard metadata is unavailable")?;
+        if !private_file(&held) || identity(&held) != expected {
+            return Err("permanent target guard changed while it was rebound");
+        }
+        Ok((guard, expected))
+    }
+
     fn validate_named_private_file(
         target: &fs::File,
         name: &str,
@@ -751,6 +973,122 @@ mod linux {
             .as_deref()
             .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
             .is_some_and(|value| value.is_object())
+    }
+
+    pub(super) fn retained_entry_present(
+        target: &fs::File,
+        name: &str,
+    ) -> Result<bool, &'static str> {
+        entry_present(target, name)
+    }
+
+    fn valid_lower_sha256(value: &str) -> bool {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    fn valid_retained_nonce(value: &str) -> bool {
+        valid_lower_sha256(value)
+    }
+
+    fn valid_retained_family(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= 128
+            && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':')
+            })
+    }
+
+    fn parse_retained_lease_payload(
+        bytes: &[u8],
+    ) -> Result<D1RetainedMigrationLeasePayload, &'static str> {
+        let payload: D1RetainedMigrationLeasePayload = serde_json::from_slice(bytes).map_err(
+            |_| "retained lease payload is malformed, duplicate-keyed, or structurally unexpected",
+        )?;
+        let canonical: Value = serde_json::from_slice(bytes)
+            .map_err(|_| "retained lease payload is not valid JSON")?;
+        if serde_json::to_vec(&canonical)
+            .ok()
+            .as_deref()
+            .is_none_or(|encoded| encoded != bytes)
+        {
+            return Err("retained lease payload is not exact canonical JSON");
+        }
+        if payload.version != 2
+            || payload.created_at_unix_ms == 0
+            || !valid_lower_sha256(&payload.target_key_sha256)
+            || !valid_lower_sha256(&payload.approved_plan_sha256)
+            || !valid_retained_nonce(&payload.nonce)
+            || !valid_retained_family(&payload.migration_family)
+        {
+            return Err("retained lease payload contains noncanonical authority fields");
+        }
+        Ok(payload)
+    }
+
+    fn open_retained_named_lease(
+        target: &fs::File,
+        name: &'static str,
+    ) -> Result<(fs::File, D1LeaseFileIdentity, Vec<u8>), &'static str> {
+        let named = open_named_entry(target, name)
+            .map_err(|_| "retained lease namespace entry could not be opened")?;
+        let metadata = named
+            .metadata()
+            .map_err(|_| "retained lease namespace metadata is unavailable")?;
+        if !private_file(&metadata) {
+            return Err("retained lease namespace entry is not a private regular file");
+        }
+        if metadata.len() > MAX_LEASE_PAYLOAD_BYTES {
+            return Err("retained lease payload exceeds the custody limit");
+        }
+        let expected = identity(&metadata);
+        let name_c = c_string_name(name)?;
+        let file = open_at(
+            target.as_raw_fd(),
+            &name_c,
+            O_RDONLY | O_NOFOLLOW | O_CLOEXEC,
+            0,
+        )
+        .map_err(|_| "retained lease namespace entry could not be rebound read-only")?;
+        let held = file
+            .metadata()
+            .map_err(|_| "held retained lease metadata is unavailable")?;
+        if !private_file(&held) || identity(&held) != expected {
+            return Err("retained lease namespace entry changed while it was rebound");
+        }
+        let bytes = read_held_file(&file)?;
+        Ok((file, expected, bytes))
+    }
+
+    pub(super) fn validate_retained_named_lease(
+        target: &fs::File,
+        name: &str,
+        evidence: &fs::File,
+        expected_file: &D1LeaseFileIdentity,
+        expected: &D1RetainedMigrationLeaseIdentity,
+    ) -> Result<(), &'static str> {
+        let held = evidence
+            .metadata()
+            .map_err(|_| "held retained lease metadata is unavailable")?;
+        if !private_file(&held) || identity(&held) != *expected_file {
+            return Err("held retained lease no longer matches its private regular file");
+        }
+        validate_named_private_file(target, name, expected_file)
+            .map_err(|_| "retained lease namespace entry no longer matches the held file")?;
+        let bytes = read_held_file(evidence)?;
+        if sha256_bytes_hex(&bytes) != expected.payload_sha256 {
+            return Err("retained lease payload digest changed");
+        }
+        let payload = parse_retained_lease_payload(&bytes)?;
+        if payload.target_key_sha256 != expected.target_key_sha256
+            || payload.nonce != expected.nonce
+            || payload.approved_plan_sha256 != expected.approved_plan_sha256
+        {
+            return Err("retained lease payload authority changed");
+        }
+        Ok(())
     }
 
     fn active_present_error(
@@ -1038,6 +1376,177 @@ mod linux {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn inspect_retained_d1_migration_lease_at_linux(
+        root_path: PathBuf,
+        account_id: &str,
+        database_id: &str,
+        family: &str,
+        approved_plan_sha256: &str,
+        nonce: &str,
+        payload_sha256: &str,
+    ) -> Result<D1RetainedMigrationLease, CallToolResult> {
+        if !valid_retained_family(family)
+            || !valid_lower_sha256(approved_plan_sha256)
+            || !valid_retained_nonce(nonce)
+            || !valid_lower_sha256(payload_sha256)
+        {
+            return Err(d1_retained_lease_error(
+                "d1.migration_reconciliation_identity_invalid",
+                "caller-supplied retained lease identity is not canonical",
+            ));
+        }
+        validate_root_and_ancestors(&root_path).map_err(|message| {
+            d1_retained_lease_error("d1.migration_reconciliation_lease_root_unsafe", message)
+        })?;
+        let root_name = c_string_path(&root_path).map_err(|message| {
+            d1_retained_lease_error("d1.migration_reconciliation_lease_root_unsafe", message)
+        })?;
+        let root = open_directory_at(AT_FDCWD, &root_name).map_err(|_| {
+            d1_retained_lease_error(
+                "d1.migration_reconciliation_lease_root_unsafe",
+                "configured migration lease root could not be opened without following a symlink",
+            )
+        })?;
+        let root_metadata = root.metadata().map_err(|_| {
+            d1_retained_lease_error(
+                "d1.migration_reconciliation_lease_root_unsafe",
+                "configured migration lease root metadata is unavailable",
+            )
+        })?;
+        if !private_dir(&root_metadata) {
+            return Err(d1_retained_lease_error(
+                "d1.migration_reconciliation_lease_root_unsafe",
+                "configured migration lease root is not a private current-operator-owned directory",
+            ));
+        }
+        let root_identity = identity(&root_metadata);
+        validate_root_path_binding(&root_path, &root, &root_identity).map_err(|message| {
+            d1_retained_lease_error("d1.migration_reconciliation_lease_root_unsafe", message)
+        })?;
+
+        let target_hash = sha256_bytes_hex(format!("{account_id}\0{database_id}").as_bytes());
+        let target_name = format!("d1-migration-target-{target_hash}");
+        let target_name_c = c_string_name(&target_name).map_err(|message| {
+            d1_retained_lease_error("d1.migration_reconciliation_target_unsafe", message)
+        })?;
+        let target = open_directory_at(root.as_raw_fd(), &target_name_c).map_err(|_| {
+            d1_retained_lease_error(
+                "d1.migration_reconciliation_evidence_absent",
+                "the exact account/database target has no retained migration custody directory",
+            )
+        })?;
+        let target_metadata = target.metadata().map_err(|_| {
+            d1_retained_lease_error(
+                "d1.migration_reconciliation_target_unsafe",
+                "retained migration target metadata is unavailable",
+            )
+        })?;
+        if !private_dir(&target_metadata) {
+            return Err(d1_retained_lease_error(
+                "d1.migration_reconciliation_target_unsafe",
+                "retained migration target is not a private current-operator-owned directory",
+            ));
+        }
+        let target_identity = identity(&target_metadata);
+        let (guard, guard_identity) = open_existing_guard(&target).map_err(|message| {
+            d1_retained_lease_error("d1.migration_reconciliation_guard_unsafe", message)
+        })?;
+        match guard.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(d1_retained_lease_error(
+                    "d1.migration_reconciliation_guard_locked",
+                    "another process holds the permanent migration target guard",
+                ));
+            }
+            Err(fs::TryLockError::Error(_)) => {
+                return Err(d1_retained_lease_error(
+                    "d1.migration_reconciliation_guard_lock_failed",
+                    "the permanent migration target guard could not be locked",
+                ));
+            }
+        }
+        validate_d1_lease_custody(
+            &root_path,
+            &root,
+            &root_identity,
+            &target_name,
+            &target,
+            &target_identity,
+            &guard,
+            &guard_identity,
+        )
+        .map_err(|message| {
+            d1_retained_lease_error("d1.migration_reconciliation_custody_changed", message)
+        })?;
+
+        let active_present = entry_present(&target, ACTIVE_LEASE_NAME).map_err(|message| {
+            d1_retained_lease_error("d1.migration_reconciliation_custody_changed", message)
+        })?;
+        let retiring_present = entry_present(&target, RETIRING_LEASE_NAME).map_err(|message| {
+            d1_retained_lease_error("d1.migration_reconciliation_custody_changed", message)
+        })?;
+        let (evidence_name, namespace) = match (active_present, retiring_present) {
+            (true, false) => (ACTIVE_LEASE_NAME, "active"),
+            (false, true) => (RETIRING_LEASE_NAME, "retiring"),
+            (false, false) => {
+                return Err(d1_retained_lease_error(
+                    "d1.migration_reconciliation_evidence_absent",
+                    "neither active nor retiring retained migration evidence is present",
+                ));
+            }
+            (true, true) => {
+                return Err(d1_retained_lease_error(
+                    "d1.migration_reconciliation_evidence_conflict",
+                    "both active and retiring retained migration evidence are present",
+                ));
+            }
+        };
+        let (evidence, evidence_file_identity, bytes) =
+            open_retained_named_lease(&target, evidence_name).map_err(|message| {
+                d1_retained_lease_error("d1.migration_reconciliation_evidence_malformed", message)
+            })?;
+        let computed_payload_sha256 = sha256_bytes_hex(&bytes);
+        let payload = parse_retained_lease_payload(&bytes).map_err(|message| {
+            d1_retained_lease_error("d1.migration_reconciliation_evidence_malformed", message)
+        })?;
+        if computed_payload_sha256 != payload_sha256
+            || payload.target_key_sha256 != target_hash
+            || payload.migration_family != family
+            || payload.approved_plan_sha256 != approved_plan_sha256
+            || payload.nonce != nonce
+        {
+            return Err(d1_retained_lease_error(
+                "d1.migration_reconciliation_evidence_contradictory",
+                "retained lease target, family, plan, nonce, or payload digest contradicts the exact caller identity",
+            ));
+        }
+        let identity = D1RetainedMigrationLeaseIdentity {
+            target_key_sha256: target_hash,
+            namespace,
+            nonce: nonce.to_string(),
+            payload_sha256: payload_sha256.to_string(),
+            approved_plan_sha256: approved_plan_sha256.to_string(),
+        };
+        let lease = D1RetainedMigrationLease {
+            root_path,
+            root,
+            root_identity,
+            target_name,
+            target,
+            target_identity,
+            guard,
+            guard_identity,
+            evidence,
+            evidence_file_identity,
+            evidence_name,
+            identity,
+        };
+        lease.revalidate()?;
+        Ok(lease)
+    }
+
     pub(super) fn acquire_d1_migration_lease_at_linux(
         root_path: PathBuf,
         account_id: &str,
@@ -1105,7 +1614,7 @@ mod linux {
             &guard_identity,
         )
         .map_err(|message| d1_lease_root_error("d1.migration_lease_custody_changed", message))?;
-        maybe_pause_after_guard_for_test();
+        maybe_pause_after_guard_for_test(&root_path);
         let nonce = d1_migration_lease_nonce(&target_hash, plan_sha256);
         let payload = json!({"version": 2, "target_key_sha256": &target_hash, "nonce": &nonce, "approved_plan_sha256": plan_sha256.to_ascii_lowercase(), "migration_family": family, "created_at_unix_ms": now_unix_ms()});
         let encoded =
@@ -1152,39 +1661,59 @@ mod linux {
     }
     #[cfg(test)]
     struct GuardPauseHook {
+        root_path: PathBuf,
         entered: mpsc::Sender<()>,
         resume: mpsc::Receiver<()>,
     }
     #[cfg(test)]
     static GUARD_PAUSE_HOOK: OnceLock<Mutex<Option<GuardPauseHook>>> = OnceLock::new();
     #[cfg(test)]
-    pub(super) fn install_guard_pause_hook(entered: mpsc::Sender<()>, resume: mpsc::Receiver<()>) {
-        *GUARD_PAUSE_HOOK
+    pub(super) fn install_guard_pause_hook(
+        root_path: PathBuf,
+        entered: mpsc::Sender<()>,
+        resume: mpsc::Receiver<()>,
+    ) {
+        let mut hook = GUARD_PAUSE_HOOK
             .get_or_init(|| Mutex::new(None))
             .lock()
-            .expect("guard pause hook lock") = Some(GuardPauseHook { entered, resume });
+            .expect("guard pause hook lock");
+        *hook = Some(GuardPauseHook {
+            root_path,
+            entered,
+            resume,
+        });
     }
     #[cfg(test)]
-    fn maybe_pause_after_guard_for_test() {
-        if let Some(hook) = GUARD_PAUSE_HOOK
-            .get_or_init(|| Mutex::new(None))
-            .lock()
-            .expect("guard pause hook lock")
-            .take()
-        {
+    fn maybe_pause_after_guard_for_test(root_path: &Path) {
+        let hook = {
+            let mut hook = GUARD_PAUSE_HOOK
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .expect("guard pause hook lock");
+            if hook
+                .as_ref()
+                .is_some_and(|candidate| candidate.root_path == root_path)
+            {
+                hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some(hook) = hook {
             hook.entered.send(()).expect("guard pause test receiver");
             hook.resume.recv().expect("guard pause test release");
         }
     }
     #[cfg(not(test))]
-    fn maybe_pause_after_guard_for_test() {}
+    fn maybe_pause_after_guard_for_test(_root_path: &Path) {}
 }
 
 #[cfg(target_os = "linux")]
 use linux::{
-    acquire_d1_migration_lease_at_linux, rename_owned_lease_no_replace,
-    restore_active_or_leave_blocker, sync_d1_lease_directory, validate_d1_lease_custody,
-    validate_owned_named_lease,
+    acquire_d1_migration_lease_at_linux, inspect_retained_d1_migration_lease_at_linux,
+    rename_owned_lease_no_replace, restore_active_or_leave_blocker, retained_entry_present,
+    sync_d1_lease_directory, validate_d1_lease_custody, validate_owned_named_lease,
+    validate_retained_named_lease,
 };
 
 #[cfg(test)]
@@ -1236,12 +1765,23 @@ mod tests {
         let root = private_test_root("race");
         let (entered_tx, entered_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
-        linux::install_guard_pause_hook(entered_tx, resume_rx);
+        linux::install_guard_pause_hook(root.clone(), entered_tx, resume_rx);
         let first_root = root.clone();
         let first = std::thread::spawn(move || {
             acquire_d1_migration_lease_at(first_root, "acct-1", "db-1", "first", &"a".repeat(64))
         });
         entered_rx.recv().expect("first holds guard");
+        let unrelated_root = private_test_root("race-unrelated");
+        let mut unrelated = acquire_d1_migration_lease_at(
+            unrelated_root.clone(),
+            "acct-1",
+            "db-1",
+            "unrelated",
+            &"c".repeat(64),
+        )
+        .expect("unrelated root must complete while the scoped owner remains paused");
+        unrelated.release().expect("retire unrelated lease");
+        fs::remove_dir_all(unrelated_root).expect("unrelated test cleanup");
         let contender = acquire_d1_migration_lease_at(
             root.clone(),
             "acct-1",
@@ -1662,6 +2202,178 @@ mod tests {
             retired_bytes,
             fs::read(&retired_path).expect("retired bytes after inert release")
         );
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_reconciliation_inspection_rebinds_exact_active_without_mutation() {
+        let root = private_test_root("reconcile-exact");
+        let plan = "a".repeat(64);
+        let mut owner =
+            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
+                .expect("create retained evidence");
+        let identity = owner.identity.clone();
+        let active = owner.active_path_for_test().expect("active path");
+        let before = fs::read(&active).expect("active bytes");
+        owner.retain();
+        drop(owner);
+
+        let retained = inspect_retained_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "db-1",
+            "newsletter-core",
+            &plan,
+            &identity.nonce,
+            &identity.payload_sha256,
+        )
+        .expect("inspect exact retained evidence");
+        assert_eq!(retained.identity.namespace, "active");
+        retained.revalidate().expect("stable retained evidence");
+        drop(retained);
+        assert_eq!(before, fs::read(&active).expect("unchanged active bytes"));
+        assert!(!active.with_file_name(RETIRING_LEASE_NAME).exists());
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_reconciliation_accepts_exact_retiring_namespace_without_retiring_it() {
+        let root = private_test_root("reconcile-retiring");
+        let plan = "a".repeat(64);
+        let mut owner =
+            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
+                .expect("create retained evidence");
+        let identity = owner.identity.clone();
+        let active = owner.active_path_for_test().expect("active path");
+        owner.retain();
+        drop(owner);
+        let retiring = active.with_file_name(RETIRING_LEASE_NAME);
+        fs::rename(&active, &retiring).expect("install exact retiring evidence");
+        let before = fs::read(&retiring).expect("retiring bytes");
+        let retained = inspect_retained_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "db-1",
+            "newsletter-core",
+            &plan,
+            &identity.nonce,
+            &identity.payload_sha256,
+        )
+        .expect("inspect exact retiring evidence");
+        assert_eq!(retained.identity.namespace, "retiring");
+        drop(retained);
+        assert_eq!(
+            before,
+            fs::read(&retiring).expect("unchanged retiring bytes")
+        );
+        assert!(!active.exists());
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_reconciliation_rejects_missing_both_malformed_and_cross_target_evidence() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        for label in [
+            "missing",
+            "both",
+            "malformed",
+            "symlink",
+            "cross-target",
+            "contradictory",
+        ] {
+            let root = private_test_root(&format!("reconcile-{label}"));
+            let plan = "a".repeat(64);
+            let mut owner = acquire_d1_migration_lease_at(
+                root.clone(),
+                "acct-1",
+                "db-1",
+                "newsletter-core",
+                &plan,
+            )
+            .expect("create retained evidence");
+            let identity = owner.identity.clone();
+            let active = owner.active_path_for_test().expect("active path");
+            owner.retain();
+            drop(owner);
+            match label {
+                "missing" => fs::rename(&active, active.with_extension("displaced"))
+                    .expect("remove active namespace"),
+                "both" => {
+                    fs::copy(&active, active.with_file_name(RETIRING_LEASE_NAME))
+                        .expect("copy retiring evidence");
+                    fs::set_permissions(
+                        active.with_file_name(RETIRING_LEASE_NAME),
+                        fs::Permissions::from_mode(0o600),
+                    )
+                    .expect("private retiring evidence");
+                }
+                "malformed" => fs::write(&active, b"{not-json").expect("malform active"),
+                "symlink" => {
+                    fs::rename(&active, active.with_extension("displaced"))
+                        .expect("displace active");
+                    symlink("/dev/null", &active).expect("replace active with symlink");
+                }
+                "cross-target" => {}
+                "contradictory" => {}
+                _ => unreachable!(),
+            }
+            let database_id = if label == "cross-target" {
+                "db-2"
+            } else {
+                "db-1"
+            };
+            let payload_sha256 = if label == "contradictory" {
+                "c".repeat(64)
+            } else {
+                identity.payload_sha256.clone()
+            };
+            let error = inspect_retained_d1_migration_lease_at(
+                root.clone(),
+                "acct-1",
+                database_id,
+                "newsletter-core",
+                &plan,
+                &identity.nonce,
+                &payload_sha256,
+            )
+            .expect_err("unsafe retained evidence must fail closed");
+            let content = error.structured_content.expect("structured custody error");
+            assert_eq!(content["retry_decision"], "do_not_retry_same_attempt");
+            assert_eq!(content["lease_decision"], "not_acquired");
+            assert_eq!(content["lease_retained"], Value::Null);
+            assert_eq!(content["custody_status"], "inspection_failed");
+            assert_eq!(content["provider_calls"], 0);
+            remove_test_path(&root);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_reconciliation_stops_at_held_guard() {
+        let root = private_test_root("reconcile-guard");
+        let plan = "a".repeat(64);
+        let owner =
+            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
+                .expect("held owner");
+        let error = inspect_retained_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "db-1",
+            "newsletter-core",
+            &plan,
+            &owner.identity.nonce,
+            &owner.identity.payload_sha256,
+        )
+        .expect_err("held guard must stop reconciliation");
+        assert_eq!(
+            error.structured_content.expect("guard error")["error"]["code"],
+            "d1.migration_reconciliation_guard_locked"
+        );
+        drop(owner);
         fs::remove_dir_all(root).expect("test cleanup");
     }
 }

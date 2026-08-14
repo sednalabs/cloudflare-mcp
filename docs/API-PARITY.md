@@ -21,6 +21,7 @@ preferred path for safety-sensitive operations.
   workflows use `d1_list_databases`, `d1_get_database`, `d1_inspect_schema`,
   `d1_query_read_only`, `d1_validate_query`, `d1_execute_write`,
   `d1_apply_migrations`, `d1_apply_migration_manifest`,
+  `d1_reconcile_migration_manifest`,
   `d1_rename_database`, and `d1_delete_database`;
   Workers Analytics Engine workflows use
   `analytics_engine_list_datasets`, `analytics_engine_describe_schema`,

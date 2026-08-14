@@ -1,5 +1,6 @@
 use std::cmp;
 use std::collections::BTreeSet;
+use std::fmt;
 use std::future::Future;
 use std::io::Write;
 use std::path::Path;
@@ -9,7 +10,7 @@ use futures::StreamExt;
 use hmac::{Hmac, Mac};
 use reqwest::StatusCode;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -115,6 +116,7 @@ impl AdapterError {
 pub struct CloudflareClient {
     pub(crate) cfg: CloudflareApiConfig,
     pub(crate) http: reqwest::Client,
+    reconciliation_http: reqwest::Client,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -225,6 +227,93 @@ impl RetryPolicy {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct D1MigrationReconciliationBatch {
+    pub(crate) result: Value,
+    pub(crate) response_body_sha256: String,
+    pub(crate) response_body_size_bytes: usize,
+    pub(crate) lifecycle: D1MigrationReconciliationReadLifecycle,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct D1MigrationReconciliationBatchError {
+    pub(crate) error: AdapterErrorPayload,
+    pub(crate) response_body_sha256: Option<String>,
+    pub(crate) response_body_size_bytes: Option<usize>,
+    pub(crate) lifecycle: D1MigrationReconciliationReadLifecycle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct D1MigrationReconciliationReadLifecycle {
+    pub(crate) dispatch_stage: &'static str,
+    pub(crate) response_stage: &'static str,
+    pub(crate) body_stage: &'static str,
+    pub(crate) http_status: Option<u16>,
+}
+
+impl D1MigrationReconciliationReadLifecycle {
+    const fn pre_dispatch() -> Self {
+        Self {
+            dispatch_stage: "pre_dispatch",
+            response_stage: "not_received",
+            body_stage: "not_read",
+            http_status: None,
+        }
+    }
+
+    const fn attempted_without_response() -> Self {
+        Self {
+            dispatch_stage: "attempted",
+            response_stage: "not_received",
+            body_stage: "not_read",
+            http_status: None,
+        }
+    }
+
+    const fn response_received(http_status: u16) -> Self {
+        Self {
+            dispatch_stage: "attempted",
+            response_stage: "received",
+            body_stage: "not_read",
+            http_status: Some(http_status),
+        }
+    }
+
+    const fn body_partially_read(http_status: u16) -> Self {
+        Self {
+            dispatch_stage: "attempted",
+            response_stage: "received",
+            body_stage: "partially_read",
+            http_status: Some(http_status),
+        }
+    }
+
+    fn body_read_failed(http_status: u16, bytes_read: usize) -> Self {
+        if bytes_read == 0 {
+            Self::response_received(http_status)
+        } else {
+            Self::body_partially_read(http_status)
+        }
+    }
+
+    const fn body_completely_read(http_status: u16) -> Self {
+        Self {
+            dispatch_stage: "attempted",
+            response_stage: "received",
+            body_stage: "completely_read",
+            http_status: Some(http_status),
+        }
+    }
+
+    pub(crate) fn provider_calls(self) -> usize {
+        if self.dispatch_stage == "attempted" {
+            1
+        } else {
+            0
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum D1EnvelopePolicy {
     Generic,
@@ -281,7 +370,22 @@ impl CloudflareClient {
                     "Verify TLS/runtime dependencies and CLOUDFLARE_MCP_API_TIMEOUT_MS settings.",
                 )
             })?;
-        Ok(Self { cfg, http })
+        let reconciliation_http = reqwest::Client::builder()
+            .timeout(cfg.request_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|err| {
+                AdapterError::new(
+                    "cloudflare.client_init_failed",
+                    format!("failed to create reconciliation HTTP client: {err}"),
+                    "Verify TLS/runtime dependencies and CLOUDFLARE_MCP_API_TIMEOUT_MS settings.",
+                )
+            })?;
+        Ok(Self {
+            cfg,
+            http,
+            reconciliation_http,
+        })
     }
 
     pub fn default_account_id(&self) -> Option<&str> {
@@ -565,6 +669,179 @@ impl CloudflareClient {
             params,
         )
         .await
+    }
+
+    /// Execute one internally constructed read-only reconciliation batch.
+    ///
+    /// Unlike the general D1 read adapter, this boundary performs exactly one
+    /// HTTP attempt and retains a digest of the exact response bytes. The
+    /// reconciliation state machine owns any subsequent complete read and
+    /// compares canonical evidence across the two calls itself.
+    pub(crate) async fn query_d1_migration_reconciliation_batch(
+        &self,
+        account_id: &str,
+        database_id: &str,
+        sql: &str,
+    ) -> Result<D1MigrationReconciliationBatch, D1MigrationReconciliationBatchError> {
+        const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+        let account_id = require_non_empty("account_id", account_id).map_err(|error| {
+            D1MigrationReconciliationBatchError {
+                error: error.payload(),
+                response_body_sha256: None,
+                response_body_size_bytes: None,
+                lifecycle: D1MigrationReconciliationReadLifecycle::pre_dispatch(),
+            }
+        })?;
+        let database_id = require_non_empty("database_id", database_id).map_err(|error| {
+            D1MigrationReconciliationBatchError {
+                error: error.payload(),
+                response_body_sha256: None,
+                response_body_size_bytes: None,
+                lifecycle: D1MigrationReconciliationReadLifecycle::pre_dispatch(),
+            }
+        })?;
+        let sql =
+            require_non_empty("sql", sql).map_err(|error| D1MigrationReconciliationBatchError {
+                error: error.payload(),
+                response_body_sha256: None,
+                response_body_size_bytes: None,
+                lifecycle: D1MigrationReconciliationReadLifecycle::pre_dispatch(),
+            })?;
+        let token = self
+            .bearer_token()
+            .map_err(|error| D1MigrationReconciliationBatchError {
+                error: error.payload(),
+                response_body_sha256: None,
+                response_body_size_bytes: None,
+                lifecycle: D1MigrationReconciliationReadLifecycle::pre_dispatch(),
+            })?;
+        let url = self.endpoint(&format!(
+            "/accounts/{}/d1/database/{}/query",
+            path_segment(account_id),
+            path_segment(database_id),
+        ));
+        let response = self
+            .reconciliation_http
+            .post(url)
+            .bearer_auth(&token)
+            .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone())
+            .json(&json!({"sql": sql}))
+            .send()
+            .await
+            .map_err(|error| {
+                let retryable = error.is_timeout() || error.is_connect() || error.is_request();
+                let code = if error.is_timeout() {
+                    "cloudflare.timeout"
+                } else {
+                    "cloudflare.transport_error"
+                };
+                D1MigrationReconciliationBatchError {
+                    error: AdapterError::new(
+                        code,
+                        format!(
+                            "cloudflare.d1.migration_reconciliation.query request failed: {error}"
+                        ),
+                        "Treat reconciliation evidence as unavailable; do not retry the retained migration attempt.",
+                    )
+                    .with_retryable(retryable)
+                    .payload(),
+                    response_body_sha256: None,
+                    response_body_size_bytes: None,
+                    lifecycle:
+                        D1MigrationReconciliationReadLifecycle::attempted_without_response(),
+                }
+            })?;
+        let status = response.status();
+        let status_code = status.as_u16();
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(D1MigrationReconciliationBatchError {
+                error: AdapterError::new(
+                    "cloudflare.d1.migration_reconciliation_response_too_large",
+                    "Cloudflare reconciliation response exceeded the exact-evidence byte limit",
+                    "Reduce the bounded expectation scope; retain the lease and do not retry the migration attempt.",
+                )
+                .with_status(Some(status.as_u16()))
+                .payload(),
+                response_body_sha256: None,
+                response_body_size_bytes: response.content_length().map(|length| length as usize),
+                lifecycle: D1MigrationReconciliationReadLifecycle::response_received(status_code),
+            });
+        }
+        let initial_capacity = response
+            .content_length()
+            .map(|length| cmp::min(length as usize, MAX_RESPONSE_BYTES))
+            .unwrap_or(0);
+        let mut bytes = Vec::with_capacity(initial_capacity);
+        let mut hasher = Sha256::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| D1MigrationReconciliationBatchError {
+                error: AdapterError::new(
+                    "cloudflare.response_read_failed",
+                    format!("failed reading Cloudflare reconciliation response body: {error}"),
+                    "Treat reconciliation evidence as unavailable; do not retry the retained migration attempt.",
+                )
+                .with_status(Some(status_code))
+                .payload(),
+                response_body_sha256: None,
+                response_body_size_bytes: Some(bytes.len()),
+                lifecycle: D1MigrationReconciliationReadLifecycle::body_read_failed(
+                    status_code,
+                    bytes.len(),
+                ),
+            })?;
+            let observed_size = bytes.len().saturating_add(chunk.len());
+            if observed_size > MAX_RESPONSE_BYTES {
+                return Err(D1MigrationReconciliationBatchError {
+                    error: AdapterError::new(
+                        "cloudflare.d1.migration_reconciliation_response_too_large",
+                        "Cloudflare reconciliation response exceeded the exact-evidence byte limit",
+                        "Reduce the bounded expectation scope; retain the lease and do not retry the migration attempt.",
+                    )
+                    .with_status(Some(status.as_u16()))
+                    .payload(),
+                    response_body_sha256: None,
+                    response_body_size_bytes: Some(observed_size),
+                    lifecycle:
+                        D1MigrationReconciliationReadLifecycle::body_partially_read(status_code),
+                });
+            }
+            hasher.update(&chunk);
+            bytes.extend_from_slice(&chunk);
+        }
+        let response_body_size_bytes = bytes.len();
+        let response_body_sha256 = format!("{:x}", hasher.finalize());
+        let evidence_error = |error: AdapterError| D1MigrationReconciliationBatchError {
+            error: error.payload(),
+            response_body_sha256: Some(response_body_sha256.clone()),
+            response_body_size_bytes: Some(response_body_size_bytes),
+            lifecycle: D1MigrationReconciliationReadLifecycle::body_completely_read(status_code),
+        };
+        let body = std::str::from_utf8(&bytes).map_err(|error| {
+            evidence_error(
+                AdapterError::new(
+                    "cloudflare.d1.migration_reconciliation_malformed_utf8",
+                    format!("Cloudflare reconciliation response was not valid UTF-8: {error}"),
+                    "Treat the provider evidence as contradictory and retain the lease.",
+                )
+                .with_status(Some(status_code)),
+            )
+        })?;
+        if !status.is_success() {
+            return Err(evidence_error(http_status_error(status, body)));
+        }
+        let envelope = decode_strict_d1_migration_reconciliation_envelope(body)
+            .map_err(|error| evidence_error(error.with_status(Some(status_code))))?;
+        Ok(D1MigrationReconciliationBatch {
+            result: envelope.result.unwrap_or(Value::Null),
+            response_body_sha256,
+            response_body_size_bytes,
+            lifecycle: D1MigrationReconciliationReadLifecycle::body_completely_read(status_code),
+        })
     }
 
     /// Submit one manifest-owned migration statement. The non-idempotent
@@ -3089,6 +3366,12 @@ fn decode_strict_d1_migration_manifest_envelope(
             )
         })?;
 
+    validate_strict_d1_migration_manifest_envelope(envelope)
+}
+
+fn validate_strict_d1_migration_manifest_envelope(
+    envelope: StrictD1MigrationManifestEnvelope<Value>,
+) -> Result<CloudflareEnvelope<Value>, AdapterError> {
     let errors = match envelope.errors {
         Some(Value::Array(errors)) if errors.is_empty() => Vec::new(),
         Some(Value::Array(_)) => {
@@ -3129,6 +3412,155 @@ fn decode_strict_d1_migration_manifest_envelope(
         messages: Vec::new(),
         result_info: None,
     })
+}
+
+const DUPLICATE_JSON_OBJECT_KEY_MARKER: &str = "duplicate JSON object key";
+
+struct DuplicateSafeJsonValue(Value);
+
+enum DuplicateSafeJsonError {
+    DuplicateObjectKey,
+    Malformed(serde_json::Error),
+}
+
+impl<'de> Deserialize<'de> for DuplicateSafeJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DuplicateSafeJsonValueVisitor)
+    }
+}
+
+struct DuplicateSafeJsonValueVisitor;
+
+impl<'de> Visitor<'de> for DuplicateSafeJsonValueVisitor {
+    type Value = DuplicateSafeJsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(DuplicateSafeJsonValue(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(DuplicateSafeJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(DuplicateSafeJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .map(DuplicateSafeJsonValue)
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_string(value.to_string())
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(DuplicateSafeJsonValue(Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(DuplicateSafeJsonValue(Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(DuplicateSafeJsonValue(Value::Null))
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        DuplicateSafeJsonValue::deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+        while let Some(value) = sequence.next_element::<DuplicateSafeJsonValue>()? {
+            values.push(value.0);
+        }
+        Ok(DuplicateSafeJsonValue(Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = Map::new();
+        while let Some(key) = object.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(serde::de::Error::custom(DUPLICATE_JSON_OBJECT_KEY_MARKER));
+            }
+            let value = object.next_value::<DuplicateSafeJsonValue>()?;
+            values.insert(key, value.0);
+        }
+        Ok(DuplicateSafeJsonValue(Value::Object(values)))
+    }
+}
+
+fn decode_strict_d1_migration_reconciliation_envelope(
+    body: &str,
+) -> Result<CloudflareEnvelope<Value>, AdapterError> {
+    let value = decode_json_rejecting_duplicate_object_keys(body).map_err(|error| match error {
+        DuplicateSafeJsonError::DuplicateObjectKey => reconciliation_duplicate_object_key_error(),
+        DuplicateSafeJsonError::Malformed(error) => AdapterError::new(
+            "cloudflare.d1.migration_manifest_malformed_envelope",
+            format!("failed decoding strict D1 reconciliation envelope: {error}"),
+            "Treat the provider evidence as contradictory and retain the lease.",
+        ),
+    })?;
+    let envelope: StrictD1MigrationManifestEnvelope<Value> = serde_json::from_value(value)
+        .map_err(|error| {
+            AdapterError::new(
+                "cloudflare.d1.migration_manifest_malformed_envelope",
+                format!("failed decoding strict D1 reconciliation envelope: {error}"),
+                "Treat the provider evidence as contradictory and retain the lease.",
+            )
+        })?;
+    validate_strict_d1_migration_manifest_envelope(envelope)
+}
+
+fn decode_json_rejecting_duplicate_object_keys(
+    body: &str,
+) -> Result<Value, DuplicateSafeJsonError> {
+    let mut deserializer = serde_json::Deserializer::from_str(body);
+    let value = DuplicateSafeJsonValue::deserialize(&mut deserializer).map_err(|error| {
+        if error.to_string().contains(DUPLICATE_JSON_OBJECT_KEY_MARKER) {
+            DuplicateSafeJsonError::DuplicateObjectKey
+        } else {
+            DuplicateSafeJsonError::Malformed(error)
+        }
+    })?;
+    deserializer
+        .end()
+        .map_err(DuplicateSafeJsonError::Malformed)?;
+    Ok(value.0)
+}
+
+fn reconciliation_duplicate_object_key_error() -> AdapterError {
+    AdapterError::new(
+        "cloudflare.d1.migration_reconciliation_duplicate_object_key",
+        "Cloudflare reconciliation response contained a duplicate JSON object key",
+        "Treat the provider evidence as contradictory and retain the lease.",
+    )
 }
 
 fn header_value(name: &'static str, value: &str) -> Result<HeaderValue, AdapterError> {
@@ -3743,10 +4175,12 @@ mod tests {
     use axum::routing::{get, post, put};
     use axum::{Json, Router};
     use serde_json::{Value, json};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     use super::{
-        AdapterError, CloudflareApiError, CloudflareClient, is_d1_sqlite_auth_error, path_segment,
+        AdapterError, CloudflareApiError, CloudflareClient, D1MigrationReconciliationReadLifecycle,
+        decode_strict_d1_migration_reconciliation_envelope, is_d1_sqlite_auth_error, path_segment,
         with_request_api_token_override, worker_listing_identity, worker_version_id,
         worker_version_page_metadata,
     };
@@ -3794,6 +4228,10 @@ mod tests {
         format!("http://{}", addr)
     }
 
+    fn refused_loopback_url(path: &str) -> String {
+        format!("http://{}:9/{path}", std::net::Ipv4Addr::LOCALHOST) // DevSkim: ignore DS137138 -- loopback-only transport fixture
+    }
+
     #[test]
     fn path_segment_encodes_separators() {
         assert_eq!(path_segment("zone/one two"), "zone%2Fone%20two");
@@ -3820,6 +4258,287 @@ mod tests {
             )
             .await
             .expect("encoded D1 query");
+    }
+
+    #[tokio::test]
+    async fn oversized_reconciliation_response_preserves_http_status() {
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let router = Router::new().route(
+                "/accounts/acct-1/d1/database/db-1/query",
+                post(move || async move {
+                    let oversized_body = vec![b'x'; 16 * 1024 * 1024 + 1];
+                    Response::builder()
+                        .status(status)
+                        .header("content-length", oversized_body.len().to_string())
+                        .body(Body::from(oversized_body))
+                        .expect("oversized response")
+                }),
+            );
+            let base = spawn_router(router).await;
+            let client = CloudflareClient::new(test_config(base)).expect("client");
+            let error = client
+                .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+                .await
+                .expect_err("oversized reconciliation response must fail closed");
+            assert_eq!(
+                error.error.code,
+                "cloudflare.d1.migration_reconciliation_response_too_large"
+            );
+            assert_eq!(error.error.status, Some(status.as_u16()));
+            assert_eq!(error.response_body_sha256, None);
+            assert_eq!(error.lifecycle.provider_calls(), 1);
+            assert_eq!(
+                error.lifecycle,
+                D1MigrationReconciliationReadLifecycle::response_received(status.as_u16())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciliation_pre_dispatch_failure_has_zero_provider_calls() {
+        let mut cfg = test_config(refused_loopback_url("pre-dispatch"));
+        cfg.api_token = None;
+        let client = CloudflareClient::new(cfg).expect("client");
+        let error = client
+            .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+            .await
+            .expect_err("missing token must fail before dispatch");
+        assert_eq!(error.error.code, "cloudflare.config_missing_token");
+        assert_eq!(error.error.status, None);
+        assert_eq!(error.lifecycle.provider_calls(), 0);
+        assert_eq!(
+            error.lifecycle,
+            D1MigrationReconciliationReadLifecycle::pre_dispatch()
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_transport_failure_records_attempt_without_response() {
+        let client =
+            CloudflareClient::new(test_config(refused_loopback_url("attempted"))).expect("client");
+        let error = client
+            .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+            .await
+            .expect_err("closed loopback port must fail after dispatch attempt");
+        assert_eq!(error.error.status, None);
+        assert_eq!(error.lifecycle.provider_calls(), 1);
+        assert_eq!(
+            error.lifecycle,
+            D1MigrationReconciliationReadLifecycle::attempted_without_response()
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_stream_failures_distinguish_zero_and_partial_body_reads() {
+        async fn spawn_truncated_response(
+            prefix: Option<Bytes>,
+            calls: Arc<AtomicUsize>,
+        ) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0") // DevSkim: ignore DS162092 -- loopback-only reconciliation stream fixture
+                .await
+                .expect("bind truncated response fixture");
+            let addr = listener.local_addr().expect("truncated fixture address");
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept request");
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 1024];
+                    let count = stream.read(&mut chunk).await.expect("read request");
+                    assert!(count > 0, "request closed before complete headers and body");
+                    request.extend_from_slice(&chunk[..count]);
+                    let Some(header_end) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let header_end = header_end + 4;
+                    let headers = std::str::from_utf8(&request[..header_end])
+                        .expect("request headers are UTF-8");
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().expect("content length"))
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + content_length {
+                        break;
+                    }
+                }
+                calls.fetch_add(1, Ordering::SeqCst);
+                stream
+                    .write_all(b"HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 64\r\n\r\n")
+                    .await
+                    .expect("write truncated response headers");
+                if let Some(prefix) = prefix {
+                    stream
+                        .write_all(&prefix)
+                        .await
+                        .expect("write partial response body");
+                }
+            });
+            format!("http://{addr}") // DevSkim: ignore DS137138 -- loopback-only reconciliation stream fixture
+        }
+
+        for (prefix, expected_size, expected_lifecycle) in [
+            (
+                None,
+                0,
+                D1MigrationReconciliationReadLifecycle::response_received(503),
+            ),
+            (
+                Some(Bytes::from_static(b"{")),
+                1,
+                D1MigrationReconciliationReadLifecycle::body_partially_read(503),
+            ),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let base = spawn_truncated_response(prefix, calls.clone()).await;
+            let client = CloudflareClient::new(test_config(base)).expect("client");
+            let error = client
+                .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+                .await
+                .expect_err("incomplete response stream must fail closed");
+
+            assert_eq!(error.error.code, "cloudflare.response_read_failed");
+            assert_eq!(error.error.status, Some(503));
+            assert!(!error.error.retryable);
+            assert_eq!(error.response_body_sha256, None);
+            assert_eq!(error.response_body_size_bytes, Some(expected_size));
+            assert_eq!(error.lifecycle, expected_lifecycle);
+            assert_eq!(error.lifecycle.provider_calls(), 1);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciliation_redirect_is_not_followed() {
+        let redirect_location = refused_loopback_url("must-not-be-followed");
+        let router = Router::new().route(
+            "/accounts/acct-1/d1/database/db-1/query",
+            post(move || {
+                let redirect_location = redirect_location.clone();
+                async move {
+                    Response::builder()
+                        .status(StatusCode::FOUND)
+                        .header("location", redirect_location)
+                        .body(Body::empty())
+                        .expect("redirect response")
+                }
+            }),
+        );
+        let base = spawn_router(router).await;
+        let client = CloudflareClient::new(test_config(base)).expect("client");
+        let error = client
+            .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+            .await
+            .expect_err("redirect is contradictory evidence");
+        assert_eq!(error.error.status, Some(302));
+        assert_eq!(error.lifecycle.provider_calls(), 1);
+        assert_eq!(
+            error.lifecycle,
+            D1MigrationReconciliationReadLifecycle::body_completely_read(302)
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_reconciliation_bodies_preserve_http_status() {
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let router = Router::new().route(
+                "/accounts/acct-1/d1/database/db-1/query",
+                post(move || async move {
+                    Response::builder()
+                        .status(status)
+                        .body(Body::from(vec![0xff, 0xfe]))
+                        .expect("malformed UTF-8 response")
+                }),
+            );
+            let base = spawn_router(router).await;
+            let client = CloudflareClient::new(test_config(base)).expect("client");
+            let error = client
+                .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+                .await
+                .expect_err("malformed UTF-8 must fail closed");
+            assert_eq!(
+                error.error.code,
+                "cloudflare.d1.migration_reconciliation_malformed_utf8"
+            );
+            assert_eq!(error.error.status, Some(status.as_u16()));
+            assert_eq!(
+                error.lifecycle,
+                D1MigrationReconciliationReadLifecycle::body_completely_read(status.as_u16())
+            );
+        }
+
+        let router = Router::new().route(
+            "/accounts/acct-1/d1/database/db-1/query",
+            post(|| async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::from("{"))
+                    .expect("malformed JSON response")
+            }),
+        );
+        let base = spawn_router(router).await;
+        let client = CloudflareClient::new(test_config(base)).expect("client");
+        let error = client
+            .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+            .await
+            .expect_err("malformed JSON must fail closed");
+        assert_eq!(error.error.status, Some(200));
+        assert_eq!(
+            error.lifecycle,
+            D1MigrationReconciliationReadLifecycle::body_completely_read(200)
+        );
+    }
+
+    #[test]
+    fn reconciliation_decoder_rejects_recursive_duplicate_object_keys_in_both_orders() {
+        let duplicate_pairs = [("false", "true"), ("true", "false")];
+        for (first, second) in duplicate_pairs {
+            let (numeric_first, numeric_second) = if first == "false" { (1, 2) } else { (2, 1) };
+            let cases = [
+                format!(r#"{{"success":{first},"success":{second},"errors":[],"result":[]}}"#),
+                format!(
+                    r#"{{"success":true,"errors":[],"result":[{{"success":{first},"success":{second},"errors":[],"results":[],"meta":{{}}}}]}}"#
+                ),
+                format!(
+                    r#"{{"success":true,"errors":[],"result":[{{"success":true,"errors":[],"results":[],"meta":{{"served_by_primary":{first},"served_by_primary":{second}}}}}]}}"#
+                ),
+                format!(
+                    r#"{{"success":true,"errors":[],"result":[{{"success":true,"errors":[{{"code":{numeric_first},"code":{numeric_second}}}],"results":[],"meta":{{}}}}]}}"#
+                ),
+                format!(
+                    r#"{{"success":true,"errors":[],"result":[{{"success":true,"errors":[],"results":[{{"id":{numeric_first},"id":{numeric_second}}}],"meta":{{}}}}]}}"#
+                ),
+            ];
+            for body in cases {
+                let error = decode_strict_d1_migration_reconciliation_envelope(&body)
+                    .expect_err("every recursive duplicate object key must fail closed");
+                assert_eq!(
+                    error.code,
+                    "cloudflare.d1.migration_reconciliation_duplicate_object_key"
+                );
+                assert_eq!(
+                    error.message,
+                    "Cloudflare reconciliation response contained a duplicate JSON object key"
+                );
+            }
+        }
+
+        let envelope = decode_strict_d1_migration_reconciliation_envelope(
+            r#"{"success":true,"errors":[],"result":[{"success":true,"errors":[],"results":[{"id":1}],"meta":{"served_by_primary":true}}]}"#,
+        )
+        .expect("duplicate-free nested reconciliation envelope");
+        assert!(envelope.success);
+        assert!(envelope.result.is_some());
     }
 
     #[tokio::test]

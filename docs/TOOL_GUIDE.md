@@ -73,11 +73,78 @@ Use curated D1 tools instead of generic API calls for database workflows:
 - `d1_execute_write`
 - `d1_apply_migrations`
 - `d1_apply_migration_manifest`
+- `d1_reconcile_migration_manifest`
 - `d1_rename_database`
 - `d1_delete_database`
 
 Read/query tools use restricted SQL checks. Write and migration tools preserve
 dry-run discipline and fail closed on unsafe or ambiguous state.
+
+Use `d1_reconcile_migration_manifest` only for exact retained
+`active.lease.json` or `retiring.lease.json` evidence after an ambiguous
+manifest apply. Supply the complete exact-byte manifest and one complete
+expected schema state for every prefix from zero through the full manifest.
+The tool derives every CREATE TABLE/INDEX target from the manifest and rejects
+omissions, additions, data-producing CREATE forms, malformed result metadata,
+and result sets whose query-bound statement marker is absent or changed. It
+also requires every fixed result set in both batches to carry exact
+`meta.served_by_primary=true` evidence; absent, false, null, non-boolean, or
+mixed primary markers are contradictory and cannot support positive
+reconciliation. It performs two bounded read-only batches and never retires
+custody evidence or authorizes an apply retry. The boundary does not follow
+HTTP redirects and returns one chronological `provider_read_lifecycle` entry
+per invocation, distinguishing pre-dispatch, attempted-without-response,
+response received, partial/complete body read, and captured HTTP status. A
+reconciliation-local recursive decoder rejects duplicate object keys in a
+successful-status body before
+the raw provider JSON can collapse into a value, across the outer envelope and
+nested result, metadata, error, and row objects in either order. Rejection keeps
+the exact raw digest, size, status, lifecycle, and retained-custody evidence but
+never exposes the duplicate key or body content. This does not broaden generic
+Cloudflare response paths or the migration-write JSON policy. A
+stream failure before any body byte is `not_read`; it is `partially_read` only
+after at least one byte was accumulated. Local token/config failure therefore
+reports zero provider calls. Validation or
+custody-inspection failure before adapter invocation instead reports
+`provider_calls=0` with an empty lifecycle array. A null `lease_retained` with
+`custody_status=not_inspected` or `inspection_failed` means no retained lease
+was acquired or proven by that call; it is not evidence that custody was
+removed. Likewise, `custody_status=retained_evidence_unverified` after a
+revalidation failure means retain and inspect the named evidence manually;
+HTTP 429 and 5xx reads are unavailable evidence and are not retried, even when
+their response body is malformed, truncated, or exceeds the byte bound; 401
+and 403 are unavailable under the same no-retry rule. HTTP status remains
+attached to invalid UTF-8, malformed JSON, partial-read, and oversized evidence.
+Post-read ledger/schema/evidence
+contradictions keep verified custody and exact provider-call accounting unless
+custody itself fails revalidation. Custody is revalidated after every attempted
+provider call, including an unavailable/error response; a simultaneous custody
+failure preserves the provider classification and response evidence but reports
+`lease_retained=null`. When a later call fails, `response_evidence` remains in
+provider-call order rather than replacing evidence from an earlier call, but it
+contains only captured response bodies. Top-level `provider_read_lifecycle` is
+the separate complete invocation chronology, so a second no-response transport
+or pre-dispatch failure is retained even though it cannot add a response
+summary. Invocation position and count, not response-value equality, determine
+that chronology: two byte-identical successful reads remain two evidence and
+lifecycle entries, while reprocessing an already merged product is idempotent.
+After a completed first read that aggregate operation reports two
+provider calls only when the second invocation reaches transport. A second
+pre-dispatch failure retains both lifecycle entries but reports one actual
+provider call; standalone pre-dispatch failure remains zero provider calls.
+
+Public tool semantic validation runs in target, migrations-table, manifest,
+then migration-family order. A failure at any of those boundaries returns the
+complete reconciliation envelope with `capability_state=contradictory`,
+`custody_status=not_inspected`, `query_sha256=null`, empty response and
+lifecycle evidence, both mutation counts zero, `provider_calls=0`, and
+`retry_decision=do_not_retry_same_attempt`; it never opens lease custody or
+contacts D1. JSON-RPC and generated-schema parse failures occur before semantic
+tool execution and remain MCP deserialization errors without fabricated
+structured reconciliation evidence.
+Target validation includes an omitted `account_id` when no configured default
+account exists; that condition is semantic zero-call evidence, not a JSON-RPC
+or generated-schema failure.
 
 For D1 usage-spike investigations, start with `account_billing_usage` to read
 Cloudflare billing usage records, then use `graphql_analytics_query` for

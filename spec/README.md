@@ -97,5 +97,11 @@ Preserved curated tool families:
   `d1_inspect_schema` supports targeted `include_tables`/`include_table_pattern`
   filtering and must keep Cloudflare internal `_cf_*` objects out of
   application `column_errors`.
+- Retained-manifest reconciliation (`d1_reconcile_migration_manifest`) is a
+  first-class read-only D1 recovery contract. Keep its exact structured
+  expectation schema, manifest-derived complete prefix inventory, query-bound
+  statement markers, bounded streaming, truthful custody classification, and
+  real MCP stdio negative/no-retry/no-custody-mutation proof aligned with the
+  snapshot.
 - Workers Analytics Engine read tools (`analytics_engine_list_datasets`, `analytics_engine_query`, `analytics_engine_describe_schema`, `analytics_engine_validate_query`) are first-class contract tools for Account Analytics Read workflows and must remain present even when broad API parity is available.
 - Queues readback tools (`queues_list`, `queues_get`, `queues_get_metrics`, `queues_list_consumers`, `queues_health`) are first-class contract tools and must remain present for operational backlog/DLQ/consumer diagnostics.

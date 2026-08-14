@@ -130,6 +130,119 @@ do not share that root. The product-neutral governed recovery path remains
 required for retained, malformed, or tampered evidence. Non-Linux installations or
 unsupported filesystems fail closed before provider I/O.
 
+### Read-only retained-manifest reconciliation
+
+When an ambiguous apply retains `active.lease.json` or a failed terminal move
+leaves `retiring.lease.json`, use `d1_reconcile_migration_manifest`; do not run
+the apply tool again. Supply the same complete exact-byte manifest and the
+reported approved-plan, nonce, and payload digests. Also supply ordered,
+bounded `state_expectations` for every manifest prefix from zero through the
+full manifest; a selected or partial prefix set is not accepted. Each state
+names the exact `sqlite_master` object type/name/table and SQL digest, complete
+`table_xinfo` rows, and complete foreign-key definitions for every declared
+table. The tool independently derives every CREATE target at every prefix and
+requires exact agreement, so a caller cannot omit a created table or index and
+obtain convergence.
+
+The current built-in effect registry accepts only
+`effect_assertion_id=schema_create_only_v1`. It independently classifies the
+exact manifest SQL and refuses arbitrary DML, ALTER, DROP, PRAGMA, trigger,
+view, virtual table, `CREATE TABLE AS SELECT`, `CREATE TABLE AS VALUES`, or
+other data-producing/unclassified CREATE effects; a caller assertion that work
+was schema-only is not proof. An effect capability gap means retain the lease
+and add a purpose-built registry assertion/readback contract before continuing.
+
+The tool opens the existing target and guard without creating entries, requires
+exactly one active or retiring regular private evidence file, and holds the
+guard across two complete internally generated read-only batches. It returns
+`not_committed`, `partial_state_converged`, or `full_state_converged` only when
+the current ledger is an exact manifest prefix, the retained approved plan
+reconstructs uniquely from that prefix relationship, both canonical snapshots
+match, and schema/FK proof is complete. These labels are documented atomic-state
+inference, not proof of which provider attempt caused the state.
+
+Every fixed result set carries a query-bound statement marker and a mandatory
+sentinel row, including result sets with no data rows. Parsing requires the
+exact marker, exact row shape, explicit success, empty errors, and—when
+present—boolean `changed_db=false` plus integer `changes=0` and
+`rows_written=0`. Every fixed result set in both batches must also carry exact
+`meta.served_by_primary=true`; missing metadata or a false, null, non-boolean,
+or mixed primary marker fails closed as contradictory evidence. Response bodies
+are capped at 16 MiB from the HTTP stream; the adapter stops before buffering a
+body beyond that bound.
+
+Before any successful-status reconciliation response object is converted to
+`serde_json::Value`, the bounded raw body is decoded through a reconciliation-
+local recursive visitor that rejects duplicate keys in the outer envelope and
+every nested object, including result, metadata, error, and row objects. Either
+key order fails as contradictory evidence. The exact raw-body digest, byte
+count, HTTP status, and completed-read lifecycle are captured first; no key or
+value from the rejected body is returned. This stricter decoder is deliberately
+limited to reconciliation reads and does not change generic Cloudflare response
+paths or the migration-write decoder.
+
+The reconciliation HTTP client does not follow redirects. Interpret
+`provider_read_lifecycle` in order: `pre_dispatch` means no provider call;
+`attempted` with `not_received` means transport outcome without a response;
+`received` plus `not_read`, `partially_read`, or `completely_read` records the
+body boundary and exact captured HTTP status. A response-stream failure is
+`not_read` when zero body bytes were accumulated and `partially_read` only
+after at least one byte was accumulated. Preserve the status for invalid
+UTF-8, malformed JSON, truncated streams, and oversized bodies. Treat 401,
+403, 429, and every 5xx as unavailable and never retry the same attempt.
+
+Interpret custody fields literally. Validation failures before custody lookup
+return `lease_retained=null` and `custody_status=not_inspected`. Inspection
+failures return `lease_retained=null` and `custody_status=inspection_failed`.
+Both are before provider-adapter invocation and must explicitly return
+`provider_calls=0` with `provider_read_lifecycle=[]`; missing fields are not
+zero-call evidence. Adapter-local token/config failure is different: it records
+one `pre_dispatch` lifecycle entry even though its provider-call count is zero.
+Public semantic validation is ordered target, migrations table, manifest, then
+migration family. Any failure there returns the complete fail-closed
+reconciliation envelope with contradictory capability, uninspected custody,
+null query digest, empty response/lifecycle evidence, and zero provider or
+local mutations; it does not acquire lease custody or contact D1. JSON-RPC and
+generated-schema parse failures remain MCP deserialization errors without a
+structured reconciliation envelope because semantic tool execution has not
+begun.
+An omitted `account_id` with no configured default is part of target semantic
+validation and must return that same zero-call envelope before any lease or D1
+access.
+Only a successfully acquired and revalidated retained lease may report
+`lease_retained=true` and `custody_status=retained_evidence_verified`. If that
+evidence drifts, conflicts, or fails revalidation around a provider read, the
+result returns `lease_retained=null` and
+`custody_status=retained_evidence_unverified`; do not infer that the named
+evidence was removed. HTTP 429 and 5xx responses make provider evidence
+unavailable and never authorize an automatic retry, including when the body
+exceeds the streaming byte bound. Contradictory ledger, schema, plan, or
+two-read evidence discovered after successful custody revalidation reports the
+retained evidence as verified and includes the exact two provider calls; only
+custody drift changes that status to unverified. `response_evidence` records
+only captured response bodies; `provider_read_lifecycle` independently records
+every invocation. Invocation position and count, not response-value equality,
+determine that chronology: two byte-identical successful reads remain two
+evidence and lifecycle entries, while reprocessing an already merged product
+is idempotent. After one complete read, a second transport failure or
+pre-dispatch adapter failure therefore leaves one response summary but two
+chronological lifecycle entries. `provider_calls` counts only actual provider
+attempts: it is `1` when that second invocation fails before dispatch and `2`
+when the second invocation reaches transport. Standalone pre-dispatch failure
+remains zero provider calls.
+Revalidation runs after every
+attempted provider call even when the provider returns an error. If provider
+failure and custody drift coincide, retain the provider classification and
+chronological response evidence while treating custody as unverified; the
+`custody_cause` names the separate revalidation failure.
+
+All current results retain the lease and prohibit retry of the same migration
+attempt. Record the query SHA-256, both bounded response-body digests, canonical
+snapshot SHA-256, scope-completeness fields, and `reconciliation_plan_sha256`.
+Do not manually rename or remove custody evidence: durable terminal receipt and
+retirement are a separate guarded recovery phase and are not implemented by
+this read-only tool.
+
 For CI-built release bundles, the `Rust Validation` workflow uploads a
 downloadable artifact named `cloudflare-mcp-linux-x86_64-stdio-<git-sha>` that
 contains:
