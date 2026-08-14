@@ -242,7 +242,7 @@ impl D1MigrationLease {
             "ok": false, "operation": "d1_apply_migration_manifest",
             "status": "reconciliation_required", "lease_retained": true, "lease": self.identity,
             "error": {"code": "d1.migration_lease_release_failed", "message": message,
-                "hint": "Inspect the permanent target custody directory and reconcile the named owner through w11990 before another apply."}
+                "hint": "Inspect the permanent target custody directory and reconcile the named owner through the governed recovery path before another apply."}
         }))
     }
 
@@ -251,7 +251,7 @@ impl D1MigrationLease {
             "ok": false, "operation": "d1_apply_migration_manifest",
             "status": "reconciliation_required", "lease_retained": true, "lease": self.identity,
             "error": {"code": "d1.migration_lease_revalidation_failed", "message": message,
-                "hint": "Do not issue provider SQL. Reconcile the permanent target custody evidence through w11990 first."}
+                "hint": "Do not issue provider SQL. Reconcile the permanent target custody evidence through the governed recovery path first."}
         }))
     }
 }
@@ -267,9 +267,9 @@ pub(crate) fn d1_migration_lease_requirements(
         "target_key_sha256": sha256_bytes_hex(format!("{account_id}\0{database_id}").as_bytes()),
         "migration_family": family,
         "scope": "one permanent directory and guard per account/database target; family is evidence only and cannot split target serialization",
-        "active_evidence": "active.lease.json and transient retiring.lease.json are never auto-reclaimed; malformed, symlink, non-regular, or otherwise present active/retiring evidence stops the next apply for w11990 reconciliation",
+        "active_evidence": "active.lease.json and transient retiring.lease.json are never auto-reclaimed; malformed, symlink, non-regular, or otherwise present active/retiring evidence stops the next apply for governed reconciliation",
         "cross_host_limitation": "Cross-process serialization covers only hosts sharing the same configured operator-owned lease root. It is not a Cloudflare/provider-distributed lease.",
-        "platform_requirement": "Linux on a trusted filesystem supporting working renameat2 RENAME_NOREPLACE, directory fsync, and advisory file locks; unsupported platforms or filesystems fail closed before provider I/O. Cross-host or shared-filesystem semantics require separate proof; w11990 remains the governed recovery path."
+        "platform_requirement": "Linux on a trusted filesystem supporting working renameat2 RENAME_NOREPLACE, directory fsync, and advisory file locks; unsupported platforms or filesystems fail closed before provider I/O. Cross-host or shared-filesystem semantics require separate proof; retained evidence requires the governed recovery path."
     })
 }
 
@@ -766,7 +766,7 @@ mod linux {
         CallToolResult::structured_error(json!({
             "ok": false, "operation": "d1_apply_migration_manifest", "status": if valid { "lease_held" } else { "reconciliation_required" }, "lease_retained": true,
             "lease": {"target_key_sha256": &identity.target_key_sha256, "ownership": "active_or_unreadable"},
-            "operator_handoff": "Reconcile the permanent active target lease and its terminal provider evidence through w11990 before another apply. The MCP never auto-reclaims active evidence.",
+            "operator_handoff": "Reconcile the permanent active target lease and its terminal provider evidence through the governed recovery path before another apply. The MCP never auto-reclaims active evidence.",
             "error": {"code": code, "message": "this account/database target already has active migration custody evidence", "hint": "Do not run another migration family against this target until the active evidence is reconciled through the governed recovery path."}
         }))
     }
@@ -775,7 +775,7 @@ mod linux {
         CallToolResult::structured_error(json!({
             "ok": false, "operation": "d1_apply_migration_manifest", "status": "reconciliation_required", "lease_retained": true,
             "lease": {"target_key_sha256": &identity.target_key_sha256, "ownership": "retiring"},
-            "operator_handoff": "A prior terminal retirement did not complete cleanly. Reconcile the permanent retiring evidence through w11990 before another apply.",
+            "operator_handoff": "A prior terminal retirement did not complete cleanly. Reconcile the permanent retiring evidence through the governed recovery path before another apply.",
             "error": {"code": "d1.migration_target_retirement_unreconciled", "message": "this account/database target has retiring migration custody evidence", "hint": "Do not run another migration family against this target until the retiring evidence is reconciled through the governed recovery path."}
         }))
     }
@@ -876,7 +876,7 @@ mod linux {
         let aborted = abort_owned_active(target, active, active_identity, identity);
         CallToolResult::structured_error(json!({
             "ok": false, "operation": "d1_apply_migration_manifest", "status": "reconciliation_required", "lease_retained": !aborted, "lease": identity,
-            "operator_handoff": if aborted { "Creation was terminally recorded as aborted; begin again only with a fresh dry-run plan." } else { "Creation may have left active or retiring evidence; reconcile the named custody entry through w11990 before another apply." },
+            "operator_handoff": if aborted { "Creation was terminally recorded as aborted; begin again only with a fresh dry-run plan." } else { "Creation may have left active or retiring evidence; reconcile the named custody entry through the governed recovery path before another apply." },
             "error": {"code": code, "message": message, "hint": "No provider write was attempted by this failed custody creation."}
         }))
     }
@@ -947,7 +947,7 @@ mod linux {
         let metadata = active.metadata().map_err(|_| {
             CallToolResult::structured_error(json!({
                 "ok": false, "operation": "d1_apply_migration_manifest", "status": "reconciliation_required", "lease_retained": true,
-                "error": {"code": "d1.migration_lease_create_identity_failed", "message": "active migration lease identity could not be established", "hint": "Reconcile the active custody entry through w11990 before another apply."}
+                "error": {"code": "d1.migration_lease_create_identity_failed", "message": "active migration lease identity could not be established", "hint": "Reconcile the active custody entry through the governed recovery path before another apply."}
             }))
         })?;
         let active_identity = D1LeaseFileIdentity {

@@ -107,8 +107,8 @@ operator-surface memory bound.
 
 A later invocation stops before provider I/O when it sees an active or
 `retiring.lease.json` entry, including one that is malformed, a symlink or
-non-regular. It must be resolved only through governed recovery work item
-`w11990`, never inferred stale or reclaimed. Normal terminal completion moves
+non-regular. It must be resolved only through the governed recovery path,
+never inferred stale or reclaimed. Normal terminal completion moves
 the active file under the held guard to `retiring.lease.json`, synchronizes the
 target directory, then records `retired.<nonce>.lease.json` without replacement
 and synchronizes again. A failed synchronization restores the exact active
@@ -126,8 +126,8 @@ supports working `renameat2(RENAME_NOREPLACE)`, directory `fsync`, and advisory
 file locks. It is a shared-filesystem lease, not a Cloudflare-distributed lock;
 cross-host or other shared-filesystem semantics require separate proof.
 Separate provider/distributed coordination remains required when MCP instances
-do not share that root. `w11990` remains the governed recovery path for
-retained, malformed, or tampered evidence. Non-Linux installations or
+do not share that root. The product-neutral governed recovery path remains
+required for retained, malformed, or tampered evidence. Non-Linux installations or
 unsupported filesystems fail closed before provider I/O.
 
 For CI-built release bundles, the `Rust Validation` workflow uploads a

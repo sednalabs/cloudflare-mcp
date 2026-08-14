@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{Query, State};
 use axum::http::{
     HeaderMap, Method, Request, StatusCode,
@@ -44,6 +44,10 @@ use cloudflare_mcp::config::{
 use cloudflare_mcp::portal::PortalAgentClient;
 use cloudflare_mcp::server::CloudflareMcp;
 use cloudflare_mcp::upstream_oauth::CloudflareOAuthManager;
+
+// A complete 16 MiB exact-SQL manifest can expand substantially when encoded
+// as JSON. Bound the executable HTTP ingress before rmcp buffers or parses it.
+const MAX_MCP_HTTP_REQUEST_BODY_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone)]
 struct AppState {
@@ -530,31 +534,43 @@ async fn handle_mcp(State(state): State<AppState>, req: Request<Body>) -> Respon
 
     match method {
         Method::POST => {
-            if let Some(session_id) = session_id.clone() {
+            let selected_service = if let Some(session_id) = session_id.clone() {
                 if session_exists(&state, &session_id).await {
-                    return forward_service(state.service.clone(), req).await;
+                    Some(state.service.clone())
+                } else if let Some(stateless) = state.stateless_service.clone() {
+                    Some(stateless)
+                } else {
+                    return session_error(
+                        StatusCode::NOT_FOUND,
+                        "Invalid or expired session ID.",
+                        "Re-initialize with POST /mcp to obtain a new session id.",
+                    );
                 }
-                if let Some(stateless) = state.stateless_service.clone() {
-                    return forward_service(stateless, req).await;
-                }
-                return session_error(
-                    StatusCode::NOT_FOUND,
-                    "Invalid or expired session ID.",
-                    "Re-initialize with POST /mcp to obtain a new session id.",
-                );
+            } else {
+                None
+            };
+
+            if req
+                .headers()
+                .get(axum::http::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|length| length > MAX_MCP_HTTP_REQUEST_BODY_BYTES as u64)
+            {
+                return mcp_request_body_too_large();
             }
 
             let (parts, body) = req.into_parts();
-            let bytes = match axum::body::to_bytes(body, usize::MAX).await {
+            let bytes = match collect_mcp_post_body(body, MAX_MCP_HTTP_REQUEST_BODY_BYTES).await {
                 Ok(bytes) => bytes,
-                Err(_) => {
-                    return session_error(
-                        StatusCode::BAD_REQUEST,
-                        "Failed to read request body.",
-                        "Retry the request.",
-                    );
-                }
+                Err(response) => return response,
             };
+
+            if let Some(service) = selected_service {
+                let req = Request::from_parts(parts, Body::from(bytes));
+                return forward_service(service, req).await;
+            }
+
             if is_initialize_payload(&bytes) {
                 let req = Request::from_parts(parts, Body::from(bytes));
                 return forward_service(state.service.clone(), req).await;
@@ -600,6 +616,20 @@ async fn handle_mcp(State(state): State<AppState>, req: Request<Body>) -> Respon
             "Use POST /mcp to initialize, then reuse the session id for later requests.",
         ),
     }
+}
+
+async fn collect_mcp_post_body(body: Body, max_bytes: usize) -> Result<Bytes, Response<Body>> {
+    axum::body::to_bytes(body, max_bytes)
+        .await
+        .map_err(|_| mcp_request_body_too_large())
+}
+
+fn mcp_request_body_too_large() -> Response<Body> {
+    session_error(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "MCP request body exceeds the configured limit or could not be read within it.",
+        "Submit a smaller request; exact-byte migration manifests are limited before parsing.",
+    )
 }
 
 fn session_error(status: StatusCode, message: &str, hint: &str) -> Response<Body> {
@@ -1037,8 +1067,9 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        AppState, RuntimeTransport, build_auth_surface_layer, build_router,
-        fallback_oauth_endpoints, parse_runtime_options_from, runtime_auth_config,
+        AppState, MAX_MCP_HTTP_REQUEST_BODY_BYTES, RuntimeTransport, build_auth_surface_layer,
+        build_router, collect_mcp_post_body, fallback_oauth_endpoints, parse_runtime_options_from,
+        runtime_auth_config,
     };
     use cloudflare_mcp::cloudflare::CloudflareClient;
     use cloudflare_mcp::config::{
@@ -1442,6 +1473,33 @@ mod tests {
                 .expect("hint")
                 .contains("Initialize with POST /mcp")
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_http_boundary_rejects_oversized_declared_and_streamed_bodies() {
+        let router = test_router_auth_disabled().await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("host", "127.0.0.1")
+                    .header("content-type", "application/json")
+                    .header(
+                        axum::http::header::CONTENT_LENGTH,
+                        (MAX_MCP_HTTP_REQUEST_BODY_BYTES + 1).to_string(),
+                    )
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let streamed = collect_mcp_post_body(Body::from(vec![b'x'; 17]), 16)
+            .await
+            .expect_err("collector must enforce its byte bound without content-length");
+        assert_eq!(streamed.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
