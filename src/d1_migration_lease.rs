@@ -68,7 +68,7 @@ pub(crate) struct D1MigrationLeaseIdentity {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct D1RetainedMigrationLeaseIdentity {
     pub(crate) target_key_sha256: String,
-    pub(crate) namespace: &'static str,
+    pub(crate) namespace: String,
     pub(crate) nonce: String,
     pub(crate) payload_sha256: String,
     pub(crate) approved_plan_sha256: String,
@@ -83,6 +83,37 @@ struct D1RetainedMigrationLeasePayload {
     nonce: String,
     target_key_sha256: String,
     version: u8,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct D1TerminalReconciliationReceipt {
+    pub(crate) version: u8,
+    pub(crate) operation: String,
+    pub(crate) target_key_sha256: String,
+    pub(crate) lease_nonce: String,
+    pub(crate) lease_payload_sha256: String,
+    pub(crate) approved_apply_plan_sha256: String,
+    pub(crate) reconciliation_plan_sha256: String,
+    pub(crate) expectation_proof_sha256: String,
+    pub(crate) query_sha256: String,
+    pub(crate) canonical_snapshot_sha256: String,
+    pub(crate) terminal_request_sha256: String,
+    pub(crate) terminal_attempt_sha256: String,
+    pub(crate) terminal_plan_sha256: String,
+    pub(crate) outcome: String,
+    pub(crate) original_prefix_length: usize,
+    pub(crate) current_prefix_length: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct D1TerminalReconciliationReceiptEvidence {
+    #[cfg(target_os = "linux")]
+    file: fs::File,
+    #[cfg(target_os = "linux")]
+    file_identity: D1LeaseFileIdentity,
+    name: String,
+    pub(crate) payload_sha256: String,
 }
 
 /// A guard-held, descriptor-bound view of retained migration evidence.
@@ -111,7 +142,7 @@ pub(crate) struct D1RetainedMigrationLease {
     #[cfg(target_os = "linux")]
     evidence_file_identity: D1LeaseFileIdentity,
     #[cfg(target_os = "linux")]
-    evidence_name: &'static str,
+    evidence_name: String,
     pub(crate) identity: D1RetainedMigrationLeaseIdentity,
 }
 
@@ -323,23 +354,39 @@ impl D1RetainedMigrationLease {
                 &self.guard_identity,
             )
             .map_err(d1_retained_lease_revalidation_error)?;
-            let other_name = if self.evidence_name == ACTIVE_LEASE_NAME {
-                RETIRING_LEASE_NAME
-            } else {
-                ACTIVE_LEASE_NAME
-            };
-            match retained_entry_present(&self.target, other_name) {
-                Ok(false) => {}
-                Ok(true) => {
-                    return Err(d1_retained_lease_revalidation_error(
-                        "both active and retiring migration evidence are present",
-                    ));
+            if self.identity.namespace == "retired" {
+                for name in [ACTIVE_LEASE_NAME, RETIRING_LEASE_NAME] {
+                    match retained_entry_present(&self.target, name) {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            return Err(d1_retained_lease_revalidation_error(
+                                "active or retiring evidence exists beside terminal retirement",
+                            ));
+                        }
+                        Err(message) => {
+                            return Err(d1_retained_lease_revalidation_error(message));
+                        }
+                    }
                 }
-                Err(message) => return Err(d1_retained_lease_revalidation_error(message)),
+            } else {
+                let other_name = if self.evidence_name == ACTIVE_LEASE_NAME {
+                    RETIRING_LEASE_NAME
+                } else {
+                    ACTIVE_LEASE_NAME
+                };
+                match retained_entry_present(&self.target, other_name) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        return Err(d1_retained_lease_revalidation_error(
+                            "both active and retiring migration evidence are present",
+                        ));
+                    }
+                    Err(message) => return Err(d1_retained_lease_revalidation_error(message)),
+                }
             }
             validate_retained_named_lease(
                 &self.target,
-                self.evidence_name,
+                &self.evidence_name,
                 &self.evidence,
                 &self.evidence_file_identity,
                 &self.identity,
@@ -351,6 +398,131 @@ impl D1RetainedMigrationLease {
             Err(d1_retained_lease_platform_unsupported())
         }
     }
+
+    pub(crate) fn is_retired(&self) -> bool {
+        self.identity.namespace == "retired"
+    }
+
+    pub(crate) fn terminal_receipt_state(
+        &self,
+        expected: &D1TerminalReconciliationReceipt,
+    ) -> Result<Option<D1TerminalReconciliationReceiptEvidence>, CallToolResult> {
+        #[cfg(target_os = "linux")]
+        {
+            self.revalidate()?;
+            linux::terminal_receipt_state(&self.target, expected)
+                .map_err(d1_terminal_reconciliation_error)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = expected;
+            Err(d1_retained_lease_platform_unsupported())
+        }
+    }
+
+    pub(crate) fn persist_terminal_receipt(
+        &self,
+        expected: &D1TerminalReconciliationReceipt,
+    ) -> Result<(D1TerminalReconciliationReceiptEvidence, bool), CallToolResult> {
+        #[cfg(target_os = "linux")]
+        {
+            self.revalidate()?;
+            if self.is_retired() {
+                return Err(d1_terminal_reconciliation_error(
+                    "terminal retirement exists without an exact durable terminal receipt",
+                ));
+            }
+            linux::persist_terminal_receipt(&self.target, expected)
+                .map_err(d1_terminal_reconciliation_error)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = expected;
+            Err(d1_retained_lease_platform_unsupported())
+        }
+    }
+
+    pub(crate) fn retire_after_terminal_receipt(
+        &mut self,
+        receipt: &D1TerminalReconciliationReceiptEvidence,
+    ) -> Result<bool, CallToolResult> {
+        #[cfg(target_os = "linux")]
+        {
+            self.revalidate()?;
+            linux::validate_terminal_receipt_evidence(&self.target, receipt)
+                .map_err(d1_terminal_reconciliation_error)?;
+            if self.is_retired() {
+                return Ok(false);
+            }
+            let retired_name = format!("retired.{}.lease.json", self.identity.nonce);
+            if retained_entry_present(&self.target, &retired_name)
+                .map_err(d1_terminal_reconciliation_error)?
+            {
+                return Err(d1_terminal_reconciliation_error(
+                    "terminal retirement is already present beside retained evidence",
+                ));
+            }
+            if self.identity.namespace == "active" {
+                linux::rename_retained_lease_no_replace(
+                    &self.target,
+                    ACTIVE_LEASE_NAME,
+                    RETIRING_LEASE_NAME,
+                    &self.evidence,
+                    &self.evidence_file_identity,
+                    &self.identity,
+                )
+                .map_err(d1_terminal_reconciliation_error)?;
+                self.evidence_name = RETIRING_LEASE_NAME.to_string();
+                self.identity.namespace = "retiring".to_string();
+                if sync_d1_lease_directory(&self.target).is_err() {
+                    return Err(d1_terminal_reconciliation_error(
+                        "retained lease entered retiring state but the directory sync failed",
+                    ));
+                }
+            }
+            linux::rename_retained_lease_no_replace(
+                &self.target,
+                RETIRING_LEASE_NAME,
+                &retired_name,
+                &self.evidence,
+                &self.evidence_file_identity,
+                &self.identity,
+            )
+            .map_err(d1_terminal_reconciliation_error)?;
+            self.evidence_name = retired_name;
+            self.identity.namespace = "retired".to_string();
+            if sync_d1_lease_directory(&self.target).is_err() {
+                return Err(d1_terminal_reconciliation_error(
+                    "retained lease entered terminal retirement but the directory sync failed",
+                ));
+            }
+            self.revalidate()?;
+            linux::validate_terminal_receipt_evidence(&self.target, receipt)
+                .map_err(d1_terminal_reconciliation_error)?;
+            Ok(true)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = receipt;
+            Err(d1_retained_lease_platform_unsupported())
+        }
+    }
+}
+
+fn d1_terminal_reconciliation_error(message: &'static str) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": "d1_finalize_migration_reconciliation",
+        "status": "reconciliation_required",
+        "retry_decision": "do_not_retry_same_attempt",
+        "lease_decision": "retain",
+        "lease_retained": true,
+        "error": {
+            "code": "d1.migration_terminal_evidence_invalid",
+            "message": message,
+            "hint": "Preserve the exact target custody directory and reconcile its receipt and lease namespaces before another terminal attempt."
+        }
+    }))
 }
 
 pub(crate) fn inspect_retained_d1_migration_lease(
@@ -401,6 +573,73 @@ pub(crate) fn inspect_retained_d1_migration_lease_at(
             approved_plan_sha256,
             nonce,
             payload_sha256,
+            false,
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (
+            root,
+            account_id,
+            database_id,
+            family,
+            approved_plan_sha256,
+            nonce,
+            payload_sha256,
+        );
+        Err(d1_retained_lease_platform_unsupported())
+    }
+}
+
+pub(crate) fn inspect_terminal_d1_migration_lease(
+    account_id: &str,
+    database_id: &str,
+    family: &str,
+    approved_plan_sha256: &str,
+    nonce: &str,
+    payload_sha256: &str,
+) -> Result<D1RetainedMigrationLease, CallToolResult> {
+    let root = std::env::var(D1_MANIFEST_LEASE_ROOT_ENV)
+        .ok()
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| {
+            d1_retained_lease_error(
+                "d1.migration_reconciliation_lease_root_unconfigured",
+                "terminal reconciliation requires the configured operator-owned migration lease root",
+            )
+        })?;
+    inspect_terminal_d1_migration_lease_at(
+        root,
+        account_id,
+        database_id,
+        family,
+        approved_plan_sha256,
+        nonce,
+        payload_sha256,
+    )
+}
+
+pub(crate) fn inspect_terminal_d1_migration_lease_at(
+    root: PathBuf,
+    account_id: &str,
+    database_id: &str,
+    family: &str,
+    approved_plan_sha256: &str,
+    nonce: &str,
+    payload_sha256: &str,
+) -> Result<D1RetainedMigrationLease, CallToolResult> {
+    #[cfg(target_os = "linux")]
+    {
+        inspect_retained_d1_migration_lease_at_linux(
+            root,
+            account_id,
+            database_id,
+            family,
+            approved_plan_sha256,
+            nonce,
+            payload_sha256,
+            true,
         )
     }
     #[cfg(not(target_os = "linux"))]
@@ -1030,15 +1269,15 @@ mod linux {
 
     fn open_retained_named_lease(
         target: &fs::File,
-        name: &'static str,
+        name: &str,
     ) -> Result<(fs::File, D1LeaseFileIdentity, Vec<u8>), &'static str> {
         let named = open_named_entry(target, name)
             .map_err(|_| "retained lease namespace entry could not be opened")?;
         let metadata = named
             .metadata()
             .map_err(|_| "retained lease namespace metadata is unavailable")?;
-        if !private_file(&metadata) {
-            return Err("retained lease namespace entry is not a private regular file");
+        if !private_file(&metadata) || metadata.nlink() != 1 {
+            return Err("retained lease namespace entry is not one private unaliased regular file");
         }
         if metadata.len() > MAX_LEASE_PAYLOAD_BYTES {
             return Err("retained lease payload exceeds the custody limit");
@@ -1055,7 +1294,7 @@ mod linux {
         let held = file
             .metadata()
             .map_err(|_| "held retained lease metadata is unavailable")?;
-        if !private_file(&held) || identity(&held) != expected {
+        if !private_file(&held) || held.nlink() != 1 || identity(&held) != expected {
             return Err("retained lease namespace entry changed while it was rebound");
         }
         let bytes = read_held_file(&file)?;
@@ -1072,7 +1311,7 @@ mod linux {
         let held = evidence
             .metadata()
             .map_err(|_| "held retained lease metadata is unavailable")?;
-        if !private_file(&held) || identity(&held) != *expected_file {
+        if !private_file(&held) || held.nlink() != 1 || identity(&held) != *expected_file {
             return Err("held retained lease no longer matches its private regular file");
         }
         validate_named_private_file(target, name, expected_file)
@@ -1089,6 +1328,179 @@ mod linux {
             return Err("retained lease payload authority changed");
         }
         Ok(())
+    }
+
+    fn terminal_receipt_name(nonce: &str) -> String {
+        format!("terminal-reconciliation.{nonce}.receipt.json")
+    }
+
+    fn canonical_terminal_receipt_bytes(
+        receipt: &D1TerminalReconciliationReceipt,
+    ) -> Result<Vec<u8>, &'static str> {
+        if receipt.version != 1
+            || receipt.operation != "d1_finalize_migration_reconciliation"
+            || !valid_lower_sha256(&receipt.target_key_sha256)
+            || !valid_retained_nonce(&receipt.lease_nonce)
+            || !valid_lower_sha256(&receipt.lease_payload_sha256)
+            || !valid_lower_sha256(&receipt.approved_apply_plan_sha256)
+            || !valid_lower_sha256(&receipt.reconciliation_plan_sha256)
+            || !valid_lower_sha256(&receipt.expectation_proof_sha256)
+            || !valid_lower_sha256(&receipt.query_sha256)
+            || !valid_lower_sha256(&receipt.canonical_snapshot_sha256)
+            || !valid_lower_sha256(&receipt.terminal_request_sha256)
+            || !valid_lower_sha256(&receipt.terminal_attempt_sha256)
+            || receipt.terminal_request_sha256 == receipt.terminal_attempt_sha256
+            || !valid_lower_sha256(&receipt.terminal_plan_sha256)
+            || !matches!(
+                receipt.outcome.as_str(),
+                "not_committed" | "partial_state_converged" | "full_state_converged"
+            )
+            || receipt.current_prefix_length < receipt.original_prefix_length
+        {
+            return Err("terminal reconciliation receipt contains noncanonical authority fields");
+        }
+        serde_json::to_vec(receipt)
+            .map_err(|_| "terminal reconciliation receipt could not be encoded canonically")
+    }
+
+    fn open_terminal_receipt(
+        target: &fs::File,
+        name: &str,
+    ) -> Result<D1TerminalReconciliationReceiptEvidence, &'static str> {
+        let named = open_named_entry(target, name)
+            .map_err(|_| "terminal reconciliation receipt could not be opened")?;
+        let metadata = named
+            .metadata()
+            .map_err(|_| "terminal reconciliation receipt metadata is unavailable")?;
+        if !private_file(&metadata) || metadata.nlink() != 1 {
+            return Err(
+                "terminal reconciliation receipt is not one private unaliased regular file",
+            );
+        }
+        if metadata.len() > MAX_LEASE_PAYLOAD_BYTES {
+            return Err("terminal reconciliation receipt exceeds the custody limit");
+        }
+        let expected = identity(&metadata);
+        let name_c = c_string_name(name)?;
+        let file = open_at(
+            target.as_raw_fd(),
+            &name_c,
+            O_RDONLY | O_NOFOLLOW | O_CLOEXEC,
+            0,
+        )
+        .map_err(|_| "terminal reconciliation receipt could not be rebound read-only")?;
+        let held = file
+            .metadata()
+            .map_err(|_| "held terminal reconciliation receipt metadata is unavailable")?;
+        if !private_file(&held) || held.nlink() != 1 || identity(&held) != expected {
+            return Err("terminal reconciliation receipt changed while it was rebound");
+        }
+        let bytes = read_held_file(&file)?;
+        let parsed: D1TerminalReconciliationReceipt = serde_json::from_slice(&bytes).map_err(
+            |_| {
+                "terminal reconciliation receipt is malformed, duplicate-keyed, or structurally unexpected"
+            },
+        )?;
+        let canonical = canonical_terminal_receipt_bytes(&parsed)?;
+        if canonical != bytes {
+            return Err("terminal reconciliation receipt is not exact canonical JSON");
+        }
+        Ok(D1TerminalReconciliationReceiptEvidence {
+            file,
+            file_identity: expected,
+            name: name.to_string(),
+            payload_sha256: sha256_bytes_hex(&bytes),
+        })
+    }
+
+    pub(super) fn validate_terminal_receipt_evidence(
+        target: &fs::File,
+        evidence: &D1TerminalReconciliationReceiptEvidence,
+    ) -> Result<(), &'static str> {
+        let held = evidence
+            .file
+            .metadata()
+            .map_err(|_| "held terminal reconciliation receipt metadata is unavailable")?;
+        if !private_file(&held) || held.nlink() != 1 || identity(&held) != evidence.file_identity {
+            return Err("held terminal reconciliation receipt is no longer exact");
+        }
+        validate_named_private_file(target, &evidence.name, &evidence.file_identity)
+            .map_err(|_| "terminal reconciliation receipt namespace changed")?;
+        let bytes = read_held_file(&evidence.file)?;
+        if sha256_bytes_hex(&bytes) != evidence.payload_sha256 {
+            return Err("terminal reconciliation receipt payload changed");
+        }
+        let parsed: D1TerminalReconciliationReceipt = serde_json::from_slice(&bytes)
+            .map_err(|_| "terminal reconciliation receipt payload is malformed")?;
+        if canonical_terminal_receipt_bytes(&parsed)? != bytes {
+            return Err("terminal reconciliation receipt payload is not canonical");
+        }
+        Ok(())
+    }
+
+    pub(super) fn terminal_receipt_state(
+        target: &fs::File,
+        expected: &D1TerminalReconciliationReceipt,
+    ) -> Result<Option<D1TerminalReconciliationReceiptEvidence>, &'static str> {
+        let expected_bytes = canonical_terminal_receipt_bytes(expected)?;
+        let name = terminal_receipt_name(&expected.lease_nonce);
+        if !entry_present(target, &name)? {
+            return Ok(None);
+        }
+        let evidence = open_terminal_receipt(target, &name)?;
+        let actual = read_held_file(&evidence.file)?;
+        if actual != expected_bytes {
+            return Err(
+                "terminal reconciliation receipt contradicts the exact request or evidence",
+            );
+        }
+        Ok(Some(evidence))
+    }
+
+    pub(super) fn persist_terminal_receipt(
+        target: &fs::File,
+        expected: &D1TerminalReconciliationReceipt,
+    ) -> Result<(D1TerminalReconciliationReceiptEvidence, bool), &'static str> {
+        if let Some(existing) = terminal_receipt_state(target, expected)? {
+            return Ok((existing, false));
+        }
+        let bytes = canonical_terminal_receipt_bytes(expected)?;
+        let name = terminal_receipt_name(&expected.lease_nonce);
+        let name_c = c_string_name(&name)?;
+        let mut file = open_at(
+            target.as_raw_fd(),
+            &name_c,
+            O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+            0o600,
+        )
+        .map_err(|_| "terminal reconciliation receipt could not be created without replacement")?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| "terminal reconciliation receipt identity is unavailable")?;
+        if !private_file(&metadata) || metadata.nlink() != 1 {
+            return Err(
+                "terminal reconciliation receipt is not one private unaliased regular file",
+            );
+        }
+        if file
+            .write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .is_err()
+        {
+            return Err("terminal reconciliation receipt could not be durably written");
+        }
+        if sync_d1_lease_directory(target).is_err() {
+            return Err("terminal reconciliation receipt directory could not be synchronized");
+        }
+        let file_identity = identity(&metadata);
+        let evidence = D1TerminalReconciliationReceiptEvidence {
+            file,
+            file_identity,
+            name,
+            payload_sha256: sha256_bytes_hex(&bytes),
+        };
+        validate_terminal_receipt_evidence(target, &evidence)?;
+        Ok((evidence, true))
     }
 
     fn active_present_error(
@@ -1148,6 +1560,19 @@ mod linux {
         validate_owned_named_lease(target, source, active, expected_file, expected, true)?;
         rename_at_no_replace(target, source, destination)
             .map_err(|_| "owned lease namespace transition could not be completed")
+    }
+
+    pub(super) fn rename_retained_lease_no_replace(
+        target: &fs::File,
+        source: &str,
+        destination: &str,
+        evidence: &fs::File,
+        expected_file: &D1LeaseFileIdentity,
+        expected: &D1RetainedMigrationLeaseIdentity,
+    ) -> Result<(), &'static str> {
+        validate_retained_named_lease(target, source, evidence, expected_file, expected)?;
+        rename_at_no_replace(target, source, destination)
+            .map_err(|_| "retained lease namespace transition could not be completed")
     }
 
     pub(super) fn abort_owned_active(
@@ -1385,6 +1810,7 @@ mod linux {
         approved_plan_sha256: &str,
         nonce: &str,
         payload_sha256: &str,
+        allow_retired: bool,
     ) -> Result<D1RetainedMigrationLease, CallToolResult> {
         if !valid_retained_family(family)
             || !valid_lower_sha256(approved_plan_sha256)
@@ -1487,24 +1913,29 @@ mod linux {
         let retiring_present = entry_present(&target, RETIRING_LEASE_NAME).map_err(|message| {
             d1_retained_lease_error("d1.migration_reconciliation_custody_changed", message)
         })?;
-        let (evidence_name, namespace) = match (active_present, retiring_present) {
-            (true, false) => (ACTIVE_LEASE_NAME, "active"),
-            (false, true) => (RETIRING_LEASE_NAME, "retiring"),
-            (false, false) => {
+        let retired_name = format!("retired.{nonce}.lease.json");
+        let retired_present = entry_present(&target, &retired_name).map_err(|message| {
+            d1_retained_lease_error("d1.migration_reconciliation_custody_changed", message)
+        })?;
+        let (evidence_name, namespace) = match (active_present, retiring_present, retired_present) {
+            (true, false, false) => (ACTIVE_LEASE_NAME.to_string(), "active".to_string()),
+            (false, true, false) => (RETIRING_LEASE_NAME.to_string(), "retiring".to_string()),
+            (false, false, true) if allow_retired => (retired_name, "retired".to_string()),
+            (false, false, false) => {
                 return Err(d1_retained_lease_error(
                     "d1.migration_reconciliation_evidence_absent",
                     "neither active nor retiring retained migration evidence is present",
                 ));
             }
-            (true, true) => {
+            _ => {
                 return Err(d1_retained_lease_error(
                     "d1.migration_reconciliation_evidence_conflict",
-                    "both active and retiring retained migration evidence are present",
+                    "active, retiring, or terminal-retired migration evidence conflicts",
                 ));
             }
         };
         let (evidence, evidence_file_identity, bytes) =
-            open_retained_named_lease(&target, evidence_name).map_err(|message| {
+            open_retained_named_lease(&target, &evidence_name).map_err(|message| {
                 d1_retained_lease_error("d1.migration_reconciliation_evidence_malformed", message)
             })?;
         let computed_payload_sha256 = sha256_bytes_hex(&bytes);
@@ -1719,6 +2150,31 @@ use linux::{
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    fn terminal_receipt(
+        identity: &D1MigrationLeaseIdentity,
+        approved_plan_sha256: &str,
+    ) -> D1TerminalReconciliationReceipt {
+        D1TerminalReconciliationReceipt {
+            version: 1,
+            operation: "d1_finalize_migration_reconciliation".to_string(),
+            target_key_sha256: identity.target_key_sha256.clone(),
+            lease_nonce: identity.nonce.clone(),
+            lease_payload_sha256: identity.payload_sha256.clone(),
+            approved_apply_plan_sha256: approved_plan_sha256.to_string(),
+            reconciliation_plan_sha256: "c".repeat(64),
+            expectation_proof_sha256: "d".repeat(64),
+            query_sha256: "e".repeat(64),
+            canonical_snapshot_sha256: "f".repeat(64),
+            terminal_request_sha256: "1".repeat(64),
+            terminal_attempt_sha256: "2".repeat(64),
+            terminal_plan_sha256: "3".repeat(64),
+            outcome: "full_state_converged".to_string(),
+            original_prefix_length: 0,
+            current_prefix_length: 1,
+        }
+    }
 
     #[cfg(target_os = "linux")]
     fn private_test_root(label: &str) -> PathBuf {
@@ -2282,6 +2738,7 @@ mod tests {
             "both",
             "malformed",
             "symlink",
+            "hardlink",
             "cross-target",
             "contradictory",
         ] {
@@ -2317,6 +2774,8 @@ mod tests {
                         .expect("displace active");
                     symlink("/dev/null", &active).expect("replace active with symlink");
                 }
+                "hardlink" => fs::hard_link(&active, active.with_extension("duplicate"))
+                    .expect("install hard-linked retained evidence"),
                 "cross-target" => {}
                 "contradictory" => {}
                 _ => unreachable!(),
@@ -2374,6 +2833,219 @@ mod tests {
             "d1.migration_reconciliation_guard_locked"
         );
         drop(owner);
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_receipt_is_create_only_replayable_and_precedes_retirement() {
+        let root = private_test_root("terminal-exact");
+        let plan = "a".repeat(64);
+        let mut owner =
+            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
+                .expect("create retained evidence");
+        let identity = owner.identity.clone();
+        owner.retain();
+        drop(owner);
+        let expected = terminal_receipt(&identity, &plan);
+        let mut retained = inspect_terminal_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "db-1",
+            "newsletter-core",
+            &plan,
+            &identity.nonce,
+            &identity.payload_sha256,
+        )
+        .expect("inspect retained lease");
+        let (receipt, created) = retained
+            .persist_terminal_receipt(&expected)
+            .expect("persist exact terminal receipt");
+        assert!(created);
+        let (replayed, created_again) = retained
+            .persist_terminal_receipt(&expected)
+            .expect("exact receipt replay converges");
+        assert!(!created_again);
+        assert_eq!(receipt.payload_sha256, replayed.payload_sha256);
+        assert!(
+            retained
+                .retire_after_terminal_receipt(&receipt)
+                .expect("retire")
+        );
+        assert!(retained.is_retired());
+        assert!(
+            retained
+                .terminal_receipt_state(&expected)
+                .expect("terminal receipt after retirement")
+                .is_some()
+        );
+        drop(retained);
+
+        let completed = inspect_terminal_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "db-1",
+            "newsletter-core",
+            &plan,
+            &identity.nonce,
+            &identity.payload_sha256,
+        )
+        .expect("reopen completed terminal state");
+        assert!(completed.is_retired());
+        assert!(
+            completed
+                .terminal_receipt_state(&expected)
+                .expect("exact completed replay")
+                .is_some()
+        );
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restored_terminal_receipt_negative_payload_matrix_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let variants = [
+            ("absent-json", b"".to_vec()),
+            ("null", b"null".to_vec()),
+            ("array", b"[]".to_vec()),
+            ("primitive", b"1".to_vec()),
+            ("malformed", b"{".to_vec()),
+            ("unknown", br#"{"unknown":true}"#.to_vec()),
+            ("duplicate", br#"{"version":1,"version":1}"#.to_vec()),
+            ("noncanonical", Vec::new()),
+        ];
+        for (label, bytes) in variants {
+            let root = private_test_root(&format!("terminal-{label}"));
+            let plan = "a".repeat(64);
+            let mut owner = acquire_d1_migration_lease_at(
+                root.clone(),
+                "acct-1",
+                "db-1",
+                "newsletter-core",
+                &plan,
+            )
+            .expect("create retained evidence");
+            let identity = owner.identity.clone();
+            let target = owner
+                .active_path_for_test()
+                .expect("active path")
+                .parent()
+                .expect("target")
+                .to_path_buf();
+            owner.retain();
+            drop(owner);
+            let receipt_path = target.join(format!(
+                "terminal-reconciliation.{}.receipt.json",
+                identity.nonce
+            ));
+            let expected = terminal_receipt(&identity, &plan);
+            let bytes = if label == "noncanonical" {
+                serde_json::to_string_pretty(&expected)
+                    .expect("pretty noncanonical receipt")
+                    .into_bytes()
+            } else {
+                bytes
+            };
+            fs::write(&receipt_path, bytes).expect("install restored receipt payload");
+            fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600))
+                .expect("private restored receipt");
+            let retained = inspect_terminal_d1_migration_lease_at(
+                root.clone(),
+                "acct-1",
+                "db-1",
+                "newsletter-core",
+                &plan,
+                &identity.nonce,
+                &identity.payload_sha256,
+            )
+            .expect("retained lease remains inspectable");
+            assert!(
+                retained.terminal_receipt_state(&expected).is_err(),
+                "{label} restored receipt must fail closed"
+            );
+            fs::remove_dir_all(root).expect("test cleanup");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_retirement_without_receipt_and_conflicting_replay_fail_closed() {
+        let root = private_test_root("terminal-order");
+        let plan = "a".repeat(64);
+        let mut owner =
+            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
+                .expect("create retained evidence");
+        let identity = owner.identity.clone();
+        owner.release().expect("install retirement before receipt");
+        drop(owner);
+        let expected = terminal_receipt(&identity, &plan);
+        let retired = inspect_terminal_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "db-1",
+            "newsletter-core",
+            &plan,
+            &identity.nonce,
+            &identity.payload_sha256,
+        )
+        .expect("inspect terminal retirement");
+        assert!(retired.is_retired());
+        assert!(
+            retired
+                .terminal_receipt_state(&expected)
+                .expect("receipt absence is explicit")
+                .is_none()
+        );
+        assert!(
+            retired.persist_terminal_receipt(&expected).is_err(),
+            "retirement must never be retroactively authorized by creating a receipt"
+        );
+        fs::remove_dir_all(root).expect("test cleanup");
+
+        let root = private_test_root("terminal-conflict");
+        let mut owner =
+            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
+                .expect("create retained evidence");
+        let identity = owner.identity.clone();
+        owner.retain();
+        drop(owner);
+        let retained = inspect_terminal_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "db-1",
+            "newsletter-core",
+            &plan,
+            &identity.nonce,
+            &identity.payload_sha256,
+        )
+        .expect("inspect retained evidence");
+        let expected = terminal_receipt(&identity, &plan);
+        retained
+            .persist_terminal_receipt(&expected)
+            .expect("persist incumbent receipt");
+        let mut conflict = expected.clone();
+        conflict.terminal_attempt_sha256 = "4".repeat(64);
+        assert!(
+            retained.persist_terminal_receipt(&conflict).is_err(),
+            "changed request or evidence must conflict with the incumbent receipt"
+        );
+        let receipt_path = root
+            .join(format!(
+                "d1-migration-target-{}",
+                identity.target_key_sha256
+            ))
+            .join(format!(
+                "terminal-reconciliation.{}.receipt.json",
+                identity.nonce
+            ));
+        fs::hard_link(&receipt_path, receipt_path.with_extension("duplicate"))
+            .expect("install duplicate physical claimant");
+        assert!(
+            retained.terminal_receipt_state(&expected).is_err(),
+            "a hard-linked duplicate physical claimant must fail closed"
+        );
         fs::remove_dir_all(root).expect("test cleanup");
     }
 }

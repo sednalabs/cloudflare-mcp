@@ -236,12 +236,50 @@ failure and custody drift coincide, retain the provider classification and
 chronological response evidence while treating custody as unverified; the
 `custody_cause` names the separate revalidation failure.
 
-All current results retain the lease and prohibit retry of the same migration
-attempt. Record the query SHA-256, both bounded response-body digests, canonical
-snapshot SHA-256, scope-completeness fields, and `reconciliation_plan_sha256`.
-Do not manually rename or remove custody evidence: durable terminal receipt and
-retirement are a separate guarded recovery phase and are not implemented by
-this read-only tool.
+All read-only reconciliation results retain the lease and prohibit retry of the
+same migration attempt. Record the query SHA-256, both bounded response-body
+digests, expectation proof, canonical snapshot SHA-256, scope-completeness
+fields, outcome/prefixes, and `reconciliation_plan_sha256`. Do not manually
+rename or remove custody evidence.
+
+### Terminal retained-manifest reconciliation
+
+Use `d1_finalize_migration_reconciliation` only after the read-only result is
+recorded. Supply every original manifest/expectation input plus the exact
+reconciliation-plan, expectation-proof, query, snapshot, outcome and prefix
+values, and preallocate distinct opaque request and attempt identities as
+lowercase SHA-256 digests. First call with `dry_run=true`; it re-runs two
+complete primary-current batches and returns `terminal_plan_sha256`. Record and
+independently approve that exact digest before a live call. A digest derived
+after the live read is not approval.
+
+The live call requires `approved_terminal_plan_sha256` and follows this fixed
+order while holding the permanent target guard:
+
+1. Re-run the two-batch retained-manifest proof and require exact agreement
+   with every approved evidence digest and outcome/prefix.
+2. Perform one fresh primary-current batch and custody revalidation immediately
+   before receipt persistence.
+3. Create `terminal-reconciliation.<nonce>.receipt.json` without replacement,
+   synchronize it and the target directory, and read it back through the held
+   descriptor. An exact incumbent is replay; any changed or malformed incumbent
+   conflicts.
+4. Perform another fresh primary-current batch and custody/receipt revalidation
+   immediately before retirement.
+5. Move exact retained evidence through active -> retiring ->
+   `retired.<nonce>.lease.json` with no-replace and directory synchronization at
+   each boundary.
+
+The terminal tool never sends D1 SQL writes and never retries an unavailable or
+ambiguous provider read. Failure before the receipt keeps the retained lease.
+Failure after the receipt leaves that durable receipt plus retained or retiring
+evidence for exact replay. A terminal retirement with no exact receipt is an
+order violation and cannot be repaired by creating a receipt afterward. Exact
+replay after completed retirement validates the receipt and retired lease and
+returns with zero provider calls. Null, array, primitive, malformed,
+duplicate-keyed, unknown-keyed, noncanonical, contradictory, hard-linked, or
+conflicting namespace evidence fails closed. Never delete, rewrite, rename, or
+copy these products manually.
 
 For CI-built release bundles, the `Rust Validation` workflow uploads a
 downloadable artifact named `cloudflare-mcp-linux-x86_64-stdio-<git-sha>` that

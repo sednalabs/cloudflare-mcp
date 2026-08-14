@@ -926,6 +926,7 @@ enum ReconciliationFault {
     SecondBatchPrimaryFalse,
     SecondBatchHttpStatus(u16),
     SecondBatchTransportFailure(Option<PathBuf>),
+    RequestTransportFailure(usize),
     DuplicateOuterSuccess(bool, Arc<Mutex<Vec<u8>>>),
     DuplicateNestedRowId(bool, Arc<Mutex<Vec<u8>>>),
     LedgerNotManifestPrefix,
@@ -1067,18 +1068,29 @@ fn one_table_reconciliation_case() -> (Value, Value) {
 }
 
 fn spawn_fake_reconciliation_api() -> (String, Arc<Mutex<Vec<Value>>>) {
-    spawn_fake_reconciliation_api_with_fault(ReconciliationFault::None)
+    spawn_fake_reconciliation_api_with_fault_and_calls(ReconciliationFault::None, 2)
+}
+
+fn spawn_fake_reconciliation_api_for_calls(call_count: usize) -> (String, Arc<Mutex<Vec<Value>>>) {
+    spawn_fake_reconciliation_api_with_fault_and_calls(ReconciliationFault::None, call_count)
 }
 
 fn spawn_fake_reconciliation_api_with_fault(
     fault: ReconciliationFault,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    spawn_fake_reconciliation_api_with_fault_and_calls(fault, 2)
+}
+
+fn spawn_fake_reconciliation_api_with_fault_and_calls(
+    fault: ReconciliationFault,
+    call_count: usize,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind reconciliation D1 API"); // DevSkim: ignore DS162092 -- loopback-only MCP test fixture
     let addr = listener.local_addr().expect("reconciliation D1 address");
     let requests = Arc::new(Mutex::new(Vec::new()));
     let requests_for_thread = requests.clone();
     thread::spawn(move || {
-        for (request_index, stream) in listener.incoming().take(2).enumerate() {
+        for (request_index, stream) in listener.incoming().take(call_count).enumerate() {
             let mut stream = stream.expect("fake reconciliation stream");
             let (headers, body) = read_http_request(&mut stream);
             assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
@@ -1099,6 +1111,10 @@ fn spawn_fake_reconciliation_api_with_fault(
                     }
                     continue;
                 }
+            }
+            if matches!(&fault, ReconciliationFault::RequestTransportFailure(index) if *index == request_index)
+            {
+                continue;
             }
             if matches!(&fault, ReconciliationFault::Redirect) {
                 let response = b"redirect refused";
@@ -1298,6 +1314,7 @@ fn spawn_fake_reconciliation_api_with_fault(
                 | ReconciliationFault::SecondBatchPrimaryFalse
                 | ReconciliationFault::SecondBatchHttpStatus(_)
                 | ReconciliationFault::SecondBatchTransportFailure(_)
+                | ReconciliationFault::RequestTransportFailure(_)
                 | ReconciliationFault::DuplicateOuterSuccess(_, _)
                 | ReconciliationFault::DuplicateNestedRowId(_, _)
                 | ReconciliationFault::UnstableSecondBatch => {}
@@ -4484,6 +4501,270 @@ fn d1_reconcile_migration_manifest_proves_stable_full_state_without_retry_or_mut
     );
     assert!(retired_manifest_entries(&manifest_target_path(&lease_root)).is_empty());
     mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_finalize_migration_reconciliation_stdio_requires_preapproval_and_retires_after_two_fresh_reads()
+ {
+    let (base_url, requests) = spawn_fake_reconciliation_api_for_calls(8);
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-finalize-manifest-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create terminal lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make terminal root private");
+    }
+    let (manifest, state_expectations) = one_table_reconciliation_case();
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&lease_root, &manifest);
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let reconciliation = mcp.call_tool(
+        746,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest,
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_only_v1",
+            "state_expectations": state_expectations,
+        }),
+    );
+    let reconciled = structured_content(&reconciliation).clone();
+    assert_eq!(reconciled["ok"], json!(true), "{reconciled}");
+
+    let terminal_args = json!({
+        "database_id": "db-1",
+        "migration_family": "newsletter-core",
+        "manifest": manifest,
+        "approved_plan_sha256": approved_plan_sha256,
+        "lease_nonce": lease_nonce,
+        "lease_payload_sha256": lease_payload_sha256,
+        "effect_assertion_id": "schema_create_only_v1",
+        "state_expectations": state_expectations,
+        "expected_reconciliation_plan_sha256": reconciled["reconciliation_plan_sha256"],
+        "expected_expectation_proof_sha256": reconciled["expectation_proof_sha256"],
+        "expected_query_sha256": reconciled["query_sha256"],
+        "expected_canonical_snapshot_sha256": reconciled["canonical_snapshot_sha256"],
+        "expected_outcome": reconciled["outcome"],
+        "expected_original_prefix_length": reconciled["reconstructed_original_prefix_length"],
+        "expected_current_prefix_length": reconciled["current_manifest_prefix_length"],
+        "terminal_request_sha256": "d".repeat(64),
+        "terminal_attempt_sha256": "e".repeat(64),
+        "dry_run": true,
+    });
+    let dry = mcp.call_tool(
+        747,
+        "d1_finalize_migration_reconciliation",
+        terminal_args.clone(),
+    );
+    let dry_content = structured_content(&dry);
+    assert_eq!(dry_content["ok"], json!(true), "{dry_content}");
+    assert_eq!(
+        dry_content["status"],
+        json!("terminal_reconciliation_plan_ready")
+    );
+    assert_eq!(dry_content["provider_calls"], json!(2));
+    assert_private_regular_active_lease(&lease_root);
+
+    let mut live_args = terminal_args;
+    live_args["dry_run"] = json!(false);
+    live_args["approved_terminal_plan_sha256"] = dry_content["terminal_plan_sha256"].clone();
+    let live = mcp.call_tool(
+        748,
+        "d1_finalize_migration_reconciliation",
+        live_args.clone(),
+    );
+    let live_content = structured_content(&live);
+    assert_eq!(live_content["ok"], json!(true), "{live_content}");
+    assert_eq!(
+        live_content["status"],
+        json!("terminal_reconciliation_complete")
+    );
+    assert_eq!(live_content["provider_calls"], json!(4));
+    assert_eq!(live_content["provider_mutations"], json!(0));
+    assert_eq!(
+        live_content["provider_read_lifecycle"]
+            .as_array()
+            .map(Vec::len),
+        Some(4)
+    );
+    assert_released_manifest_target_custody(&lease_root);
+    let target = manifest_target_path(&lease_root);
+    let receipts = fs::read_dir(&target)
+        .expect("read terminal target")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("terminal-reconciliation.")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(receipts.len(), 1, "one durable terminal receipt");
+
+    let replay = mcp.call_tool(749, "d1_finalize_migration_reconciliation", live_args);
+    let replay_content = structured_content(&replay);
+    assert_eq!(replay_content["ok"], json!(true), "{replay_content}");
+    assert_eq!(
+        replay_content["status"],
+        json!("terminal_reconciliation_already_complete")
+    );
+    assert_eq!(replay_content["replayed"], json!(true));
+    assert_eq!(replay_content["provider_calls"], json!(0));
+    assert_eq!(requests.lock().expect("request log").len(), 8);
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_finalize_migration_reconciliation_resumes_exact_receipt_from_retiring_namespace() {
+    let (base_url, first_requests) = spawn_fake_reconciliation_api_with_fault_and_calls(
+        ReconciliationFault::RequestTransportFailure(7),
+        8,
+    );
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-finalize-resume-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create terminal resume lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make terminal resume root private");
+    }
+    let (manifest, state_expectations) = one_table_reconciliation_case();
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&lease_root, &manifest);
+    let mut first_mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let reconciliation = first_mcp.call_tool(
+        750,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest,
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_only_v1",
+            "state_expectations": state_expectations,
+        }),
+    );
+    let reconciled = structured_content(&reconciliation).clone();
+    assert_eq!(reconciled["ok"], json!(true), "{reconciled}");
+    let terminal_args = json!({
+        "database_id": "db-1",
+        "migration_family": "newsletter-core",
+        "manifest": manifest,
+        "approved_plan_sha256": approved_plan_sha256,
+        "lease_nonce": lease_nonce,
+        "lease_payload_sha256": lease_payload_sha256,
+        "effect_assertion_id": "schema_create_only_v1",
+        "state_expectations": state_expectations,
+        "expected_reconciliation_plan_sha256": reconciled["reconciliation_plan_sha256"],
+        "expected_expectation_proof_sha256": reconciled["expectation_proof_sha256"],
+        "expected_query_sha256": reconciled["query_sha256"],
+        "expected_canonical_snapshot_sha256": reconciled["canonical_snapshot_sha256"],
+        "expected_outcome": reconciled["outcome"],
+        "expected_original_prefix_length": reconciled["reconstructed_original_prefix_length"],
+        "expected_current_prefix_length": reconciled["current_manifest_prefix_length"],
+        "terminal_request_sha256": "d".repeat(64),
+        "terminal_attempt_sha256": "e".repeat(64),
+        "dry_run": true,
+    });
+    let dry = first_mcp.call_tool(
+        751,
+        "d1_finalize_migration_reconciliation",
+        terminal_args.clone(),
+    );
+    let dry_content = structured_content(&dry);
+    assert_eq!(dry_content["ok"], json!(true), "{dry_content}");
+    let mut live_args = terminal_args;
+    live_args["dry_run"] = json!(false);
+    live_args["approved_terminal_plan_sha256"] = dry_content["terminal_plan_sha256"].clone();
+    let interrupted = first_mcp.call_tool(
+        752,
+        "d1_finalize_migration_reconciliation",
+        live_args.clone(),
+    );
+    let interrupted_content = structured_content(&interrupted);
+    assert_eq!(
+        interrupted_content["ok"],
+        json!(false),
+        "{interrupted_content}"
+    );
+    assert_eq!(interrupted_content["provider_calls"], json!(4));
+    assert_eq!(first_requests.lock().expect("first request log").len(), 8);
+    first_mcp.terminate();
+
+    let target = manifest_target_path(&lease_root);
+    let receipts = fs::read_dir(&target)
+        .expect("read interrupted terminal target")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("terminal-reconciliation.")
+        })
+        .count();
+    assert_eq!(
+        receipts, 1,
+        "receipt must precede the interrupted retirement"
+    );
+    fs::rename(
+        target.join("active.lease.json"),
+        target.join("retiring.lease.json"),
+    )
+    .expect("model interruption after entering retiring namespace");
+    fs::File::open(&target)
+        .expect("open target directory")
+        .sync_all()
+        .expect("sync modeled retiring namespace");
+
+    let (resume_url, resume_requests) = spawn_fake_reconciliation_api_for_calls(4);
+    let mut resume_mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", resume_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let resumed = resume_mcp.call_tool(753, "d1_finalize_migration_reconciliation", live_args);
+    let resumed_content = structured_content(&resumed);
+    assert_eq!(resumed_content["ok"], json!(true), "{resumed_content}");
+    assert_eq!(
+        resumed_content["status"],
+        json!("terminal_reconciliation_complete")
+    );
+    assert_eq!(resumed_content["provider_calls"], json!(4));
+    assert_eq!(resumed_content["provider_mutations"], json!(0));
+    assert_eq!(resume_requests.lock().expect("resume request log").len(), 4);
+    assert_released_manifest_target_custody(&lease_root);
+    resume_mcp.terminate();
     let _ = fs::remove_dir_all(lease_root);
 }
 

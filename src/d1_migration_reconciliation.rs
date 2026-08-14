@@ -17,7 +17,9 @@ use crate::cloudflare::client::{
     D1MigrationReconciliationBatch, D1MigrationReconciliationBatchError,
     D1MigrationReconciliationReadLifecycle,
 };
-use crate::d1_migration_lease::{D1RetainedMigrationLease, inspect_retained_d1_migration_lease};
+use crate::d1_migration_lease::{
+    D1RetainedMigrationLease, D1RetainedMigrationLeaseIdentity, inspect_retained_d1_migration_lease,
+};
 use crate::d1_migration_manifest::{
     D1ManifestLedgerRow, classify_d1_manifest_ledger, d1_ledger_summaries, d1_manifest_plan_sha256,
     d1_manifest_summaries,
@@ -231,7 +233,65 @@ struct FixedQuery {
     statements: Vec<BatchStatement>,
 }
 
-pub(crate) async fn reconcile_d1_migration_manifest(
+#[derive(Debug)]
+pub(crate) struct D1MigrationReconciliationProof {
+    pub(crate) lease: D1RetainedMigrationLease,
+    query: FixedQuery,
+    first: ParsedBatch,
+    second: ParsedBatch,
+    pub(crate) expectation_proof_sha256: String,
+    pub(crate) canonical_snapshot_sha256: String,
+    pub(crate) reconciliation_plan_sha256: String,
+    pub(crate) original_prefix_length: usize,
+    pub(crate) current_prefix_length: usize,
+    pub(crate) outcome: String,
+}
+
+impl D1MigrationReconciliationProof {
+    pub(crate) fn query_sha256(&self) -> &str {
+        &self.query.sha256
+    }
+
+    pub(crate) fn response_evidence(&self) -> Vec<Value> {
+        vec![
+            response_digest_summary(&self.first),
+            response_digest_summary(&self.second),
+        ]
+    }
+
+    pub(crate) fn provider_read_lifecycle(&self) -> Vec<Value> {
+        vec![json!(self.first.lifecycle), json!(self.second.lifecycle)]
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plan_sha256_for_namespace(
+        &self,
+        account_id: &str,
+        database_id: &str,
+        family: &str,
+        migrations_table: &str,
+        manifest: &[D1MigrationManifestEntry],
+        namespace: &str,
+    ) -> String {
+        let mut identity = self.lease.identity.clone();
+        identity.namespace = namespace.to_string();
+        reconciliation_plan_sha256(
+            account_id,
+            database_id,
+            family,
+            migrations_table,
+            manifest,
+            &identity,
+            self.original_prefix_length,
+            self.current_prefix_length,
+            &self.outcome,
+            &self.query.sha256,
+            &self.canonical_snapshot_sha256,
+        )
+    }
+}
+
+pub(crate) async fn prepare_d1_migration_reconciliation(
     server: &CloudflareMcp,
     account_id: &str,
     database_id: &str,
@@ -243,14 +303,14 @@ pub(crate) async fn reconcile_d1_migration_manifest(
     lease_payload_sha256: &str,
     effect_assertion_id: Option<&str>,
     state_expectations: Vec<D1MigrationStateExpectation>,
-) -> CallToolResult {
+) -> Result<D1MigrationReconciliationProof, CallToolResult> {
     let derived_states = match derive_effect_assertion(effect_assertion_id, manifest) {
         Ok(derived_states) => derived_states,
-        Err(result) => return prelease_error(result, "not_inspected", None),
+        Err(result) => return Err(prelease_error(result, "not_inspected", None)),
     };
     let validated = match validate_expectations(&derived_states, state_expectations) {
         Ok(validated) => validated,
-        Err(result) => return prelease_error(result, "not_inspected", None),
+        Err(result) => return Err(prelease_error(result, "not_inspected", None)),
     };
     let query = build_fixed_query(
         migrations_table,
@@ -268,14 +328,20 @@ pub(crate) async fn reconcile_d1_migration_manifest(
         lease_payload_sha256,
     ) {
         Ok(lease) => lease,
-        Err(result) => return prelease_error(result, "inspection_failed", Some(&query.sha256)),
+        Err(result) => {
+            return Err(prelease_error(
+                result,
+                "inspection_failed",
+                Some(&query.sha256),
+            ));
+        }
     };
 
     let first = match read_complete_batch(server, &lease, account_id, database_id, &query, manifest)
         .await
     {
         Ok(batch) => batch,
-        Err(result) => return result,
+        Err(result) => return Err(result),
     };
     let first_digest = batch_digest(&first);
     let second = match read_complete_batch(
@@ -290,16 +356,16 @@ pub(crate) async fn reconcile_d1_migration_manifest(
     {
         Ok(batch) => batch,
         Err(result) => {
-            return contextualize_error(
+            return Err(contextualize_error(
                 result,
                 Some(&query.sha256),
                 &[response_digest_summary(&first)],
                 1,
-            );
+            ));
         }
     };
     if let Err(result) = lease.revalidate() {
-        return contextualize_unverified_custody_error(
+        return Err(contextualize_unverified_custody_error(
             result,
             Some(&query.sha256),
             &[
@@ -307,11 +373,11 @@ pub(crate) async fn reconcile_d1_migration_manifest(
                 response_digest_summary(&second),
             ],
             2,
-        );
+        ));
     }
     let second_digest = batch_digest(&second);
     if first.snapshot != second.snapshot || first_digest != second_digest {
-        return contextualize_error(
+        return Err(contextualize_error(
             reconciliation_error_with_evidence(
                 "contradictory",
                 "d1.migration_reconciliation_evidence_unstable",
@@ -325,14 +391,14 @@ pub(crate) async fn reconcile_d1_migration_manifest(
             Some(&query.sha256),
             &[],
             2,
-        );
+        ));
     }
 
     let ledger_classification = match classify_d1_manifest_ledger(manifest, &first.snapshot.ledger)
     {
         Ok(classification) => classification,
         Err(_) => {
-            return contextualize_error(
+            return Err(contextualize_error(
                 reconciliation_error_with_evidence(
                     "contradictory",
                     "d1.migration_reconciliation_ledger_not_manifest_prefix",
@@ -346,7 +412,7 @@ pub(crate) async fn reconcile_d1_migration_manifest(
                 Some(&query.sha256),
                 &[],
                 2,
-            );
+            ));
         }
     };
     let original_prefix = match reconstruct_unique_original_prefix(
@@ -360,7 +426,7 @@ pub(crate) async fn reconcile_d1_migration_manifest(
     ) {
         Ok(prefix) => prefix,
         Err(result) => {
-            return contextualize_error(
+            return Err(contextualize_error(
                 result,
                 Some(&query.sha256),
                 &[
@@ -368,7 +434,7 @@ pub(crate) async fn reconcile_d1_migration_manifest(
                     response_digest_summary(&second),
                 ],
                 2,
-            );
+            ));
         }
     };
     let current_prefix = ledger_classification.applied_names.len();
@@ -379,7 +445,7 @@ pub(crate) async fn reconcile_d1_migration_manifest(
     {
         Some(state) => state,
         None => {
-            return contextualize_error(
+            return Err(contextualize_error(
                 reconciliation_error_with_evidence(
                     "capability_gap",
                     "d1.migration_reconciliation_state_expectation_missing",
@@ -393,11 +459,11 @@ pub(crate) async fn reconcile_d1_migration_manifest(
                 Some(&query.sha256),
                 &[],
                 2,
-            );
+            ));
         }
     };
     if let Err(result) = verify_expected_state(expected_state, &validated, &first.snapshot) {
-        return contextualize_error(
+        return Err(contextualize_error(
             result,
             Some(&query.sha256),
             &[
@@ -405,7 +471,7 @@ pub(crate) async fn reconcile_d1_migration_manifest(
                 response_digest_summary(&second),
             ],
             2,
-        );
+        ));
     }
 
     let outcome = if current_prefix == original_prefix {
@@ -418,7 +484,7 @@ pub(crate) async fn reconcile_d1_migration_manifest(
         "unknown"
     };
     if outcome == "unknown" {
-        return contextualize_error(
+        return Err(contextualize_error(
             reconciliation_error_with_evidence(
                 "contradictory",
                 "d1.migration_reconciliation_plan_relationship_contradictory",
@@ -432,7 +498,7 @@ pub(crate) async fn reconcile_d1_migration_manifest(
             Some(&query.sha256),
             &[],
             2,
-        );
+        ));
     }
 
     let snapshot_sha256 = first_digest;
@@ -442,20 +508,65 @@ pub(crate) async fn reconcile_d1_migration_manifest(
         family,
         migrations_table,
         manifest,
-        &lease,
+        &lease.identity,
         original_prefix,
         current_prefix,
         outcome,
         &query.sha256,
         &snapshot_sha256,
     );
+    Ok(D1MigrationReconciliationProof {
+        lease,
+        query,
+        first,
+        second,
+        expectation_proof_sha256: validated.proof_sha256,
+        canonical_snapshot_sha256: snapshot_sha256,
+        reconciliation_plan_sha256,
+        original_prefix_length: original_prefix,
+        current_prefix_length: current_prefix,
+        outcome: outcome.to_string(),
+    })
+}
+
+pub(crate) async fn reconcile_d1_migration_manifest(
+    server: &CloudflareMcp,
+    account_id: &str,
+    database_id: &str,
+    family: &str,
+    migrations_table: &str,
+    manifest: &[D1MigrationManifestEntry],
+    approved_plan_sha256: &str,
+    lease_nonce: &str,
+    lease_payload_sha256: &str,
+    effect_assertion_id: Option<&str>,
+    state_expectations: Vec<D1MigrationStateExpectation>,
+) -> CallToolResult {
+    let proof = match prepare_d1_migration_reconciliation(
+        server,
+        account_id,
+        database_id,
+        family,
+        migrations_table,
+        manifest,
+        approved_plan_sha256,
+        lease_nonce,
+        lease_payload_sha256,
+        effect_assertion_id,
+        state_expectations,
+    )
+    .await
+    {
+        Ok(proof) => proof,
+        Err(result) => return result,
+    };
     CallToolResult::structured(json!({
         "ok": true,
         "operation": OPERATION,
         "dry_run": true,
         "read_only": true,
         "status": "reconciliation_evidence_ready",
-        "outcome": outcome,
+        "outcome": proof.outcome,
         "retry_decision": "do_not_retry_same_attempt",
         "lease_decision": "retain",
         "lease_retained": true,
@@ -468,16 +579,16 @@ pub(crate) async fn reconcile_d1_migration_manifest(
         "migrations_table": migrations_table,
         "manifest": d1_manifest_summaries(manifest),
         "approved_plan_sha256": approved_plan_sha256,
-        "reconstructed_original_prefix_length": original_prefix,
-        "current_manifest_prefix_length": current_prefix,
-        "ledger": d1_ledger_summaries(&first.snapshot.ledger),
-        "lease": lease.identity,
-        "query_sha256": query.sha256,
-        "expectation_proof_sha256": validated.proof_sha256,
-        "query_sha256s": [&query.sha256, &query.sha256],
-        "response_evidence": [response_digest_summary(&first), response_digest_summary(&second)],
-        "provider_read_lifecycle": [first.lifecycle, second.lifecycle],
-        "canonical_snapshot_sha256": snapshot_sha256,
+        "reconstructed_original_prefix_length": proof.original_prefix_length,
+        "current_manifest_prefix_length": proof.current_prefix_length,
+        "ledger": d1_ledger_summaries(&proof.first.snapshot.ledger),
+        "lease": proof.lease.identity,
+        "query_sha256": proof.query.sha256,
+        "expectation_proof_sha256": proof.expectation_proof_sha256,
+        "query_sha256s": [&proof.query.sha256, &proof.query.sha256],
+        "response_evidence": [response_digest_summary(&proof.first), response_digest_summary(&proof.second)],
+        "provider_read_lifecycle": [proof.first.lifecycle, proof.second.lifecycle],
+        "canonical_snapshot_sha256": proof.canonical_snapshot_sha256,
         "scope_completeness": {
             "ledger": "complete_bounded_manifest_prefix",
             "sqlite_master": "complete_exact_declared_object_union",
@@ -491,12 +602,64 @@ pub(crate) async fn reconcile_d1_migration_manifest(
             "source": "built_in_registry_and_exact_manifest_sql_classification",
             "caller_schema_only_declaration_used": false,
         },
-        "reconciliation_plan_sha256": reconciliation_plan_sha256,
-        "future_live_transition": "not_implemented_in_this_slice",
+        "reconciliation_plan_sha256": proof.reconciliation_plan_sha256,
+        "future_live_transition": "use_d1_finalize_migration_reconciliation_after_independent_approval",
         "provider_calls": 2,
         "provider_mutations": 0,
         "local_namespace_mutations": 0,
     }))
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct D1MigrationReconciliationRefresh {
+    pub(crate) response_evidence: Value,
+    pub(crate) lifecycle: Value,
+}
+
+pub(crate) async fn refresh_d1_migration_reconciliation(
+    server: &CloudflareMcp,
+    proof: &D1MigrationReconciliationProof,
+    account_id: &str,
+    database_id: &str,
+    manifest: &[D1MigrationManifestEntry],
+) -> Result<D1MigrationReconciliationRefresh, CallToolResult> {
+    let batch = read_complete_batch(
+        server,
+        &proof.lease,
+        account_id,
+        database_id,
+        &proof.query,
+        manifest,
+    )
+    .await?;
+    proof.lease.revalidate().map_err(|result| {
+        contextualize_unverified_custody_error(
+            result,
+            Some(&proof.query.sha256),
+            &[response_digest_summary(&batch)],
+            1,
+        )
+    })?;
+    if batch.snapshot != proof.first.snapshot
+        || batch_digest(&batch) != proof.canonical_snapshot_sha256
+    {
+        return Err(contextualize_error(
+            reconciliation_error_with_evidence(
+                "contradictory",
+                "d1.migration_reconciliation_fresh_state_changed",
+                "fresh primary-current evidence no longer matches the approved canonical snapshot",
+                Some(&proof.query.sha256),
+                &[response_digest_summary(&batch)],
+            ),
+            Some(&proof.query.sha256),
+            &[],
+            1,
+        ));
+    }
+    Ok(D1MigrationReconciliationRefresh {
+        response_evidence: response_digest_summary(&batch),
+        lifecycle: json!(batch.lifecycle),
+    })
 }
 
 #[derive(Debug)]
@@ -1943,7 +2106,7 @@ fn reconciliation_plan_sha256(
     family: &str,
     migrations_table: &str,
     manifest: &[D1MigrationManifestEntry],
-    lease: &D1RetainedMigrationLease,
+    lease: &D1RetainedMigrationLeaseIdentity,
     original_prefix: usize,
     current_prefix: usize,
     outcome: &str,
@@ -1958,7 +2121,7 @@ fn reconciliation_plan_sha256(
         "migration_family": family,
         "migrations_table": migrations_table,
         "manifest": d1_manifest_summaries(manifest),
-        "lease": lease.identity,
+        "lease": lease,
         "original_prefix_length": original_prefix,
         "current_prefix_length": current_prefix,
         "outcome": outcome,
