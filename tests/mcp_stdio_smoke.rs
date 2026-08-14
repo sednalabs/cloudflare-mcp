@@ -4274,13 +4274,34 @@ fn d1_reconcile_migration_manifest_stdio_rejects_unproven_effects_and_incomplete
         }),
     );
     let content = structured_content(&rejected_effect);
-    assert_eq!(content["ok"], json!(false), "{content}");
     assert_eq!(
-        content["error"]["code"],
-        json!("d1.migration_reconciliation_effect_proof_unavailable")
+        content,
+        json!({
+            "ok": false,
+            "operation": "d1_reconcile_migration_manifest",
+            "dry_run": true,
+            "read_only": true,
+            "status": "reconciliation_required",
+            "outcome": "unknown",
+            "capability_state": "capability_gap",
+            "retry_decision": "do_not_retry_same_attempt",
+            "lease_decision": "not_acquired",
+            "lease_retained": null,
+            "custody_status": "not_inspected",
+            "query_sha256": null,
+            "response_evidence": [],
+            "provider_calls": 0,
+            "provider_read_lifecycle": [],
+            "provider_mutations": 0,
+            "local_namespace_mutations": 0,
+            "error": {
+                "code": "d1.migration_reconciliation_effect_proof_unavailable",
+                "message": "the built-in effect registry cannot exactly prove arbitrary DML, ALTER, DROP, PRAGMA, trigger, view, virtual table, or data-producing CREATE effects",
+                "hint": "Retain the exact lease evidence. Do not retry the original migration attempt or mutate D1 from this result."
+            }
+        }),
+        "{content}"
     );
-    assert_eq!(content["lease_retained"], Value::Null);
-    assert_eq!(content["custody_status"], json!("not_inspected"));
 
     let schema_create = "CREATE TABLE items(id INTEGER PRIMARY KEY);";
     let schema_manifest = json!([{
@@ -4307,13 +4328,34 @@ fn d1_reconcile_migration_manifest_stdio_rejects_unproven_effects_and_incomplete
         }),
     );
     let content = structured_content(&omitted_schema);
-    assert_eq!(content["ok"], json!(false), "{content}");
     assert_eq!(
-        content["error"]["code"],
-        json!("d1.migration_reconciliation_schema_expectation_incomplete")
+        content,
+        json!({
+            "ok": false,
+            "operation": "d1_reconcile_migration_manifest",
+            "dry_run": true,
+            "read_only": true,
+            "status": "reconciliation_required",
+            "outcome": "unknown",
+            "capability_state": "contradictory",
+            "retry_decision": "do_not_retry_same_attempt",
+            "lease_decision": "not_acquired",
+            "lease_retained": null,
+            "custody_status": "not_inspected",
+            "query_sha256": null,
+            "response_evidence": [],
+            "provider_calls": 0,
+            "provider_read_lifecycle": [],
+            "provider_mutations": 0,
+            "local_namespace_mutations": 0,
+            "error": {
+                "code": "d1.migration_reconciliation_schema_expectation_incomplete",
+                "message": "schema object expectations must exactly match every CREATE target derived from the manifest prefix",
+                "hint": "Retain the exact lease evidence. Do not retry the original migration attempt or mutate D1 from this result."
+            }
+        }),
+        "{content}"
     );
-    assert_eq!(content["lease_retained"], Value::Null);
-    assert_eq!(content["custody_status"], json!("not_inspected"));
 
     let inspection_failed = mcp.call_tool(
         743,
@@ -4354,13 +4396,41 @@ fn d1_reconcile_migration_manifest_stdio_rejects_unproven_effects_and_incomplete
         }),
     );
     let content = structured_content(&inspection_failed);
-    assert_eq!(content["ok"], json!(false), "{content}");
+    let query_sha256 = content["query_sha256"]
+        .as_str()
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .expect("canonical fixed-query SHA-256")
+        .to_string();
     assert_eq!(
-        content["error"]["code"],
-        json!("d1.migration_reconciliation_lease_root_unconfigured")
+        content,
+        json!({
+            "ok": false,
+            "operation": "d1_reconcile_migration_manifest",
+            "dry_run": true,
+            "read_only": true,
+            "status": "reconciliation_required",
+            "retry_decision": "do_not_retry_same_attempt",
+            "lease_decision": "not_acquired",
+            "lease_retained": null,
+            "custody_status": "inspection_failed",
+            "query_sha256": query_sha256,
+            "provider_calls": 0,
+            "provider_read_lifecycle": [],
+            "provider_mutations": 0,
+            "local_namespace_mutations": 0,
+            "error": {
+                "code": "d1.migration_reconciliation_lease_root_unconfigured",
+                "message": "read-only reconciliation requires the configured operator-owned migration lease root",
+                "hint": "Retain the exact custody evidence and resolve this boundary before any provider read or migration retry."
+            }
+        }),
+        "{content}"
     );
-    assert_eq!(content["lease_retained"], Value::Null);
-    assert_eq!(content["custody_status"], json!("inspection_failed"));
     mcp.terminate();
 }
 

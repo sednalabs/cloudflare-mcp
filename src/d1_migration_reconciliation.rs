@@ -2087,6 +2087,8 @@ fn prelease_error(
         content.insert("lease_retained".to_string(), Value::Null);
         content.insert("custody_status".to_string(), json!(custody_status));
         content.insert("query_sha256".to_string(), json!(query_sha256));
+        content.insert("provider_calls".to_string(), json!(0));
+        content.insert("provider_read_lifecycle".to_string(), json!([]));
         content.insert("provider_mutations".to_string(), json!(0));
         content.insert("local_namespace_mutations".to_string(), json!(0));
     }
@@ -2241,6 +2243,53 @@ mod tests {
             derive_effect_assertion(Some(EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1), &mixed_case)
                 .expect("derive case-insensitive keyword with exact identifier");
         assert_eq!(mixed_case_derived[1][0].name, "Items");
+    }
+
+    #[test]
+    fn preprovider_failures_emit_closed_zero_call_lifecycle_evidence() {
+        for (custody_status, query_sha256) in
+            [("not_inspected", None), ("inspection_failed", Some(PROOF))]
+        {
+            let result = prelease_error(
+                reconciliation_error(
+                    "capability_gap",
+                    "d1.migration_reconciliation_synthetic_preprovider_failure",
+                    "synthetic pre-provider failure",
+                ),
+                custody_status,
+                query_sha256,
+            );
+            let content = result
+                .structured_content
+                .expect("structured pre-provider failure");
+            assert_eq!(
+                content,
+                json!({
+                    "ok": false,
+                    "operation": "d1_reconcile_migration_manifest",
+                    "dry_run": true,
+                    "read_only": true,
+                    "status": "reconciliation_required",
+                    "outcome": "unknown",
+                    "capability_state": "capability_gap",
+                    "retry_decision": "do_not_retry_same_attempt",
+                    "lease_decision": "not_acquired",
+                    "lease_retained": null,
+                    "custody_status": custody_status,
+                    "query_sha256": query_sha256,
+                    "response_evidence": [],
+                    "provider_calls": 0,
+                    "provider_read_lifecycle": [],
+                    "provider_mutations": 0,
+                    "local_namespace_mutations": 0,
+                    "error": {
+                        "code": "d1.migration_reconciliation_synthetic_preprovider_failure",
+                        "message": "synthetic pre-provider failure",
+                        "hint": "Retain the exact lease evidence. Do not retry the original migration attempt or mutate D1 from this result."
+                    }
+                })
+            );
+        }
     }
 
     #[test]

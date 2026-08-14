@@ -95,7 +95,9 @@ custody evidence or authorizes an apply retry. The boundary does not follow
 HTTP redirects and returns one chronological `provider_read_lifecycle` entry
 per invocation, distinguishing pre-dispatch, attempted-without-response,
 response received, partial/complete body read, and captured HTTP status. Local
-token/config failure therefore reports zero provider calls. A null `lease_retained` with
+token/config failure therefore reports zero provider calls. Validation or
+custody-inspection failure before adapter invocation instead reports
+`provider_calls=0` with an empty lifecycle array. A null `lease_retained` with
 `custody_status=not_inspected` or `inspection_failed` means no retained lease
 was acquired or proven by that call; it is not evidence that custody was
 removed. Likewise, `custody_status=retained_evidence_unverified` after a

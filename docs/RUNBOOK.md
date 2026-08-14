@@ -182,6 +182,10 @@ UTF-8, malformed JSON, truncated streams, and oversized bodies. Treat 401,
 Interpret custody fields literally. Validation failures before custody lookup
 return `lease_retained=null` and `custody_status=not_inspected`. Inspection
 failures return `lease_retained=null` and `custody_status=inspection_failed`.
+Both are before provider-adapter invocation and must explicitly return
+`provider_calls=0` with `provider_read_lifecycle=[]`; missing fields are not
+zero-call evidence. Adapter-local token/config failure is different: it records
+one `pre_dispatch` lifecycle entry even though its provider-call count is zero.
 Only a successfully acquired and revalidated retained lease may report
 `lease_retained=true` and `custody_status=retained_evidence_verified`. If that
 evidence drifts, conflicts, or fails revalidation around a provider read, the
