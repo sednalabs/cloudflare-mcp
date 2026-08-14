@@ -4541,12 +4541,12 @@ impl CloudflareMcp {
         let database_id = target.database_id;
         // Preserve the canonical target in the request-shaped value used below so
         // every provider call, plan, and lease key observes the same identifiers.
-        let args = D1ApplyMigrationManifestArgs {
+        let mut args = D1ApplyMigrationManifestArgs {
             account_id: requested_account_id,
             database_id: database_id.clone(),
             migration_family: migration_family.clone(),
             migrations_table,
-            manifest: manifest.clone(),
+            manifest,
             dry_run,
             approved_plan_sha256,
             max_rows,
@@ -4558,7 +4558,7 @@ impl CloudflareMcp {
             Ok(table) => table,
             Err(result) => return Ok(result),
         };
-        let manifest = match validate_d1_migration_manifest(manifest) {
+        let manifest = match validate_d1_migration_manifest(std::mem::take(&mut args.manifest)) {
             Ok(manifest) => manifest,
             Err(result) => return Ok(result),
         };
@@ -12066,6 +12066,7 @@ fn queue_consumer_dlq_name(consumer: &Value) -> Option<String> {
 const D1_WRITE_ALLOWED_KINDS: &[&str] = &["INSERT", "UPDATE", "DELETE", "REPLACE"];
 const DEFAULT_D1_MIGRATIONS_TABLE: &str = "d1_migrations";
 pub(crate) const MAX_D1_MIGRATION_BYTES: u64 = 5 * 1024 * 1024;
+pub(crate) const MAX_D1_MIGRATION_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const MAX_D1_MIGRATION_COUNT: usize = 1_000;
 
 #[derive(Debug, Clone)]
@@ -16247,6 +16248,26 @@ mod tests {
         assert_eq!(
             error.structured_content.expect("structured error")["error"]["code"],
             json!("d1.invalid_manifest_migration_name")
+        );
+
+        let sql = format!(
+            "-- {}\n",
+            "x".repeat((MAX_D1_MIGRATION_MANIFEST_BYTES / 4) as usize)
+        );
+        let sql_sha256 = super::sha256_hex(&sql);
+        let manifest = (1..=4)
+            .map(|index| D1MigrationManifestEntry {
+                name: format!("{index:04}_aggregate.sql"),
+                size_bytes: sql.len() as u64,
+                sql_sha256: sql_sha256.clone(),
+                sql: sql.clone(),
+            })
+            .collect();
+        let error = validate_d1_migration_manifest(manifest)
+            .expect_err("aggregate exact SQL bytes above the manifest bound must fail");
+        assert_eq!(
+            error.structured_content.expect("structured error")["error"]["code"],
+            json!("d1.migration_manifest_too_large")
         );
     }
 

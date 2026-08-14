@@ -100,6 +100,11 @@ directory, guard, identity and mode before every provider boundary. Do not use
 a shared writable directory or manually rename or remove any lease evidence by
 pathname.
 
+The exact-byte manifest boundary accepts at most 16 MiB of aggregate SQL and
+moves the supplied manifest into validation without cloning its SQL strings.
+Split a larger migration family before review rather than increasing this
+operator-surface memory bound.
+
 A later invocation stops before provider I/O when it sees an active or
 `retiring.lease.json` entry, including one that is malformed, a symlink or
 non-regular. It must be resolved only through governed recovery work item

@@ -13,8 +13,8 @@ use crate::d1_migration_lease::D1MigrationLease;
 use crate::server::CloudflareMcp;
 use crate::tools::{
     D1MigrationManifestEntry, MAX_D1_MIGRATION_BYTES, MAX_D1_MIGRATION_COUNT,
-    d1_applied_migrations_sql, d1_call_tool_error_value, invalid_argument_result, sha256_bytes_hex,
-    sha256_hex,
+    MAX_D1_MIGRATION_MANIFEST_BYTES, d1_applied_migrations_sql, d1_call_tool_error_value,
+    invalid_argument_result, sha256_bytes_hex, sha256_hex,
 };
 
 #[derive(Debug, Clone)]
@@ -125,6 +125,7 @@ pub(crate) fn validate_d1_migration_manifest(
         ));
     }
     let mut previous = None::<String>;
+    let mut manifest_size_bytes = 0_u64;
     for migration in &manifest {
         let name = migration.name.trim();
         if name != migration.name
@@ -155,6 +156,24 @@ pub(crate) fn validate_d1_migration_manifest(
                 "d1.manifest_size_mismatch",
                 "manifest size_bytes must equal the exact UTF-8 SQL byte length and stay within the migration limit",
                 "Rebuild the manifest from the reviewed SQL bytes.",
+            ));
+        }
+        manifest_size_bytes = manifest_size_bytes
+            .checked_add(migration.size_bytes)
+            .ok_or_else(|| {
+                invalid_argument_result(
+                    "d1.migration_manifest_too_large",
+                    "manifest aggregate SQL byte length overflowed the supported bound",
+                    "Apply a smaller complete migration family.",
+                )
+            })?;
+        if manifest_size_bytes > MAX_D1_MIGRATION_MANIFEST_BYTES {
+            return Err(invalid_argument_result(
+                "d1.migration_manifest_too_large",
+                format!(
+                    "manifest exact SQL bytes exceed the {MAX_D1_MIGRATION_MANIFEST_BYTES}-byte aggregate limit"
+                ),
+                "Apply a smaller complete migration family.",
             ));
         }
         if migration.sql.trim().is_empty() {
