@@ -119,7 +119,9 @@ contains only captured response bodies. Top-level `provider_read_lifecycle` is
 the separate complete invocation chronology, so a second no-response transport
 or pre-dispatch failure is retained even though it cannot add a response
 summary. After a completed first read that aggregate operation reports two
-provider calls; standalone pre-dispatch failure remains zero provider calls.
+provider calls only when the second invocation reaches transport. A second
+pre-dispatch failure retains both lifecycle entries but reports one actual
+provider call; standalone pre-dispatch failure remains zero provider calls.
 
 For D1 usage-spike investigations, start with `account_billing_usage` to read
 Cloudflare billing usage records, then use `graphql_analytics_query` for

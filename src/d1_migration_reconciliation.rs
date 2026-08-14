@@ -1974,14 +1974,11 @@ fn contextualize_error(
         );
         content.insert("provider_mutations".to_string(), json!(0));
         content.insert("local_namespace_mutations".to_string(), json!(0));
-        let mut provider_calls = content
+        let provider_calls = content
             .get("provider_calls")
             .and_then(Value::as_u64)
             .unwrap_or(0)
             .saturating_add(prior_provider_calls as u64);
-        if !response_evidence.is_empty() {
-            provider_calls = provider_calls.max(provider_lifecycle.len() as u64);
-        }
         content.insert("provider_calls".to_string(), json!(provider_calls));
     }
     CallToolResult::structured_error(content)
@@ -2788,7 +2785,7 @@ mod tests {
                 "query_sha256": PROOF,
                 "response_evidence": [first.clone()],
                 "provider_read_lifecycle": [first_lifecycle.clone(), second_lifecycle],
-                "provider_calls": 2,
+                "provider_calls": if pre_dispatch { 1 } else { 2 },
                 "provider_mutations": 0,
                 "local_namespace_mutations": 0,
                 "provider_cause": {
@@ -2841,7 +2838,7 @@ mod tests {
         let mut content = json!({
             "response_evidence": [first.clone()],
             "provider_read_lifecycle": [first["lifecycle"].clone(), second_lifecycle.clone()],
-            "provider_calls": 2,
+            "provider_calls": 1,
         })
         .as_object()
         .expect("content object")

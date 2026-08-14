@@ -202,8 +202,10 @@ custody drift changes that status to unverified. `response_evidence` records
 only captured response bodies; `provider_read_lifecycle` independently records
 every invocation. After one complete read, a second transport failure or
 pre-dispatch adapter failure therefore leaves one response summary but two
-chronological lifecycle entries and aggregate `provider_calls=2`. Standalone
-pre-dispatch failure remains zero provider calls.
+chronological lifecycle entries. `provider_calls` counts only actual provider
+attempts: it is `1` when that second invocation fails before dispatch and `2`
+when the second invocation reaches transport. Standalone pre-dispatch failure
+remains zero provider calls.
 Revalidation runs after every
 attempted provider call even when the provider returns an error. If provider
 failure and custody drift coincide, retain the provider classification and
