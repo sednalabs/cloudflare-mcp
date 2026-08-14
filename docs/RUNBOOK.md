@@ -116,10 +116,14 @@ the active target lease: reconcile provider ledger evidence and the reported
 lease identity before any governed recovery. A matching ledger filename is only
 an observation: it does not attest to the reviewed SQL bytes or complete
 provider transaction, and therefore never authorizes lease release after an
-ambiguous apply. This is a shared-filesystem lease, not a Cloudflare-distributed
-lock; separate provider/distributed coordination remains required when MCP
-instances do not share that root. Non-Linux installations fail closed before
-provider I/O.
+ambiguous apply. This guarantee is limited to a trusted Linux filesystem that
+supports working `renameat2(RENAME_NOREPLACE)`, directory `fsync`, and advisory
+file locks. It is a shared-filesystem lease, not a Cloudflare-distributed lock;
+cross-host or other shared-filesystem semantics require separate proof.
+Separate provider/distributed coordination remains required when MCP instances
+do not share that root. `w11990` remains the governed recovery path for
+retained, malformed, or tampered evidence. Non-Linux installations or
+unsupported filesystems fail closed before provider I/O.
 
 For CI-built release bundles, the `Rust Validation` workflow uploads a
 downloadable artifact named `cloudflare-mcp-linux-x86_64-stdio-<git-sha>` that

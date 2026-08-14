@@ -269,7 +269,7 @@ pub(crate) fn d1_migration_lease_requirements(
         "scope": "one permanent directory and guard per account/database target; family is evidence only and cannot split target serialization",
         "active_evidence": "active.lease.json and transient retiring.lease.json are never auto-reclaimed; malformed, symlink, non-regular, or otherwise present active/retiring evidence stops the next apply for w11990 reconciliation",
         "cross_host_limitation": "Cross-process serialization covers only hosts sharing the same configured operator-owned lease root. It is not a Cloudflare/provider-distributed lease.",
-        "platform_requirement": "Linux with dirfd-bound file locking and renameat2 support; unsupported platforms fail closed before provider I/O."
+        "platform_requirement": "Linux on a trusted filesystem supporting working renameat2 RENAME_NOREPLACE, directory fsync, and advisory file locks; unsupported platforms or filesystems fail closed before provider I/O. Cross-host or shared-filesystem semantics require separate proof; w11990 remains the governed recovery path."
     })
 }
 
@@ -1205,6 +1205,29 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn remove_test_path(path: &Path) {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                fs::remove_file(path).expect("remove test symlink or file");
+            }
+            Ok(_) => fs::remove_dir_all(path).expect("remove test directory"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("inspect test cleanup path: {error}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_revalidation_failed(error: CallToolResult, label: &str) {
+        let content = error.structured_content.expect("revalidation error");
+        assert_eq!(
+            content["error"]["code"],
+            json!("d1.migration_lease_revalidation_failed"),
+            "{label}"
+        );
+        assert_eq!(content["lease_retained"], json!(true), "{label}");
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn held_permanent_guard_blocks_another_thread_before_active_creation() {
         use std::sync::mpsc;
@@ -1253,11 +1276,15 @@ mod tests {
         );
         assert_eq!(fs::read(&active).expect("restored active"), original);
         assert!(
-            !active
-                .parent()
-                .expect("target parent")
-                .join(RETIRING_LEASE_NAME)
-                .exists(),
+            matches!(
+                fs::symlink_metadata(
+                    active
+                        .parent()
+                        .expect("target parent")
+                        .join(RETIRING_LEASE_NAME)
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ),
             "successful restoration must not leave a retiring entry"
         );
         owner.retain();
@@ -1467,28 +1494,171 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn root_and_ancestor_unsafe_or_symlink_drift_fails_revalidation() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        for label in [
+            "root-mode",
+            "root-symlink",
+            "ancestor-mode",
+            "ancestor-symlink",
+        ] {
+            let base = private_test_root(label);
+            let root = if label.starts_with("ancestor-") {
+                let root = base.join("root");
+                fs::create_dir(&root).expect("nested lease root");
+                fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                    .expect("nested lease root permissions");
+                root
+            } else {
+                base.clone()
+            };
+            let mut owner = acquire_d1_migration_lease_at(
+                root.clone(),
+                "acct-1",
+                "db-1",
+                "first",
+                &"a".repeat(64),
+            )
+            .expect("owner lease");
+            match label {
+                "root-mode" => fs::set_permissions(&root, fs::Permissions::from_mode(0o755))
+                    .expect("unsafe root mode"),
+                "root-symlink" => {
+                    let displaced = root.with_extension("displaced");
+                    fs::rename(&root, &displaced).expect("displace root");
+                    symlink(&displaced, &root).expect("replace root with symlink");
+                }
+                "ancestor-mode" => fs::set_permissions(&base, fs::Permissions::from_mode(0o775))
+                    .expect("unsafe ancestor mode"),
+                "ancestor-symlink" => {
+                    let displaced = base.with_extension("displaced");
+                    fs::rename(&base, &displaced).expect("displace ancestor");
+                    symlink(&displaced, &base).expect("replace ancestor with symlink");
+                }
+                _ => unreachable!(),
+            }
+            assert_revalidation_failed(owner.revalidate().expect_err("unsafe custody"), label);
+            owner.retain();
+            if label == "root-symlink" {
+                remove_test_path(&root);
+                remove_test_path(&root.with_extension("displaced"));
+            } else if label == "ancestor-symlink" {
+                remove_test_path(&base);
+                remove_test_path(&base.with_extension("displaced"));
+            } else {
+                remove_test_path(&root);
+            }
+            if label == "ancestor-mode" {
+                remove_test_path(&base);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn active_inode_mode_payload_or_symlink_tampering_fails_revalidation() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+        for label in ["mode", "inode", "payload", "symlink"] {
+            let root = private_test_root(&format!("active-{label}"));
+            let mut owner = acquire_d1_migration_lease_at(
+                root.clone(),
+                "acct-1",
+                "db-1",
+                "first",
+                &"a".repeat(64),
+            )
+            .expect("owner lease");
+            let active = owner.active_path_for_test().expect("active path");
+            match label {
+                "mode" => fs::set_permissions(&active, fs::Permissions::from_mode(0o644))
+                    .expect("unsafe active mode"),
+                "inode" => {
+                    let displaced = active.with_extension("displaced");
+                    fs::rename(&active, &displaced).expect("displace active evidence");
+                    fs::write(&active, b"replacement active evidence").expect("replacement active");
+                    fs::set_permissions(&active, fs::Permissions::from_mode(0o600))
+                        .expect("private replacement active");
+                    let original = fs::symlink_metadata(&displaced).expect("old active metadata");
+                    let replacement = fs::symlink_metadata(&active).expect("replacement metadata");
+                    assert_ne!(
+                        (original.dev(), original.ino()),
+                        (replacement.dev(), replacement.ino())
+                    );
+                }
+                "payload" => {
+                    let before = fs::read(&active).expect("active payload");
+                    fs::write(&active, b"tampered payload").expect("tamper active payload");
+                    assert_ne!(before, fs::read(&active).expect("tampered payload"));
+                }
+                "symlink" => {
+                    let displaced = active.with_extension("displaced");
+                    fs::rename(&active, &displaced).expect("displace active evidence");
+                    symlink("/dev/null", &active).expect("replace active with symlink");
+                }
+                _ => unreachable!(),
+            }
+            assert_revalidation_failed(owner.revalidate().expect_err("tampered active"), label);
+            owner.retain();
+            remove_test_path(&root);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn second_release_is_inert_after_terminal_retirement() {
+        use std::os::unix::fs::MetadataExt;
+
         let root = private_test_root("release-idempotent");
         let mut owner =
             acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "first", &"a".repeat(64))
                 .expect("owner lease");
         owner.release().expect("first release");
-        owner.release().expect("second release is inert");
         let target = owner
             .active_path_for_test()
             .expect("active path")
             .parent()
             .expect("target path")
             .to_path_buf();
-        assert!(!target.join(ACTIVE_LEASE_NAME).exists());
+        let active = target.join(ACTIVE_LEASE_NAME);
+        assert!(
+            matches!(fs::symlink_metadata(&active), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+            "normal release removes active namespace entry"
+        );
+        let retired = fs::read_dir(&target)
+            .expect("read target")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("retired."))
+            .map(|entry| {
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path).expect("retired metadata");
+                assert!(metadata.is_file() && !metadata.file_type().is_symlink());
+                (path, metadata, fs::read(&path).expect("retired bytes"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retired.len(), 1, "one terminal retirement record");
+        let (retired_path, retired_metadata, retired_bytes) =
+            retired.into_iter().next().expect("terminal retirement");
+        owner.release().expect("second release is inert");
+        let after_metadata =
+            fs::symlink_metadata(&retired_path).expect("retired metadata after inert release");
         assert_eq!(
-            fs::read_dir(&target)
-                .expect("read target")
-                .filter_map(Result::ok)
-                .filter(|entry| entry.file_name().to_string_lossy().starts_with("retired."))
-                .count(),
-            1,
-            "an inert second release must not create another terminal record"
+            (
+                retired_metadata.dev(),
+                retired_metadata.ino(),
+                retired_metadata.mode()
+            ),
+            (
+                after_metadata.dev(),
+                after_metadata.ino(),
+                after_metadata.mode()
+            ),
+            "an inert second release must not replace terminal evidence"
+        );
+        assert_eq!(
+            retired_bytes,
+            fs::read(&retired_path).expect("retired bytes after inert release")
         );
         fs::remove_dir_all(root).expect("test cleanup");
     }

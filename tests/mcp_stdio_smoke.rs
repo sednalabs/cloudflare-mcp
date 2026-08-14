@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 fn sha256_hex(value: &str) -> String {
@@ -25,26 +25,126 @@ fn fixture_material(label: &str) -> String {
     value
 }
 
-fn assert_released_manifest_target_custody(lease_root: &Path) {
-    let target = lease_root.join(format!(
+fn manifest_target_path(lease_root: &Path) -> PathBuf {
+    lease_root.join(format!(
         "d1-migration-target-{}",
         sha256_hex("acct-1\0db-1")
-    ));
+    ))
+}
+
+fn assert_private_regular_active_lease(lease_root: &Path) -> PathBuf {
+    let target = manifest_target_path(lease_root);
+    let target_metadata = fs::symlink_metadata(&target).expect("manifest target metadata");
+    assert!(target_metadata.is_dir(), "manifest target is a directory");
     assert!(
-        target.join("guard.lock").is_file(),
+        !target_metadata.file_type().is_symlink(),
+        "manifest target must not be a symlink"
+    );
+    let active = target.join("active.lease.json");
+    let metadata = fs::symlink_metadata(&active).expect("retained active lease metadata");
+    assert!(metadata.is_file(), "retained active lease is regular");
+    assert!(
+        !metadata.file_type().is_symlink(),
+        "retained active lease must not be a symlink"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    }
+    assert!(metadata.len() > 0, "retained active lease has payload");
+    active
+}
+
+fn retired_manifest_entries(target: &Path) -> Vec<PathBuf> {
+    fs::read_dir(target)
+        .expect("read permanent target custody")
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = entry.file_name();
+            if !name.to_string_lossy().starts_with("retired.") {
+                return None;
+            }
+            let metadata = fs::symlink_metadata(&path).expect("retired evidence metadata");
+            assert!(metadata.is_file(), "retired evidence is regular");
+            assert!(
+                !metadata.file_type().is_symlink(),
+                "retired evidence must not be a symlink"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            }
+            Some(path)
+        })
+        .collect()
+}
+
+fn assert_released_manifest_target_custody(lease_root: &Path) {
+    let target = manifest_target_path(lease_root);
+    let target_metadata = fs::symlink_metadata(&target).expect("manifest target metadata");
+    assert!(target_metadata.is_dir(), "manifest target is a directory");
+    assert!(
+        !target_metadata.file_type().is_symlink(),
+        "manifest target must not be a symlink"
+    );
+    let guard_metadata =
+        fs::symlink_metadata(target.join("guard.lock")).expect("permanent guard metadata");
+    assert!(
+        guard_metadata.is_file() && !guard_metadata.file_type().is_symlink(),
         "permanent guard remains"
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(guard_metadata.permissions().mode() & 0o777, 0o600);
+    }
+    let active = target.join("active.lease.json");
     assert!(
-        !target.join("active.lease.json").exists(),
+        matches!(fs::symlink_metadata(&active), Err(error) if error.kind() == std::io::ErrorKind::NotFound),
         "normal completion has no active custody evidence"
     );
+    let retired = retired_manifest_entries(&target);
     assert!(
-        fs::read_dir(&target)
-            .expect("read permanent target custody")
-            .filter_map(Result::ok)
-            .any(|entry| entry.file_name().to_string_lossy().starts_with("retired.")),
+        retired.len() == 1,
         "normal completion retains a terminal retirement record"
     );
+}
+
+fn assert_fresh_process_blocked_without_provider_request(
+    env: Vec<(&'static str, String)>,
+    manifest: &Value,
+    plan: &str,
+    requests: &Arc<Mutex<Vec<Value>>>,
+    expected_requests: usize,
+    label: &str,
+) {
+    let mut contender = McpStdioProcess::start_with_env(env);
+    let response = contender.call_tool(
+        900,
+        "d1_apply_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "fresh-caller",
+            "manifest": manifest.clone(),
+            "approved_plan_sha256": plan,
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{label}: {content}");
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.migration_target_lease_held"),
+        "{label}: fresh caller must stop at retained active evidence"
+    );
+    assert_eq!(
+        requests.lock().expect("request log").len(),
+        expected_requests,
+        "{label}: fresh caller must not issue another provider request"
+    );
+    drop(contender);
 }
 
 struct McpStdioProcess {
@@ -3234,7 +3334,7 @@ fn d1_apply_migration_manifest_outer_write_errors_remain_unknown_and_retain_leas
                 .expect("make lease root private");
         }
         let mut mcp = McpStdioProcess::start_with_env(vec![
-            ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+            ("CLOUDFLARE_MCP_API_BASE_URL", base_url.clone()),
             (
                 "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
                 lease_root.to_string_lossy().to_string(),
@@ -3261,8 +3361,8 @@ fn d1_apply_migration_manifest_outer_write_errors_remain_unknown_and_retain_leas
             61 + index as u64 * 2,
             "d1_apply_migration_manifest",
             json!({
-                "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest,
-                "approved_plan_sha256": plan,
+                "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest.clone(),
+                "approved_plan_sha256": plan.clone(),
             }),
         );
         let content = structured_content(&live);
@@ -3291,12 +3391,21 @@ fn d1_apply_migration_manifest_outer_write_errors_remain_unknown_and_retain_leas
             1,
             "{label} must issue one non-idempotent write"
         );
-        assert!(
-            fs::read_dir(&lease_root)
-                .expect("read retained lease root")
-                .next()
-                .is_some(),
-            "{label} must retain the lease"
+        assert_private_regular_active_lease(&lease_root);
+        mcp.terminate();
+        assert_fresh_process_blocked_without_provider_request(
+            vec![
+                ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+                (
+                    "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+                    lease_root.to_string_lossy().to_string(),
+                ),
+            ],
+            &manifest,
+            &plan,
+            &requests,
+            6,
+            label,
         );
         let _ = fs::remove_dir_all(lease_root);
     }
@@ -3456,11 +3565,10 @@ fn d1_manifest_crashed_stdio_holder_retains_active_evidence_and_contender_never_
         2,
         "the next MCP process after the holder exits must stop at active evidence without a provider request"
     );
-    let target = lease_root.join(format!(
-        "d1-migration-target-{}",
-        sha256_hex("acct-1\0db-1")
-    ));
-    assert!(target.join("active.lease.json").is_file());
+    let target = manifest_target_path(&lease_root);
+    let active_metadata =
+        fs::symlink_metadata(target.join("active.lease.json")).expect("active lease metadata");
+    assert!(active_metadata.is_file() && !active_metadata.file_type().is_symlink());
     resume.send(()).expect("release fake preflight handler");
     drop(recovered_contender);
     let _ = fs::remove_dir_all(lease_root);
@@ -3567,34 +3675,16 @@ fn d1_apply_migration_manifest_response_loss_stops_without_retry_and_next_proces
         1,
         "a retryable HTTP status after a non-idempotent write must not issue a second write"
     );
-    assert!(
-        fs::read_dir(&lease_root)
-            .expect("read retained lease root")
-            .next()
-            .is_some()
-    );
+    assert_private_regular_active_lease(&lease_root);
     mcp.terminate();
-    let mut contender = McpStdioProcess::start_with_env(env);
-    let response = contender.call_tool(
-        73,
-        "d1_apply_migration_manifest",
-        json!({
-            "database_id": "db-1", "migration_family": "different-family", "manifest": manifest,
-            "approved_plan_sha256": plan,
-        }),
-    );
-    let content = structured_content(&response);
-    assert_eq!(content["ok"], json!(false), "{content}");
-    assert_eq!(
-        content["error"]["code"],
-        json!("d1.migration_target_lease_held")
-    );
-    assert_eq!(
-        requests.lock().expect("request log").len(),
+    assert_fresh_process_blocked_without_provider_request(
+        env,
+        &manifest,
+        &plan,
+        &requests,
         6,
-        "the next MCP process after an ambiguous holder exits must not issue a provider call"
+        "response loss",
     );
-    drop(contender);
     let _ = fs::remove_dir_all(lease_root);
 }
 
@@ -3614,7 +3704,7 @@ fn d1_apply_migration_manifest_same_name_after_response_loss_stays_unknown_and_r
             .expect("make lease root private");
     }
     let mut mcp = McpStdioProcess::start_with_env(vec![
-        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url.clone()),
         (
             "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
             lease_root.to_string_lossy().to_string(),
@@ -3637,8 +3727,8 @@ fn d1_apply_migration_manifest_same_name_after_response_loss_stays_unknown_and_r
         9,
         "d1_apply_migration_manifest",
         json!({
-            "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest,
-            "approved_plan_sha256": plan,
+            "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest.clone(),
+            "approved_plan_sha256": plan.clone(),
         }),
     );
     let content = structured_content(&live);
@@ -3662,11 +3752,21 @@ fn d1_apply_migration_manifest_same_name_after_response_loss_stays_unknown_and_r
         6,
         "same-name ledger evidence must neither release the lease nor apply the next statement"
     );
-    assert!(
-        fs::read_dir(&lease_root)
-            .expect("read retained lease root")
-            .next()
-            .is_some()
+    assert_private_regular_active_lease(&lease_root);
+    mcp.terminate();
+    assert_fresh_process_blocked_without_provider_request(
+        vec![
+            ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+            (
+                "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+                lease_root.to_string_lossy().to_string(),
+            ),
+        ],
+        &manifest,
+        &plan,
+        &requests,
+        6,
+        "same-name response loss",
     );
     let _ = fs::remove_dir_all(lease_root);
 }
@@ -3713,7 +3813,7 @@ fn d1_apply_migration_manifest_ambiguous_inner_result_shapes_retain_lease_withou
                 .expect("make lease root private");
         }
         let mut mcp = McpStdioProcess::start_with_env(vec![
-            ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+            ("CLOUDFLARE_MCP_API_BASE_URL", base_url.clone()),
             (
                 "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
                 lease_root.to_string_lossy().to_string(),
@@ -3735,8 +3835,8 @@ fn d1_apply_migration_manifest_ambiguous_inner_result_shapes_retain_lease_withou
             13 + index as u64 * 2,
             "d1_apply_migration_manifest",
             json!({
-                "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest,
-                "approved_plan_sha256": plan,
+                "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest.clone(),
+                "approved_plan_sha256": plan.clone(),
             }),
         );
         let content = structured_content(&live);
@@ -3781,12 +3881,21 @@ fn d1_apply_migration_manifest_ambiguous_inner_result_shapes_retain_lease_withou
             1,
             "{label} must issue one non-idempotent write"
         );
-        assert!(
-            fs::read_dir(&lease_root)
-                .expect("read retained lease root")
-                .next()
-                .is_some(),
-            "{label} must retain the lease"
+        assert_private_regular_active_lease(&lease_root);
+        mcp.terminate();
+        assert_fresh_process_blocked_without_provider_request(
+            vec![
+                ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+                (
+                    "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+                    lease_root.to_string_lossy().to_string(),
+                ),
+            ],
+            &manifest,
+            &plan,
+            &requests,
+            6,
+            label,
         );
         let _ = fs::remove_dir_all(lease_root);
     }
@@ -3865,7 +3974,7 @@ fn d1_apply_migration_manifest_partial_multi_statement_response_loss_stays_unkno
             .expect("make lease root private");
     }
     let mut mcp = McpStdioProcess::start_with_env(vec![
-        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url.clone()),
         (
             "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
             lease_root.to_string_lossy().to_string(),
@@ -3888,8 +3997,8 @@ fn d1_apply_migration_manifest_partial_multi_statement_response_loss_stays_unkno
         11,
         "d1_apply_migration_manifest",
         json!({
-            "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest,
-            "approved_plan_sha256": plan,
+            "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest.clone(),
+            "approved_plan_sha256": plan.clone(),
         }),
     );
     let content = structured_content(&live);
@@ -3910,11 +4019,21 @@ fn d1_apply_migration_manifest_partial_multi_statement_response_loss_stays_unkno
         7,
         "first statement may have committed; second ambiguity must stop the batch without any retry"
     );
-    assert!(
-        fs::read_dir(&lease_root)
-            .expect("read retained lease root")
-            .next()
-            .is_some()
+    assert_private_regular_active_lease(&lease_root);
+    mcp.terminate();
+    assert_fresh_process_blocked_without_provider_request(
+        vec![
+            ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+            (
+                "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+                lease_root.to_string_lossy().to_string(),
+            ),
+        ],
+        &manifest,
+        &plan,
+        &requests,
+        7,
+        "partial response loss",
     );
     let _ = fs::remove_dir_all(lease_root);
 }
