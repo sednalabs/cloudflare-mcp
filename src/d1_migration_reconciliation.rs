@@ -478,18 +478,25 @@ async fn read_complete_batch(
     lease.revalidate().map_err(|result| {
         contextualize_unverified_custody_error(result, Some(&query.sha256), &[], 0)
     })?;
-    let batch = server
+    let batch = match server
         .cloudflare
         .query_d1_migration_reconciliation_batch(account_id, database_id, &query.sql)
         .await
-        .map_err(|error| {
-            contextualize_error(
-                adapter_batch_error(error, &query.sha256),
-                Some(&query.sha256),
-                &[],
-                1,
-            )
-        })?;
+    {
+        Ok(batch) => batch,
+        Err(error) => {
+            let provider_error = adapter_batch_error(error, &query.sha256);
+            return Err(match lease.revalidate() {
+                Ok(()) => contextualize_error(provider_error, Some(&query.sha256), &[], 1),
+                Err(custody_error) => contextualize_provider_error_with_unverified_custody(
+                    provider_error,
+                    custody_error,
+                    Some(&query.sha256),
+                    1,
+                ),
+            });
+        }
+    };
     lease.revalidate().map_err(|result| {
         contextualize_unverified_custody_error(
             result,
@@ -1934,9 +1941,7 @@ fn contextualize_error(
             );
         }
         content.insert("query_sha256".to_string(), json!(query_sha256));
-        if !response_evidence.is_empty() || !content.contains_key("response_evidence") {
-            content.insert("response_evidence".to_string(), json!(response_evidence));
-        }
+        prepend_response_evidence(content, response_evidence);
         content.insert("provider_mutations".to_string(), json!(0));
         content.insert("local_namespace_mutations".to_string(), json!(0));
         let provider_calls = content
@@ -1973,12 +1978,51 @@ fn contextualize_unverified_custody_error(
             json!("retained_evidence_unverified"),
         );
         content.insert("query_sha256".to_string(), json!(query_sha256));
-        content.insert("response_evidence".to_string(), json!(response_evidence));
+        prepend_response_evidence(content, response_evidence);
         content.insert("provider_calls".to_string(), json!(provider_calls));
         content.insert("provider_mutations".to_string(), json!(0));
         content.insert("local_namespace_mutations".to_string(), json!(0));
     }
     CallToolResult::structured_error(content)
+}
+
+fn contextualize_provider_error_with_unverified_custody(
+    provider_error: CallToolResult,
+    custody_error: CallToolResult,
+    query_sha256: Option<&str>,
+    provider_calls: usize,
+) -> CallToolResult {
+    let custody_cause = custody_error
+        .structured_content
+        .as_ref()
+        .and_then(|content| content.get("error"))
+        .cloned()
+        .unwrap_or_else(|| {
+            json!({
+                "code": "d1.migration_reconciliation_custody_revalidation_failed",
+                "message": "retained custody could not be revalidated after the provider call",
+            })
+        });
+    let mut result =
+        contextualize_unverified_custody_error(provider_error, query_sha256, &[], provider_calls);
+    if let Some(Value::Object(content)) = result.structured_content.as_mut() {
+        content.insert("custody_cause".to_string(), custody_cause);
+    }
+    result
+}
+
+fn prepend_response_evidence(content: &mut serde_json::Map<String, Value>, prior: &[Value]) {
+    if prior.is_empty() {
+        content
+            .entry("response_evidence".to_string())
+            .or_insert_with(|| json!([]));
+        return;
+    }
+    let mut merged = prior.to_vec();
+    if let Some(Value::Array(current)) = content.get("response_evidence") {
+        merged.extend(current.iter().cloned());
+    }
+    content.insert("response_evidence".to_string(), Value::Array(merged));
 }
 
 fn prelease_error(
@@ -2260,6 +2304,86 @@ mod tests {
         assert_eq!(content["lease_decision"], "retain");
         assert_eq!(content["lease_retained"], Value::Null);
         assert_eq!(content["custody_status"], "retained_evidence_unverified");
+        assert_eq!(content["provider_calls"], 2);
+    }
+
+    #[test]
+    fn provider_error_preserves_classification_when_custody_revalidation_fails() {
+        let provider_error = adapter_batch_error(
+            D1MigrationReconciliationBatchError {
+                error: crate::cloudflare::client::AdapterErrorPayload {
+                    code: "cloudflare.http_server_error",
+                    message: "synthetic provider failure".to_string(),
+                    hint: "synthetic fixture",
+                    retryable: false,
+                    status: Some(503),
+                    classification: None,
+                },
+                response_body_sha256: Some(PROOF.to_string()),
+                response_body_size_bytes: Some(31),
+            },
+            PROOF,
+        );
+        let result = contextualize_provider_error_with_unverified_custody(
+            provider_error,
+            reconciliation_error(
+                "contradictory",
+                "d1.migration_reconciliation_lease_changed",
+                "retained evidence changed during the provider call",
+            ),
+            Some(PROOF),
+            1,
+        );
+        let content = result
+            .structured_content
+            .expect("structured provider error");
+        assert_eq!(content["capability_state"], "unavailable");
+        assert_eq!(
+            content["error"]["code"],
+            "d1.migration_reconciliation_provider_unavailable"
+        );
+        assert_eq!(content["provider_cause"]["status"], 503);
+        assert_eq!(
+            content["custody_cause"]["code"],
+            "d1.migration_reconciliation_lease_changed"
+        );
+        assert_eq!(content["lease_retained"], Value::Null);
+        assert_eq!(content["custody_status"], "retained_evidence_unverified");
+        assert_eq!(content["provider_calls"], 1);
+        assert_eq!(
+            content["response_evidence"].as_array().map(Vec::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn outer_context_prepends_prior_response_evidence_without_losing_inner_evidence() {
+        let second = contextualize_error(
+            reconciliation_error_with_evidence(
+                "unavailable",
+                "d1.migration_reconciliation_provider_unavailable",
+                "second provider call failed",
+                Some(PROOF),
+                &[json!({"response_body_sha256": "second"})],
+            ),
+            Some(PROOF),
+            &[],
+            1,
+        );
+        let merged = contextualize_error(
+            second,
+            Some(PROOF),
+            &[json!({"response_body_sha256": "first"})],
+            1,
+        );
+        let content = merged.structured_content.expect("merged response evidence");
+        assert_eq!(
+            content["response_evidence"],
+            json!([
+                {"response_body_sha256": "first"},
+                {"response_body_sha256": "second"},
+            ])
+        );
         assert_eq!(content["provider_calls"], 2);
     }
 

@@ -96,7 +96,11 @@ revalidation failure means retain and inspect the named evidence manually;
 HTTP 429 and 5xx reads are unavailable evidence and are not retried, even when
 their response body exceeds the byte bound. Post-read ledger/schema/evidence
 contradictions keep verified custody and exact provider-call accounting unless
-custody itself fails revalidation.
+custody itself fails revalidation. Custody is revalidated after every attempted
+provider call, including an unavailable/error response; a simultaneous custody
+failure preserves the provider classification and response evidence but reports
+`lease_retained=null`. When a later call fails, `response_evidence` remains in
+provider-call order rather than replacing evidence from an earlier call.
 
 For D1 usage-spike investigations, start with `account_billing_usage` to read
 Cloudflare billing usage records, then use `graphql_analytics_query` for

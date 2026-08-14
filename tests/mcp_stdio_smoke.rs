@@ -881,9 +881,21 @@ enum ReconciliationFault {
     MalformedReadOnlyMetadata,
     OversizedResponse,
     HttpStatus(u16),
+    HttpStatusCustodyDrift(u16, PathBuf),
     OversizedHttpStatus(u16),
     CustodyDrift(PathBuf),
+    SecondBatchHttpStatus(u16),
     UnstableSecondBatch,
+}
+
+fn reconciliation_http_error_response(status: u16) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "success": false,
+        "errors": [{"code": 1000, "message": format!("synthetic HTTP {status}")}],
+        "messages": [],
+        "result": null,
+    }))
+    .expect("serialize reconciliation HTTP error")
 }
 
 fn reconciliation_statement_markers(sql: &str) -> Vec<String> {
@@ -989,6 +1001,26 @@ fn spawn_fake_reconciliation_api_with_fault(
                 .lock()
                 .expect("request log lock")
                 .push(body_json);
+            if let ReconciliationFault::HttpStatusCustodyDrift(status, path) = &fault {
+                fs::write(path, b"tampered retained evidence")
+                    .expect("tamper retained evidence before provider error");
+                let response = reconciliation_http_error_response(*status);
+                write!(stream, "HTTP/1.1 {status} Synthetic\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write reconciliation drift HTTP error headers");
+                stream
+                    .write_all(&response)
+                    .expect("write reconciliation drift HTTP error");
+                continue;
+            }
+            if let ReconciliationFault::SecondBatchHttpStatus(status) = &fault {
+                if request_index == 1 {
+                    let response = reconciliation_http_error_response(*status);
+                    write!(stream, "HTTP/1.1 {status} Synthetic\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write second reconciliation HTTP error headers");
+                    stream
+                        .write_all(&response)
+                        .expect("write second reconciliation HTTP error");
+                    continue;
+                }
+            }
             if let ReconciliationFault::OversizedHttpStatus(status) = &fault {
                 write!(stream, "HTTP/1.1 {status} Synthetic\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", 16 * 1024 * 1024 + 1).expect("write oversized reconciliation HTTP error headers");
                 continue;
@@ -1000,13 +1032,7 @@ fn spawn_fake_reconciliation_api_with_fault(
                 continue;
             }
             if let ReconciliationFault::HttpStatus(status) = &fault {
-                let response = serde_json::to_vec(&json!({
-                    "success": false,
-                    "errors": [{"code": 1000, "message": format!("synthetic HTTP {status}")}],
-                    "messages": [],
-                    "result": null,
-                }))
-                .expect("serialize reconciliation HTTP error");
+                let response = reconciliation_http_error_response(*status);
                 write!(stream, "HTTP/1.1 {status} Synthetic\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write reconciliation HTTP error headers");
                 stream
                     .write_all(&response)
@@ -1084,7 +1110,9 @@ fn spawn_fake_reconciliation_api_with_fault(
                 ReconciliationFault::None
                 | ReconciliationFault::OversizedResponse
                 | ReconciliationFault::HttpStatus(_)
+                | ReconciliationFault::HttpStatusCustodyDrift(_, _)
                 | ReconciliationFault::OversizedHttpStatus(_)
+                | ReconciliationFault::SecondBatchHttpStatus(_)
                 | ReconciliationFault::UnstableSecondBatch => {}
             }
             let response = serde_json::to_vec(&json!({
@@ -4398,6 +4426,79 @@ fn d1_reconcile_migration_manifest_stdio_keeps_drifted_custody_unverified() {
 }
 
 #[test]
+fn d1_reconcile_migration_manifest_stdio_revalidates_custody_after_provider_error() {
+    let (manifest, expectations) = one_table_reconciliation_case();
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-reconcile-provider-drift-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create provider drift reconciliation root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make provider drift reconciliation root private");
+    }
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&lease_root, &manifest);
+    let active = assert_private_regular_active_lease(&lease_root);
+    let expected_response = reconciliation_http_error_response(503);
+    let expected_response_sha256 =
+        sha256_hex(std::str::from_utf8(&expected_response).expect("synthetic HTTP error is UTF-8"));
+    let (base_url, requests) = spawn_fake_reconciliation_api_with_fault(
+        ReconciliationFault::HttpStatusCustodyDrift(503, active),
+    );
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let response = mcp.call_tool(
+        762,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest,
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_only_v1",
+            "state_expectations": expectations,
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["capability_state"], json!("unavailable"));
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.migration_reconciliation_provider_unavailable")
+    );
+    assert_eq!(
+        content["custody_cause"]["code"],
+        json!("d1.migration_reconciliation_lease_changed")
+    );
+    assert_eq!(content["lease_retained"], Value::Null, "{content}");
+    assert_eq!(
+        content["custody_status"],
+        json!("retained_evidence_unverified"),
+        "{content}"
+    );
+    assert_eq!(content["provider_calls"], json!(1), "{content}");
+    assert_eq!(
+        content["response_evidence"][0]["response_body_sha256"],
+        json!(expected_response_sha256),
+        "{content}"
+    );
+    assert_eq!(requests.lock().expect("request log").len(), 1);
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
 fn d1_reconcile_migration_manifest_stdio_keeps_post_read_contradictions_verified() {
     let (manifest, expectations) = one_table_reconciliation_case();
     let lease_root = PathBuf::from("/tmp").join(format!(
@@ -4452,6 +4553,82 @@ fn d1_reconcile_migration_manifest_stdio_keeps_post_read_contradictions_verified
         "{content}"
     );
     assert_eq!(content["provider_calls"], json!(2), "{content}");
+    assert_eq!(requests.lock().expect("request log").len(), 2);
+    assert_private_regular_active_lease(&lease_root);
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_reconcile_migration_manifest_stdio_preserves_both_batches_when_second_call_errors() {
+    let (manifest, expectations) = one_table_reconciliation_case();
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-reconcile-second-error-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create second-error reconciliation root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make second-error reconciliation root private");
+    }
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&lease_root, &manifest);
+    let expected_second = reconciliation_http_error_response(503);
+    let expected_second_sha256 =
+        sha256_hex(std::str::from_utf8(&expected_second).expect("synthetic HTTP error is UTF-8"));
+    let (base_url, requests) =
+        spawn_fake_reconciliation_api_with_fault(ReconciliationFault::SecondBatchHttpStatus(503));
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let response = mcp.call_tool(
+        763,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest,
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_only_v1",
+            "state_expectations": expectations,
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["capability_state"], json!("unavailable"));
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.migration_reconciliation_provider_unavailable")
+    );
+    assert_eq!(content["lease_retained"], json!(true), "{content}");
+    assert_eq!(
+        content["custody_status"],
+        json!("retained_evidence_verified"),
+        "{content}"
+    );
+    assert_eq!(content["provider_calls"], json!(2), "{content}");
+    let evidence = content["response_evidence"]
+        .as_array()
+        .expect("chronological response evidence");
+    assert_eq!(evidence.len(), 2, "{content}");
+    assert_ne!(
+        evidence[0]["response_body_sha256"], evidence[1]["response_body_sha256"],
+        "{content}"
+    );
+    assert_eq!(
+        evidence[1]["response_body_sha256"],
+        json!(expected_second_sha256),
+        "{content}"
+    );
     assert_eq!(requests.lock().expect("request log").len(), 2);
     assert_private_regular_active_lease(&lease_root);
     mcp.terminate();

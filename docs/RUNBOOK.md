@@ -181,7 +181,11 @@ unavailable and never authorize an automatic retry, including when the body
 exceeds the streaming byte bound. Contradictory ledger, schema, plan, or
 two-read evidence discovered after successful custody revalidation reports the
 retained evidence as verified and includes the exact two provider calls; only
-custody drift changes that status to unverified.
+custody drift changes that status to unverified. Revalidation runs after every
+attempted provider call even when the provider returns an error. If provider
+failure and custody drift coincide, retain the provider classification and
+chronological response evidence while treating custody as unverified; the
+`custody_cause` names the separate revalidation failure.
 
 All current results retain the lease and prohibit retry of the same migration
 attempt. Record the query SHA-256, both bounded response-body digests, canonical
