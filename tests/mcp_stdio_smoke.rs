@@ -25,6 +25,28 @@ fn fixture_material(label: &str) -> String {
     value
 }
 
+fn assert_released_manifest_target_custody(lease_root: &Path) {
+    let target = lease_root.join(format!(
+        "d1-migration-target-{}",
+        sha256_hex("acct-1\0db-1")
+    ));
+    assert!(
+        target.join("guard.lock").is_file(),
+        "permanent guard remains"
+    );
+    assert!(
+        !target.join("active.lease.json").exists(),
+        "normal completion has no active custody evidence"
+    );
+    assert!(
+        fs::read_dir(&target)
+            .expect("read permanent target custody")
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().starts_with("retired.")),
+        "normal completion retains a terminal retirement record"
+    );
+}
+
 struct McpStdioProcess {
     child: Child,
     stdin: ChildStdin,
@@ -465,6 +487,54 @@ fn spawn_fake_manifest_apply_api() -> (String, Arc<Mutex<Vec<Value>>>) {
         }
     });
     (format!("http://{addr}"), requests)
+}
+
+fn spawn_blocked_manifest_preflight_api() -> (
+    String,
+    Arc<Mutex<Vec<Value>>>,
+    mpsc::Receiver<()>,
+    mpsc::Sender<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind blocked manifest D1 API");
+    let addr = listener.local_addr().expect("blocked manifest D1 address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    thread::spawn(move || {
+        for request_index in 0..2 {
+            let mut stream = listener
+                .accept()
+                .expect("accept blocked manifest request")
+                .0;
+            let (headers, body) = read_http_request(&mut stream);
+            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            let body_json: Value = serde_json::from_slice(&body).expect("blocked request JSON");
+            assert_eq!(
+                body_json["sql"],
+                json!("SELECT * FROM \"d1_migrations\" ORDER BY id")
+            );
+            requests_for_thread
+                .lock()
+                .expect("blocked request log")
+                .push(body_json);
+            if request_index == 1 {
+                entered_tx.send(()).expect("notify held active lease");
+                resume_rx.recv().expect("release blocked preflight");
+            }
+            let response = serde_json::to_vec(&json!({
+                "success": true,
+                "errors": [],
+                "messages": [],
+                "result": [{"success": true, "results": [{"id": 1, "name": "0001_initial.sql"}]}]
+            }))
+            .expect("serialize blocked response");
+            write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                .expect("write blocked response headers");
+            let _ = stream.write_all(&response);
+        }
+    });
+    (format!("http://{addr}"), requests, entered_rx, resume_tx)
 }
 
 fn spawn_fake_manifest_malformed_ledger_api(result_set: Value) -> (String, Arc<Mutex<Vec<Value>>>) {
@@ -3040,13 +3110,7 @@ fn d1_apply_migration_manifest_rejects_malformed_ledger_before_any_provider_writ
                 .is_some_and(|sql| sql.contains("INSERT INTO \"d1_migrations\""))),
             "{label} must never reach a provider write"
         );
-        assert!(
-            fs::read_dir(&lease_root)
-                .expect("read released lease root")
-                .next()
-                .is_none(),
-            "{label} must release the pre-write lease"
-        );
+        assert_released_manifest_target_custody(&lease_root);
         let _ = fs::remove_dir_all(lease_root);
     }
 }
@@ -3129,13 +3193,7 @@ fn d1_apply_migration_manifest_outer_ledger_errors_release_pre_write_lease() {
                 .is_some_and(|sql| sql.contains("INSERT INTO \"d1_migrations\""))),
             "{label} must fail before a migration provider write"
         );
-        assert!(
-            fs::read_dir(&lease_root)
-                .expect("read released pre-write lease root")
-                .next()
-                .is_none(),
-            "{label} must release the pre-write lease"
-        );
+        assert_released_manifest_target_custody(&lease_root);
         let _ = fs::remove_dir_all(lease_root);
     }
 }
@@ -3292,12 +3350,7 @@ fn d1_apply_migration_manifest_live_rechecks_plan_and_stably_reads_back_before_r
         content["applied_migrations"][0]["sql_sha256"],
         json!(sha256_hex(second_sql))
     );
-    assert!(
-        fs::read_dir(&lease_root)
-            .expect("read released lease root")
-            .next()
-            .is_none()
-    );
+    assert_released_manifest_target_custody(&lease_root);
     let requests = requests.lock().expect("requests lock").clone();
     assert_eq!(
         requests.len(),
@@ -3316,6 +3369,78 @@ fn d1_apply_migration_manifest_live_rechecks_plan_and_stably_reads_back_before_r
             .expect("apply SQL")
             .contains(first_sql)
     );
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_manifest_crashed_stdio_holder_retains_active_evidence_and_contender_never_calls_provider() {
+    let (base_url, requests, entered, resume) = spawn_blocked_manifest_preflight_api();
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-manifest-crash-custody-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make lease root private");
+    }
+    let env = vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ];
+    let first_sql = "CREATE TABLE submissions(id TEXT);";
+    let second_sql = "ALTER TABLE submissions ADD COLUMN status TEXT;";
+    let manifest = json!([
+        {"name": "0001_initial.sql", "size_bytes": first_sql.len(), "sql_sha256": sha256_hex(first_sql), "sql": first_sql},
+        {"name": "0002_second.sql", "size_bytes": second_sql.len(), "sql_sha256": sha256_hex(second_sql), "sql": second_sql}
+    ]);
+    let mut holder = McpStdioProcess::start_with_env(env.clone());
+    let dry = holder.call_tool(70, "d1_apply_migration_manifest", json!({
+        "database_id": "db-1", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
+    }));
+    let plan = structured_content(&dry)["plan_sha256"]
+        .as_str()
+        .expect("plan digest")
+        .to_string();
+    holder.send(json!({
+        "jsonrpc": "2.0", "id": 71, "method": "tools/call",
+        "params": {"name": "d1_apply_migration_manifest", "arguments": {
+            "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest.clone(), "approved_plan_sha256": plan.clone()
+        }}
+    }));
+    entered
+        .recv_timeout(Duration::from_secs(10))
+        .expect("holder has created active evidence and is blocked in preflight");
+    drop(holder);
+
+    let mut contender = McpStdioProcess::start_with_env(env);
+    let response = contender.call_tool(72, "d1_apply_migration_manifest", json!({
+        "database_id": "db-1", "migration_family": "different-family", "manifest": manifest, "approved_plan_sha256": plan,
+    }));
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.migration_target_lease_held")
+    );
+    assert_eq!(
+        requests.lock().expect("request log").len(),
+        2,
+        "the contender must stop at durable active evidence without a provider request"
+    );
+    let target = lease_root.join(format!(
+        "d1-migration-target-{}",
+        sha256_hex("acct-1\0db-1")
+    ));
+    assert!(target.join("active.lease.json").is_file());
+    resume.send(()).expect("release fake preflight handler");
+    drop(contender);
     let _ = fs::remove_dir_all(lease_root);
 }
 
@@ -3675,12 +3800,7 @@ fn d1_apply_migration_manifest_multiple_successful_query_results_apply_once() {
         Some(1)
     );
     assert_eq!(requests.lock().expect("requests lock").len(), 6);
-    assert!(
-        fs::read_dir(&lease_root)
-            .expect("read released lease root")
-            .next()
-            .is_none()
-    );
+    assert_released_manifest_target_custody(&lease_root);
     let _ = fs::remove_dir_all(lease_root);
 }
 

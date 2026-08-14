@@ -4668,7 +4668,7 @@ impl CloudflareMcp {
             })));
         }
 
-        let lease = match acquire_d1_migration_lease(
+        let mut lease = match acquire_d1_migration_lease(
             account_id,
             &args.database_id,
             &family,
@@ -4677,6 +4677,9 @@ impl CloudflareMcp {
             Ok(lease) => lease,
             Err(result) => finish_manifest!(result),
         };
+        if let Err(result) = lease.revalidate() {
+            finish_manifest!(result);
+        }
 
         let ledger = match read_stable_d1_migration_ledger(
             self,
@@ -4849,6 +4852,10 @@ impl CloudflareMcp {
 
         let mut applied = Vec::new();
         for migration in &classification.pending {
+            if let Err(result) = lease.revalidate() {
+                lease.retain();
+                finish_manifest!(result);
+            }
             let statement =
                 d1_migration_apply_sql(&migration.sql, &migrations_table, &migration.name);
             let write_result = self
@@ -4909,6 +4916,10 @@ impl CloudflareMcp {
             }
         }
 
+        if let Err(result) = lease.revalidate() {
+            lease.retain();
+            finish_manifest!(result);
+        }
         let final_ledger = match read_stable_d1_migration_ledger(
             self,
             account_id,
@@ -16317,7 +16328,7 @@ mod tests {
                 .expect("make lease root private");
         }
         let digest = "a".repeat(64);
-        let first =
+        let mut first =
             acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "audience", &digest)
                 .expect("first family lease");
         let second =
@@ -16325,7 +16336,7 @@ mod tests {
                 .expect_err("family must not split one target lease");
         assert_eq!(
             second.structured_content.expect("structured error")["error"]["code"],
-            json!("d1.migration_target_lease_held")
+            json!("d1.migration_target_guard_locked")
         );
         first.release().expect("release first family lease");
         let _ = fs::remove_dir_all(root);
@@ -16353,7 +16364,7 @@ mod tests {
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
                 .expect("make lease root private");
         }
-        let lease = acquire_d1_migration_lease_at(
+        let mut lease = acquire_d1_migration_lease_at(
             root.clone(),
             "acct-1",
             "db-1",
@@ -16469,19 +16480,29 @@ mod tests {
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
                 .expect("make lease root private");
         }
-        let first =
+        let mut first =
             acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "first", &"a".repeat(64))
                 .expect("first lease");
         #[cfg(unix)]
         assert_eq!(
             std::os::unix::fs::MetadataExt::mode(
-                &fs::symlink_metadata(&first.path).expect("lease metadata"),
+                &fs::symlink_metadata(
+                    first
+                        .active_path_for_test()
+                        .expect("Unix active lease pathname"),
+                )
+                .expect("lease metadata"),
             ) & 0o777,
             0o600,
             "lease file must not inherit an ambient permissive umask"
         );
-        fs::remove_file(&first.path).expect("simulate explicit stale-lease replacement");
-        let replacement = acquire_d1_migration_lease_at(
+        let first_active = first
+            .active_path_for_test()
+            .expect("Unix active lease pathname")
+            .to_path_buf();
+        fs::remove_file(&first_active).expect("simulate explicit stale-lease removal");
+        first.retain();
+        let mut replacement = acquire_d1_migration_lease_at(
             root.clone(),
             "acct-1",
             "db-1",
@@ -16497,7 +16518,10 @@ mod tests {
             json!("d1.migration_lease_release_failed")
         );
         assert!(
-            replacement.path.exists(),
+            replacement
+                .active_path_for_test()
+                .expect("Unix replacement active lease pathname")
+                .exists(),
             "replacement lease remains present"
         );
         replacement.release().expect("release replacement");

@@ -86,21 +86,33 @@ must submit that value as `approved_plan_sha256` and configure
 `CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT` to a pre-created, operator-owned,
 non-group/world-writable directory shared by every MCP process that can target
 the database. On Unix the root must be an absolute real directory owned by the
-current operator with mode `0700` (or stricter); every non-sticky ancestor must
-also be non-writable, and its lease entries are created with mode `0600` then
-the parent directory is synchronized. Do
-not use a shared writable directory or manually remove a lease by pathname:
-terminal errors report the target hash, nonce and payload hash needed to
-reconcile the specific owner safely. The manifest tool never
-reopens a directory after review and never retries an ambiguous provider write.
-An unknown outcome retains the target lease: reconcile provider ledger evidence
-and the reported lease identity before clearing it and begin again with a fresh
-dry run. A matching ledger filename is only an observation: it does not attest
-to the reviewed SQL bytes or complete provider transaction, and therefore never
-authorizes lease release after an ambiguous apply. This is an atomic
-shared-filesystem lease, not a Cloudflare-distributed lock; separate
-provider/distributed coordination remains required when MCP instances do not
-share that lease root.
+current operator with mode `0700` (or stricter), and every non-sticky ancestor
+must be non-writable. The MCP permanently creates one private target directory
+per account/database. It contains a permanent `guard.lock`, acquired with a
+cross-process file lock, and terminal evidence such as
+`retired.<nonce>.lease.json`; neither is cleanup material. While holding that
+guard, the MCP writes `active.lease.json` with mode `0600` and synchronizes the
+directory. It revalidates root, ancestors, directory, guard, identity and mode
+before every provider boundary. Do not use a shared writable directory or
+manually rename or remove any lease evidence by pathname.
+
+A later invocation stops before provider I/O when it sees an active entry,
+including one that is malformed, a symlink or non-regular. It must be resolved
+through the governed reconciliation path, never inferred stale or reclaimed.
+Normal terminal completion moves the active file under the held guard to
+`retired.<nonce>.lease.json` without replacement, then synchronizes the target
+directory. A failed creation is retained as
+`aborted-create.<nonce>.lease.json`; production code never unlinks a lease file
+or directory. The manifest tool never reopens a migration directory after
+review and never retries an ambiguous provider write. An unknown outcome retains
+the active target lease: reconcile provider ledger evidence and the reported
+lease identity before any governed recovery. A matching ledger filename is only
+an observation: it does not attest to the reviewed SQL bytes or complete
+provider transaction, and therefore never authorizes lease release after an
+ambiguous apply. This is a shared-filesystem lease, not a Cloudflare-distributed
+lock; separate provider/distributed coordination remains required when MCP
+instances do not share that root. Non-Unix installations fail closed before
+provider I/O.
 
 For CI-built release bundles, the `Rust Validation` workflow uploads a
 downloadable artifact named `cloudflare-mcp-linux-x86_64-stdio-<git-sha>` that
