@@ -130,6 +130,11 @@ impl McpStdioProcess {
         process
     }
 
+    fn terminate(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
     fn send(&mut self, value: Value) {
         let line = serde_json::to_string(&value).expect("serialize JSON-RPC request");
         writeln!(self.stdin, "{line}").expect("write JSON-RPC request");
@@ -3417,10 +3422,27 @@ fn d1_manifest_crashed_stdio_holder_retains_active_evidence_and_contender_never_
     entered
         .recv_timeout(Duration::from_secs(10))
         .expect("holder has created active evidence and is blocked in preflight");
-    drop(holder);
 
-    let mut contender = McpStdioProcess::start_with_env(env);
+    let mut contender = McpStdioProcess::start_with_env(env.clone());
     let response = contender.call_tool(72, "d1_apply_migration_manifest", json!({
+        "database_id": "db-1", "migration_family": "different-family", "manifest": manifest.clone(), "approved_plan_sha256": plan.clone(),
+    }));
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.migration_target_guard_locked")
+    );
+    assert_eq!(
+        requests.lock().expect("request log").len(),
+        2,
+        "the concurrent MCP process must stop at the held target guard without a provider request"
+    );
+    holder.terminate();
+    drop(contender);
+
+    let mut recovered_contender = McpStdioProcess::start_with_env(env);
+    let response = recovered_contender.call_tool(73, "d1_apply_migration_manifest", json!({
         "database_id": "db-1", "migration_family": "different-family", "manifest": manifest, "approved_plan_sha256": plan,
     }));
     let content = structured_content(&response);
@@ -3432,7 +3454,7 @@ fn d1_manifest_crashed_stdio_holder_retains_active_evidence_and_contender_never_
     assert_eq!(
         requests.lock().expect("request log").len(),
         2,
-        "the contender must stop at durable active evidence without a provider request"
+        "the next MCP process after the holder exits must stop at active evidence without a provider request"
     );
     let target = lease_root.join(format!(
         "d1-migration-target-{}",
@@ -3440,12 +3462,12 @@ fn d1_manifest_crashed_stdio_holder_retains_active_evidence_and_contender_never_
     ));
     assert!(target.join("active.lease.json").is_file());
     resume.send(()).expect("release fake preflight handler");
-    drop(contender);
+    drop(recovered_contender);
     let _ = fs::remove_dir_all(lease_root);
 }
 
 #[test]
-fn d1_apply_migration_manifest_response_loss_stops_without_retry_and_retains_lease() {
+fn d1_apply_migration_manifest_response_loss_stops_without_retry_and_next_process_is_blocked() {
     let (base_url, requests) = spawn_fake_manifest_ambiguous_api(false);
     // Keep this retained-lease fixture under the sticky system temporary root.
     let lease_root = std::path::PathBuf::from("/tmp").join(format!(
@@ -3460,13 +3482,14 @@ fn d1_apply_migration_manifest_response_loss_stops_without_retry_and_retains_lea
         fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
             .expect("make lease root private");
     }
-    let mut mcp = McpStdioProcess::start_with_env(vec![
+    let env = vec![
         ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
         (
             "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
             lease_root.to_string_lossy().to_string(),
         ),
-    ]);
+    ];
+    let mut mcp = McpStdioProcess::start_with_env(env.clone());
     let first_sql = "CREATE TABLE submissions(id TEXT);";
     let second_sql = "ALTER TABLE submissions ADD COLUMN status TEXT;";
     let manifest = json!([
@@ -3484,8 +3507,8 @@ fn d1_apply_migration_manifest_response_loss_stops_without_retry_and_retains_lea
         7,
         "d1_apply_migration_manifest",
         json!({
-            "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest,
-            "approved_plan_sha256": plan,
+            "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest.clone(),
+            "approved_plan_sha256": plan.clone(),
         }),
     );
     let content = structured_content(&live);
@@ -3550,6 +3573,28 @@ fn d1_apply_migration_manifest_response_loss_stops_without_retry_and_retains_lea
             .next()
             .is_some()
     );
+    mcp.terminate();
+    let mut contender = McpStdioProcess::start_with_env(env);
+    let response = contender.call_tool(
+        73,
+        "d1_apply_migration_manifest",
+        json!({
+            "database_id": "db-1", "migration_family": "different-family", "manifest": manifest,
+            "approved_plan_sha256": plan,
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.migration_target_lease_held")
+    );
+    assert_eq!(
+        requests.lock().expect("request log").len(),
+        6,
+        "the next MCP process after an ambiguous holder exits must not issue a provider call"
+    );
+    drop(contender);
     let _ = fs::remove_dir_all(lease_root);
 }
 

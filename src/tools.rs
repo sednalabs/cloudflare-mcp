@@ -16318,6 +16318,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn d1_manifest_target_lease_serializes_families_for_one_database() {
         let root = d1_migration_test_dir("d1-manifest-target-lease");
@@ -16342,6 +16343,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn d1_manifest_reconciliation_preserves_known_ledger_and_plan_evidence() {
         let sql = "CREATE TABLE t(id TEXT);".to_string();
@@ -16434,7 +16436,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn d1_manifest_lease_rejects_same_owner_writable_non_sticky_ancestor() {
         use std::os::unix::fs::PermissionsExt;
@@ -16459,6 +16461,7 @@ mod tests {
         let _ = fs::remove_dir_all(ancestor);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn d1_manifest_target_rejects_aliases_and_preserves_replacement_lease() {
         let error = normalize_d1_manifest_target(" acct-1", "db-1")
