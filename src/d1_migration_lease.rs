@@ -799,7 +799,7 @@ mod linux {
         }
     }
 
-    fn rename_owned_lease_no_replace(
+    pub(super) fn rename_owned_lease_no_replace(
         target: &fs::File,
         source: &str,
         destination: &str,
@@ -812,7 +812,7 @@ mod linux {
             .map_err(|_| "owned lease namespace transition could not be completed")
     }
 
-    fn abort_owned_active(
+    pub(super) fn abort_owned_active(
         target: &fs::File,
         active: &fs::File,
         expected_file: &D1LeaseFileIdentity,
@@ -832,7 +832,7 @@ mod linux {
             && sync_d1_lease_directory(target).is_ok()
     }
 
-    fn restore_active_or_leave_blocker(
+    pub(super) fn restore_active_or_leave_blocker(
         target: &fs::File,
         source: &str,
         active: &fs::File,
@@ -1182,7 +1182,8 @@ mod linux {
 
 #[cfg(target_os = "linux")]
 use linux::{
-    acquire_d1_migration_lease_at_linux, sync_d1_lease_directory, validate_d1_lease_custody,
+    acquire_d1_migration_lease_at_linux, rename_owned_lease_no_replace,
+    restore_active_or_leave_blocker, sync_d1_lease_directory, validate_d1_lease_custody,
     validate_owned_named_lease,
 };
 
@@ -1495,7 +1496,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn root_and_ancestor_unsafe_or_symlink_drift_fails_revalidation() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::{PermissionsExt, symlink};
 
         for label in [
             "root-mode",
@@ -1558,7 +1559,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn active_inode_mode_payload_or_symlink_tampering_fails_revalidation() {
-        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
         for label in ["mode", "inode", "payload", "symlink"] {
             let root = private_test_root(&format!("active-{label}"));
@@ -1634,7 +1635,8 @@ mod tests {
                 let path = entry.path();
                 let metadata = fs::symlink_metadata(&path).expect("retired metadata");
                 assert!(metadata.is_file() && !metadata.file_type().is_symlink());
-                (path, metadata, fs::read(&path).expect("retired bytes"))
+                let bytes = fs::read(&path).expect("retired bytes");
+                (path, metadata, bytes)
             })
             .collect::<Vec<_>>();
         assert_eq!(retired.len(), 1, "one terminal retirement record");
