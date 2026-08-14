@@ -101,6 +101,14 @@ struct ValidatedExpectations {
     states: Vec<D1MigrationStateExpectation>,
     object_names: Vec<String>,
     table_names: Vec<String>,
+    proof_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+struct DerivedSchemaObject {
+    object_type: String,
+    name: String,
+    table_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -134,10 +142,54 @@ enum BatchStatement {
     ForeignKeyCheck(String),
 }
 
+impl BatchStatement {
+    fn marker(&self, proof_sha256: &str) -> String {
+        let logical_identity = match self {
+            Self::Ledger => "ledger".to_string(),
+            Self::Schema => "sqlite_master".to_string(),
+            Self::TableXinfo(table) => format!("table_xinfo\0{table}"),
+            Self::ForeignKeyList(table) => format!("foreign_key_list\0{table}"),
+            Self::ForeignKeyCheck(table) => format!("foreign_key_check\0{table}"),
+        };
+        sha256_bytes_hex(
+            format!("d1-reconciliation-statement-v1\0{proof_sha256}\0{logical_identity}")
+                .as_bytes(),
+        )
+    }
+
+    fn data_fields(&self) -> &'static [&'static str] {
+        match self {
+            Self::Ledger => &["id", "name"],
+            Self::Schema => &["type", "name", "tbl_name", "sql"],
+            Self::TableXinfo(_) => &[
+                "cid",
+                "name",
+                "type",
+                "notnull",
+                "dflt_value",
+                "pk",
+                "hidden",
+            ],
+            Self::ForeignKeyList(_) => &[
+                "id",
+                "seq",
+                "table",
+                "from",
+                "to",
+                "on_update",
+                "on_delete",
+                "match",
+            ],
+            Self::ForeignKeyCheck(_) => &["table", "rowid", "parent", "fkid"],
+        }
+    }
+}
+
 #[derive(Debug)]
 struct FixedQuery {
     sql: String,
     sha256: String,
+    proof_sha256: String,
     statements: Vec<BatchStatement>,
 }
 
@@ -154,18 +206,20 @@ pub(crate) async fn reconcile_d1_migration_manifest(
     effect_assertion_id: Option<&str>,
     state_expectations: Vec<D1MigrationStateExpectation>,
 ) -> CallToolResult {
-    let validated = match validate_expectations(manifest.len(), state_expectations) {
-        Ok(validated) => validated,
-        Err(result) => return result,
+    let derived_states = match derive_effect_assertion(effect_assertion_id, manifest) {
+        Ok(derived_states) => derived_states,
+        Err(result) => return prelease_error(result, "not_inspected", None),
     };
-    if let Err(result) = validate_effect_assertion(effect_assertion_id, manifest) {
-        return result;
-    }
+    let validated = match validate_expectations(&derived_states, state_expectations) {
+        Ok(validated) => validated,
+        Err(result) => return prelease_error(result, "not_inspected", None),
+    };
     let query = build_fixed_query(
         migrations_table,
         manifest.len(),
         &validated.object_names,
         &validated.table_names,
+        &validated.proof_sha256,
     );
     let lease = match inspect_retained_d1_migration_lease(
         account_id,
@@ -176,7 +230,7 @@ pub(crate) async fn reconcile_d1_migration_manifest(
         lease_payload_sha256,
     ) {
         Ok(lease) => lease,
-        Err(result) => return contextualize_error(result, Some(&query.sha256), &[]),
+        Err(result) => return prelease_error(result, "inspection_failed", Some(&query.sha256)),
     };
 
     let first = match read_complete_batch(server, &lease, account_id, database_id, &query, manifest)
@@ -343,6 +397,7 @@ pub(crate) async fn reconcile_d1_migration_manifest(
         "retry_decision": "do_not_retry_same_attempt",
         "lease_decision": "retain",
         "lease_retained": true,
+        "custody_status": "retained_evidence_verified",
         "provider_attempt_causality": "not_claimed",
         "inference_basis": "documented_atomic_state_inference_from_stable_ledger_schema_and_foreign_key_evidence",
         "account_id": account_id,
@@ -356,6 +411,7 @@ pub(crate) async fn reconcile_d1_migration_manifest(
         "ledger": d1_ledger_summaries(&first.snapshot.ledger),
         "lease": lease.identity,
         "query_sha256": query.sha256,
+        "expectation_proof_sha256": validated.proof_sha256,
         "query_sha256s": [&query.sha256, &query.sha256],
         "response_evidence": [response_digest_summary(&first), response_digest_summary(&second)],
         "canonical_snapshot_sha256": snapshot_sha256,
@@ -402,7 +458,13 @@ async fn read_complete_batch(
         .cloudflare
         .query_d1_migration_reconciliation_batch(account_id, database_id, &query.sql)
         .await
-        .map_err(|error| adapter_batch_error(error, &query.sha256))?;
+        .map_err(|error| {
+            contextualize_error(
+                adapter_batch_error(error, &query.sha256),
+                Some(&query.sha256),
+                &[],
+            )
+        })?;
     lease.revalidate().map_err(|result| {
         contextualize_error(
             result,
@@ -410,14 +472,19 @@ async fn read_complete_batch(
             &[response_digest_summary_from_adapter(&batch)],
         )
     })?;
-    let snapshot =
-        parse_complete_batch(&batch.result, &query.statements, manifest).map_err(|result| {
-            contextualize_error(
-                result,
-                Some(&query.sha256),
-                &[response_digest_summary_from_adapter(&batch)],
-            )
-        })?;
+    let snapshot = parse_complete_batch(
+        &batch.result,
+        &query.statements,
+        &query.proof_sha256,
+        manifest,
+    )
+    .map_err(|result| {
+        contextualize_error(
+            result,
+            Some(&query.sha256),
+            &[response_digest_summary_from_adapter(&batch)],
+        )
+    })?;
     Ok(ParsedBatch {
         snapshot,
         response_body_sha256: batch.response_body_sha256,
@@ -426,21 +493,23 @@ async fn read_complete_batch(
 }
 
 fn validate_expectations(
-    manifest_len: usize,
+    derived_states: &[Vec<DerivedSchemaObject>],
     states: Vec<D1MigrationStateExpectation>,
 ) -> Result<ValidatedExpectations, CallToolResult> {
-    if states.is_empty() || states.len() > MAX_STATE_EXPECTATIONS {
+    let manifest_len = derived_states.len().saturating_sub(1);
+    if states.len() != derived_states.len() || states.len() > MAX_STATE_EXPECTATIONS {
         return Err(reconciliation_error(
             "capability_gap",
-            "d1.migration_reconciliation_expectations_unbounded",
-            "state_expectations must contain 1..128 reviewed manifest-prefix states",
+            "d1.migration_reconciliation_expectations_incomplete",
+            "state_expectations must contain one complete reviewed state for every manifest prefix, including zero",
         ));
     }
     let mut previous_prefix = None;
     let mut object_names = BTreeSet::new();
     let mut table_names = BTreeSet::new();
-    for state in &states {
-        if state.manifest_prefix_length > manifest_len
+    for (expected_prefix, state) in states.iter().enumerate() {
+        if state.manifest_prefix_length != expected_prefix
+            || state.manifest_prefix_length > manifest_len
             || previous_prefix.is_some_and(|prefix| prefix >= state.manifest_prefix_length)
         {
             return Err(reconciliation_error(
@@ -459,6 +528,7 @@ fn validate_expectations(
         }
         let mut previous_object = None::<(String, String)>;
         let mut state_table_objects = BTreeSet::new();
+        let mut supplied_derived_objects = Vec::new();
         for object in &state.schema_objects {
             validate_identifier("schema object name", &object.name)?;
             validate_identifier("schema object table_name", &object.table_name)?;
@@ -493,7 +563,19 @@ fn validate_expectations(
                 }
                 state_table_objects.insert(object.name.clone());
             }
+            supplied_derived_objects.push(DerivedSchemaObject {
+                object_type: object.object_type.clone(),
+                name: object.name.clone(),
+                table_name: object.table_name.clone(),
+            });
             object_names.insert(object.name.clone());
+        }
+        if supplied_derived_objects != derived_states[expected_prefix] {
+            return Err(reconciliation_error(
+                "contradictory",
+                "d1.migration_reconciliation_schema_expectation_incomplete",
+                "schema object expectations must exactly match every CREATE target derived from the manifest prefix",
+            ));
         }
         let mut previous_table = None::<String>;
         for table in &state.tables {
@@ -552,10 +634,15 @@ fn validate_expectations(
             "the union of reviewed schema objects or tables exceeds the fixed query bound",
         ));
     }
+    let proof_sha256 = sha256_bytes_hex(
+        &serde_json::to_vec(&states)
+            .expect("validated reconciliation expectations serialize canonically"),
+    );
     Ok(ValidatedExpectations {
         states,
         object_names: object_names.into_iter().collect(),
         table_names: table_names.into_iter().collect(),
+        proof_sha256,
     })
 }
 
@@ -653,10 +740,18 @@ fn valid_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn validate_effect_assertion(
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SqlToken {
+    Word(String),
+    Identifier(String),
+    StringLiteral,
+    Symbol(char),
+}
+
+fn derive_effect_assertion(
     effect_assertion_id: Option<&str>,
     manifest: &[D1MigrationManifestEntry],
-) -> Result<(), CallToolResult> {
+) -> Result<Vec<Vec<DerivedSchemaObject>>, CallToolResult> {
     if effect_assertion_id != Some(EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1) {
         return Err(reconciliation_error(
             "capability_gap",
@@ -664,6 +759,8 @@ fn validate_effect_assertion(
             "a supported registry-backed migration effect assertion is required",
         ));
     }
+    let mut cumulative = BTreeMap::<(String, String), DerivedSchemaObject>::new();
+    let mut states = vec![Vec::new()];
     for migration in manifest {
         let statements = tokenize_sql_statements(&migration.sql).ok_or_else(|| {
             reconciliation_error(
@@ -672,27 +769,153 @@ fn validate_effect_assertion(
                 "exact migration SQL could not be classified by the built-in effect registry",
             )
         })?;
-        if statements.is_empty() || statements.iter().any(|tokens| !schema_create_only(tokens)) {
+        if statements.is_empty() {
             return Err(reconciliation_error(
                 "capability_gap",
                 "d1.migration_reconciliation_effect_proof_unavailable",
                 "the built-in effect registry cannot exactly prove arbitrary DML, ALTER, DROP, PRAGMA, trigger, view, or data-copy effects",
             ));
         }
+        for tokens in statements {
+            let object = schema_create_only(&tokens).ok_or_else(|| {
+                reconciliation_error(
+                    "capability_gap",
+                    "d1.migration_reconciliation_effect_proof_unavailable",
+                    "the built-in effect registry cannot exactly prove arbitrary DML, ALTER, DROP, PRAGMA, trigger, view, virtual table, or data-producing CREATE effects",
+                )
+            })?;
+            let key = (object.object_type.clone(), object.name.clone());
+            if cumulative.insert(key, object).is_some() {
+                return Err(reconciliation_error(
+                    "contradictory",
+                    "d1.migration_reconciliation_create_target_reused",
+                    "the manifest reuses a CREATE object identity and cannot derive one exact schema state per prefix",
+                ));
+            }
+        }
+        states.push(cumulative.values().cloned().collect());
     }
-    Ok(())
+    Ok(states)
 }
 
-fn schema_create_only(tokens: &[String]) -> bool {
-    let allowed_prefix = tokens.starts_with(&["create".into(), "table".into()])
-        || tokens.starts_with(&["create".into(), "index".into()])
-        || tokens.starts_with(&["create".into(), "unique".into(), "index".into()]);
-    allowed_prefix
-        && !tokens.iter().any(|token| token == "select")
-        && !tokens.iter().any(|token| token == "virtual")
+fn schema_create_only(tokens: &[SqlToken]) -> Option<DerivedSchemaObject> {
+    if !token_is_word(tokens.first(), "create") {
+        return None;
+    }
+    let mut cursor = 1;
+    let unique = if token_is_word(tokens.get(cursor), "unique") {
+        cursor += 1;
+        true
+    } else {
+        false
+    };
+    let object_type = if token_is_word(tokens.get(cursor), "table") && !unique {
+        cursor += 1;
+        "table"
+    } else if token_is_word(tokens.get(cursor), "index") {
+        cursor += 1;
+        "index"
+    } else {
+        return None;
+    };
+    if token_is_word(tokens.get(cursor), "if")
+        && token_is_word(tokens.get(cursor + 1), "not")
+        && token_is_word(tokens.get(cursor + 2), "exists")
+    {
+        cursor += 3;
+    }
+    let name = token_identifier(tokens.get(cursor))?;
+    validate_identifier("derived CREATE object", &name).ok()?;
+    cursor += 1;
+
+    if object_type == "table" {
+        if tokens.get(cursor) != Some(&SqlToken::Symbol('(')) {
+            // This rejects CREATE TABLE AS SELECT, CREATE TABLE AS VALUES, and
+            // every other data-producing table form before provider access.
+            return None;
+        }
+        let after_definition = balanced_parenthesized_end(tokens, cursor)?;
+        if !valid_table_suffix(&tokens[after_definition..]) {
+            return None;
+        }
+        Some(DerivedSchemaObject {
+            object_type: object_type.to_string(),
+            table_name: name.clone(),
+            name,
+        })
+    } else {
+        if !token_is_word(tokens.get(cursor), "on") {
+            return None;
+        }
+        let table_name = token_identifier(tokens.get(cursor + 1))?;
+        validate_identifier("derived CREATE INDEX parent", &table_name).ok()?;
+        if tokens.get(cursor + 2) != Some(&SqlToken::Symbol('(')) {
+            return None;
+        }
+        let after_columns = balanced_parenthesized_end(tokens, cursor + 2)?;
+        if after_columns < tokens.len() && !token_is_word(tokens.get(after_columns), "where") {
+            return None;
+        }
+        Some(DerivedSchemaObject {
+            object_type: object_type.to_string(),
+            name,
+            table_name,
+        })
+    }
 }
 
-fn tokenize_sql_statements(sql: &str) -> Option<Vec<Vec<String>>> {
+fn token_is_word(token: Option<&SqlToken>, value: &str) -> bool {
+    matches!(token, Some(SqlToken::Word(word)) if word.eq_ignore_ascii_case(value))
+}
+
+fn token_identifier(token: Option<&SqlToken>) -> Option<String> {
+    match token? {
+        SqlToken::Word(value) | SqlToken::Identifier(value) => Some(value.clone()),
+        SqlToken::StringLiteral | SqlToken::Symbol(_) => None,
+    }
+}
+
+fn balanced_parenthesized_end(tokens: &[SqlToken], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (offset, token) in tokens.get(start..)?.iter().enumerate() {
+        match token {
+            SqlToken::Symbol('(') => depth = depth.checked_add(1)?,
+            SqlToken::Symbol(')') => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(start + offset + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn valid_table_suffix(tokens: &[SqlToken]) -> bool {
+    let mut cursor = 0;
+    let mut without_rowid = false;
+    let mut strict = false;
+    while cursor < tokens.len() {
+        if tokens.get(cursor) == Some(&SqlToken::Symbol(',')) {
+            cursor += 1;
+        } else if !without_rowid
+            && token_is_word(tokens.get(cursor), "without")
+            && token_is_word(tokens.get(cursor + 1), "rowid")
+        {
+            without_rowid = true;
+            cursor += 2;
+        } else if !strict && token_is_word(tokens.get(cursor), "strict") {
+            strict = true;
+            cursor += 1;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+fn tokenize_sql_statements(sql: &str) -> Option<Vec<Vec<SqlToken>>> {
     #[derive(Clone, Copy)]
     enum Mode {
         Normal,
@@ -708,10 +931,11 @@ fn tokenize_sql_statements(sql: &str) -> Option<Vec<Vec<String>>> {
     let mut statements = Vec::new();
     let mut tokens = Vec::new();
     let mut token = Vec::new();
+    let mut quoted = Vec::new();
     let mut index = 0;
-    let flush_token = |token: &mut Vec<u8>, tokens: &mut Vec<String>| {
+    let flush_token = |token: &mut Vec<u8>, tokens: &mut Vec<SqlToken>| {
         if !token.is_empty() {
-            tokens.push(String::from_utf8_lossy(token).to_ascii_lowercase());
+            tokens.push(SqlToken::Word(String::from_utf8_lossy(token).into_owned()));
             token.clear();
         }
     };
@@ -736,14 +960,17 @@ fn tokenize_sql_statements(sql: &str) -> Option<Vec<Vec<String>>> {
                 }
                 (b'"', _) => {
                     flush_token(&mut token, &mut tokens);
+                    quoted.clear();
                     mode = Mode::DoubleQuote;
                 }
                 (b'`', _) => {
                     flush_token(&mut token, &mut tokens);
+                    quoted.clear();
                     mode = Mode::Backtick;
                 }
                 (b'[', _) => {
                     flush_token(&mut token, &mut tokens);
+                    quoted.clear();
                     mode = Mode::Bracket;
                 }
                 (b';', _) => {
@@ -751,6 +978,10 @@ fn tokenize_sql_statements(sql: &str) -> Option<Vec<Vec<String>>> {
                     if !tokens.is_empty() {
                         statements.push(std::mem::take(&mut tokens));
                     }
+                }
+                (b'(' | b')' | b',', _) => {
+                    flush_token(&mut token, &mut tokens);
+                    tokens.push(SqlToken::Symbol(byte as char));
                 }
                 _ if byte.is_ascii_alphanumeric() || byte == b'_' => token.push(byte),
                 _ => flush_token(&mut token, &mut tokens),
@@ -761,26 +992,48 @@ fn tokenize_sql_statements(sql: &str) -> Option<Vec<Vec<String>>> {
                         index += 1;
                     } else {
                         mode = Mode::Normal;
+                        tokens.push(SqlToken::StringLiteral);
                     }
                 }
             }
             Mode::DoubleQuote => {
                 if byte == b'"' {
                     if next == Some(b'"') {
+                        quoted.push(b'"');
                         index += 1;
                     } else {
                         mode = Mode::Normal;
+                        tokens.push(SqlToken::Identifier(
+                            String::from_utf8(quoted.clone()).ok()?,
+                        ));
                     }
+                } else {
+                    quoted.push(byte);
                 }
             }
             Mode::Backtick => {
                 if byte == b'`' {
-                    mode = Mode::Normal;
+                    if next == Some(b'`') {
+                        quoted.push(b'`');
+                        index += 1;
+                    } else {
+                        mode = Mode::Normal;
+                        tokens.push(SqlToken::Identifier(
+                            String::from_utf8(quoted.clone()).ok()?,
+                        ));
+                    }
+                } else {
+                    quoted.push(byte);
                 }
             }
             Mode::Bracket => {
                 if byte == b']' {
                     mode = Mode::Normal;
+                    tokens.push(SqlToken::Identifier(
+                        String::from_utf8(quoted.clone()).ok()?,
+                    ));
+                } else {
+                    quoted.push(byte);
                 }
             }
             Mode::LineComment => {
@@ -812,15 +1065,22 @@ fn build_fixed_query(
     manifest_len: usize,
     object_names: &[String],
     table_names: &[String],
+    proof_sha256: &str,
 ) -> FixedQuery {
     let mut sql = Vec::new();
     let mut statements = Vec::new();
-    sql.push(format!(
-        "SELECT id, name FROM {} ORDER BY id LIMIT {}",
-        quote_identifier(migrations_table),
-        manifest_len + 1
+    let ledger = BatchStatement::Ledger;
+    sql.push(tagged_statement(
+        &ledger,
+        proof_sha256,
+        &format!(
+            "SELECT id, name FROM {} ORDER BY id LIMIT {}",
+            quote_identifier(migrations_table),
+            manifest_len + 1
+        ),
+        &[3],
     ));
-    statements.push(BatchStatement::Ledger);
+    statements.push(ledger);
     let names = if object_names.is_empty() {
         String::from("NULL")
     } else {
@@ -830,34 +1090,80 @@ fn build_fixed_query(
             .collect::<Vec<_>>()
             .join(", ")
     };
-    sql.push(format!(
-        "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name IN ({names}) ORDER BY type, name LIMIT {}",
-        object_names.len() + 1
+    let schema = BatchStatement::Schema;
+    sql.push(tagged_statement(
+        &schema,
+        proof_sha256,
+        &format!(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name IN ({names}) ORDER BY type, name LIMIT {}",
+            object_names.len() + 1
+        ),
+        &[3, 4],
     ));
-    statements.push(BatchStatement::Schema);
+    statements.push(schema);
     for table in table_names {
         let table_string = quote_string(table);
-        sql.push(format!(
-            "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden FROM pragma_table_xinfo({table_string}) ORDER BY cid LIMIT {}",
-            MAX_COLUMNS_PER_TABLE + 1
+        let xinfo = BatchStatement::TableXinfo(table.clone());
+        sql.push(tagged_statement(
+            &xinfo,
+            proof_sha256,
+            &format!(
+                "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden FROM pragma_table_xinfo({table_string}) ORDER BY cid LIMIT {}",
+                MAX_COLUMNS_PER_TABLE + 1
+            ),
+            &[3],
         ));
-        statements.push(BatchStatement::TableXinfo(table.clone()));
-        sql.push(format!(
-            "SELECT id, seq, \"table\", \"from\", \"to\", on_update, on_delete, \"match\" FROM pragma_foreign_key_list({table_string}) ORDER BY id, seq LIMIT {}",
-            MAX_FOREIGN_KEYS_PER_TABLE + 1
+        statements.push(xinfo);
+        let foreign_keys = BatchStatement::ForeignKeyList(table.clone());
+        sql.push(tagged_statement(
+            &foreign_keys,
+            proof_sha256,
+            &format!(
+                "SELECT id, seq, \"table\", \"from\", \"to\", on_update, on_delete, \"match\" FROM pragma_foreign_key_list({table_string}) ORDER BY id, seq LIMIT {}",
+                MAX_FOREIGN_KEYS_PER_TABLE + 1
+            ),
+            &[3, 4],
         ));
-        statements.push(BatchStatement::ForeignKeyList(table.clone()));
-        sql.push(format!(
-            "SELECT \"table\", rowid, parent, fkid FROM pragma_foreign_key_check({table_string}) LIMIT 1"
+        statements.push(foreign_keys);
+        let foreign_key_check = BatchStatement::ForeignKeyCheck(table.clone());
+        sql.push(tagged_statement(
+            &foreign_key_check,
+            proof_sha256,
+            &format!(
+                "SELECT \"table\", rowid, parent, fkid FROM pragma_foreign_key_check({table_string}) LIMIT 1"
+            ),
+            &[],
         ));
-        statements.push(BatchStatement::ForeignKeyCheck(table.clone()));
+        statements.push(foreign_key_check);
     }
     let sql = sql.join(";\n");
     FixedQuery {
         sha256: sha256_bytes_hex(sql.as_bytes()),
         sql,
+        proof_sha256: proof_sha256.to_string(),
         statements,
     }
+}
+
+fn tagged_statement(
+    statement: &BatchStatement,
+    proof_sha256: &str,
+    data_sql: &str,
+    data_order_positions: &[usize],
+) -> String {
+    let marker = quote_string(&statement.marker(proof_sha256));
+    let null_fields = statement
+        .data_fields()
+        .iter()
+        .map(|field| format!("NULL AS {}", quote_identifier(field)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut order = vec!["2".to_string()];
+    order.extend(data_order_positions.iter().map(ToString::to_string));
+    format!(
+        "SELECT {marker} AS \"__cf_mcp_statement_id\", 0 AS \"__cf_mcp_row_kind\", {null_fields} UNION ALL SELECT {marker}, 1, * FROM ({data_sql}) ORDER BY {}",
+        order.join(", ")
+    )
 }
 
 fn quote_identifier(value: &str) -> String {
@@ -871,6 +1177,7 @@ fn quote_string(value: &str) -> String {
 fn parse_complete_batch(
     value: &Value,
     statements: &[BatchStatement],
+    proof_sha256: &str,
     manifest: &[D1MigrationManifestEntry],
 ) -> Result<CanonicalSnapshot, CallToolResult> {
     let result_sets = value.as_array().ok_or_else(|| {
@@ -891,7 +1198,7 @@ fn parse_complete_batch(
     let mut schema_objects = None;
     let mut tables: BTreeMap<String, ObservedTable> = BTreeMap::new();
     for (result_set, statement) in result_sets.iter().zip(statements) {
-        let rows = result_rows(result_set)?;
+        let rows = result_rows(result_set, statement, proof_sha256)?;
         match statement {
             BatchStatement::Ledger => {
                 if rows.len() > manifest.len() {
@@ -901,7 +1208,7 @@ fn parse_complete_batch(
                         "migration ledger exceeded the exact manifest prefix bound",
                     ));
                 }
-                ledger = Some(parse_ledger_rows(rows)?);
+                ledger = Some(parse_ledger_rows(&rows)?);
             }
             BatchStatement::Schema => {
                 if rows.len() > MAX_SCHEMA_OBJECTS {
@@ -911,7 +1218,7 @@ fn parse_complete_batch(
                         "sqlite_master evidence exceeded the declared object bound",
                     ));
                 }
-                schema_objects = Some(parse_schema_rows(rows)?);
+                schema_objects = Some(parse_schema_rows(&rows)?);
             }
             BatchStatement::TableXinfo(table) => {
                 if rows.len() > MAX_COLUMNS_PER_TABLE {
@@ -928,7 +1235,7 @@ fn parse_complete_batch(
                         columns: Vec::new(),
                         foreign_keys: Vec::new(),
                     })
-                    .columns = parse_column_rows(rows)?;
+                    .columns = parse_column_rows(&rows)?;
             }
             BatchStatement::ForeignKeyList(table) => {
                 if rows.len() > MAX_FOREIGN_KEYS_PER_TABLE {
@@ -945,7 +1252,7 @@ fn parse_complete_batch(
                         columns: Vec::new(),
                         foreign_keys: Vec::new(),
                     })
-                    .foreign_keys = parse_foreign_key_rows(rows)?;
+                    .foreign_keys = parse_foreign_key_rows(&rows)?;
             }
             BatchStatement::ForeignKeyCheck(table) => {
                 if !rows.is_empty() {
@@ -978,7 +1285,11 @@ fn parse_complete_batch(
     })
 }
 
-fn result_rows(result_set: &Value) -> Result<&[Value], CallToolResult> {
+fn result_rows(
+    result_set: &Value,
+    statement: &BatchStatement,
+    proof_sha256: &str,
+) -> Result<Vec<Value>, CallToolResult> {
     let object = result_set.as_object().ok_or_else(|| {
         reconciliation_error(
             "contradictory",
@@ -1015,36 +1326,105 @@ fn result_rows(result_set: &Value) -> Result<&[Value], CallToolResult> {
                 "provider result metadata was not an object",
             )
         })?;
-        if meta
+        let changed_db_valid = meta
             .get("changed_db")
-            .is_some_and(|value| value != &json!(false))
-            || meta
-                .get("changes")
-                .and_then(Value::as_i64)
-                .is_some_and(|value| value != 0)
-            || meta
-                .get("rows_written")
-                .and_then(Value::as_i64)
-                .is_some_and(|value| value != 0)
-        {
+            .is_none_or(|value| value == &Value::Bool(false));
+        let exact_zero = |key: &str| meta.get(key).is_none_or(|value| value.as_i64() == Some(0));
+        if !changed_db_valid || !exact_zero("changes") || !exact_zero("rows_written") {
             return Err(reconciliation_error(
                 "contradictory",
                 "d1.migration_reconciliation_read_only_meta_contradictory",
-                "provider metadata contradicted the internally constructed read-only batch",
+                "provider metadata was malformed or contradicted the internally constructed read-only batch",
             ));
         }
     }
-    object
+    let rows = object
         .get("results")
         .and_then(Value::as_array)
-        .map(Vec::as_slice)
         .ok_or_else(|| {
             reconciliation_error(
                 "contradictory",
                 "d1.migration_reconciliation_rows_missing",
                 "a reconciliation result set omitted its rows array",
             )
-        })
+        })?;
+    parse_tagged_rows(rows, statement, proof_sha256)
+}
+
+fn parse_tagged_rows(
+    rows: &[Value],
+    statement: &BatchStatement,
+    proof_sha256: &str,
+) -> Result<Vec<Value>, CallToolResult> {
+    let first = rows.first().ok_or_else(|| {
+        reconciliation_error(
+            "contradictory",
+            "d1.migration_reconciliation_statement_marker_missing",
+            "a fixed reconciliation result omitted its mandatory statement identity marker",
+        )
+    })?;
+    let first_object = first.as_object().ok_or_else(statement_marker_malformed)?;
+    let marker = first_object
+        .get("__cf_mcp_statement_id")
+        .and_then(Value::as_str)
+        .filter(|value| *value == statement.marker(proof_sha256))
+        .ok_or_else(statement_marker_malformed)?;
+    if first_object
+        .get("__cf_mcp_row_kind")
+        .and_then(Value::as_i64)
+        != Some(0)
+        || statement
+            .data_fields()
+            .iter()
+            .any(|field| first_object.get(*field) != Some(&Value::Null))
+    {
+        return Err(statement_marker_malformed());
+    }
+    let expected_keys = statement
+        .data_fields()
+        .iter()
+        .copied()
+        .chain(["__cf_mcp_row_kind", "__cf_mcp_statement_id"])
+        .collect::<BTreeSet<_>>();
+    if first_object
+        .keys()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>()
+        != expected_keys
+    {
+        return Err(statement_marker_malformed());
+    }
+
+    let mut data_rows = Vec::with_capacity(rows.len().saturating_sub(1));
+    for row in &rows[1..] {
+        let object = row.as_object().ok_or_else(statement_marker_malformed)?;
+        if object.keys().map(String::as_str).collect::<BTreeSet<_>>() != expected_keys
+            || object.get("__cf_mcp_statement_id").and_then(Value::as_str) != Some(marker)
+            || object.get("__cf_mcp_row_kind").and_then(Value::as_i64) != Some(1)
+        {
+            return Err(statement_marker_malformed());
+        }
+        let mut data = Map::new();
+        for field in statement.data_fields() {
+            data.insert(
+                (*field).to_string(),
+                object
+                    .get(*field)
+                    .cloned()
+                    .ok_or_else(statement_marker_malformed)?,
+            );
+        }
+        data_rows.push(Value::Object(data));
+    }
+    Ok(data_rows)
+}
+
+fn statement_marker_malformed() -> CallToolResult {
+    reconciliation_error(
+        "contradictory",
+        "d1.migration_reconciliation_statement_marker_malformed",
+        "a fixed reconciliation result had a missing, malformed, duplicate, or conflicting statement identity marker",
+    )
 }
 
 fn parse_ledger_rows(rows: &[Value]) -> Result<Vec<D1ManifestLedgerRow>, CallToolResult> {
@@ -1429,15 +1809,21 @@ fn adapter_batch_error(
         (Some(sha256), Some(size)) => vec![json!({
             "response_body_sha256": sha256,
             "response_body_size_bytes": size,
+            "complete_body_digest": true,
+        })],
+        (None, Some(size)) => vec![json!({
+            "response_body_sha256": null,
+            "response_body_size_bytes": size,
+            "complete_body_digest": false,
         })],
         _ => Vec::new(),
     };
     let mut result = reconciliation_error_with_evidence(
         capability_state,
-        if capability_state == "capability_gap" {
-            "d1.migration_reconciliation_query_capability_gap"
-        } else {
-            "d1.migration_reconciliation_provider_unavailable"
+        match capability_state {
+            "capability_gap" => "d1.migration_reconciliation_query_capability_gap",
+            "unavailable" => "d1.migration_reconciliation_provider_unavailable",
+            _ => "d1.migration_reconciliation_provider_evidence_contradictory",
         },
         "provider could not return one complete strict read-only reconciliation batch",
         Some(query_sha256),
@@ -1512,8 +1898,36 @@ fn contextualize_error(
         );
         content.insert("lease_decision".to_string(), json!("retain"));
         content.insert("lease_retained".to_string(), json!(true));
+        content.insert(
+            "custody_status".to_string(),
+            json!("retained_evidence_verified"),
+        );
         content.insert("query_sha256".to_string(), json!(query_sha256));
-        content.insert("response_evidence".to_string(), json!(response_evidence));
+        if !response_evidence.is_empty() || !content.contains_key("response_evidence") {
+            content.insert("response_evidence".to_string(), json!(response_evidence));
+        }
+        content.insert("provider_mutations".to_string(), json!(0));
+        content.insert("local_namespace_mutations".to_string(), json!(0));
+    }
+    CallToolResult::structured_error(content)
+}
+
+fn prelease_error(
+    result: CallToolResult,
+    custody_status: &'static str,
+    query_sha256: Option<&str>,
+) -> CallToolResult {
+    let mut content = result
+        .structured_content
+        .unwrap_or_else(|| json!({"ok": false, "error": {"code": "d1.migration_reconciliation_failed", "message": "reconciliation failed before custody acquisition"}}));
+    if let Value::Object(content) = &mut content {
+        content.insert("operation".to_string(), json!(OPERATION));
+        content.insert("dry_run".to_string(), json!(true));
+        content.insert("read_only".to_string(), json!(true));
+        content.insert("lease_decision".to_string(), json!("not_acquired"));
+        content.insert("lease_retained".to_string(), Value::Null);
+        content.insert("custody_status".to_string(), json!(custody_status));
+        content.insert("query_sha256".to_string(), json!(query_sha256));
         content.insert("provider_mutations".to_string(), json!(0));
         content.insert("local_namespace_mutations".to_string(), json!(0));
     }
@@ -1544,8 +1958,9 @@ fn reconciliation_error_with_evidence(
         "outcome": "unknown",
         "capability_state": capability_state,
         "retry_decision": "do_not_retry_same_attempt",
-        "lease_decision": "retain",
-        "lease_retained": true,
+        "lease_decision": "not_acquired",
+        "lease_retained": null,
+        "custody_status": "not_inspected",
         "query_sha256": query_sha256,
         "response_evidence": response_evidence,
         "provider_mutations": 0,
@@ -1562,6 +1977,8 @@ fn reconciliation_error_with_evidence(
 mod tests {
     use super::*;
 
+    const PROOF: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
     fn manifest(sql: &str) -> Vec<D1MigrationManifestEntry> {
         vec![D1MigrationManifestEntry {
             name: "0001_create.sql".to_string(),
@@ -1571,21 +1988,97 @@ mod tests {
         }]
     }
 
+    fn empty_state() -> D1MigrationStateExpectation {
+        D1MigrationStateExpectation {
+            manifest_prefix_length: 0,
+            schema_objects: Vec::new(),
+            tables: Vec::new(),
+        }
+    }
+
+    fn tagged_result(
+        statement: &BatchStatement,
+        proof_sha256: &str,
+        rows: Vec<Value>,
+        meta: Option<Value>,
+    ) -> Value {
+        let marker = statement.marker(proof_sha256);
+        let mut tagged = Vec::new();
+        let mut sentinel = Map::new();
+        sentinel.insert("__cf_mcp_statement_id".to_string(), json!(marker));
+        sentinel.insert("__cf_mcp_row_kind".to_string(), json!(0));
+        for field in statement.data_fields() {
+            sentinel.insert((*field).to_string(), Value::Null);
+        }
+        tagged.push(Value::Object(sentinel));
+        for row in rows {
+            let mut row = row.as_object().expect("test data row").clone();
+            row.insert("__cf_mcp_statement_id".to_string(), json!(marker));
+            row.insert("__cf_mcp_row_kind".to_string(), json!(1));
+            tagged.push(Value::Object(row));
+        }
+        let mut result = json!({"success": true, "results": tagged});
+        if let Some(meta) = meta {
+            result
+                .as_object_mut()
+                .expect("test result object")
+                .insert("meta".to_string(), meta);
+        }
+        result
+    }
+
     #[test]
     fn registry_rejects_missing_and_non_schema_effect_proof() {
         let create = manifest("CREATE TABLE items(id INTEGER PRIMARY KEY);");
-        assert!(validate_effect_assertion(None, &create).is_err());
+        assert!(derive_effect_assertion(None, &create).is_err());
         assert!(
-            validate_effect_assertion(
+            derive_effect_assertion(
                 Some(EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1),
                 &manifest("INSERT INTO items(id) VALUES (1);")
             )
             .is_err()
         );
         assert!(
-            validate_effect_assertion(Some(EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1), &create)
-                .is_ok()
+            derive_effect_assertion(Some(EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1), &create).is_ok()
         );
+        for sql in [
+            "CREATE TABLE items AS VALUES (1);",
+            "CREATE TABLE items AS SELECT 1;",
+            "CREATE VIRTUAL TABLE items USING fts5(value);",
+            "CREATE VIEW items AS SELECT 1;",
+            "CREATE TRIGGER items AFTER INSERT ON source BEGIN SELECT 1; END;",
+        ] {
+            assert!(
+                derive_effect_assertion(
+                    Some(EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1),
+                    &manifest(sql)
+                )
+                .is_err(),
+                "must reject data-producing or non-schema-only CREATE: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn derived_schema_requires_complete_prefix_expectations() {
+        let create = manifest("CREATE TABLE items(id INTEGER PRIMARY KEY);");
+        let derived =
+            derive_effect_assertion(Some(EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1), &create)
+                .expect("derive exact CREATE target");
+        assert!(validate_expectations(&derived, vec![empty_state()]).is_err());
+
+        let mut omitted = empty_state();
+        omitted.manifest_prefix_length = 1;
+        assert!(
+            validate_expectations(&derived, vec![empty_state(), omitted]).is_err(),
+            "caller omission cannot produce a converged schema proof"
+        );
+
+        let mixed_case = manifest("CrEaTe TaBlE Items(id INTEGER PRIMARY KEY);");
+        let mixed_case_derived =
+            derive_effect_assertion(Some(EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1), &mixed_case)
+                .expect("derive case-insensitive keyword with exact identifier");
+        assert_eq!(mixed_case_derived[1][0].name, "Items");
     }
 
     #[test]
@@ -1610,6 +2103,7 @@ mod tests {
             2,
             &["items".to_string(), "items_by_name".to_string()],
             &["items".to_string()],
+            PROOF,
         );
         assert_eq!(query.statements.len(), 5);
         assert!(query.sql.split(';').all(|statement| {
@@ -1623,21 +2117,61 @@ mod tests {
     #[test]
     fn malformed_partial_and_fk_violation_batches_fail_closed() {
         let manifest = manifest("CREATE TABLE items(id INTEGER PRIMARY KEY);");
-        let query = build_fixed_query("d1_migrations", 1, &[], &[]);
-        assert!(parse_complete_batch(&json!([]), &query.statements, &manifest).is_err());
+        let query = build_fixed_query("d1_migrations", 1, &[], &[], PROOF);
+        assert!(parse_complete_batch(&json!([]), &query.statements, PROOF, &manifest).is_err());
         let table_query = build_fixed_query(
             "d1_migrations",
             1,
             &["items".to_string()],
             &["items".to_string()],
+            PROOF,
         );
-        let mut result_sets = (0..table_query.statements.len())
-            .map(|_| json!({"success": true, "results": []}))
+        let mut result_sets = table_query
+            .statements
+            .iter()
+            .map(|statement| tagged_result(statement, PROOF, Vec::new(), None))
             .collect::<Vec<_>>();
-        result_sets[4] = json!({"success": true, "results": [{"table":"items","rowid":1,"parent":"parents","fkid":0}]});
-        assert!(
-            parse_complete_batch(&json!(result_sets), &table_query.statements, &manifest).is_err()
+        result_sets[4] = tagged_result(
+            &table_query.statements[4],
+            PROOF,
+            vec![json!({"table":"items","rowid":1,"parent":"parents","fkid":0})],
+            None,
         );
+        assert!(
+            parse_complete_batch(
+                &json!(result_sets),
+                &table_query.statements,
+                PROOF,
+                &manifest
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn statement_markers_and_read_only_metadata_are_exact() {
+        let statement = BatchStatement::Ledger;
+        let mut wrong_marker = tagged_result(&statement, PROOF, Vec::new(), None);
+        wrong_marker["results"][0]["__cf_mcp_statement_id"] = json!("b".repeat(64));
+        assert!(result_rows(&wrong_marker, &statement, PROOF).is_err());
+
+        for meta in [
+            json!({"changed_db": "false"}),
+            json!({"changes": "0"}),
+            json!({"rows_written": 0.0}),
+            json!({"changed_db": true}),
+            json!({"changes": 1}),
+        ] {
+            let malformed = tagged_result(&statement, PROOF, Vec::new(), Some(meta));
+            assert!(result_rows(&malformed, &statement, PROOF).is_err());
+        }
+        let valid = tagged_result(
+            &statement,
+            PROOF,
+            Vec::new(),
+            Some(json!({"changed_db": false, "changes": 0, "rows_written": 0})),
+        );
+        assert!(result_rows(&valid, &statement, PROOF).is_ok());
     }
 
     #[test]
@@ -1664,7 +2198,16 @@ mod tests {
                 foreign_keys: Vec::new(),
             }],
         };
-        let validated = validate_expectations(1, vec![expected.clone()]).expect("expectations");
+        let derived = vec![
+            Vec::new(),
+            vec![DerivedSchemaObject {
+                object_type: "table".to_string(),
+                name: "items".to_string(),
+                table_name: "items".to_string(),
+            }],
+        ];
+        let validated = validate_expectations(&derived, vec![empty_state(), expected.clone()])
+            .expect("expectations");
         let snapshot = CanonicalSnapshot {
             ledger: vec![D1ManifestLedgerRow {
                 id: 1,

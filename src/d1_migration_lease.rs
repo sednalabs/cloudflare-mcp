@@ -437,8 +437,9 @@ fn d1_retained_lease_error(code: &'static str, message: &'static str) -> CallToo
         "read_only": true,
         "status": "reconciliation_required",
         "retry_decision": "do_not_retry_same_attempt",
-        "lease_decision": "retain",
-        "lease_retained": true,
+        "lease_decision": "not_acquired",
+        "lease_retained": null,
+        "custody_status": "inspection_failed",
         "provider_calls": 0,
         "error": {
             "code": code,

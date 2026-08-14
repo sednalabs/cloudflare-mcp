@@ -73,11 +73,25 @@ Use curated D1 tools instead of generic API calls for database workflows:
 - `d1_execute_write`
 - `d1_apply_migrations`
 - `d1_apply_migration_manifest`
+- `d1_reconcile_migration_manifest`
 - `d1_rename_database`
 - `d1_delete_database`
 
 Read/query tools use restricted SQL checks. Write and migration tools preserve
 dry-run discipline and fail closed on unsafe or ambiguous state.
+
+Use `d1_reconcile_migration_manifest` only for exact retained
+`active.lease.json` or `retiring.lease.json` evidence after an ambiguous
+manifest apply. Supply the complete exact-byte manifest and one complete
+expected schema state for every prefix from zero through the full manifest.
+The tool derives every CREATE TABLE/INDEX target from the manifest and rejects
+omissions, additions, data-producing CREATE forms, malformed result metadata,
+and result sets whose query-bound statement marker is absent or changed. It
+performs two bounded read-only batches and never retires custody evidence or
+authorizes an apply retry. A null `lease_retained` with
+`custody_status=not_inspected` or `inspection_failed` means no retained lease
+was acquired or proven by that call; it is not evidence that custody was
+removed.
 
 For D1 usage-spike investigations, start with `account_billing_usage` to read
 Cloudflare billing usage records, then use `graphql_analytics_query` for

@@ -657,8 +657,30 @@ impl CloudflareClient {
                 }
             })?;
         let status = response.status();
-        let bytes = response.bytes().await.map_err(|error| {
-            D1MigrationReconciliationBatchError {
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(D1MigrationReconciliationBatchError {
+                error: AdapterError::new(
+                    "cloudflare.d1.migration_reconciliation_response_too_large",
+                    "Cloudflare reconciliation response exceeded the exact-evidence byte limit",
+                    "Reduce the bounded expectation scope; retain the lease and do not retry the migration attempt.",
+                )
+                .payload(),
+                response_body_sha256: None,
+                response_body_size_bytes: response.content_length().map(|length| length as usize),
+            });
+        }
+        let initial_capacity = response
+            .content_length()
+            .map(|length| cmp::min(length as usize, MAX_RESPONSE_BYTES))
+            .unwrap_or(0);
+        let mut bytes = Vec::with_capacity(initial_capacity);
+        let mut hasher = Sha256::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| D1MigrationReconciliationBatchError {
                 error: AdapterError::new(
                     "cloudflare.response_read_failed",
                     format!("failed reading Cloudflare reconciliation response body: {error}"),
@@ -666,23 +688,31 @@ impl CloudflareClient {
                 )
                 .payload(),
                 response_body_sha256: None,
-                response_body_size_bytes: None,
+                response_body_size_bytes: Some(bytes.len()),
+            })?;
+            let observed_size = bytes.len().saturating_add(chunk.len());
+            if observed_size > MAX_RESPONSE_BYTES {
+                return Err(D1MigrationReconciliationBatchError {
+                    error: AdapterError::new(
+                        "cloudflare.d1.migration_reconciliation_response_too_large",
+                        "Cloudflare reconciliation response exceeded the exact-evidence byte limit",
+                        "Reduce the bounded expectation scope; retain the lease and do not retry the migration attempt.",
+                    )
+                    .payload(),
+                    response_body_sha256: None,
+                    response_body_size_bytes: Some(observed_size),
+                });
             }
-        })?;
+            hasher.update(&chunk);
+            bytes.extend_from_slice(&chunk);
+        }
         let response_body_size_bytes = bytes.len();
-        let response_body_sha256 = sha256_hex(&bytes);
+        let response_body_sha256 = format!("{:x}", hasher.finalize());
         let evidence_error = |error: AdapterError| D1MigrationReconciliationBatchError {
             error: error.payload(),
             response_body_sha256: Some(response_body_sha256.clone()),
             response_body_size_bytes: Some(response_body_size_bytes),
         };
-        if response_body_size_bytes > MAX_RESPONSE_BYTES {
-            return Err(evidence_error(AdapterError::new(
-                "cloudflare.d1.migration_reconciliation_response_too_large",
-                "Cloudflare reconciliation response exceeded the exact-evidence byte limit",
-                "Reduce the bounded expectation scope; retain the lease and do not retry the migration attempt.",
-            )));
-        }
         let body = std::str::from_utf8(&bytes).map_err(|error| {
             evidence_error(AdapterError::new(
                 "cloudflare.d1.migration_reconciliation_malformed_utf8",

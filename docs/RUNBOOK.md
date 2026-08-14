@@ -136,17 +136,21 @@ When an ambiguous apply retains `active.lease.json` or a failed terminal move
 leaves `retiring.lease.json`, use `d1_reconcile_migration_manifest`; do not run
 the apply tool again. Supply the same complete exact-byte manifest and the
 reported approved-plan, nonce, and payload digests. Also supply ordered,
-bounded `state_expectations` for the reviewed manifest prefixes that may be
-classified. Each state names the exact `sqlite_master` object type/name/table
-and SQL digest, complete `table_xinfo` rows, and complete foreign-key
-definitions for every declared table.
+bounded `state_expectations` for every manifest prefix from zero through the
+full manifest; a selected or partial prefix set is not accepted. Each state
+names the exact `sqlite_master` object type/name/table and SQL digest, complete
+`table_xinfo` rows, and complete foreign-key definitions for every declared
+table. The tool independently derives every CREATE target at every prefix and
+requires exact agreement, so a caller cannot omit a created table or index and
+obtain convergence.
 
 The current built-in effect registry accepts only
 `effect_assertion_id=schema_create_only_v1`. It independently classifies the
 exact manifest SQL and refuses arbitrary DML, ALTER, DROP, PRAGMA, trigger,
-view, or data-copy effects; a caller assertion that work was schema-only is not
-proof. An effect capability gap means retain the lease and add a purpose-built
-registry assertion/readback contract before continuing.
+view, virtual table, `CREATE TABLE AS SELECT`, `CREATE TABLE AS VALUES`, or
+other data-producing/unclassified CREATE effects; a caller assertion that work
+was schema-only is not proof. An effect capability gap means retain the lease
+and add a purpose-built registry assertion/readback contract before continuing.
 
 The tool opens the existing target and guard without creating entries, requires
 exactly one active or retiring regular private evidence file, and holds the
@@ -156,6 +160,19 @@ the current ledger is an exact manifest prefix, the retained approved plan
 reconstructs uniquely from that prefix relationship, both canonical snapshots
 match, and schema/FK proof is complete. These labels are documented atomic-state
 inference, not proof of which provider attempt caused the state.
+
+Every fixed result set carries a query-bound statement marker and a mandatory
+sentinel row, including result sets with no data rows. Parsing requires the
+exact marker, exact row shape, explicit success, empty errors, and—when
+present—boolean `changed_db=false` plus integer `changes=0` and
+`rows_written=0`. Response bodies are capped at 16 MiB from the HTTP stream;
+the adapter stops before buffering a body beyond that bound.
+
+Interpret custody fields literally. Validation failures before custody lookup
+return `lease_retained=null` and `custody_status=not_inspected`. Inspection
+failures return `lease_retained=null` and `custody_status=inspection_failed`.
+Only a successfully acquired and revalidated retained lease may report
+`lease_retained=true` and `custody_status=retained_evidence_verified`.
 
 All current results retain the lease and prohibit retry of the same migration
 attempt. Record the query SHA-256, both bounded response-body digests, canonical
