@@ -16462,7 +16462,7 @@ mod tests {
                 ),
             ),
         ];
-        let mut server = test_server("http://127.0.0.1:9".to_string()); // DevSkim: ignore DS137138 -- loopback-only no-provider-call test fixture
+        let mut server = test_server("http://127.0.0.1:9".to_string()); // DevSkim: ignore DS162092 -- loopback-only no-provider-call test fixture
         for (label, args, expected) in cases {
             let result = server
                 .cloudflare_d1_reconcile_migration_manifest(Parameters(args))
