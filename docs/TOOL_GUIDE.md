@@ -142,6 +142,9 @@ lifecycle evidence, both mutation counts zero, `provider_calls=0`, and
 contacts D1. JSON-RPC and generated-schema parse failures occur before semantic
 tool execution and remain MCP deserialization errors without fabricated
 structured reconciliation evidence.
+Target validation includes an omitted `account_id` when no configured default
+account exists; that condition is semantic zero-call evidence, not a JSON-RPC
+or generated-schema failure.
 
 For D1 usage-spike investigations, start with `account_billing_usage` to read
 Cloudflare billing usage records, then use `graphql_analytics_query` for

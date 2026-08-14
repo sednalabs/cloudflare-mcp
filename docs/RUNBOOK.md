@@ -206,6 +206,9 @@ local mutations; it does not acquire lease custody or contact D1. JSON-RPC and
 generated-schema parse failures remain MCP deserialization errors without a
 structured reconciliation envelope because semantic tool execution has not
 begun.
+An omitted `account_id` with no configured default is part of target semantic
+validation and must return that same zero-call envelope before any lease or D1
+access.
 Only a successfully acquired and revalidated retained lease may report
 `lease_retained=true` and `custody_status=retained_evidence_verified`. If that
 evidence drifts, conflicts, or fails revalidation around a provider read, the

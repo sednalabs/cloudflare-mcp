@@ -5070,7 +5070,18 @@ impl CloudflareMcp {
                 return Ok(contextualize_d1_reconciliation_semantic_error(result));
             }
         }
-        let resolved_account_id = resolve_account_id(self, requested_account_id.as_deref())?;
+        let resolved_account_id = match resolve_account_id(self, requested_account_id.as_deref()) {
+            Ok(account_id) => account_id,
+            Err(_) => {
+                return Ok(contextualize_d1_reconciliation_semantic_error(
+                    invalid_argument_result(
+                        "d1.invalid_manifest_target_identity",
+                        "account_id must be supplied or configured as a canonical identifier",
+                        "Use the exact account_id read from the intended Cloudflare resource.",
+                    ),
+                ));
+            }
+        };
         let target = match normalize_d1_manifest_target(resolved_account_id, &requested_database_id)
         {
             Ok(target) => target,
@@ -16443,7 +16454,7 @@ mod tests {
             ),
             (
                 "family is wrapped after earlier fields validate",
-                args(Some("acct-1"), None, vec![valid], "bad family"),
+                args(Some("acct-1"), None, vec![valid.clone()], "bad family"),
                 expected_d1_reconciliation_semantic_error(
                     "d1.invalid_migration_family",
                     "migration_family must be 1..128 ASCII letters, digits, '.', '_', '-', or ':' characters",
@@ -16451,7 +16462,7 @@ mod tests {
                 ),
             ),
         ];
-        let server = test_server("http://127.0.0.1:9".to_string());
+        let mut server = test_server("http://127.0.0.1:9".to_string()); // DevSkim: ignore DS137138 -- loopback-only no-provider-call test fixture
         for (label, args, expected) in cases {
             let result = server
                 .cloudflare_d1_reconcile_migration_manifest(Parameters(args))
@@ -16465,6 +16476,26 @@ mod tests {
                 "{label}",
             );
         }
+        server.default_account_id = None;
+        let result = server
+            .cloudflare_d1_reconcile_migration_manifest(Parameters(args(
+                None,
+                None,
+                vec![valid],
+                "newsletter-core",
+            )))
+            .await
+            .expect("missing account semantic validation result");
+        assert_eq!(
+            result
+                .structured_content
+                .expect("structured missing-account error"),
+            expected_d1_reconciliation_semantic_error(
+                "d1.invalid_manifest_target_identity",
+                "account_id must be supplied or configured as a canonical identifier",
+                "Use the exact account_id read from the intended Cloudflare resource.",
+            ),
+        );
     }
 
     #[tokio::test]

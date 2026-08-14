@@ -4290,7 +4290,7 @@ fn d1_reconcile_migration_manifest_stdio_wraps_semantic_validation_in_fixed_orde
         ),
         (
             "family is wrapped after earlier fields validate",
-            args(valid_manifest, "bad family"),
+            args(valid_manifest.clone(), "bad family"),
             expected_d1_reconciliation_semantic_error(
                 "d1.invalid_migration_family",
                 "migration_family must be 1..128 ASCII letters, digits, '.', '_', '-', or ':' characters",
@@ -4332,6 +4332,30 @@ fn d1_reconcile_migration_manifest_stdio_wraps_semantic_validation_in_fixed_orde
         "schema parsing must remain outside semantic tool execution",
     );
     mcp.terminate();
+
+    let mut missing_account_mcp = McpStdioProcess::start_with_env(vec![
+        (
+            "CLOUDFLARE_MCP_API_BASE_URL",
+            "http://127.0.0.1:9".to_string(), // DevSkim: ignore DS137138 -- loopback-only no-provider-call test fixture
+        ),
+        ("CLOUDFLARE_MCP_DEFAULT_ACCOUNT_ID", String::new()),
+    ]);
+    let mut missing_account_args = args(valid_manifest, "newsletter-core");
+    missing_account_args
+        .as_object_mut()
+        .expect("missing-account arguments object")
+        .remove("account_id");
+    let response =
+        missing_account_mcp.call_tool(736, "d1_reconcile_migration_manifest", missing_account_args);
+    assert_eq!(
+        structured_content(&response),
+        &expected_d1_reconciliation_semantic_error(
+            "d1.invalid_manifest_target_identity",
+            "account_id must be supplied or configured as a canonical identifier",
+            "Use the exact account_id read from the intended Cloudflare resource.",
+        ),
+    );
+    missing_account_mcp.terminate();
 }
 
 #[test]
