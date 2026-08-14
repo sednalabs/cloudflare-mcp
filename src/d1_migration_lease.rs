@@ -112,6 +112,7 @@ pub(crate) struct D1TerminalReconciliationReceiptEvidence {
     file: fs::File,
     #[cfg(target_os = "linux")]
     file_identity: D1LeaseFileIdentity,
+    #[cfg(target_os = "linux")]
     name: String,
     pub(crate) payload_sha256: String,
 }

@@ -156,6 +156,14 @@ persistence, repeats that read immediately before retirement, and never issues
 a provider write. Exact replay of a completed receipt/retirement converges with
 zero provider calls; changed, malformed, duplicate, noncanonical, or
 retirement-before-receipt evidence fails closed and retains the blocker.
+The terminal response claims custody only after fresh physical readback. A
+verified active lease reports `lease_retained=true` with
+`lease_decision=retain`; verified retirement reports `lease_retained=false`
+with `lease_decision=retired`. Pre-inspection, inspection failure, retiring,
+and unverified/drifted custody report `lease_retained=null` with the
+corresponding `custody_status` and no fabricated lease decision.
+Retired-without-receipt is a verified-retired order violation, not evidence
+that an active lease was retained.
 
 For D1 usage-spike investigations, start with `account_billing_usage` to read
 Cloudflare billing usage records, then use `graphql_analytics_query` for

@@ -1067,6 +1067,80 @@ fn one_table_reconciliation_case() -> (Value, Value) {
     (manifest, expectations)
 }
 
+fn terminal_request_args(
+    manifest: &Value,
+    state_expectations: &Value,
+    approved_plan_sha256: &str,
+    lease_nonce: &str,
+    lease_payload_sha256: &str,
+) -> Value {
+    json!({
+        "database_id": "db-1",
+        "migration_family": "newsletter-core",
+        "manifest": manifest,
+        "approved_plan_sha256": approved_plan_sha256,
+        "lease_nonce": lease_nonce,
+        "lease_payload_sha256": lease_payload_sha256,
+        "effect_assertion_id": "schema_create_only_v1",
+        "state_expectations": state_expectations,
+        "expected_reconciliation_plan_sha256": "1".repeat(64),
+        "expected_expectation_proof_sha256": "2".repeat(64),
+        "expected_query_sha256": "3".repeat(64),
+        "expected_canonical_snapshot_sha256": "4".repeat(64),
+        "expected_outcome": "not_committed",
+        "expected_original_prefix_length": 0,
+        "expected_current_prefix_length": 0,
+        "terminal_request_sha256": "5".repeat(64),
+        "terminal_attempt_sha256": "6".repeat(64),
+        "dry_run": true,
+    })
+}
+
+fn terminal_args_from_reconciliation(
+    manifest: &Value,
+    state_expectations: &Value,
+    approved_plan_sha256: &str,
+    lease_nonce: &str,
+    lease_payload_sha256: &str,
+    reconciled: &Value,
+) -> Value {
+    let mut args = terminal_request_args(
+        manifest,
+        state_expectations,
+        approved_plan_sha256,
+        lease_nonce,
+        lease_payload_sha256,
+    );
+    args["expected_reconciliation_plan_sha256"] = reconciled["reconciliation_plan_sha256"].clone();
+    args["expected_expectation_proof_sha256"] = reconciled["expectation_proof_sha256"].clone();
+    args["expected_query_sha256"] = reconciled["query_sha256"].clone();
+    args["expected_canonical_snapshot_sha256"] = reconciled["canonical_snapshot_sha256"].clone();
+    args["expected_outcome"] = reconciled["outcome"].clone();
+    args["expected_original_prefix_length"] =
+        reconciled["reconstructed_original_prefix_length"].clone();
+    args["expected_current_prefix_length"] = reconciled["current_manifest_prefix_length"].clone();
+    args
+}
+
+fn assert_terminal_negative_whole_response(content: &Value, mut expected: Value) {
+    let plan = content["plan"].clone();
+    let audit = content["audit"].clone();
+    assert_eq!(
+        plan["operation"],
+        json!("d1_finalize_migration_reconciliation"),
+        "{content}"
+    );
+    assert_eq!(
+        audit["action"],
+        json!("d1_finalize_migration_reconciliation"),
+        "{content}"
+    );
+    assert_eq!(audit["outcome"], json!("error"), "{content}");
+    expected["plan"] = plan;
+    expected["audit"] = audit;
+    assert_eq!(content, &expected, "{content}");
+}
+
 fn spawn_fake_reconciliation_api() -> (String, Arc<Mutex<Vec<Value>>>) {
     spawn_fake_reconciliation_api_with_fault_and_calls(ReconciliationFault::None, 2)
 }
@@ -4579,6 +4653,12 @@ fn d1_finalize_migration_reconciliation_stdio_requires_preapproval_and_retires_a
         json!("terminal_reconciliation_plan_ready")
     );
     assert_eq!(dry_content["provider_calls"], json!(2));
+    assert_eq!(dry_content["lease_retained"], json!(true));
+    assert_eq!(
+        dry_content["custody_status"],
+        json!("retained_evidence_verified")
+    );
+    assert_eq!(dry_content["lease_decision"], json!("retain"));
     assert_private_regular_active_lease(&lease_root);
 
     let mut live_args = terminal_args;
@@ -4597,6 +4677,12 @@ fn d1_finalize_migration_reconciliation_stdio_requires_preapproval_and_retires_a
     );
     assert_eq!(live_content["provider_calls"], json!(4));
     assert_eq!(live_content["provider_mutations"], json!(0));
+    assert_eq!(live_content["lease_retained"], json!(false));
+    assert_eq!(
+        live_content["custody_status"],
+        json!("retired_evidence_verified")
+    );
+    assert_eq!(live_content["lease_decision"], json!("retired"));
     assert_eq!(
         live_content["provider_read_lifecycle"]
             .as_array()
@@ -4626,6 +4712,12 @@ fn d1_finalize_migration_reconciliation_stdio_requires_preapproval_and_retires_a
     );
     assert_eq!(replay_content["replayed"], json!(true));
     assert_eq!(replay_content["provider_calls"], json!(0));
+    assert_eq!(replay_content["lease_retained"], json!(false));
+    assert_eq!(
+        replay_content["custody_status"],
+        json!("retired_evidence_verified")
+    );
+    assert_eq!(replay_content["lease_decision"], json!("retired"));
     assert_eq!(requests.lock().expect("request log").len(), 8);
     mcp.terminate();
     let _ = fs::remove_dir_all(lease_root);
@@ -4717,6 +4809,12 @@ fn d1_finalize_migration_reconciliation_resumes_exact_receipt_from_retiring_name
         "{interrupted_content}"
     );
     assert_eq!(interrupted_content["provider_calls"], json!(4));
+    assert_eq!(interrupted_content["lease_retained"], json!(true));
+    assert_eq!(
+        interrupted_content["custody_status"],
+        json!("retained_evidence_verified")
+    );
+    assert_eq!(interrupted_content["lease_decision"], json!("retain"));
     assert_eq!(first_requests.lock().expect("first request log").len(), 8);
     first_mcp.terminate();
 
@@ -4762,10 +4860,378 @@ fn d1_finalize_migration_reconciliation_resumes_exact_receipt_from_retiring_name
     );
     assert_eq!(resumed_content["provider_calls"], json!(4));
     assert_eq!(resumed_content["provider_mutations"], json!(0));
+    assert_eq!(resumed_content["lease_retained"], json!(false));
+    assert_eq!(
+        resumed_content["custody_status"],
+        json!("retired_evidence_verified")
+    );
+    assert_eq!(resumed_content["lease_decision"], json!("retired"));
     assert_eq!(resume_requests.lock().expect("resume request log").len(), 4);
     assert_released_manifest_target_custody(&lease_root);
     resume_mcp.terminate();
     let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_finalize_migration_reconciliation_stdio_reports_preinspection_and_inspection_failures_exactly()
+ {
+    let (manifest, state_expectations) = one_table_reconciliation_case();
+    let mut mcp = McpStdioProcess::start();
+    let base_args = terminal_request_args(
+        &manifest,
+        &state_expectations,
+        &"a".repeat(64),
+        &"b".repeat(64),
+        &"c".repeat(64),
+    );
+
+    let mut invalid_args = base_args.clone();
+    invalid_args["expected_outcome"] = json!("unknown");
+    let invalid = mcp.call_tool(754, "d1_finalize_migration_reconciliation", invalid_args);
+    let invalid_content = structured_content(&invalid);
+    assert_terminal_negative_whole_response(
+        invalid_content,
+        json!({
+            "ok": false,
+            "operation": "d1_finalize_migration_reconciliation",
+            "dry_run": true,
+            "status": "reconciliation_required",
+            "retry_decision": "do_not_retry_same_attempt",
+            "lease_retained": null,
+            "custody_status": "not_inspected",
+            "receipt_persisted": false,
+            "provider_calls": 0,
+            "provider_read_lifecycle": [],
+            "response_evidence": [],
+            "provider_mutations": 0,
+            "local_namespace_mutations": 0,
+            "error": {
+                "code": "d1.migration_terminal_request_invalid",
+                "message": "terminal reconciliation requires canonical distinct request/attempt digests, exact approved evidence, a valid outcome/prefix relationship, and a live approval pin",
+                "hint": "Retain exact custody evidence. Do not retry the provider write or retire the lease outside this guarded terminal boundary."
+            }
+        }),
+    );
+
+    let mut approval_mismatch_args = base_args.clone();
+    approval_mismatch_args["dry_run"] = json!(false);
+    approval_mismatch_args["approved_terminal_plan_sha256"] = json!("f".repeat(64));
+    let approval_mismatch = mcp.call_tool(
+        755,
+        "d1_finalize_migration_reconciliation",
+        approval_mismatch_args,
+    );
+    let approval_mismatch_content = structured_content(&approval_mismatch);
+    assert_terminal_negative_whole_response(
+        approval_mismatch_content,
+        json!({
+            "ok": false,
+            "operation": "d1_finalize_migration_reconciliation",
+            "dry_run": false,
+            "status": "reconciliation_required",
+            "retry_decision": "do_not_retry_same_attempt",
+            "lease_retained": null,
+            "custody_status": "not_inspected",
+            "receipt_persisted": false,
+            "provider_calls": 0,
+            "provider_read_lifecycle": [],
+            "response_evidence": [],
+            "provider_mutations": 0,
+            "local_namespace_mutations": 0,
+            "error": {
+                "code": "d1.migration_terminal_plan_mismatch",
+                "message": "approved_terminal_plan_sha256 does not match the exact pre-existing terminal plan",
+                "hint": "Retain exact custody evidence. Do not retry the provider write or retire the lease outside this guarded terminal boundary."
+            }
+        }),
+    );
+
+    let inspection_failed = mcp.call_tool(756, "d1_finalize_migration_reconciliation", base_args);
+    let inspection_failed_content = structured_content(&inspection_failed);
+    assert_terminal_negative_whole_response(
+        inspection_failed_content,
+        json!({
+            "ok": false,
+            "operation": "d1_finalize_migration_reconciliation",
+            "dry_run": true,
+            "read_only": true,
+            "status": "reconciliation_required",
+            "retry_decision": "do_not_retry_same_attempt",
+            "lease_retained": null,
+            "custody_status": "inspection_failed",
+            "receipt_persisted": false,
+            "provider_calls": 0,
+            "provider_read_lifecycle": [],
+            "response_evidence": [],
+            "provider_mutations": 0,
+            "local_namespace_mutations": 0,
+            "error": {
+                "code": "d1.migration_reconciliation_lease_root_unconfigured",
+                "message": "terminal reconciliation requires the configured operator-owned migration lease root",
+                "hint": "Retain the exact custody evidence and resolve this boundary before any provider read or migration retry."
+            }
+        }),
+    );
+    mcp.terminate();
+}
+
+#[test]
+fn d1_finalize_migration_reconciliation_stdio_distinguishes_verified_retained_and_retired_without_receipt()
+ {
+    let (manifest, state_expectations) = one_table_reconciliation_case();
+
+    let retained_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-finalize-retained-negative-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&retained_root);
+    fs::create_dir(&retained_root).expect("create retained negative root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&retained_root, fs::Permissions::from_mode(0o700))
+            .expect("make retained negative root private");
+    }
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&retained_root, &manifest);
+    let receipt = manifest_target_path(&retained_root).join(format!(
+        "terminal-reconciliation.{lease_nonce}.receipt.json"
+    ));
+    fs::write(&receipt, b"{}").expect("write contradictory terminal receipt");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&receipt, fs::Permissions::from_mode(0o600))
+            .expect("make contradictory receipt private");
+    }
+    let mut retained_mcp = McpStdioProcess::start_with_env(vec![(
+        "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+        retained_root.to_string_lossy().to_string(),
+    )]);
+    let retained_failure = retained_mcp.call_tool(
+        757,
+        "d1_finalize_migration_reconciliation",
+        terminal_request_args(
+            &manifest,
+            &state_expectations,
+            &approved_plan_sha256,
+            &lease_nonce,
+            &lease_payload_sha256,
+        ),
+    );
+    let retained_content = structured_content(&retained_failure);
+    assert_terminal_negative_whole_response(
+        retained_content,
+        json!({
+            "ok": false,
+            "operation": "d1_finalize_migration_reconciliation",
+            "dry_run": true,
+            "status": "reconciliation_required",
+            "retry_decision": "do_not_retry_same_attempt",
+            "lease_decision": "retain",
+            "lease_retained": true,
+            "custody_status": "retained_evidence_verified",
+            "receipt_persisted": false,
+            "provider_calls": 0,
+            "provider_read_lifecycle": [],
+            "response_evidence": [],
+            "provider_mutations": 0,
+            "local_namespace_mutations": 0,
+            "error": {
+                "code": "d1.migration_terminal_evidence_invalid",
+                "message": "terminal reconciliation receipt is malformed, duplicate-keyed, or structurally unexpected",
+                "hint": "Preserve the exact target custody directory and reconcile its receipt and lease namespaces before another terminal attempt."
+            }
+        }),
+    );
+    assert_private_regular_active_lease(&retained_root);
+    retained_mcp.terminate();
+    let _ = fs::remove_dir_all(&retained_root);
+
+    let retired_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-finalize-retired-negative-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&retired_root);
+    fs::create_dir(&retired_root).expect("create retired negative root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&retired_root, fs::Permissions::from_mode(0o700))
+            .expect("make retired negative root private");
+    }
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&retired_root, &manifest);
+    let target = manifest_target_path(&retired_root);
+    fs::rename(
+        target.join("active.lease.json"),
+        target.join(format!("retired.{lease_nonce}.lease.json")),
+    )
+    .expect("model retirement without receipt");
+    fs::File::open(&target)
+        .expect("open retired target")
+        .sync_all()
+        .expect("sync retired target");
+    let mut retired_mcp = McpStdioProcess::start_with_env(vec![(
+        "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+        retired_root.to_string_lossy().to_string(),
+    )]);
+    let retired_failure = retired_mcp.call_tool(
+        758,
+        "d1_finalize_migration_reconciliation",
+        terminal_request_args(
+            &manifest,
+            &state_expectations,
+            &approved_plan_sha256,
+            &lease_nonce,
+            &lease_payload_sha256,
+        ),
+    );
+    let retired_content = structured_content(&retired_failure);
+    assert_terminal_negative_whole_response(
+        retired_content,
+        json!({
+            "ok": false,
+            "operation": "d1_finalize_migration_reconciliation",
+            "dry_run": true,
+            "status": "reconciliation_required",
+            "retry_decision": "do_not_retry_same_attempt",
+            "lease_decision": "retired",
+            "lease_retained": false,
+            "custody_status": "retired_evidence_verified",
+            "receipt_persisted": false,
+            "provider_calls": 0,
+            "provider_read_lifecycle": [],
+            "response_evidence": [],
+            "provider_mutations": 0,
+            "local_namespace_mutations": 0,
+            "error": {
+                "code": "d1.migration_terminal_receipt_absent",
+                "message": "terminal retirement exists without its exact terminal receipt",
+                "hint": "Retain exact custody evidence. Do not retry the provider write or retire the lease outside this guarded terminal boundary."
+            }
+        }),
+    );
+    assert_eq!(retired_manifest_entries(&target).len(), 1);
+    retired_mcp.terminate();
+    let _ = fs::remove_dir_all(&retired_root);
+}
+
+#[test]
+fn d1_finalize_migration_reconciliation_stdio_does_not_claim_retention_after_custody_drift() {
+    let (manifest, state_expectations) = one_table_reconciliation_case();
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-finalize-drift-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create terminal drift root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make terminal drift root private");
+    }
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&lease_root, &manifest);
+
+    let (baseline_url, baseline_requests) = spawn_fake_reconciliation_api();
+    let mut baseline_mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", baseline_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let reconciled_response = baseline_mcp.call_tool(
+        759,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest,
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_only_v1",
+            "state_expectations": state_expectations,
+        }),
+    );
+    let reconciled = structured_content(&reconciled_response).clone();
+    assert_eq!(reconciled["ok"], json!(true), "{reconciled}");
+    assert_eq!(
+        baseline_requests
+            .lock()
+            .expect("baseline request log")
+            .len(),
+        2
+    );
+    baseline_mcp.terminate();
+
+    let active = assert_private_regular_active_lease(&lease_root);
+    let (drift_url, drift_requests) =
+        spawn_fake_reconciliation_api_with_fault(ReconciliationFault::CustodyDrift(active));
+    let mut drift_mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", drift_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let drift = drift_mcp.call_tool(
+        760,
+        "d1_finalize_migration_reconciliation",
+        terminal_args_from_reconciliation(
+            &manifest,
+            &state_expectations,
+            &approved_plan_sha256,
+            &lease_nonce,
+            &lease_payload_sha256,
+            &reconciled,
+        ),
+    );
+    let drift_content = structured_content(&drift);
+    let query_sha256 = drift_content["query_sha256"].clone();
+    let response_evidence = drift_content["response_evidence"].clone();
+    let provider_lifecycle = drift_content["provider_read_lifecycle"].clone();
+    assert_eq!(
+        response_evidence.as_array().map(Vec::len),
+        Some(1),
+        "{drift_content}"
+    );
+    assert_eq!(
+        provider_lifecycle.as_array().map(Vec::len),
+        Some(1),
+        "{drift_content}"
+    );
+    assert_terminal_negative_whole_response(
+        drift_content,
+        json!({
+            "ok": false,
+            "operation": "d1_finalize_migration_reconciliation",
+            "dry_run": true,
+            "read_only": true,
+            "status": "reconciliation_required",
+            "retry_decision": "do_not_retry_same_attempt",
+            "lease_retained": null,
+            "custody_status": "retained_evidence_unverified",
+            "receipt_persisted": false,
+            "query_sha256": query_sha256,
+            "response_evidence": response_evidence,
+            "provider_calls": 1,
+            "provider_read_lifecycle": provider_lifecycle,
+            "provider_mutations": 0,
+            "local_namespace_mutations": 0,
+            "error": {
+                "code": "d1.migration_reconciliation_lease_changed",
+                "message": "retained lease payload digest changed",
+                "hint": "Retain the exact custody evidence and resolve this boundary before any provider read or migration retry."
+            }
+        }),
+    );
+    assert_eq!(drift_requests.lock().expect("drift request log").len(), 1);
+    drift_mcp.terminate();
+    let _ = fs::remove_dir_all(&lease_root);
 }
 
 #[test]

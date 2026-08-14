@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::d1_migration_lease::{
-    D1TerminalReconciliationReceipt, inspect_terminal_d1_migration_lease,
+    D1RetainedMigrationLease, D1TerminalReconciliationReceipt, inspect_terminal_d1_migration_lease,
 };
 use crate::d1_migration_reconciliation::{
     D1MigrationStateExpectation, prepare_d1_migration_reconciliation,
@@ -22,8 +22,26 @@ use crate::tools::{D1MigrationManifestEntry, sha256_bytes_hex};
 
 const OPERATION: &str = "d1_finalize_migration_reconciliation";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalCustodyState {
+    NotInspected,
+    InspectionFailed,
+    ActiveVerified,
+    RetiringVerified,
+    RetiredVerified,
+    Unverified,
+}
+
 pub(crate) fn contextualize_terminal_semantic_error(result: CallToolResult) -> CallToolResult {
-    terminalize_failure(result, 0, Vec::new(), Vec::new(), 0, false)
+    terminalize_failure(
+        result,
+        TerminalCustodyState::NotInspected,
+        0,
+        Vec::new(),
+        Vec::new(),
+        0,
+        false,
+    )
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -120,6 +138,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
         return terminal_error(
             "d1.migration_terminal_plan_mismatch",
             "approved_terminal_plan_sha256 does not match the exact pre-existing terminal plan",
+            TerminalCustodyState::NotInspected,
             0,
             Vec::new(),
             Vec::new(),
@@ -155,7 +174,17 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
         lease_payload_sha256,
     ) {
         Ok(lease) => lease,
-        Err(result) => return terminalize_failure(result, 0, Vec::new(), Vec::new(), 0, false),
+        Err(result) => {
+            return terminalize_failure(
+                result,
+                TerminalCustodyState::InspectionFailed,
+                0,
+                Vec::new(),
+                Vec::new(),
+                0,
+                false,
+            );
+        }
     };
     if initial_lease.is_retired() {
         let receipt_evidence = match initial_lease.terminal_receipt_state(&receipt) {
@@ -164,6 +193,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
                 return terminal_error(
                     "d1.migration_terminal_receipt_absent",
                     "terminal retirement exists without its exact terminal receipt",
+                    TerminalCustodyState::RetiredVerified,
                     0,
                     Vec::new(),
                     Vec::new(),
@@ -172,25 +202,27 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
                 );
             }
             Err(result) => {
-                return terminalize_failure(result, 0, Vec::new(), Vec::new(), 0, false);
+                let custody = held_terminal_custody(&initial_lease);
+                return terminalize_failure(result, custody, 0, Vec::new(), Vec::new(), 0, false);
             }
         };
-        return CallToolResult::structured(json!({
-            "ok": true,
-            "operation": OPERATION,
-            "dry_run": dry_run,
-            "status": "terminal_reconciliation_already_complete",
-            "replayed": true,
-            "terminal_plan_sha256": terminal_plan_sha256,
-            "terminal_receipt_sha256": receipt_evidence.payload_sha256,
-            "lease_decision": "retired",
-            "lease_retained": false,
-            "provider_calls": 0,
-            "provider_read_lifecycle": [],
-            "response_evidence": [],
-            "provider_mutations": 0,
-            "local_namespace_mutations": 0,
-        }));
+        return terminal_result(
+            json!({
+                "ok": true,
+                "operation": OPERATION,
+                "dry_run": dry_run,
+                "status": "terminal_reconciliation_already_complete",
+                "replayed": true,
+                "terminal_plan_sha256": terminal_plan_sha256,
+                "terminal_receipt_sha256": receipt_evidence.payload_sha256,
+                "provider_calls": 0,
+                "provider_read_lifecycle": [],
+                "response_evidence": [],
+                "provider_mutations": 0,
+                "local_namespace_mutations": 0,
+            }),
+            TerminalCustodyState::RetiredVerified,
+        );
     }
     let initial_receipt_preexisted = match initial_lease.terminal_receipt_state(&receipt) {
         Ok(Some(_)) => true,
@@ -199,6 +231,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
             return terminal_error(
                 "d1.migration_terminal_receipt_absent",
                 "terminal retirement began without its exact durable terminal receipt",
+                held_terminal_custody(&initial_lease),
                 0,
                 Vec::new(),
                 Vec::new(),
@@ -207,7 +240,8 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
             );
         }
         Err(result) => {
-            return terminalize_failure(result, 0, Vec::new(), Vec::new(), 0, false);
+            let custody = held_terminal_custody(&initial_lease);
+            return terminalize_failure(result, custody, 0, Vec::new(), Vec::new(), 0, false);
         }
     };
     let recovering_exact_retiring_receipt =
@@ -230,7 +264,18 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
     .await
     {
         Ok(proof) => proof,
-        Err(result) => return terminalize_failure(result, 0, Vec::new(), Vec::new(), 0, false),
+        Err(result) => {
+            let custody = reconciliation_failure_custody(
+                &result,
+                account_id,
+                database_id,
+                family,
+                approved_plan_sha256,
+                lease_nonce,
+                lease_payload_sha256,
+            );
+            return terminalize_failure(result, custody, 0, Vec::new(), Vec::new(), 0, false);
+        }
     };
     let mut response_evidence = proof.response_evidence();
     let mut lifecycle = proof.provider_read_lifecycle();
@@ -255,6 +300,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
         return terminal_error(
             "d1.migration_terminal_approved_evidence_mismatch",
             "fresh retained-manifest proof does not match every independently approved expectation, query, snapshot, outcome, and prefix",
+            held_terminal_custody(&proof.lease),
             2,
             response_evidence,
             lifecycle,
@@ -264,29 +310,43 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
     }
 
     if dry_run {
-        return CallToolResult::structured(json!({
-            "ok": true,
-            "operation": OPERATION,
-            "dry_run": true,
-            "status": "terminal_reconciliation_plan_ready",
-            "terminal_plan_sha256": terminal_plan_sha256,
-            "approved_evidence": {
-                "reconciliation_plan_sha256": expected_reconciliation_plan_sha256,
-                "expectation_proof_sha256": expected_expectation_proof_sha256,
-                "query_sha256": expected_query_sha256,
-                "canonical_snapshot_sha256": expected_canonical_snapshot_sha256,
-                "terminal_request_sha256": terminal_request_sha256,
-                "terminal_attempt_sha256": terminal_attempt_sha256,
-            },
-            "lease_decision": "retain",
-            "lease_retained": true,
-            "provider_calls": 2,
-            "provider_read_lifecycle": lifecycle,
-            "response_evidence": response_evidence,
-            "provider_mutations": 0,
-            "local_namespace_mutations": 0,
-            "next_action": "independently approve this exact terminal_plan_sha256 before a live call",
-        }));
+        let custody = held_terminal_custody(&proof.lease);
+        if custody == TerminalCustodyState::Unverified {
+            return terminal_error(
+                "d1.migration_terminal_custody_unverified",
+                "retained custody could not be revalidated before returning the terminal plan",
+                custody,
+                2,
+                response_evidence,
+                lifecycle,
+                0,
+                false,
+            );
+        }
+        return terminal_result(
+            json!({
+                "ok": true,
+                "operation": OPERATION,
+                "dry_run": true,
+                "status": "terminal_reconciliation_plan_ready",
+                "terminal_plan_sha256": terminal_plan_sha256,
+                "approved_evidence": {
+                    "reconciliation_plan_sha256": expected_reconciliation_plan_sha256,
+                    "expectation_proof_sha256": expected_expectation_proof_sha256,
+                    "query_sha256": expected_query_sha256,
+                    "canonical_snapshot_sha256": expected_canonical_snapshot_sha256,
+                    "terminal_request_sha256": terminal_request_sha256,
+                    "terminal_attempt_sha256": terminal_attempt_sha256,
+                },
+                "provider_calls": 2,
+                "provider_read_lifecycle": lifecycle,
+                "response_evidence": response_evidence,
+                "provider_mutations": 0,
+                "local_namespace_mutations": 0,
+                "next_action": "independently approve this exact terminal_plan_sha256 before a live call",
+            }),
+            custody,
+        );
     }
 
     let before_receipt = match refresh_d1_migration_reconciliation(
@@ -300,7 +360,8 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
     {
         Ok(refresh) => refresh,
         Err(result) => {
-            return terminalize_failure(result, 2, response_evidence, lifecycle, 0, false);
+            let custody = held_terminal_custody(&proof.lease);
+            return terminalize_failure(result, custody, 2, response_evidence, lifecycle, 0, false);
         }
     };
     response_evidence.push(before_receipt.response_evidence);
@@ -309,7 +370,8 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
     let (receipt_evidence, receipt_created) = match proof.lease.persist_terminal_receipt(&receipt) {
         Ok(receipt) => receipt,
         Err(result) => {
-            return terminalize_failure(result, 3, response_evidence, lifecycle, 0, false);
+            let custody = held_terminal_custody(&proof.lease);
+            return terminalize_failure(result, custody, 3, response_evidence, lifecycle, 0, false);
         }
     };
     let local_mutations = usize::from(receipt_created);
@@ -325,8 +387,10 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
     {
         Ok(refresh) => refresh,
         Err(result) => {
+            let custody = held_terminal_custody(&proof.lease);
             return terminalize_failure(
                 result,
+                custody,
                 3,
                 response_evidence,
                 lifecycle,
@@ -341,8 +405,10 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
     let retired_now = match proof.lease.retire_after_terminal_receipt(&receipt_evidence) {
         Ok(retired) => retired,
         Err(result) => {
+            let custody = held_terminal_custody(&proof.lease);
             return terminalize_failure(
                 result,
+                custody,
                 4,
                 response_evidence,
                 lifecycle,
@@ -351,30 +417,31 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
             );
         }
     };
-    CallToolResult::structured(json!({
-        "ok": true,
-        "operation": OPERATION,
-        "dry_run": false,
-        "status": "terminal_reconciliation_complete",
-        "replayed": !receipt_created && !retired_now,
-        "terminal_plan_sha256": terminal_plan_sha256,
-        "terminal_receipt_sha256": receipt_evidence.payload_sha256,
-        "approved_evidence": {
-            "reconciliation_plan_sha256": expected_reconciliation_plan_sha256,
-            "expectation_proof_sha256": expected_expectation_proof_sha256,
-            "query_sha256": expected_query_sha256,
-            "canonical_snapshot_sha256": expected_canonical_snapshot_sha256,
-            "terminal_request_sha256": terminal_request_sha256,
-            "terminal_attempt_sha256": terminal_attempt_sha256,
-        },
-        "lease_decision": "retired",
-        "lease_retained": false,
-        "provider_calls": 4,
-        "provider_read_lifecycle": lifecycle,
-        "response_evidence": response_evidence,
-        "provider_mutations": 0,
-        "local_namespace_mutations": local_mutations + usize::from(retired_now),
-    }))
+    terminal_result(
+        json!({
+            "ok": true,
+            "operation": OPERATION,
+            "dry_run": false,
+            "status": "terminal_reconciliation_complete",
+            "replayed": !receipt_created && !retired_now,
+            "terminal_plan_sha256": terminal_plan_sha256,
+            "terminal_receipt_sha256": receipt_evidence.payload_sha256,
+            "approved_evidence": {
+                "reconciliation_plan_sha256": expected_reconciliation_plan_sha256,
+                "expectation_proof_sha256": expected_expectation_proof_sha256,
+                "query_sha256": expected_query_sha256,
+                "canonical_snapshot_sha256": expected_canonical_snapshot_sha256,
+                "terminal_request_sha256": terminal_request_sha256,
+                "terminal_attempt_sha256": terminal_attempt_sha256,
+            },
+            "provider_calls": 4,
+            "provider_read_lifecycle": lifecycle,
+            "response_evidence": response_evidence,
+            "provider_mutations": 0,
+            "local_namespace_mutations": local_mutations + usize::from(retired_now),
+        }),
+        TerminalCustodyState::RetiredVerified,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -418,6 +485,7 @@ fn validate_terminal_arguments(
         return Err(terminal_error(
             "d1.migration_terminal_request_invalid",
             "terminal reconciliation requires canonical distinct request/attempt digests, exact approved evidence, a valid outcome/prefix relationship, and a live approval pin",
+            TerminalCustodyState::NotInspected,
             0,
             Vec::new(),
             Vec::new(),
@@ -473,8 +541,86 @@ fn valid_lower_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn held_terminal_custody(lease: &D1RetainedMigrationLease) -> TerminalCustodyState {
+    if lease.revalidate().is_err() {
+        return TerminalCustodyState::Unverified;
+    }
+    match lease.identity.namespace.as_str() {
+        "active" => TerminalCustodyState::ActiveVerified,
+        "retiring" => TerminalCustodyState::RetiringVerified,
+        "retired" => TerminalCustodyState::RetiredVerified,
+        _ => TerminalCustodyState::Unverified,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconciliation_failure_custody(
+    result: &CallToolResult,
+    account_id: &str,
+    database_id: &str,
+    family: &str,
+    approved_plan_sha256: &str,
+    lease_nonce: &str,
+    lease_payload_sha256: &str,
+) -> TerminalCustodyState {
+    match result
+        .structured_content
+        .as_ref()
+        .and_then(|content| content.get("custody_status"))
+        .and_then(Value::as_str)
+    {
+        Some("not_inspected") => TerminalCustodyState::NotInspected,
+        Some("inspection_failed") => TerminalCustodyState::InspectionFailed,
+        Some("retained_evidence_unverified") => TerminalCustodyState::Unverified,
+        Some("retained_evidence_verified") => inspect_terminal_d1_migration_lease(
+            account_id,
+            database_id,
+            family,
+            approved_plan_sha256,
+            lease_nonce,
+            lease_payload_sha256,
+        )
+        .map_or(TerminalCustodyState::Unverified, |lease| {
+            held_terminal_custody(&lease)
+        }),
+        _ => TerminalCustodyState::Unverified,
+    }
+}
+
+fn apply_terminal_custody(
+    content: &mut serde_json::Map<String, Value>,
+    custody: TerminalCustodyState,
+) {
+    content.remove("lease_decision");
+    let (custody_status, lease_retained, lease_decision) = match custody {
+        TerminalCustodyState::NotInspected => ("not_inspected", Value::Null, None),
+        TerminalCustodyState::InspectionFailed => ("inspection_failed", Value::Null, None),
+        TerminalCustodyState::ActiveVerified => {
+            ("retained_evidence_verified", json!(true), Some("retain"))
+        }
+        TerminalCustodyState::RetiringVerified => ("retiring_evidence_verified", Value::Null, None),
+        TerminalCustodyState::RetiredVerified => {
+            ("retired_evidence_verified", json!(false), Some("retired"))
+        }
+        TerminalCustodyState::Unverified => ("retained_evidence_unverified", Value::Null, None),
+    };
+    content.insert("lease_retained".to_string(), lease_retained);
+    content.insert("custody_status".to_string(), json!(custody_status));
+    if let Some(decision) = lease_decision {
+        content.insert("lease_decision".to_string(), json!(decision));
+    }
+}
+
+fn terminal_result(mut content: Value, custody: TerminalCustodyState) -> CallToolResult {
+    if let Value::Object(map) = &mut content {
+        apply_terminal_custody(map, custody);
+    }
+    CallToolResult::structured(content)
+}
+
 fn terminalize_failure(
     result: CallToolResult,
+    custody: TerminalCustodyState,
     completed_provider_calls: usize,
     prior_response_evidence: Vec<Value>,
     prior_lifecycle: Vec<Value>,
@@ -507,8 +653,7 @@ fn terminalize_failure(
             "retry_decision".to_string(),
             json!("do_not_retry_same_attempt"),
         );
-        map.insert("lease_decision".to_string(), json!("retain"));
-        map.insert("lease_retained".to_string(), json!(true));
+        apply_terminal_custody(map, custody);
         map.insert("receipt_persisted".to_string(), json!(receipt_persisted));
         map.insert(
             "provider_calls".to_string(),
@@ -529,19 +674,18 @@ fn terminalize_failure(
 fn terminal_error(
     code: &'static str,
     message: &'static str,
+    custody: TerminalCustodyState,
     provider_calls: usize,
     response_evidence: Vec<Value>,
     lifecycle: Vec<Value>,
     local_namespace_mutations: usize,
     receipt_persisted: bool,
 ) -> CallToolResult {
-    CallToolResult::structured_error(json!({
+    let mut content = json!({
         "ok": false,
         "operation": OPERATION,
         "status": "reconciliation_required",
         "retry_decision": "do_not_retry_same_attempt",
-        "lease_decision": "retain",
-        "lease_retained": true,
         "receipt_persisted": receipt_persisted,
         "provider_calls": provider_calls,
         "provider_read_lifecycle": lifecycle,
@@ -553,5 +697,168 @@ fn terminal_error(
             "message": message,
             "hint": "Retain exact custody evidence. Do not retry the provider write or retire the lease outside this guarded terminal boundary."
         }
-    }))
+    });
+    if let Value::Object(map) = &mut content {
+        apply_terminal_custody(map, custody);
+    }
+    CallToolResult::structured_error(content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn custody_cases() -> [(
+        TerminalCustodyState,
+        &'static str,
+        Value,
+        Option<&'static str>,
+    ); 6] {
+        [
+            (
+                TerminalCustodyState::NotInspected,
+                "not_inspected",
+                Value::Null,
+                None,
+            ),
+            (
+                TerminalCustodyState::InspectionFailed,
+                "inspection_failed",
+                Value::Null,
+                None,
+            ),
+            (
+                TerminalCustodyState::ActiveVerified,
+                "retained_evidence_verified",
+                json!(true),
+                Some("retain"),
+            ),
+            (
+                TerminalCustodyState::RetiringVerified,
+                "retiring_evidence_verified",
+                Value::Null,
+                None,
+            ),
+            (
+                TerminalCustodyState::RetiredVerified,
+                "retired_evidence_verified",
+                json!(false),
+                Some("retired"),
+            ),
+            (
+                TerminalCustodyState::Unverified,
+                "retained_evidence_unverified",
+                Value::Null,
+                None,
+            ),
+        ]
+    }
+
+    fn add_expected_custody(
+        value: &mut Value,
+        custody_status: &str,
+        lease_retained: Value,
+        lease_decision: Option<&str>,
+    ) {
+        let map = value.as_object_mut().expect("expected object");
+        map.insert("custody_status".to_string(), json!(custody_status));
+        map.insert("lease_retained".to_string(), lease_retained);
+        if let Some(decision) = lease_decision {
+            map.insert("lease_decision".to_string(), json!(decision));
+        }
+    }
+
+    #[test]
+    fn direct_terminal_errors_report_only_proven_custody_authority() {
+        for (custody, custody_status, lease_retained, lease_decision) in custody_cases() {
+            let actual = terminal_error(
+                "d1.test_terminal_failure",
+                "synthetic terminal failure",
+                custody,
+                0,
+                Vec::new(),
+                Vec::new(),
+                0,
+                false,
+            )
+            .structured_content
+            .expect("structured terminal error");
+            let mut expected = json!({
+                "ok": false,
+                "operation": OPERATION,
+                "status": "reconciliation_required",
+                "retry_decision": "do_not_retry_same_attempt",
+                "receipt_persisted": false,
+                "provider_calls": 0,
+                "provider_read_lifecycle": [],
+                "response_evidence": [],
+                "provider_mutations": 0,
+                "local_namespace_mutations": 0,
+                "error": {
+                    "code": "d1.test_terminal_failure",
+                    "message": "synthetic terminal failure",
+                    "hint": "Retain exact custody evidence. Do not retry the provider write or retire the lease outside this guarded terminal boundary."
+                }
+            });
+            add_expected_custody(
+                &mut expected,
+                custody_status,
+                lease_retained,
+                lease_decision,
+            );
+            assert_eq!(actual, expected, "{custody:?}");
+        }
+    }
+
+    #[test]
+    fn direct_terminalized_failures_do_not_overwrite_custody_authority() {
+        for (custody, custody_status, lease_retained, lease_decision) in custody_cases() {
+            let upstream = CallToolResult::structured_error(json!({
+                "lease_decision": "stale",
+                "lease_retained": true,
+                "custody_status": "stale",
+                "provider_calls": 1,
+                "provider_read_lifecycle": [{"dispatch_stage": "attempted"}],
+                "response_evidence": [{"response_body_sha256": "a"}],
+                "error": {"code": "d1.test_upstream", "message": "upstream failure"}
+            }));
+            let actual = terminalize_failure(
+                upstream,
+                custody,
+                2,
+                vec![json!({"response_body_sha256": "b"})],
+                vec![json!({"dispatch_stage": "received"})],
+                0,
+                false,
+            )
+            .structured_content
+            .expect("structured terminalized error");
+            let mut expected = json!({
+                "ok": false,
+                "operation": OPERATION,
+                "status": "reconciliation_required",
+                "retry_decision": "do_not_retry_same_attempt",
+                "receipt_persisted": false,
+                "provider_calls": 3,
+                "provider_read_lifecycle": [
+                    {"dispatch_stage": "received"},
+                    {"dispatch_stage": "attempted"}
+                ],
+                "response_evidence": [
+                    {"response_body_sha256": "b"},
+                    {"response_body_sha256": "a"}
+                ],
+                "provider_mutations": 0,
+                "local_namespace_mutations": 0,
+                "error": {"code": "d1.test_upstream", "message": "upstream failure"}
+            });
+            add_expected_custody(
+                &mut expected,
+                custody_status,
+                lease_retained,
+                lease_decision,
+            );
+            assert_eq!(actual, expected, "{custody:?}");
+        }
+    }
 }

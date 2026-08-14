@@ -271,7 +271,21 @@ order while holding the permanent target guard:
    each boundary.
 
 The terminal tool never sends D1 SQL writes and never retries an unavailable or
-ambiguous provider read. Failure before the receipt keeps the retained lease.
+ambiguous provider read. Interpret its custody product literally. Only a fresh
+revalidation of physical `active.lease.json` may return
+`lease_retained=true`, `custody_status=retained_evidence_verified`, and
+`lease_decision=retain`. Pre-inspection rejection returns null plus
+`not_inspected`; inspection failure returns null plus `inspection_failed`;
+retiring evidence returns null plus `retiring_evidence_verified`; and drift or
+otherwise unverified custody returns null plus
+`retained_evidence_unverified`. Those null states omit `lease_decision`; they
+do not fabricate retention or retirement authority. Verified physical
+retirement returns `lease_retained=false`,
+`custody_status=retired_evidence_verified`, and `lease_decision=retired`, even
+when the missing or invalid receipt then fails the request closed.
+
+Failure before the receipt keeps the retained lease only when the response also
+proves that active custody state.
 Failure after the receipt leaves that durable receipt plus retained or retiring
 evidence for exact replay. A terminal retirement with no exact receipt is an
 order violation and cannot be repaired by creating a receipt afterward. Exact
