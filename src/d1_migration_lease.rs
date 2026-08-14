@@ -1614,7 +1614,7 @@ mod linux {
             &guard_identity,
         )
         .map_err(|message| d1_lease_root_error("d1.migration_lease_custody_changed", message))?;
-        maybe_pause_after_guard_for_test();
+        maybe_pause_after_guard_for_test(&root_path);
         let nonce = d1_migration_lease_nonce(&target_hash, plan_sha256);
         let payload = json!({"version": 2, "target_key_sha256": &target_hash, "nonce": &nonce, "approved_plan_sha256": plan_sha256.to_ascii_lowercase(), "migration_family": family, "created_at_unix_ms": now_unix_ms()});
         let encoded =
@@ -1661,32 +1661,51 @@ mod linux {
     }
     #[cfg(test)]
     struct GuardPauseHook {
+        root_path: PathBuf,
         entered: mpsc::Sender<()>,
         resume: mpsc::Receiver<()>,
     }
     #[cfg(test)]
     static GUARD_PAUSE_HOOK: OnceLock<Mutex<Option<GuardPauseHook>>> = OnceLock::new();
     #[cfg(test)]
-    pub(super) fn install_guard_pause_hook(entered: mpsc::Sender<()>, resume: mpsc::Receiver<()>) {
-        *GUARD_PAUSE_HOOK
+    pub(super) fn install_guard_pause_hook(
+        root_path: PathBuf,
+        entered: mpsc::Sender<()>,
+        resume: mpsc::Receiver<()>,
+    ) {
+        let mut hook = GUARD_PAUSE_HOOK
             .get_or_init(|| Mutex::new(None))
             .lock()
-            .expect("guard pause hook lock") = Some(GuardPauseHook { entered, resume });
+            .expect("guard pause hook lock");
+        *hook = Some(GuardPauseHook {
+            root_path,
+            entered,
+            resume,
+        });
     }
     #[cfg(test)]
-    fn maybe_pause_after_guard_for_test() {
-        if let Some(hook) = GUARD_PAUSE_HOOK
-            .get_or_init(|| Mutex::new(None))
-            .lock()
-            .expect("guard pause hook lock")
-            .take()
-        {
+    fn maybe_pause_after_guard_for_test(root_path: &Path) {
+        let hook = {
+            let mut hook = GUARD_PAUSE_HOOK
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .expect("guard pause hook lock");
+            if hook
+                .as_ref()
+                .is_some_and(|candidate| candidate.root_path == root_path)
+            {
+                hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some(hook) = hook {
             hook.entered.send(()).expect("guard pause test receiver");
             hook.resume.recv().expect("guard pause test release");
         }
     }
     #[cfg(not(test))]
-    fn maybe_pause_after_guard_for_test() {}
+    fn maybe_pause_after_guard_for_test(_root_path: &Path) {}
 }
 
 #[cfg(target_os = "linux")]
@@ -1746,7 +1765,18 @@ mod tests {
         let root = private_test_root("race");
         let (entered_tx, entered_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
-        linux::install_guard_pause_hook(entered_tx, resume_rx);
+        linux::install_guard_pause_hook(root.clone(), entered_tx, resume_rx);
+        let unrelated_root = private_test_root("race-unrelated");
+        let mut unrelated = acquire_d1_migration_lease_at(
+            unrelated_root.clone(),
+            "acct-1",
+            "db-1",
+            "unrelated",
+            &"c".repeat(64),
+        )
+        .expect("unrelated root must not consume the scoped pause hook");
+        unrelated.release().expect("retire unrelated lease");
+        fs::remove_dir_all(unrelated_root).expect("unrelated test cleanup");
         let first_root = root.clone();
         let first = std::thread::spawn(move || {
             acquire_d1_migration_lease_at(first_root, "acct-1", "db-1", "first", &"a".repeat(64))
