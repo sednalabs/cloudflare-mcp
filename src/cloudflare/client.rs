@@ -287,6 +287,14 @@ impl D1MigrationReconciliationReadLifecycle {
         }
     }
 
+    fn body_read_failed(http_status: u16, bytes_read: usize) -> Self {
+        if bytes_read == 0 {
+            Self::response_received(http_status)
+        } else {
+            Self::body_partially_read(http_status)
+        }
+    }
+
     const fn body_completely_read(http_status: u16) -> Self {
         Self {
             dispatch_stage: "attempted",
@@ -780,8 +788,10 @@ impl CloudflareClient {
                 .payload(),
                 response_body_sha256: None,
                 response_body_size_bytes: Some(bytes.len()),
-                lifecycle:
-                    D1MigrationReconciliationReadLifecycle::body_partially_read(status_code),
+                lifecycle: D1MigrationReconciliationReadLifecycle::body_read_failed(
+                    status_code,
+                    bytes.len(),
+                ),
             })?;
             let observed_size = bytes.len().saturating_add(chunk.len());
             if observed_size > MAX_RESPONSE_BYTES {
@@ -4009,6 +4019,7 @@ mod tests {
     use axum::routing::{get, post, put};
     use axum::{Json, Router};
     use serde_json::{Value, json};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     use super::{
@@ -4161,6 +4172,90 @@ mod tests {
             error.lifecycle,
             D1MigrationReconciliationReadLifecycle::attempted_without_response()
         );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_stream_failures_distinguish_zero_and_partial_body_reads() {
+        async fn spawn_truncated_response(
+            prefix: Option<Bytes>,
+            calls: Arc<AtomicUsize>,
+        ) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind truncated response fixture");
+            let addr = listener.local_addr().expect("truncated fixture address");
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept request");
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 1024];
+                    let count = stream.read(&mut chunk).await.expect("read request");
+                    assert!(count > 0, "request closed before complete headers and body");
+                    request.extend_from_slice(&chunk[..count]);
+                    let Some(header_end) =
+                        request.windows(4).position(|window| window == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let header_end = header_end + 4;
+                    let headers = std::str::from_utf8(&request[..header_end])
+                        .expect("request headers are UTF-8");
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().expect("content length"))
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + content_length {
+                        break;
+                    }
+                }
+                calls.fetch_add(1, Ordering::SeqCst);
+                stream
+                    .write_all(b"HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 64\r\n\r\n")
+                    .await
+                    .expect("write truncated response headers");
+                if let Some(prefix) = prefix {
+                    stream
+                        .write_all(&prefix)
+                        .await
+                        .expect("write partial response body");
+                }
+            });
+            format!("http://{addr}")
+        }
+
+        for (prefix, expected_size, expected_lifecycle) in [
+            (
+                None,
+                0,
+                D1MigrationReconciliationReadLifecycle::response_received(503),
+            ),
+            (
+                Some(Bytes::from_static(b"{")),
+                1,
+                D1MigrationReconciliationReadLifecycle::body_partially_read(503),
+            ),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let base = spawn_truncated_response(prefix, calls.clone()).await;
+            let client = CloudflareClient::new(test_config(base)).expect("client");
+            let error = client
+                .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+                .await
+                .expect_err("incomplete response stream must fail closed");
+
+            assert_eq!(error.error.code, "cloudflare.response_read_failed");
+            assert_eq!(error.error.status, Some(503));
+            assert!(!error.error.retryable);
+            assert_eq!(error.response_body_sha256, None);
+            assert_eq!(error.response_body_size_bytes, Some(expected_size));
+            assert_eq!(error.lifecycle, expected_lifecycle);
+            assert_eq!(error.lifecycle.provider_calls(), 1);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[tokio::test]

@@ -94,8 +94,10 @@ reconciliation. It performs two bounded read-only batches and never retires
 custody evidence or authorizes an apply retry. The boundary does not follow
 HTTP redirects and returns one chronological `provider_read_lifecycle` entry
 per invocation, distinguishing pre-dispatch, attempted-without-response,
-response received, partial/complete body read, and captured HTTP status. Local
-token/config failure therefore reports zero provider calls. Validation or
+response received, partial/complete body read, and captured HTTP status. A
+stream failure before any body byte is `not_read`; it is `partially_read` only
+after at least one byte was accumulated. Local token/config failure therefore
+reports zero provider calls. Validation or
 custody-inspection failure before adapter invocation instead reports
 `provider_calls=0` with an empty lifecycle array. A null `lease_retained` with
 `custody_status=not_inspected` or `inspection_failed` means no retained lease

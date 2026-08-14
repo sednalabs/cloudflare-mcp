@@ -882,6 +882,7 @@ enum ReconciliationFault {
     Redirect,
     MalformedUtf8HttpStatus(u16),
     MalformedJsonStatus(u16),
+    ZeroByteTruncatedHttpStatus(u16),
     TruncatedHttpStatus(u16),
     OversizedResponse,
     HttpStatus(u16),
@@ -1041,6 +1042,10 @@ fn spawn_fake_reconciliation_api_with_fault(
                     .expect("write malformed JSON reconciliation body");
                 continue;
             }
+            if let ReconciliationFault::ZeroByteTruncatedHttpStatus(status) = &fault {
+                write!(stream, "HTTP/1.1 {status} Synthetic\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 64\r\n\r\n").expect("write zero-byte truncated reconciliation headers");
+                continue;
+            }
             if let ReconciliationFault::TruncatedHttpStatus(status) = &fault {
                 let response = b"{";
                 write!(stream, "HTTP/1.1 {status} Synthetic\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 64\r\n\r\n").expect("write truncated reconciliation headers");
@@ -1186,6 +1191,7 @@ fn spawn_fake_reconciliation_api_with_fault(
                 | ReconciliationFault::Redirect
                 | ReconciliationFault::MalformedUtf8HttpStatus(_)
                 | ReconciliationFault::MalformedJsonStatus(_)
+                | ReconciliationFault::ZeroByteTruncatedHttpStatus(_)
                 | ReconciliationFault::TruncatedHttpStatus(_)
                 | ReconciliationFault::OversizedResponse
                 | ReconciliationFault::HttpStatus(_)
@@ -5050,35 +5056,66 @@ fn d1_reconcile_migration_manifest_stdio_preserves_both_batches_when_second_call
 fn d1_reconcile_migration_manifest_stdio_treats_auth_rate_limit_and_5xx_evidence_as_unavailable_without_retry()
  {
     let (manifest, expectations) = one_table_reconciliation_case();
-    for (index, (fault, status, body_stage)) in [
-        (ReconciliationFault::HttpStatus(401), 401, "completely_read"),
-        (ReconciliationFault::HttpStatus(403), 403, "completely_read"),
-        (ReconciliationFault::HttpStatus(429), 429, "completely_read"),
-        (ReconciliationFault::HttpStatus(503), 503, "completely_read"),
+    for (index, (fault, status, body_stage, incomplete_size)) in [
+        (
+            ReconciliationFault::HttpStatus(401),
+            401,
+            "completely_read",
+            None,
+        ),
+        (
+            ReconciliationFault::HttpStatus(403),
+            403,
+            "completely_read",
+            None,
+        ),
+        (
+            ReconciliationFault::HttpStatus(429),
+            429,
+            "completely_read",
+            None,
+        ),
+        (
+            ReconciliationFault::HttpStatus(503),
+            503,
+            "completely_read",
+            None,
+        ),
         (
             ReconciliationFault::MalformedUtf8HttpStatus(429),
             429,
             "completely_read",
+            None,
         ),
         (
             ReconciliationFault::MalformedUtf8HttpStatus(503),
             503,
             "completely_read",
+            None,
+        ),
+        (
+            ReconciliationFault::ZeroByteTruncatedHttpStatus(503),
+            503,
+            "not_read",
+            Some(0),
         ),
         (
             ReconciliationFault::TruncatedHttpStatus(503),
             503,
             "partially_read",
+            Some(1),
         ),
         (
             ReconciliationFault::OversizedHttpStatus(429),
             429,
             "not_read",
+            None,
         ),
         (
             ReconciliationFault::OversizedHttpStatus(503),
             503,
             "not_read",
+            None,
         ),
     ]
     .into_iter()
@@ -5148,6 +5185,23 @@ fn d1_reconcile_migration_manifest_stdio_treats_auth_rate_limit_and_5xx_evidence
             "{content}"
         );
         assert_eq!(requests.lock().expect("request log").len(), 1);
+        if let Some(expected_size) = incomplete_size {
+            assert_eq!(
+                content["response_evidence"],
+                json!([{
+                    "response_body_sha256": null,
+                    "response_body_size_bytes": expected_size,
+                    "complete_body_digest": false,
+                    "lifecycle": {
+                        "dispatch_stage": "attempted",
+                        "response_stage": "received",
+                        "body_stage": body_stage,
+                        "http_status": status,
+                    },
+                }]),
+                "{content}"
+            );
+        }
         assert_private_regular_active_lease(&lease_root);
         mcp.terminate();
         let _ = fs::remove_dir_all(lease_root);

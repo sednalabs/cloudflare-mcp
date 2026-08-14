@@ -175,7 +175,9 @@ The reconciliation HTTP client does not follow redirects. Interpret
 `provider_read_lifecycle` in order: `pre_dispatch` means no provider call;
 `attempted` with `not_received` means transport outcome without a response;
 `received` plus `not_read`, `partially_read`, or `completely_read` records the
-body boundary and exact captured HTTP status. Preserve that status for invalid
+body boundary and exact captured HTTP status. A response-stream failure is
+`not_read` when zero body bytes were accumulated and `partially_read` only
+after at least one byte was accumulated. Preserve the status for invalid
 UTF-8, malformed JSON, truncated streams, and oversized bodies. Treat 401,
 403, 429, and every 5xx as unavailable and never retry the same attempt.
 
