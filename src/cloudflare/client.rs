@@ -4180,7 +4180,7 @@ mod tests {
             prefix: Option<Bytes>,
             calls: Arc<AtomicUsize>,
         ) -> String {
-            let listener = TcpListener::bind("127.0.0.1:0")
+            let listener = TcpListener::bind("127.0.0.1:0") // DevSkim: ignore DS162092 -- loopback-only reconciliation stream fixture
                 .await
                 .expect("bind truncated response fixture");
             let addr = listener.local_addr().expect("truncated fixture address");
@@ -4224,7 +4224,7 @@ mod tests {
                         .expect("write partial response body");
                 }
             });
-            format!("http://{addr}")
+            format!("http://{addr}") // DevSkim: ignore DS137138 -- loopback-only reconciliation stream fixture
         }
 
         for (prefix, expected_size, expected_lifecycle) in [
