@@ -114,9 +114,12 @@ custody itself fails revalidation. Custody is revalidated after every attempted
 provider call, including an unavailable/error response; a simultaneous custody
 failure preserves the provider classification and response evidence but reports
 `lease_retained=null`. When a later call fails, `response_evidence` remains in
-provider-call order rather than replacing evidence from an earlier call.
-Top-level `provider_read_lifecycle` mirrors the complete lifecycle entries in
-that chronological evidence.
+provider-call order rather than replacing evidence from an earlier call, but it
+contains only captured response bodies. Top-level `provider_read_lifecycle` is
+the separate complete invocation chronology, so a second no-response transport
+or pre-dispatch failure is retained even though it cannot add a response
+summary. After a completed first read that aggregate operation reports two
+provider calls; standalone pre-dispatch failure remains zero provider calls.
 
 For D1 usage-spike investigations, start with `account_billing_usage` to read
 Cloudflare billing usage records, then use `graphql_analytics_query` for

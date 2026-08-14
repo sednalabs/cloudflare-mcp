@@ -1965,15 +1965,23 @@ fn contextualize_error(
             );
         }
         content.insert("query_sha256".to_string(), json!(query_sha256));
+        let provider_lifecycle =
+            merge_provider_lifecycle_with_response_evidence(content, response_evidence);
         prepend_response_evidence(content, response_evidence);
-        synchronize_provider_lifecycle_with_response_evidence(content);
+        content.insert(
+            "provider_read_lifecycle".to_string(),
+            Value::Array(provider_lifecycle.clone()),
+        );
         content.insert("provider_mutations".to_string(), json!(0));
         content.insert("local_namespace_mutations".to_string(), json!(0));
-        let provider_calls = content
+        let mut provider_calls = content
             .get("provider_calls")
             .and_then(Value::as_u64)
             .unwrap_or(0)
             .saturating_add(prior_provider_calls as u64);
+        if !response_evidence.is_empty() {
+            provider_calls = provider_calls.max(provider_lifecycle.len() as u64);
+        }
         content.insert("provider_calls".to_string(), json!(provider_calls));
     }
     CallToolResult::structured_error(content)
@@ -2003,8 +2011,13 @@ fn contextualize_unverified_custody_error(
             json!("retained_evidence_unverified"),
         );
         content.insert("query_sha256".to_string(), json!(query_sha256));
+        let provider_lifecycle =
+            merge_provider_lifecycle_with_response_evidence(content, response_evidence);
         prepend_response_evidence(content, response_evidence);
-        synchronize_provider_lifecycle_with_response_evidence(content);
+        content.insert(
+            "provider_read_lifecycle".to_string(),
+            Value::Array(provider_lifecycle),
+        );
         content.insert("provider_calls".to_string(), json!(provider_calls));
         content.insert("provider_mutations".to_string(), json!(0));
         content.insert("local_namespace_mutations".to_string(), json!(0));
@@ -2044,33 +2057,89 @@ fn prepend_response_evidence(content: &mut serde_json::Map<String, Value>, prior
             .or_insert_with(|| json!([]));
         return;
     }
-    let mut merged = prior.to_vec();
-    if let Some(Value::Array(current)) = content.get("response_evidence") {
-        merged.extend(current.iter().cloned());
-    }
+    let current = content
+        .get("response_evidence")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut merged = if current.starts_with(prior) {
+        current
+    } else {
+        let mut merged = prior.to_vec();
+        merged.extend(current);
+        merged
+    };
+    merged.shrink_to_fit();
     content.insert("response_evidence".to_string(), Value::Array(merged));
 }
 
-fn synchronize_provider_lifecycle_with_response_evidence(
-    content: &mut serde_json::Map<String, Value>,
-) {
-    let lifecycle = content
+fn response_evidence_lifecycle(response_evidence: &[Value]) -> Vec<Value> {
+    response_evidence
+        .iter()
+        .filter_map(|evidence| evidence.get("lifecycle").cloned())
+        .collect()
+}
+
+fn lifecycle_covers_body_evidence_without_stale_reads(
+    body_evidence: &[Value],
+    lifecycle: &[Value],
+) -> bool {
+    let mut body_evidence = body_evidence.iter().peekable();
+    for invocation in lifecycle {
+        if body_evidence
+            .peek()
+            .is_some_and(|evidence| *evidence == invocation)
+        {
+            body_evidence.next();
+        } else if invocation.get("body_stage").and_then(Value::as_str) != Some("not_read") {
+            return false;
+        }
+    }
+    body_evidence.next().is_none()
+}
+
+fn merge_provider_lifecycle_with_response_evidence(
+    content: &serde_json::Map<String, Value>,
+    prior_response_evidence: &[Value],
+) -> Vec<Value> {
+    let prior_lifecycle = response_evidence_lifecycle(prior_response_evidence);
+    let current_response_evidence = content
         .get("response_evidence")
         .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|evidence| evidence.get("lifecycle").cloned())
-        .collect::<Vec<_>>();
-    if lifecycle.is_empty() {
-        content
-            .entry("provider_read_lifecycle".to_string())
-            .or_insert_with(|| json!([]));
-        return;
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let current_evidence_lifecycle = response_evidence_lifecycle(current_response_evidence);
+    let current_lifecycle = content
+        .get("provider_read_lifecycle")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let current_attempted_calls = current_lifecycle
+        .iter()
+        .filter(|lifecycle| {
+            lifecycle.get("dispatch_stage").and_then(Value::as_str) == Some("attempted")
+        })
+        .count() as u64;
+    let current_recorded_calls = content.get("provider_calls").and_then(Value::as_u64);
+    let current_lifecycle_is_consistent = current_recorded_calls.is_some_and(|calls| {
+        (calls == current_attempted_calls || calls == current_lifecycle.len() as u64)
+            && lifecycle_covers_body_evidence_without_stale_reads(
+                &current_evidence_lifecycle,
+                &current_lifecycle,
+            )
+    });
+    let current_lifecycle = if current_lifecycle_is_consistent {
+        current_lifecycle
+    } else {
+        current_evidence_lifecycle
+    };
+    if current_response_evidence.starts_with(prior_response_evidence) {
+        current_lifecycle
+    } else {
+        let mut merged = prior_lifecycle;
+        merged.extend(current_lifecycle);
+        merged
     }
-    content.insert(
-        "provider_read_lifecycle".to_string(),
-        Value::Array(lifecycle),
-    );
 }
 
 fn prelease_error(
@@ -2141,6 +2210,7 @@ mod tests {
     use super::*;
 
     const PROOF: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // DevSkim: ignore DS173237 -- synthetic SHA-256 fixture, not a credential
+    const SECOND_PROOF: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"; // DevSkim: ignore DS173237 -- synthetic SHA-256 fixture, not a credential
 
     fn manifest(sql: &str) -> Vec<D1MigrationManifestEntry> {
         vec![D1MigrationManifestEntry {
@@ -2460,7 +2530,7 @@ mod tests {
                 },
             },
             {
-                "response_body_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "response_body_sha256": SECOND_PROOF,
                 "response_body_size_bytes": 102,
                 "lifecycle": {
                     "dispatch_stage": "attempted",
@@ -2619,6 +2689,201 @@ mod tests {
     }
 
     #[test]
+    fn second_call_without_response_preserves_chronological_invocation_evidence() {
+        let first = json!({
+            "response_body_sha256": PROOF,
+            "response_body_size_bytes": 101,
+            "lifecycle": {
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 200,
+            },
+        });
+        let first_lifecycle = first["lifecycle"].clone();
+
+        for (pre_dispatch, custody_verified) in
+            [(false, true), (false, false), (true, true), (true, false)]
+        {
+            let second_lifecycle = if pre_dispatch {
+                D1MigrationReconciliationReadLifecycle {
+                    dispatch_stage: "pre_dispatch",
+                    response_stage: "not_received",
+                    body_stage: "not_read",
+                    http_status: None,
+                }
+            } else {
+                D1MigrationReconciliationReadLifecycle {
+                    dispatch_stage: "attempted",
+                    response_stage: "not_received",
+                    body_stage: "not_read",
+                    http_status: None,
+                }
+            };
+            let provider_code = if pre_dispatch {
+                "cloudflare.config_missing_token"
+            } else {
+                "cloudflare.transport_error"
+            };
+            let capability_state = if pre_dispatch {
+                "capability_gap"
+            } else {
+                "unavailable"
+            };
+            let error_code = if pre_dispatch {
+                "d1.migration_reconciliation_query_capability_gap"
+            } else {
+                "d1.migration_reconciliation_provider_unavailable"
+            };
+            let second = adapter_batch_error(
+                D1MigrationReconciliationBatchError {
+                    error: crate::cloudflare::client::AdapterErrorPayload {
+                        code: provider_code,
+                        message: "synthetic second-call failure".to_string(),
+                        hint: "synthetic fixture",
+                        retryable: false,
+                        status: None,
+                        classification: None,
+                    },
+                    response_body_sha256: None,
+                    response_body_size_bytes: None,
+                    lifecycle: second_lifecycle,
+                },
+                PROOF,
+            );
+            let second = if custody_verified {
+                contextualize_error(second, Some(PROOF), &[], 0)
+            } else {
+                contextualize_provider_error_with_unverified_custody(
+                    second,
+                    reconciliation_error(
+                        "contradictory",
+                        "d1.migration_reconciliation_lease_changed",
+                        "retained evidence changed during the second provider call",
+                    ),
+                    Some(PROOF),
+                    second_lifecycle.provider_calls(),
+                )
+            };
+            let result = contextualize_error(second, Some(PROOF), &[first.clone()], 1);
+            let content = result
+                .structured_content
+                .expect("structured second-call failure");
+            let mut expected = json!({
+                "ok": false,
+                "operation": "d1_reconcile_migration_manifest",
+                "dry_run": true,
+                "read_only": true,
+                "status": "reconciliation_required",
+                "outcome": "unknown",
+                "capability_state": capability_state,
+                "retry_decision": "do_not_retry_same_attempt",
+                "lease_decision": "retain",
+                "lease_retained": custody_verified.then_some(true),
+                "custody_status": if custody_verified {
+                    "retained_evidence_verified"
+                } else {
+                    "retained_evidence_unverified"
+                },
+                "query_sha256": PROOF,
+                "response_evidence": [first.clone()],
+                "provider_read_lifecycle": [first_lifecycle.clone(), second_lifecycle],
+                "provider_calls": 2,
+                "provider_mutations": 0,
+                "local_namespace_mutations": 0,
+                "provider_cause": {
+                    "code": provider_code,
+                    "status": null,
+                    "retryable": false,
+                    "operator_guidance": "reconciliation_only",
+                },
+                "error": {
+                    "code": error_code,
+                    "message": "provider could not return one complete strict read-only reconciliation batch",
+                    "hint": "Retain the exact lease evidence. Do not retry the original migration attempt or mutate D1 from this result.",
+                },
+            });
+            if !custody_verified {
+                expected.as_object_mut().expect("expected object").insert(
+                    "custody_cause".to_string(),
+                    json!({
+                        "code": "d1.migration_reconciliation_lease_changed",
+                        "message": "retained evidence changed during the second provider call",
+                        "hint": "Retain the exact lease evidence. Do not retry the original migration attempt or mutate D1 from this result.",
+                    }),
+                );
+            }
+            assert_eq!(
+                content, expected,
+                "pre_dispatch={pre_dispatch} custody_verified={custody_verified}"
+            );
+        }
+    }
+
+    #[test]
+    fn existing_merged_lifecycle_and_body_evidence_are_not_duplicated() {
+        let first = json!({
+            "response_body_sha256": PROOF,
+            "response_body_size_bytes": 101,
+            "lifecycle": {
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 200,
+            },
+        });
+        let second_lifecycle = json!({
+            "dispatch_stage": "pre_dispatch",
+            "response_stage": "not_received",
+            "body_stage": "not_read",
+            "http_status": null,
+        });
+        let mut content = json!({
+            "response_evidence": [first.clone()],
+            "provider_read_lifecycle": [first["lifecycle"].clone(), second_lifecycle.clone()],
+            "provider_calls": 2,
+        })
+        .as_object()
+        .expect("content object")
+        .clone();
+        assert_eq!(
+            merge_provider_lifecycle_with_response_evidence(&content, &[first.clone()]),
+            json!([first["lifecycle"].clone(), second_lifecycle])
+                .as_array()
+                .expect("expected lifecycle")
+                .clone(),
+        );
+        prepend_response_evidence(&mut content, &[first.clone()]);
+        assert_eq!(content["response_evidence"], json!([first]));
+
+        let retained_lifecycle = content["response_evidence"][0]["lifecycle"].clone();
+        content.insert(
+            "provider_read_lifecycle".to_string(),
+            json!([
+                retained_lifecycle.clone(),
+                {
+                    "dispatch_stage": "attempted",
+                    "response_stage": "received",
+                    "body_stage": "completely_read",
+                    "http_status": 200,
+                },
+            ]),
+        );
+        assert_eq!(
+            merge_provider_lifecycle_with_response_evidence(
+                &content,
+                content["response_evidence"]
+                    .as_array()
+                    .expect("prior response evidence"),
+            ),
+            json!([retained_lifecycle])
+                .as_array()
+                .expect("stale-free lifecycle")
+                .clone(),
+        );
+    }
+
+    #[test]
     fn post_read_contradictions_retain_verified_custody_context() {
         let first = json!({
             "response_body_sha256": PROOF,
@@ -2631,7 +2896,7 @@ mod tests {
             },
         });
         let second = json!({
-            "response_body_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "response_body_sha256": SECOND_PROOF,
             "response_body_size_bytes": 102,
             "lifecycle": {
                 "dispatch_stage": "attempted",

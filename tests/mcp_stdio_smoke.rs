@@ -897,6 +897,7 @@ enum ReconciliationFault {
     MixedPrimaryMarkers,
     SecondBatchPrimaryFalse,
     SecondBatchHttpStatus(u16),
+    SecondBatchTransportFailure(Option<PathBuf>),
     LedgerNotManifestPrefix,
     UnstableSecondBatch,
 }
@@ -1017,6 +1018,15 @@ fn spawn_fake_reconciliation_api_with_fault(
                 .lock()
                 .expect("request log lock")
                 .push(body_json);
+            if let ReconciliationFault::SecondBatchTransportFailure(custody_path) = &fault {
+                if request_index == 1 {
+                    if let Some(path) = custody_path {
+                        fs::write(path, b"tampered retained evidence")
+                            .expect("tamper retained evidence before transport failure");
+                    }
+                    continue;
+                }
+            }
             if matches!(&fault, ReconciliationFault::Redirect) {
                 let response = b"redirect refused";
                 let redirect_location =
@@ -1209,6 +1219,7 @@ fn spawn_fake_reconciliation_api_with_fault(
                 | ReconciliationFault::MixedPrimaryMarkers
                 | ReconciliationFault::SecondBatchPrimaryFalse
                 | ReconciliationFault::SecondBatchHttpStatus(_)
+                | ReconciliationFault::SecondBatchTransportFailure(_)
                 | ReconciliationFault::UnstableSecondBatch => {}
             }
             let response = serde_json::to_vec(&json!({
@@ -4571,26 +4582,44 @@ fn d1_reconcile_migration_manifest_stdio_reports_pre_dispatch_without_provider_c
         }),
     );
     let content = structured_content(&response);
-    assert_eq!(content["ok"], json!(false), "{content}");
-    assert_eq!(content["capability_state"], json!("capability_gap"));
+    let query_sha256 = content["query_sha256"].clone();
     assert_eq!(
-        content["error"]["code"],
-        json!("d1.migration_reconciliation_query_capability_gap")
-    );
-    assert_eq!(content["provider_calls"], json!(0), "{content}");
-    assert_eq!(
-        content["provider_read_lifecycle"],
-        json!([{
-            "dispatch_stage": "pre_dispatch",
-            "response_stage": "not_received",
-            "body_stage": "not_read",
-            "http_status": null,
-        }]),
-        "{content}"
-    );
-    assert_eq!(
-        content["response_evidence"].as_array().map(Vec::len),
-        Some(0),
+        content,
+        &json!({
+            "ok": false,
+            "operation": "d1_reconcile_migration_manifest",
+            "dry_run": true,
+            "read_only": true,
+            "status": "reconciliation_required",
+            "outcome": "unknown",
+            "capability_state": "capability_gap",
+            "retry_decision": "do_not_retry_same_attempt",
+            "lease_decision": "retain",
+            "lease_retained": true,
+            "custody_status": "retained_evidence_verified",
+            "query_sha256": query_sha256,
+            "response_evidence": [],
+            "provider_read_lifecycle": [{
+                "dispatch_stage": "pre_dispatch",
+                "response_stage": "not_received",
+                "body_stage": "not_read",
+                "http_status": null,
+            }],
+            "provider_calls": 0,
+            "provider_mutations": 0,
+            "local_namespace_mutations": 0,
+            "provider_cause": {
+                "code": "cloudflare.config_missing_token",
+                "status": null,
+                "retryable": false,
+                "operator_guidance": "reconciliation_only",
+            },
+            "error": {
+                "code": "d1.migration_reconciliation_query_capability_gap",
+                "message": "provider could not return one complete strict read-only reconciliation batch",
+                "hint": "Retain the exact lease evidence. Do not retry the original migration attempt or mutate D1 from this result.",
+            },
+        }),
         "{content}"
     );
     assert_eq!(requests.lock().expect("request log").len(), 0);
@@ -5117,6 +5146,115 @@ fn d1_reconcile_migration_manifest_stdio_preserves_both_batches_when_second_call
     assert_private_regular_active_lease(&lease_root);
     mcp.terminate();
     let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_reconcile_migration_manifest_stdio_preserves_second_transport_invocation_without_body() {
+    let (manifest, expectations) = one_table_reconciliation_case();
+    for (index, custody_verified) in [true, false].into_iter().enumerate() {
+        let lease_root = PathBuf::from("/tmp").join(format!(
+            "cloudflare-mcp-reconcile-second-transport-{}-{index}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&lease_root);
+        fs::create_dir(&lease_root).expect("create second-transport reconciliation root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+                .expect("make second-transport reconciliation root private");
+        }
+        let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+            create_retained_reconciliation_fixture(&lease_root, &manifest);
+        let active = assert_private_regular_active_lease(&lease_root);
+        let fault =
+            ReconciliationFault::SecondBatchTransportFailure((!custody_verified).then_some(active));
+        let (base_url, requests) = spawn_fake_reconciliation_api_with_fault(fault);
+        let mut mcp = McpStdioProcess::start_with_env(vec![
+            ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+            (
+                "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+                lease_root.to_string_lossy().to_string(),
+            ),
+        ]);
+        let response = mcp.call_tool(
+            764 + index as u64,
+            "d1_reconcile_migration_manifest",
+            json!({
+                "database_id": "db-1",
+                "migration_family": "newsletter-core",
+                "manifest": manifest.clone(),
+                "approved_plan_sha256": approved_plan_sha256,
+                "lease_nonce": lease_nonce,
+                "lease_payload_sha256": lease_payload_sha256,
+                "effect_assertion_id": "schema_create_only_v1",
+                "state_expectations": expectations.clone(),
+            }),
+        );
+        let content = structured_content(&response);
+        let query_sha256 = content["query_sha256"].clone();
+        let first = content["response_evidence"][0].clone();
+        assert_eq!(first.as_object().map(|value| value.len()), Some(3));
+        let mut expected = json!({
+            "ok": false,
+            "operation": "d1_reconcile_migration_manifest",
+            "dry_run": true,
+            "read_only": true,
+            "status": "reconciliation_required",
+            "outcome": "unknown",
+            "capability_state": "unavailable",
+            "retry_decision": "do_not_retry_same_attempt",
+            "lease_decision": "retain",
+            "lease_retained": custody_verified.then_some(true),
+            "custody_status": if custody_verified {
+                "retained_evidence_verified"
+            } else {
+                "retained_evidence_unverified"
+            },
+            "query_sha256": query_sha256,
+            "response_evidence": [first.clone()],
+            "provider_read_lifecycle": [
+                first["lifecycle"].clone(),
+                {
+                    "dispatch_stage": "attempted",
+                    "response_stage": "not_received",
+                    "body_stage": "not_read",
+                    "http_status": null,
+                },
+            ],
+            "provider_calls": 2,
+            "provider_mutations": 0,
+            "local_namespace_mutations": 0,
+            "provider_cause": {
+                "code": "cloudflare.transport_error",
+                "status": null,
+                "retryable": false,
+                "operator_guidance": "reconciliation_only",
+            },
+            "error": {
+                "code": "d1.migration_reconciliation_provider_unavailable",
+                "message": "provider could not return one complete strict read-only reconciliation batch",
+                "hint": "Retain the exact lease evidence. Do not retry the original migration attempt or mutate D1 from this result.",
+            },
+        });
+        if !custody_verified {
+            expected.as_object_mut().expect("expected object").insert(
+                "custody_cause".to_string(),
+                json!({
+                    "code": "d1.migration_reconciliation_lease_changed",
+                    "message": "retained lease payload digest changed",
+                    "hint": "Retain the exact custody evidence and resolve this boundary before any provider read or migration retry.",
+                }),
+            );
+        }
+        assert_eq!(content, &expected, "custody_verified={custody_verified}");
+        assert_eq!(requests.lock().expect("request log").len(), 2);
+        if custody_verified {
+            assert_private_regular_active_lease(&lease_root);
+        }
+        mcp.terminate();
+        let _ = fs::remove_dir_all(lease_root);
+    }
 }
 
 #[test]

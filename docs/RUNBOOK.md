@@ -198,9 +198,12 @@ unavailable and never authorize an automatic retry, including when the body
 exceeds the streaming byte bound. Contradictory ledger, schema, plan, or
 two-read evidence discovered after successful custody revalidation reports the
 retained evidence as verified and includes the exact two provider calls; only
-custody drift changes that status to unverified. When two chronological
-`response_evidence` summaries retain complete lifecycle fields, top-level
-`provider_read_lifecycle` reproduces those same two entries in order.
+custody drift changes that status to unverified. `response_evidence` records
+only captured response bodies; `provider_read_lifecycle` independently records
+every invocation. After one complete read, a second transport failure or
+pre-dispatch adapter failure therefore leaves one response summary but two
+chronological lifecycle entries and aggregate `provider_calls=2`. Standalone
+pre-dispatch failure remains zero provider calls.
 Revalidation runs after every
 attempted provider call even when the provider returns an error. If provider
 failure and custody drift coincide, retain the provider classification and
