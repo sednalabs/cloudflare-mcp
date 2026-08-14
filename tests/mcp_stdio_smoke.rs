@@ -4276,7 +4276,7 @@ fn d1_reconcile_migration_manifest_stdio_rejects_unproven_effects_and_incomplete
     let content = structured_content(&rejected_effect);
     assert_eq!(
         content,
-        json!({
+        &json!({
             "ok": false,
             "operation": "d1_reconcile_migration_manifest",
             "dry_run": true,
@@ -4330,7 +4330,7 @@ fn d1_reconcile_migration_manifest_stdio_rejects_unproven_effects_and_incomplete
     let content = structured_content(&omitted_schema);
     assert_eq!(
         content,
-        json!({
+        &json!({
             "ok": false,
             "operation": "d1_reconcile_migration_manifest",
             "dry_run": true,
@@ -4408,7 +4408,7 @@ fn d1_reconcile_migration_manifest_stdio_rejects_unproven_effects_and_incomplete
         .to_string();
     assert_eq!(
         content,
-        json!({
+        &json!({
             "ok": false,
             "operation": "d1_reconcile_migration_manifest",
             "dry_run": true,
