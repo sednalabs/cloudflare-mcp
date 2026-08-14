@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -111,6 +112,89 @@ fn assert_released_manifest_target_custody(lease_root: &Path) {
         retired.len() == 1,
         "normal completion retains a terminal retirement record"
     );
+}
+
+fn create_retained_reconciliation_fixture(
+    lease_root: &Path,
+    manifest: &Value,
+) -> (String, String, String) {
+    #[derive(Serialize)]
+    struct ApprovedPlan<'a> {
+        version: u8,
+        operation: &'static str,
+        account_id: &'static str,
+        database_id: &'static str,
+        migration_family: &'static str,
+        migrations_table: &'static str,
+        manifest: &'a Value,
+        ledger: Vec<Value>,
+    }
+
+    let target = manifest_target_path(lease_root);
+    fs::create_dir(&target).expect("create retained target");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
+            .expect("make retained target private");
+    }
+    let guard = target.join("guard.lock");
+    fs::write(&guard, []).expect("create retained guard");
+    let nonce = "b".repeat(64);
+    let manifest_summary = Value::Array(
+        manifest
+            .as_array()
+            .expect("manifest array")
+            .iter()
+            .map(|entry| {
+                json!({
+                    "name": entry["name"],
+                    "size_bytes": entry["size_bytes"],
+                    "sql_sha256": entry["sql_sha256"],
+                })
+            })
+            .collect(),
+    );
+    let plan = ApprovedPlan {
+        version: 1,
+        operation: "d1_apply_migration_manifest",
+        account_id: "acct-1",
+        database_id: "db-1",
+        migration_family: "newsletter-core",
+        migrations_table: "d1_migrations",
+        manifest: &manifest_summary,
+        ledger: Vec::new(),
+    };
+    let approved_plan_sha256 = {
+        let bytes = serde_json::to_vec(&plan).expect("serialize approved plan");
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    };
+    let payload = json!({
+        "version": 2,
+        "target_key_sha256": sha256_hex("acct-1\0db-1"),
+        "nonce": nonce,
+        "approved_plan_sha256": approved_plan_sha256,
+        "migration_family": "newsletter-core",
+        "created_at_unix_ms": 1_800_000_000_000_u64,
+    });
+    let payload_bytes = serde_json::to_vec(&payload).expect("serialize retained payload");
+    let payload_sha256 = {
+        let mut hasher = Sha256::new();
+        hasher.update(&payload_bytes);
+        format!("{:x}", hasher.finalize())
+    };
+    let active = target.join("active.lease.json");
+    fs::write(&active, payload_bytes).expect("write retained payload");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&guard, fs::Permissions::from_mode(0o600)).expect("make guard private");
+        fs::set_permissions(&active, fs::Permissions::from_mode(0o600))
+            .expect("make active evidence private");
+    }
+    (approved_plan_sha256, nonce, payload_sha256)
 }
 
 fn assert_fresh_process_blocked_without_provider_request(
@@ -784,6 +868,44 @@ fn spawn_fake_manifest_ambiguous_api(
             .expect("serialize response");
             write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write headers");
             stream.write_all(&response).expect("write response");
+        }
+    });
+    (format!("http://{addr}"), requests)
+}
+
+fn spawn_fake_reconciliation_api() -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind reconciliation D1 API");
+    let addr = listener.local_addr().expect("reconciliation D1 address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().take(2) {
+            let mut stream = stream.expect("fake reconciliation stream");
+            let (headers, body) = read_http_request(&mut stream);
+            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            let body_json: Value =
+                serde_json::from_slice(&body).expect("reconciliation request JSON");
+            requests_for_thread
+                .lock()
+                .expect("request log lock")
+                .push(body_json);
+            let response = serde_json::to_vec(&json!({
+                "success": true,
+                "errors": [],
+                "messages": [],
+                "result": [
+                    {"success": true, "results": [{"id": 1, "name": "0001_create.sql"}], "meta": {"changed_db": false, "changes": 0, "rows_written": 0}},
+                    {"success": true, "results": [{"type": "table", "name": "items", "tbl_name": "items", "sql": "CREATE TABLE items(id INTEGER PRIMARY KEY)"}]},
+                    {"success": true, "results": [{"cid": 0, "name": "id", "type": "INTEGER", "notnull": 0, "dflt_value": null, "pk": 1, "hidden": 0}]},
+                    {"success": true, "results": []},
+                    {"success": true, "results": []}
+                ]
+            }))
+            .expect("serialize reconciliation response");
+            write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write reconciliation headers");
+            stream
+                .write_all(&response)
+                .expect("write reconciliation response");
         }
     });
     (format!("http://{addr}"), requests)
@@ -3685,6 +3807,118 @@ fn d1_apply_migration_manifest_response_loss_stops_without_retry_and_next_proces
         6,
         "response loss",
     );
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_reconcile_migration_manifest_proves_stable_full_state_without_retry_or_mutation() {
+    let (base_url, requests) = spawn_fake_reconciliation_api();
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-reconcile-manifest-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create reconciliation lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make reconciliation root private");
+    }
+    let migration_sql = "CREATE TABLE items(id INTEGER PRIMARY KEY);";
+    let manifest = json!([{
+        "name": "0001_create.sql",
+        "size_bytes": migration_sql.len(),
+        "sql_sha256": sha256_hex(migration_sql),
+        "sql": migration_sql,
+    }]);
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&lease_root, &manifest);
+    let retained_before =
+        fs::read(assert_private_regular_active_lease(&lease_root)).expect("read retained before");
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let response = mcp.call_tool(
+        740,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest,
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_only_v1",
+            "state_expectations": [
+                {"manifest_prefix_length": 0, "schema_objects": [], "tables": []},
+                {
+                    "manifest_prefix_length": 1,
+                    "schema_objects": [{
+                        "object_type": "table",
+                        "name": "items",
+                        "table_name": "items",
+                        "sql_sha256": sha256_hex("CREATE TABLE items(id INTEGER PRIMARY KEY)"),
+                    }],
+                    "tables": [{
+                        "name": "items",
+                        "columns": [{
+                            "cid": 0,
+                            "name": "id",
+                            "declared_type": "INTEGER",
+                            "not_null": false,
+                            "default_value": null,
+                            "primary_key_position": 1,
+                            "hidden": 0,
+                        }],
+                        "foreign_keys": [],
+                    }],
+                }
+            ],
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(true), "{content}");
+    assert_eq!(content["outcome"], json!("full_state_converged"));
+    assert_eq!(
+        content["retry_decision"],
+        json!("do_not_retry_same_attempt")
+    );
+    assert_eq!(content["lease_decision"], json!("retain"));
+    assert_eq!(content["provider_calls"], json!(2));
+    assert_eq!(content["provider_mutations"], json!(0));
+    assert_eq!(content["local_namespace_mutations"], json!(0));
+    assert!(content["query_sha256"].as_str().is_some());
+    assert!(content["canonical_snapshot_sha256"].as_str().is_some());
+    assert!(content["reconciliation_plan_sha256"].as_str().is_some());
+    assert_eq!(
+        content["response_evidence"].as_array().map(Vec::len),
+        Some(2)
+    );
+    let observed = requests.lock().expect("request log");
+    assert_eq!(observed.len(), 2, "exactly two complete batches");
+    for request in observed.iter() {
+        let sql = request["sql"].as_str().expect("fixed reconciliation SQL");
+        assert!(sql.split(';').all(|statement| {
+            statement.trim().is_empty() || statement.trim_start().starts_with("SELECT ")
+        }));
+        assert!(!sql.contains("INSERT"));
+        assert!(!sql.contains("UPDATE"));
+        assert!(!sql.contains("DELETE"));
+    }
+    drop(observed);
+    let retained_after =
+        fs::read(assert_private_regular_active_lease(&lease_root)).expect("read retained after");
+    assert_eq!(
+        retained_after, retained_before,
+        "retained evidence is immutable"
+    );
+    assert!(retired_manifest_entries(&manifest_target_path(&lease_root)).is_empty());
+    mcp.terminate();
     let _ = fs::remove_dir_all(lease_root);
 }
 

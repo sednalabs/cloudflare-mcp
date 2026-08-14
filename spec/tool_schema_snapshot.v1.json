@@ -1823,6 +1823,260 @@
       "name": "d1_query_read_only"
     },
     {
+      "description": "Build stable read-only ledger, schema, table_xinfo, and foreign-key reconciliation evidence for one exact retained D1 migration manifest.",
+      "inputSchema": {
+        "$defs": {
+          "D1MigrationColumnExpectation": {
+            "properties": {
+              "cid": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "declared_type": {
+                "type": "string"
+              },
+              "default_value": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "hidden": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              },
+              "not_null": {
+                "type": "boolean"
+              },
+              "primary_key_position": {
+                "format": "int64",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "cid",
+              "name",
+              "declared_type",
+              "not_null",
+              "primary_key_position",
+              "hidden"
+            ],
+            "type": "object"
+          },
+          "D1MigrationForeignKeyExpectation": {
+            "properties": {
+              "from_column": {
+                "type": "string"
+              },
+              "id": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "match_mode": {
+                "type": "string"
+              },
+              "on_delete": {
+                "type": "string"
+              },
+              "on_update": {
+                "type": "string"
+              },
+              "referenced_table": {
+                "type": "string"
+              },
+              "sequence": {
+                "format": "int64",
+                "type": "integer"
+              },
+              "to_column": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "id",
+              "sequence",
+              "referenced_table",
+              "from_column",
+              "on_update",
+              "on_delete",
+              "match_mode"
+            ],
+            "type": "object"
+          },
+          "D1MigrationManifestEntry": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "size_bytes": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "sql": {
+                "type": "string"
+              },
+              "sql_sha256": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "size_bytes",
+              "sql_sha256",
+              "sql"
+            ],
+            "type": "object"
+          },
+          "D1MigrationSchemaObjectExpectation": {
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "object_type": {
+                "type": "string"
+              },
+              "sql_sha256": {
+                "type": "string"
+              },
+              "table_name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "object_type",
+              "name",
+              "table_name",
+              "sql_sha256"
+            ],
+            "type": "object"
+          },
+          "D1MigrationStateExpectation": {
+            "properties": {
+              "manifest_prefix_length": {
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "schema_objects": {
+                "items": {
+                  "$ref": "#/$defs/D1MigrationSchemaObjectExpectation"
+                },
+                "type": "array"
+              },
+              "tables": {
+                "items": {
+                  "$ref": "#/$defs/D1MigrationTableExpectation"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "manifest_prefix_length",
+              "schema_objects",
+              "tables"
+            ],
+            "type": "object"
+          },
+          "D1MigrationTableExpectation": {
+            "properties": {
+              "columns": {
+                "items": {
+                  "$ref": "#/$defs/D1MigrationColumnExpectation"
+                },
+                "type": "array"
+              },
+              "foreign_keys": {
+                "items": {
+                  "$ref": "#/$defs/D1MigrationForeignKeyExpectation"
+                },
+                "type": "array"
+              },
+              "name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "columns",
+              "foreign_keys"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "approved_plan_sha256": {
+            "type": "string"
+          },
+          "database_id": {
+            "type": "string"
+          },
+          "effect_assertion_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lease_nonce": {
+            "type": "string"
+          },
+          "lease_payload_sha256": {
+            "type": "string"
+          },
+          "manifest": {
+            "items": {
+              "$ref": "#/$defs/D1MigrationManifestEntry"
+            },
+            "type": "array"
+          },
+          "migration_family": {
+            "type": "string"
+          },
+          "migrations_table": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state_expectations": {
+            "items": {
+              "$ref": "#/$defs/D1MigrationStateExpectation"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "database_id",
+          "migration_family",
+          "manifest",
+          "approved_plan_sha256",
+          "lease_nonce",
+          "lease_payload_sha256",
+          "state_expectations"
+        ],
+        "type": "object"
+      },
+      "name": "d1_reconcile_migration_manifest"
+    },
+    {
       "description": "Rename a Cloudflare D1 database through the curated partial-update endpoint. Supports dry-run planning.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",

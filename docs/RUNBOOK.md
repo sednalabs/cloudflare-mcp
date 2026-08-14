@@ -130,6 +130,40 @@ do not share that root. The product-neutral governed recovery path remains
 required for retained, malformed, or tampered evidence. Non-Linux installations or
 unsupported filesystems fail closed before provider I/O.
 
+### Read-only retained-manifest reconciliation
+
+When an ambiguous apply retains `active.lease.json` or a failed terminal move
+leaves `retiring.lease.json`, use `d1_reconcile_migration_manifest`; do not run
+the apply tool again. Supply the same complete exact-byte manifest and the
+reported approved-plan, nonce, and payload digests. Also supply ordered,
+bounded `state_expectations` for the reviewed manifest prefixes that may be
+classified. Each state names the exact `sqlite_master` object type/name/table
+and SQL digest, complete `table_xinfo` rows, and complete foreign-key
+definitions for every declared table.
+
+The current built-in effect registry accepts only
+`effect_assertion_id=schema_create_only_v1`. It independently classifies the
+exact manifest SQL and refuses arbitrary DML, ALTER, DROP, PRAGMA, trigger,
+view, or data-copy effects; a caller assertion that work was schema-only is not
+proof. An effect capability gap means retain the lease and add a purpose-built
+registry assertion/readback contract before continuing.
+
+The tool opens the existing target and guard without creating entries, requires
+exactly one active or retiring regular private evidence file, and holds the
+guard across two complete internally generated read-only batches. It returns
+`not_committed`, `partial_state_converged`, or `full_state_converged` only when
+the current ledger is an exact manifest prefix, the retained approved plan
+reconstructs uniquely from that prefix relationship, both canonical snapshots
+match, and schema/FK proof is complete. These labels are documented atomic-state
+inference, not proof of which provider attempt caused the state.
+
+All current results retain the lease and prohibit retry of the same migration
+attempt. Record the query SHA-256, both bounded response-body digests, canonical
+snapshot SHA-256, scope-completeness fields, and `reconciliation_plan_sha256`.
+Do not manually rename or remove custody evidence: durable terminal receipt and
+retirement are a separate guarded recovery phase and are not implemented by
+this read-only tool.
+
 For CI-built release bundles, the `Rust Validation` workflow uploads a
 downloadable artifact named `cloudflare-mcp-linux-x86_64-stdio-<git-sha>` that
 contains:

@@ -148,6 +148,9 @@ fn tool_capabilities() -> Vec<ToolCapability> {
         cap("d1_apply_migration_manifest")
             .with_group("d1")
             .with_read_only(false),
+        cap("d1_reconcile_migration_manifest")
+            .with_group("d1")
+            .with_read_only(true),
         cap("analytics_engine_query")
             .with_group("analytics_engine")
             .with_read_only(true),

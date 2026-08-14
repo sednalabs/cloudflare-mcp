@@ -1196,6 +1196,7 @@ mod tests {
             "connector_control",
             "d1_apply_migrations",
             "d1_apply_migration_manifest",
+            "d1_reconcile_migration_manifest",
             "d1_delete_database",
             "d1_execute_write",
             "d1_get_database",

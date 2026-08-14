@@ -225,6 +225,20 @@ impl RetryPolicy {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct D1MigrationReconciliationBatch {
+    pub(crate) result: Value,
+    pub(crate) response_body_sha256: String,
+    pub(crate) response_body_size_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct D1MigrationReconciliationBatchError {
+    pub(crate) error: AdapterErrorPayload,
+    pub(crate) response_body_sha256: Option<String>,
+    pub(crate) response_body_size_bytes: Option<usize>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum D1EnvelopePolicy {
     Generic,
@@ -565,6 +579,127 @@ impl CloudflareClient {
             params,
         )
         .await
+    }
+
+    /// Execute one internally constructed read-only reconciliation batch.
+    ///
+    /// Unlike the general D1 read adapter, this boundary performs exactly one
+    /// HTTP attempt and retains a digest of the exact response bytes. The
+    /// reconciliation state machine owns any subsequent complete read and
+    /// compares canonical evidence across the two calls itself.
+    pub(crate) async fn query_d1_migration_reconciliation_batch(
+        &self,
+        account_id: &str,
+        database_id: &str,
+        sql: &str,
+    ) -> Result<D1MigrationReconciliationBatch, D1MigrationReconciliationBatchError> {
+        const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+        let account_id = require_non_empty("account_id", account_id).map_err(|error| {
+            D1MigrationReconciliationBatchError {
+                error: error.payload(),
+                response_body_sha256: None,
+                response_body_size_bytes: None,
+            }
+        })?;
+        let database_id = require_non_empty("database_id", database_id).map_err(|error| {
+            D1MigrationReconciliationBatchError {
+                error: error.payload(),
+                response_body_sha256: None,
+                response_body_size_bytes: None,
+            }
+        })?;
+        let sql =
+            require_non_empty("sql", sql).map_err(|error| D1MigrationReconciliationBatchError {
+                error: error.payload(),
+                response_body_sha256: None,
+                response_body_size_bytes: None,
+            })?;
+        let token = self
+            .bearer_token()
+            .map_err(|error| D1MigrationReconciliationBatchError {
+                error: error.payload(),
+                response_body_sha256: None,
+                response_body_size_bytes: None,
+            })?;
+        let url = self.endpoint(&format!(
+            "/accounts/{}/d1/database/{}/query",
+            path_segment(account_id),
+            path_segment(database_id),
+        ));
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(&token)
+            .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone())
+            .json(&json!({"sql": sql}))
+            .send()
+            .await
+            .map_err(|error| {
+                let retryable = error.is_timeout() || error.is_connect() || error.is_request();
+                let code = if error.is_timeout() {
+                    "cloudflare.timeout"
+                } else {
+                    "cloudflare.transport_error"
+                };
+                D1MigrationReconciliationBatchError {
+                    error: AdapterError::new(
+                        code,
+                        format!(
+                            "cloudflare.d1.migration_reconciliation.query request failed: {error}"
+                        ),
+                        "Treat reconciliation evidence as unavailable; do not retry the retained migration attempt.",
+                    )
+                    .with_retryable(retryable)
+                    .payload(),
+                    response_body_sha256: None,
+                    response_body_size_bytes: None,
+                }
+            })?;
+        let status = response.status();
+        let bytes = response.bytes().await.map_err(|error| {
+            D1MigrationReconciliationBatchError {
+                error: AdapterError::new(
+                    "cloudflare.response_read_failed",
+                    format!("failed reading Cloudflare reconciliation response body: {error}"),
+                    "Treat reconciliation evidence as unavailable; do not retry the retained migration attempt.",
+                )
+                .payload(),
+                response_body_sha256: None,
+                response_body_size_bytes: None,
+            }
+        })?;
+        let response_body_size_bytes = bytes.len();
+        let response_body_sha256 = sha256_hex(&bytes);
+        let evidence_error = |error: AdapterError| D1MigrationReconciliationBatchError {
+            error: error.payload(),
+            response_body_sha256: Some(response_body_sha256.clone()),
+            response_body_size_bytes: Some(response_body_size_bytes),
+        };
+        if response_body_size_bytes > MAX_RESPONSE_BYTES {
+            return Err(evidence_error(AdapterError::new(
+                "cloudflare.d1.migration_reconciliation_response_too_large",
+                "Cloudflare reconciliation response exceeded the exact-evidence byte limit",
+                "Reduce the bounded expectation scope; retain the lease and do not retry the migration attempt.",
+            )));
+        }
+        let body = std::str::from_utf8(&bytes).map_err(|error| {
+            evidence_error(AdapterError::new(
+                "cloudflare.d1.migration_reconciliation_malformed_utf8",
+                format!("Cloudflare reconciliation response was not valid UTF-8: {error}"),
+                "Treat the provider evidence as contradictory and retain the lease.",
+            ))
+        })?;
+        if !status.is_success() {
+            return Err(evidence_error(http_status_error(status, body)));
+        }
+        let envelope =
+            decode_strict_d1_migration_manifest_envelope(body).map_err(evidence_error)?;
+        Ok(D1MigrationReconciliationBatch {
+            result: envelope.result.unwrap_or(Value::Null),
+            response_body_sha256,
+            response_body_size_bytes,
+        })
     }
 
     /// Submit one manifest-owned migration statement. The non-idempotent

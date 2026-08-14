@@ -47,6 +47,9 @@ use crate::d1_migration_manifest::{
     parse_d1_migration_ledger, read_stable_d1_migration_ledger, validate_d1_manifest_write_result,
     validate_d1_migration_manifest,
 };
+use crate::d1_migration_reconciliation::{
+    D1ReconcileMigrationManifestArgs, reconcile_d1_migration_manifest,
+};
 use crate::dns_route::{
     DnsRouteConflict, DnsRouteVerificationState, plan_dns_route_reconciliation, verify_dns_route,
 };
@@ -5037,6 +5040,67 @@ impl CloudflareMcp {
             audit,
             dry_run,
         ))
+    }
+
+    #[tool(
+        name = "d1_reconcile_migration_manifest",
+        description = "Build stable read-only ledger, schema, table_xinfo, and foreign-key reconciliation evidence for one exact retained D1 migration manifest."
+    )]
+    async fn cloudflare_d1_reconcile_migration_manifest(
+        &self,
+        Parameters(args): Parameters<D1ReconcileMigrationManifestArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let D1ReconcileMigrationManifestArgs {
+            account_id: requested_account_id,
+            database_id: requested_database_id,
+            migration_family,
+            migrations_table,
+            manifest,
+            approved_plan_sha256,
+            lease_nonce,
+            lease_payload_sha256,
+            effect_assertion_id,
+            state_expectations,
+        } = args;
+        if let Some(requested_account_id) = requested_account_id.as_deref() {
+            if let Err(result) =
+                normalize_d1_manifest_target(requested_account_id, &requested_database_id)
+            {
+                return Ok(result);
+            }
+        }
+        let resolved_account_id = resolve_account_id(self, requested_account_id.as_deref())?;
+        let target = match normalize_d1_manifest_target(resolved_account_id, &requested_database_id)
+        {
+            Ok(target) => target,
+            Err(result) => return Ok(result),
+        };
+        let migrations_table = match normalize_d1_migrations_table(migrations_table.as_deref()) {
+            Ok(table) => table,
+            Err(result) => return Ok(result),
+        };
+        let manifest = match validate_d1_migration_manifest(manifest) {
+            Ok(manifest) => manifest,
+            Err(result) => return Ok(result),
+        };
+        let family = match normalize_d1_migration_family(&migration_family) {
+            Ok(family) => family,
+            Err(result) => return Ok(result),
+        };
+        Ok(reconcile_d1_migration_manifest(
+            self,
+            &target.account_id,
+            &target.database_id,
+            &family,
+            &migrations_table,
+            &manifest,
+            &approved_plan_sha256,
+            &lease_nonce,
+            &lease_payload_sha256,
+            effect_assertion_id.as_deref(),
+            state_expectations,
+        )
+        .await)
     }
 
     #[tool(
@@ -12423,7 +12487,7 @@ fn r2_download_too_large_result(
     }))
 }
 
-fn normalize_d1_migrations_table(value: Option<&str>) -> Result<String, CallToolResult> {
+pub(crate) fn normalize_d1_migrations_table(value: Option<&str>) -> Result<String, CallToolResult> {
     let table = value
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -14688,6 +14752,7 @@ mod tests {
             "d1_get_database",
             "d1_inspect_schema",
             "d1_query_read_only",
+            "d1_reconcile_migration_manifest",
         ] {
             assert!(allowed.iter().any(|candidate| candidate == tool), "{tool}");
             assert!(payload["schemas"][tool].is_object(), "{tool} schema");

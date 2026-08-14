@@ -10,6 +10,7 @@ pub mod cloudflare;
 pub mod config;
 pub(crate) mod d1_migration_lease;
 pub(crate) mod d1_migration_manifest;
+pub(crate) mod d1_migration_reconciliation;
 pub mod dns_route;
 pub mod mutation;
 pub(crate) mod pages_deploy;
