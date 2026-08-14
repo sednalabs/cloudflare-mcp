@@ -165,8 +165,11 @@ Every fixed result set carries a query-bound statement marker and a mandatory
 sentinel row, including result sets with no data rows. Parsing requires the
 exact marker, exact row shape, explicit success, empty errors, and—when
 present—boolean `changed_db=false` plus integer `changes=0` and
-`rows_written=0`. Response bodies are capped at 16 MiB from the HTTP stream;
-the adapter stops before buffering a body beyond that bound.
+`rows_written=0`. Every fixed result set in both batches must also carry exact
+`meta.served_by_primary=true`; missing metadata or a false, null, non-boolean,
+or mixed primary marker fails closed as contradictory evidence. Response bodies
+are capped at 16 MiB from the HTTP stream; the adapter stops before buffering a
+body beyond that bound.
 
 Interpret custody fields literally. Validation failures before custody lookup
 return `lease_retained=null` and `custody_status=not_inspected`. Inspection

@@ -884,6 +884,13 @@ enum ReconciliationFault {
     HttpStatusCustodyDrift(u16, PathBuf),
     OversizedHttpStatus(u16),
     CustodyDrift(PathBuf),
+    PrimaryMetaMissing,
+    PrimaryMarkerMissing,
+    PrimaryMarkerFalse,
+    PrimaryMarkerNull,
+    PrimaryMarkerWrongType,
+    MixedPrimaryMarkers,
+    SecondBatchPrimaryFalse,
     SecondBatchHttpStatus(u16),
     UnstableSecondBatch,
 }
@@ -930,13 +937,16 @@ fn tagged_reconciliation_result(
         row.insert("__cf_mcp_row_kind".to_string(), json!(1));
         tagged.push(Value::Object(row));
     }
+    let mut meta = meta.unwrap_or_else(|| json!({}));
+    meta.as_object_mut()
+        .expect("reconciliation result metadata")
+        .entry("served_by_primary".to_string())
+        .or_insert_with(|| json!(true));
     let mut result = json!({"success": true, "results": tagged});
-    if let Some(meta) = meta {
-        result
-            .as_object_mut()
-            .expect("reconciliation result")
-            .insert("meta".to_string(), meta);
-    }
+    result
+        .as_object_mut()
+        .expect("reconciliation result")
+        .insert("meta".to_string(), meta);
     result
 }
 
@@ -1103,6 +1113,33 @@ fn spawn_fake_reconciliation_api_with_fault(
                     fs::write(path, b"tampered retained evidence")
                         .expect("tamper retained evidence fixture");
                 }
+                ReconciliationFault::PrimaryMetaMissing => {
+                    results[0]
+                        .as_object_mut()
+                        .expect("result object")
+                        .remove("meta");
+                }
+                ReconciliationFault::PrimaryMarkerMissing => {
+                    results[0]["meta"]
+                        .as_object_mut()
+                        .expect("metadata object")
+                        .remove("served_by_primary");
+                }
+                ReconciliationFault::PrimaryMarkerFalse => {
+                    results[0]["meta"]["served_by_primary"] = json!(false);
+                }
+                ReconciliationFault::PrimaryMarkerNull => {
+                    results[0]["meta"]["served_by_primary"] = Value::Null;
+                }
+                ReconciliationFault::PrimaryMarkerWrongType => {
+                    results[0]["meta"]["served_by_primary"] = json!("true");
+                }
+                ReconciliationFault::MixedPrimaryMarkers => {
+                    results[2]["meta"]["served_by_primary"] = json!(false);
+                }
+                ReconciliationFault::SecondBatchPrimaryFalse if request_index == 1 => {
+                    results[3]["meta"]["served_by_primary"] = json!(false);
+                }
                 ReconciliationFault::UnstableSecondBatch if request_index == 1 => {
                     results[1]["results"][1]["sql"] =
                         json!("CREATE TABLE items(id INTEGER PRIMARY KEY, changed TEXT)");
@@ -1112,6 +1149,13 @@ fn spawn_fake_reconciliation_api_with_fault(
                 | ReconciliationFault::HttpStatus(_)
                 | ReconciliationFault::HttpStatusCustodyDrift(_, _)
                 | ReconciliationFault::OversizedHttpStatus(_)
+                | ReconciliationFault::PrimaryMetaMissing
+                | ReconciliationFault::PrimaryMarkerMissing
+                | ReconciliationFault::PrimaryMarkerFalse
+                | ReconciliationFault::PrimaryMarkerNull
+                | ReconciliationFault::PrimaryMarkerWrongType
+                | ReconciliationFault::MixedPrimaryMarkers
+                | ReconciliationFault::SecondBatchPrimaryFalse
                 | ReconciliationFault::SecondBatchHttpStatus(_)
                 | ReconciliationFault::UnstableSecondBatch => {}
             }
@@ -4259,6 +4303,92 @@ fn d1_reconcile_migration_manifest_stdio_rejects_unproven_effects_and_incomplete
     assert_eq!(content["lease_retained"], Value::Null);
     assert_eq!(content["custody_status"], json!("inspection_failed"));
     mcp.terminate();
+}
+
+#[test]
+fn d1_reconcile_migration_manifest_stdio_requires_primary_current_evidence_for_every_result_set() {
+    let (manifest, expectations) = one_table_reconciliation_case();
+    for (index, (fault, expected_calls)) in [
+        (ReconciliationFault::PrimaryMetaMissing, 1),
+        (ReconciliationFault::PrimaryMarkerMissing, 1),
+        (ReconciliationFault::PrimaryMarkerFalse, 1),
+        (ReconciliationFault::PrimaryMarkerNull, 1),
+        (ReconciliationFault::PrimaryMarkerWrongType, 1),
+        (ReconciliationFault::MixedPrimaryMarkers, 1),
+        (ReconciliationFault::SecondBatchPrimaryFalse, 2),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let lease_root = PathBuf::from("/tmp").join(format!(
+            "cloudflare-mcp-reconcile-primary-{}-{index}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&lease_root);
+        fs::create_dir(&lease_root).expect("create primary reconciliation root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+                .expect("make primary reconciliation root private");
+        }
+        let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+            create_retained_reconciliation_fixture(&lease_root, &manifest);
+        let (base_url, requests) = spawn_fake_reconciliation_api_with_fault(fault);
+        let mut mcp = McpStdioProcess::start_with_env(vec![
+            ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+            (
+                "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+                lease_root.to_string_lossy().to_string(),
+            ),
+        ]);
+        let response = mcp.call_tool(
+            730 + index as u64,
+            "d1_reconcile_migration_manifest",
+            json!({
+                "database_id": "db-1",
+                "migration_family": "newsletter-core",
+                "manifest": manifest.clone(),
+                "approved_plan_sha256": approved_plan_sha256,
+                "lease_nonce": lease_nonce,
+                "lease_payload_sha256": lease_payload_sha256,
+                "effect_assertion_id": "schema_create_only_v1",
+                "state_expectations": expectations.clone(),
+            }),
+        );
+        let content = structured_content(&response);
+        assert_eq!(content["ok"], json!(false), "{content}");
+        assert_eq!(content["capability_state"], json!("contradictory"));
+        assert_eq!(
+            content["error"]["code"],
+            json!("d1.migration_reconciliation_primary_evidence_contradictory"),
+            "{content}"
+        );
+        assert_eq!(
+            content["retry_decision"],
+            json!("do_not_retry_same_attempt")
+        );
+        assert_eq!(content["lease_retained"], json!(true), "{content}");
+        assert_eq!(
+            content["custody_status"],
+            json!("retained_evidence_verified"),
+            "{content}"
+        );
+        assert_eq!(
+            content["provider_calls"],
+            json!(expected_calls),
+            "{content}"
+        );
+        assert_eq!(
+            content["response_evidence"].as_array().map(Vec::len),
+            Some(expected_calls),
+            "{content}"
+        );
+        assert_eq!(requests.lock().expect("request log").len(), expected_calls);
+        assert_private_regular_active_lease(&lease_root);
+        mcp.terminate();
+        let _ = fs::remove_dir_all(lease_root);
+    }
 }
 
 #[test]

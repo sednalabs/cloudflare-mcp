@@ -1352,25 +1352,33 @@ fn result_rows(
             ));
         }
     }
-    if let Some(meta) = object.get("meta") {
-        let meta = meta.as_object().ok_or_else(|| {
+    let meta = object
+        .get("meta")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
             reconciliation_error(
                 "contradictory",
-                "d1.migration_reconciliation_meta_malformed",
-                "provider result metadata was not an object",
+                "d1.migration_reconciliation_primary_evidence_contradictory",
+                "provider result metadata did not prove that the fixed result set was served by the primary",
             )
         })?;
-        let changed_db_valid = meta
-            .get("changed_db")
-            .is_none_or(|value| value == &Value::Bool(false));
-        let exact_zero = |key: &str| meta.get(key).is_none_or(|value| value.as_i64() == Some(0));
-        if !changed_db_valid || !exact_zero("changes") || !exact_zero("rows_written") {
-            return Err(reconciliation_error(
-                "contradictory",
-                "d1.migration_reconciliation_read_only_meta_contradictory",
-                "provider metadata was malformed or contradicted the internally constructed read-only batch",
-            ));
-        }
+    if meta.get("served_by_primary") != Some(&Value::Bool(true)) {
+        return Err(reconciliation_error(
+            "contradictory",
+            "d1.migration_reconciliation_primary_evidence_contradictory",
+            "provider result metadata did not prove that the fixed result set was served by the primary",
+        ));
+    }
+    let changed_db_valid = meta
+        .get("changed_db")
+        .is_none_or(|value| value == &Value::Bool(false));
+    let exact_zero = |key: &str| meta.get(key).is_none_or(|value| value.as_i64() == Some(0));
+    if !changed_db_valid || !exact_zero("changes") || !exact_zero("rows_written") {
+        return Err(reconciliation_error(
+            "contradictory",
+            "d1.migration_reconciliation_read_only_meta_contradictory",
+            "provider metadata was malformed or contradicted the internally constructed read-only batch",
+        ));
     }
     let rows = object
         .get("results")
@@ -2130,13 +2138,16 @@ mod tests {
             row.insert("__cf_mcp_row_kind".to_string(), json!(1));
             tagged.push(Value::Object(row));
         }
+        let mut meta = meta.unwrap_or_else(|| json!({}));
+        meta.as_object_mut()
+            .expect("test result metadata object")
+            .entry("served_by_primary".to_string())
+            .or_insert_with(|| json!(true));
         let mut result = json!({"success": true, "results": tagged});
-        if let Some(meta) = meta {
-            result
-                .as_object_mut()
-                .expect("test result object")
-                .insert("meta".to_string(), meta);
-        }
+        result
+            .as_object_mut()
+            .expect("test result object")
+            .insert("meta".to_string(), meta);
         result
     }
 
@@ -2285,6 +2296,65 @@ mod tests {
             Some(json!({"changed_db": false, "changes": 0, "rows_written": 0})),
         );
         assert!(result_rows(&valid, &statement, PROOF).is_ok());
+
+        let mut missing_meta = valid.clone();
+        missing_meta
+            .as_object_mut()
+            .expect("result object")
+            .remove("meta");
+        let mut non_object_meta = valid.clone();
+        non_object_meta["meta"] = Value::Null;
+        let mut missing_primary = valid.clone();
+        missing_primary["meta"]
+            .as_object_mut()
+            .expect("metadata object")
+            .remove("served_by_primary");
+        let mut false_primary = valid.clone();
+        false_primary["meta"]["served_by_primary"] = json!(false);
+        let mut null_primary = valid.clone();
+        null_primary["meta"]["served_by_primary"] = Value::Null;
+        let mut wrong_type_primary = valid.clone();
+        wrong_type_primary["meta"]["served_by_primary"] = json!("true");
+        for candidate in [
+            missing_meta,
+            non_object_meta,
+            missing_primary,
+            false_primary,
+            null_primary,
+            wrong_type_primary,
+        ] {
+            let error = result_rows(&candidate, &statement, PROOF)
+                .expect_err("primary-current evidence must be exact");
+            let content = error.structured_content.expect("structured primary error");
+            assert_eq!(
+                content["error"]["code"],
+                "d1.migration_reconciliation_primary_evidence_contradictory"
+            );
+        }
+    }
+
+    #[test]
+    fn complete_batch_requires_primary_evidence_for_every_fixed_result_set() {
+        let manifest = manifest("CREATE TABLE items(id INTEGER PRIMARY KEY);");
+        let query = build_fixed_query("d1_migrations", 1, &[], &[], PROOF);
+        let valid_result_sets = query
+            .statements
+            .iter()
+            .map(|statement| tagged_result(statement, PROOF, Vec::new(), None))
+            .collect::<Vec<_>>();
+        for index in 0..valid_result_sets.len() {
+            let mut mixed = valid_result_sets.clone();
+            mixed[index]["meta"]["served_by_primary"] = json!(false);
+            let error =
+                parse_complete_batch(&Value::Array(mixed), &query.statements, PROOF, &manifest)
+                    .expect_err("one non-primary result set must fail the complete batch");
+            let content = error.structured_content.expect("structured primary error");
+            assert_eq!(
+                content["error"]["code"],
+                "d1.migration_reconciliation_primary_evidence_contradictory",
+                "result set {index}"
+            );
+        }
     }
 
     #[test]

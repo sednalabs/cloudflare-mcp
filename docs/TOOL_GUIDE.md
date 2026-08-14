@@ -87,8 +87,11 @@ expected schema state for every prefix from zero through the full manifest.
 The tool derives every CREATE TABLE/INDEX target from the manifest and rejects
 omissions, additions, data-producing CREATE forms, malformed result metadata,
 and result sets whose query-bound statement marker is absent or changed. It
-performs two bounded read-only batches and never retires custody evidence or
-authorizes an apply retry. A null `lease_retained` with
+also requires every fixed result set in both batches to carry exact
+`meta.served_by_primary=true` evidence; absent, false, null, non-boolean, or
+mixed primary markers are contradictory and cannot support positive
+reconciliation. It performs two bounded read-only batches and never retires
+custody evidence or authorizes an apply retry. A null `lease_retained` with
 `custody_status=not_inspected` or `inspection_failed` means no retained lease
 was acquired or proven by that call; it is not evidence that custody was
 removed. Likewise, `custody_status=retained_evidence_unverified` after a
