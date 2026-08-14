@@ -1766,6 +1766,11 @@ mod tests {
         let (entered_tx, entered_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
         linux::install_guard_pause_hook(root.clone(), entered_tx, resume_rx);
+        let first_root = root.clone();
+        let first = std::thread::spawn(move || {
+            acquire_d1_migration_lease_at(first_root, "acct-1", "db-1", "first", &"a".repeat(64))
+        });
+        entered_rx.recv().expect("first holds guard");
         let unrelated_root = private_test_root("race-unrelated");
         let mut unrelated = acquire_d1_migration_lease_at(
             unrelated_root.clone(),
@@ -1774,14 +1779,9 @@ mod tests {
             "unrelated",
             &"c".repeat(64),
         )
-        .expect("unrelated root must not consume the scoped pause hook");
+        .expect("unrelated root must complete while the scoped owner remains paused");
         unrelated.release().expect("retire unrelated lease");
         fs::remove_dir_all(unrelated_root).expect("unrelated test cleanup");
-        let first_root = root.clone();
-        let first = std::thread::spawn(move || {
-            acquire_d1_migration_lease_at(first_root, "acct-1", "db-1", "first", &"a".repeat(64))
-        });
-        entered_rx.recv().expect("first holds guard");
         let contender = acquire_d1_migration_lease_at(
             root.clone(),
             "acct-1",
