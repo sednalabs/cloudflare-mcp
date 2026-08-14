@@ -1966,7 +1966,7 @@ fn contextualize_error(
         }
         content.insert("query_sha256".to_string(), json!(query_sha256));
         prepend_response_evidence(content, response_evidence);
-        prepend_provider_lifecycle(content, response_evidence);
+        synchronize_provider_lifecycle_with_response_evidence(content);
         content.insert("provider_mutations".to_string(), json!(0));
         content.insert("local_namespace_mutations".to_string(), json!(0));
         let provider_calls = content
@@ -2004,7 +2004,7 @@ fn contextualize_unverified_custody_error(
         );
         content.insert("query_sha256".to_string(), json!(query_sha256));
         prepend_response_evidence(content, response_evidence);
-        prepend_provider_lifecycle(content, response_evidence);
+        synchronize_provider_lifecycle_with_response_evidence(content);
         content.insert("provider_calls".to_string(), json!(provider_calls));
         content.insert("provider_mutations".to_string(), json!(0));
         content.insert("local_namespace_mutations".to_string(), json!(0));
@@ -2051,9 +2051,14 @@ fn prepend_response_evidence(content: &mut serde_json::Map<String, Value>, prior
     content.insert("response_evidence".to_string(), Value::Array(merged));
 }
 
-fn prepend_provider_lifecycle(content: &mut serde_json::Map<String, Value>, prior: &[Value]) {
-    let mut lifecycle = prior
-        .iter()
+fn synchronize_provider_lifecycle_with_response_evidence(
+    content: &mut serde_json::Map<String, Value>,
+) {
+    let lifecycle = content
+        .get("response_evidence")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
         .filter_map(|evidence| evidence.get("lifecycle").cloned())
         .collect::<Vec<_>>();
     if lifecycle.is_empty() {
@@ -2061,9 +2066,6 @@ fn prepend_provider_lifecycle(content: &mut serde_json::Map<String, Value>, prio
             .entry("provider_read_lifecycle".to_string())
             .or_insert_with(|| json!([]));
         return;
-    }
-    if let Some(Value::Array(current)) = content.get("provider_read_lifecycle") {
-        lifecycle.extend(current.iter().cloned());
     }
     content.insert(
         "provider_read_lifecycle".to_string(),
@@ -2446,22 +2448,61 @@ mod tests {
 
     #[test]
     fn lease_revalidation_drift_remains_unverified_after_outer_context() {
-        let drift = contextualize_unverified_custody_error(
+        let response_evidence = json!([
+            {
+                "response_body_sha256": PROOF,
+                "response_body_size_bytes": 101,
+                "lifecycle": {
+                    "dispatch_stage": "attempted",
+                    "response_stage": "received",
+                    "body_stage": "completely_read",
+                    "http_status": 200,
+                },
+            },
+            {
+                "response_body_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "response_body_size_bytes": 102,
+                "lifecycle": {
+                    "dispatch_stage": "attempted",
+                    "response_stage": "received",
+                    "body_stage": "completely_read",
+                    "http_status": 200,
+                },
+            },
+        ]);
+        let wrapped = contextualize_unverified_custody_error(
             reconciliation_error(
                 "contradictory",
                 "d1.migration_reconciliation_lease_changed",
                 "retained evidence changed",
             ),
             Some(PROOF),
-            &[json!({"response_body_sha256": PROOF})],
-            1,
+            response_evidence.as_array().expect("response evidence"),
+            2,
         );
-        let wrapped = contextualize_error(drift, Some(PROOF), &[], 1);
         let content = wrapped.structured_content.expect("structured drift");
         assert_eq!(content["lease_decision"], "retain");
         assert_eq!(content["lease_retained"], Value::Null);
         assert_eq!(content["custody_status"], "retained_evidence_unverified");
         assert_eq!(content["provider_calls"], 2);
+        assert_eq!(content["response_evidence"], response_evidence);
+        assert_eq!(
+            content["provider_read_lifecycle"],
+            json!([
+                {
+                    "dispatch_stage": "attempted",
+                    "response_stage": "received",
+                    "body_stage": "completely_read",
+                    "http_status": 200,
+                },
+                {
+                    "dispatch_stage": "attempted",
+                    "response_stage": "received",
+                    "body_stage": "completely_read",
+                    "http_status": 200,
+                },
+            ])
+        );
     }
 
     #[test]
@@ -2521,54 +2562,137 @@ mod tests {
 
     #[test]
     fn outer_context_prepends_prior_response_evidence_without_losing_inner_evidence() {
+        let first = json!({
+            "response_body_sha256": "first",
+            "lifecycle": {
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 200,
+            },
+        });
+        let second_evidence = json!({
+            "response_body_sha256": "second",
+            "lifecycle": {
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 503,
+            },
+        });
         let second = contextualize_error(
             reconciliation_error_with_evidence(
                 "unavailable",
                 "d1.migration_reconciliation_provider_unavailable",
                 "second provider call failed",
                 Some(PROOF),
-                &[json!({"response_body_sha256": "second"})],
+                &[second_evidence.clone()],
             ),
             Some(PROOF),
             &[],
             1,
         );
-        let merged = contextualize_error(
-            second,
-            Some(PROOF),
-            &[json!({"response_body_sha256": "first"})],
-            1,
-        );
+        let merged = contextualize_error(second, Some(PROOF), &[first.clone()], 1);
         let content = merged.structured_content.expect("merged response evidence");
         assert_eq!(
             content["response_evidence"],
-            json!([
-                {"response_body_sha256": "first"},
-                {"response_body_sha256": "second"},
-            ])
+            json!([first, second_evidence])
         );
         assert_eq!(content["provider_calls"], 2);
+        assert_eq!(
+            content["provider_read_lifecycle"],
+            json!([
+                {
+                    "dispatch_stage": "attempted",
+                    "response_stage": "received",
+                    "body_stage": "completely_read",
+                    "http_status": 200,
+                },
+                {
+                    "dispatch_stage": "attempted",
+                    "response_stage": "received",
+                    "body_stage": "completely_read",
+                    "http_status": 503,
+                },
+            ])
+        );
     }
 
     #[test]
     fn post_read_contradictions_retain_verified_custody_context() {
+        let first = json!({
+            "response_body_sha256": PROOF,
+            "response_body_size_bytes": 101,
+            "lifecycle": {
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 200,
+            },
+        });
+        let second = json!({
+            "response_body_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "response_body_size_bytes": 102,
+            "lifecycle": {
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 200,
+            },
+        });
         let result = contextualize_error(
             reconciliation_error_with_evidence(
                 "contradictory",
                 "d1.migration_reconciliation_evidence_unstable",
                 "stable reads differed",
                 Some(PROOF),
-                &[json!({"response_body_sha256": PROOF})],
+                &[first.clone(), second.clone()],
             ),
             Some(PROOF),
             &[],
             2,
         );
         let content = result.structured_content.expect("structured contradiction");
-        assert_eq!(content["lease_decision"], "retain");
-        assert_eq!(content["lease_retained"], true);
-        assert_eq!(content["custody_status"], "retained_evidence_verified");
-        assert_eq!(content["provider_calls"], 2);
+        assert_eq!(
+            content,
+            json!({
+                "ok": false,
+                "operation": "d1_reconcile_migration_manifest",
+                "dry_run": true,
+                "read_only": true,
+                "status": "reconciliation_required",
+                "outcome": "unknown",
+                "capability_state": "contradictory",
+                "retry_decision": "do_not_retry_same_attempt",
+                "lease_decision": "retain",
+                "lease_retained": true,
+                "custody_status": "retained_evidence_verified",
+                "query_sha256": PROOF,
+                "response_evidence": [first, second],
+                "provider_read_lifecycle": [
+                    {
+                        "dispatch_stage": "attempted",
+                        "response_stage": "received",
+                        "body_stage": "completely_read",
+                        "http_status": 200,
+                    },
+                    {
+                        "dispatch_stage": "attempted",
+                        "response_stage": "received",
+                        "body_stage": "completely_read",
+                        "http_status": 200,
+                    },
+                ],
+                "provider_calls": 2,
+                "provider_mutations": 0,
+                "local_namespace_mutations": 0,
+                "error": {
+                    "code": "d1.migration_reconciliation_evidence_unstable",
+                    "message": "stable reads differed",
+                    "hint": "Retain the exact lease evidence. Do not retry the original migration attempt or mutate D1 from this result.",
+                },
+            })
+        );
     }
 
     #[test]

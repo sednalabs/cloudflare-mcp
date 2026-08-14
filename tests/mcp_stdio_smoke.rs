@@ -897,6 +897,7 @@ enum ReconciliationFault {
     MixedPrimaryMarkers,
     SecondBatchPrimaryFalse,
     SecondBatchHttpStatus(u16),
+    LedgerNotManifestPrefix,
     UnstableSecondBatch,
 }
 
@@ -1182,6 +1183,9 @@ fn spawn_fake_reconciliation_api_with_fault(
                 }
                 ReconciliationFault::SecondBatchPrimaryFalse if request_index == 1 => {
                     results[3]["meta"]["served_by_primary"] = json!(false);
+                }
+                ReconciliationFault::LedgerNotManifestPrefix => {
+                    results[0]["results"][1]["name"] = json!("0099_unknown.sql");
                 }
                 ReconciliationFault::UnstableSecondBatch if request_index == 1 => {
                     results[1]["results"][1]["sql"] =
@@ -4900,62 +4904,125 @@ fn d1_reconcile_migration_manifest_stdio_revalidates_custody_after_provider_erro
 #[test]
 fn d1_reconcile_migration_manifest_stdio_keeps_post_read_contradictions_verified() {
     let (manifest, expectations) = one_table_reconciliation_case();
-    let lease_root = PathBuf::from("/tmp").join(format!(
-        "cloudflare-mcp-reconcile-unstable-{}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&lease_root);
-    fs::create_dir(&lease_root).expect("create unstable reconciliation root");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
-            .expect("make unstable reconciliation root private");
-    }
-    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
-        create_retained_reconciliation_fixture(&lease_root, &manifest);
-    let (base_url, requests) =
-        spawn_fake_reconciliation_api_with_fault(ReconciliationFault::UnstableSecondBatch);
-    let mut mcp = McpStdioProcess::start_with_env(vec![
-        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+    for (index, (fault, expected_code, expected_message)) in [
         (
-            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
-            lease_root.to_string_lossy().to_string(),
+            ReconciliationFault::UnstableSecondBatch,
+            "d1.migration_reconciliation_evidence_unstable",
+            "two complete read-only reconciliation batches were not canonically equivalent",
         ),
-    ]);
-    let response = mcp.call_tool(
-        761,
-        "d1_reconcile_migration_manifest",
-        json!({
-            "database_id": "db-1",
-            "migration_family": "newsletter-core",
-            "manifest": manifest,
-            "approved_plan_sha256": approved_plan_sha256,
-            "lease_nonce": lease_nonce,
-            "lease_payload_sha256": lease_payload_sha256,
-            "effect_assertion_id": "schema_create_only_v1",
-            "state_expectations": expectations,
-        }),
-    );
-    let content = structured_content(&response);
-    assert_eq!(content["ok"], json!(false), "{content}");
-    assert_eq!(
-        content["error"]["code"],
-        json!("d1.migration_reconciliation_evidence_unstable"),
-        "{content}"
-    );
-    assert_eq!(content["lease_decision"], json!("retain"), "{content}");
-    assert_eq!(content["lease_retained"], json!(true), "{content}");
-    assert_eq!(
-        content["custody_status"],
-        json!("retained_evidence_verified"),
-        "{content}"
-    );
-    assert_eq!(content["provider_calls"], json!(2), "{content}");
-    assert_eq!(requests.lock().expect("request log").len(), 2);
-    assert_private_regular_active_lease(&lease_root);
-    mcp.terminate();
-    let _ = fs::remove_dir_all(lease_root);
+        (
+            ReconciliationFault::LedgerNotManifestPrefix,
+            "d1.migration_reconciliation_ledger_not_manifest_prefix",
+            "stable migration ledger is not an exact prefix of the supplied manifest",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let lease_root = PathBuf::from("/tmp").join(format!(
+            "cloudflare-mcp-reconcile-post-read-{}-{index}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&lease_root);
+        fs::create_dir(&lease_root).expect("create post-read reconciliation root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+                .expect("make post-read reconciliation root private");
+        }
+        let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+            create_retained_reconciliation_fixture(&lease_root, &manifest);
+        let (base_url, requests) = spawn_fake_reconciliation_api_with_fault(fault);
+        let mut mcp = McpStdioProcess::start_with_env(vec![
+            ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+            (
+                "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+                lease_root.to_string_lossy().to_string(),
+            ),
+        ]);
+        let response = mcp.call_tool(
+            761 + index as u64,
+            "d1_reconcile_migration_manifest",
+            json!({
+                "database_id": "db-1",
+                "migration_family": "newsletter-core",
+                "manifest": manifest.clone(),
+                "approved_plan_sha256": approved_plan_sha256,
+                "lease_nonce": lease_nonce,
+                "lease_payload_sha256": lease_payload_sha256,
+                "effect_assertion_id": "schema_create_only_v1",
+                "state_expectations": expectations.clone(),
+            }),
+        );
+        let content = structured_content(&response);
+        let query_sha256 = content["query_sha256"].clone();
+        let response_evidence = content["response_evidence"].clone();
+        let evidence = response_evidence
+            .as_array()
+            .expect("two chronological response summaries");
+        assert_eq!(evidence.len(), 2, "{content}");
+        for summary in evidence {
+            assert_eq!(summary.as_object().map(|value| value.len()), Some(3));
+            assert!(summary["response_body_sha256"].as_str().is_some());
+            assert!(summary["response_body_size_bytes"].as_u64().is_some());
+            assert_eq!(
+                summary["lifecycle"],
+                json!({
+                    "dispatch_stage": "attempted",
+                    "response_stage": "received",
+                    "body_stage": "completely_read",
+                    "http_status": 200,
+                })
+            );
+        }
+        let lifecycle = json!([
+            {
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 200,
+            },
+            {
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 200,
+            },
+        ]);
+        assert_eq!(
+            content,
+            &json!({
+                "ok": false,
+                "operation": "d1_reconcile_migration_manifest",
+                "dry_run": true,
+                "read_only": true,
+                "status": "reconciliation_required",
+                "outcome": "unknown",
+                "capability_state": "contradictory",
+                "retry_decision": "do_not_retry_same_attempt",
+                "lease_decision": "retain",
+                "lease_retained": true,
+                "custody_status": "retained_evidence_verified",
+                "query_sha256": query_sha256,
+                "response_evidence": response_evidence,
+                "provider_read_lifecycle": lifecycle,
+                "provider_calls": 2,
+                "provider_mutations": 0,
+                "local_namespace_mutations": 0,
+                "error": {
+                    "code": expected_code,
+                    "message": expected_message,
+                    "hint": "Retain the exact lease evidence. Do not retry the original migration attempt or mutate D1 from this result.",
+                },
+            }),
+            "{content}"
+        );
+        assert_eq!(requests.lock().expect("request log").len(), 2);
+        assert_private_regular_active_lease(&lease_root);
+        mcp.terminate();
+        let _ = fs::remove_dir_all(lease_root);
+    }
 }
 
 #[test]

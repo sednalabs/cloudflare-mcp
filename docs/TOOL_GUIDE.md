@@ -115,6 +115,8 @@ provider call, including an unavailable/error response; a simultaneous custody
 failure preserves the provider classification and response evidence but reports
 `lease_retained=null`. When a later call fails, `response_evidence` remains in
 provider-call order rather than replacing evidence from an earlier call.
+Top-level `provider_read_lifecycle` mirrors the complete lifecycle entries in
+that chronological evidence.
 
 For D1 usage-spike investigations, start with `account_billing_usage` to read
 Cloudflare billing usage records, then use `graphql_analytics_query` for
