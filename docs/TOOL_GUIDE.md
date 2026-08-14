@@ -72,6 +72,7 @@ Use curated D1 tools instead of generic API calls for database workflows:
 - `d1_query_read_only`
 - `d1_execute_write`
 - `d1_apply_migrations`
+- `d1_apply_migration_manifest`
 - `d1_rename_database`
 - `d1_delete_database`
 

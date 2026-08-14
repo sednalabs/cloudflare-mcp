@@ -77,6 +77,59 @@ release artifact bundle so agents can compare:
 - schema snapshot hash versus `spec/tool_schema_snapshot.v1.json`,
 - `/proc/<pid>/exe` hash for any already-running stdio process.
 
+## Exact-byte D1 migration manifests
+
+Use `d1_apply_migration_manifest` for an approval-gated D1 migration family.
+First run it with `dry_run=true`; retain the returned `plan_sha256`, which is
+bound to the exact SQL bytes and current Wrangler ledger prefix. A live call
+must submit that value as `approved_plan_sha256` and configure
+`CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT` to a pre-created, operator-owned,
+non-group/world-writable directory shared by every MCP process that can target
+the database. On Linux the root must be an absolute real directory owned by the
+current operator with mode `0700` (or stricter), and every non-sticky ancestor
+must be non-writable. The MCP permanently creates one private target directory
+per account/database. It retains held root, target, guard and active file
+descriptors while an apply is in progress. The target contains a permanent
+`guard.lock`, acquired with a cross-process file lock, and terminal evidence such as
+`retired.<nonce>.lease.json`; neither is cleanup material. While holding that
+guard, the MCP writes `active.lease.json` with mode `0600` and synchronizes the
+directory. Every active, abort and retirement namespace transition is relative
+to the held target directory descriptor; replacing the target pathname cannot
+redirect it into a replacement directory. It revalidates root, ancestors,
+directory, guard, identity and mode before every provider boundary. Do not use
+a shared writable directory or manually rename or remove any lease evidence by
+pathname.
+
+The exact-byte manifest boundary accepts at most 16 MiB of aggregate SQL and
+moves the supplied manifest into validation without cloning its SQL strings.
+Split a larger migration family before review rather than increasing this
+operator-surface memory bound.
+
+A later invocation stops before provider I/O when it sees an active or
+`retiring.lease.json` entry, including one that is malformed, a symlink or
+non-regular. It must be resolved only through the governed recovery path,
+never inferred stale or reclaimed. Normal terminal completion moves
+the active file under the held guard to `retiring.lease.json`, synchronizes the
+target directory, then records `retired.<nonce>.lease.json` without replacement
+and synchronizes again. A failed synchronization restores the exact active
+entry or leaves active/retiring evidence as an explicit blocker. A failed
+creation is retained as
+`aborted-create.<nonce>.lease.json`; production code never unlinks a lease file
+or directory. The manifest tool never reopens a migration directory after
+review and never retries an ambiguous provider write. An unknown outcome retains
+the active target lease: reconcile provider ledger evidence and the reported
+lease identity before any governed recovery. A matching ledger filename is only
+an observation: it does not attest to the reviewed SQL bytes or complete
+provider transaction, and therefore never authorizes lease release after an
+ambiguous apply. This guarantee is limited to a trusted Linux filesystem that
+supports working `renameat2(RENAME_NOREPLACE)`, directory `fsync`, and advisory
+file locks. It is a shared-filesystem lease, not a Cloudflare-distributed lock;
+cross-host or other shared-filesystem semantics require separate proof.
+Separate provider/distributed coordination remains required when MCP instances
+do not share that root. The product-neutral governed recovery path remains
+required for retained, malformed, or tampered evidence. Non-Linux installations or
+unsupported filesystems fail closed before provider I/O.
+
 For CI-built release bundles, the `Rust Validation` workflow uploads a
 downloadable artifact named `cloudflare-mcp-linux-x86_64-stdio-<git-sha>` that
 contains:

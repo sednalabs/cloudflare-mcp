@@ -170,6 +170,10 @@ impl MutationAuditSession {
             approval: self.approval,
         }
     }
+
+    pub fn set_target(&mut self, target: Value) {
+        self.target = target;
+    }
 }
 
 pub fn emit_mutation_audit_log(record: &MutationAuditRecord) {

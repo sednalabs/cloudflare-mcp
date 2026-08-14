@@ -225,6 +225,12 @@ impl RetryPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum D1EnvelopePolicy {
+    Generic,
+    RequireEmptyErrors,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct CloudflareEnvelope<T> {
     pub(crate) success: bool,
@@ -236,6 +242,18 @@ pub(crate) struct CloudflareEnvelope<T> {
     pub(crate) messages: Vec<CloudflareApiMessage>,
     #[serde(default)]
     pub(crate) result_info: Option<PageInfo>,
+}
+
+/// The manifest migration boundary cannot use the compatibility envelope above:
+/// `errors` is deliberately normalised there so ordinary Cloudflare endpoints
+/// can omit it or return `null`. For a one-time migration write, either shape
+/// is ambiguous evidence and must not be mistaken for an empty error list.
+#[derive(Debug, Deserialize)]
+struct StrictD1MigrationManifestEnvelope<T> {
+    success: bool,
+    result: Option<T>,
+    #[serde(default)]
+    errors: Option<Value>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -314,7 +332,10 @@ impl CloudflareClient {
     ) -> Result<Page<D1Database>, AdapterError> {
         let account_id = require_non_empty("account_id", account_id)?;
         let token = self.bearer_token()?;
-        let url = self.endpoint(&format!("/accounts/{account_id}/d1/database"));
+        let url = self.endpoint(&format!(
+            "/accounts/{}/d1/database",
+            path_segment(account_id)
+        ));
         let name = name.map(str::trim).filter(|value| !value.is_empty());
 
         let envelope: CloudflareEnvelope<Vec<D1Database>> = self
@@ -351,8 +372,9 @@ impl CloudflareClient {
         let database_id = require_non_empty("database_id", database_id)?;
         let token = self.bearer_token()?;
         let url = self.endpoint(&format!(
-            "/accounts/{account_id}/d1/database/{}",
-            path_segment(database_id)
+            "/accounts/{}/d1/database/{}",
+            path_segment(account_id),
+            path_segment(database_id),
         ));
 
         let envelope: CloudflareEnvelope<D1Database> = self
@@ -388,8 +410,9 @@ impl CloudflareClient {
         let name = require_non_empty("name", name)?;
         let token = self.bearer_token()?;
         let url = self.endpoint(&format!(
-            "/accounts/{account_id}/d1/database/{}",
-            path_segment(database_id)
+            "/accounts/{}/d1/database/{}",
+            path_segment(account_id),
+            path_segment(database_id),
         ));
         let body = json!({ "name": name });
 
@@ -425,8 +448,9 @@ impl CloudflareClient {
         let database_id = require_non_empty("database_id", database_id)?;
         let token = self.bearer_token()?;
         let url = self.endpoint(&format!(
-            "/accounts/{account_id}/d1/database/{}",
-            path_segment(database_id)
+            "/accounts/{}/d1/database/{}",
+            path_segment(account_id),
+            path_segment(database_id),
         ));
 
         let envelope: CloudflareEnvelope<Value> = self
@@ -455,6 +479,7 @@ impl CloudflareClient {
         self.execute_d1_query(
             "cloudflare.d1.databases.query",
             RetryPolicy::Idempotent,
+            D1EnvelopePolicy::Generic,
             account_id,
             database_id,
             sql,
@@ -510,6 +535,52 @@ impl CloudflareClient {
         self.execute_d1_query(
             "cloudflare.d1.databases.write",
             RetryPolicy::NonIdempotent,
+            D1EnvelopePolicy::Generic,
+            account_id,
+            database_id,
+            sql,
+            params,
+        )
+        .await
+    }
+
+    /// Query a D1 migration ledger without discarding contradictory outer
+    /// Cloudflare-envelope error evidence. This is intentionally narrower than
+    /// the general D1 query surface: manifest application treats every provider
+    /// ambiguity as a reconciliation boundary.
+    pub async fn query_d1_migration_manifest(
+        &self,
+        account_id: &str,
+        database_id: &str,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Value, AdapterError> {
+        self.execute_d1_query(
+            "cloudflare.d1.migration_manifest.query",
+            RetryPolicy::Idempotent,
+            D1EnvelopePolicy::RequireEmptyErrors,
+            account_id,
+            database_id,
+            sql,
+            params,
+        )
+        .await
+    }
+
+    /// Submit one manifest-owned migration statement. The non-idempotent
+    /// transport policy and strict outer-envelope evidence are both required:
+    /// callers must reconcile rather than retry an ambiguous result.
+    pub async fn execute_d1_migration_manifest_write(
+        &self,
+        account_id: &str,
+        database_id: &str,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Value, AdapterError> {
+        self.execute_d1_query(
+            "cloudflare.d1.migration_manifest.write",
+            RetryPolicy::NonIdempotent,
+            D1EnvelopePolicy::RequireEmptyErrors,
             account_id,
             database_id,
             sql,
@@ -522,6 +593,7 @@ impl CloudflareClient {
         &self,
         operation: &'static str,
         retry_policy: RetryPolicy,
+        envelope_policy: D1EnvelopePolicy,
         account_id: &str,
         database_id: &str,
         sql: &str,
@@ -532,8 +604,9 @@ impl CloudflareClient {
         let sql = require_non_empty("sql", sql)?;
         let token = self.bearer_token()?;
         let url = self.endpoint(&format!(
-            "/accounts/{account_id}/d1/database/{}/query",
-            path_segment(database_id)
+            "/accounts/{}/d1/database/{}/query",
+            path_segment(account_id),
+            path_segment(database_id),
         ));
         let mut body = Map::new();
         body.insert("sql".to_string(), Value::String(sql.to_string()));
@@ -541,15 +614,22 @@ impl CloudflareClient {
             body.insert("params".to_string(), Value::Array(params.to_vec()));
         }
 
-        let envelope: CloudflareEnvelope<Value> = self
-            .send_envelope(operation, retry_policy, || {
-                self.http
-                    .post(url.clone())
-                    .bearer_auth(&token)
-                    .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone())
-                    .json(&Value::Object(body.clone()))
-            })
-            .await?;
+        let request = || {
+            self.http
+                .post(url.clone())
+                .bearer_auth(&token)
+                .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone())
+                .json(&Value::Object(body.clone()))
+        };
+        let envelope: CloudflareEnvelope<Value> = match envelope_policy {
+            D1EnvelopePolicy::Generic => {
+                self.send_envelope(operation, retry_policy, request).await?
+            }
+            D1EnvelopePolicy::RequireEmptyErrors => {
+                self.send_d1_migration_manifest_envelope(operation, retry_policy, request)
+                    .await?
+            }
+        };
 
         Ok(envelope.result.unwrap_or_else(|| json!(null)))
     }
@@ -2442,11 +2522,46 @@ impl CloudflareClient {
         &self,
         operation: &'static str,
         retry_policy: RetryPolicy,
-        mut request_builder: F,
+        request_builder: F,
     ) -> Result<CloudflareEnvelope<T>, AdapterError>
     where
         T: DeserializeOwned,
         F: FnMut() -> reqwest::RequestBuilder,
+    {
+        self.send_envelope_with_decoder(operation, retry_policy, request_builder, |body| {
+            decode_cloudflare_envelope(body)
+        })
+        .await
+    }
+
+    /// The manifest migration path has stricter outer-envelope semantics than
+    /// generic D1 calls. It rejects omitted, null, non-array, and non-empty
+    /// `errors` before returning a result to the migration state machine.
+    async fn send_d1_migration_manifest_envelope<F>(
+        &self,
+        operation: &'static str,
+        retry_policy: RetryPolicy,
+        request_builder: F,
+    ) -> Result<CloudflareEnvelope<Value>, AdapterError>
+    where
+        F: FnMut() -> reqwest::RequestBuilder,
+    {
+        self.send_envelope_with_decoder(operation, retry_policy, request_builder, |body| {
+            decode_strict_d1_migration_manifest_envelope(body)
+        })
+        .await
+    }
+
+    async fn send_envelope_with_decoder<T, F, D>(
+        &self,
+        operation: &'static str,
+        retry_policy: RetryPolicy,
+        mut request_builder: F,
+        decode: D,
+    ) -> Result<T, AdapterError>
+    where
+        F: FnMut() -> reqwest::RequestBuilder,
+        D: Fn(&str) -> Result<T, AdapterError>,
     {
         let mut attempt = 0u32;
         let max_attempts = self.cfg.max_retries;
@@ -2504,19 +2619,7 @@ impl CloudflareClient {
                 return Err(http_status_error(status, &body));
             }
 
-            let envelope: CloudflareEnvelope<T> = serde_json::from_str(&body).map_err(|err| {
-                AdapterError::new(
-                    "cloudflare.decode_error",
-                    format!("failed decoding Cloudflare envelope: {err}"),
-                    "Verify Cloudflare endpoint compatibility with expected response schema.",
-                )
-            })?;
-
-            if !envelope.success {
-                return Err(api_error(&envelope.errors));
-            }
-
-            return Ok(envelope);
+            return decode(&body);
         }
     }
 
@@ -2955,6 +3058,77 @@ where
     T: Deserialize<'de>,
 {
     Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn decode_cloudflare_envelope<T>(body: &str) -> Result<CloudflareEnvelope<T>, AdapterError>
+where
+    T: DeserializeOwned,
+{
+    let envelope: CloudflareEnvelope<T> = serde_json::from_str(body).map_err(|err| {
+        AdapterError::new(
+            "cloudflare.decode_error",
+            format!("failed decoding Cloudflare envelope: {err}"),
+            "Verify Cloudflare endpoint compatibility with expected response schema.",
+        )
+    })?;
+    if !envelope.success {
+        return Err(api_error(&envelope.errors));
+    }
+    Ok(envelope)
+}
+
+fn decode_strict_d1_migration_manifest_envelope(
+    body: &str,
+) -> Result<CloudflareEnvelope<Value>, AdapterError> {
+    let envelope: StrictD1MigrationManifestEnvelope<Value> =
+        serde_json::from_str(body).map_err(|err| {
+            AdapterError::new(
+                "cloudflare.d1.migration_manifest_malformed_envelope",
+                format!("failed decoding strict D1 migration-manifest envelope: {err}"),
+                "Treat the manifest operation as ambiguous and reconcile the exact provider ledger before another apply.",
+            )
+        })?;
+
+    let errors = match envelope.errors {
+        Some(Value::Array(errors)) if errors.is_empty() => Vec::new(),
+        Some(Value::Array(_)) => {
+            return Err(AdapterError::new(
+                "cloudflare.d1.migration_manifest_contradictory_envelope",
+                "Cloudflare D1 migration-manifest envelope reported a non-empty errors array",
+                "Treat the manifest operation as ambiguous and reconcile the exact provider ledger before another apply.",
+            ));
+        }
+        Some(Value::Null) | None => {
+            return Err(AdapterError::new(
+                "cloudflare.d1.migration_manifest_malformed_envelope",
+                "Cloudflare D1 migration-manifest envelope omitted errors or supplied null",
+                "Treat the manifest operation as ambiguous and reconcile the exact provider ledger before another apply.",
+            ));
+        }
+        Some(_) => {
+            return Err(AdapterError::new(
+                "cloudflare.d1.migration_manifest_malformed_envelope",
+                "Cloudflare D1 migration-manifest envelope errors field was not an array",
+                "Treat the manifest operation as ambiguous and reconcile the exact provider ledger before another apply.",
+            ));
+        }
+    };
+
+    if !envelope.success {
+        return Err(AdapterError::new(
+            "cloudflare.d1.migration_manifest_unsuccessful_envelope",
+            "Cloudflare D1 migration-manifest envelope did not report success",
+            "Treat the manifest operation as ambiguous and reconcile the exact provider ledger before another apply.",
+        ));
+    }
+
+    Ok(CloudflareEnvelope {
+        success: true,
+        result: envelope.result,
+        errors,
+        messages: Vec::new(),
+        result_info: None,
+    })
 }
 
 fn header_value(name: &'static str, value: &str) -> Result<HeaderValue, AdapterError> {
@@ -3563,7 +3737,7 @@ mod tests {
     use std::time::Duration;
 
     use axum::body::{Body, Bytes};
-    use axum::extract::{Path, Query, State};
+    use axum::extract::{OriginalUri, Path, Query, State};
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::Response;
     use axum::routing::{get, post, put};
@@ -3623,6 +3797,29 @@ mod tests {
     #[test]
     fn path_segment_encodes_separators() {
         assert_eq!(path_segment("zone/one two"), "zone%2Fone%20two");
+    }
+
+    #[tokio::test]
+    async fn d1_account_and_database_path_segments_cannot_inject_path_query_or_fragment() {
+        async fn query(OriginalUri(uri): OriginalUri) -> Json<Value> {
+            assert_eq!(
+                uri.to_string(),
+                "/accounts/acct%2Fone%3Fnext%3D1%23fragment/d1/database/db%2Fone%3Fnext%3D1%23fragment/query"
+            );
+            Json(json!({"success": true, "errors": [], "messages": [], "result": []}))
+        }
+
+        let base = spawn_router(Router::new().route("/{*path}", post(query))).await;
+        let client = CloudflareClient::new(test_config(base)).expect("client");
+        client
+            .query_d1_database(
+                "acct/one?next=1#fragment",
+                "db/one?next=1#fragment",
+                "SELECT 1",
+                &[],
+            )
+            .await
+            .expect("encoded D1 query");
     }
 
     #[tokio::test]
