@@ -19,6 +19,33 @@ fn sha256_hex(value: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn expected_d1_reconciliation_semantic_error(code: &str, message: &str, hint: &str) -> Value {
+    json!({
+        "ok": false,
+        "operation": "d1_reconcile_migration_manifest",
+        "dry_run": true,
+        "read_only": true,
+        "status": "reconciliation_required",
+        "outcome": "unknown",
+        "capability_state": "contradictory",
+        "retry_decision": "do_not_retry_same_attempt",
+        "lease_decision": "not_acquired",
+        "lease_retained": null,
+        "custody_status": "not_inspected",
+        "query_sha256": null,
+        "response_evidence": [],
+        "provider_calls": 0,
+        "provider_read_lifecycle": [],
+        "provider_mutations": 0,
+        "local_namespace_mutations": 0,
+        "error": {
+            "code": code,
+            "message": message,
+            "hint": hint,
+        },
+    })
+}
+
 fn fixture_material(label: &str) -> String {
     let mut value = String::from("fixture-");
     value.push_str(label);
@@ -4191,6 +4218,120 @@ fn d1_apply_migration_manifest_response_loss_stops_without_retry_and_next_proces
         "response loss",
     );
     let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_reconcile_migration_manifest_stdio_wraps_semantic_validation_in_fixed_order() {
+    fn args(manifest: Value, migration_family: &str) -> Value {
+        json!({
+            "account_id": "acct-1",
+            "database_id": "db-1",
+            "migration_family": migration_family,
+            "manifest": manifest,
+            "approved_plan_sha256": "a".repeat(64),
+            "lease_nonce": "b".repeat(64),
+            "lease_payload_sha256": "c".repeat(64),
+            "effect_assertion_id": "schema_create_only_v1",
+            "state_expectations": [],
+        })
+    }
+
+    let sql = "CREATE TABLE items(id INTEGER PRIMARY KEY);";
+    let valid_manifest = json!([{
+        "name": "0001_create.sql",
+        "size_bytes": sql.len(),
+        "sql_sha256": sha256_hex(sql),
+        "sql": sql,
+    }]);
+    let mut digest_drift = valid_manifest.clone();
+    digest_drift[0]["sql_sha256"] = json!("0".repeat(64));
+
+    let mut invalid_target = args(json!([]), "bad family");
+    invalid_target["account_id"] = json!(" acct-1");
+    invalid_target["migrations_table"] = json!("bad-name");
+    let mut invalid_table = args(json!([]), "bad family");
+    invalid_table["migrations_table"] = json!("bad-name");
+    let cases = [
+        (
+            "target precedes every later invalid field",
+            invalid_target,
+            expected_d1_reconciliation_semantic_error(
+                "d1.invalid_manifest_target_identity",
+                "account_id must be a non-empty canonical identifier, not a dot path segment, and without surrounding whitespace",
+                "Use the exact account_id and database_id read from the intended Cloudflare resource.",
+            ),
+        ),
+        (
+            "table precedes manifest and family",
+            invalid_table,
+            expected_d1_reconciliation_semantic_error(
+                "d1.invalid_migrations_table",
+                "migrations_table must be an ASCII SQL identifier with at most 64 characters",
+                "Use a simple table name such as d1_migrations.",
+            ),
+        ),
+        (
+            "empty manifest precedes family",
+            args(json!([]), "bad family"),
+            expected_d1_reconciliation_semantic_error(
+                "d1.empty_migration_manifest",
+                "manifest must contain at least one exact migration",
+                "Provide the complete approved migration manifest in lexical Wrangler order.",
+            ),
+        ),
+        (
+            "manifest digest drift precedes family",
+            args(digest_drift, "bad family"),
+            expected_d1_reconciliation_semantic_error(
+                "d1.manifest_sha256_mismatch",
+                "manifest sql_sha256 does not match the supplied exact SQL bytes",
+                "Recompute SHA-256 from the same SQL string that will be applied.",
+            ),
+        ),
+        (
+            "family is wrapped after earlier fields validate",
+            args(valid_manifest, "bad family"),
+            expected_d1_reconciliation_semantic_error(
+                "d1.invalid_migration_family",
+                "migration_family must be 1..128 ASCII letters, digits, '.', '_', '-', or ':' characters",
+                "Use a stable operator-facing family label such as newsletter-core.",
+            ),
+        ),
+    ];
+    let mut mcp = McpStdioProcess::start_with_env(vec![(
+        "CLOUDFLARE_MCP_API_BASE_URL",
+        "http://127.0.0.1:9".to_string(),
+    )]);
+    for (index, (label, arguments, expected)) in cases.into_iter().enumerate() {
+        let response = mcp.call_tool(
+            730 + index as u64,
+            "d1_reconcile_migration_manifest",
+            arguments,
+        );
+        assert_eq!(structured_content(&response), &expected, "{label}");
+    }
+
+    let schema_error = mcp.call_tool(
+        735,
+        "d1_reconcile_migration_manifest",
+        json!({"database_id": 42}),
+    );
+    assert_eq!(
+        schema_error,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 735,
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": "failed to deserialize parameters: invalid type: integer `42`, expected a string",
+                }],
+                "isError": true,
+            },
+        }),
+        "schema parsing must remain outside semantic tool execution",
+    );
+    mcp.terminate();
 }
 
 #[test]

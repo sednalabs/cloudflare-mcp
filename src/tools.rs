@@ -48,7 +48,8 @@ use crate::d1_migration_manifest::{
     validate_d1_migration_manifest,
 };
 use crate::d1_migration_reconciliation::{
-    D1ReconcileMigrationManifestArgs, reconcile_d1_migration_manifest,
+    D1ReconcileMigrationManifestArgs, contextualize_d1_reconciliation_semantic_error,
+    reconcile_d1_migration_manifest,
 };
 use crate::dns_route::{
     DnsRouteConflict, DnsRouteVerificationState, plan_dns_route_reconciliation, verify_dns_route,
@@ -5066,26 +5067,34 @@ impl CloudflareMcp {
             if let Err(result) =
                 normalize_d1_manifest_target(requested_account_id, &requested_database_id)
             {
-                return Ok(result);
+                return Ok(contextualize_d1_reconciliation_semantic_error(result));
             }
         }
         let resolved_account_id = resolve_account_id(self, requested_account_id.as_deref())?;
         let target = match normalize_d1_manifest_target(resolved_account_id, &requested_database_id)
         {
             Ok(target) => target,
-            Err(result) => return Ok(result),
+            Err(result) => {
+                return Ok(contextualize_d1_reconciliation_semantic_error(result));
+            }
         };
         let migrations_table = match normalize_d1_migrations_table(migrations_table.as_deref()) {
             Ok(table) => table,
-            Err(result) => return Ok(result),
+            Err(result) => {
+                return Ok(contextualize_d1_reconciliation_semantic_error(result));
+            }
         };
         let manifest = match validate_d1_migration_manifest(manifest) {
             Ok(manifest) => manifest,
-            Err(result) => return Ok(result),
+            Err(result) => {
+                return Ok(contextualize_d1_reconciliation_semantic_error(result));
+            }
         };
         let family = match normalize_d1_migration_family(&migration_family) {
             Ok(family) => family,
-            Err(result) => return Ok(result),
+            Err(result) => {
+                return Ok(contextualize_d1_reconciliation_semantic_error(result));
+            }
         };
         Ok(reconcile_d1_migration_manifest(
             self,
@@ -13344,15 +13353,16 @@ mod tests {
         ApiReadArgs, ApplyAccessAllowlistArgs, BindingsDiscoverArgs, CapabilitiesCheckArgs,
         CloudflareMcp, ConnectorControlArgs, D1ApplyMigrationManifestArgs, D1ApplyMigrationsArgs,
         D1InspectSchemaArgs, D1ListDatabasesArgs, D1MigrationManifestEntry, D1QueryArgs,
-        D1ValidateQueryArgs, EmergencyUnpublishArgs, EnsureTunnelArgs, FindToolsArgs,
-        GenerateTunnelIngressArgs, GraphqlAnalyticsQueryArgs, LockFirstPublishArgs,
-        MAX_D1_MIGRATION_MANIFEST_BYTES, PagesDeploymentActionArgs, PagesUpdateProjectArgs,
-        PatchWorkerSettingsArgs, PortalAgentRequestArgs, QueueHealthArgs, UpsertAccessAppArgs,
-        UpsertDnsCnameArgs, VerifyHttpGateArgs, WafEventFilterInput, WafSecurityEventsSummaryArgs,
-        WafTimeWindow, WorkersObservabilityListKeysArgs, WorkersObservabilityListValuesArgs,
-        WorkersObservabilityQueryEventsArgs, WorkersObservabilityTimeframe,
-        WorkersUploadScriptArgs, build_waf_security_events_query, normalize_waf_group_by,
-        normalize_waf_phases, query_mentions_waf, waf_security_events_filter,
+        D1ReconcileMigrationManifestArgs, D1ValidateQueryArgs, EmergencyUnpublishArgs,
+        EnsureTunnelArgs, FindToolsArgs, GenerateTunnelIngressArgs, GraphqlAnalyticsQueryArgs,
+        LockFirstPublishArgs, MAX_D1_MIGRATION_MANIFEST_BYTES, PagesDeploymentActionArgs,
+        PagesUpdateProjectArgs, PatchWorkerSettingsArgs, PortalAgentRequestArgs, QueueHealthArgs,
+        UpsertAccessAppArgs, UpsertDnsCnameArgs, VerifyHttpGateArgs, WafEventFilterInput,
+        WafSecurityEventsSummaryArgs, WafTimeWindow, WorkersObservabilityListKeysArgs,
+        WorkersObservabilityListValuesArgs, WorkersObservabilityQueryEventsArgs,
+        WorkersObservabilityTimeframe, WorkersUploadScriptArgs, build_waf_security_events_query,
+        normalize_waf_group_by, normalize_waf_phases, query_mentions_waf,
+        waf_security_events_filter,
     };
     use crate::cloudflare::CloudflareClient;
     use crate::cloudflare::model::WorkerScript;
@@ -13372,6 +13382,33 @@ mod tests {
         value.push_str(label);
         value.push_str("-value");
         value
+    }
+
+    fn expected_d1_reconciliation_semantic_error(code: &str, message: &str, hint: &str) -> Value {
+        json!({
+            "ok": false,
+            "operation": "d1_reconcile_migration_manifest",
+            "dry_run": true,
+            "read_only": true,
+            "status": "reconciliation_required",
+            "outcome": "unknown",
+            "capability_state": "contradictory",
+            "retry_decision": "do_not_retry_same_attempt",
+            "lease_decision": "not_acquired",
+            "lease_retained": null,
+            "custody_status": "not_inspected",
+            "query_sha256": null,
+            "response_evidence": [],
+            "provider_calls": 0,
+            "provider_read_lifecycle": [],
+            "provider_mutations": 0,
+            "local_namespace_mutations": 0,
+            "error": {
+                "code": code,
+                "message": message,
+                "hint": hint,
+            },
+        })
     }
 
     fn test_server(base_url: String) -> CloudflareMcp {
@@ -16334,6 +16371,100 @@ mod tests {
             error.structured_content.expect("structured error")["error"]["code"],
             json!("d1.migration_manifest_too_large")
         );
+    }
+
+    #[tokio::test]
+    async fn d1_reconciliation_semantic_validation_is_zero_effect_and_ordered() {
+        fn args(
+            account_id: Option<&str>,
+            migrations_table: Option<&str>,
+            manifest: Vec<D1MigrationManifestEntry>,
+            migration_family: &str,
+        ) -> D1ReconcileMigrationManifestArgs {
+            D1ReconcileMigrationManifestArgs {
+                account_id: account_id.map(str::to_string),
+                database_id: "db-1".to_string(),
+                migration_family: migration_family.to_string(),
+                migrations_table: migrations_table.map(str::to_string),
+                manifest,
+                approved_plan_sha256: "a".repeat(64),
+                lease_nonce: "b".repeat(64),
+                lease_payload_sha256: "c".repeat(64),
+                effect_assertion_id: Some("schema_create_only_v1".to_string()),
+                state_expectations: Vec::new(),
+            }
+        }
+
+        let sql = "CREATE TABLE items(id INTEGER PRIMARY KEY);".to_string();
+        let valid = D1MigrationManifestEntry {
+            name: "0001_create.sql".to_string(),
+            size_bytes: sql.len() as u64,
+            sql_sha256: super::sha256_hex(&sql),
+            sql,
+        };
+        let mut digest_drift = valid.clone();
+        digest_drift.sql_sha256 = "0".repeat(64);
+        let cases = [
+            (
+                "target precedes every later invalid field",
+                args(Some(" acct-1"), Some("bad-name"), Vec::new(), "bad family"),
+                expected_d1_reconciliation_semantic_error(
+                    "d1.invalid_manifest_target_identity",
+                    "account_id must be a non-empty canonical identifier, not a dot path segment, and without surrounding whitespace",
+                    "Use the exact account_id and database_id read from the intended Cloudflare resource.",
+                ),
+            ),
+            (
+                "table precedes manifest and family",
+                args(Some("acct-1"), Some("bad-name"), Vec::new(), "bad family"),
+                expected_d1_reconciliation_semantic_error(
+                    "d1.invalid_migrations_table",
+                    "migrations_table must be an ASCII SQL identifier with at most 64 characters",
+                    "Use a simple table name such as d1_migrations.",
+                ),
+            ),
+            (
+                "empty manifest precedes family",
+                args(Some("acct-1"), None, Vec::new(), "bad family"),
+                expected_d1_reconciliation_semantic_error(
+                    "d1.empty_migration_manifest",
+                    "manifest must contain at least one exact migration",
+                    "Provide the complete approved migration manifest in lexical Wrangler order.",
+                ),
+            ),
+            (
+                "manifest digest drift precedes family",
+                args(Some("acct-1"), None, vec![digest_drift], "bad family"),
+                expected_d1_reconciliation_semantic_error(
+                    "d1.manifest_sha256_mismatch",
+                    "manifest sql_sha256 does not match the supplied exact SQL bytes",
+                    "Recompute SHA-256 from the same SQL string that will be applied.",
+                ),
+            ),
+            (
+                "family is wrapped after earlier fields validate",
+                args(Some("acct-1"), None, vec![valid], "bad family"),
+                expected_d1_reconciliation_semantic_error(
+                    "d1.invalid_migration_family",
+                    "migration_family must be 1..128 ASCII letters, digits, '.', '_', '-', or ':' characters",
+                    "Use a stable operator-facing family label such as newsletter-core.",
+                ),
+            ),
+        ];
+        let server = test_server("http://127.0.0.1:9".to_string());
+        for (label, args, expected) in cases {
+            let result = server
+                .cloudflare_d1_reconcile_migration_manifest(Parameters(args))
+                .await
+                .expect("semantic validation result");
+            assert_eq!(
+                result
+                    .structured_content
+                    .expect("structured validation error"),
+                expected,
+                "{label}",
+            );
+        }
     }
 
     #[tokio::test]

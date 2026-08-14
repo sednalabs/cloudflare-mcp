@@ -198,6 +198,14 @@ Both are before provider-adapter invocation and must explicitly return
 `provider_calls=0` with `provider_read_lifecycle=[]`; missing fields are not
 zero-call evidence. Adapter-local token/config failure is different: it records
 one `pre_dispatch` lifecycle entry even though its provider-call count is zero.
+Public semantic validation is ordered target, migrations table, manifest, then
+migration family. Any failure there returns the complete fail-closed
+reconciliation envelope with contradictory capability, uninspected custody,
+null query digest, empty response/lifecycle evidence, and zero provider or
+local mutations; it does not acquire lease custody or contact D1. JSON-RPC and
+generated-schema parse failures remain MCP deserialization errors without a
+structured reconciliation envelope because semantic tool execution has not
+begun.
 Only a successfully acquired and revalidated retained lease may report
 `lease_retained=true` and `custody_status=retained_evidence_verified`. If that
 evidence drifts, conflicts, or fails revalidation around a provider read, the

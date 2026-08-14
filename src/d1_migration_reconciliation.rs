@@ -26,6 +26,43 @@ use crate::server::CloudflareMcp;
 use crate::tools::{D1MigrationManifestEntry, sha256_bytes_hex};
 
 const OPERATION: &str = "d1_reconcile_migration_manifest";
+
+pub(crate) fn contextualize_d1_reconciliation_semantic_error(
+    result: CallToolResult,
+) -> CallToolResult {
+    let error = result
+        .structured_content
+        .as_ref()
+        .and_then(|content| content.get("error"))
+        .cloned()
+        .unwrap_or_else(|| {
+            json!({
+                "code": "d1.migration_reconciliation_invalid_request",
+                "message": "migration reconciliation request validation failed closed",
+                "hint": "Correct the bounded request fields before another reconciliation attempt.",
+            })
+        });
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": OPERATION,
+        "dry_run": true,
+        "read_only": true,
+        "status": "reconciliation_required",
+        "outcome": "unknown",
+        "capability_state": "contradictory",
+        "retry_decision": "do_not_retry_same_attempt",
+        "lease_decision": "not_acquired",
+        "lease_retained": null,
+        "custody_status": "not_inspected",
+        "query_sha256": null,
+        "response_evidence": [],
+        "provider_calls": 0,
+        "provider_read_lifecycle": [],
+        "provider_mutations": 0,
+        "local_namespace_mutations": 0,
+        "error": error,
+    }))
+}
 const EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1: &str = "schema_create_only_v1";
 const MAX_STATE_EXPECTATIONS: usize = 128;
 const MAX_SCHEMA_OBJECTS: usize = 128;

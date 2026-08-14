@@ -133,6 +133,16 @@ provider calls only when the second invocation reaches transport. A second
 pre-dispatch failure retains both lifecycle entries but reports one actual
 provider call; standalone pre-dispatch failure remains zero provider calls.
 
+Public tool semantic validation runs in target, migrations-table, manifest,
+then migration-family order. A failure at any of those boundaries returns the
+complete reconciliation envelope with `capability_state=contradictory`,
+`custody_status=not_inspected`, `query_sha256=null`, empty response and
+lifecycle evidence, both mutation counts zero, `provider_calls=0`, and
+`retry_decision=do_not_retry_same_attempt`; it never opens lease custody or
+contacts D1. JSON-RPC and generated-schema parse failures occur before semantic
+tool execution and remain MCP deserialization errors without fabricated
+structured reconciliation evidence.
+
 For D1 usage-spike investigations, start with `account_billing_usage` to read
 Cloudflare billing usage records, then use `graphql_analytics_query` for
 Cloudflare Analytics GraphQL attribution such as `d1AnalyticsAdaptiveGroups` or
