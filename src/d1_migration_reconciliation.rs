@@ -256,17 +256,19 @@ pub(crate) async fn reconcile_d1_migration_manifest(
                 result,
                 Some(&query.sha256),
                 &[response_digest_summary(&first)],
+                1,
             );
         }
     };
     if let Err(result) = lease.revalidate() {
-        return contextualize_error(
+        return contextualize_unverified_custody_error(
             result,
             Some(&query.sha256),
             &[
                 response_digest_summary(&first),
                 response_digest_summary(&second),
             ],
+            2,
         );
     }
     let second_digest = batch_digest(&second);
@@ -317,6 +319,7 @@ pub(crate) async fn reconcile_d1_migration_manifest(
                     response_digest_summary(&first),
                     response_digest_summary(&second),
                 ],
+                2,
             );
         }
     };
@@ -348,6 +351,7 @@ pub(crate) async fn reconcile_d1_migration_manifest(
                 response_digest_summary(&first),
                 response_digest_summary(&second),
             ],
+            2,
         );
     }
 
@@ -451,9 +455,9 @@ async fn read_complete_batch(
     query: &FixedQuery,
     manifest: &[D1MigrationManifestEntry],
 ) -> Result<ParsedBatch, CallToolResult> {
-    lease
-        .revalidate()
-        .map_err(|result| contextualize_error(result, Some(&query.sha256), &[]))?;
+    lease.revalidate().map_err(|result| {
+        contextualize_unverified_custody_error(result, Some(&query.sha256), &[], 0)
+    })?;
     let batch = server
         .cloudflare
         .query_d1_migration_reconciliation_batch(account_id, database_id, &query.sql)
@@ -463,13 +467,15 @@ async fn read_complete_batch(
                 adapter_batch_error(error, &query.sha256),
                 Some(&query.sha256),
                 &[],
+                1,
             )
         })?;
     lease.revalidate().map_err(|result| {
-        contextualize_error(
+        contextualize_unverified_custody_error(
             result,
             Some(&query.sha256),
             &[response_digest_summary_from_adapter(&batch)],
+            1,
         )
     })?;
     let snapshot = parse_complete_batch(
@@ -483,6 +489,7 @@ async fn read_complete_batch(
             result,
             Some(&query.sha256),
             &[response_digest_summary_from_adapter(&batch)],
+            1,
         )
     })?;
     Ok(ParsedBatch {
@@ -1785,23 +1792,22 @@ fn adapter_batch_error(
     failure: D1MigrationReconciliationBatchError,
     query_sha256: &str,
 ) -> CallToolResult {
-    let capability_state = if failure
-        .error
-        .status
-        .is_some_and(|status| matches!(status, 401 | 403))
-        || matches!(
+    let capability_state =
+        if failure.error.status.is_some_and(|status| {
+            matches!(status, 401 | 403 | 429) || (500..=599).contains(&status)
+        }) || matches!(
             failure.error.code,
             "cloudflare.timeout" | "cloudflare.transport_error" | "cloudflare.response_read_failed"
         ) {
-        "unavailable"
-    } else if failure.error.message.contains("pragma_")
-        || failure.error.message.contains("not authorized")
-        || failure.error.message.contains("SQLITE_AUTH")
-    {
-        "capability_gap"
-    } else {
-        "contradictory"
-    };
+            "unavailable"
+        } else if failure.error.message.contains("pragma_")
+            || failure.error.message.contains("not authorized")
+            || failure.error.message.contains("SQLITE_AUTH")
+        {
+            "capability_gap"
+        } else {
+            "contradictory"
+        };
     let response = match (
         failure.response_body_sha256,
         failure.response_body_size_bytes,
@@ -1884,6 +1890,7 @@ fn contextualize_error(
     result: CallToolResult,
     query_sha256: Option<&str>,
     response_evidence: &[Value],
+    prior_provider_calls: usize,
 ) -> CallToolResult {
     let mut content = result
         .structured_content
@@ -1896,16 +1903,58 @@ fn contextualize_error(
             "retry_decision".to_string(),
             json!("do_not_retry_same_attempt"),
         );
-        content.insert("lease_decision".to_string(), json!("retain"));
-        content.insert("lease_retained".to_string(), json!(true));
-        content.insert(
-            "custody_status".to_string(),
-            json!("retained_evidence_verified"),
-        );
+        let custody_unverified =
+            content.get("custody_status") == Some(&json!("retained_evidence_unverified"));
+        if !custody_unverified {
+            content.insert("lease_decision".to_string(), json!("retain"));
+            content.insert("lease_retained".to_string(), json!(true));
+            content.insert(
+                "custody_status".to_string(),
+                json!("retained_evidence_verified"),
+            );
+        }
         content.insert("query_sha256".to_string(), json!(query_sha256));
         if !response_evidence.is_empty() || !content.contains_key("response_evidence") {
             content.insert("response_evidence".to_string(), json!(response_evidence));
         }
+        content.insert("provider_mutations".to_string(), json!(0));
+        content.insert("local_namespace_mutations".to_string(), json!(0));
+        let provider_calls = content
+            .get("provider_calls")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .saturating_add(prior_provider_calls as u64);
+        content.insert("provider_calls".to_string(), json!(provider_calls));
+    }
+    CallToolResult::structured_error(content)
+}
+
+fn contextualize_unverified_custody_error(
+    result: CallToolResult,
+    query_sha256: Option<&str>,
+    response_evidence: &[Value],
+    provider_calls: usize,
+) -> CallToolResult {
+    let mut content = result
+        .structured_content
+        .unwrap_or_else(|| json!({"ok": false, "error": {"code": "d1.migration_reconciliation_failed", "message": "retained custody could not be revalidated"}}));
+    if let Value::Object(content) = &mut content {
+        content.insert("operation".to_string(), json!(OPERATION));
+        content.insert("dry_run".to_string(), json!(true));
+        content.insert("read_only".to_string(), json!(true));
+        content.insert(
+            "retry_decision".to_string(),
+            json!("do_not_retry_same_attempt"),
+        );
+        content.insert("lease_decision".to_string(), json!("retain"));
+        content.insert("lease_retained".to_string(), Value::Null);
+        content.insert(
+            "custody_status".to_string(),
+            json!("retained_evidence_unverified"),
+        );
+        content.insert("query_sha256".to_string(), json!(query_sha256));
+        content.insert("response_evidence".to_string(), json!(response_evidence));
+        content.insert("provider_calls".to_string(), json!(provider_calls));
         content.insert("provider_mutations".to_string(), json!(0));
         content.insert("local_namespace_mutations".to_string(), json!(0));
     }
@@ -1977,7 +2026,7 @@ fn reconciliation_error_with_evidence(
 mod tests {
     use super::*;
 
-    const PROOF: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const PROOF: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // DevSkim: ignore DS173237 -- synthetic SHA-256 fixture, not a credential
 
     fn manifest(sql: &str) -> Vec<D1MigrationManifestEntry> {
         vec![D1MigrationManifestEntry {
@@ -2172,6 +2221,55 @@ mod tests {
             Some(json!({"changed_db": false, "changes": 0, "rows_written": 0})),
         );
         assert!(result_rows(&valid, &statement, PROOF).is_ok());
+    }
+
+    #[test]
+    fn lease_revalidation_drift_remains_unverified_after_outer_context() {
+        let drift = contextualize_unverified_custody_error(
+            reconciliation_error(
+                "contradictory",
+                "d1.migration_reconciliation_lease_changed",
+                "retained evidence changed",
+            ),
+            Some(PROOF),
+            &[json!({"response_body_sha256": PROOF})],
+            1,
+        );
+        let wrapped = contextualize_error(drift, Some(PROOF), &[], 1);
+        let content = wrapped.structured_content.expect("structured drift");
+        assert_eq!(content["lease_decision"], "retain");
+        assert_eq!(content["lease_retained"], Value::Null);
+        assert_eq!(content["custody_status"], "retained_evidence_unverified");
+        assert_eq!(content["provider_calls"], 2);
+    }
+
+    #[test]
+    fn rate_limit_and_server_statuses_are_unavailable_without_retry() {
+        for status in [429, 500, 503, 599] {
+            let result = adapter_batch_error(
+                D1MigrationReconciliationBatchError {
+                    error: crate::cloudflare::client::AdapterErrorPayload {
+                        code: "cloudflare.http_error",
+                        message: format!("HTTP status {status}"),
+                        hint: "synthetic fixture",
+                        retryable: true,
+                        status: Some(status),
+                        classification: None,
+                    },
+                    response_body_sha256: Some(PROOF.to_string()),
+                    response_body_size_bytes: Some(2),
+                },
+                PROOF,
+            );
+            let content = result.structured_content.expect("structured status");
+            assert_eq!(content["capability_state"], "unavailable", "{status}");
+            assert_eq!(
+                content["error"]["code"], "d1.migration_reconciliation_provider_unavailable",
+                "{status}"
+            );
+            assert_eq!(content["retry_decision"], "do_not_retry_same_attempt");
+            assert_eq!(content["provider_cause"]["retryable"], false);
+        }
     }
 
     #[test]

@@ -172,7 +172,12 @@ Interpret custody fields literally. Validation failures before custody lookup
 return `lease_retained=null` and `custody_status=not_inspected`. Inspection
 failures return `lease_retained=null` and `custody_status=inspection_failed`.
 Only a successfully acquired and revalidated retained lease may report
-`lease_retained=true` and `custody_status=retained_evidence_verified`.
+`lease_retained=true` and `custody_status=retained_evidence_verified`. If that
+evidence drifts, conflicts, or fails revalidation around a provider read, the
+result returns `lease_retained=null` and
+`custody_status=retained_evidence_unverified`; do not infer that the named
+evidence was removed. HTTP 429 and 5xx responses make provider evidence
+unavailable and never authorize an automatic retry.
 
 All current results retain the lease and prohibit retry of the same migration
 attempt. Record the query SHA-256, both bounded response-body digests, canonical

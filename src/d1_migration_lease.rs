@@ -2313,7 +2313,9 @@ mod tests {
             .expect_err("unsafe retained evidence must fail closed");
             let content = error.structured_content.expect("structured custody error");
             assert_eq!(content["retry_decision"], "do_not_retry_same_attempt");
-            assert_eq!(content["lease_decision"], "retain");
+            assert_eq!(content["lease_decision"], "not_acquired");
+            assert_eq!(content["lease_retained"], Value::Null);
+            assert_eq!(content["custody_status"], "inspection_failed");
             assert_eq!(content["provider_calls"], 0);
             remove_test_path(&root);
         }
