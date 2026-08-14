@@ -210,7 +210,10 @@ two-read evidence discovered after successful custody revalidation reports the
 retained evidence as verified and includes the exact two provider calls; only
 custody drift changes that status to unverified. `response_evidence` records
 only captured response bodies; `provider_read_lifecycle` independently records
-every invocation. After one complete read, a second transport failure or
+every invocation. Invocation position and count, not response-value equality,
+determine that chronology: two byte-identical successful reads remain two
+evidence and lifecycle entries, while reprocessing an already merged product
+is idempotent. After one complete read, a second transport failure or
 pre-dispatch adapter failure therefore leaves one response summary but two
 chronological lifecycle entries. `provider_calls` counts only actual provider
 attempts: it is `1` when that second invocation fails before dispatch and `2`

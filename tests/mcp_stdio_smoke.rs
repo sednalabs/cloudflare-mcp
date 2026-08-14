@@ -889,6 +889,7 @@ enum ReconciliationFault {
     HttpStatusCustodyDrift(u16, PathBuf),
     OversizedHttpStatus(u16),
     CustodyDrift(PathBuf),
+    SecondBatchCustodyDrift(PathBuf),
     PrimaryMetaMissing,
     PrimaryMarkerMissing,
     PrimaryMarkerFalse,
@@ -1212,6 +1213,10 @@ fn spawn_fake_reconciliation_api_with_fault(
                     fs::write(path, b"tampered retained evidence")
                         .expect("tamper retained evidence fixture");
                 }
+                ReconciliationFault::SecondBatchCustodyDrift(path) if request_index == 1 => {
+                    fs::write(path, b"tampered retained evidence")
+                        .expect("tamper retained evidence after second provider read");
+                }
                 ReconciliationFault::PrimaryMetaMissing => {
                     results[0]
                         .as_object_mut()
@@ -1256,6 +1261,7 @@ fn spawn_fake_reconciliation_api_with_fault(
                 | ReconciliationFault::HttpStatus(_)
                 | ReconciliationFault::HttpStatusCustodyDrift(_, _)
                 | ReconciliationFault::OversizedHttpStatus(_)
+                | ReconciliationFault::SecondBatchCustodyDrift(_)
                 | ReconciliationFault::PrimaryMetaMissing
                 | ReconciliationFault::PrimaryMarkerMissing
                 | ReconciliationFault::PrimaryMarkerFalse
@@ -4903,6 +4909,88 @@ fn d1_reconcile_migration_manifest_stdio_keeps_drifted_custody_unverified() {
     );
     assert_eq!(content["provider_calls"], json!(1), "{content}");
     assert_eq!(requests.lock().expect("request log").len(), 1);
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_reconcile_migration_manifest_stdio_preserves_identical_reads_after_second_custody_drift() {
+    let (manifest, expectations) = one_table_reconciliation_case();
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-reconcile-second-drift-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create second-drift reconciliation root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make second-drift reconciliation root private");
+    }
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&lease_root, &manifest);
+    let active = assert_private_regular_active_lease(&lease_root);
+    let (base_url, requests) = spawn_fake_reconciliation_api_with_fault(
+        ReconciliationFault::SecondBatchCustodyDrift(active),
+    );
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let response = mcp.call_tool(
+        766,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest,
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_only_v1",
+            "state_expectations": expectations,
+        }),
+    );
+    let content = structured_content(&response);
+    let query_sha256 = content["query_sha256"].clone();
+    let evidence = content["response_evidence"]
+        .as_array()
+        .expect("two chronological response summaries");
+    assert_eq!(evidence.len(), 2, "{content}");
+    assert_eq!(evidence[0], evidence[1], "{content}");
+    let response_summary = evidence[0].clone();
+    let lifecycle = response_summary["lifecycle"].clone();
+    assert_eq!(
+        content,
+        &json!({
+            "ok": false,
+            "operation": "d1_reconcile_migration_manifest",
+            "dry_run": true,
+            "read_only": true,
+            "status": "reconciliation_required",
+            "retry_decision": "do_not_retry_same_attempt",
+            "lease_decision": "retain",
+            "lease_retained": null,
+            "custody_status": "retained_evidence_unverified",
+            "query_sha256": query_sha256,
+            "response_evidence": [response_summary.clone(), response_summary],
+            "provider_read_lifecycle": [lifecycle.clone(), lifecycle],
+            "provider_calls": 2,
+            "provider_mutations": 0,
+            "local_namespace_mutations": 0,
+            "error": {
+                "code": "d1.migration_reconciliation_lease_changed",
+                "message": "retained lease payload digest changed",
+                "hint": "Retain the exact custody evidence and resolve this boundary before any provider read or migration retry.",
+            },
+        }),
+        "{content}"
+    );
+    assert_eq!(requests.lock().expect("request log").len(), 2);
     mcp.terminate();
     let _ = fs::remove_dir_all(lease_root);
 }

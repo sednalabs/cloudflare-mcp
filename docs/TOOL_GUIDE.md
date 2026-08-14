@@ -125,7 +125,10 @@ provider-call order rather than replacing evidence from an earlier call, but it
 contains only captured response bodies. Top-level `provider_read_lifecycle` is
 the separate complete invocation chronology, so a second no-response transport
 or pre-dispatch failure is retained even though it cannot add a response
-summary. After a completed first read that aggregate operation reports two
+summary. Invocation position and count, not response-value equality, determine
+that chronology: two byte-identical successful reads remain two evidence and
+lifecycle entries, while reprocessing an already merged product is idempotent.
+After a completed first read that aggregate operation reports two
 provider calls only when the second invocation reaches transport. A second
 pre-dispatch failure retains both lifecycle entries but reports one actual
 provider call; standalone pre-dispatch failure remains zero provider calls.

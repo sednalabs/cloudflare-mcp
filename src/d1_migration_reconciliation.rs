@@ -1965,20 +1965,32 @@ fn contextualize_error(
             );
         }
         content.insert("query_sha256".to_string(), json!(query_sha256));
-        let provider_lifecycle =
-            merge_provider_lifecycle_with_response_evidence(content, response_evidence);
-        prepend_response_evidence(content, response_evidence);
+        let already_contains_prior = product_already_contains_prior_invocations(
+            content,
+            response_evidence,
+            prior_provider_calls,
+        );
+        let provider_lifecycle = merge_provider_lifecycle_with_response_evidence(
+            content,
+            response_evidence,
+            already_contains_prior,
+        );
+        prepend_response_evidence(content, response_evidence, already_contains_prior);
         content.insert(
             "provider_read_lifecycle".to_string(),
             Value::Array(provider_lifecycle.clone()),
         );
         content.insert("provider_mutations".to_string(), json!(0));
         content.insert("local_namespace_mutations".to_string(), json!(0));
-        let provider_calls = content
+        let current_provider_calls = content
             .get("provider_calls")
             .and_then(Value::as_u64)
-            .unwrap_or(0)
-            .saturating_add(prior_provider_calls as u64);
+            .unwrap_or(0);
+        let provider_calls = if already_contains_prior {
+            current_provider_calls
+        } else {
+            current_provider_calls.saturating_add(prior_provider_calls as u64)
+        };
         content.insert("provider_calls".to_string(), json!(provider_calls));
     }
     CallToolResult::structured_error(content)
@@ -2008,9 +2020,14 @@ fn contextualize_unverified_custody_error(
             json!("retained_evidence_unverified"),
         );
         content.insert("query_sha256".to_string(), json!(query_sha256));
-        let provider_lifecycle =
-            merge_provider_lifecycle_with_response_evidence(content, response_evidence);
-        prepend_response_evidence(content, response_evidence);
+        let already_contains_prior =
+            product_already_contains_prior_invocations(content, response_evidence, provider_calls);
+        let provider_lifecycle = merge_provider_lifecycle_with_response_evidence(
+            content,
+            response_evidence,
+            already_contains_prior,
+        );
+        prepend_response_evidence(content, response_evidence, already_contains_prior);
         content.insert(
             "provider_read_lifecycle".to_string(),
             Value::Array(provider_lifecycle),
@@ -2047,7 +2064,11 @@ fn contextualize_provider_error_with_unverified_custody(
     result
 }
 
-fn prepend_response_evidence(content: &mut serde_json::Map<String, Value>, prior: &[Value]) {
+fn prepend_response_evidence(
+    content: &mut serde_json::Map<String, Value>,
+    prior: &[Value],
+    already_contains_prior: bool,
+) {
     if prior.is_empty() {
         content
             .entry("response_evidence".to_string())
@@ -2059,7 +2080,7 @@ fn prepend_response_evidence(content: &mut serde_json::Map<String, Value>, prior
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let mut merged = if current.starts_with(prior) {
+    let mut merged = if already_contains_prior {
         current
     } else {
         let mut merged = prior.to_vec();
@@ -2075,6 +2096,37 @@ fn response_evidence_lifecycle(response_evidence: &[Value]) -> Vec<Value> {
         .iter()
         .filter_map(|evidence| evidence.get("lifecycle").cloned())
         .collect()
+}
+
+fn product_already_contains_prior_invocations(
+    content: &serde_json::Map<String, Value>,
+    prior_response_evidence: &[Value],
+    prior_provider_calls: usize,
+) -> bool {
+    if prior_response_evidence.is_empty() {
+        return false;
+    }
+    let prior_lifecycle = response_evidence_lifecycle(prior_response_evidence);
+    let current_response_evidence = content
+        .get("response_evidence")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let current_lifecycle = content
+        .get("provider_read_lifecycle")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let current_provider_calls = content
+        .get("provider_calls")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let positional_growth = current_response_evidence.len() > prior_response_evidence.len()
+        || current_lifecycle.len() > prior_lifecycle.len()
+        || current_provider_calls > prior_provider_calls as u64;
+    positional_growth
+        && current_response_evidence.starts_with(prior_response_evidence)
+        && current_lifecycle.starts_with(&prior_lifecycle)
 }
 
 fn lifecycle_covers_body_evidence_without_stale_reads(
@@ -2098,6 +2150,7 @@ fn lifecycle_covers_body_evidence_without_stale_reads(
 fn merge_provider_lifecycle_with_response_evidence(
     content: &serde_json::Map<String, Value>,
     prior_response_evidence: &[Value],
+    already_contains_prior: bool,
 ) -> Vec<Value> {
     let prior_lifecycle = response_evidence_lifecycle(prior_response_evidence);
     let current_response_evidence = content
@@ -2130,7 +2183,7 @@ fn merge_provider_lifecycle_with_response_evidence(
     } else {
         current_evidence_lifecycle
     };
-    if current_response_evidence.starts_with(prior_response_evidence) {
+    if already_contains_prior {
         current_lifecycle
     } else {
         let mut merged = prior_lifecycle;
@@ -2686,6 +2739,74 @@ mod tests {
     }
 
     #[test]
+    fn identical_successful_responses_remain_two_invocations_after_second_custody_drift() {
+        let response = json!({
+            "response_body_sha256": PROOF,
+            "response_body_size_bytes": 101,
+            "lifecycle": {
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 200,
+            },
+        });
+        let inner = contextualize_unverified_custody_error(
+            reconciliation_error(
+                "contradictory",
+                "d1.migration_reconciliation_lease_changed",
+                "retained evidence changed after the second provider call",
+            ),
+            Some(PROOF),
+            &[response.clone()],
+            1,
+        );
+        let result = contextualize_error(inner, Some(PROOF), &[response.clone()], 1);
+        let content = result.structured_content.expect("structured custody drift");
+        assert_eq!(
+            content,
+            json!({
+                "ok": false,
+                "operation": "d1_reconcile_migration_manifest",
+                "dry_run": true,
+                "read_only": true,
+                "status": "reconciliation_required",
+                "outcome": "unknown",
+                "capability_state": "contradictory",
+                "retry_decision": "do_not_retry_same_attempt",
+                "lease_decision": "retain",
+                "lease_retained": null,
+                "custody_status": "retained_evidence_unverified",
+                "query_sha256": PROOF,
+                "response_evidence": [response.clone(), response.clone()],
+                "provider_read_lifecycle": [
+                    response["lifecycle"].clone(),
+                    response["lifecycle"].clone(),
+                ],
+                "provider_calls": 2,
+                "provider_mutations": 0,
+                "local_namespace_mutations": 0,
+                "error": {
+                    "code": "d1.migration_reconciliation_lease_changed",
+                    "message": "retained evidence changed after the second provider call",
+                    "hint": "Retain the exact lease evidence. Do not retry the original migration attempt or mutate D1 from this result.",
+                },
+            })
+        );
+
+        let replayed = contextualize_error(
+            CallToolResult::structured_error(content.clone()),
+            Some(PROOF),
+            &[response],
+            1,
+        );
+        assert_eq!(
+            replayed.structured_content.expect("replayed product"),
+            content,
+            "reprocessing an already merged product must remain idempotent",
+        );
+    }
+
+    #[test]
     fn second_call_without_response_preserves_chronological_invocation_evidence() {
         let first = json!({
             "response_body_sha256": PROOF,
@@ -2843,14 +2964,20 @@ mod tests {
         .as_object()
         .expect("content object")
         .clone();
+        let already_contains_prior =
+            product_already_contains_prior_invocations(&content, &[first.clone()], 1);
         assert_eq!(
-            merge_provider_lifecycle_with_response_evidence(&content, &[first.clone()]),
+            merge_provider_lifecycle_with_response_evidence(
+                &content,
+                &[first.clone()],
+                already_contains_prior,
+            ),
             json!([first["lifecycle"].clone(), second_lifecycle])
                 .as_array()
                 .expect("expected lifecycle")
                 .clone(),
         );
-        prepend_response_evidence(&mut content, &[first.clone()]);
+        prepend_response_evidence(&mut content, &[first.clone()], already_contains_prior);
         assert_eq!(content["response_evidence"], json!([first]));
 
         let retained_lifecycle = content["response_evidence"][0]["lifecycle"].clone();
@@ -2872,6 +2999,7 @@ mod tests {
                 content["response_evidence"]
                     .as_array()
                     .expect("prior response evidence"),
+                true,
             ),
             json!([retained_lifecycle])
                 .as_array()
