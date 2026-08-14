@@ -3998,10 +3998,11 @@ mod tests {
             let router = Router::new().route(
                 "/accounts/acct-1/d1/database/db-1/query",
                 post(move || async move {
+                    let oversized_body = vec![b'x'; 16 * 1024 * 1024 + 1];
                     Response::builder()
                         .status(status)
-                        .header("content-length", (16 * 1024 * 1024 + 1).to_string())
-                        .body(Body::empty())
+                        .header("content-length", oversized_body.len().to_string())
+                        .body(Body::from(oversized_body))
                         .expect("oversized response")
                 }),
             );
