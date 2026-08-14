@@ -103,5 +103,14 @@ Preserved curated tool families:
   statement markers, bounded streaming, truthful custody classification, and
   real MCP stdio negative/no-retry/no-custody-mutation proof aligned with the
   snapshot.
+- Terminal retained-manifest reconciliation
+  (`d1_finalize_migration_reconciliation`) is the separately approval-gated
+  local-custody mutation contract. Keep its exact evidence/request/attempt
+  binding, create-only canonical receipt, fresh primary-current checks,
+  no-provider-write behavior, guarded retirement, truthful custody-state
+  products, restored negative matrix, and completed exact replay aligned across
+  schema, stdio proof, and runbook. Only freshly verified active custody may
+  claim retained/retain; unknown, uninspected, failed-inspection, or retiring
+  states must not fabricate that authority.
 - Workers Analytics Engine read tools (`analytics_engine_list_datasets`, `analytics_engine_query`, `analytics_engine_describe_schema`, `analytics_engine_validate_query`) are first-class contract tools for Account Analytics Read workflows and must remain present even when broad API parity is available.
 - Queues readback tools (`queues_list`, `queues_get`, `queues_get_metrics`, `queues_list_consumers`, `queues_health`) are first-class contract tools and must remain present for operational backlog/DLQ/consumer diagnostics.

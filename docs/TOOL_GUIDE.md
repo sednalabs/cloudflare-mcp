@@ -74,6 +74,7 @@ Use curated D1 tools instead of generic API calls for database workflows:
 - `d1_apply_migrations`
 - `d1_apply_migration_manifest`
 - `d1_reconcile_migration_manifest`
+- `d1_finalize_migration_reconciliation`
 - `d1_rename_database`
 - `d1_delete_database`
 
@@ -141,10 +142,28 @@ lifecycle evidence, both mutation counts zero, `provider_calls=0`, and
 `retry_decision=do_not_retry_same_attempt`; it never opens lease custody or
 contacts D1. JSON-RPC and generated-schema parse failures occur before semantic
 tool execution and remain MCP deserialization errors without fabricated
-structured reconciliation evidence.
-Target validation includes an omitted `account_id` when no configured default
-account exists; that condition is semantic zero-call evidence, not a JSON-RPC
-or generated-schema failure.
+structured reconciliation evidence. Target validation includes an omitted
+`account_id` when no configured default account exists; that condition is
+semantic zero-call evidence, not a JSON-RPC or generated-schema failure.
+
+Use `d1_finalize_migration_reconciliation` only after recording and
+independently approving the exact terminal plan returned by its dry run. The
+tool binds the retained target, original apply plan, read-only reconciliation
+plan, expectation proof, fixed query, canonical snapshot, outcome/prefixes,
+and distinct request/attempt digests. A live call re-proves the retained state,
+performs another primary-current read immediately before create-only receipt
+persistence, repeats that read immediately before retirement, and never issues
+a provider write. Exact replay of a completed receipt/retirement converges with
+zero provider calls; changed, malformed, duplicate, noncanonical, or
+retirement-before-receipt evidence fails closed and retains the blocker.
+The terminal response claims custody only after fresh physical readback. A
+verified active lease reports `lease_retained=true` with
+`lease_decision=retain`; verified retirement reports `lease_retained=false`
+with `lease_decision=retired`. Pre-inspection, inspection failure, retiring,
+and unverified/drifted custody report `lease_retained=null` with the
+corresponding `custody_status` and no fabricated lease decision.
+Retired-without-receipt is a verified-retired order violation, not evidence
+that an active lease was retained.
 
 For D1 usage-spike investigations, start with `account_billing_usage` to read
 Cloudflare billing usage records, then use `graphql_analytics_query` for

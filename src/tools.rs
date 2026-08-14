@@ -51,6 +51,10 @@ use crate::d1_migration_reconciliation::{
     D1ReconcileMigrationManifestArgs, contextualize_d1_reconciliation_semantic_error,
     reconcile_d1_migration_manifest,
 };
+use crate::d1_migration_terminal::{
+    D1FinalizeMigrationReconciliationArgs, contextualize_terminal_semantic_error,
+    finalize_d1_migration_reconciliation,
+};
 use crate::dns_route::{
     DnsRouteConflict, DnsRouteVerificationState, plan_dns_route_reconciliation, verify_dns_route,
 };
@@ -5121,6 +5125,130 @@ impl CloudflareMcp {
             state_expectations,
         )
         .await)
+    }
+
+    #[tool(
+        name = "d1_finalize_migration_reconciliation",
+        description = "Create an approval-bound terminal reconciliation receipt and retire one exactly re-proven retained D1 migration lease without provider writes."
+    )]
+    async fn cloudflare_d1_finalize_migration_reconciliation(
+        &self,
+        Parameters(args): Parameters<D1FinalizeMigrationReconciliationArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let D1FinalizeMigrationReconciliationArgs {
+            account_id: requested_account_id,
+            database_id: requested_database_id,
+            migration_family,
+            migrations_table,
+            manifest,
+            approved_plan_sha256,
+            lease_nonce,
+            lease_payload_sha256,
+            effect_assertion_id,
+            state_expectations,
+            expected_reconciliation_plan_sha256,
+            expected_expectation_proof_sha256,
+            expected_query_sha256,
+            expected_canonical_snapshot_sha256,
+            expected_outcome,
+            expected_original_prefix_length,
+            expected_current_prefix_length,
+            terminal_request_sha256,
+            terminal_attempt_sha256,
+            dry_run,
+            approved_terminal_plan_sha256,
+        } = args;
+        if let Some(requested_account_id) = requested_account_id.as_deref() {
+            if let Err(result) =
+                normalize_d1_manifest_target(requested_account_id, &requested_database_id)
+            {
+                return Ok(contextualize_terminal_semantic_error(result));
+            }
+        }
+        let resolved_account_id = match resolve_account_id(self, requested_account_id.as_deref()) {
+            Ok(account_id) => account_id,
+            Err(_) => {
+                return Ok(contextualize_terminal_semantic_error(
+                    invalid_argument_result(
+                        "d1.invalid_manifest_target_identity",
+                        "account_id must be supplied or configured as a canonical identifier",
+                        "Use the exact account_id read from the intended Cloudflare resource.",
+                    ),
+                ));
+            }
+        };
+        let target = match normalize_d1_manifest_target(resolved_account_id, &requested_database_id)
+        {
+            Ok(target) => target,
+            Err(result) => return Ok(contextualize_terminal_semantic_error(result)),
+        };
+        let migrations_table = match normalize_d1_migrations_table(migrations_table.as_deref()) {
+            Ok(table) => table,
+            Err(result) => return Ok(contextualize_terminal_semantic_error(result)),
+        };
+        let manifest = match validate_d1_migration_manifest(manifest) {
+            Ok(manifest) => manifest,
+            Err(result) => return Ok(contextualize_terminal_semantic_error(result)),
+        };
+        let family = match normalize_d1_migration_family(&migration_family) {
+            Ok(family) => family,
+            Err(result) => return Ok(contextualize_terminal_semantic_error(result)),
+        };
+        let mutation_target = json!({
+            "target_key_sha256": sha256_bytes_hex(
+                format!("{}\0{}", target.account_id, target.database_id).as_bytes()
+            ),
+            "migration_family": family,
+            "expected_reconciliation_plan_sha256": expected_reconciliation_plan_sha256,
+            "expected_expectation_proof_sha256": expected_expectation_proof_sha256,
+            "expected_query_sha256": expected_query_sha256,
+            "expected_canonical_snapshot_sha256": expected_canonical_snapshot_sha256,
+            "terminal_request_sha256": terminal_request_sha256,
+            "terminal_attempt_sha256": terminal_attempt_sha256,
+        });
+        let mutation_plan = MutationPlan::new("d1_finalize_migration_reconciliation")
+            .step("reprove_retained_manifest", false, mutation_target.clone())
+            .step("persist_terminal_receipt", true, mutation_target.clone())
+            .step("reprove_before_retirement", false, mutation_target.clone())
+            .step("retire_retained_lease", true, mutation_target.clone());
+        let audit = MutationAuditSession::start(
+            Some(&parts),
+            "d1_finalize_migration_reconciliation",
+            mutation_target,
+            dry_run,
+        );
+        let result = finalize_d1_migration_reconciliation(
+            self,
+            &target.account_id,
+            &target.database_id,
+            &family,
+            &migrations_table,
+            &manifest,
+            &approved_plan_sha256,
+            &lease_nonce,
+            &lease_payload_sha256,
+            effect_assertion_id.as_deref(),
+            state_expectations,
+            &expected_reconciliation_plan_sha256,
+            &expected_expectation_proof_sha256,
+            &expected_query_sha256,
+            &expected_canonical_snapshot_sha256,
+            &expected_outcome,
+            expected_original_prefix_length,
+            expected_current_prefix_length,
+            &terminal_request_sha256,
+            &terminal_attempt_sha256,
+            dry_run,
+            approved_terminal_plan_sha256.as_deref(),
+        )
+        .await;
+        Ok(finalize_mutation_result(
+            result,
+            &mutation_plan,
+            audit,
+            dry_run,
+        ))
     }
 
     #[tool(
