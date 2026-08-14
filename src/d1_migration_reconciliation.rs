@@ -273,15 +273,20 @@ pub(crate) async fn reconcile_d1_migration_manifest(
     }
     let second_digest = batch_digest(&second);
     if first.snapshot != second.snapshot || first_digest != second_digest {
-        return reconciliation_error_with_evidence(
-            "contradictory",
-            "d1.migration_reconciliation_evidence_unstable",
-            "two complete read-only reconciliation batches were not canonically equivalent",
+        return contextualize_error(
+            reconciliation_error_with_evidence(
+                "contradictory",
+                "d1.migration_reconciliation_evidence_unstable",
+                "two complete read-only reconciliation batches were not canonically equivalent",
+                Some(&query.sha256),
+                &[
+                    response_digest_summary(&first),
+                    response_digest_summary(&second),
+                ],
+            ),
             Some(&query.sha256),
-            &[
-                response_digest_summary(&first),
-                response_digest_summary(&second),
-            ],
+            &[],
+            2,
         );
     }
 
@@ -289,15 +294,20 @@ pub(crate) async fn reconcile_d1_migration_manifest(
     {
         Ok(classification) => classification,
         Err(_) => {
-            return reconciliation_error_with_evidence(
-                "contradictory",
-                "d1.migration_reconciliation_ledger_not_manifest_prefix",
-                "stable migration ledger is not an exact prefix of the supplied manifest",
+            return contextualize_error(
+                reconciliation_error_with_evidence(
+                    "contradictory",
+                    "d1.migration_reconciliation_ledger_not_manifest_prefix",
+                    "stable migration ledger is not an exact prefix of the supplied manifest",
+                    Some(&query.sha256),
+                    &[
+                        response_digest_summary(&first),
+                        response_digest_summary(&second),
+                    ],
+                ),
                 Some(&query.sha256),
-                &[
-                    response_digest_summary(&first),
-                    response_digest_summary(&second),
-                ],
+                &[],
+                2,
             );
         }
     };
@@ -331,15 +341,20 @@ pub(crate) async fn reconcile_d1_migration_manifest(
     {
         Some(state) => state,
         None => {
-            return reconciliation_error_with_evidence(
-                "capability_gap",
-                "d1.migration_reconciliation_state_expectation_missing",
-                "no bounded reviewed state expectation covers the stable current manifest prefix",
+            return contextualize_error(
+                reconciliation_error_with_evidence(
+                    "capability_gap",
+                    "d1.migration_reconciliation_state_expectation_missing",
+                    "no bounded reviewed state expectation covers the stable current manifest prefix",
+                    Some(&query.sha256),
+                    &[
+                        response_digest_summary(&first),
+                        response_digest_summary(&second),
+                    ],
+                ),
                 Some(&query.sha256),
-                &[
-                    response_digest_summary(&first),
-                    response_digest_summary(&second),
-                ],
+                &[],
+                2,
             );
         }
     };
@@ -365,15 +380,20 @@ pub(crate) async fn reconcile_d1_migration_manifest(
         "unknown"
     };
     if outcome == "unknown" {
-        return reconciliation_error_with_evidence(
-            "contradictory",
-            "d1.migration_reconciliation_plan_relationship_contradictory",
-            "stable ledger precedes the uniquely reconstructed approved-plan prefix",
+        return contextualize_error(
+            reconciliation_error_with_evidence(
+                "contradictory",
+                "d1.migration_reconciliation_plan_relationship_contradictory",
+                "stable ledger precedes the uniquely reconstructed approved-plan prefix",
+                Some(&query.sha256),
+                &[
+                    response_digest_summary(&first),
+                    response_digest_summary(&second),
+                ],
+            ),
             Some(&query.sha256),
-            &[
-                response_digest_summary(&first),
-                response_digest_summary(&second),
-            ],
+            &[],
+            2,
         );
     }
 
@@ -2240,6 +2260,27 @@ mod tests {
         assert_eq!(content["lease_decision"], "retain");
         assert_eq!(content["lease_retained"], Value::Null);
         assert_eq!(content["custody_status"], "retained_evidence_unverified");
+        assert_eq!(content["provider_calls"], 2);
+    }
+
+    #[test]
+    fn post_read_contradictions_retain_verified_custody_context() {
+        let result = contextualize_error(
+            reconciliation_error_with_evidence(
+                "contradictory",
+                "d1.migration_reconciliation_evidence_unstable",
+                "stable reads differed",
+                Some(PROOF),
+                &[json!({"response_body_sha256": PROOF})],
+            ),
+            Some(PROOF),
+            &[],
+            2,
+        );
+        let content = result.structured_content.expect("structured contradiction");
+        assert_eq!(content["lease_decision"], "retain");
+        assert_eq!(content["lease_retained"], true);
+        assert_eq!(content["custody_status"], "retained_evidence_verified");
         assert_eq!(content["provider_calls"], 2);
     }
 

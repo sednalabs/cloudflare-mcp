@@ -881,7 +881,9 @@ enum ReconciliationFault {
     MalformedReadOnlyMetadata,
     OversizedResponse,
     HttpStatus(u16),
+    OversizedHttpStatus(u16),
     CustodyDrift(PathBuf),
+    UnstableSecondBatch,
 }
 
 fn reconciliation_statement_markers(sql: &str) -> Vec<String> {
@@ -974,7 +976,7 @@ fn spawn_fake_reconciliation_api_with_fault(
     let requests = Arc::new(Mutex::new(Vec::new()));
     let requests_for_thread = requests.clone();
     thread::spawn(move || {
-        for stream in listener.incoming().take(2) {
+        for (request_index, stream) in listener.incoming().take(2).enumerate() {
             let mut stream = stream.expect("fake reconciliation stream");
             let (headers, body) = read_http_request(&mut stream);
             assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
@@ -987,6 +989,10 @@ fn spawn_fake_reconciliation_api_with_fault(
                 .lock()
                 .expect("request log lock")
                 .push(body_json);
+            if let ReconciliationFault::OversizedHttpStatus(status) = &fault {
+                write!(stream, "HTTP/1.1 {status} Synthetic\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", 16 * 1024 * 1024 + 1).expect("write oversized reconciliation HTTP error headers");
+                continue;
+            }
             if matches!(&fault, ReconciliationFault::OversizedResponse) {
                 let response = vec![b'x'; 16 * 1024 * 1024 + 1];
                 write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write oversized reconciliation headers");
@@ -1071,9 +1077,15 @@ fn spawn_fake_reconciliation_api_with_fault(
                     fs::write(path, b"tampered retained evidence")
                         .expect("tamper retained evidence fixture");
                 }
+                ReconciliationFault::UnstableSecondBatch if request_index == 1 => {
+                    results[1]["results"][1]["sql"] =
+                        json!("CREATE TABLE items(id INTEGER PRIMARY KEY, changed TEXT)");
+                }
                 ReconciliationFault::None
                 | ReconciliationFault::OversizedResponse
-                | ReconciliationFault::HttpStatus(_) => {}
+                | ReconciliationFault::HttpStatus(_)
+                | ReconciliationFault::OversizedHttpStatus(_)
+                | ReconciliationFault::UnstableSecondBatch => {}
             }
             let response = serde_json::to_vec(&json!({
                 "success": true,
@@ -4386,12 +4398,82 @@ fn d1_reconcile_migration_manifest_stdio_keeps_drifted_custody_unverified() {
 }
 
 #[test]
-fn d1_reconcile_migration_manifest_stdio_treats_429_and_5xx_as_unavailable_without_retry() {
+fn d1_reconcile_migration_manifest_stdio_keeps_post_read_contradictions_verified() {
     let (manifest, expectations) = one_table_reconciliation_case();
-    for status in [429, 503] {
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-reconcile-unstable-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create unstable reconciliation root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make unstable reconciliation root private");
+    }
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&lease_root, &manifest);
+    let (base_url, requests) =
+        spawn_fake_reconciliation_api_with_fault(ReconciliationFault::UnstableSecondBatch);
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let response = mcp.call_tool(
+        761,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest,
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_only_v1",
+            "state_expectations": expectations,
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.migration_reconciliation_evidence_unstable"),
+        "{content}"
+    );
+    assert_eq!(content["lease_decision"], json!("retain"), "{content}");
+    assert_eq!(content["lease_retained"], json!(true), "{content}");
+    assert_eq!(
+        content["custody_status"],
+        json!("retained_evidence_verified"),
+        "{content}"
+    );
+    assert_eq!(content["provider_calls"], json!(2), "{content}");
+    assert_eq!(requests.lock().expect("request log").len(), 2);
+    assert_private_regular_active_lease(&lease_root);
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_reconcile_migration_manifest_stdio_treats_429_and_5xx_including_oversized_as_unavailable_without_retry()
+ {
+    let (manifest, expectations) = one_table_reconciliation_case();
+    for (index, (fault, status)) in [
+        (ReconciliationFault::HttpStatus(429), 429),
+        (ReconciliationFault::HttpStatus(503), 503),
+        (ReconciliationFault::OversizedHttpStatus(429), 429),
+        (ReconciliationFault::OversizedHttpStatus(503), 503),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let lease_root = PathBuf::from("/tmp").join(format!(
-            "cloudflare-mcp-reconcile-http-{}-{status}",
-            std::process::id()
+            "cloudflare-mcp-reconcile-http-{}-{status}-{index}",
+            std::process::id(),
         ));
         let _ = fs::remove_dir_all(&lease_root);
         fs::create_dir(&lease_root).expect("create HTTP reconciliation root");
@@ -4403,8 +4485,7 @@ fn d1_reconcile_migration_manifest_stdio_treats_429_and_5xx_as_unavailable_witho
         }
         let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
             create_retained_reconciliation_fixture(&lease_root, &manifest);
-        let (base_url, requests) =
-            spawn_fake_reconciliation_api_with_fault(ReconciliationFault::HttpStatus(status));
+        let (base_url, requests) = spawn_fake_reconciliation_api_with_fault(fault);
         let mut mcp = McpStdioProcess::start_with_env(vec![
             ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
             (

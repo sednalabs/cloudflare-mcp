@@ -93,7 +93,10 @@ authorizes an apply retry. A null `lease_retained` with
 was acquired or proven by that call; it is not evidence that custody was
 removed. Likewise, `custody_status=retained_evidence_unverified` after a
 revalidation failure means retain and inspect the named evidence manually;
-HTTP 429 and 5xx reads are unavailable evidence and are not retried.
+HTTP 429 and 5xx reads are unavailable evidence and are not retried, even when
+their response body exceeds the byte bound. Post-read ledger/schema/evidence
+contradictions keep verified custody and exact provider-call accounting unless
+custody itself fails revalidation.
 
 For D1 usage-spike investigations, start with `account_billing_usage` to read
 Cloudflare billing usage records, then use `graphql_analytics_query` for

@@ -177,7 +177,11 @@ evidence drifts, conflicts, or fails revalidation around a provider read, the
 result returns `lease_retained=null` and
 `custody_status=retained_evidence_unverified`; do not infer that the named
 evidence was removed. HTTP 429 and 5xx responses make provider evidence
-unavailable and never authorize an automatic retry.
+unavailable and never authorize an automatic retry, including when the body
+exceeds the streaming byte bound. Contradictory ledger, schema, plan, or
+two-read evidence discovered after successful custody revalidation reports the
+retained evidence as verified and includes the exact two provider calls; only
+custody drift changes that status to unverified.
 
 All current results retain the lease and prohibit retry of the same migration
 attempt. Record the query SHA-256, both bounded response-body digests, canonical

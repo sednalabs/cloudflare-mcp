@@ -667,6 +667,7 @@ impl CloudflareClient {
                     "Cloudflare reconciliation response exceeded the exact-evidence byte limit",
                     "Reduce the bounded expectation scope; retain the lease and do not retry the migration attempt.",
                 )
+                .with_status(Some(status.as_u16()))
                 .payload(),
                 response_body_sha256: None,
                 response_body_size_bytes: response.content_length().map(|length| length as usize),
@@ -698,6 +699,7 @@ impl CloudflareClient {
                         "Cloudflare reconciliation response exceeded the exact-evidence byte limit",
                         "Reduce the bounded expectation scope; retain the lease and do not retry the migration attempt.",
                     )
+                    .with_status(Some(status.as_u16()))
                     .payload(),
                     response_body_sha256: None,
                     response_body_size_bytes: Some(observed_size),
@@ -3985,6 +3987,37 @@ mod tests {
             )
             .await
             .expect("encoded D1 query");
+    }
+
+    #[tokio::test]
+    async fn oversized_reconciliation_response_preserves_http_status() {
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let router = Router::new().route(
+                "/accounts/acct-1/d1/database/db-1/query",
+                post(move || async move {
+                    Response::builder()
+                        .status(status)
+                        .header("content-length", (16 * 1024 * 1024 + 1).to_string())
+                        .body(Body::empty())
+                        .expect("oversized response")
+                }),
+            );
+            let base = spawn_router(router).await;
+            let client = CloudflareClient::new(test_config(base)).expect("client");
+            let error = client
+                .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+                .await
+                .expect_err("oversized reconciliation response must fail closed");
+            assert_eq!(
+                error.error.code,
+                "cloudflare.d1.migration_reconciliation_response_too_large"
+            );
+            assert_eq!(error.error.status, Some(status.as_u16()));
+            assert_eq!(error.response_body_sha256, None);
+        }
     }
 
     #[tokio::test]
