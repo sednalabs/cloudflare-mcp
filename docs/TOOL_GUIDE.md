@@ -95,6 +95,13 @@ custody evidence or authorizes an apply retry. The boundary does not follow
 HTTP redirects and returns one chronological `provider_read_lifecycle` entry
 per invocation, distinguishing pre-dispatch, attempted-without-response,
 response received, partial/complete body read, and captured HTTP status. A
+reconciliation-local recursive decoder rejects duplicate object keys in a
+successful-status body before
+the raw provider JSON can collapse into a value, across the outer envelope and
+nested result, metadata, error, and row objects in either order. Rejection keeps
+the exact raw digest, size, status, lifecycle, and retained-custody evidence but
+never exposes the duplicate key or body content. This does not broaden generic
+Cloudflare response paths or the migration-write JSON policy. A
 stream failure before any body byte is `not_read`; it is `partially_read` only
 after at least one byte was accumulated. Local token/config failure therefore
 reports zero provider calls. Validation or

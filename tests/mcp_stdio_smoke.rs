@@ -898,6 +898,8 @@ enum ReconciliationFault {
     SecondBatchPrimaryFalse,
     SecondBatchHttpStatus(u16),
     SecondBatchTransportFailure(Option<PathBuf>),
+    DuplicateOuterSuccess(bool, Arc<Mutex<Vec<u8>>>),
+    DuplicateNestedRowId(bool, Arc<Mutex<Vec<u8>>>),
     LedgerNotManifestPrefix,
     UnstableSecondBatch,
 }
@@ -910,6 +912,49 @@ fn reconciliation_http_error_response(status: u16) -> Vec<u8> {
         "result": null,
     }))
     .expect("serialize reconciliation HTTP error")
+}
+
+fn duplicate_reconciliation_response(
+    results: &[Value],
+    fault: &ReconciliationFault,
+) -> Option<Vec<u8>> {
+    let result_json = serde_json::to_string(results).expect("serialize reconciliation results");
+    let (response, capture) = match fault {
+        ReconciliationFault::DuplicateOuterSuccess(reverse, capture) => {
+            let duplicate = if *reverse {
+                r#""success":true,"success":false"#
+            } else {
+                r#""success":false,"success":true"#
+            };
+            (
+                format!(r#"{{{duplicate},"errors":[],"messages":[],"result":{result_json}}}"#),
+                capture,
+            )
+        }
+        ReconciliationFault::DuplicateNestedRowId(reverse, capture) => {
+            let needle = r#""id":1,"name":"0001_create.sql""#;
+            assert!(
+                result_json.contains(needle),
+                "synthetic ledger row must remain uniquely replaceable"
+            );
+            let duplicate = if *reverse {
+                r#""id":2,"id":1,"name":"0001_create.sql""#
+            } else {
+                r#""id":1,"id":2,"name":"0001_create.sql""#
+            };
+            (
+                format!(
+                    r#"{{"success":true,"errors":[],"messages":[],"result":{}}}"#,
+                    result_json.replacen(needle, duplicate, 1)
+                ),
+                capture,
+            )
+        }
+        _ => return None,
+    };
+    let response = response.into_bytes();
+    *capture.lock().expect("duplicate response capture") = response.clone();
+    Some(response)
 }
 
 fn reconciliation_statement_markers(sql: &str) -> Vec<String> {
@@ -1220,15 +1265,20 @@ fn spawn_fake_reconciliation_api_with_fault(
                 | ReconciliationFault::SecondBatchPrimaryFalse
                 | ReconciliationFault::SecondBatchHttpStatus(_)
                 | ReconciliationFault::SecondBatchTransportFailure(_)
+                | ReconciliationFault::DuplicateOuterSuccess(_, _)
+                | ReconciliationFault::DuplicateNestedRowId(_, _)
                 | ReconciliationFault::UnstableSecondBatch => {}
             }
-            let response = serde_json::to_vec(&json!({
-                "success": true,
-                "errors": [],
-                "messages": [],
-                "result": results,
-            }))
-            .expect("serialize reconciliation response");
+            let response =
+                duplicate_reconciliation_response(&results, &fault).unwrap_or_else(|| {
+                    serde_json::to_vec(&json!({
+                        "success": true,
+                        "errors": [],
+                        "messages": [],
+                        "result": results,
+                    }))
+                    .expect("serialize reconciliation response")
+                });
             write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write reconciliation headers");
             stream
                 .write_all(&response)
@@ -5252,6 +5302,113 @@ fn d1_reconcile_migration_manifest_stdio_preserves_second_transport_invocation_w
         if custody_verified {
             assert_private_regular_active_lease(&lease_root);
         }
+        mcp.terminate();
+        let _ = fs::remove_dir_all(lease_root);
+    }
+}
+
+#[test]
+fn d1_reconcile_migration_manifest_stdio_rejects_recursive_duplicate_keys_in_both_orders() {
+    let (manifest, expectations) = one_table_reconciliation_case();
+    for (index, (nested, reverse)) in [(false, false), (false, true), (true, false), (true, true)]
+        .into_iter()
+        .enumerate()
+    {
+        let lease_root = PathBuf::from("/tmp").join(format!(
+            "cloudflare-mcp-reconcile-duplicate-json-{}-{index}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&lease_root);
+        fs::create_dir(&lease_root).expect("create duplicate-json reconciliation root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+                .expect("make duplicate-json reconciliation root private");
+        }
+        let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+            create_retained_reconciliation_fixture(&lease_root, &manifest);
+        let raw_response = Arc::new(Mutex::new(Vec::new()));
+        let fault = if nested {
+            ReconciliationFault::DuplicateNestedRowId(reverse, raw_response.clone())
+        } else {
+            ReconciliationFault::DuplicateOuterSuccess(reverse, raw_response.clone())
+        };
+        let (base_url, requests) = spawn_fake_reconciliation_api_with_fault(fault);
+        let mut mcp = McpStdioProcess::start_with_env(vec![
+            ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+            (
+                "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+                lease_root.to_string_lossy().to_string(),
+            ),
+        ]);
+        let response = mcp.call_tool(
+            766 + index as u64,
+            "d1_reconcile_migration_manifest",
+            json!({
+                "database_id": "db-1",
+                "migration_family": "newsletter-core",
+                "manifest": manifest.clone(),
+                "approved_plan_sha256": approved_plan_sha256,
+                "lease_nonce": lease_nonce,
+                "lease_payload_sha256": lease_payload_sha256,
+                "effect_assertion_id": "schema_create_only_v1",
+                "state_expectations": expectations.clone(),
+            }),
+        );
+        let raw_response = raw_response.lock().expect("raw duplicate response").clone();
+        let raw_response_text =
+            std::str::from_utf8(&raw_response).expect("synthetic response UTF-8");
+        let response_body_sha256 = sha256_hex(raw_response_text);
+        let content = structured_content(&response);
+        let query_sha256 = content["query_sha256"].clone();
+        let lifecycle = json!({
+            "dispatch_stage": "attempted",
+            "response_stage": "received",
+            "body_stage": "completely_read",
+            "http_status": 200,
+        });
+        assert_eq!(
+            content,
+            &json!({
+                "ok": false,
+                "operation": "d1_reconcile_migration_manifest",
+                "dry_run": true,
+                "read_only": true,
+                "status": "reconciliation_required",
+                "outcome": "unknown",
+                "capability_state": "contradictory",
+                "retry_decision": "do_not_retry_same_attempt",
+                "lease_decision": "retain",
+                "lease_retained": true,
+                "custody_status": "retained_evidence_verified",
+                "query_sha256": query_sha256,
+                "response_evidence": [{
+                    "response_body_sha256": response_body_sha256,
+                    "response_body_size_bytes": raw_response.len(),
+                    "complete_body_digest": true,
+                    "lifecycle": lifecycle.clone(),
+                }],
+                "provider_read_lifecycle": [lifecycle],
+                "provider_calls": 1,
+                "provider_mutations": 0,
+                "local_namespace_mutations": 0,
+                "provider_cause": {
+                    "code": "cloudflare.d1.migration_reconciliation_duplicate_object_key",
+                    "status": 200,
+                    "retryable": false,
+                    "operator_guidance": "reconciliation_only",
+                },
+                "error": {
+                    "code": "d1.migration_reconciliation_provider_evidence_contradictory",
+                    "message": "provider could not return one complete strict read-only reconciliation batch",
+                    "hint": "Retain the exact lease evidence. Do not retry the original migration attempt or mutate D1 from this result.",
+                },
+            }),
+            "nested={nested} reverse={reverse}: {content}"
+        );
+        assert_eq!(requests.lock().expect("request log").len(), 1);
+        assert_private_regular_active_lease(&lease_root);
         mcp.terminate();
         let _ = fs::remove_dir_all(lease_root);
     }

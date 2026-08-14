@@ -171,6 +171,16 @@ or mixed primary marker fails closed as contradictory evidence. Response bodies
 are capped at 16 MiB from the HTTP stream; the adapter stops before buffering a
 body beyond that bound.
 
+Before any successful-status reconciliation response object is converted to
+`serde_json::Value`, the bounded raw body is decoded through a reconciliation-
+local recursive visitor that rejects duplicate keys in the outer envelope and
+every nested object, including result, metadata, error, and row objects. Either
+key order fails as contradictory evidence. The exact raw-body digest, byte
+count, HTTP status, and completed-read lifecycle are captured first; no key or
+value from the rejected body is returned. This stricter decoder is deliberately
+limited to reconciliation reads and does not change generic Cloudflare response
+paths or the migration-write decoder.
+
 The reconciliation HTTP client does not follow redirects. Interpret
 `provider_read_lifecycle` in order: `pre_dispatch` means no provider call;
 `attempted` with `not_received` means transport outcome without a response;

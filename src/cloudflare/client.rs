@@ -1,5 +1,6 @@
 use std::cmp;
 use std::collections::BTreeSet;
+use std::fmt;
 use std::future::Future;
 use std::io::Write;
 use std::path::Path;
@@ -9,7 +10,7 @@ use futures::StreamExt;
 use hmac::{Hmac, Mac};
 use reqwest::StatusCode;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -833,7 +834,7 @@ impl CloudflareClient {
         if !status.is_success() {
             return Err(evidence_error(http_status_error(status, body)));
         }
-        let envelope = decode_strict_d1_migration_manifest_envelope(body)
+        let envelope = decode_strict_d1_migration_reconciliation_envelope(body)
             .map_err(|error| evidence_error(error.with_status(Some(status_code))))?;
         Ok(D1MigrationReconciliationBatch {
             result: envelope.result.unwrap_or(Value::Null),
@@ -3365,6 +3366,12 @@ fn decode_strict_d1_migration_manifest_envelope(
             )
         })?;
 
+    validate_strict_d1_migration_manifest_envelope(envelope)
+}
+
+fn validate_strict_d1_migration_manifest_envelope(
+    envelope: StrictD1MigrationManifestEnvelope<Value>,
+) -> Result<CloudflareEnvelope<Value>, AdapterError> {
     let errors = match envelope.errors {
         Some(Value::Array(errors)) if errors.is_empty() => Vec::new(),
         Some(Value::Array(_)) => {
@@ -3405,6 +3412,155 @@ fn decode_strict_d1_migration_manifest_envelope(
         messages: Vec::new(),
         result_info: None,
     })
+}
+
+const DUPLICATE_JSON_OBJECT_KEY_MARKER: &str = "duplicate JSON object key";
+
+struct DuplicateSafeJsonValue(Value);
+
+enum DuplicateSafeJsonError {
+    DuplicateObjectKey,
+    Malformed(serde_json::Error),
+}
+
+impl<'de> Deserialize<'de> for DuplicateSafeJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DuplicateSafeJsonValueVisitor)
+    }
+}
+
+struct DuplicateSafeJsonValueVisitor;
+
+impl<'de> Visitor<'de> for DuplicateSafeJsonValueVisitor {
+    type Value = DuplicateSafeJsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(DuplicateSafeJsonValue(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(DuplicateSafeJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(DuplicateSafeJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .map(DuplicateSafeJsonValue)
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        self.visit_string(value.to_string())
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(DuplicateSafeJsonValue(Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(DuplicateSafeJsonValue(Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(DuplicateSafeJsonValue(Value::Null))
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        DuplicateSafeJsonValue::deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+        while let Some(value) = sequence.next_element::<DuplicateSafeJsonValue>()? {
+            values.push(value.0);
+        }
+        Ok(DuplicateSafeJsonValue(Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = Map::new();
+        while let Some(key) = object.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(serde::de::Error::custom(DUPLICATE_JSON_OBJECT_KEY_MARKER));
+            }
+            let value = object.next_value::<DuplicateSafeJsonValue>()?;
+            values.insert(key, value.0);
+        }
+        Ok(DuplicateSafeJsonValue(Value::Object(values)))
+    }
+}
+
+fn decode_strict_d1_migration_reconciliation_envelope(
+    body: &str,
+) -> Result<CloudflareEnvelope<Value>, AdapterError> {
+    let value = decode_json_rejecting_duplicate_object_keys(body).map_err(|error| match error {
+        DuplicateSafeJsonError::DuplicateObjectKey => reconciliation_duplicate_object_key_error(),
+        DuplicateSafeJsonError::Malformed(error) => AdapterError::new(
+            "cloudflare.d1.migration_manifest_malformed_envelope",
+            format!("failed decoding strict D1 reconciliation envelope: {error}"),
+            "Treat the provider evidence as contradictory and retain the lease.",
+        ),
+    })?;
+    let envelope: StrictD1MigrationManifestEnvelope<Value> = serde_json::from_value(value)
+        .map_err(|error| {
+            AdapterError::new(
+                "cloudflare.d1.migration_manifest_malformed_envelope",
+                format!("failed decoding strict D1 reconciliation envelope: {error}"),
+                "Treat the provider evidence as contradictory and retain the lease.",
+            )
+        })?;
+    validate_strict_d1_migration_manifest_envelope(envelope)
+}
+
+fn decode_json_rejecting_duplicate_object_keys(
+    body: &str,
+) -> Result<Value, DuplicateSafeJsonError> {
+    let mut deserializer = serde_json::Deserializer::from_str(body);
+    let value = DuplicateSafeJsonValue::deserialize(&mut deserializer).map_err(|error| {
+        if error.to_string().contains(DUPLICATE_JSON_OBJECT_KEY_MARKER) {
+            DuplicateSafeJsonError::DuplicateObjectKey
+        } else {
+            DuplicateSafeJsonError::Malformed(error)
+        }
+    })?;
+    deserializer
+        .end()
+        .map_err(DuplicateSafeJsonError::Malformed)?;
+    Ok(value.0)
+}
+
+fn reconciliation_duplicate_object_key_error() -> AdapterError {
+    AdapterError::new(
+        "cloudflare.d1.migration_reconciliation_duplicate_object_key",
+        "Cloudflare reconciliation response contained a duplicate JSON object key",
+        "Treat the provider evidence as contradictory and retain the lease.",
+    )
 }
 
 fn header_value(name: &'static str, value: &str) -> Result<HeaderValue, AdapterError> {
@@ -4024,8 +4180,9 @@ mod tests {
 
     use super::{
         AdapterError, CloudflareApiError, CloudflareClient, D1MigrationReconciliationReadLifecycle,
-        is_d1_sqlite_auth_error, path_segment, with_request_api_token_override,
-        worker_listing_identity, worker_version_id, worker_version_page_metadata,
+        decode_strict_d1_migration_reconciliation_envelope, is_d1_sqlite_auth_error, path_segment,
+        with_request_api_token_override, worker_listing_identity, worker_version_id,
+        worker_version_page_metadata,
     };
     use crate::cloudflare::model::{AccessPolicyWrite, PageInfo, WorkerScript};
     use crate::config::{ApiTokenSource, CloudflareApiConfig};
@@ -4340,6 +4497,48 @@ mod tests {
             error.lifecycle,
             D1MigrationReconciliationReadLifecycle::body_completely_read(200)
         );
+    }
+
+    #[test]
+    fn reconciliation_decoder_rejects_recursive_duplicate_object_keys_in_both_orders() {
+        let duplicate_pairs = [("false", "true"), ("true", "false")];
+        for (first, second) in duplicate_pairs {
+            let (numeric_first, numeric_second) = if first == "false" { (1, 2) } else { (2, 1) };
+            let cases = [
+                format!(r#"{{"success":{first},"success":{second},"errors":[],"result":[]}}"#),
+                format!(
+                    r#"{{"success":true,"errors":[],"result":[{{"success":{first},"success":{second},"errors":[],"results":[],"meta":{{}}}}]}}"#
+                ),
+                format!(
+                    r#"{{"success":true,"errors":[],"result":[{{"success":true,"errors":[],"results":[],"meta":{{"served_by_primary":{first},"served_by_primary":{second}}}}}]}}"#
+                ),
+                format!(
+                    r#"{{"success":true,"errors":[],"result":[{{"success":true,"errors":[{{"code":{numeric_first},"code":{numeric_second}}}],"results":[],"meta":{{}}}}]}}"#
+                ),
+                format!(
+                    r#"{{"success":true,"errors":[],"result":[{{"success":true,"errors":[],"results":[{{"id":{numeric_first},"id":{numeric_second}}}],"meta":{{}}}}]}}"#
+                ),
+            ];
+            for body in cases {
+                let error = decode_strict_d1_migration_reconciliation_envelope(&body)
+                    .expect_err("every recursive duplicate object key must fail closed");
+                assert_eq!(
+                    error.code,
+                    "cloudflare.d1.migration_reconciliation_duplicate_object_key"
+                );
+                assert_eq!(
+                    error.message,
+                    "Cloudflare reconciliation response contained a duplicate JSON object key"
+                );
+            }
+        }
+
+        let envelope = decode_strict_d1_migration_reconciliation_envelope(
+            r#"{"success":true,"errors":[],"result":[{"success":true,"errors":[],"results":[{"id":1}],"meta":{"served_by_primary":true}}]}"#,
+        )
+        .expect("duplicate-free nested reconciliation envelope");
+        assert!(envelope.success);
+        assert!(envelope.result.is_some());
     }
 
     #[tokio::test]
