@@ -34,7 +34,7 @@ pub(crate) fn valid_manifest_outcome_prefixes(
         "not_committed" => true,
         "partial_state_converged" => current_prefix_length < manifest_length,
         "full_state_converged" => current_prefix_length == manifest_length,
-        _ => unreachable!("receipt outcome validation already rejected unknown values"),
+        _ => false,
     }
 }
 
