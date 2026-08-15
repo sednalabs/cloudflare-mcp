@@ -8,6 +8,8 @@
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock, mpsc};
 
 #[cfg(target_os = "linux")]
 use std::fs;
@@ -30,6 +32,18 @@ static D1_MANIFEST_LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 // the focused tests run alongside unrelated lease tests.
 #[cfg(test)]
 static TERMINAL_RETIRE_TEST_FAIL_AFTER_NAMESPACE_MUTATIONS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+struct TerminalReceiptReadbackPauseHook {
+    lease_nonce: String,
+    entered: mpsc::Sender<()>,
+    resume: mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static TERMINAL_RECEIPT_READBACK_PAUSE_HOOK: OnceLock<
+    Mutex<Option<TerminalReceiptReadbackPauseHook>>,
+> = OnceLock::new();
 
 #[cfg(target_os = "linux")]
 const ACTIVE_LEASE_NAME: &str = "active.lease.json";
@@ -146,6 +160,8 @@ pub(crate) struct D1TerminalReconciliationReceiptEvidence {
     pub(crate) payload_sha256: String,
     pub(crate) receipt_version: u8,
     pub(crate) effect_assertion_id: String,
+    target_key_sha256: String,
+    lease_nonce: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -414,35 +430,27 @@ impl D1RetainedMigrationLease {
                 &self.guard_identity,
             )
             .map_err(d1_retained_lease_revalidation_error)?;
-            if self.identity.namespace == "retired" {
-                for name in [ACTIVE_LEASE_NAME, RETIRING_LEASE_NAME] {
-                    match retained_entry_present(&self.target, name) {
-                        Ok(false) => {}
-                        Ok(true) => {
-                            return Err(d1_retained_lease_revalidation_error(
-                                "active or retiring evidence exists beside terminal retirement",
-                            ));
-                        }
-                        Err(message) => {
-                            return Err(d1_retained_lease_revalidation_error(message));
-                        }
-                    }
+            let retired_name = format!("retired.{}.lease.json", self.identity.nonce);
+            let active_present = retained_entry_present(&self.target, ACTIVE_LEASE_NAME)
+                .map_err(d1_retained_lease_revalidation_error)?;
+            let retiring_present = retained_entry_present(&self.target, RETIRING_LEASE_NAME)
+                .map_err(d1_retained_lease_revalidation_error)?;
+            let retired_present = retained_entry_present(&self.target, &retired_name)
+                .map_err(d1_retained_lease_revalidation_error)?;
+            let expected_namespace = match self.identity.namespace.as_str() {
+                "active" => (true, false, false),
+                "retiring" => (false, true, false),
+                "retired" => (false, false, true),
+                _ => {
+                    return Err(d1_retained_lease_revalidation_error(
+                        "retained lease namespace is not recognized",
+                    ));
                 }
-            } else {
-                let other_name = if self.evidence_name == ACTIVE_LEASE_NAME {
-                    RETIRING_LEASE_NAME
-                } else {
-                    ACTIVE_LEASE_NAME
-                };
-                match retained_entry_present(&self.target, other_name) {
-                    Ok(false) => {}
-                    Ok(true) => {
-                        return Err(d1_retained_lease_revalidation_error(
-                            "both active and retiring migration evidence are present",
-                        ));
-                    }
-                    Err(message) => return Err(d1_retained_lease_revalidation_error(message)),
-                }
+            };
+            if (active_present, retiring_present, retired_present) != expected_namespace {
+                return Err(d1_retained_lease_revalidation_error(
+                    "active, retiring, or exact terminal-retired migration evidence conflicts",
+                ));
             }
             validate_retained_named_lease(
                 &self.target,
@@ -548,16 +556,62 @@ impl D1RetainedMigrationLease {
                     };
                 }
             };
-            let receipt_persisted = match (first_receipt, second_receipt) {
+            let preliminary_receipt_persisted = match (&first_receipt, &second_receipt) {
                 (None, None) => Some(false),
-                (Some(first), Some(_))
-                    if linux::validate_terminal_receipt_evidence(&self.target, &first).is_ok() =>
+                (Some(first), Some(second))
+                    if linux::same_terminal_receipt_evidence(first, second)
+                        && linux::validate_stable_terminal_receipt_evidence(
+                            &self.target,
+                            second,
+                        )
+                        .is_ok() =>
                 {
                     Some(true)
                 }
                 _ => None,
             };
-            if receipt_persisted.is_none() || self.revalidate().is_err() {
+            if preliminary_receipt_persisted.is_none() {
+                return D1TerminalEvidenceReadback {
+                    custody: D1TerminalCustodyNamespace::Unverified,
+                    receipt_persisted: None,
+                };
+            }
+            maybe_pause_terminal_receipt_readback_for_test(&expected.lease_nonce);
+            if self.revalidate().is_err() {
+                return D1TerminalEvidenceReadback {
+                    custody: D1TerminalCustodyNamespace::Unverified,
+                    receipt_persisted: None,
+                };
+            }
+            let final_receipt = match linux::compatible_terminal_receipt_state(
+                &self.target,
+                expected,
+                legacy_expected,
+            ) {
+                Ok(receipt) => receipt,
+                Err(_) => {
+                    return D1TerminalEvidenceReadback {
+                        custody: D1TerminalCustodyNamespace::Unverified,
+                        receipt_persisted: None,
+                    };
+                }
+            };
+            let receipt_persisted = match (second_receipt, final_receipt) {
+                (None, None) if preliminary_receipt_persisted == Some(false) => Some(false),
+                (Some(second), Some(final_receipt))
+                    if preliminary_receipt_persisted == Some(true)
+                        && linux::same_terminal_receipt_evidence(&second, &final_receipt)
+                        && linux::validate_stable_terminal_receipt_evidence(
+                            &self.target,
+                            &final_receipt,
+                        )
+                        .is_ok() =>
+                {
+                    Some(true)
+                }
+                _ => None,
+            };
+            if receipt_persisted.is_none() {
                 return D1TerminalEvidenceReadback {
                     custody: D1TerminalCustodyNamespace::Unverified,
                     receipt_persisted: None,
@@ -619,7 +673,9 @@ impl D1RetainedMigrationLease {
                     local_namespace_mutations,
                 });
             }
-            if let Err(message) = linux::validate_terminal_receipt_evidence(&self.target, receipt) {
+            if let Err(message) =
+                linux::validate_stable_terminal_receipt_evidence(&self.target, receipt)
+            {
                 return Err(D1TerminalRetirementFailure {
                     result: d1_terminal_reconciliation_error(message),
                     local_namespace_mutations,
@@ -720,7 +776,9 @@ impl D1RetainedMigrationLease {
                     local_namespace_mutations,
                 });
             }
-            if let Err(message) = linux::validate_terminal_receipt_evidence(&self.target, receipt) {
+            if let Err(message) =
+                linux::validate_stable_terminal_receipt_evidence(&self.target, receipt)
+            {
                 return Err(D1TerminalRetirementFailure {
                     result: d1_terminal_reconciliation_error(message),
                     local_namespace_mutations,
@@ -740,6 +798,52 @@ impl D1RetainedMigrationLease {
         }
     }
 }
+
+#[cfg(test)]
+fn install_terminal_receipt_readback_pause_hook(
+    lease_nonce: String,
+    entered: mpsc::Sender<()>,
+    resume: mpsc::Receiver<()>,
+) {
+    let mut hook = TERMINAL_RECEIPT_READBACK_PAUSE_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("terminal receipt readback pause hook lock");
+    *hook = Some(TerminalReceiptReadbackPauseHook {
+        lease_nonce,
+        entered,
+        resume,
+    });
+}
+
+#[cfg(test)]
+fn maybe_pause_terminal_receipt_readback_for_test(lease_nonce: &str) {
+    let hook = {
+        let mut hook = TERMINAL_RECEIPT_READBACK_PAUSE_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("terminal receipt readback pause hook lock");
+        if hook
+            .as_ref()
+            .is_some_and(|candidate| candidate.lease_nonce == lease_nonce)
+        {
+            hook.take()
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        hook.entered
+            .send(())
+            .expect("terminal receipt readback pause receiver");
+        hook.resume
+            .recv()
+            .expect("terminal receipt readback resume signal");
+    }
+}
+
+#[cfg(not(test))]
+fn maybe_pause_terminal_receipt_readback_for_test(_lease_nonce: &str) {}
 
 #[cfg(test)]
 fn terminal_retirement_test_failure_after(local_namespace_mutations: usize) -> bool {
@@ -1072,9 +1176,9 @@ fn d1_migration_lease_nonce(target_hash: &str, plan_sha256: &str) -> String {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
-    use std::ffi::CString;
+    use std::ffi::{CStr, CString, c_char};
     use std::io;
-    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 
@@ -1089,6 +1193,23 @@ mod linux {
     const O_PATH: i32 = 0o10000000;
     const RENAME_NOREPLACE: u32 = 1;
     const MAX_LEASE_PAYLOAD_BYTES: u64 = 4096;
+    const MAX_TERMINAL_RECEIPT_NAMESPACE_ENTRIES: usize = 4096;
+    const TERMINAL_RECEIPT_PREFIX: &str = "terminal-reconciliation.";
+    const TERMINAL_RECEIPT_SUFFIX: &str = ".receipt.json";
+
+    #[repr(C)]
+    struct CDirectoryStream {
+        _private: [u8; 0],
+    }
+
+    #[repr(C)]
+    struct CDirectoryEntry {
+        d_ino: u64,
+        d_off: i64,
+        d_reclen: u16,
+        d_type: u8,
+        d_name: [c_char; 256],
+    }
 
     unsafe extern "C" {
         fn geteuid() -> u32;
@@ -1101,6 +1222,10 @@ mod linux {
             newpath: *const std::ffi::c_char,
             flags: u32,
         ) -> i32;
+        fn fdopendir(fd: i32) -> *mut CDirectoryStream;
+        fn readdir(directory: *mut CDirectoryStream) -> *mut CDirectoryEntry;
+        fn closedir(directory: *mut CDirectoryStream) -> i32;
+        fn __errno_location() -> *mut i32;
     }
 
     fn current_effective_uid() -> u32 {
@@ -1163,6 +1288,47 @@ mod linux {
             O_PATH | O_NOFOLLOW | O_CLOEXEC,
             0,
         )
+    }
+
+    fn directory_entry_names(target: &fs::File) -> Result<Vec<Vec<u8>>, &'static str> {
+        let current = c_string_name(".")?;
+        let directory = open_at(
+            target.as_raw_fd(),
+            &current,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+            0,
+        )
+        .map_err(|_| "target custody directory could not be duplicated for enumeration")?;
+        let directory_fd = directory.into_raw_fd();
+        let stream = unsafe { fdopendir(directory_fd) };
+        if stream.is_null() {
+            drop(unsafe { fs::File::from_raw_fd(directory_fd) });
+            return Err("target custody directory could not be opened for enumeration");
+        }
+        let read_result = (|| {
+            let mut names = Vec::new();
+            loop {
+                unsafe {
+                    *__errno_location() = 0;
+                }
+                let entry = unsafe { readdir(stream) };
+                if entry.is_null() {
+                    if unsafe { *__errno_location() } != 0 {
+                        return Err("target custody directory enumeration failed");
+                    }
+                    break;
+                }
+                let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+                if name != b"." && name != b".." {
+                    names.push(name.to_vec());
+                }
+            }
+            Ok(names)
+        })();
+        if unsafe { closedir(stream) } != 0 {
+            return Err("target custody directory enumeration could not be closed cleanly");
+        }
+        read_result
     }
 
     fn entry_present(target: &fs::File, name: &str) -> Result<bool, &'static str> {
@@ -1692,7 +1858,7 @@ mod linux {
     }
 
     enum ParsedTerminalReceipt {
-        V1,
+        V1(D1TerminalReconciliationReceiptV1),
         V2(D1TerminalReconciliationReceipt),
     }
 
@@ -1715,7 +1881,7 @@ mod linux {
         if canonical != bytes {
             return Err("terminal reconciliation receipt is not exact canonical JSON");
         }
-        Ok(ParsedTerminalReceipt::V1)
+        Ok(ParsedTerminalReceipt::V1(receipt))
     }
 
     fn open_terminal_receipt(
@@ -1752,9 +1918,19 @@ mod linux {
         }
         let bytes = read_held_file(&file)?;
         let parsed = parse_canonical_terminal_receipt(&bytes)?;
-        let (receipt_version, effect_assertion_id) = match parsed {
-            ParsedTerminalReceipt::V1 => (1, "schema_create_only_v1".to_string()),
-            ParsedTerminalReceipt::V2(receipt) => (2, receipt.effect_assertion_id),
+        let (receipt_version, effect_assertion_id, target_key_sha256, lease_nonce) = match parsed {
+            ParsedTerminalReceipt::V1(receipt) => (
+                1,
+                "schema_create_only_v1".to_string(),
+                receipt.target_key_sha256,
+                receipt.lease_nonce,
+            ),
+            ParsedTerminalReceipt::V2(receipt) => (
+                2,
+                receipt.effect_assertion_id,
+                receipt.target_key_sha256,
+                receipt.lease_nonce,
+            ),
         };
         Ok(D1TerminalReconciliationReceiptEvidence {
             file,
@@ -1763,7 +1939,116 @@ mod linux {
             payload_sha256: sha256_bytes_hex(&bytes),
             receipt_version,
             effect_assertion_id,
+            target_key_sha256,
+            lease_nonce,
         })
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TerminalReceiptNamespaceEntry {
+        name: String,
+        file_identity: D1LeaseFileIdentity,
+        payload_sha256: String,
+        receipt_version: u8,
+        effect_assertion_id: String,
+        target_key_sha256: String,
+        lease_nonce: String,
+    }
+
+    fn terminal_receipt_namespace_snapshot(
+        target: &fs::File,
+        expected_target_key_sha256: &str,
+    ) -> Result<Vec<TerminalReceiptNamespaceEntry>, &'static str> {
+        let mut receipts = Vec::new();
+        for name in directory_entry_names(target)? {
+            if !name.starts_with(TERMINAL_RECEIPT_PREFIX.as_bytes()) {
+                continue;
+            }
+            if receipts.len() == MAX_TERMINAL_RECEIPT_NAMESPACE_ENTRIES {
+                return Err("terminal reconciliation receipt namespace exceeds the custody limit");
+            }
+            let name = String::from_utf8(name)
+                .map_err(|_| "terminal reconciliation receipt namespace is not valid UTF-8")?;
+            let nonce = name
+                .strip_prefix(TERMINAL_RECEIPT_PREFIX)
+                .and_then(|value| value.strip_suffix(TERMINAL_RECEIPT_SUFFIX))
+                .filter(|value| valid_retained_nonce(value))
+                .ok_or(
+                    "terminal reconciliation receipt namespace contains an unclassifiable sibling",
+                )?;
+            let evidence = open_terminal_receipt(target, &name)?;
+            if evidence.target_key_sha256 != expected_target_key_sha256
+                || evidence.lease_nonce != nonce
+            {
+                return Err(
+                    "terminal reconciliation receipt sibling contradicts its target or filename identity",
+                );
+            }
+            receipts.push(TerminalReceiptNamespaceEntry {
+                name,
+                file_identity: evidence.file_identity,
+                payload_sha256: evidence.payload_sha256,
+                receipt_version: evidence.receipt_version,
+                effect_assertion_id: evidence.effect_assertion_id,
+                target_key_sha256: evidence.target_key_sha256,
+                lease_nonce: evidence.lease_nonce,
+            });
+        }
+        receipts.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(receipts)
+    }
+
+    fn receipt_matches_namespace_entry(
+        evidence: &D1TerminalReconciliationReceiptEvidence,
+        entry: &TerminalReceiptNamespaceEntry,
+    ) -> bool {
+        evidence.name == entry.name
+            && evidence.file_identity == entry.file_identity
+            && evidence.payload_sha256 == entry.payload_sha256
+            && evidence.receipt_version == entry.receipt_version
+            && evidence.effect_assertion_id == entry.effect_assertion_id
+            && evidence.target_key_sha256 == entry.target_key_sha256
+            && evidence.lease_nonce == entry.lease_nonce
+    }
+
+    pub(super) fn same_terminal_receipt_evidence(
+        left: &D1TerminalReconciliationReceiptEvidence,
+        right: &D1TerminalReconciliationReceiptEvidence,
+    ) -> bool {
+        left.name == right.name
+            && left.file_identity == right.file_identity
+            && left.payload_sha256 == right.payload_sha256
+            && left.receipt_version == right.receipt_version
+            && left.effect_assertion_id == right.effect_assertion_id
+            && left.target_key_sha256 == right.target_key_sha256
+            && left.lease_nonce == right.lease_nonce
+    }
+
+    pub(super) fn validate_stable_terminal_receipt_evidence(
+        target: &fs::File,
+        evidence: &D1TerminalReconciliationReceiptEvidence,
+    ) -> Result<(), &'static str> {
+        let first = terminal_receipt_namespace_snapshot(target, &evidence.target_key_sha256)?;
+        let first_entry = first
+            .iter()
+            .find(|entry| entry.name == evidence.name)
+            .ok_or("exact terminal reconciliation receipt is absent from its namespace")?;
+        if !receipt_matches_namespace_entry(evidence, first_entry) {
+            return Err("terminal reconciliation receipt namespace contradicts the held evidence");
+        }
+        validate_terminal_receipt_evidence(target, evidence)?;
+        let second = terminal_receipt_namespace_snapshot(target, &evidence.target_key_sha256)?;
+        if first != second {
+            return Err("terminal reconciliation receipt namespace changed during stable readback");
+        }
+        let second_entry = second
+            .iter()
+            .find(|entry| entry.name == evidence.name)
+            .ok_or("exact terminal reconciliation receipt is absent from its namespace")?;
+        if !receipt_matches_namespace_entry(evidence, second_entry) {
+            return Err("terminal reconciliation receipt namespace contradicts the held evidence");
+        }
+        validate_terminal_receipt_evidence(target, evidence)
     }
 
     pub(super) fn validate_terminal_receipt_evidence(
@@ -1794,16 +2079,29 @@ mod linux {
     ) -> Result<Option<D1TerminalReconciliationReceiptEvidence>, &'static str> {
         let expected_bytes = canonical_terminal_receipt_bytes(expected)?;
         let name = terminal_receipt_name(&expected.lease_nonce);
-        if !entry_present(target, &name)? {
+        let first = terminal_receipt_namespace_snapshot(target, &expected.target_key_sha256)?;
+        let Some(first_entry) = first.iter().find(|entry| entry.name == name) else {
+            let second = terminal_receipt_namespace_snapshot(target, &expected.target_key_sha256)?;
+            if first != second || second.iter().any(|entry| entry.name == name) {
+                return Err(
+                    "terminal reconciliation receipt namespace changed during stable absence readback",
+                );
+            }
             return Ok(None);
-        }
+        };
         let evidence = open_terminal_receipt(target, &name)?;
+        if !receipt_matches_namespace_entry(&evidence, first_entry) {
+            return Err(
+                "terminal reconciliation receipt changed after its initial namespace readback",
+            );
+        }
         let actual = read_held_file(&evidence.file)?;
         if actual != expected_bytes {
             return Err(
                 "terminal reconciliation receipt contradicts the exact request or evidence",
             );
         }
+        validate_stable_terminal_receipt_evidence(target, &evidence)?;
         Ok(Some(evidence))
     }
 
@@ -1817,10 +2115,22 @@ mod linux {
             .map(canonical_terminal_receipt_v1_bytes)
             .transpose()?;
         let name = terminal_receipt_name(&expected.lease_nonce);
-        if !entry_present(target, &name)? {
+        let first = terminal_receipt_namespace_snapshot(target, &expected.target_key_sha256)?;
+        let Some(first_entry) = first.iter().find(|entry| entry.name == name) else {
+            let second = terminal_receipt_namespace_snapshot(target, &expected.target_key_sha256)?;
+            if first != second || second.iter().any(|entry| entry.name == name) {
+                return Err(
+                    "terminal reconciliation receipt namespace changed during stable absence readback",
+                );
+            }
             return Ok(None);
-        }
+        };
         let evidence = open_terminal_receipt(target, &name)?;
+        if !receipt_matches_namespace_entry(&evidence, first_entry) {
+            return Err(
+                "terminal reconciliation receipt changed after its initial namespace readback",
+            );
+        }
         let actual = read_held_file(&evidence.file)?;
         let exact_current = actual == expected_bytes;
         let exact_legacy = legacy_expected_bytes
@@ -1831,6 +2141,7 @@ mod linux {
                 "terminal reconciliation receipt contradicts the exact request or evidence",
             );
         }
+        validate_stable_terminal_receipt_evidence(target, &evidence)?;
         Ok(Some(evidence))
     }
 
@@ -1877,8 +2188,10 @@ mod linux {
             payload_sha256: sha256_bytes_hex(&bytes),
             receipt_version: expected.version,
             effect_assertion_id: expected.effect_assertion_id.clone(),
+            target_key_sha256: expected.target_key_sha256.clone(),
+            lease_nonce: expected.lease_nonce.clone(),
         };
-        validate_terminal_receipt_evidence(target, &evidence)?;
+        validate_stable_terminal_receipt_evidence(target, &evidence)?;
         Ok((evidence, true))
     }
 
@@ -2701,6 +3014,15 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn write_private_test_file(path: &Path, bytes: &[u8]) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::write(path, bytes).expect("write private test file");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .expect("set private test file mode");
+    }
+
+    #[cfg(target_os = "linux")]
     fn remove_test_path(path: &Path) {
         match fs::symlink_metadata(path) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
@@ -3493,6 +3815,261 @@ mod tests {
         assert_eq!(altered.receipt_persisted, None);
         drop(retained);
         fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_evidence_readback_rechecks_receipt_after_preliminary_stable_read() {
+        let root = private_test_root("terminal-readback-final-recheck");
+        let plan = "a".repeat(64);
+        let mut owner =
+            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
+                .expect("create retained evidence");
+        let identity = owner.identity.clone();
+        let target = owner
+            .active_path_for_test()
+            .expect("active path")
+            .parent()
+            .expect("target")
+            .to_path_buf();
+        owner.retain();
+        drop(owner);
+        let expected = terminal_receipt(&identity, &plan);
+        let retained = inspect_terminal_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "db-1",
+            "newsletter-core",
+            &plan,
+            &identity.nonce,
+            &identity.payload_sha256,
+        )
+        .expect("inspect retained lease");
+        retained
+            .persist_terminal_receipt(&expected)
+            .expect("persist exact terminal receipt");
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        install_terminal_receipt_readback_pause_hook(identity.nonce.clone(), entered_tx, resume_rx);
+        let expected_for_readback = expected.clone();
+        let readback = std::thread::spawn(move || {
+            retained.terminal_evidence_readback(&expected_for_readback, None)
+        });
+        entered_rx
+            .recv()
+            .expect("preliminary receipt and lease readback completed");
+        let receipt_path = target.join(format!(
+            "terminal-reconciliation.{}.receipt.json",
+            identity.nonce
+        ));
+        let displaced = root.join("displaced-terminal-receipt.json");
+        fs::rename(&receipt_path, &displaced).expect("displace incumbent receipt inode");
+        write_private_test_file(
+            &receipt_path,
+            &serde_json::to_vec(&expected).expect("canonical replacement receipt"),
+        );
+        resume_tx.send(()).expect("resume final receipt readback");
+        let result = readback.join().expect("readback thread");
+        assert_eq!(result.custody, D1TerminalCustodyNamespace::Unverified);
+        assert_eq!(result.receipt_persisted, None);
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_receipt_namespace_conflicts_fail_closed_in_both_insertion_orders() {
+        for order in ["conflict-first", "exact-first"] {
+            let root = private_test_root(&format!("terminal-receipt-order-{order}"));
+            let plan = "a".repeat(64);
+            let mut owner = acquire_d1_migration_lease_at(
+                root.clone(),
+                "acct-1",
+                "db-1",
+                "newsletter-core",
+                &plan,
+            )
+            .expect("create retained evidence");
+            let identity = owner.identity.clone();
+            let target = owner
+                .active_path_for_test()
+                .expect("active path")
+                .parent()
+                .expect("target")
+                .to_path_buf();
+            owner.retain();
+            drop(owner);
+            let expected = terminal_receipt(&identity, &plan);
+            let mut retained = inspect_terminal_d1_migration_lease_at(
+                root.clone(),
+                "acct-1",
+                "db-1",
+                "newsletter-core",
+                &plan,
+                &identity.nonce,
+                &identity.payload_sha256,
+            )
+            .expect("inspect retained lease");
+            let sibling_nonce = "9".repeat(64);
+            assert_ne!(sibling_nonce, identity.nonce);
+            let sibling_path = target.join(format!(
+                "terminal-reconciliation.{sibling_nonce}.receipt.json"
+            ));
+            let conflicting_sibling = serde_json::to_vec(&expected)
+                .expect("canonical receipt with contradictory filename identity");
+            if order == "conflict-first" {
+                write_private_test_file(&sibling_path, &conflicting_sibling);
+                assert!(
+                    retained.persist_terminal_receipt(&expected).is_err(),
+                    "conflicting sibling must block exact receipt creation"
+                );
+                assert!(
+                    !target
+                        .join(format!(
+                            "terminal-reconciliation.{}.receipt.json",
+                            identity.nonce
+                        ))
+                        .exists(),
+                    "failed create-only custody must not install the exact receipt"
+                );
+            } else {
+                let (receipt, created) = retained
+                    .persist_terminal_receipt(&expected)
+                    .expect("persist exact incumbent before conflict");
+                assert!(created);
+                write_private_test_file(&sibling_path, &conflicting_sibling);
+                assert!(retained.terminal_receipt_state(&expected).is_err());
+                let failure = retained
+                    .retire_after_terminal_receipt(&receipt)
+                    .expect_err("conflicting sibling must block retirement");
+                assert_eq!(failure.local_namespace_mutations, 0);
+                assert_eq!(retained.identity.namespace, "active");
+            }
+            fs::remove_dir_all(root).expect("test cleanup");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn canonical_historical_receipt_sibling_preserves_exact_current_replay() {
+        let root = private_test_root("terminal-receipt-historical-sibling");
+        let plan = "a".repeat(64);
+        let mut owner =
+            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
+                .expect("create retained evidence");
+        let identity = owner.identity.clone();
+        let target = owner
+            .active_path_for_test()
+            .expect("active path")
+            .parent()
+            .expect("target")
+            .to_path_buf();
+        owner.retain();
+        drop(owner);
+        let expected = terminal_receipt(&identity, &plan);
+        let mut historical = expected.clone();
+        historical.lease_nonce = "9".repeat(64);
+        assert_ne!(historical.lease_nonce, identity.nonce);
+        historical.lease_payload_sha256 = "8".repeat(64);
+        write_private_test_file(
+            &target.join(format!(
+                "terminal-reconciliation.{}.receipt.json",
+                historical.lease_nonce
+            )),
+            &serde_json::to_vec(&historical).expect("canonical historical receipt"),
+        );
+        let mut retained = inspect_terminal_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "db-1",
+            "newsletter-core",
+            &plan,
+            &identity.nonce,
+            &identity.payload_sha256,
+        )
+        .expect("inspect retained lease beside historical receipt");
+        let (receipt, created) = retained
+            .persist_terminal_receipt(&expected)
+            .expect("create current receipt beside canonical historical evidence");
+        assert!(created);
+        let (replayed, created_again) = retained
+            .persist_terminal_receipt(&expected)
+            .expect("exact current receipt replay converges");
+        assert!(!created_again);
+        assert!(linux::same_terminal_receipt_evidence(&receipt, &replayed));
+        assert_eq!(
+            retained
+                .retire_after_terminal_receipt(&receipt)
+                .expect("retire current evidence")
+                .local_namespace_mutations,
+            2
+        );
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_retired_active_and_retiring_namespace_conflicts_all_fail_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for namespace in ["active", "retiring", "retired"] {
+            let root = private_test_root(&format!("terminal-namespace-{namespace}"));
+            let plan = "a".repeat(64);
+            let mut owner = acquire_d1_migration_lease_at(
+                root.clone(),
+                "acct-1",
+                "db-1",
+                "newsletter-core",
+                &plan,
+            )
+            .expect("create retained evidence");
+            let identity = owner.identity.clone();
+            let target = owner
+                .active_path_for_test()
+                .expect("active path")
+                .parent()
+                .expect("target")
+                .to_path_buf();
+            owner.retain();
+            drop(owner);
+            let active = target.join(ACTIVE_LEASE_NAME);
+            let retiring = target.join(RETIRING_LEASE_NAME);
+            let retired = target.join(format!("retired.{}.lease.json", identity.nonce));
+            match namespace {
+                "active" => {}
+                "retiring" => fs::rename(&active, &retiring).expect("install retiring state"),
+                "retired" => fs::rename(&active, &retired).expect("install retired state"),
+                _ => unreachable!(),
+            }
+            let retained = inspect_terminal_d1_migration_lease_at(
+                root.clone(),
+                "acct-1",
+                "db-1",
+                "newsletter-core",
+                &plan,
+                &identity.nonce,
+                &identity.payload_sha256,
+            )
+            .expect("inspect one exact namespace state");
+            let (source, conflict) = match namespace {
+                "active" => (&active, &retired),
+                "retiring" => (&retiring, &retired),
+                "retired" => (&retired, &active),
+                _ => unreachable!(),
+            };
+            fs::copy(source, conflict).expect("install conflicting exact namespace sibling");
+            fs::set_permissions(conflict, fs::Permissions::from_mode(0o600))
+                .expect("private conflicting namespace sibling");
+            assert!(
+                retained.revalidate().is_err(),
+                "{namespace} plus an exact sibling state must be contradictory"
+            );
+            let readback =
+                retained.terminal_evidence_readback(&terminal_receipt(&identity, &plan), None);
+            assert_eq!(readback.custody, D1TerminalCustodyNamespace::Unverified);
+            assert_eq!(readback.receipt_persisted, None);
+            fs::remove_dir_all(root).expect("test cleanup");
+        }
     }
 
     #[cfg(target_os = "linux")]
