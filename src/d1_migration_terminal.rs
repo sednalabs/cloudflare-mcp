@@ -11,7 +11,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::d1_migration_lease::{
-    D1RetainedMigrationLease, D1TerminalReconciliationReceipt, D1TerminalReconciliationReceiptV1,
+    D1RetainedMigrationLease, D1TerminalReconciliationReceipt,
+    D1TerminalReconciliationReceiptEvidence, D1TerminalReconciliationReceiptV1,
     inspect_terminal_d1_migration_lease,
 };
 use crate::d1_migration_reconciliation::{
@@ -289,79 +290,17 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
             )
         });
     if initial_lease.is_retired() {
-        let receipt_evidence = match initial_receipt {
-            None => {
-                return terminal_error(
-                    "d1.migration_terminal_receipt_absent",
-                    "terminal retirement exists without its exact terminal receipt",
-                    TerminalCustodyState::RetiredVerified,
-                    0,
-                    Vec::new(),
-                    Vec::new(),
-                    0,
-                    false,
-                );
-            }
-            Some(evidence) => evidence,
-        };
-        let recomputed_plan = if receipt_evidence.receipt_version == 1 {
-            recomputed_legacy_reconciliation_plan_sha256
-                .as_deref()
-                .expect("v1 receipt is reachable only for the legacy assertion")
-        } else {
-            recomputed_current_reconciliation_plan_sha256.as_str()
-        };
-        if replay_expectation_proof_sha256 != expected_expectation_proof_sha256
-            || recomputed_plan != expected_reconciliation_plan_sha256
-        {
-            return terminal_error(
-                "d1.migration_terminal_approved_evidence_mismatch",
-                "supplied replay manifest does not reproduce the receipt-bound reconciliation plan",
-                TerminalCustodyState::RetiredVerified,
-                0,
-                Vec::new(),
-                Vec::new(),
-                0,
-                false,
-            );
-        }
-        let selected_terminal_plan_sha256 = if receipt_evidence.receipt_version == 1 {
-            legacy_terminal_plan_sha256
-                .as_deref()
-                .expect("v1 receipt is reachable only for the legacy assertion")
-        } else {
-            terminal_plan_sha256.as_str()
-        };
-        if !dry_run && approved_terminal_plan_sha256 != Some(selected_terminal_plan_sha256) {
-            return terminal_error(
-                "d1.migration_terminal_plan_mismatch",
-                "approved_terminal_plan_sha256 does not match the exact pre-existing terminal plan",
-                TerminalCustodyState::RetiredVerified,
-                0,
-                Vec::new(),
-                Vec::new(),
-                0,
-                false,
-            );
-        }
-        return terminal_result(
-            json!({
-                "ok": true,
-                "operation": OPERATION,
-                "dry_run": dry_run,
-                "status": "terminal_reconciliation_already_complete",
-                "replayed": true,
-                "terminal_plan_sha256": selected_terminal_plan_sha256,
-                "terminal_receipt_sha256": receipt_evidence.payload_sha256,
-                "terminal_receipt_version": receipt_evidence.receipt_version,
-                "effect_assertion_id": receipt_evidence.effect_assertion_id,
-                "provider_calls": 0,
-                "provider_read_lifecycle": [],
-                "response_evidence": [],
-                "provider_mutations": 0,
-                "local_namespace_mutations": 0,
-            }),
-            TerminalCustodyState::RetiredVerified,
+        return completed_terminal_replay(
+            initial_receipt,
+            &replay_expectation_proof_sha256,
+            expected_expectation_proof_sha256,
+            expected_reconciliation_plan_sha256,
+            &recomputed_current_reconciliation_plan_sha256,
+            recomputed_legacy_reconciliation_plan_sha256.as_deref(),
+            &terminal_plan_sha256,
+            legacy_terminal_plan_sha256.as_deref(),
+            dry_run,
+            approved_terminal_plan_sha256,
         );
     }
     let initial_receipt_evidence = match initial_receipt {
@@ -450,6 +389,51 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
     {
         Ok(proof) => proof,
         Err(result) => {
+            if let Some(completed) = replay_after_zero_call_prepare_failure(&result, || {
+                let completed_lease = inspect_terminal_d1_migration_lease(
+                    account_id,
+                    database_id,
+                    family,
+                    approved_plan_sha256,
+                    lease_nonce,
+                    lease_payload_sha256,
+                )
+                .ok()?;
+                if !completed_lease.is_retired() {
+                    return None;
+                }
+                let completed_receipt = match completed_lease
+                    .compatible_terminal_receipt_state(&receipt, legacy_receipt.as_ref())
+                {
+                    Ok(evidence) => evidence,
+                    Err(receipt_error) => {
+                        let custody = held_terminal_custody(&completed_lease);
+                        return Some(terminalize_failure(
+                            receipt_error,
+                            custody,
+                            0,
+                            Vec::new(),
+                            Vec::new(),
+                            0,
+                            false,
+                        ));
+                    }
+                };
+                Some(completed_terminal_replay(
+                    completed_receipt,
+                    &replay_expectation_proof_sha256,
+                    expected_expectation_proof_sha256,
+                    expected_reconciliation_plan_sha256,
+                    &recomputed_current_reconciliation_plan_sha256,
+                    recomputed_legacy_reconciliation_plan_sha256.as_deref(),
+                    &terminal_plan_sha256,
+                    legacy_terminal_plan_sha256.as_deref(),
+                    dry_run,
+                    approved_terminal_plan_sha256,
+                ))
+            }) {
+                return completed;
+            }
             let custody = reconciliation_failure_custody(
                 &result,
                 account_id,
@@ -663,6 +647,106 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
             "response_evidence": response_evidence,
             "provider_mutations": 0,
             "local_namespace_mutations": local_mutations + usize::from(retired_now),
+        }),
+        TerminalCustodyState::RetiredVerified,
+    )
+}
+
+fn replay_after_zero_call_prepare_failure(
+    result: &CallToolResult,
+    inspect_exact_completion: impl FnOnce() -> Option<CallToolResult>,
+) -> Option<CallToolResult> {
+    let provider_calls = result
+        .structured_content
+        .as_ref()
+        .and_then(|content| content.get("provider_calls"))
+        .and_then(Value::as_u64);
+    (provider_calls == Some(0))
+        .then(inspect_exact_completion)
+        .flatten()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn completed_terminal_replay(
+    receipt_evidence: Option<D1TerminalReconciliationReceiptEvidence>,
+    replay_expectation_proof_sha256: &str,
+    expected_expectation_proof_sha256: &str,
+    expected_reconciliation_plan_sha256: &str,
+    recomputed_current_reconciliation_plan_sha256: &str,
+    recomputed_legacy_reconciliation_plan_sha256: Option<&str>,
+    terminal_plan_sha256: &str,
+    legacy_terminal_plan_sha256: Option<&str>,
+    dry_run: bool,
+    approved_terminal_plan_sha256: Option<&str>,
+) -> CallToolResult {
+    let receipt_evidence = match receipt_evidence {
+        None => {
+            return terminal_error(
+                "d1.migration_terminal_receipt_absent",
+                "terminal retirement exists without its exact terminal receipt",
+                TerminalCustodyState::RetiredVerified,
+                0,
+                Vec::new(),
+                Vec::new(),
+                0,
+                false,
+            );
+        }
+        Some(evidence) => evidence,
+    };
+    let recomputed_plan = if receipt_evidence.receipt_version == 1 {
+        recomputed_legacy_reconciliation_plan_sha256
+            .expect("v1 receipt is reachable only for the legacy assertion")
+    } else {
+        recomputed_current_reconciliation_plan_sha256
+    };
+    if replay_expectation_proof_sha256 != expected_expectation_proof_sha256
+        || recomputed_plan != expected_reconciliation_plan_sha256
+    {
+        return terminal_error(
+            "d1.migration_terminal_approved_evidence_mismatch",
+            "supplied replay manifest does not reproduce the receipt-bound reconciliation plan",
+            TerminalCustodyState::RetiredVerified,
+            0,
+            Vec::new(),
+            Vec::new(),
+            0,
+            false,
+        );
+    }
+    let selected_terminal_plan_sha256 = if receipt_evidence.receipt_version == 1 {
+        legacy_terminal_plan_sha256.expect("v1 receipt is reachable only for the legacy assertion")
+    } else {
+        terminal_plan_sha256
+    };
+    if !dry_run && approved_terminal_plan_sha256 != Some(selected_terminal_plan_sha256) {
+        return terminal_error(
+            "d1.migration_terminal_plan_mismatch",
+            "approved_terminal_plan_sha256 does not match the exact pre-existing terminal plan",
+            TerminalCustodyState::RetiredVerified,
+            0,
+            Vec::new(),
+            Vec::new(),
+            0,
+            false,
+        );
+    }
+    terminal_result(
+        json!({
+            "ok": true,
+            "operation": OPERATION,
+            "dry_run": dry_run,
+            "status": "terminal_reconciliation_already_complete",
+            "replayed": true,
+            "terminal_plan_sha256": selected_terminal_plan_sha256,
+            "terminal_receipt_sha256": receipt_evidence.payload_sha256,
+            "terminal_receipt_version": receipt_evidence.receipt_version,
+            "effect_assertion_id": receipt_evidence.effect_assertion_id,
+            "provider_calls": 0,
+            "provider_read_lifecycle": [],
+            "response_evidence": [],
+            "provider_mutations": 0,
+            "local_namespace_mutations": 0,
         }),
         TerminalCustodyState::RetiredVerified,
     )
@@ -886,7 +970,7 @@ fn terminal_result(mut content: Value, custody: TerminalCustodyState) -> CallToo
 
 fn terminalize_failure(
     result: CallToolResult,
-    custody: TerminalCustodyState,
+    mut custody: TerminalCustodyState,
     completed_provider_calls: usize,
     prior_response_evidence: Vec<Value>,
     prior_lifecycle: Vec<Value>,
@@ -896,6 +980,9 @@ fn terminalize_failure(
     let mut content = result.structured_content.unwrap_or_else(|| {
         json!({"error": {"code": "d1.migration_terminal_failed", "message": "terminal reconciliation failed closed"}})
     });
+    if content.get("custody_status") == Some(&json!("retained_evidence_unverified")) {
+        custody = TerminalCustodyState::Unverified;
+    }
     let current_calls = content
         .get("provider_calls")
         .and_then(Value::as_u64)
@@ -1126,5 +1213,99 @@ mod tests {
             );
             assert_eq!(actual, expected, "{custody:?}");
         }
+    }
+
+    #[test]
+    fn detected_custody_drift_remains_unverified_after_physical_state_looks_restored() {
+        let upstream = CallToolResult::structured_error(json!({
+            "lease_decision": "retain",
+            "lease_retained": null,
+            "custody_status": "retained_evidence_unverified",
+            "provider_calls": 1,
+            "provider_read_lifecycle": [{"dispatch_stage": "attempted"}],
+            "response_evidence": [{"response_body_sha256": "a"}],
+            "error": {
+                "code": "d1.migration_reconciliation_lease_changed",
+                "message": "retained custody changed after the provider read"
+            }
+        }));
+        let actual = terminalize_failure(
+            upstream,
+            TerminalCustodyState::ActiveVerified,
+            2,
+            vec![json!({"response_body_sha256": "b"})],
+            vec![json!({"dispatch_stage": "received"})],
+            0,
+            false,
+        )
+        .structured_content
+        .expect("structured terminalized custody drift");
+        assert_eq!(actual["ok"], false, "{actual}");
+        assert_eq!(actual["custody_status"], "retained_evidence_unverified");
+        assert_eq!(actual["lease_retained"], Value::Null);
+        assert_eq!(actual["lease_decision"], Value::Null);
+        assert_eq!(actual["provider_calls"], 3);
+        assert_eq!(actual["provider_mutations"], 0);
+        assert_eq!(actual["local_namespace_mutations"], 0);
+        assert_eq!(
+            actual["error"]["code"],
+            "d1.migration_reconciliation_lease_changed"
+        );
+    }
+
+    #[test]
+    fn exact_concurrent_retirement_replay_is_reachable_only_before_any_provider_call() {
+        let zero_call_failure = CallToolResult::structured_error(json!({
+            "provider_calls": 0,
+            "custody_status": "inspection_failed",
+            "error": {
+                "code": "d1.migration_reconciliation_evidence_absent",
+                "message": "active custody retired after initial inspection"
+            }
+        }));
+        let recovered = replay_after_zero_call_prepare_failure(&zero_call_failure, || {
+            Some(terminal_result(
+                json!({
+                    "ok": true,
+                    "operation": OPERATION,
+                    "dry_run": false,
+                    "status": "terminal_reconciliation_already_complete",
+                    "replayed": true,
+                    "provider_calls": 0,
+                    "provider_read_lifecycle": [],
+                    "response_evidence": [],
+                    "provider_mutations": 0,
+                    "local_namespace_mutations": 0,
+                }),
+                TerminalCustodyState::RetiredVerified,
+            ))
+        })
+        .expect("zero-call prepare race may inspect exact completed retirement");
+        let recovered = recovered
+            .structured_content
+            .expect("structured concurrent retirement replay");
+        assert_eq!(recovered["ok"], true, "{recovered}");
+        assert_eq!(
+            recovered["status"],
+            "terminal_reconciliation_already_complete"
+        );
+        assert_eq!(recovered["provider_calls"], 0);
+        assert_eq!(recovered["provider_mutations"], 0);
+        assert_eq!(recovered["custody_status"], "retired_evidence_verified");
+
+        let post_dispatch_failure = CallToolResult::structured_error(json!({
+            "provider_calls": 1,
+            "custody_status": "retained_evidence_unverified",
+            "error": {
+                "code": "d1.migration_reconciliation_lease_changed",
+                "message": "custody changed after provider dispatch"
+            }
+        }));
+        assert!(
+            replay_after_zero_call_prepare_failure(&post_dispatch_failure, || {
+                panic!("post-dispatch ambiguity must not be relabeled as zero-call replay")
+            })
+            .is_none()
+        );
     }
 }

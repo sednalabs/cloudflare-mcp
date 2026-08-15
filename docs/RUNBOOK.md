@@ -425,6 +425,14 @@ order violation and cannot be repaired by creating a receipt afterward. Exact
 replay after completed retirement validates the receipt and retired lease and
 reproduces the receipt-bound expectation proof and versioned reconciliation
 plan from the supplied manifest before returning with zero provider calls.
+If another exact caller completes retirement after initial inspection but
+before reconciliation preparation, a preparation failure with exactly zero
+provider calls permits one fresh custody inspection. It converges only through
+the same exact completed-retirement replay validation. Once any provider call
+has been attempted, the failure is not eligible for this convergence path and
+remains reconciliation-required. Once a refresh or read reports unverified
+custody, preserve that negative classification through terminal error handling;
+a later physical inspection that appears restored cannot overwrite it.
 Null, array, primitive, malformed,
 duplicate-keyed, unknown-keyed, noncanonical, contradictory, hard-linked, or
 conflicting namespace evidence fails closed. Never delete, rewrite, rename, or
