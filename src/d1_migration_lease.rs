@@ -94,6 +94,28 @@ pub(crate) struct D1TerminalReconciliationReceipt {
     pub(crate) lease_nonce: String,
     pub(crate) lease_payload_sha256: String,
     pub(crate) approved_apply_plan_sha256: String,
+    pub(crate) effect_assertion_id: String,
+    pub(crate) reconciliation_plan_sha256: String,
+    pub(crate) expectation_proof_sha256: String,
+    pub(crate) query_sha256: String,
+    pub(crate) canonical_snapshot_sha256: String,
+    pub(crate) terminal_request_sha256: String,
+    pub(crate) terminal_attempt_sha256: String,
+    pub(crate) terminal_plan_sha256: String,
+    pub(crate) outcome: String,
+    pub(crate) original_prefix_length: usize,
+    pub(crate) current_prefix_length: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct D1TerminalReconciliationReceiptV1 {
+    pub(crate) version: u8,
+    pub(crate) operation: String,
+    pub(crate) target_key_sha256: String,
+    pub(crate) lease_nonce: String,
+    pub(crate) lease_payload_sha256: String,
+    pub(crate) approved_apply_plan_sha256: String,
     pub(crate) reconciliation_plan_sha256: String,
     pub(crate) expectation_proof_sha256: String,
     pub(crate) query_sha256: String,
@@ -115,6 +137,8 @@ pub(crate) struct D1TerminalReconciliationReceiptEvidence {
     #[cfg(target_os = "linux")]
     name: String,
     pub(crate) payload_sha256: String,
+    pub(crate) receipt_version: u8,
+    pub(crate) effect_assertion_id: String,
 }
 
 /// A guard-held, descriptor-bound view of retained migration evidence.
@@ -404,6 +428,7 @@ impl D1RetainedMigrationLease {
         self.identity.namespace == "retired"
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn terminal_receipt_state(
         &self,
         expected: &D1TerminalReconciliationReceipt,
@@ -417,6 +442,24 @@ impl D1RetainedMigrationLease {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = expected;
+            Err(d1_retained_lease_platform_unsupported())
+        }
+    }
+
+    pub(crate) fn compatible_terminal_receipt_state(
+        &self,
+        expected: &D1TerminalReconciliationReceipt,
+        legacy_expected: Option<&D1TerminalReconciliationReceiptV1>,
+    ) -> Result<Option<D1TerminalReconciliationReceiptEvidence>, CallToolResult> {
+        #[cfg(target_os = "linux")]
+        {
+            self.revalidate()?;
+            linux::compatible_terminal_receipt_state(&self.target, expected, legacy_expected)
+                .map_err(d1_terminal_reconciliation_error)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (expected, legacy_expected);
             Err(d1_retained_lease_platform_unsupported())
         }
     }
@@ -1338,6 +1381,39 @@ mod linux {
     fn canonical_terminal_receipt_bytes(
         receipt: &D1TerminalReconciliationReceipt,
     ) -> Result<Vec<u8>, &'static str> {
+        if receipt.version != 2
+            || receipt.operation != "d1_finalize_migration_reconciliation"
+            || !valid_lower_sha256(&receipt.target_key_sha256)
+            || !valid_retained_nonce(&receipt.lease_nonce)
+            || !valid_lower_sha256(&receipt.lease_payload_sha256)
+            || !valid_lower_sha256(&receipt.approved_apply_plan_sha256)
+            || !matches!(
+                receipt.effect_assertion_id.as_str(),
+                "schema_create_only_v1" | "schema_create_tables_indexes_views_triggers_v1"
+            )
+            || !valid_lower_sha256(&receipt.reconciliation_plan_sha256)
+            || !valid_lower_sha256(&receipt.expectation_proof_sha256)
+            || !valid_lower_sha256(&receipt.query_sha256)
+            || !valid_lower_sha256(&receipt.canonical_snapshot_sha256)
+            || !valid_lower_sha256(&receipt.terminal_request_sha256)
+            || !valid_lower_sha256(&receipt.terminal_attempt_sha256)
+            || receipt.terminal_request_sha256 == receipt.terminal_attempt_sha256
+            || !valid_lower_sha256(&receipt.terminal_plan_sha256)
+            || !matches!(
+                receipt.outcome.as_str(),
+                "not_committed" | "partial_state_converged" | "full_state_converged"
+            )
+            || receipt.current_prefix_length < receipt.original_prefix_length
+        {
+            return Err("terminal reconciliation receipt contains noncanonical authority fields");
+        }
+        serde_json::to_vec(receipt)
+            .map_err(|_| "terminal reconciliation receipt could not be encoded canonically")
+    }
+
+    fn canonical_terminal_receipt_v1_bytes(
+        receipt: &D1TerminalReconciliationReceiptV1,
+    ) -> Result<Vec<u8>, &'static str> {
         if receipt.version != 1
             || receipt.operation != "d1_finalize_migration_reconciliation"
             || !valid_lower_sha256(&receipt.target_key_sha256)
@@ -1362,6 +1438,33 @@ mod linux {
         }
         serde_json::to_vec(receipt)
             .map_err(|_| "terminal reconciliation receipt could not be encoded canonically")
+    }
+
+    enum ParsedTerminalReceipt {
+        V1,
+        V2(D1TerminalReconciliationReceipt),
+    }
+
+    fn parse_canonical_terminal_receipt(
+        bytes: &[u8],
+    ) -> Result<ParsedTerminalReceipt, &'static str> {
+        if let Ok(receipt) = serde_json::from_slice::<D1TerminalReconciliationReceipt>(bytes) {
+            let canonical = canonical_terminal_receipt_bytes(&receipt)?;
+            if canonical != bytes {
+                return Err("terminal reconciliation receipt is not exact canonical JSON");
+            }
+            return Ok(ParsedTerminalReceipt::V2(receipt));
+        }
+        let receipt: D1TerminalReconciliationReceiptV1 = serde_json::from_slice(bytes).map_err(
+            |_| {
+                "terminal reconciliation receipt is malformed, duplicate-keyed, or structurally unexpected"
+            },
+        )?;
+        let canonical = canonical_terminal_receipt_v1_bytes(&receipt)?;
+        if canonical != bytes {
+            return Err("terminal reconciliation receipt is not exact canonical JSON");
+        }
+        Ok(ParsedTerminalReceipt::V1)
     }
 
     fn open_terminal_receipt(
@@ -1397,20 +1500,18 @@ mod linux {
             return Err("terminal reconciliation receipt changed while it was rebound");
         }
         let bytes = read_held_file(&file)?;
-        let parsed: D1TerminalReconciliationReceipt = serde_json::from_slice(&bytes).map_err(
-            |_| {
-                "terminal reconciliation receipt is malformed, duplicate-keyed, or structurally unexpected"
-            },
-        )?;
-        let canonical = canonical_terminal_receipt_bytes(&parsed)?;
-        if canonical != bytes {
-            return Err("terminal reconciliation receipt is not exact canonical JSON");
-        }
+        let parsed = parse_canonical_terminal_receipt(&bytes)?;
+        let (receipt_version, effect_assertion_id) = match parsed {
+            ParsedTerminalReceipt::V1 => (1, "schema_create_only_v1".to_string()),
+            ParsedTerminalReceipt::V2(receipt) => (2, receipt.effect_assertion_id),
+        };
         Ok(D1TerminalReconciliationReceiptEvidence {
             file,
             file_identity: expected,
             name: name.to_string(),
             payload_sha256: sha256_bytes_hex(&bytes),
+            receipt_version,
+            effect_assertion_id,
         })
     }
 
@@ -1431,11 +1532,8 @@ mod linux {
         if sha256_bytes_hex(&bytes) != evidence.payload_sha256 {
             return Err("terminal reconciliation receipt payload changed");
         }
-        let parsed: D1TerminalReconciliationReceipt = serde_json::from_slice(&bytes)
-            .map_err(|_| "terminal reconciliation receipt payload is malformed")?;
-        if canonical_terminal_receipt_bytes(&parsed)? != bytes {
-            return Err("terminal reconciliation receipt payload is not canonical");
-        }
+        parse_canonical_terminal_receipt(&bytes)
+            .map_err(|_| "terminal reconciliation receipt payload is not canonical")?;
         Ok(())
     }
 
@@ -1451,6 +1549,33 @@ mod linux {
         let evidence = open_terminal_receipt(target, &name)?;
         let actual = read_held_file(&evidence.file)?;
         if actual != expected_bytes {
+            return Err(
+                "terminal reconciliation receipt contradicts the exact request or evidence",
+            );
+        }
+        Ok(Some(evidence))
+    }
+
+    pub(super) fn compatible_terminal_receipt_state(
+        target: &fs::File,
+        expected: &D1TerminalReconciliationReceipt,
+        legacy_expected: Option<&D1TerminalReconciliationReceiptV1>,
+    ) -> Result<Option<D1TerminalReconciliationReceiptEvidence>, &'static str> {
+        let expected_bytes = canonical_terminal_receipt_bytes(expected)?;
+        let legacy_expected_bytes = legacy_expected
+            .map(canonical_terminal_receipt_v1_bytes)
+            .transpose()?;
+        let name = terminal_receipt_name(&expected.lease_nonce);
+        if !entry_present(target, &name)? {
+            return Ok(None);
+        }
+        let evidence = open_terminal_receipt(target, &name)?;
+        let actual = read_held_file(&evidence.file)?;
+        let exact_current = actual == expected_bytes;
+        let exact_legacy = legacy_expected_bytes
+            .as_ref()
+            .is_some_and(|legacy| actual == *legacy);
+        if !exact_current && !exact_legacy {
             return Err(
                 "terminal reconciliation receipt contradicts the exact request or evidence",
             );
@@ -1499,6 +1624,8 @@ mod linux {
             file_identity,
             name,
             payload_sha256: sha256_bytes_hex(&bytes),
+            receipt_version: expected.version,
+            effect_assertion_id: expected.effect_assertion_id.clone(),
         };
         validate_terminal_receipt_evidence(target, &evidence)?;
         Ok((evidence, true))
@@ -2158,6 +2285,32 @@ mod tests {
         approved_plan_sha256: &str,
     ) -> D1TerminalReconciliationReceipt {
         D1TerminalReconciliationReceipt {
+            version: 2,
+            operation: "d1_finalize_migration_reconciliation".to_string(),
+            target_key_sha256: identity.target_key_sha256.clone(),
+            lease_nonce: identity.nonce.clone(),
+            lease_payload_sha256: identity.payload_sha256.clone(),
+            approved_apply_plan_sha256: approved_plan_sha256.to_string(),
+            effect_assertion_id: "schema_create_only_v1".to_string(),
+            reconciliation_plan_sha256: "c".repeat(64),
+            expectation_proof_sha256: "d".repeat(64),
+            query_sha256: "e".repeat(64),
+            canonical_snapshot_sha256: "f".repeat(64),
+            terminal_request_sha256: "1".repeat(64),
+            terminal_attempt_sha256: "2".repeat(64),
+            terminal_plan_sha256: "3".repeat(64),
+            outcome: "full_state_converged".to_string(),
+            original_prefix_length: 0,
+            current_prefix_length: 1,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn terminal_receipt_v1(
+        identity: &D1MigrationLeaseIdentity,
+        approved_plan_sha256: &str,
+    ) -> D1TerminalReconciliationReceiptV1 {
+        D1TerminalReconciliationReceiptV1 {
             version: 1,
             operation: "d1_finalize_migration_reconciliation".to_string(),
             target_key_sha256: identity.target_key_sha256.clone(),
@@ -2904,6 +3057,173 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn canonical_v1_terminal_receipt_recovers_active_retiring_and_retired_as_legacy_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for namespace in ["active", "retiring"] {
+            let root = private_test_root(&format!("terminal-v1-{namespace}"));
+            let plan = "a".repeat(64);
+            let mut owner = acquire_d1_migration_lease_at(
+                root.clone(),
+                "acct-1",
+                "db-1",
+                "newsletter-core",
+                &plan,
+            )
+            .expect("create retained evidence");
+            let identity = owner.identity.clone();
+            let target = owner
+                .active_path_for_test()
+                .expect("active path")
+                .parent()
+                .expect("target")
+                .to_path_buf();
+            owner.retain();
+            drop(owner);
+            let legacy = terminal_receipt_v1(&identity, &plan);
+            let receipt_path = target.join(format!(
+                "terminal-reconciliation.{}.receipt.json",
+                identity.nonce
+            ));
+            fs::write(
+                &receipt_path,
+                serde_json::to_vec(&legacy).expect("canonical v1 receipt"),
+            )
+            .expect("install v1 receipt");
+            fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600))
+                .expect("private v1 receipt");
+            if namespace == "retiring" {
+                fs::rename(
+                    target.join(ACTIVE_LEASE_NAME),
+                    target.join(RETIRING_LEASE_NAME),
+                )
+                .expect("simulate predecessor retiring boundary");
+            }
+            let mut retained = inspect_terminal_d1_migration_lease_at(
+                root.clone(),
+                "acct-1",
+                "db-1",
+                "newsletter-core",
+                &plan,
+                &identity.nonce,
+                &identity.payload_sha256,
+            )
+            .expect("inspect predecessor receipt state");
+            let current = terminal_receipt(&identity, &plan);
+            let evidence = retained
+                .compatible_terminal_receipt_state(&current, Some(&legacy))
+                .expect("v1 receipt is compatible with legacy expectation")
+                .expect("v1 receipt exists");
+            assert_eq!(evidence.receipt_version, 1);
+            assert_eq!(evidence.effect_assertion_id, "schema_create_only_v1");
+            assert!(
+                retained
+                    .compatible_terminal_receipt_state(&current, None)
+                    .is_err(),
+                "v1 receipt must not attest the extended/current-only expectation"
+            );
+            assert!(
+                retained
+                    .retire_after_terminal_receipt(&evidence)
+                    .expect("retire exact predecessor receipt")
+            );
+            drop(retained);
+            let retired = inspect_terminal_d1_migration_lease_at(
+                root.clone(),
+                "acct-1",
+                "db-1",
+                "newsletter-core",
+                &plan,
+                &identity.nonce,
+                &identity.payload_sha256,
+            )
+            .expect("reopen retired predecessor state");
+            let replay = retired
+                .compatible_terminal_receipt_state(&current, Some(&legacy))
+                .expect("retired v1 replay validates")
+                .expect("retired v1 receipt exists");
+            assert_eq!(replay.receipt_version, 1);
+            assert_eq!(replay.effect_assertion_id, "schema_create_only_v1");
+            fs::remove_dir_all(root).expect("test cleanup");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn malformed_noncanonical_and_unknown_field_v1_terminal_receipts_fail_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for variant in ["noncanonical", "unknown", "duplicate"] {
+            let root = private_test_root(&format!("terminal-v1-{variant}"));
+            let plan = "a".repeat(64);
+            let mut owner = acquire_d1_migration_lease_at(
+                root.clone(),
+                "acct-1",
+                "db-1",
+                "newsletter-core",
+                &plan,
+            )
+            .expect("create retained evidence");
+            let identity = owner.identity.clone();
+            let target = owner
+                .active_path_for_test()
+                .expect("active path")
+                .parent()
+                .expect("target")
+                .to_path_buf();
+            owner.retain();
+            drop(owner);
+            let legacy = terminal_receipt_v1(&identity, &plan);
+            let canonical = serde_json::to_vec(&legacy).expect("canonical v1 receipt");
+            let bytes = match variant {
+                "noncanonical" => serde_json::to_vec_pretty(&legacy).expect("pretty v1"),
+                "unknown" => {
+                    let mut value = serde_json::to_value(&legacy).expect("v1 value");
+                    value.as_object_mut().expect("v1 object").insert(
+                        "effect_assertion_id".to_string(),
+                        json!("schema_create_only_v1"),
+                    );
+                    serde_json::to_vec(&value).expect("unknown-field v1")
+                }
+                "duplicate" => {
+                    let mut duplicate = br#"{"version":1,"#.to_vec();
+                    duplicate.extend_from_slice(&canonical[1..]);
+                    duplicate
+                }
+                _ => unreachable!(),
+            };
+            let receipt_path = target.join(format!(
+                "terminal-reconciliation.{}.receipt.json",
+                identity.nonce
+            ));
+            fs::write(&receipt_path, bytes).expect("install invalid v1 receipt");
+            fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600))
+                .expect("private invalid v1 receipt");
+            let retained = inspect_terminal_d1_migration_lease_at(
+                root.clone(),
+                "acct-1",
+                "db-1",
+                "newsletter-core",
+                &plan,
+                &identity.nonce,
+                &identity.payload_sha256,
+            )
+            .expect("retained lease remains inspectable");
+            assert!(
+                retained
+                    .compatible_terminal_receipt_state(
+                        &terminal_receipt(&identity, &plan),
+                        Some(&legacy),
+                    )
+                    .is_err(),
+                "{variant} v1 receipt must fail closed"
+            );
+            fs::remove_dir_all(root).expect("test cleanup");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn restored_terminal_receipt_negative_payload_matrix_fails_closed() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -3031,6 +3351,15 @@ mod tests {
         assert!(
             retained.persist_terminal_receipt(&conflict).is_err(),
             "changed request or evidence must conflict with the incumbent receipt"
+        );
+        let mut assertion_conflict = expected.clone();
+        assertion_conflict.effect_assertion_id =
+            "schema_create_tables_indexes_views_triggers_v1".to_string();
+        assert!(
+            retained
+                .persist_terminal_receipt(&assertion_conflict)
+                .is_err(),
+            "changed effect assertion must conflict with the incumbent receipt"
         );
         let receipt_path = root
             .join(format!(

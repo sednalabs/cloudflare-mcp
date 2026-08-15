@@ -142,15 +142,53 @@ names the exact `sqlite_master` object type/name/table and SQL digest, complete
 `table_xinfo` rows, and complete foreign-key definitions for every declared
 table. The tool independently derives every CREATE target at every prefix and
 requires exact agreement, so a caller cannot omit a created table or index and
-obtain convergence.
+obtain convergence; the extended assertion applies the same rule to views and
+triggers.
 
-The current built-in effect registry accepts only
-`effect_assertion_id=schema_create_only_v1`. It independently classifies the
-exact manifest SQL and refuses arbitrary DML, ALTER, DROP, PRAGMA, trigger,
-view, virtual table, `CREATE TABLE AS SELECT`, `CREATE TABLE AS VALUES`, or
-other data-producing/unclassified CREATE effects; a caller assertion that work
-was schema-only is not proof. An effect capability gap means retain the lease
-and add a purpose-built registry assertion/readback contract before continuing.
+Select one explicit built-in effect assertion:
+
+- `effect_assertion_id=schema_create_only_v1` remains the backward-compatible
+  table/index contract and still rejects views and triggers.
+- `effect_assertion_id=schema_create_tables_indexes_views_triggers_v1` adds
+  versioned `CREATE VIEW` and `CREATE TRIGGER` classification. Each prefix must
+  name every view as `type=view`, `name=<view>`, `table_name=<view>` and every
+  trigger as `type=trigger`, `name=<trigger>`, `table_name=<parent table>`, with
+  the exact `sqlite_master.sql` SHA-256. The trigger parent table must exist in
+  that selected prefix. Only physical tables receive `table_xinfo`,
+  `foreign_key_list`, and `foreign_key_check` expectations; views and triggers
+  remain covered by the complete exact `sqlite_master` union.
+
+The successful response names the selected assertion and its exact object-type
+scope. That ID is also part of the reconciliation-plan digest, terminal-plan
+digest, version-2 durable receipt, and exact replay. Never change it between
+approval and finalization, even when both assertions derive identical state for
+a table/index-only manifest.
+
+Receipt reads are deliberately dual-version while writes are version 2 only.
+An exact canonical predecessor version-1 receipt has its original field set and
+is mapped exclusively to `schema_create_only_v1`; it can resume active or
+retiring custody and replay a completed retirement. It never attests the
+extended assertion. Unknown fields, duplicate keys, malformed/noncanonical
+bytes, or an attempt to pair version 1 with the extended assertion fail closed
+before provider access.
+
+Completed-retirement replay is not receipt-only lookup. Before returning the
+zero-provider success, the terminal boundary reclassifies the supplied manifest,
+validates the complete typed expectations, and locally recomputes the applicable
+historical version-1 or current version-2 reconciliation-plan digest. Changed
+manifest names or bytes, expectation objects/tables, prefixes, or assertion
+scope therefore cannot borrow an incumbent receipt.
+
+The extended classifier keeps an entire trigger body together across internal
+semicolons and nested `CASE ... END`, then accepts only bounded canonical
+trigger identities, a supported event/header, and semicolon-terminated
+`INSERT`, `UPDATE`, `DELETE`, or `SELECT` body statements. It rejects malformed
+or unclosed quotes/comments/bodies, `TEMP`/`TEMPORARY`, schema-qualified names,
+reused identities, and top-level DML. Both assertions refuse arbitrary DML,
+ALTER, DROP, PRAGMA, virtual tables, `CREATE TABLE AS SELECT`, `CREATE TABLE AS
+VALUES`, and other data-producing or unclassified CREATE effects; a caller
+assertion is not proof. An effect capability gap means retain the lease and add
+a purpose-built registry assertion/readback contract before continuing.
 
 The tool opens the existing target and guard without creating entries, requires
 exactly one active or retiring regular private evidence file, and holds the
@@ -253,6 +291,11 @@ complete primary-current batches and returns `terminal_plan_sha256`. Record and
 independently approve that exact digest before a live call. A digest derived
 after the live read is not approval.
 
+Reuse the exact same effect assertion in reconciliation, terminal dry run, and
+live finalization. The terminal path derives and verifies the same complete
+table/index/view/trigger inventory; it does not downgrade the assertion or
+replace view/trigger `sqlite_master` proof with table PRAGMAs.
+
 The live call requires `approved_terminal_plan_sha256` and follows this fixed
 order while holding the permanent target guard:
 
@@ -290,7 +333,9 @@ Failure after the receipt leaves that durable receipt plus retained or retiring
 evidence for exact replay. A terminal retirement with no exact receipt is an
 order violation and cannot be repaired by creating a receipt afterward. Exact
 replay after completed retirement validates the receipt and retired lease and
-returns with zero provider calls. Null, array, primitive, malformed,
+reproduces the receipt-bound expectation proof and versioned reconciliation
+plan from the supplied manifest before returning with zero provider calls.
+Null, array, primitive, malformed,
 duplicate-keyed, unknown-keyed, noncanonical, contradictory, hard-linked, or
 conflicting namespace evidence fails closed. Never delete, rewrite, rename, or
 copy these products manually.
