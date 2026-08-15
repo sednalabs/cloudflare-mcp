@@ -946,6 +946,14 @@ mod tests {
                 "write_metadata_contradictory",
             ),
             (
+                "only non-mutating metadata",
+                json!([
+                    {"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": false, "changes": 0, "rows_written": 0}},
+                    {"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": false, "changes": 0, "rows_written": 0}}
+                ]),
+                "write_did_not_acknowledge_database_change",
+            ),
+            (
                 "empty mutation counts",
                 json!([{"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": true, "changes": 0, "rows_written": 0}}]),
                 "write_metadata_did_not_prove_mutation",
