@@ -113,6 +113,21 @@ constraint or SQL effect. The PRAGMA is classified intent, not a claim about
 persistent connection state. No manifest SQL is ever sent to the provider by
 this tool.
 The two predecessor assertions continue to reject ALTER and PRAGMA unchanged.
+Use `schema_create_objects_additive_seed_rows_v1` only for a bounded canonical
+top-level seed INSERT on a table created by the supplied manifest. Its closed
+form is `INSERT INTO <table> (<explicit columns>) VALUES (<literal tuples>)`:
+the table and columns are plain unqualified identifiers, values are canonical
+TEXT or signed INTEGER literals, and each target may be seeded once. The CREATE
+must precede the INSERT and every trigger on that target must follow it, even
+across manifest entries. Every `state_expectations` prefix adds `seed_tables`
+with the exact target, ordered columns, row count, and locally derived
+`rows_sha256`. The tool first selects the current primary manifest prefix, then
+runs two identical complete primary-current proofs that include exact typed seed
+row readback. Responses return aggregate row-count/digest evidence only; raw
+seed values are never returned. Implicit columns, INSERT SELECT, expressions,
+NULL/REAL/BLOB values, conflict clauses, qualified or quoted identities,
+duplicate rows/targets, other DML, and any readback mismatch fail closed.
+Predecessor assertions remain closed to top-level INSERT.
 On success, inspect the complete `effect_assertion.scope` object: its
 `statement_class` is assertion-specific (`schema_create_only`,
 `schema_create_tables_indexes_views_triggers`, or

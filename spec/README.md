@@ -118,6 +118,18 @@ Preserved curated tool families:
   before custody. It never executes manifest SQL or treats connection
   PRAGMA state as persistent evidence. The predecessor assertions remain
   byte-for-byte behaviorally closed to ALTER and PRAGMA.
+  `schema_create_objects_additive_seed_rows_v1` is the distinct canonical
+  seed-row assertion. It extends the additive scope with one bounded,
+  unqualified `INSERT INTO <manifest-created-table> (<explicit columns>)
+  VALUES (<literal tuples>)` per target table. Only canonical TEXT and signed
+  INTEGER literals are admitted. CREATE must precede the seed and every trigger
+  on that table must follow it, including across manifest entries. Each prefix
+  supplies the exact table, ordered columns, row count, and aggregate row-set
+  SHA-256. A primary-current selection read chooses the manifest prefix before
+  two complete primary-current proofs read the exact typed rows; responses expose
+  only aggregate summaries. Arbitrary DML, expressions, implicit columns,
+  conflict clauses, reused targets, and malformed or mismatched rows fail closed.
+  The three predecessor assertions remain closed to top-level INSERT effects.
   Successful evidence keeps the legacy `schema_create_only` statement-class
   label only for the legacy assertion; the extended and additive assertions
   report `schema_create_tables_indexes_views_triggers` and

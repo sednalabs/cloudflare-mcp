@@ -1207,6 +1207,155 @@ fn additive_reconciliation_case() -> (Value, Value, Vec<Value>) {
     (manifest, expectations, schema_rows)
 }
 
+fn uppercase_hex(value: &str) -> String {
+    value
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect()
+}
+
+fn seed_rowset_sha256(table_name: &str, columns: &[&str], rows: &[&[&str]]) -> String {
+    let mut rows = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|value| {
+                    json!({
+                        "storage_class": "text",
+                        "value": uppercase_hex(value),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        serde_json::to_vec(left)
+            .expect("seed row serialization")
+            .cmp(&serde_json::to_vec(right).expect("seed row serialization"))
+    });
+    sha256_hex(
+        &serde_json::to_string(&json!({
+            "version": 1,
+            "table_name": table_name,
+            "columns": columns,
+            "rows": rows,
+        }))
+        .expect("seed row-set proof serialization"),
+    )
+}
+
+fn canonical_seed_row_reconciliation_case() -> (Value, Value, Vec<Value>, Vec<Value>) {
+    let publications_table_sql =
+        "CREATE TABLE publications(publication TEXT PRIMARY KEY, display_name TEXT NOT NULL)";
+    let publications_insert_sql = "INSERT INTO publications (publication, display_name) VALUES ('daily', 'Daily'), ('events', 'Events'), ('weekly', 'Weekly')";
+    let origins_table_sql = "CREATE TABLE trusted_first_party_origins(origin TEXT PRIMARY KEY)";
+    let origins_insert_sql = "INSERT INTO trusted_first_party_origins (origin) VALUES ('https://example.com'), ('https://www.example.com')";
+    let origins_trigger_sql = "CREATE TRIGGER trusted_first_party_origins_no_update BEFORE UPDATE ON trusted_first_party_origins BEGIN SELECT RAISE(ABORT, 'immutable seed'); END";
+    let migration_one_sql = format!("{publications_table_sql};\n{publications_insert_sql};");
+    let migration_two_sql =
+        format!("{origins_table_sql};\n{origins_insert_sql};\n{origins_trigger_sql};");
+    let manifest = json!([
+        {
+            "name": "0001_publications.sql",
+            "size_bytes": migration_one_sql.len(),
+            "sql_sha256": sha256_hex(&migration_one_sql),
+            "sql": migration_one_sql,
+        },
+        {
+            "name": "0002_trusted_origins.sql",
+            "size_bytes": migration_two_sql.len(),
+            "sql_sha256": sha256_hex(&migration_two_sql),
+            "sql": migration_two_sql,
+        },
+    ]);
+    let publication_seed = json!({
+        "table_name": "publications",
+        "columns": ["publication", "display_name"],
+        "row_count": 3,
+        "rows_sha256": seed_rowset_sha256(
+            "publications",
+            &["publication", "display_name"],
+            &[
+                &["daily", "Daily"],
+                &["events", "Events"],
+                &["weekly", "Weekly"],
+            ],
+        ),
+    });
+    let origin_seed = json!({
+        "table_name": "trusted_first_party_origins",
+        "columns": ["origin"],
+        "row_count": 2,
+        "rows_sha256": seed_rowset_sha256(
+            "trusted_first_party_origins",
+            &["origin"],
+            &[
+                &["https://example.com"],
+                &["https://www.example.com"],
+            ],
+        ),
+    });
+    let publications_object = json!({
+        "object_type": "table",
+        "name": "publications",
+        "table_name": "publications",
+        "sql_sha256": sha256_hex(publications_table_sql),
+    });
+    let origins_object = json!({
+        "object_type": "table",
+        "name": "trusted_first_party_origins",
+        "table_name": "trusted_first_party_origins",
+        "sql_sha256": sha256_hex(origins_table_sql),
+    });
+    let trigger_object = json!({
+        "object_type": "trigger",
+        "name": "trusted_first_party_origins_no_update",
+        "table_name": "trusted_first_party_origins",
+        "sql_sha256": sha256_hex(origins_trigger_sql),
+    });
+    let publications_table = json!({
+        "name": "publications",
+        "columns": [
+            {"cid": 0, "name": "publication", "declared_type": "TEXT", "not_null": false, "default_value": null, "primary_key_position": 1, "hidden": 0},
+            {"cid": 1, "name": "display_name", "declared_type": "TEXT", "not_null": true, "default_value": null, "primary_key_position": 0, "hidden": 0},
+        ],
+        "foreign_keys": [],
+    });
+    let origins_table = json!({
+        "name": "trusted_first_party_origins",
+        "columns": [
+            {"cid": 0, "name": "origin", "declared_type": "TEXT", "not_null": false, "default_value": null, "primary_key_position": 1, "hidden": 0},
+        ],
+        "foreign_keys": [],
+    });
+    let expectations = json!([
+        {"manifest_prefix_length": 0, "schema_objects": [], "tables": []},
+        {
+            "manifest_prefix_length": 1,
+            "schema_objects": [publications_object.clone()],
+            "tables": [publications_table.clone()],
+            "seed_tables": [publication_seed.clone()],
+        },
+        {
+            "manifest_prefix_length": 2,
+            "schema_objects": [publications_object, origins_object, trigger_object],
+            "tables": [publications_table, origins_table],
+            "seed_tables": [publication_seed, origin_seed],
+        },
+    ]);
+    let schema_rows = vec![
+        json!({"type": "table", "name": "publications", "tbl_name": "publications", "sql": publications_table_sql}),
+        json!({"type": "table", "name": "trusted_first_party_origins", "tbl_name": "trusted_first_party_origins", "sql": origins_table_sql}),
+        json!({"type": "trigger", "name": "trusted_first_party_origins_no_update", "tbl_name": "trusted_first_party_origins", "sql": origins_trigger_sql}),
+    ];
+    let ledger_rows = vec![
+        json!({"id": 1, "name": "0001_publications.sql"}),
+        json!({"id": 2, "name": "0002_trusted_origins.sql"}),
+    ];
+    (manifest, expectations, schema_rows, ledger_rows)
+}
+
 fn additive_check_reconciliation_case() -> (Value, Value, Vec<Value>, Vec<Value>, Vec<Value>) {
     let additions = [
         (
@@ -1695,6 +1844,168 @@ fn spawn_fake_schema_object_reconciliation_api(
             json!({"cid": 1, "name": "name", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 0, "hidden": 0}),
         ],
     )
+}
+
+fn spawn_fake_canonical_seed_reconciliation_api(
+    call_count: usize,
+    schema_rows: Vec<Value>,
+    ledger_rows: Vec<Value>,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").expect("bind canonical seed reconciliation D1 API"); // DevSkim: ignore DS162092 -- loopback-only MCP test fixture
+    let addr = listener
+        .local_addr()
+        .expect("canonical seed reconciliation D1 address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().take(call_count) {
+            let mut stream = stream.expect("canonical seed reconciliation stream");
+            let (headers, body) = read_http_request(&mut stream);
+            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            let body_json: Value =
+                serde_json::from_slice(&body).expect("canonical seed request JSON");
+            let sql = body_json["sql"]
+                .as_str()
+                .expect("canonical seed reconciliation SQL");
+            let markers = reconciliation_statement_markers(sql);
+            assert!(matches!(markers.len(), 8 | 10));
+            assert!(
+                sql.split(";\n")
+                    .all(|statement| statement.starts_with("SELECT "))
+            );
+            requests_for_thread
+                .lock()
+                .expect("canonical seed request log lock")
+                .push(body_json);
+
+            let publications_xinfo = vec![
+                json!({"cid": 0, "name": "publication", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 1, "hidden": 0}),
+                json!({"cid": 1, "name": "display_name", "type": "TEXT", "notnull": 1, "dflt_value": null, "pk": 0, "hidden": 0}),
+            ];
+            let origins_xinfo = vec![
+                json!({"cid": 0, "name": "origin", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 1, "hidden": 0}),
+            ];
+            let mut results = vec![
+                tagged_reconciliation_result(
+                    &markers[0],
+                    &["id", "name"],
+                    ledger_rows.clone(),
+                    Some(json!({"changed_db": false, "changes": 0, "rows_written": 0})),
+                ),
+                tagged_reconciliation_result(
+                    &markers[1],
+                    &["type", "name", "tbl_name", "sql"],
+                    schema_rows.clone(),
+                    None,
+                ),
+                tagged_reconciliation_result(
+                    &markers[2],
+                    &[
+                        "cid",
+                        "name",
+                        "type",
+                        "notnull",
+                        "dflt_value",
+                        "pk",
+                        "hidden",
+                    ],
+                    publications_xinfo,
+                    None,
+                ),
+                tagged_reconciliation_result(
+                    &markers[3],
+                    &[
+                        "id",
+                        "seq",
+                        "table",
+                        "from",
+                        "to",
+                        "on_update",
+                        "on_delete",
+                        "match",
+                    ],
+                    Vec::new(),
+                    None,
+                ),
+                tagged_reconciliation_result(
+                    &markers[4],
+                    &["table", "rowid", "parent", "fkid"],
+                    Vec::new(),
+                    None,
+                ),
+                tagged_reconciliation_result(
+                    &markers[5],
+                    &[
+                        "cid",
+                        "name",
+                        "type",
+                        "notnull",
+                        "dflt_value",
+                        "pk",
+                        "hidden",
+                    ],
+                    origins_xinfo,
+                    None,
+                ),
+                tagged_reconciliation_result(
+                    &markers[6],
+                    &[
+                        "id",
+                        "seq",
+                        "table",
+                        "from",
+                        "to",
+                        "on_update",
+                        "on_delete",
+                        "match",
+                    ],
+                    Vec::new(),
+                    None,
+                ),
+                tagged_reconciliation_result(
+                    &markers[7],
+                    &["table", "rowid", "parent", "fkid"],
+                    Vec::new(),
+                    None,
+                ),
+            ];
+            if markers.len() == 10 {
+                results.push(tagged_reconciliation_result(
+                    &markers[8],
+                    &["t0", "v0", "t1", "v1"],
+                    vec![
+                        json!({"t0": "text", "v0": uppercase_hex("daily"), "t1": "text", "v1": uppercase_hex("Daily")}),
+                        json!({"t0": "text", "v0": uppercase_hex("events"), "t1": "text", "v1": uppercase_hex("Events")}),
+                        json!({"t0": "text", "v0": uppercase_hex("weekly"), "t1": "text", "v1": uppercase_hex("Weekly")}),
+                    ],
+                    None,
+                ));
+                results.push(tagged_reconciliation_result(
+                    &markers[9],
+                    &["t0", "v0"],
+                    vec![
+                        json!({"t0": "text", "v0": uppercase_hex("https://example.com")}),
+                        json!({"t0": "text", "v0": uppercase_hex("https://www.example.com")}),
+                    ],
+                    None,
+                ));
+            }
+            let response = serde_json::to_vec(&json!({
+                "success": true,
+                "errors": [],
+                "messages": [],
+                "result": results,
+            }))
+            .expect("serialize canonical seed response");
+            write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                .expect("write canonical seed response headers");
+            stream
+                .write_all(&response)
+                .expect("write canonical seed response");
+        }
+    });
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
 }
 
 fn spawn_fake_custom_schema_reconciliation_api(
@@ -5301,6 +5612,182 @@ fn d1_reconciliation_and_terminal_finalize_share_additive_effect_proof() {
         assert_eq!(sql.matches("pragma_table_xinfo").count(), 1);
         assert!(!sql.contains("ALTER TABLE"));
         assert!(!sql.contains("PRAGMA foreign_keys = ON"));
+    }
+    drop(observed);
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_canonical_five_seed_rows_bind_reconciliation_terminal_receipt_and_replay() {
+    let (manifest, state_expectations, schema_rows, ledger_rows) =
+        canonical_seed_row_reconciliation_case();
+    let (base_url, requests) =
+        spawn_fake_canonical_seed_reconciliation_api(11, schema_rows, ledger_rows);
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-reconcile-canonical-seeds-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create canonical seed reconciliation root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make canonical seed reconciliation root private");
+    }
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&lease_root, &manifest);
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let reconciliation_args = json!({
+        "database_id": "db-1",
+        "migration_family": "newsletter-core",
+        "manifest": manifest,
+        "approved_plan_sha256": approved_plan_sha256,
+        "lease_nonce": lease_nonce,
+        "lease_payload_sha256": lease_payload_sha256,
+        "effect_assertion_id": "schema_create_objects_additive_seed_rows_v1",
+        "state_expectations": state_expectations,
+    });
+    let reconciliation = mcp.call_tool(
+        841,
+        "d1_reconcile_migration_manifest",
+        reconciliation_args.clone(),
+    );
+    let reconciled = structured_content(&reconciliation).clone();
+    assert_eq!(reconciled["ok"], json!(true), "{reconciled}");
+    assert_eq!(reconciled["outcome"], json!("full_state_converged"));
+    assert_eq!(reconciled["provider_calls"], json!(3));
+    assert_eq!(reconciled["provider_mutations"], json!(0));
+    assert_eq!(
+        reconciled["seed_row_evidence"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(reconciled["seed_row_evidence"][0]["row_count"], json!(3));
+    assert_eq!(reconciled["seed_row_evidence"][1]["row_count"], json!(2));
+    assert_eq!(
+        reconciled["effect_assertion"]["scope"],
+        json!({
+            "statement_class": "schema_create_objects_additive_seed_rows",
+            "schema_object_types": [
+                "table",
+                "index",
+                "view",
+                "trigger",
+                "alter_table_add_column",
+                "pragma_foreign_keys_on",
+                "insert_seed_values",
+            ],
+        })
+    );
+    let response_json = serde_json::to_string(&reconciled).expect("serialize seed response");
+    for private_value in ["Daily", "Events", "Weekly", "example.com"] {
+        assert!(
+            !response_json.contains(private_value),
+            "aggregate response must not expose seed values: {private_value}"
+        );
+    }
+
+    let mut terminal_args = reconciliation_args;
+    terminal_args["expected_reconciliation_plan_sha256"] =
+        reconciled["reconciliation_plan_sha256"].clone();
+    terminal_args["expected_expectation_proof_sha256"] =
+        reconciled["expectation_proof_sha256"].clone();
+    terminal_args["expected_query_sha256"] = reconciled["query_sha256"].clone();
+    terminal_args["expected_canonical_snapshot_sha256"] =
+        reconciled["canonical_snapshot_sha256"].clone();
+    terminal_args["expected_outcome"] = reconciled["outcome"].clone();
+    terminal_args["expected_original_prefix_length"] =
+        reconciled["reconstructed_original_prefix_length"].clone();
+    terminal_args["expected_current_prefix_length"] =
+        reconciled["current_manifest_prefix_length"].clone();
+    terminal_args["terminal_request_sha256"] = json!("9".repeat(64));
+    terminal_args["terminal_attempt_sha256"] = json!("a".repeat(64));
+    terminal_args["dry_run"] = json!(true);
+    let dry = mcp.call_tool(
+        842,
+        "d1_finalize_migration_reconciliation",
+        terminal_args.clone(),
+    );
+    let dry_content = structured_content(&dry).clone();
+    assert_eq!(dry_content["ok"], json!(true), "{dry_content}");
+    assert_eq!(dry_content["provider_calls"], json!(3));
+
+    terminal_args["dry_run"] = json!(false);
+    terminal_args["approved_terminal_plan_sha256"] = dry_content["terminal_plan_sha256"].clone();
+    let live = mcp.call_tool(
+        843,
+        "d1_finalize_migration_reconciliation",
+        terminal_args.clone(),
+    );
+    let live_content = structured_content(&live);
+    assert_eq!(live_content["ok"], json!(true), "{live_content}");
+    assert_eq!(live_content["provider_calls"], json!(5));
+    assert_eq!(live_content["provider_mutations"], json!(0));
+    assert_eq!(live_content["lease_retained"], json!(false));
+    assert_eq!(
+        live_content["effect_assertion_id"],
+        json!("schema_create_objects_additive_seed_rows_v1")
+    );
+
+    let target = manifest_target_path(&lease_root);
+    let receipt_path = fs::read_dir(&target)
+        .expect("read canonical seed terminal target")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .starts_with("terminal-reconciliation.")
+            })
+        })
+        .expect("canonical seed terminal receipt");
+    let receipt: Value = serde_json::from_slice(
+        &fs::read(receipt_path).expect("read canonical seed terminal receipt"),
+    )
+    .expect("parse canonical seed terminal receipt");
+    assert_eq!(receipt["version"], json!(2));
+    assert_eq!(
+        receipt["effect_assertion_id"],
+        json!("schema_create_objects_additive_seed_rows_v1")
+    );
+
+    let replay = mcp.call_tool(844, "d1_finalize_migration_reconciliation", terminal_args);
+    let replay_content = structured_content(&replay);
+    assert_eq!(replay_content["ok"], json!(true), "{replay_content}");
+    assert_eq!(
+        replay_content["status"],
+        json!("terminal_reconciliation_already_complete")
+    );
+    assert_eq!(replay_content["provider_calls"], json!(0));
+
+    let observed = requests.lock().expect("canonical seed request log");
+    assert_eq!(observed.len(), 11);
+    assert_eq!(
+        observed
+            .iter()
+            .filter(
+                |request| reconciliation_statement_markers(request["sql"].as_str().unwrap()).len()
+                    == 8
+            )
+            .count(),
+        3,
+        "one no-seed selection read precedes each complete proof"
+    );
+    for request in observed.iter() {
+        let sql = request["sql"].as_str().expect("canonical seed proof SQL");
+        assert!(
+            sql.split(";\n")
+                .all(|statement| statement.starts_with("SELECT "))
+        );
+        assert!(!sql.contains("Daily"));
+        assert!(!sql.contains("example.com"));
     }
     drop(observed);
     mcp.terminate();

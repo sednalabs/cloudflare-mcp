@@ -462,6 +462,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
             return terminalize_failure(result, custody, 0, Vec::new(), Vec::new(), 0, false);
         }
     };
+    let base_provider_calls = proof.provider_calls();
     let mut response_evidence = proof.response_evidence();
     let mut lifecycle = proof.provider_read_lifecycle();
     let exact_active_plan_matches = recovering_exact_receipt
@@ -497,7 +498,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
             "d1.migration_terminal_approved_evidence_mismatch",
             "fresh retained-manifest proof does not match every independently approved expectation, query, snapshot, outcome, and prefix",
             held_terminal_custody(&proof.lease),
-            2,
+            base_provider_calls,
             response_evidence,
             lifecycle,
             0,
@@ -512,7 +513,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
                 "d1.migration_terminal_custody_unverified",
                 "retained custody could not be revalidated before returning the terminal plan",
                 custody,
-                2,
+                base_provider_calls,
                 response_evidence,
                 lifecycle,
                 0,
@@ -539,7 +540,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
                     "terminal_request_sha256": terminal_request_sha256,
                     "terminal_attempt_sha256": terminal_attempt_sha256,
                 },
-                "provider_calls": 2,
+                "provider_calls": base_provider_calls,
                 "provider_read_lifecycle": lifecycle,
                 "response_evidence": response_evidence,
                 "provider_mutations": 0,
@@ -562,7 +563,15 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
         Ok(refresh) => refresh,
         Err(result) => {
             let custody = held_terminal_custody(&proof.lease);
-            return terminalize_failure(result, custody, 2, response_evidence, lifecycle, 0, false);
+            return terminalize_failure(
+                result,
+                custody,
+                base_provider_calls,
+                response_evidence,
+                lifecycle,
+                0,
+                false,
+            );
         }
     };
     response_evidence.push(before_receipt.response_evidence);
@@ -577,7 +586,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
                 return terminalize_failure(
                     result,
                     custody,
-                    3,
+                    base_provider_calls + 1,
                     response_evidence,
                     lifecycle,
                     0,
@@ -603,7 +612,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
             return terminalize_failure(
                 result,
                 custody,
-                3,
+                base_provider_calls + 1,
                 response_evidence,
                 lifecycle,
                 local_mutations,
@@ -621,7 +630,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
             return terminalize_failure(
                 result,
                 custody,
-                4,
+                base_provider_calls + 2,
                 response_evidence,
                 lifecycle,
                 local_mutations,
@@ -649,7 +658,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
                 "terminal_request_sha256": terminal_request_sha256,
                 "terminal_attempt_sha256": terminal_attempt_sha256,
             },
-            "provider_calls": 4,
+            "provider_calls": base_provider_calls + 2,
             "provider_read_lifecycle": lifecycle,
             "response_evidence": response_evidence,
             "provider_mutations": 0,

@@ -178,6 +178,18 @@ Select one explicit built-in effect assertion:
   migration intent. It does not execute caller SQL or claim that the provider
   connection retained PRAGMA state; proof remains the fixed read-only schema
   and foreign-key snapshot.
+- `effect_assertion_id=schema_create_objects_additive_seed_rows_v1` extends the
+  additive assertion with one canonical top-level seed INSERT per
+  manifest-created target. Require plain unqualified table/column identifiers,
+  explicit columns, bounded literal `VALUES` tuples, CREATE-before-seed, and
+  seed-before-trigger ordering across the complete manifest. Add the exact
+  cumulative `seed_tables` summary to every prefix expectation: target, ordered
+  columns, row count, and local row-set SHA-256. This assertion performs one
+  primary-current prefix-selection read followed by two identical complete
+  primary-current schema-and-seed reads. Verify three provider reads, zero
+  provider mutations, exact aggregate seed summaries, and no raw seed values in
+  the response. Any ambiguity or mismatch remains reconciliation-required.
+  The predecessor assertions do not accept top-level INSERT.
 
 The successful response identifies that same closed scope without flattening
 the broader assertions back to the legacy label: `effect_assertion.scope`

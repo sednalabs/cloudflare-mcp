@@ -251,6 +251,33 @@ contains the current template plus a read-only-only optional approval override.
 
 ## Structured payload details for complex tools
 
+For `effect_assertion_id=schema_create_objects_additive_seed_rows_v1`, every
+`d1_reconcile_migration_manifest.state_expectations[]` item includes cumulative
+`seed_tables[]` entries with this aggregate-only shape:
+
+```json
+{
+  "table_name": "channels",
+  "columns": ["channel_id", "display_name"],
+  "row_count": 3,
+  "rows_sha256": "<lowercase SHA-256>"
+}
+```
+
+The assertion admits only one plain unqualified `INSERT INTO <table>
+(<explicit columns>) VALUES (<bounded canonical TEXT or INTEGER tuples>)` per
+manifest-created table. CREATE must precede the seed, and every trigger on the
+target must follow it across the whole manifest. The tool performs one
+primary-current prefix-selection read before two identical complete
+primary-current schema-and-seed reads. It compares storage class and canonical
+value locally and returns only table/column identity, exact row count, and the
+row-set digest. Arbitrary DML, conflict clauses, expressions, implicit columns,
+qualified identifiers, unsupported storage classes, duplicates, ordering
+violations, and any row-set mismatch fail closed. Reconciliation, terminal
+planning, version-2 receipts, and zero-provider-call replay bind the selected
+assertion and the same expectation proof. Predecessor assertions remain closed
+to top-level INSERT.
+
 `replace_access_policies` expects each `policies[]` item as:
 
 ```json
