@@ -157,6 +157,45 @@ Select one explicit built-in effect assertion:
   that selected prefix. Only physical tables receive `table_xinfo`,
   `foreign_key_list`, and `foreign_key_check` expectations; views and triggers
   remain covered by the complete exact `sqlite_master` union.
+- `effect_assertion_id=schema_create_objects_additive_v1` preserves that full
+  CREATE-object proof and additionally classifies at most one canonical
+  unqualified `ALTER TABLE <parent> ADD [COLUMN] <column> <type>` per manifest
+  entry. The bounded column definition may add `NOT NULL`, one literal
+  `DEFAULT` (`NULL`, signed integer, or quoted string), and one trailing
+  `CHECK`, in that order when present. CHECK expressions are capped by token
+  count, nesting depth, literal size, and IN-list length; they may reference only
+  the added column through `IS NULL`, literal equality, a literal `IN` list, and
+  the pure `length(column)` or
+  `substr(column, positive_integer, positive_integer)` forms joined by
+  `AND`/`OR`. Subqueries, other-column reads, unknown functions/operators,
+  `REFERENCES`, `UNIQUE`, `PRIMARY KEY`, `COLLATE`, `GENERATED`, compound types,
+  quoted/schema-qualified identities, and every other ALTER form are rejected.
+  The parent must be present in the baseline or a strictly earlier prefix.
+  Every transition must preserve the complete ordered prior
+  `table_xinfo` and foreign-key state, append exactly one matching column, and
+  bind the changed parent to a distinct reviewed `sqlite_master.sql` digest.
+  The assertion also accepts exactly `PRAGMA foreign_keys = ON` as semantic
+  migration intent. It does not execute caller SQL or claim that the provider
+  connection retained PRAGMA state; proof remains the fixed read-only schema
+  and foreign-key snapshot.
+
+The successful response identifies that same closed scope without flattening
+the broader assertions back to the legacy label: `effect_assertion.scope`
+reports `schema_create_only`, `schema_create_tables_indexes_views_triggers`, or
+`schema_create_objects_additive` respectively, alongside the complete allowed
+`schema_object_types` array.
+
+For every assertion, the configured `migrations_table` is a reserved schema
+identifier under SQLite ASCII case-insensitive matching. A manifest must not
+create an object with that name, create an index or trigger on that table, or
+use additive ALTER against it. Every accepted trigger contributes bounded
+lexical evidence from the complete post-parent header (including `WHEN`) and
+body: each word, quoted identifier, and string-literal value is retained, while
+symbols carry no value. Any exact ASCII-case-insensitive collision fails
+closed, including a string literal; longer unrelated token values remain valid.
+This is rejected before expectation validation, custody
+inspection, or provider access so an injected ledger INSERT cannot activate
+manifest-defined behavior.
 
 The successful response names the selected assertion and its exact object-type
 scope. That ID is also part of the reconciliation-plan digest, terminal-plan
@@ -184,10 +223,12 @@ semicolons and nested `CASE ... END`, then accepts only bounded canonical
 trigger identities, a supported event/header, and semicolon-terminated
 `INSERT`, `UPDATE`, `DELETE`, or `SELECT` body statements. It rejects malformed
 or unclosed quotes/comments/bodies, `TEMP`/`TEMPORARY`, schema-qualified names,
-reused identities, and top-level DML. Both assertions refuse arbitrary DML,
-ALTER, DROP, PRAGMA, virtual tables, `CREATE TABLE AS SELECT`, `CREATE TABLE AS
-VALUES`, and other data-producing or unclassified CREATE effects; a caller
-assertion is not proof. An effect capability gap means retain the lease and add
+reused identities, and top-level DML. The two CREATE-only assertions refuse
+arbitrary DML, ALTER, DROP, PRAGMA, virtual tables, `CREATE TABLE AS SELECT`,
+`CREATE TABLE AS VALUES`, and other data-producing or unclassified CREATE
+effects. The additive assertion refuses those same effects except for its exact
+ADD COLUMN and foreign-keys-on forms; a caller assertion is not proof. An
+effect capability gap means retain the lease and add
 a purpose-built registry assertion/readback contract before continuing.
 
 The tool opens the existing target and guard without creating entries, requires

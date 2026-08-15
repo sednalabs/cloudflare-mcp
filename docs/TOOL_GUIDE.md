@@ -97,7 +97,36 @@ triggers do not receive table_xinfo or foreign-key PRAGMA expectations. The
 extended registry safely keeps trigger-body semicolons and nested `CASE ...
 END` inside one statement while rejecting temporary/schema-qualified objects,
 malformed bodies, unsupported top-level effects, and reused identities. It
-also requires every fixed result set in both batches to carry exact
+also supports the separately selected
+`schema_create_objects_additive_v1` contract for a closed additive migration:
+all of the extended CREATE-object proof, at most one canonical unqualified
+`ALTER TABLE ... ADD [COLUMN]` with one bounded column definition per prefix,
+and at most one exact `PRAGMA foreign_keys = ON`. The parent must already exist
+in the baseline or an earlier prefix. Every expected transition must preserve
+the complete prior ordered columns and foreign keys, append the exact next
+column, and change only the altered parent's reviewed SQL digest plus explicitly
+created objects. A trailing CHECK is accepted only through the bounded
+column-local pure-expression grammar: `IS NULL`, literal equality or IN,
+`length`, `substr`, `AND`/`OR`, and bounded parentheses. It cannot read another
+column, run a subquery, call another function, or introduce another column
+constraint or SQL effect. The PRAGMA is classified intent, not a claim about
+persistent connection state. No manifest SQL is ever sent to the provider by
+this tool.
+The two predecessor assertions continue to reject ALTER and PRAGMA unchanged.
+On success, inspect the complete `effect_assertion.scope` object: its
+`statement_class` is assertion-specific (`schema_create_only`,
+`schema_create_tables_indexes_views_triggers`, or
+`schema_create_objects_additive`) and its `schema_object_types` array is the
+closed allowed scope for that selected assertion.
+The configured `migrations_table` remains reserved across all assertions using
+SQLite ASCII case-insensitive identifier equivalence. CREATE object identities,
+index/trigger parents, any exact admitted trigger header/body lexical token, and additive
+ALTER targets that collide with it fail before custody or provider access.
+The bounded evidence retains every word, quoted identifier, and string-literal
+value across the complete post-parent trigger header (including `WHEN`) and
+body. An exact string-literal collision is deliberately rejected; longer
+unrelated token values and unrelated triggers remain supported.
+The boundary also requires every fixed result set in both batches to carry exact
 `meta.served_by_primary=true` evidence; absent, false, null, non-boolean, or
 mixed primary markers are contradictory and cannot support positive
 reconciliation. It performs two bounded read-only batches and never retires

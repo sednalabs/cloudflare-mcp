@@ -108,6 +108,29 @@ Preserved curated tool families:
   for every view and trigger without issuing table PRAGMAs for those objects,
   and must keep trigger-body semicolons plus nested `CASE ... END` inside one
   fail-closed classified statement.
+  `schema_create_objects_additive_v1` is the separate closed additive
+  assertion: it retains the extended CREATE proof, adds one bounded unqualified
+  ADD COLUMN transition and semantic `PRAGMA foreign_keys = ON` intent per
+  prefix, and requires exact ordered before/after xinfo, foreign-key, and parent
+  SQL-digest evidence. Its optional trailing CHECK is a bounded column-local
+  pure expression over literal equality/IN, `IS NULL`, `length`, `substr`, and
+  `AND`/`OR`; other identifiers, functions, constraints, and SQL effects fail
+  before custody. It never executes manifest SQL or treats connection
+  PRAGMA state as persistent evidence. The predecessor assertions remain
+  byte-for-byte behaviorally closed to ALTER and PRAGMA.
+  Successful evidence keeps the legacy `schema_create_only` statement-class
+  label only for the legacy assertion; the extended and additive assertions
+  report `schema_create_tables_indexes_views_triggers` and
+  `schema_create_objects_additive` respectively, with their complete closed
+  object/operation arrays.
+  Every assertion also treats the configured migration-ledger table as a
+  reserved SQLite identifier: case variants in CREATE identities, index or
+  trigger parents, any exact admitted trigger header/body lexical token, and additive
+  ALTER targets fail before custody/provider access.
+  The conservative bounded evidence includes words, quoted identifiers, and
+  string-literal values across the complete post-parent header (including
+  `WHEN`) and body. Exact string-literal collisions therefore fail closed;
+  longer unrelated token values and unrelated triggers remain valid.
 - Terminal retained-manifest reconciliation
   (`d1_finalize_migration_reconciliation`) is the separately approval-gated
   local-custody mutation contract. Keep its exact evidence/request/attempt
