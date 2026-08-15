@@ -619,6 +619,12 @@ pub(crate) fn validate_d1_manifest_write_result(value: &Value) -> Result<(), Val
                     "provider write response did not contain a non-negative integer rows_written count",
                 )
             })?;
+        if !changed_db && (changes != 0 || rows_written != 0) {
+            return Err(d1_manifest_ambiguous_write_evidence(
+                "write_metadata_contradictory",
+                "provider write result reported changed_db=false with nonzero mutation counts",
+            ));
+        }
         total_changes = total_changes.checked_add(changes).ok_or_else(|| {
             d1_manifest_ambiguous_write_evidence(
                 "write_metadata_overflow",
@@ -844,6 +850,7 @@ mod tests {
             "missing_or_malformed_write_metadata",
             "write_not_served_by_primary",
             "write_did_not_acknowledge_database_change",
+            "write_metadata_contradictory",
             "write_metadata_overflow",
             "write_metadata_did_not_prove_mutation",
         ] {
@@ -928,7 +935,15 @@ mod tests {
             (
                 "unchanged metadata",
                 json!([{"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": false, "changes": 1, "rows_written": 1}}]),
-                "write_did_not_acknowledge_database_change",
+                "write_metadata_contradictory",
+            ),
+            (
+                "mixed contradictory non-mutating result",
+                json!([
+                    {"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": false, "changes": 1, "rows_written": 1}},
+                    {"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": true, "changes": 0, "rows_written": 0}}
+                ]),
+                "write_metadata_contradictory",
             ),
             (
                 "empty mutation counts",
@@ -1480,6 +1495,7 @@ fn d1_manifest_write_result_classification(value: &str) -> Option<&'static str> 
         "write_did_not_acknowledge_database_change" => {
             Some("write_did_not_acknowledge_database_change")
         }
+        "write_metadata_contradictory" => Some("write_metadata_contradictory"),
         "write_metadata_overflow" => Some("write_metadata_overflow"),
         "write_metadata_did_not_prove_mutation" => Some("write_metadata_did_not_prove_mutation"),
         _ => None,

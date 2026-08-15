@@ -100,8 +100,8 @@ and does not turn an absent local file into permission for a new apply.
 For every migration-write result set, success additionally requires literal
 `meta.served_by_primary=true`, boolean `meta.changed_db`, and non-negative JSON
 integer `meta.changes` and `meta.rows_written`. A non-mutating successful result
-(for example a supported PRAGMA in a multi-statement migration) may report
-`changed_db=false` with zero counts, but the complete response must contain at
+(for example a supported PRAGMA in a multi-statement migration) must report
+`changed_db=false` with both counts zero. The complete response must contain at
 least one `changed_db=true` result and positive aggregate changes and
 rows-written totals. Any missing, non-boolean, non-integer, zero-total,
 overflowed, failed, or malformed result is `reconciliation_required`, never a
