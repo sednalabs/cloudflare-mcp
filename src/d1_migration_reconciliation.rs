@@ -17,6 +17,11 @@ use crate::cloudflare::client::{
     D1MigrationReconciliationBatch, D1MigrationReconciliationBatchError,
     D1MigrationReconciliationReadLifecycle,
 };
+use crate::d1_migration_additive::{
+    AddColumnEffect, AdditiveContractError, AdditiveManifestPlan, AdditivePrefixPlan,
+    AdditiveStatement, EFFECT_ASSERTION_SCHEMA_ADDITIVE_V1, classify_additive_statement,
+    validate_additive_transitions,
+};
 use crate::d1_migration_lease::{
     D1RetainedMigrationLease, D1RetainedMigrationLeaseIdentity, inspect_retained_d1_migration_lease,
 };
@@ -343,15 +348,24 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
         Ok(id) => id,
         Err(result) => return Err(prelease_error(result, "not_inspected", None)),
     };
-    let derived_states = match derive_effect_assertion(Some(selected_effect_assertion_id), manifest)
-    {
-        Ok(derived_states) => derived_states,
-        Err(result) => return Err(prelease_error(result, "not_inspected", None)),
-    };
-    let validated = match validate_expectations(&derived_states, state_expectations) {
+    let derived =
+        match derive_effect_assertion_details(Some(selected_effect_assertion_id), manifest) {
+            Ok(derived) => derived,
+            Err(result) => return Err(prelease_error(result, "not_inspected", None)),
+        };
+    let validated = match validate_expectations(&derived.states, state_expectations) {
         Ok(validated) => validated,
         Err(result) => return Err(prelease_error(result, "not_inspected", None)),
     };
+    if let Some(plan) = derived.additive_plan.as_ref() {
+        if let Err(error) = validate_additive_transitions(plan, &validated.states) {
+            return Err(prelease_error(
+                additive_contract_error(error),
+                "not_inspected",
+                None,
+            ));
+        }
+    }
     let query = build_fixed_query(
         migrations_table,
         manifest.len(),
@@ -1047,17 +1061,38 @@ fn valid_sha256(value: &str) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum SqlToken {
+pub(crate) enum SqlToken {
     Word(String),
     Identifier(String),
-    StringLiteral,
+    StringLiteral(String),
     Symbol(char),
 }
 
+#[derive(Debug)]
+struct DerivedEffectAssertion {
+    states: Vec<Vec<DerivedSchemaObject>>,
+    additive_plan: Option<AdditiveManifestPlan>,
+}
+
+#[derive(Debug, Clone)]
+enum ClassifiedEffect {
+    Create(DerivedSchemaObject),
+    AddColumn(AddColumnEffect),
+    ForeignKeysOn,
+}
+
+#[cfg(test)]
 fn derive_effect_assertion(
     effect_assertion_id: Option<&str>,
     manifest: &[D1MigrationManifestEntry],
 ) -> Result<Vec<Vec<DerivedSchemaObject>>, CallToolResult> {
+    derive_effect_assertion_details(effect_assertion_id, manifest).map(|derived| derived.states)
+}
+
+fn derive_effect_assertion_details(
+    effect_assertion_id: Option<&str>,
+    manifest: &[D1MigrationManifestEntry],
+) -> Result<DerivedEffectAssertion, CallToolResult> {
     let selected = canonical_effect_assertion_id(effect_assertion_id)?;
     let (allow_views_and_triggers, unclassified_message) = match selected {
         EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1 => (
@@ -1068,6 +1103,9 @@ fn derive_effect_assertion(
             true,
             "the selected effect assertion cannot exactly prove this statement or any arbitrary top-level DML, ALTER, DROP, PRAGMA, virtual table, or data-producing CREATE effect",
         ),
+        EFFECT_ASSERTION_SCHEMA_ADDITIVE_V1 => {
+            return derive_additive_effect_assertion(manifest);
+        }
         _ => unreachable!("canonical registry assertion"),
     };
     let mut cumulative = BTreeMap::<(String, String), DerivedSchemaObject>::new();
@@ -1110,7 +1148,145 @@ fn derive_effect_assertion(
         }
         states.push(cumulative.values().cloned().collect());
     }
-    Ok(states)
+    Ok(DerivedEffectAssertion {
+        states,
+        additive_plan: None,
+    })
+}
+
+fn derive_additive_effect_assertion(
+    manifest: &[D1MigrationManifestEntry],
+) -> Result<DerivedEffectAssertion, CallToolResult> {
+    let mut migrations = Vec::with_capacity(manifest.len());
+    for migration in manifest {
+        let statements = tokenize_sql_statements(&migration.sql).ok_or_else(|| {
+            reconciliation_error(
+                "capability_gap",
+                "d1.migration_reconciliation_effect_proof_unavailable",
+                "exact migration SQL could not be classified by the additive effect registry",
+            )
+        })?;
+        if statements.is_empty() {
+            return Err(reconciliation_error(
+                "capability_gap",
+                "d1.migration_reconciliation_effect_proof_unavailable",
+                "the additive effect registry requires at least one classified statement per manifest entry",
+            ));
+        }
+        let mut effects = Vec::with_capacity(statements.len());
+        let mut addition_count = 0usize;
+        let mut pragma_count = 0usize;
+        for tokens in statements {
+            if let Some(object) = classify_schema_create(&tokens, true) {
+                effects.push(ClassifiedEffect::Create(object));
+                continue;
+            }
+            match classify_additive_statement(&tokens).map_err(additive_contract_error)? {
+                Some(AdditiveStatement::AddColumn(effect)) => {
+                    addition_count += 1;
+                    effects.push(ClassifiedEffect::AddColumn(effect));
+                }
+                Some(AdditiveStatement::ForeignKeysOn) => {
+                    pragma_count += 1;
+                    effects.push(ClassifiedEffect::ForeignKeysOn);
+                }
+                None => {
+                    return Err(reconciliation_error(
+                        "capability_gap",
+                        "d1.migration_reconciliation_effect_proof_unavailable",
+                        "the additive assertion cannot prove this statement or any arbitrary DML, ALTER, DROP, PRAGMA, virtual table, or data-producing CREATE effect",
+                    ));
+                }
+            }
+        }
+        if addition_count > 1 || pragma_count > 1 {
+            return Err(reconciliation_error(
+                "capability_gap",
+                "d1.migration_reconciliation_additive_prefix_unbounded",
+                "each additive manifest prefix may contain at most one ADD COLUMN and one semantic foreign_keys directive",
+            ));
+        }
+        migrations.push(effects);
+    }
+
+    let mut created_names = BTreeMap::<String, (String, usize)>::new();
+    let mut preexisting_tables = BTreeSet::new();
+    for (prefix, effects) in migrations.iter().enumerate() {
+        for effect in effects {
+            match effect {
+                ClassifiedEffect::Create(object) => {
+                    if preexisting_tables.contains(&object.name)
+                        || created_names
+                            .insert(object.name.clone(), (object.object_type.clone(), prefix))
+                            .is_some()
+                    {
+                        return Err(reconciliation_error(
+                            "contradictory",
+                            "d1.migration_reconciliation_create_target_reused",
+                            "the manifest reuses a CREATE or additive parent identity and cannot derive exact prefix states",
+                        ));
+                    }
+                }
+                ClassifiedEffect::AddColumn(effect) => {
+                    if let Some((object_type, created_prefix)) =
+                        created_names.get(&effect.table_name)
+                    {
+                        if object_type != "table" || *created_prefix >= prefix {
+                            return Err(reconciliation_error(
+                                "contradictory",
+                                "d1.migration_reconciliation_additive_parent_missing",
+                                "ADD COLUMN must target a pre-existing table or a table created in an earlier manifest prefix",
+                            ));
+                        }
+                    } else {
+                        preexisting_tables.insert(effect.table_name.clone());
+                    }
+                }
+                ClassifiedEffect::ForeignKeysOn => {}
+            }
+        }
+    }
+
+    let mut cumulative = preexisting_tables
+        .into_iter()
+        .map(|name| {
+            (
+                ("table".to_string(), name.clone()),
+                DerivedSchemaObject {
+                    object_type: "table".to_string(),
+                    table_name: name.clone(),
+                    name,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut states = vec![cumulative.values().cloned().collect()];
+    let mut prefixes = Vec::with_capacity(migrations.len());
+    for effects in migrations {
+        let mut prefix = AdditivePrefixPlan::default();
+        for effect in effects {
+            match effect {
+                ClassifiedEffect::Create(object) => {
+                    prefix
+                        .created_objects
+                        .insert((object.object_type.clone(), object.name.clone()));
+                    cumulative.insert((object.object_type.clone(), object.name.clone()), object);
+                }
+                ClassifiedEffect::AddColumn(effect) => prefix.addition = Some(effect),
+                ClassifiedEffect::ForeignKeysOn => prefix.foreign_keys_on = true,
+            }
+        }
+        states.push(cumulative.values().cloned().collect());
+        prefixes.push(prefix);
+    }
+    Ok(DerivedEffectAssertion {
+        states,
+        additive_plan: Some(AdditiveManifestPlan { prefixes }),
+    })
+}
+
+fn additive_contract_error(error: AdditiveContractError) -> CallToolResult {
+    reconciliation_error(error.capability_state, error.code, error.message)
 }
 
 pub(crate) fn canonical_effect_assertion_id(
@@ -1121,6 +1297,7 @@ pub(crate) fn canonical_effect_assertion_id(
         Some(EFFECT_ASSERTION_SCHEMA_CREATE_OBJECTS_V1) => {
             Ok(EFFECT_ASSERTION_SCHEMA_CREATE_OBJECTS_V1)
         }
+        Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_V1) => Ok(EFFECT_ASSERTION_SCHEMA_ADDITIVE_V1),
         _ => Err(reconciliation_error(
             "capability_gap",
             "d1.migration_reconciliation_effect_assertion_missing",
@@ -1135,8 +1312,11 @@ pub(crate) fn validate_replay_manifest_expectations(
     state_expectations: &[D1MigrationStateExpectation],
 ) -> Result<String, CallToolResult> {
     let selected = canonical_effect_assertion_id(Some(effect_assertion_id))?;
-    let derived_states = derive_effect_assertion(Some(selected), manifest)?;
-    let validated = validate_expectations(&derived_states, state_expectations.to_vec())?;
+    let derived = derive_effect_assertion_details(Some(selected), manifest)?;
+    let validated = validate_expectations(&derived.states, state_expectations.to_vec())?;
+    if let Some(plan) = derived.additive_plan.as_ref() {
+        validate_additive_transitions(plan, &validated.states).map_err(additive_contract_error)?;
+    }
     Ok(validated.proof_sha256)
 }
 
@@ -1144,6 +1324,14 @@ fn effect_assertion_scope(effect_assertion_id: &str) -> &'static [&'static str] 
     match effect_assertion_id {
         EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1 => &["table", "index"],
         EFFECT_ASSERTION_SCHEMA_CREATE_OBJECTS_V1 => &["table", "index", "view", "trigger"],
+        EFFECT_ASSERTION_SCHEMA_ADDITIVE_V1 => &[
+            "table",
+            "index",
+            "view",
+            "trigger",
+            "alter_table_add_column",
+            "pragma_foreign_keys_on",
+        ],
         _ => &[],
     }
 }
@@ -1367,7 +1555,7 @@ fn token_is_word(token: Option<&SqlToken>, value: &str) -> bool {
 fn token_identifier(token: Option<&SqlToken>) -> Option<String> {
     match token? {
         SqlToken::Word(value) | SqlToken::Identifier(value) => Some(value.clone()),
-        SqlToken::StringLiteral | SqlToken::Symbol(_) => None,
+        SqlToken::StringLiteral(_) | SqlToken::Symbol(_) => None,
     }
 }
 
@@ -1451,6 +1639,7 @@ fn tokenize_sql_statements(sql: &str) -> Option<Vec<Vec<SqlToken>>> {
                 }
                 (b'\'', _) => {
                     flush_token(&mut token, &mut tokens);
+                    quoted.clear();
                     mode = Mode::SingleQuote;
                 }
                 (b'"', _) => {
@@ -1472,7 +1661,7 @@ fn tokenize_sql_statements(sql: &str) -> Option<Vec<Vec<SqlToken>>> {
                     flush_token(&mut token, &mut tokens);
                     tokens.push(SqlToken::Symbol(';'));
                 }
-                (b'(' | b')' | b',' | b'.', _) => {
+                (b'(' | b')' | b',' | b'.' | b'=' | b'+' | b'-', _) => {
                     flush_token(&mut token, &mut tokens);
                     tokens.push(SqlToken::Symbol(byte as char));
                 }
@@ -1482,11 +1671,16 @@ fn tokenize_sql_statements(sql: &str) -> Option<Vec<Vec<SqlToken>>> {
             Mode::SingleQuote => {
                 if byte == b'\'' {
                     if next == Some(b'\'') {
+                        quoted.push(b'\'');
                         index += 1;
                     } else {
                         mode = Mode::Normal;
-                        tokens.push(SqlToken::StringLiteral);
+                        tokens.push(SqlToken::StringLiteral(
+                            String::from_utf8(quoted.clone()).ok()?,
+                        ));
                     }
+                } else {
+                    quoted.push(byte);
                 }
             }
             Mode::DoubleQuote => {
@@ -3055,6 +3249,181 @@ mod tests {
             )
             .is_err(),
             "schema identities cannot be reused across object types",
+        );
+    }
+
+    #[test]
+    fn additive_registry_derives_baseline_parent_and_mixed_exact_prefixes() {
+        let first = "PRAGMA foreign_keys = ON; ALTER TABLE items ADD COLUMN status TEXT;";
+        let second = "CREATE TABLE audit(id INTEGER PRIMARY KEY); CREATE INDEX audit_by_id ON audit(id); CREATE VIEW audit_ids AS SELECT id FROM audit; CREATE TRIGGER audit_after_insert AFTER INSERT ON audit BEGIN SELECT 1; END;";
+        let manifest = vec![
+            D1MigrationManifestEntry {
+                name: "0001_add.sql".to_string(),
+                size_bytes: first.len() as u64,
+                sql_sha256: sha256_bytes_hex(first.as_bytes()),
+                sql: first.to_string(),
+            },
+            D1MigrationManifestEntry {
+                name: "0002_create.sql".to_string(),
+                size_bytes: second.len() as u64,
+                sql_sha256: sha256_bytes_hex(second.as_bytes()),
+                sql: second.to_string(),
+            },
+        ];
+        let derived =
+            derive_effect_assertion_details(Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_V1), &manifest)
+                .expect("derive additive mixed prefixes");
+        assert_eq!(
+            derived.states,
+            vec![
+                vec![DerivedSchemaObject {
+                    object_type: "table".to_string(),
+                    name: "items".to_string(),
+                    table_name: "items".to_string(),
+                }],
+                vec![DerivedSchemaObject {
+                    object_type: "table".to_string(),
+                    name: "items".to_string(),
+                    table_name: "items".to_string(),
+                }],
+                vec![
+                    DerivedSchemaObject {
+                        object_type: "index".to_string(),
+                        name: "audit_by_id".to_string(),
+                        table_name: "audit".to_string(),
+                    },
+                    DerivedSchemaObject {
+                        object_type: "table".to_string(),
+                        name: "audit".to_string(),
+                        table_name: "audit".to_string(),
+                    },
+                    DerivedSchemaObject {
+                        object_type: "table".to_string(),
+                        name: "items".to_string(),
+                        table_name: "items".to_string(),
+                    },
+                    DerivedSchemaObject {
+                        object_type: "trigger".to_string(),
+                        name: "audit_after_insert".to_string(),
+                        table_name: "audit".to_string(),
+                    },
+                    DerivedSchemaObject {
+                        object_type: "view".to_string(),
+                        name: "audit_ids".to_string(),
+                        table_name: "audit_ids".to_string(),
+                    },
+                ],
+            ],
+        );
+        let plan = derived.additive_plan.expect("additive plan");
+        assert!(plan.prefixes[0].foreign_keys_on);
+        assert_eq!(
+            plan.prefixes[0]
+                .addition
+                .as_ref()
+                .expect("one addition")
+                .column
+                .name,
+            "status",
+        );
+        assert_eq!(
+            plan.prefixes[1].created_objects,
+            BTreeSet::from([
+                ("index".to_string(), "audit_by_id".to_string()),
+                ("table".to_string(), "audit".to_string()),
+                ("trigger".to_string(), "audit_after_insert".to_string()),
+                ("view".to_string(), "audit_ids".to_string()),
+            ]),
+        );
+
+        assert!(
+            derive_effect_assertion(Some(EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1), &manifest,)
+                .is_err(),
+            "the legacy table/index assertion remains unchanged",
+        );
+        assert!(
+            derive_effect_assertion(Some(EFFECT_ASSERTION_SCHEMA_CREATE_OBJECTS_V1), &manifest,)
+                .is_err(),
+            "the view/trigger assertion remains unchanged",
+        );
+    }
+
+    #[test]
+    fn additive_registry_rejects_unsupported_ddl_and_pragma_before_expectations() {
+        for sql in [
+            "ALTER TABLE items RENAME TO renamed;",
+            "ALTER TABLE items DROP COLUMN status;",
+            "ALTER TABLE items ADD COLUMN first TEXT, ADD COLUMN second TEXT;",
+            "ALTER TABLE main.items ADD COLUMN status TEXT;",
+            "ALTER TABLE items ADD COLUMN status TEXT REFERENCES other(id);",
+            "PRAGMA foreign_keys(ON);",
+            "PRAGMA main.foreign_keys = ON;",
+            "PRAGMA foreign_keys = OFF;",
+            "PRAGMA journal_mode = WAL;",
+        ] {
+            assert!(
+                derive_effect_assertion(Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_V1), &manifest(sql),)
+                    .is_err(),
+                "unsupported additive effect must fail closed: {sql}",
+            );
+        }
+
+        let create_and_add_same_prefix =
+            "CREATE TABLE items(id INTEGER); ALTER TABLE items ADD COLUMN status TEXT;";
+        assert!(
+            derive_effect_assertion(
+                Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_V1),
+                &manifest(create_and_add_same_prefix),
+            )
+            .is_err(),
+            "a parent must exist in baseline or an earlier observable prefix",
+        );
+
+        let manifest_entries = |sql_entries: &[&str]| {
+            sql_entries
+                .iter()
+                .enumerate()
+                .map(|(index, sql)| D1MigrationManifestEntry {
+                    name: format!("{:04}.sql", index + 1),
+                    size_bytes: sql.len() as u64,
+                    sql_sha256: sha256_bytes_hex(sql.as_bytes()),
+                    sql: (*sql).to_string(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let create_then_add = manifest_entries(&[
+            "CREATE TABLE items(id INTEGER);",
+            "PRAGMA foreign_keys = ON; ALTER TABLE items ADD status TEXT DEFAULT 'ready';",
+        ]);
+        let derived = derive_effect_assertion_details(
+            Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_V1),
+            &create_then_add,
+        )
+        .expect("a table created in an earlier prefix may be altered later");
+        assert_eq!(derived.states[0], Vec::new());
+        assert_eq!(derived.states[1], derived.states[2]);
+        assert_eq!(
+            derived
+                .additive_plan
+                .expect("additive transition plan")
+                .prefixes[1]
+                .addition
+                .as_ref()
+                .expect("later add")
+                .column
+                .default_value
+                .as_deref(),
+            Some("'ready'")
+        );
+
+        let add_then_create = manifest_entries(&[
+            "ALTER TABLE items ADD COLUMN status TEXT;",
+            "CREATE TABLE items(id INTEGER);",
+        ]);
+        assert!(
+            derive_effect_assertion(Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_V1), &add_then_create,)
+                .is_err(),
+            "a later CREATE cannot retroactively establish an additive baseline parent",
         );
     }
 

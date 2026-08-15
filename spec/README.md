@@ -108,6 +108,13 @@ Preserved curated tool families:
   for every view and trigger without issuing table PRAGMAs for those objects,
   and must keep trigger-body semicolons plus nested `CASE ... END` inside one
   fail-closed classified statement.
+  `schema_create_objects_additive_v1` is the separate closed additive
+  assertion: it retains the extended CREATE proof, adds one bounded unqualified
+  ADD COLUMN transition and semantic `PRAGMA foreign_keys = ON` intent per
+  prefix, and requires exact ordered before/after xinfo, foreign-key, and parent
+  SQL-digest evidence. It never executes manifest SQL or treats connection
+  PRAGMA state as persistent evidence. The predecessor assertions remain
+  byte-for-byte behaviorally closed to ALTER and PRAGMA.
 - Terminal retained-manifest reconciliation
   (`d1_finalize_migration_reconciliation`) is the separately approval-gated
   local-custody mutation contract. Keep its exact evidence/request/attempt

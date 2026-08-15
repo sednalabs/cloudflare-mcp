@@ -157,6 +157,20 @@ Select one explicit built-in effect assertion:
   that selected prefix. Only physical tables receive `table_xinfo`,
   `foreign_key_list`, and `foreign_key_check` expectations; views and triggers
   remain covered by the complete exact `sqlite_master` union.
+- `effect_assertion_id=schema_create_objects_additive_v1` preserves that full
+  CREATE-object proof and additionally classifies at most one canonical
+  unqualified `ALTER TABLE <parent> ADD [COLUMN] <column> <type>` per manifest
+  entry. The bounded column definition may add `NOT NULL` followed by one
+  literal `DEFAULT` (`NULL`, signed integer, or quoted string); constraints,
+  compound types, quoted/schema-qualified identities, and every other ALTER
+  form are rejected. The parent must be present in the baseline or a strictly
+  earlier prefix. Every transition must preserve the complete ordered prior
+  `table_xinfo` and foreign-key state, append exactly one matching column, and
+  bind the changed parent to a distinct reviewed `sqlite_master.sql` digest.
+  The assertion also accepts exactly `PRAGMA foreign_keys = ON` as semantic
+  migration intent. It does not execute caller SQL or claim that the provider
+  connection retained PRAGMA state; proof remains the fixed read-only schema
+  and foreign-key snapshot.
 
 The successful response names the selected assertion and its exact object-type
 scope. That ID is also part of the reconciliation-plan digest, terminal-plan
@@ -184,10 +198,12 @@ semicolons and nested `CASE ... END`, then accepts only bounded canonical
 trigger identities, a supported event/header, and semicolon-terminated
 `INSERT`, `UPDATE`, `DELETE`, or `SELECT` body statements. It rejects malformed
 or unclosed quotes/comments/bodies, `TEMP`/`TEMPORARY`, schema-qualified names,
-reused identities, and top-level DML. Both assertions refuse arbitrary DML,
-ALTER, DROP, PRAGMA, virtual tables, `CREATE TABLE AS SELECT`, `CREATE TABLE AS
-VALUES`, and other data-producing or unclassified CREATE effects; a caller
-assertion is not proof. An effect capability gap means retain the lease and add
+reused identities, and top-level DML. The two CREATE-only assertions refuse
+arbitrary DML, ALTER, DROP, PRAGMA, virtual tables, `CREATE TABLE AS SELECT`,
+`CREATE TABLE AS VALUES`, and other data-producing or unclassified CREATE
+effects. The additive assertion refuses those same effects except for its exact
+ADD COLUMN and foreign-keys-on forms; a caller assertion is not proof. An
+effect capability gap means retain the lease and add
 a purpose-built registry assertion/readback contract before continuing.
 
 The tool opens the existing target and guard without creating entries, requires
