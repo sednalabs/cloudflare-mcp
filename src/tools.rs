@@ -16638,7 +16638,7 @@ mod tests {
         let ledger = parse_d1_migration_ledger(&json!({
             "success": true,
             "errors": [],
-            "result": [{"success": true, "results": [{"id": 1, "name": "9999_external.sql"}]}]
+            "result": [{"success": true, "meta": {"served_by_primary": true}, "results": [{"id": 1, "name": "9999_external.sql"}]}]
         }))
         .expect("parse ledger");
         let error = classify_d1_manifest_ledger(&manifest, &ledger)
@@ -16902,7 +16902,7 @@ mod tests {
         let ledger = parse_d1_migration_ledger(&json!({
             "success": true,
             "errors": [],
-            "result": [{"success": true, "results": [{"id": 1, "name": "9999_external.sql"}]}]
+            "result": [{"success": true, "meta": {"served_by_primary": true}, "results": [{"id": 1, "name": "9999_external.sql"}]}]
         }))
         .expect("known contradictory ledger");
         let root = d1_migration_test_dir("d1-manifest-evidence");
@@ -17089,7 +17089,7 @@ mod tests {
                 "success": true,
                 "errors": [],
                 "messages": [],
-                "result": [{"success": true, "results": [{"id": 1, "name": "0001_initial.sql"}]}]
+                "result": [{"success": true, "meta": {"served_by_primary": true}, "results": [{"id": 1, "name": "0001_initial.sql"}]}]
             }))
         }
         let state = CallState {

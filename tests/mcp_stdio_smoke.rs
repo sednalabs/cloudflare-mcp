@@ -2133,12 +2133,6 @@ fn spawn_fake_reconciliation_api_with_fault_and_calls(
                 | ReconciliationFault::HttpStatusCustodyDrift(_, _)
                 | ReconciliationFault::OversizedHttpStatus(_)
                 | ReconciliationFault::SecondBatchCustodyDrift(_)
-                | ReconciliationFault::PrimaryMetaMissing
-                | ReconciliationFault::PrimaryMarkerMissing
-                | ReconciliationFault::PrimaryMarkerFalse
-                | ReconciliationFault::PrimaryMarkerNull
-                | ReconciliationFault::PrimaryMarkerWrongType
-                | ReconciliationFault::MixedPrimaryMarkers
                 | ReconciliationFault::SecondBatchPrimaryFalse
                 | ReconciliationFault::SecondBatchHttpStatus(_)
                 | ReconciliationFault::SecondBatchTransportFailure(_)
