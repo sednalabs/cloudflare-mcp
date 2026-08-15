@@ -5007,6 +5007,355 @@ fn d1_terminal_plan_rejects_effect_assertion_change_after_approval_for_identical
 }
 
 #[test]
+fn d1_terminal_replays_canonical_v1_retirement_as_legacy_and_rejects_extended_reinterpretation() {
+    #[derive(Serialize)]
+    struct LegacyReceipt<'a> {
+        version: u8,
+        operation: &'static str,
+        target_key_sha256: &'a str,
+        lease_nonce: &'a str,
+        lease_payload_sha256: &'a str,
+        approved_apply_plan_sha256: &'a str,
+        reconciliation_plan_sha256: &'a str,
+        expectation_proof_sha256: &'a str,
+        query_sha256: &'a str,
+        canonical_snapshot_sha256: &'a str,
+        terminal_request_sha256: &'a str,
+        terminal_attempt_sha256: &'a str,
+        terminal_plan_sha256: &'a str,
+        outcome: &'static str,
+        original_prefix_length: usize,
+        current_prefix_length: usize,
+    }
+
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-terminal-v1-replay-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create v1 replay root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make v1 replay root private");
+    }
+    let (manifest, state_expectations) = one_table_reconciliation_case();
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&lease_root, &manifest);
+    let target_key_sha256 = sha256_hex("acct-1\0db-1");
+    let reconciliation_plan_sha256 = "1".repeat(64);
+    let expectation_proof_sha256 = "2".repeat(64);
+    let query_sha256 = "3".repeat(64);
+    let snapshot_sha256 = "4".repeat(64);
+    let terminal_request_sha256 = "5".repeat(64);
+    let terminal_attempt_sha256 = "6".repeat(64);
+    let terminal_plan = |effect_assertion_id: Option<&str>| {
+        let mut plan = json!({
+            "version": 1,
+            "operation": "d1_finalize_migration_reconciliation",
+            "target_key_sha256": target_key_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "approved_apply_plan_sha256": approved_plan_sha256,
+            "reconciliation_plan_sha256": reconciliation_plan_sha256,
+            "expectation_proof_sha256": expectation_proof_sha256,
+            "query_sha256": query_sha256,
+            "canonical_snapshot_sha256": snapshot_sha256,
+            "outcome": "not_committed",
+            "original_prefix_length": 0,
+            "current_prefix_length": 0,
+            "terminal_request_sha256": terminal_request_sha256,
+            "terminal_attempt_sha256": terminal_attempt_sha256,
+            "effect": "create_exact_terminal_receipt_then_guarded_retained_lease_retirement",
+            "provider_mutations": 0,
+        });
+        if let Some(id) = effect_assertion_id {
+            plan.as_object_mut()
+                .expect("terminal plan object")
+                .insert("effect_assertion_id".to_string(), json!(id));
+        }
+        sha256_hex(&serde_json::to_string(&plan).expect("terminal plan JSON"))
+    };
+    let legacy_terminal_plan = terminal_plan(None);
+    let receipt = LegacyReceipt {
+        version: 1,
+        operation: "d1_finalize_migration_reconciliation",
+        target_key_sha256: &target_key_sha256,
+        lease_nonce: &lease_nonce,
+        lease_payload_sha256: &lease_payload_sha256,
+        approved_apply_plan_sha256: &approved_plan_sha256,
+        reconciliation_plan_sha256: &reconciliation_plan_sha256,
+        expectation_proof_sha256: &expectation_proof_sha256,
+        query_sha256: &query_sha256,
+        canonical_snapshot_sha256: &snapshot_sha256,
+        terminal_request_sha256: &terminal_request_sha256,
+        terminal_attempt_sha256: &terminal_attempt_sha256,
+        terminal_plan_sha256: &legacy_terminal_plan,
+        outcome: "not_committed",
+        original_prefix_length: 0,
+        current_prefix_length: 0,
+    };
+    let target = manifest_target_path(&lease_root);
+    let receipt_path = target.join(format!(
+        "terminal-reconciliation.{lease_nonce}.receipt.json"
+    ));
+    fs::write(
+        &receipt_path,
+        serde_json::to_vec(&receipt).expect("canonical v1 receipt"),
+    )
+    .expect("install canonical v1 receipt");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600))
+            .expect("make v1 receipt private");
+    }
+    fs::rename(
+        target.join("active.lease.json"),
+        target.join(format!("retired.{lease_nonce}.lease.json")),
+    )
+    .expect("install predecessor retired state");
+    fs::File::open(&target)
+        .expect("open v1 target")
+        .sync_all()
+        .expect("sync v1 target");
+
+    let mut mcp = McpStdioProcess::start_with_env(vec![(
+        "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+        lease_root.to_string_lossy().to_string(),
+    )]);
+    let mut legacy_args = terminal_request_args(
+        &manifest,
+        &state_expectations,
+        &approved_plan_sha256,
+        &lease_nonce,
+        &lease_payload_sha256,
+    );
+    legacy_args["dry_run"] = json!(false);
+    legacy_args["approved_terminal_plan_sha256"] = json!(legacy_terminal_plan);
+    let replay = mcp.call_tool(
+        820,
+        "d1_finalize_migration_reconciliation",
+        legacy_args.clone(),
+    );
+    let replay_content = structured_content(&replay);
+    assert_eq!(replay_content["ok"], json!(true), "{replay_content}");
+    assert_eq!(
+        replay_content["status"],
+        json!("terminal_reconciliation_already_complete")
+    );
+    assert_eq!(replay_content["terminal_receipt_version"], json!(1));
+    assert_eq!(
+        replay_content["effect_assertion_id"],
+        json!("schema_create_only_v1")
+    );
+    assert_eq!(replay_content["provider_calls"], json!(0));
+
+    let mut extended_args = legacy_args;
+    extended_args["effect_assertion_id"] = json!("schema_create_tables_indexes_views_triggers_v1");
+    extended_args["approved_terminal_plan_sha256"] = json!(terminal_plan(Some(
+        "schema_create_tables_indexes_views_triggers_v1"
+    )));
+    let rejected = mcp.call_tool(821, "d1_finalize_migration_reconciliation", extended_args);
+    let rejected_content = structured_content(&rejected);
+    assert_eq!(rejected_content["ok"], json!(false), "{rejected_content}");
+    assert_eq!(rejected_content["provider_calls"], json!(0));
+    assert_eq!(
+        rejected_content["error"]["code"],
+        json!("d1.migration_terminal_evidence_invalid")
+    );
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_terminal_resumes_canonical_v1_receipt_from_retiring_namespace() {
+    #[derive(Serialize)]
+    struct LegacyReceipt<'a> {
+        version: u8,
+        operation: &'static str,
+        target_key_sha256: &'a str,
+        lease_nonce: &'a str,
+        lease_payload_sha256: &'a str,
+        approved_apply_plan_sha256: &'a str,
+        reconciliation_plan_sha256: &'a str,
+        expectation_proof_sha256: &'a str,
+        query_sha256: &'a str,
+        canonical_snapshot_sha256: &'a str,
+        terminal_request_sha256: &'a str,
+        terminal_attempt_sha256: &'a str,
+        terminal_plan_sha256: &'a str,
+        outcome: &'a str,
+        original_prefix_length: usize,
+        current_prefix_length: usize,
+    }
+
+    let (base_url, requests) = spawn_fake_reconciliation_api_for_calls(6);
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-terminal-v1-retiring-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create v1 retiring root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make v1 retiring root private");
+    }
+    let (manifest, state_expectations) = one_table_reconciliation_case();
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&lease_root, &manifest);
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let reconciliation = mcp.call_tool(
+        822,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest,
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_only_v1",
+            "state_expectations": state_expectations,
+        }),
+    );
+    let reconciled = structured_content(&reconciliation).clone();
+    assert_eq!(reconciled["ok"], json!(true), "{reconciled}");
+    let legacy_reconciliation_plan = json!({
+        "version": 1,
+        "operation": "d1_reconcile_migration_manifest",
+        "target_key_sha256": sha256_hex("acct-1\0db-1"),
+        "database_id": "db-1",
+        "migration_family": "newsletter-core",
+        "migrations_table": "d1_migrations",
+        "manifest": reconciled["manifest"],
+        "lease": reconciled["lease"],
+        "original_prefix_length": reconciled["reconstructed_original_prefix_length"],
+        "current_prefix_length": reconciled["current_manifest_prefix_length"],
+        "outcome": reconciled["outcome"],
+        "query_sha256": reconciled["query_sha256"],
+        "canonical_snapshot_sha256": reconciled["canonical_snapshot_sha256"],
+        "retry_decision": "do_not_retry_same_attempt",
+        "lease_decision": "retain",
+        "next_slice": "persist_terminal_reconciliation_receipt_then_guarded_retirement",
+    });
+    let legacy_reconciliation_plan_sha256 = sha256_hex(
+        &serde_json::to_string(&legacy_reconciliation_plan)
+            .expect("legacy reconciliation plan JSON"),
+    );
+    let terminal_request_sha256 = "d".repeat(64);
+    let terminal_attempt_sha256 = "e".repeat(64);
+    let legacy_terminal_plan = json!({
+        "version": 1,
+        "operation": "d1_finalize_migration_reconciliation",
+        "target_key_sha256": sha256_hex("acct-1\0db-1"),
+        "lease_nonce": lease_nonce,
+        "lease_payload_sha256": lease_payload_sha256,
+        "approved_apply_plan_sha256": approved_plan_sha256,
+        "reconciliation_plan_sha256": legacy_reconciliation_plan_sha256,
+        "expectation_proof_sha256": reconciled["expectation_proof_sha256"],
+        "query_sha256": reconciled["query_sha256"],
+        "canonical_snapshot_sha256": reconciled["canonical_snapshot_sha256"],
+        "outcome": reconciled["outcome"],
+        "original_prefix_length": reconciled["reconstructed_original_prefix_length"],
+        "current_prefix_length": reconciled["current_manifest_prefix_length"],
+        "terminal_request_sha256": terminal_request_sha256,
+        "terminal_attempt_sha256": terminal_attempt_sha256,
+        "effect": "create_exact_terminal_receipt_then_guarded_retained_lease_retirement",
+        "provider_mutations": 0,
+    });
+    let legacy_terminal_plan_sha256 = sha256_hex(
+        &serde_json::to_string(&legacy_terminal_plan).expect("legacy terminal plan JSON"),
+    );
+    let target_key_sha256 = sha256_hex("acct-1\0db-1");
+    let receipt = LegacyReceipt {
+        version: 1,
+        operation: "d1_finalize_migration_reconciliation",
+        target_key_sha256: &target_key_sha256,
+        lease_nonce: &lease_nonce,
+        lease_payload_sha256: &lease_payload_sha256,
+        approved_apply_plan_sha256: &approved_plan_sha256,
+        reconciliation_plan_sha256: &legacy_reconciliation_plan_sha256,
+        expectation_proof_sha256: reconciled["expectation_proof_sha256"]
+            .as_str()
+            .expect("expectation digest"),
+        query_sha256: reconciled["query_sha256"].as_str().expect("query digest"),
+        canonical_snapshot_sha256: reconciled["canonical_snapshot_sha256"]
+            .as_str()
+            .expect("snapshot digest"),
+        terminal_request_sha256: &terminal_request_sha256,
+        terminal_attempt_sha256: &terminal_attempt_sha256,
+        terminal_plan_sha256: &legacy_terminal_plan_sha256,
+        outcome: reconciled["outcome"].as_str().expect("outcome"),
+        original_prefix_length: reconciled["reconstructed_original_prefix_length"]
+            .as_u64()
+            .expect("original prefix") as usize,
+        current_prefix_length: reconciled["current_manifest_prefix_length"]
+            .as_u64()
+            .expect("current prefix") as usize,
+    };
+    let target = manifest_target_path(&lease_root);
+    let receipt_path = target.join(format!(
+        "terminal-reconciliation.{lease_nonce}.receipt.json"
+    ));
+    fs::write(
+        &receipt_path,
+        serde_json::to_vec(&receipt).expect("canonical v1 receipt"),
+    )
+    .expect("install v1 receipt");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600))
+            .expect("make v1 receipt private");
+    }
+    fs::rename(
+        target.join("active.lease.json"),
+        target.join("retiring.lease.json"),
+    )
+    .expect("install predecessor retiring state");
+    fs::File::open(&target)
+        .expect("open target")
+        .sync_all()
+        .expect("sync retiring state");
+    let mut terminal_args = terminal_args_from_reconciliation(
+        &manifest,
+        &state_expectations,
+        &approved_plan_sha256,
+        &lease_nonce,
+        &lease_payload_sha256,
+        &reconciled,
+    );
+    terminal_args["expected_reconciliation_plan_sha256"] = json!(legacy_reconciliation_plan_sha256);
+    terminal_args["terminal_request_sha256"] = json!(terminal_request_sha256);
+    terminal_args["terminal_attempt_sha256"] = json!(terminal_attempt_sha256);
+    terminal_args["dry_run"] = json!(false);
+    terminal_args["approved_terminal_plan_sha256"] = json!(legacy_terminal_plan_sha256);
+    let resumed = mcp.call_tool(823, "d1_finalize_migration_reconciliation", terminal_args);
+    let resumed_content = structured_content(&resumed);
+    assert_eq!(resumed_content["ok"], json!(true), "{resumed_content}");
+    assert_eq!(
+        resumed_content["status"],
+        json!("terminal_reconciliation_complete")
+    );
+    assert_eq!(resumed_content["terminal_receipt_version"], json!(1));
+    assert_eq!(resumed_content["provider_calls"], json!(4));
+    assert_eq!(requests.lock().expect("request log").len(), 6);
+    assert_released_manifest_target_custody(&lease_root);
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
 fn d1_reconciliation_stdio_rejects_view_trigger_effects_outside_the_explicit_registry() {
     let (manifest, _, _) = table_index_view_trigger_reconciliation_case();
     let temp_sql = "CREATE TEMP VIEW item_names AS SELECT id FROM items;";

@@ -11,7 +11,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::d1_migration_lease::{
-    D1RetainedMigrationLease, D1TerminalReconciliationReceipt, inspect_terminal_d1_migration_lease,
+    D1RetainedMigrationLease, D1TerminalReconciliationReceipt, D1TerminalReconciliationReceiptV1,
+    inspect_terminal_d1_migration_lease,
 };
 use crate::d1_migration_reconciliation::{
     D1MigrationStateExpectation, canonical_effect_assertion_id,
@@ -139,7 +140,28 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
         terminal_attempt_sha256,
         selected_effect_assertion_id,
     );
-    if !dry_run && approved_terminal_plan_sha256 != Some(terminal_plan_sha256.as_str()) {
+    let legacy_terminal_plan_sha256 = (selected_effect_assertion_id == "schema_create_only_v1")
+        .then(|| {
+            terminal_plan_sha256_v1(
+                &target_key_sha256,
+                lease_nonce,
+                lease_payload_sha256,
+                approved_plan_sha256,
+                expected_reconciliation_plan_sha256,
+                expected_expectation_proof_sha256,
+                expected_query_sha256,
+                expected_canonical_snapshot_sha256,
+                expected_outcome,
+                expected_original_prefix_length,
+                expected_current_prefix_length,
+                terminal_request_sha256,
+                terminal_attempt_sha256,
+            )
+        });
+    if !dry_run
+        && approved_terminal_plan_sha256 != Some(terminal_plan_sha256.as_str())
+        && approved_terminal_plan_sha256 != legacy_terminal_plan_sha256.as_deref()
+    {
         return terminal_error(
             "d1.migration_terminal_plan_mismatch",
             "approved_terminal_plan_sha256 does not match the exact pre-existing terminal plan",
@@ -154,7 +176,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
     let receipt = D1TerminalReconciliationReceipt {
         version: 2,
         operation: OPERATION.to_string(),
-        target_key_sha256,
+        target_key_sha256: target_key_sha256.clone(),
         lease_nonce: lease_nonce.to_string(),
         lease_payload_sha256: lease_payload_sha256.to_string(),
         approved_apply_plan_sha256: approved_plan_sha256.to_string(),
@@ -170,6 +192,27 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
         original_prefix_length: expected_original_prefix_length,
         current_prefix_length: expected_current_prefix_length,
     };
+    let legacy_receipt =
+        legacy_terminal_plan_sha256
+            .as_ref()
+            .map(|legacy_plan| D1TerminalReconciliationReceiptV1 {
+                version: 1,
+                operation: OPERATION.to_string(),
+                target_key_sha256: target_key_sha256.clone(),
+                lease_nonce: lease_nonce.to_string(),
+                lease_payload_sha256: lease_payload_sha256.to_string(),
+                approved_apply_plan_sha256: approved_plan_sha256.to_string(),
+                reconciliation_plan_sha256: expected_reconciliation_plan_sha256.to_string(),
+                expectation_proof_sha256: expected_expectation_proof_sha256.to_string(),
+                query_sha256: expected_query_sha256.to_string(),
+                canonical_snapshot_sha256: expected_canonical_snapshot_sha256.to_string(),
+                terminal_request_sha256: terminal_request_sha256.to_string(),
+                terminal_attempt_sha256: terminal_attempt_sha256.to_string(),
+                terminal_plan_sha256: legacy_plan.clone(),
+                outcome: expected_outcome.to_string(),
+                original_prefix_length: expected_original_prefix_length,
+                current_prefix_length: expected_current_prefix_length,
+            });
 
     let initial_lease = match inspect_terminal_d1_migration_lease(
         account_id,
@@ -192,10 +235,17 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
             );
         }
     };
+    let initial_receipt =
+        match initial_lease.compatible_terminal_receipt_state(&receipt, legacy_receipt.as_ref()) {
+            Ok(evidence) => evidence,
+            Err(result) => {
+                let custody = held_terminal_custody(&initial_lease);
+                return terminalize_failure(result, custody, 0, Vec::new(), Vec::new(), 0, false);
+            }
+        };
     if initial_lease.is_retired() {
-        let receipt_evidence = match initial_lease.terminal_receipt_state(&receipt) {
-            Ok(Some(evidence)) => evidence,
-            Ok(None) => {
+        let receipt_evidence = match initial_receipt {
+            None => {
                 return terminal_error(
                     "d1.migration_terminal_receipt_absent",
                     "terminal retirement exists without its exact terminal receipt",
@@ -207,11 +257,27 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
                     false,
                 );
             }
-            Err(result) => {
-                let custody = held_terminal_custody(&initial_lease);
-                return terminalize_failure(result, custody, 0, Vec::new(), Vec::new(), 0, false);
-            }
+            Some(evidence) => evidence,
         };
+        let selected_terminal_plan_sha256 = if receipt_evidence.receipt_version == 1 {
+            legacy_terminal_plan_sha256
+                .as_deref()
+                .expect("v1 receipt is reachable only for the legacy assertion")
+        } else {
+            terminal_plan_sha256.as_str()
+        };
+        if !dry_run && approved_terminal_plan_sha256 != Some(selected_terminal_plan_sha256) {
+            return terminal_error(
+                "d1.migration_terminal_plan_mismatch",
+                "approved_terminal_plan_sha256 does not match the exact pre-existing terminal plan",
+                TerminalCustodyState::RetiredVerified,
+                0,
+                Vec::new(),
+                Vec::new(),
+                0,
+                false,
+            );
+        }
         return terminal_result(
             json!({
                 "ok": true,
@@ -219,9 +285,10 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
                 "dry_run": dry_run,
                 "status": "terminal_reconciliation_already_complete",
                 "replayed": true,
-                "terminal_plan_sha256": terminal_plan_sha256,
+                "terminal_plan_sha256": selected_terminal_plan_sha256,
                 "terminal_receipt_sha256": receipt_evidence.payload_sha256,
-                "effect_assertion_id": selected_effect_assertion_id,
+                "terminal_receipt_version": receipt_evidence.receipt_version,
+                "effect_assertion_id": receipt_evidence.effect_assertion_id,
                 "provider_calls": 0,
                 "provider_read_lifecycle": [],
                 "response_evidence": [],
@@ -231,10 +298,10 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
             TerminalCustodyState::RetiredVerified,
         );
     }
-    let initial_receipt_preexisted = match initial_lease.terminal_receipt_state(&receipt) {
-        Ok(Some(_)) => true,
-        Ok(None) if initial_lease.identity.namespace == "active" => false,
-        Ok(None) => {
+    let initial_receipt_evidence = match initial_receipt {
+        Some(evidence) => Some(evidence),
+        None if initial_lease.identity.namespace == "active" => None,
+        None => {
             return terminal_error(
                 "d1.migration_terminal_receipt_absent",
                 "terminal retirement began without its exact durable terminal receipt",
@@ -246,13 +313,33 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
                 false,
             );
         }
-        Err(result) => {
-            let custody = held_terminal_custody(&initial_lease);
-            return terminalize_failure(result, custody, 0, Vec::new(), Vec::new(), 0, false);
-        }
     };
-    let recovering_exact_retiring_receipt =
-        initial_receipt_preexisted && initial_lease.identity.namespace == "retiring";
+    let selected_terminal_plan_sha256 = if initial_receipt_evidence
+        .as_ref()
+        .is_some_and(|evidence| evidence.receipt_version == 1)
+    {
+        legacy_terminal_plan_sha256
+            .as_deref()
+            .expect("v1 receipt is reachable only for the legacy assertion")
+    } else {
+        terminal_plan_sha256.as_str()
+    };
+    if !dry_run && approved_terminal_plan_sha256 != Some(selected_terminal_plan_sha256) {
+        return terminal_error(
+            "d1.migration_terminal_plan_mismatch",
+            "approved_terminal_plan_sha256 does not match the exact pre-existing terminal plan",
+            held_terminal_custody(&initial_lease),
+            0,
+            Vec::new(),
+            Vec::new(),
+            0,
+            false,
+        );
+    }
+    let recovering_legacy_receipt = initial_receipt_evidence
+        .as_ref()
+        .is_some_and(|evidence| evidence.receipt_version == 1);
+    let recovering_exact_receipt = initial_receipt_evidence.is_some();
     drop(initial_lease);
 
     let mut proof = match prepare_d1_migration_reconciliation(
@@ -286,15 +373,26 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
     };
     let mut response_evidence = proof.response_evidence();
     let mut lifecycle = proof.provider_read_lifecycle();
-    let exact_active_plan_matches = recovering_exact_retiring_receipt
-        && proof.plan_sha256_for_namespace(
-            account_id,
-            database_id,
-            family,
-            migrations_table,
-            manifest,
-            "active",
-        ) == expected_reconciliation_plan_sha256;
+    let exact_active_plan_matches = recovering_exact_receipt
+        && if recovering_legacy_receipt {
+            proof.legacy_plan_sha256_for_namespace(
+                account_id,
+                database_id,
+                family,
+                migrations_table,
+                manifest,
+                "active",
+            ) == expected_reconciliation_plan_sha256
+        } else {
+            proof.plan_sha256_for_namespace(
+                account_id,
+                database_id,
+                family,
+                migrations_table,
+                manifest,
+                "active",
+            ) == expected_reconciliation_plan_sha256
+        };
     if (proof.reconciliation_plan_sha256 != expected_reconciliation_plan_sha256
         && !exact_active_plan_matches)
         || proof.expectation_proof_sha256 != expected_expectation_proof_sha256
@@ -336,7 +434,10 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
                 "operation": OPERATION,
                 "dry_run": true,
                 "status": "terminal_reconciliation_plan_ready",
-                "terminal_plan_sha256": terminal_plan_sha256,
+                "terminal_plan_sha256": selected_terminal_plan_sha256,
+                "terminal_receipt_version": initial_receipt_evidence
+                    .as_ref()
+                    .map(|evidence| evidence.receipt_version),
                 "effect_assertion_id": proof.effect_assertion_id,
                 "approved_evidence": {
                     "effect_assertion_id": proof.effect_assertion_id,
@@ -376,12 +477,23 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
     response_evidence.push(before_receipt.response_evidence);
     lifecycle.push(before_receipt.lifecycle);
 
-    let (receipt_evidence, receipt_created) = match proof.lease.persist_terminal_receipt(&receipt) {
-        Ok(receipt) => receipt,
-        Err(result) => {
-            let custody = held_terminal_custody(&proof.lease);
-            return terminalize_failure(result, custody, 3, response_evidence, lifecycle, 0, false);
-        }
+    let (receipt_evidence, receipt_created) = match initial_receipt_evidence {
+        Some(evidence) => (evidence, false),
+        None => match proof.lease.persist_terminal_receipt(&receipt) {
+            Ok(receipt) => receipt,
+            Err(result) => {
+                let custody = held_terminal_custody(&proof.lease);
+                return terminalize_failure(
+                    result,
+                    custody,
+                    3,
+                    response_evidence,
+                    lifecycle,
+                    0,
+                    false,
+                );
+            }
+        },
     };
     let local_mutations = usize::from(receipt_created);
 
@@ -433,8 +545,9 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
             "dry_run": false,
             "status": "terminal_reconciliation_complete",
             "replayed": !receipt_created && !retired_now,
-            "terminal_plan_sha256": terminal_plan_sha256,
+            "terminal_plan_sha256": selected_terminal_plan_sha256,
             "terminal_receipt_sha256": receipt_evidence.payload_sha256,
+            "terminal_receipt_version": receipt_evidence.receipt_version,
             "effect_assertion_id": proof.effect_assertion_id,
             "approved_evidence": {
                 "effect_assertion_id": proof.effect_assertion_id,
@@ -545,6 +658,46 @@ fn terminal_plan_sha256(
         "provider_mutations": 0,
     });
     sha256_bytes_hex(&serde_json::to_vec(&plan).expect("terminal plan serialization is infallible"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn terminal_plan_sha256_v1(
+    target_key_sha256: &str,
+    lease_nonce: &str,
+    lease_payload_sha256: &str,
+    approved_plan_sha256: &str,
+    reconciliation_plan_sha256: &str,
+    expectation_proof_sha256: &str,
+    query_sha256: &str,
+    snapshot_sha256: &str,
+    outcome: &str,
+    original_prefix_length: usize,
+    current_prefix_length: usize,
+    terminal_request_sha256: &str,
+    terminal_attempt_sha256: &str,
+) -> String {
+    let plan = json!({
+        "version": 1,
+        "operation": OPERATION,
+        "target_key_sha256": target_key_sha256,
+        "lease_nonce": lease_nonce,
+        "lease_payload_sha256": lease_payload_sha256,
+        "approved_apply_plan_sha256": approved_plan_sha256,
+        "reconciliation_plan_sha256": reconciliation_plan_sha256,
+        "expectation_proof_sha256": expectation_proof_sha256,
+        "query_sha256": query_sha256,
+        "canonical_snapshot_sha256": snapshot_sha256,
+        "outcome": outcome,
+        "original_prefix_length": original_prefix_length,
+        "current_prefix_length": current_prefix_length,
+        "terminal_request_sha256": terminal_request_sha256,
+        "terminal_attempt_sha256": terminal_attempt_sha256,
+        "effect": "create_exact_terminal_receipt_then_guarded_retained_lease_retirement",
+        "provider_mutations": 0,
+    });
+    sha256_bytes_hex(
+        &serde_json::to_vec(&plan).expect("legacy terminal plan serialization is infallible"),
+    )
 }
 
 fn valid_lower_sha256(value: &str) -> bool {

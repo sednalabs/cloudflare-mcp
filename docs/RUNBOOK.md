@@ -164,6 +164,14 @@ digest, version-2 durable receipt, and exact replay. Never change it between
 approval and finalization, even when both assertions derive identical state for
 a table/index-only manifest.
 
+Receipt reads are deliberately dual-version while writes are version 2 only.
+An exact canonical predecessor version-1 receipt has its original field set and
+is mapped exclusively to `schema_create_only_v1`; it can resume active or
+retiring custody and replay a completed retirement. It never attests the
+extended assertion. Unknown fields, duplicate keys, malformed/noncanonical
+bytes, or an attempt to pair version 1 with the extended assertion fail closed
+before provider access.
+
 The extended classifier keeps an entire trigger body together across internal
 semicolons and nested `CASE ... END`, then accepts only bounded canonical
 trigger identities, a supported event/header, and semicolon-terminated

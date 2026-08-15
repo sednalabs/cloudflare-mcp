@@ -294,6 +294,33 @@ impl D1MigrationReconciliationProof {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn legacy_plan_sha256_for_namespace(
+        &self,
+        account_id: &str,
+        database_id: &str,
+        family: &str,
+        migrations_table: &str,
+        manifest: &[D1MigrationManifestEntry],
+        namespace: &str,
+    ) -> String {
+        let mut identity = self.lease.identity.clone();
+        identity.namespace = namespace.to_string();
+        reconciliation_plan_sha256_v1(
+            account_id,
+            database_id,
+            family,
+            migrations_table,
+            manifest,
+            &identity,
+            self.original_prefix_length,
+            self.current_prefix_length,
+            &self.outcome,
+            &self.query.sha256,
+            &self.canonical_snapshot_sha256,
+        )
+    }
+
     pub(crate) fn effect_assertion_scope(&self) -> &'static [&'static str] {
         effect_assertion_scope(&self.effect_assertion_id)
     }
@@ -2403,6 +2430,44 @@ fn reconciliation_plan_sha256(
     sha256_bytes_hex(
         &serde_json::to_vec(&plan)
             .expect("reconciliation transition plan serialization is infallible"),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconciliation_plan_sha256_v1(
+    account_id: &str,
+    database_id: &str,
+    family: &str,
+    migrations_table: &str,
+    manifest: &[D1MigrationManifestEntry],
+    lease: &D1RetainedMigrationLeaseIdentity,
+    original_prefix: usize,
+    current_prefix: usize,
+    outcome: &str,
+    query_sha256: &str,
+    snapshot_sha256: &str,
+) -> String {
+    let plan = json!({
+        "version": 1,
+        "operation": OPERATION,
+        "target_key_sha256": sha256_bytes_hex(format!("{account_id}\0{database_id}").as_bytes()),
+        "database_id": database_id,
+        "migration_family": family,
+        "migrations_table": migrations_table,
+        "manifest": d1_manifest_summaries(manifest),
+        "lease": lease,
+        "original_prefix_length": original_prefix,
+        "current_prefix_length": current_prefix,
+        "outcome": outcome,
+        "query_sha256": query_sha256,
+        "canonical_snapshot_sha256": snapshot_sha256,
+        "retry_decision": "do_not_retry_same_attempt",
+        "lease_decision": "retain",
+        "next_slice": "persist_terminal_reconciliation_receipt_then_guarded_retirement",
+    });
+    sha256_bytes_hex(
+        &serde_json::to_vec(&plan)
+            .expect("legacy reconciliation transition plan serialization is infallible"),
     )
 }
 
