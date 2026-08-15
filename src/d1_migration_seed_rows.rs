@@ -213,11 +213,9 @@ fn parse_literal(
         Some(SqlToken::Symbol('-')) => tokens
             .get(cursor + 1)
             .and_then(|token| match token {
-                SqlToken::Word(value) => canonical_unsigned_integer(value),
+                SqlToken::Word(value) => canonical_negative_integer(value),
                 _ => None,
             })
-            .and_then(|value| value.checked_neg())
-            .filter(|value| *value != 0)
             .map(|value| (SeedLiteral::Integer(value), 2))
             .ok_or_else(SeedContractError::grammar),
         _ => Err(SeedContractError::grammar()),
@@ -229,20 +227,40 @@ fn parse_integer(value: &str) -> Option<i64> {
 }
 
 fn canonical_unsigned_integer(value: &str) -> Option<i64> {
-    if value.is_empty()
-        || !value.bytes().all(|byte| byte.is_ascii_digit())
-        || (value.len() > 1 && value.starts_with('0'))
-    {
+    if !canonical_unsigned_decimal_grammar(value) {
         return None;
     }
     value.parse().ok()
+}
+
+fn canonical_negative_integer(magnitude: &str) -> Option<i64> {
+    if !canonical_unsigned_decimal_grammar(magnitude) || magnitude == "0" {
+        return None;
+    }
+    let magnitude = magnitude.parse::<u64>().ok()?;
+    if magnitude == i64::MAX as u64 + 1 {
+        Some(i64::MIN)
+    } else {
+        i64::try_from(magnitude).ok()?.checked_neg()
+    }
+}
+
+fn canonical_unsigned_decimal_grammar(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && (value.len() == 1 || !value.starts_with('0'))
+}
+
+pub(crate) fn sqlite_ascii_identifier_key(value: &str) -> String {
+    value.to_ascii_lowercase()
 }
 
 pub(crate) fn insert_seed_effect(
     cumulative: &mut BTreeMap<String, SeedTableState>,
     effect: SeedInsertEffect,
 ) -> Result<(), SeedContractError> {
-    if cumulative.len() >= MAX_SEED_TABLES || cumulative.contains_key(&effect.table_name) {
+    let authority_key = sqlite_ascii_identifier_key(&effect.table_name);
+    if cumulative.len() >= MAX_SEED_TABLES || cumulative.contains_key(&authority_key) {
         return Err(SeedContractError::contradictory(
             "d1.migration_reconciliation_seed_target_reused",
             "each manifest-created seed table may have exactly one canonical top-level seed INSERT",
@@ -262,7 +280,7 @@ pub(crate) fn insert_seed_effect(
         })?;
     let _ = rows_total;
     cumulative.insert(
-        effect.table_name.clone(),
+        authority_key,
         SeedTableState {
             table_name: effect.table_name,
             columns: effect.columns,
@@ -392,6 +410,7 @@ fn seed_summary_from_canonical_rows(
     columns: &[String],
     rows: Vec<Vec<Value>>,
 ) -> D1MigrationSeedTableExpectation {
+    let row_count = rows.len();
     let proof = json!({
         "version": 1,
         "table_name": table_name,
@@ -401,7 +420,7 @@ fn seed_summary_from_canonical_rows(
     D1MigrationSeedTableExpectation {
         table_name: table_name.to_string(),
         columns: columns.to_vec(),
-        row_count: proof["rows"].as_array().map_or(0, Vec::len),
+        row_count,
         rows_sha256: sha256_bytes_hex(
             &serde_json::to_vec(&proof).expect("canonical seed-row proof serialization"),
         ),
@@ -507,6 +526,44 @@ mod tests {
         assert_eq!(parsed.table_name, "publications");
         assert_eq!(parsed.columns, ["publication", "display_name"]);
         assert_eq!(parsed.rows.len(), 2);
+    }
+
+    #[test]
+    fn parses_the_complete_canonical_signed_integer_range() {
+        let minimum = vec![
+            SqlToken::Word("INSERT".into()),
+            SqlToken::Word("INTO".into()),
+            SqlToken::Word("ranges".into()),
+            SqlToken::Symbol('('),
+            SqlToken::Word("value".into()),
+            SqlToken::Symbol(')'),
+            SqlToken::Word("VALUES".into()),
+            SqlToken::Symbol('('),
+            SqlToken::Symbol('-'),
+            SqlToken::Word("9223372036854775808".into()),
+            SqlToken::Symbol(')'),
+        ];
+        let parsed = classify_seed_insert(&minimum)
+            .expect("minimum i64 is canonical")
+            .expect("seed INSERT");
+        assert_eq!(parsed.rows, vec![vec![SeedLiteral::Integer(i64::MIN)]]);
+        assert!(canonical_signed_decimal("-9223372036854775808"));
+        assert!(!canonical_signed_decimal("-9223372036854775809"));
+    }
+
+    #[test]
+    fn cumulative_seed_authority_rejects_ascii_case_aliases() {
+        let effect = |table_name: &str| SeedInsertEffect {
+            table_name: table_name.to_string(),
+            columns: vec!["id".into()],
+            rows: vec![vec![SeedLiteral::Text("x".into())]],
+        };
+        let mut cumulative = BTreeMap::new();
+        insert_seed_effect(&mut cumulative, effect("Channels")).expect("first target");
+        let error = insert_seed_effect(&mut cumulative, effect("CHANNELS"))
+            .expect_err("case alias must reuse one SQLite target");
+        assert_eq!(error.code, "d1.migration_reconciliation_seed_target_reused");
+        assert_eq!(cumulative["channels"].table_name, "Channels");
     }
 
     #[test]

@@ -7353,6 +7353,76 @@ fn d1_reconcile_migration_manifest_stdio_rejects_unproven_effects_and_incomplete
 }
 
 #[test]
+fn d1_canonical_seed_table_case_aliases_fail_before_custody_or_provider_access() {
+    let cases = [
+        (
+            vec![
+                "CREATE TABLE channels(id TEXT PRIMARY KEY); CREATE TRIGGER channels_guard BEFORE UPDATE ON CHANNELS BEGIN SELECT RAISE(ABORT, 'immutable'); END; INSERT INTO channels (id) VALUES ('daily');",
+            ],
+            "d1.migration_reconciliation_seed_after_trigger",
+            "a canonical seed INSERT must precede every trigger on its target, including across manifest entries",
+        ),
+        (
+            vec![
+                "CREATE TABLE channels(id TEXT PRIMARY KEY); CREATE TRIGGER channels_guard BEFORE UPDATE ON CHANNELS BEGIN SELECT RAISE(ABORT, 'immutable'); END;",
+                "INSERT INTO cHaNnElS (id) VALUES ('daily');",
+            ],
+            "d1.migration_reconciliation_seed_after_trigger",
+            "a canonical seed INSERT must precede every trigger on its target, including across manifest entries",
+        ),
+        (
+            vec![
+                "CREATE TABLE Channels(id TEXT PRIMARY KEY); INSERT INTO channels (id) VALUES ('daily');",
+                "INSERT INTO CHANNELS (id) VALUES ('weekly');",
+            ],
+            "d1.migration_reconciliation_seed_target_reused",
+            "each manifest-created seed table may have exactly one canonical top-level seed INSERT",
+        ),
+    ];
+
+    let mut mcp = McpStdioProcess::start();
+    for (offset, (sql_entries, code, message)) in cases.into_iter().enumerate() {
+        let manifest = sql_entries
+            .into_iter()
+            .enumerate()
+            .map(|(index, sql)| {
+                json!({
+                    "name": format!("{:04}.sql", index + 1),
+                    "size_bytes": sql.len(),
+                    "sql_sha256": sha256_hex(sql),
+                    "sql": sql,
+                })
+            })
+            .collect::<Vec<_>>();
+        let response = mcp.call_tool(
+            757 + offset as u64,
+            "d1_reconcile_migration_manifest",
+            json!({
+                "database_id": "db-1",
+                "migration_family": "newsletter-core",
+                "manifest": manifest,
+                "approved_plan_sha256": "a".repeat(64),
+                "lease_nonce": "b".repeat(64),
+                "lease_payload_sha256": "c".repeat(64),
+                "effect_assertion_id": "schema_create_objects_additive_seed_rows_v1",
+                "state_expectations": [],
+            }),
+        );
+        let content = structured_content(&response);
+        assert_eq!(
+            content,
+            &expected_d1_reconciliation_semantic_error(
+                code,
+                message,
+                "Retain the exact lease evidence. Do not retry the original migration attempt or mutate D1 from this result.",
+            ),
+            "{content}",
+        );
+    }
+    mcp.terminate();
+}
+
+#[test]
 fn d1_additive_reconciliation_rejects_unsupported_and_drifted_state_before_custody() {
     let mut mcp = McpStdioProcess::start();
     for (index, (sql, code)) in [

@@ -184,7 +184,9 @@ Select one explicit built-in effect assertion:
   explicit columns, bounded literal `VALUES` tuples, CREATE-before-seed, and
   seed-before-trigger ordering across the complete manifest. Add the exact
   cumulative `seed_tables` summary to every prefix expectation: target, ordered
-  columns, row count, and local row-set SHA-256. This assertion performs one
+  columns, row count, and local row-set SHA-256. Treat ASCII case variants as
+  one SQLite target while retaining the reviewed `CREATE TABLE` spelling in
+  expectations and fixed queries. This assertion performs one
   primary-current prefix-selection read followed by two identical complete
   primary-current schema-and-seed reads. Verify three provider reads, zero
   provider mutations, exact aggregate seed summaries, and no raw seed values in

@@ -119,9 +119,11 @@ form is `INSERT INTO <table> (<explicit columns>) VALUES (<literal tuples>)`:
 the table and columns are plain unqualified identifiers, values are canonical
 TEXT or signed INTEGER literals, and each target may be seeded once. The CREATE
 must precede the INSERT and every trigger on that target must follow it, even
-across manifest entries. Every `state_expectations` prefix adds `seed_tables`
-with the exact target, ordered columns, row count, and locally derived
-`rows_sha256`. The tool first selects the current primary manifest prefix, then
+across manifest entries. Table membership and reuse follow SQLite ASCII
+case-insensitive identifier identity; expectations and fixed read queries retain
+the one reviewed spelling from `CREATE TABLE`. Every `state_expectations`
+prefix adds `seed_tables` with the exact target, ordered columns, row count,
+and locally derived `rows_sha256`. The tool first selects the current primary manifest prefix, then
 runs two identical complete primary-current proofs that include exact typed seed
 row readback. Responses return aggregate row-count/digest evidence only; raw
 seed values are never returned. Implicit columns, INSERT SELECT, expressions,

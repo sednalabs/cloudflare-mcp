@@ -32,7 +32,8 @@ use crate::d1_migration_manifest::{
 use crate::d1_migration_seed_rows::{
     D1MigrationSeedTableExpectation, EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1,
     SeedContractError, SeedInsertEffect, SeedManifestPlan, SeedTableState, classify_seed_insert,
-    insert_seed_effect, observed_seed_summary, seed_data_fields, seed_select_sql, state_summaries,
+    insert_seed_effect, observed_seed_summary, seed_data_fields, seed_select_sql,
+    sqlite_ascii_identifier_key, state_summaries,
 };
 use crate::server::CloudflareMcp;
 use crate::tools::{D1MigrationManifestEntry, sha256_bytes_hex};
@@ -1339,7 +1340,7 @@ fn derive_additive_effect_assertion(
 ) -> Result<DerivedEffectAssertion, CallToolResult> {
     let mut migrations = Vec::with_capacity(manifest.len());
     let mut trigger_lexical_token_values = BTreeSet::new();
-    let mut manifest_created_tables = BTreeSet::new();
+    let mut manifest_created_tables = BTreeMap::<String, String>::new();
     let mut trigger_seen = BTreeSet::new();
     let mut seeded_tables = BTreeSet::new();
     for migration in manifest {
@@ -1362,10 +1363,20 @@ fn derive_additive_effect_assertion(
         let mut pragma_count = 0usize;
         for tokens in statements {
             if let Some((object, trigger_tokens)) = classify_schema_create(&tokens, true) {
-                if object.object_type == "table" {
-                    manifest_created_tables.insert(object.name.clone());
-                } else if object.object_type == "trigger" {
-                    trigger_seen.insert(object.table_name.clone());
+                if allow_seed_rows && object.object_type == "table" {
+                    let authority_key = sqlite_ascii_identifier_key(&object.name);
+                    if manifest_created_tables
+                        .insert(authority_key, object.name.clone())
+                        .is_some()
+                    {
+                        return Err(reconciliation_error(
+                            "contradictory",
+                            "d1.migration_reconciliation_create_target_reused",
+                            "the manifest reuses a CREATE or additive parent identity and cannot derive exact prefix states",
+                        ));
+                    }
+                } else if allow_seed_rows && object.object_type == "trigger" {
+                    trigger_seen.insert(sqlite_ascii_identifier_key(&object.table_name));
                 }
                 trigger_lexical_token_values.extend(trigger_tokens);
                 effects.push(ClassifiedEffect::Create(object));
@@ -1382,30 +1393,34 @@ fn derive_additive_effect_assertion(
                 }
                 None => {
                     if allow_seed_rows {
-                        if let Some(effect) =
+                        if let Some(mut effect) =
                             classify_seed_insert(&tokens).map_err(seed_contract_error)?
                         {
-                            if !manifest_created_tables.contains(&effect.table_name) {
-                                return Err(reconciliation_error(
-                                    "contradictory",
-                                    "d1.migration_reconciliation_seed_parent_missing",
-                                    "a canonical seed INSERT must follow CREATE TABLE for its target in the same manifest history",
-                                ));
-                            }
-                            if trigger_seen.contains(&effect.table_name) {
+                            let authority_key = sqlite_ascii_identifier_key(&effect.table_name);
+                            let reviewed_table_name = manifest_created_tables
+                                .get(&authority_key)
+                                .ok_or_else(|| {
+                                    reconciliation_error(
+                                        "contradictory",
+                                        "d1.migration_reconciliation_seed_parent_missing",
+                                        "a canonical seed INSERT must follow CREATE TABLE for its target in the same manifest history",
+                                    )
+                                })?;
+                            if trigger_seen.contains(&authority_key) {
                                 return Err(reconciliation_error(
                                     "contradictory",
                                     "d1.migration_reconciliation_seed_after_trigger",
                                     "a canonical seed INSERT must precede every trigger on its target, including across manifest entries",
                                 ));
                             }
-                            if !seeded_tables.insert(effect.table_name.clone()) {
+                            if !seeded_tables.insert(authority_key) {
                                 return Err(reconciliation_error(
                                     "contradictory",
                                     "d1.migration_reconciliation_seed_target_reused",
                                     "each manifest-created seed table may have exactly one canonical top-level seed INSERT",
                                 ));
                             }
+                            effect.table_name = reviewed_table_name.clone();
                             effects.push(ClassifiedEffect::SeedRows(effect));
                             continue;
                         }
@@ -3730,6 +3745,21 @@ mod tests {
             assert_eq!(seed_plan.states[1][0].rows.len(), 2);
         }
 
+        let case_variant_parent = manifest(
+            "CREATE TABLE Channels(id TEXT PRIMARY KEY); INSERT INTO CHANNELS (id) VALUES ('daily'); CREATE TRIGGER channels_guard BEFORE UPDATE ON cHaNnElS BEGIN SELECT RAISE(ABORT, 'immutable'); END;",
+        );
+        let derived = derive_effect_assertion_details(
+            Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1),
+            &case_variant_parent,
+        )
+        .expect("SQLite case aliases share the reviewed CREATE spelling");
+        let seed_state = &derived.seed_plan.expect("seed plan").states[1][0];
+        assert_eq!(seed_state.table_name, "Channels");
+        assert_eq!(
+            seed_select_sql(seed_state).matches("\"Channels\"").count(),
+            1
+        );
+
         let cross_entry = [format!("{table}; {seed};"), format!("{trigger};")]
             .into_iter()
             .enumerate()
@@ -3761,6 +3791,8 @@ mod tests {
             format!("{seed}; {table};"),
             format!("{table}; {trigger}; {seed};"),
             format!("{table}; {seed}; {seed};"),
+            "CREATE TABLE channels(id TEXT); CREATE TRIGGER channels_guard BEFORE UPDATE ON CHANNELS BEGIN SELECT 1; END; INSERT INTO channels (id) VALUES ('daily');".to_string(),
+            "CREATE TABLE channels(id TEXT); INSERT INTO channels (id) VALUES ('daily'); INSERT INTO CHANNELS (id) VALUES ('weekly');".to_string(),
         ];
         for sql in rejected {
             assert!(
@@ -3790,6 +3822,28 @@ mod tests {
             )
             .is_err(),
             "a trigger in an earlier prefix closes seed authority for that target",
+        );
+
+        let case_variant_trigger_then_seed = [
+            "CREATE TABLE channels(id TEXT); CREATE TRIGGER channels_guard BEFORE UPDATE ON CHANNELS BEGIN SELECT 1; END;".to_string(),
+            "INSERT INTO cHaNnElS (id) VALUES ('daily');".to_string(),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, sql)| D1MigrationManifestEntry {
+            name: format!("{:04}.sql", index + 1),
+            size_bytes: sql.len() as u64,
+            sql_sha256: sha256_bytes_hex(sql.as_bytes()),
+            sql,
+        })
+        .collect::<Vec<_>>();
+        assert!(
+            derive_effect_assertion_details(
+                Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1),
+                &case_variant_trigger_then_seed,
+            )
+            .is_err(),
+            "case variants cannot bypass a trigger in an earlier prefix",
         );
     }
 

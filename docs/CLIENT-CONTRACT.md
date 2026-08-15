@@ -267,7 +267,10 @@ For `effect_assertion_id=schema_create_objects_additive_seed_rows_v1`, every
 The assertion admits only one plain unqualified `INSERT INTO <table>
 (<explicit columns>) VALUES (<bounded canonical TEXT or INTEGER tuples>)` per
 manifest-created table. CREATE must precede the seed, and every trigger on the
-target must follow it across the whole manifest. The tool performs one
+target must follow it across the whole manifest. SQLite ASCII case-insensitive
+target matching governs parent, trigger, and reuse
+authority, while preserving the reviewed `CREATE TABLE` spelling in exact
+expectations and fixed read queries. The tool performs one
 primary-current prefix-selection read before two identical complete
 primary-current schema-and-seed reads. It compares storage class and canonical
 value locally and returns only table/column identity, exact row count, and the
