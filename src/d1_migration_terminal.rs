@@ -107,6 +107,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
     };
     let replay_expectation_proof_sha256 = match validate_replay_manifest_expectations(
         selected_effect_assertion_id,
+        migrations_table,
         manifest,
         &state_expectations,
     ) {

@@ -123,6 +123,10 @@ Preserved curated tool families:
   report `schema_create_tables_indexes_views_triggers` and
   `schema_create_objects_additive` respectively, with their complete closed
   object/operation arrays.
+  Every assertion also treats the configured migration-ledger table as a
+  reserved SQLite identifier: case variants in CREATE identities, index or
+  trigger parents, and additive ALTER targets fail before custody/provider
+  access, while unrelated trigger targets remain valid.
 - Terminal retained-manifest reconciliation
   (`d1_finalize_migration_reconciliation`) is the separately approval-gated
   local-custody mutation contract. Keep its exact evidence/request/attempt

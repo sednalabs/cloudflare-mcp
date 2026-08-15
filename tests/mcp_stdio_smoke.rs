@@ -7015,6 +7015,194 @@ fn d1_additive_reconciliation_rejects_unsupported_and_drifted_state_before_custo
 }
 
 #[test]
+fn d1_reconciliation_reserves_the_migrations_table_before_custody() {
+    let cases = vec![
+        (
+            "trigger-only ledger parent",
+            "d1_migrations",
+            "schema_create_objects_additive_v1",
+            vec![
+                "CREATE TRIGGER ledger_after_insert AFTER INSERT ON D1_MIGRATIONS BEGIN SELECT 1; END;",
+            ],
+        ),
+        (
+            "same entry alter then trigger",
+            "d1_migrations",
+            "schema_create_objects_additive_v1",
+            vec![
+                "ALTER TABLE d1_migrations ADD COLUMN status TEXT; CREATE TRIGGER ledger_after_insert AFTER INSERT ON D1_MIGRATIONS BEGIN SELECT 1; END;",
+            ],
+        ),
+        (
+            "same entry trigger then alter",
+            "d1_migrations",
+            "schema_create_objects_additive_v1",
+            vec![
+                "CREATE TRIGGER ledger_after_insert AFTER INSERT ON d1_migrations BEGIN SELECT 1; END; ALTER TABLE D1_MIGRATIONS ADD COLUMN status TEXT;",
+            ],
+        ),
+        (
+            "cross entry alter then trigger",
+            "d1_migrations",
+            "schema_create_objects_additive_v1",
+            vec![
+                "ALTER TABLE D1_MIGRATIONS ADD COLUMN status TEXT;",
+                "CREATE TRIGGER ledger_after_insert AFTER INSERT ON d1_migrations BEGIN SELECT 1; END;",
+            ],
+        ),
+        (
+            "cross entry trigger then alter",
+            "d1_migrations",
+            "schema_create_objects_additive_v1",
+            vec![
+                "CREATE TRIGGER ledger_after_insert AFTER INSERT ON D1_MIGRATIONS BEGIN SELECT 1; END;",
+                "ALTER TABLE d1_migrations ADD COLUMN status TEXT;",
+            ],
+        ),
+        (
+            "table identity case variant",
+            "d1_migrations",
+            "schema_create_only_v1",
+            vec!["CREATE TABLE D1_MIGRATIONS(id INTEGER PRIMARY KEY);"],
+        ),
+        (
+            "index parent case variant",
+            "d1_migrations",
+            "schema_create_only_v1",
+            vec!["CREATE INDEX ledger_by_id ON D1_MiGrAtIoNs(id);"],
+        ),
+        (
+            "index identity",
+            "d1_migrations",
+            "schema_create_only_v1",
+            vec![
+                "CREATE TABLE records(id INTEGER PRIMARY KEY); CREATE INDEX d1_migrations ON records(id);",
+            ],
+        ),
+        (
+            "view identity",
+            "d1_migrations",
+            "schema_create_tables_indexes_views_triggers_v1",
+            vec!["CREATE VIEW D1_MIGRATIONS AS SELECT 1;"],
+        ),
+        (
+            "trigger identity",
+            "d1_migrations",
+            "schema_create_tables_indexes_views_triggers_v1",
+            vec!["CREATE TRIGGER d1_migrations AFTER INSERT ON records BEGIN SELECT 1; END;"],
+        ),
+        (
+            "custom configured table case variant",
+            "MigrationLedger",
+            "schema_create_objects_additive_v1",
+            vec![
+                "CREATE TRIGGER custom_ledger_after_insert AFTER INSERT ON migrationledger BEGIN SELECT 1; END;",
+            ],
+        ),
+    ];
+    let (base_url, requests) = spawn_fake_reconciliation_api_for_calls(0);
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    for (index, (label, migrations_table, effect_assertion_id, statements)) in
+        cases.into_iter().enumerate()
+    {
+        let manifest = Value::Array(
+            statements
+                .into_iter()
+                .enumerate()
+                .map(|(prefix, sql)| {
+                    json!({
+                        "name": format!("{:04}_reserved.sql", prefix + 1),
+                        "size_bytes": sql.len(),
+                        "sql_sha256": sha256_hex(sql),
+                        "sql": sql,
+                    })
+                })
+                .collect(),
+        );
+        let response = mcp.call_tool(
+            862 + index as u64,
+            "d1_reconcile_migration_manifest",
+            json!({
+                "database_id": "db-1",
+                "migration_family": "newsletter-core",
+                "migrations_table": migrations_table,
+                "manifest": manifest,
+                "approved_plan_sha256": "a".repeat(64),
+                "lease_nonce": "b".repeat(64),
+                "lease_payload_sha256": "c".repeat(64),
+                "effect_assertion_id": effect_assertion_id,
+                "state_expectations": [],
+            }),
+        );
+        let content = structured_content(&response);
+        let expected = expected_d1_reconciliation_semantic_error(
+            "d1.migration_reconciliation_migrations_table_reserved",
+            "the configured migrations table is reserved and cannot be created, indexed, used as a trigger parent, named as another schema object, or altered by a reconciled manifest",
+            "Retain the exact lease evidence. Do not retry the original migration attempt or mutate D1 from this result.",
+        );
+        assert_eq!(content, &expected, "{label}: {content}");
+        assert_eq!(content["provider_calls"], json!(0), "{label}");
+        assert_eq!(content["provider_mutations"], json!(0), "{label}");
+        assert_eq!(content["local_namespace_mutations"], json!(0), "{label}");
+    }
+    assert_eq!(
+        requests.lock().expect("reserved ledger request log").len(),
+        0,
+        "reserved ledger effects must stop before provider access",
+    );
+
+    let terminal_sql =
+        "CREATE TRIGGER ledger_after_insert AFTER INSERT ON D1_MIGRATIONS BEGIN SELECT 1; END;";
+    let terminal_manifest = json!([{
+        "name": "0001_reserved.sql",
+        "size_bytes": terminal_sql.len(),
+        "sql_sha256": sha256_hex(terminal_sql),
+        "sql": terminal_sql,
+    }]);
+    let terminal = mcp.call_tool(
+        872,
+        "d1_finalize_migration_reconciliation",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": terminal_manifest,
+            "approved_plan_sha256": "a".repeat(64),
+            "lease_nonce": "b".repeat(64),
+            "lease_payload_sha256": "c".repeat(64),
+            "effect_assertion_id": "schema_create_objects_additive_v1",
+            "state_expectations": [],
+            "expected_reconciliation_plan_sha256": "d".repeat(64),
+            "expected_expectation_proof_sha256": "e".repeat(64),
+            "expected_query_sha256": "f".repeat(64),
+            "expected_canonical_snapshot_sha256": "1".repeat(64),
+            "expected_outcome": "not_committed",
+            "expected_original_prefix_length": 0,
+            "expected_current_prefix_length": 0,
+            "terminal_request_sha256": "2".repeat(64),
+            "terminal_attempt_sha256": "3".repeat(64),
+            "dry_run": true,
+        }),
+    );
+    let terminal_content = structured_content(&terminal);
+    assert_eq!(terminal_content["ok"], json!(false), "{terminal_content}");
+    assert_eq!(
+        terminal_content["error"]["code"],
+        json!("d1.migration_reconciliation_migrations_table_reserved")
+    );
+    assert_eq!(terminal_content["custody_status"], json!("not_inspected"));
+    assert_eq!(terminal_content["provider_calls"], json!(0));
+    assert_eq!(terminal_content["provider_mutations"], json!(0));
+    assert_eq!(terminal_content["local_namespace_mutations"], json!(0));
+    assert_eq!(terminal_content["receipt_persisted"], json!(false));
+    assert_eq!(
+        requests.lock().expect("terminal reserved ledger log").len(),
+        0,
+        "terminal replay must reject the reserved ledger before provider access",
+    );
+    mcp.terminate();
+}
+
+#[test]
 fn d1_reconcile_migration_manifest_stdio_requires_primary_current_evidence_for_every_result_set() {
     let (manifest, expectations) = one_table_reconciliation_case();
     for (index, (fault, expected_calls)) in [

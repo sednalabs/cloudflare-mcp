@@ -118,6 +118,10 @@ On success, inspect the complete `effect_assertion.scope` object: its
 `schema_create_tables_indexes_views_triggers`, or
 `schema_create_objects_additive`) and its `schema_object_types` array is the
 closed allowed scope for that selected assertion.
+The configured `migrations_table` remains reserved across all assertions using
+SQLite ASCII case-insensitive identifier equivalence. CREATE object identities,
+index/trigger parents, and additive ALTER targets that collide with it fail
+before custody or provider access; unrelated triggers remain supported.
 The boundary also requires every fixed result set in both batches to carry exact
 `meta.served_by_primary=true` evidence; absent, false, null, non-boolean, or
 mixed primary markers are contradictory and cannot support positive

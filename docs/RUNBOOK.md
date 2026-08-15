@@ -185,6 +185,13 @@ reports `schema_create_only`, `schema_create_tables_indexes_views_triggers`, or
 `schema_create_objects_additive` respectively, alongside the complete allowed
 `schema_object_types` array.
 
+For every assertion, the configured `migrations_table` is a reserved schema
+identifier under SQLite ASCII case-insensitive matching. A manifest must not
+create an object with that name, create an index or trigger on that table, or
+use additive ALTER against it. This is rejected before expectation validation,
+custody inspection, or provider access so an injected ledger INSERT cannot
+activate manifest-defined behavior.
+
 The successful response names the selected assertion and its exact object-type
 scope. That ID is also part of the reconciliation-plan digest, terminal-plan
 digest, version-2 durable receipt, and exact replay. Never change it between

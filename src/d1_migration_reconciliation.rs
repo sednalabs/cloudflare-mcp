@@ -357,6 +357,9 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
             Ok(derived) => derived,
             Err(result) => return Err(prelease_error(result, "not_inspected", None)),
         };
+    if let Err(result) = validate_reserved_migrations_table(migrations_table, &derived) {
+        return Err(prelease_error(result, "not_inspected", None));
+    }
     let validated = match validate_expectations(&derived.states, state_expectations) {
         Ok(validated) => validated,
         Err(result) => return Err(prelease_error(result, "not_inspected", None)),
@@ -1312,16 +1315,36 @@ pub(crate) fn canonical_effect_assertion_id(
 
 pub(crate) fn validate_replay_manifest_expectations(
     effect_assertion_id: &str,
+    migrations_table: &str,
     manifest: &[D1MigrationManifestEntry],
     state_expectations: &[D1MigrationStateExpectation],
 ) -> Result<String, CallToolResult> {
     let selected = canonical_effect_assertion_id(Some(effect_assertion_id))?;
     let derived = derive_effect_assertion_details(Some(selected), manifest)?;
+    validate_reserved_migrations_table(migrations_table, &derived)?;
     let validated = validate_expectations(&derived.states, state_expectations.to_vec())?;
     if let Some(plan) = derived.additive_plan.as_ref() {
         validate_additive_transitions(plan, &validated.states).map_err(additive_contract_error)?;
     }
     Ok(validated.proof_sha256)
+}
+
+fn validate_reserved_migrations_table(
+    migrations_table: &str,
+    derived: &DerivedEffectAssertion,
+) -> Result<(), CallToolResult> {
+    let conflicts = derived.states.last().into_iter().flatten().any(|object| {
+        object.name.eq_ignore_ascii_case(migrations_table)
+            || object.table_name.eq_ignore_ascii_case(migrations_table)
+    });
+    if conflicts {
+        return Err(reconciliation_error(
+            "contradictory",
+            "d1.migration_reconciliation_migrations_table_reserved",
+            "the configured migrations table is reserved and cannot be created, indexed, used as a trigger parent, named as another schema object, or altered by a reconciled manifest",
+        ));
+    }
+    Ok(())
 }
 
 fn effect_assertion_scope(effect_assertion_id: &str) -> &'static [&'static str] {
@@ -3291,6 +3314,8 @@ mod tests {
         let derived =
             derive_effect_assertion_details(Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_V1), &manifest)
                 .expect("derive additive mixed prefixes");
+        validate_reserved_migrations_table("d1_migrations", &derived)
+            .expect("an unrelated additive trigger must not conflict with the reserved ledger");
         assert_eq!(
             derived.states,
             vec![
