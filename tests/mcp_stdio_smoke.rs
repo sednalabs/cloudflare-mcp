@@ -1207,6 +1207,136 @@ fn additive_reconciliation_case() -> (Value, Value, Vec<Value>) {
     (manifest, expectations, schema_rows)
 }
 
+fn additive_check_reconciliation_case() -> (Value, Value, Vec<Value>, Vec<Value>, Vec<Value>) {
+    let additions = [
+        (
+            "plain_col TEXT",
+            json!({"cid": 1, "name": "plain_col", "declared_type": "TEXT", "not_null": false, "default_value": null, "primary_key_position": 0, "hidden": 0}),
+        ),
+        (
+            "token TEXT CHECK (token IS NULL OR (length(token)=35 AND substr(token,1,3)='pre'))",
+            json!({"cid": 2, "name": "token", "declared_type": "TEXT", "not_null": false, "default_value": null, "primary_key_position": 0, "hidden": 0}),
+        ),
+        (
+            "state TEXT NOT NULL DEFAULT 'x' CHECK (state='x')",
+            json!({"cid": 3, "name": "state", "declared_type": "TEXT", "not_null": true, "default_value": "'x'", "primary_key_position": 0, "hidden": 0}),
+        ),
+        (
+            "kind TEXT NOT NULL DEFAULT 'x' CHECK (kind IN ('x','y'))",
+            json!({"cid": 4, "name": "kind", "declared_type": "TEXT", "not_null": true, "default_value": "'x'", "primary_key_position": 0, "hidden": 0}),
+        ),
+        (
+            "rank INTEGER DEFAULT 0",
+            json!({"cid": 5, "name": "rank", "declared_type": "INTEGER", "not_null": false, "default_value": "0", "primary_key_position": 0, "hidden": 0}),
+        ),
+    ];
+    let index_sql = "CREATE INDEX records_by_state ON records(state)";
+    let view_sql = "CREATE VIEW record_ids AS SELECT id FROM records";
+    let baseline_column = json!({
+        "cid": 0,
+        "name": "id",
+        "declared_type": "INTEGER",
+        "not_null": false,
+        "default_value": null,
+        "primary_key_position": 1,
+        "hidden": 0,
+    });
+    let mut definitions = vec!["id INTEGER PRIMARY KEY".to_string()];
+    let mut columns = vec![baseline_column.clone()];
+    let mut table_sql = "CREATE TABLE records(id INTEGER PRIMARY KEY)".to_string();
+    let mut expectations = vec![json!({
+        "manifest_prefix_length": 0,
+        "schema_objects": [{
+            "object_type": "table",
+            "name": "records",
+            "table_name": "records",
+            "sql_sha256": sha256_hex(&table_sql),
+        }],
+        "tables": [{"name": "records", "columns": columns.clone(), "foreign_keys": []}],
+    })];
+    let mut manifest = Vec::new();
+    let mut ledger_rows = Vec::new();
+
+    for (index, (definition, column)) in additions.iter().enumerate() {
+        let migration_number = index + 1;
+        let name = format!("{migration_number:04}_add.sql");
+        let mut sql =
+            format!("PRAGMA foreign_keys = ON; ALTER TABLE records ADD COLUMN {definition};");
+        if migration_number == 4 {
+            sql.push_str(" CREATE INDEX records_by_state ON records(state);");
+        }
+        if migration_number == 5 {
+            sql.push_str(" CREATE VIEW record_ids AS SELECT id FROM records;");
+        }
+        manifest.push(json!({
+            "name": name,
+            "size_bytes": sql.len(),
+            "sql_sha256": sha256_hex(&sql),
+            "sql": sql,
+        }));
+        ledger_rows.push(json!({"id": migration_number, "name": name}));
+
+        definitions.push((*definition).to_string());
+        columns.push(column.clone());
+        table_sql = format!("CREATE TABLE records({})", definitions.join(", "));
+        let mut schema_objects = Vec::new();
+        if migration_number >= 4 {
+            schema_objects.push(json!({
+                "object_type": "index",
+                "name": "records_by_state",
+                "table_name": "records",
+                "sql_sha256": sha256_hex(index_sql),
+            }));
+        }
+        schema_objects.push(json!({
+            "object_type": "table",
+            "name": "records",
+            "table_name": "records",
+            "sql_sha256": sha256_hex(&table_sql),
+        }));
+        if migration_number >= 5 {
+            schema_objects.push(json!({
+                "object_type": "view",
+                "name": "record_ids",
+                "table_name": "record_ids",
+                "sql_sha256": sha256_hex(view_sql),
+            }));
+        }
+        expectations.push(json!({
+            "manifest_prefix_length": migration_number,
+            "schema_objects": schema_objects,
+            "tables": [{"name": "records", "columns": columns.clone(), "foreign_keys": []}],
+        }));
+    }
+
+    let schema_rows = vec![
+        json!({"type": "index", "name": "records_by_state", "tbl_name": "records", "sql": index_sql}),
+        json!({"type": "table", "name": "records", "tbl_name": "records", "sql": table_sql}),
+        json!({"type": "view", "name": "record_ids", "tbl_name": "record_ids", "sql": view_sql}),
+    ];
+    let xinfo_rows = columns
+        .into_iter()
+        .map(|column| {
+            json!({
+                "cid": column["cid"],
+                "name": column["name"],
+                "type": column["declared_type"],
+                "notnull": if column["not_null"] == json!(true) { 1 } else { 0 },
+                "dflt_value": column["default_value"],
+                "pk": column["primary_key_position"],
+                "hidden": column["hidden"],
+            })
+        })
+        .collect::<Vec<_>>();
+    (
+        Value::Array(manifest),
+        Value::Array(expectations),
+        schema_rows,
+        ledger_rows,
+        xinfo_rows,
+    )
+}
+
 fn terminal_request_args(
     manifest: &Value,
     state_expectations: &Value,
@@ -1556,6 +1686,23 @@ fn spawn_fake_schema_object_reconciliation_api(
     call_count: usize,
     schema_rows: Vec<Value>,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
+    spawn_fake_custom_schema_reconciliation_api(
+        call_count,
+        vec![json!({"id": 1, "name": "0001_create.sql"})],
+        schema_rows,
+        vec![
+            json!({"cid": 0, "name": "id", "type": "INTEGER", "notnull": 0, "dflt_value": null, "pk": 1, "hidden": 0}),
+            json!({"cid": 1, "name": "name", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 0, "hidden": 0}),
+        ],
+    )
+}
+
+fn spawn_fake_custom_schema_reconciliation_api(
+    call_count: usize,
+    ledger_rows: Vec<Value>,
+    schema_rows: Vec<Value>,
+    xinfo_rows: Vec<Value>,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
     let listener =
         TcpListener::bind("127.0.0.1:0").expect("bind schema-object reconciliation D1 API"); // DevSkim: ignore DS162092 -- loopback-only MCP test fixture
     let addr = listener
@@ -1588,7 +1735,7 @@ fn spawn_fake_schema_object_reconciliation_api(
                 tagged_reconciliation_result(
                     &markers[0],
                     &["id", "name"],
-                    vec![json!({"id": 1, "name": "0001_create.sql"})],
+                    ledger_rows.clone(),
                     Some(json!({"changed_db": false, "changes": 0, "rows_written": 0})),
                 ),
                 tagged_reconciliation_result(
@@ -1608,10 +1755,7 @@ fn spawn_fake_schema_object_reconciliation_api(
                         "pk",
                         "hidden",
                     ],
-                    vec![
-                        json!({"cid": 0, "name": "id", "type": "INTEGER", "notnull": 0, "dflt_value": null, "pk": 1, "hidden": 0}),
-                        json!({"cid": 1, "name": "name", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 0, "hidden": 0}),
-                    ],
+                    xinfo_rows.clone(),
                     None,
                 ),
                 tagged_reconciliation_result(
@@ -5151,6 +5295,76 @@ fn d1_reconciliation_and_terminal_finalize_share_additive_effect_proof() {
 }
 
 #[test]
+fn d1_additive_reconciliation_proves_five_prefixes_with_bounded_checks() {
+    let (manifest, state_expectations, schema_rows, ledger_rows, xinfo_rows) =
+        additive_check_reconciliation_case();
+    assert_eq!(manifest.as_array().map(Vec::len), Some(5));
+    assert!(
+        manifest
+            .as_array()
+            .is_some_and(|entries| entries.iter().all(|entry| entry["sql"]
+                .as_str()
+                .is_some_and(|sql| sql.matches("PRAGMA foreign_keys = ON").count() == 1)))
+    );
+    let (base_url, requests) =
+        spawn_fake_custom_schema_reconciliation_api(2, ledger_rows, schema_rows, xinfo_rows);
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-reconcile-additive-checks-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create additive CHECK reconciliation lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make additive CHECK reconciliation root private");
+    }
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&lease_root, &manifest);
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let response = mcp.call_tool(
+        835,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest,
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_objects_additive_v1",
+            "state_expectations": state_expectations,
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(true), "{content}");
+    assert_eq!(content["outcome"], json!("full_state_converged"));
+    assert_eq!(content["current_manifest_prefix_length"], json!(5));
+    assert_eq!(content["provider_calls"], json!(2));
+    assert_eq!(content["provider_mutations"], json!(0));
+    assert_eq!(content["lease_retained"], json!(true));
+
+    let observed = requests.lock().expect("additive CHECK request log");
+    assert_eq!(observed.len(), 2);
+    for request in observed.iter() {
+        let sql = request["sql"].as_str().expect("fixed reconciliation SQL");
+        assert!(!sql.contains("ALTER TABLE"));
+        assert!(!sql.contains("CHECK"));
+        assert!(!sql.contains("PRAGMA foreign_keys = ON"));
+    }
+    drop(observed);
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
 fn d1_terminal_plan_rejects_effect_assertion_change_after_approval_for_identical_table_state() {
     let (base_url, requests) = spawn_fake_reconciliation_api_for_calls(6);
     let lease_root = PathBuf::from("/tmp").join(format!(
@@ -6662,6 +6876,38 @@ fn d1_additive_reconciliation_rejects_unsupported_and_drifted_state_before_custo
             "PRAGMA journal_mode = WAL;",
             "d1.migration_reconciliation_pragma_effect_unavailable",
         ),
+        (
+            "ALTER TABLE records ADD COLUMN state TEXT CHECK (EXISTS (SELECT 1));",
+            "d1.migration_reconciliation_add_column_effect_unavailable",
+        ),
+        (
+            "ALTER TABLE records ADD COLUMN state TEXT CHECK (other_column='x');",
+            "d1.migration_reconciliation_add_column_effect_unavailable",
+        ),
+        (
+            "ALTER TABLE records ADD COLUMN state TEXT CHECK (lower(state)='x');",
+            "d1.migration_reconciliation_add_column_effect_unavailable",
+        ),
+        (
+            "ALTER TABLE records ADD COLUMN state TEXT CHECK ((state='x');",
+            "d1.migration_reconciliation_add_column_effect_unavailable",
+        ),
+        (
+            "ALTER TABLE records ADD COLUMN state TEXT CHECK (((((((state='x')))))));",
+            "d1.migration_reconciliation_add_column_effect_unavailable",
+        ),
+        (
+            "ALTER TABLE records ADD COLUMN state TEXT CHECK (state!='x');",
+            "d1.migration_reconciliation_add_column_effect_unavailable",
+        ),
+        (
+            "ALTER TABLE records ADD COLUMN state TEXT CHECK (state='x') REFERENCES parent(id);",
+            "d1.migration_reconciliation_add_column_effect_unavailable",
+        ),
+        (
+            "ALTER TABLE records ADD COLUMN state TEXT CHECK (state='x'); DELETE FROM records;",
+            "d1.migration_reconciliation_effect_proof_unavailable",
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -6701,7 +6947,7 @@ fn d1_additive_reconciliation_rejects_unsupported_and_drifted_state_before_custo
     state_expectations[1]["tables"][0]["columns"] =
         state_expectations[0]["tables"][0]["columns"].clone();
     let missing_column = mcp.call_tool(
-        846,
+        860,
         "d1_reconcile_migration_manifest",
         json!({
             "database_id": "db-1",
@@ -6724,7 +6970,7 @@ fn d1_additive_reconciliation_rejects_unsupported_and_drifted_state_before_custo
     );
 
     let legacy = mcp.call_tool(
-        847,
+        861,
         "d1_reconcile_migration_manifest",
         json!({
             "database_id": "db-1",

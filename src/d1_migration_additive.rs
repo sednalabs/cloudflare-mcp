@@ -13,6 +13,11 @@ use crate::d1_migration_reconciliation::{
 
 pub(crate) const EFFECT_ASSERTION_SCHEMA_ADDITIVE_V1: &str = "schema_create_objects_additive_v1";
 
+const MAX_CHECK_TOKENS: usize = 96;
+const MAX_CHECK_DEPTH: usize = 6;
+const MAX_CHECK_IN_VALUES: usize = 16;
+const MAX_CHECK_LITERAL_BYTES: usize = 256;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AddColumnEffect {
     pub(crate) table_name: String,
@@ -126,6 +131,10 @@ fn parse_add_column(tokens: &[SqlToken]) -> Result<AddColumnEffect, AdditiveCont
         default_value = Some(value);
         cursor += width + 1;
     }
+    if token_is_word(tokens.get(cursor), "check") {
+        cursor = parse_check_constraint(tokens, cursor + 1, &column_name)
+            .ok_or_else(AdditiveContractError::alter_grammar)?;
+    }
     if cursor != tokens.len()
         || (not_null
             && default_value
@@ -147,6 +156,202 @@ fn parse_add_column(tokens: &[SqlToken]) -> Result<AddColumnEffect, AdditiveCont
             hidden: 0,
         },
     })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CheckValueKind {
+    Column,
+    ColumnDerived,
+    Literal,
+}
+
+struct CheckExpressionParser<'a> {
+    tokens: &'a [SqlToken],
+    cursor: usize,
+    column_name: &'a str,
+}
+
+fn parse_check_constraint(tokens: &[SqlToken], cursor: usize, column_name: &str) -> Option<usize> {
+    let remaining = tokens.get(cursor..)?;
+    if remaining.is_empty() || remaining.len() > MAX_CHECK_TOKENS {
+        return None;
+    }
+    let mut parser = CheckExpressionParser {
+        tokens,
+        cursor,
+        column_name,
+    };
+    parser.consume_symbol('(')?;
+    parser.parse_or_expression(1)?;
+    parser.consume_symbol(')')?;
+    Some(parser.cursor)
+}
+
+impl CheckExpressionParser<'_> {
+    fn parse_or_expression(&mut self, depth: usize) -> Option<()> {
+        self.ensure_depth(depth)?;
+        self.parse_and_expression(depth)?;
+        while self.consume_word("or").is_some() {
+            self.parse_and_expression(depth)?;
+        }
+        Some(())
+    }
+
+    fn parse_and_expression(&mut self, depth: usize) -> Option<()> {
+        self.parse_predicate(depth)?;
+        while self.consume_word("and").is_some() {
+            self.parse_predicate(depth)?;
+        }
+        Some(())
+    }
+
+    fn parse_predicate(&mut self, depth: usize) -> Option<()> {
+        if self.consume_symbol('(').is_some() {
+            self.parse_or_expression(depth.checked_add(1)?)?;
+            self.consume_symbol(')')?;
+            return Some(());
+        }
+
+        let left = self.parse_value()?;
+        if self.consume_word("is").is_some() {
+            if left != CheckValueKind::Column {
+                return None;
+            }
+            self.consume_word("null")?;
+            return Some(());
+        }
+        if self.consume_symbol('=').is_some() {
+            if !matches!(left, CheckValueKind::Column | CheckValueKind::ColumnDerived)
+                || self.parse_value()? != CheckValueKind::Literal
+            {
+                return None;
+            }
+            return Some(());
+        }
+        if self.consume_word("in").is_some() {
+            if left != CheckValueKind::Column {
+                return None;
+            }
+            self.consume_symbol('(')?;
+            let mut values = 0usize;
+            loop {
+                if self.parse_value()? != CheckValueKind::Literal {
+                    return None;
+                }
+                values = values.checked_add(1)?;
+                if values > MAX_CHECK_IN_VALUES {
+                    return None;
+                }
+                if self.consume_symbol(',').is_none() {
+                    break;
+                }
+            }
+            self.consume_symbol(')')?;
+            return Some(());
+        }
+        None
+    }
+
+    fn parse_value(&mut self) -> Option<CheckValueKind> {
+        match self.tokens.get(self.cursor)? {
+            SqlToken::Word(value)
+                if value.eq_ignore_ascii_case("length")
+                    && self.tokens.get(self.cursor + 1) == Some(&SqlToken::Symbol('(')) =>
+            {
+                self.cursor += 2;
+                self.consume_column()?;
+                self.consume_symbol(')')?;
+                Some(CheckValueKind::ColumnDerived)
+            }
+            SqlToken::Word(value)
+                if value.eq_ignore_ascii_case("substr")
+                    && self.tokens.get(self.cursor + 1) == Some(&SqlToken::Symbol('(')) =>
+            {
+                self.cursor += 2;
+                self.consume_column()?;
+                self.consume_symbol(',')?;
+                self.consume_positive_integer()?;
+                self.consume_symbol(',')?;
+                self.consume_positive_integer()?;
+                self.consume_symbol(')')?;
+                Some(CheckValueKind::ColumnDerived)
+            }
+            SqlToken::Word(value) if value.eq_ignore_ascii_case(self.column_name) => {
+                self.cursor += 1;
+                Some(CheckValueKind::Column)
+            }
+            SqlToken::Word(value)
+                if value.len() <= 10 && value.bytes().all(|byte| byte.is_ascii_digit()) =>
+            {
+                self.cursor += 1;
+                Some(CheckValueKind::Literal)
+            }
+            SqlToken::Symbol('-' | '+') => {
+                let Some(SqlToken::Word(value)) = self.tokens.get(self.cursor + 1) else {
+                    return None;
+                };
+                if value.len() > 10 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return None;
+                }
+                self.cursor += 2;
+                Some(CheckValueKind::Literal)
+            }
+            SqlToken::StringLiteral(value) if value.len() <= MAX_CHECK_LITERAL_BYTES => {
+                self.cursor += 1;
+                Some(CheckValueKind::Literal)
+            }
+            SqlToken::Word(_)
+            | SqlToken::Identifier(_)
+            | SqlToken::StringLiteral(_)
+            | SqlToken::Symbol(_) => None,
+        }
+    }
+
+    fn consume_column(&mut self) -> Option<()> {
+        match self.tokens.get(self.cursor) {
+            Some(SqlToken::Word(value)) if value.eq_ignore_ascii_case(self.column_name) => {
+                self.cursor += 1;
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
+    fn consume_positive_integer(&mut self) -> Option<()> {
+        match self.tokens.get(self.cursor) {
+            Some(SqlToken::Word(value))
+                if value.len() <= 10
+                    && value.bytes().all(|byte| byte.is_ascii_digit())
+                    && value.bytes().any(|byte| byte != b'0') =>
+            {
+                self.cursor += 1;
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
+    fn consume_word(&mut self, expected: &str) -> Option<()> {
+        if token_is_word(self.tokens.get(self.cursor), expected) {
+            self.cursor += 1;
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    fn consume_symbol(&mut self, expected: char) -> Option<()> {
+        if self.tokens.get(self.cursor) == Some(&SqlToken::Symbol(expected)) {
+            self.cursor += 1;
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    fn ensure_depth(&self, depth: usize) -> Option<()> {
+        (depth <= MAX_CHECK_DEPTH).then_some(())
+    }
 }
 
 fn parse_default(tokens: &[SqlToken], cursor: usize) -> Option<(String, usize)> {

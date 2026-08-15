@@ -1666,7 +1666,12 @@ fn tokenize_sql_statements(sql: &str) -> Option<Vec<Vec<SqlToken>>> {
                     tokens.push(SqlToken::Symbol(byte as char));
                 }
                 _ if byte.is_ascii_alphanumeric() || byte == b'_' => token.push(byte),
-                _ => flush_token(&mut token, &mut tokens),
+                _ if byte.is_ascii_whitespace() => flush_token(&mut token, &mut tokens),
+                _ if byte.is_ascii_punctuation() => {
+                    flush_token(&mut token, &mut tokens);
+                    tokens.push(SqlToken::Symbol(byte as char));
+                }
+                _ => return None,
             },
             Mode::SingleQuote => {
                 if byte == b'\'' {
@@ -3425,6 +3430,35 @@ mod tests {
                 .is_err(),
             "a later CREATE cannot retroactively establish an additive baseline parent",
         );
+    }
+
+    #[test]
+    fn additive_registry_accepts_only_bounded_column_local_check_expressions() {
+        for sql in [
+            "ALTER TABLE records ADD COLUMN token TEXT CHECK (token IS NULL OR (length(token)=35 AND substr(token,1,3)='pre'));",
+            "ALTER TABLE records ADD COLUMN state TEXT NOT NULL DEFAULT 'x' CHECK (state='x');",
+            "ALTER TABLE records ADD COLUMN kind TEXT NOT NULL DEFAULT 'x' CHECK (kind IN ('x','y'));",
+        ] {
+            derive_effect_assertion(Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_V1), &manifest(sql))
+                .unwrap_or_else(|_| panic!("bounded CHECK must classify: {sql}"));
+        }
+
+        for sql in [
+            "ALTER TABLE records ADD COLUMN state TEXT CHECK (EXISTS (SELECT 1));",
+            "ALTER TABLE records ADD COLUMN state TEXT CHECK (other_column='x');",
+            "ALTER TABLE records ADD COLUMN state TEXT CHECK (lower(state)='x');",
+            "ALTER TABLE records ADD COLUMN state TEXT CHECK ((state='x');",
+            "ALTER TABLE records ADD COLUMN state TEXT CHECK (((((((state='x')))))));",
+            "ALTER TABLE records ADD COLUMN state TEXT CHECK (state!='x');",
+            "ALTER TABLE records ADD COLUMN state TEXT CHECK (state='x') REFERENCES parent(id);",
+            "ALTER TABLE records ADD COLUMN state TEXT CHECK (state='x'); DELETE FROM records;",
+        ] {
+            assert!(
+                derive_effect_assertion(Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_V1), &manifest(sql))
+                    .is_err(),
+                "hostile or unsupported CHECK must fail closed: {sql}",
+            );
+        }
     }
 
     #[test]

@@ -105,8 +105,13 @@ and at most one exact `PRAGMA foreign_keys = ON`. The parent must already exist
 in the baseline or an earlier prefix. Every expected transition must preserve
 the complete prior ordered columns and foreign keys, append the exact next
 column, and change only the altered parent's reviewed SQL digest plus explicitly
-created objects. The PRAGMA is classified intent, not a claim about persistent
-connection state. No manifest SQL is ever sent to the provider by this tool.
+created objects. A trailing CHECK is accepted only through the bounded
+column-local pure-expression grammar: `IS NULL`, literal equality or IN,
+`length`, `substr`, `AND`/`OR`, and bounded parentheses. It cannot read another
+column, run a subquery, call another function, or introduce another column
+constraint or SQL effect. The PRAGMA is classified intent, not a claim about
+persistent connection state. No manifest SQL is ever sent to the provider by
+this tool.
 The two predecessor assertions continue to reject ALTER and PRAGMA unchanged.
 The boundary also requires every fixed result set in both batches to carry exact
 `meta.served_by_primary=true` evidence; absent, false, null, non-boolean, or

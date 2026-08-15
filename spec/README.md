@@ -112,7 +112,10 @@ Preserved curated tool families:
   assertion: it retains the extended CREATE proof, adds one bounded unqualified
   ADD COLUMN transition and semantic `PRAGMA foreign_keys = ON` intent per
   prefix, and requires exact ordered before/after xinfo, foreign-key, and parent
-  SQL-digest evidence. It never executes manifest SQL or treats connection
+  SQL-digest evidence. Its optional trailing CHECK is a bounded column-local
+  pure expression over literal equality/IN, `IS NULL`, `length`, `substr`, and
+  `AND`/`OR`; other identifiers, functions, constraints, and SQL effects fail
+  before custody. It never executes manifest SQL or treats connection
   PRAGMA state as persistent evidence. The predecessor assertions remain
   byte-for-byte behaviorally closed to ALTER and PRAGMA.
 - Terminal retained-manifest reconciliation

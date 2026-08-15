@@ -160,11 +160,18 @@ Select one explicit built-in effect assertion:
 - `effect_assertion_id=schema_create_objects_additive_v1` preserves that full
   CREATE-object proof and additionally classifies at most one canonical
   unqualified `ALTER TABLE <parent> ADD [COLUMN] <column> <type>` per manifest
-  entry. The bounded column definition may add `NOT NULL` followed by one
-  literal `DEFAULT` (`NULL`, signed integer, or quoted string); constraints,
-  compound types, quoted/schema-qualified identities, and every other ALTER
-  form are rejected. The parent must be present in the baseline or a strictly
-  earlier prefix. Every transition must preserve the complete ordered prior
+  entry. The bounded column definition may add `NOT NULL`, one literal
+  `DEFAULT` (`NULL`, signed integer, or quoted string), and one trailing
+  `CHECK`, in that order when present. CHECK expressions are capped by token
+  count, nesting depth, literal size, and IN-list length; they may reference only
+  the added column through `IS NULL`, literal equality, a literal `IN` list, and
+  the pure `length(column)` or
+  `substr(column, positive_integer, positive_integer)` forms joined by
+  `AND`/`OR`. Subqueries, other-column reads, unknown functions/operators,
+  `REFERENCES`, `UNIQUE`, `PRIMARY KEY`, `COLLATE`, `GENERATED`, compound types,
+  quoted/schema-qualified identities, and every other ALTER form are rejected.
+  The parent must be present in the baseline or a strictly earlier prefix.
+  Every transition must preserve the complete ordered prior
   `table_xinfo` and foreign-key state, append exactly one matching column, and
   bind the changed parent to a distinct reviewed `sqlite_master.sql` digest.
   The assertion also accepts exactly `PRAGMA foreign_keys = ON` as semantic
