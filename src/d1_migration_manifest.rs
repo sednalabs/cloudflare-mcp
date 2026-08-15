@@ -367,16 +367,27 @@ fn expected_d1_migration_ledger_table_sql(table: &str) -> String {
         .replacen("CREATE TABLE IF NOT EXISTS", "CREATE TABLE", 1)
 }
 
-// Wrangler 4.87.0 `src/d1/migrations/apply.ts` emits this source shape for
-// its default ledger. SQLite retains its unquoted identifier and tab alignment
-// in `sqlite_master.sql`. Keep this as a closed accepted form rather than
+// Wrangler 4.87.0 `src/d1/migrations/apply.ts` interpolates the already
+// validated configured table identifier into this source form. SQLite retains
+// that unquoted, case-preserving identifier and the tab alignment in
+// `sqlite_master.sql`. Keep this as a closed accepted form rather than
 // normalizing arbitrary SQL: the helper-generated spelling remains accepted,
 // but an extra constraint, column, statement, or changed default never does.
-const WRANGLER_DEFAULT_D1_MIGRATIONS_TABLE_SQL: &str = "CREATE TABLE d1_migrations(\n\t\tid         INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tname       TEXT UNIQUE,\n\t\tapplied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL\n)";
+fn wrangler_d1_migration_ledger_table_sql(table: &str) -> Option<String> {
+    let mut characters = table.chars();
+    let valid_identifier = matches!(characters.next(), Some(ch) if ch == '_' || ch.is_ascii_alphabetic())
+        && characters.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        && table.len() <= 64;
+    valid_identifier.then(|| {
+        format!(
+            "CREATE TABLE {table}(\n\t\tid         INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tname       TEXT UNIQUE,\n\t\tapplied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL\n)"
+        )
+    })
+}
 
 fn is_supported_d1_migration_ledger_table_sql(table_sql: &str, table: &str) -> bool {
     table_sql == expected_d1_migration_ledger_table_sql(table)
-        || (table == "d1_migrations" && table_sql == WRANGLER_DEFAULT_D1_MIGRATIONS_TABLE_SQL)
+        || wrangler_d1_migration_ledger_table_sql(table).as_deref() == Some(table_sql)
 }
 
 pub(crate) fn d1_migration_ledger_authority_sql(table: &str) -> String {
@@ -514,8 +525,11 @@ pub(crate) fn parse_d1_migration_ledger_authority(
 /// inner D1 result as an unknown external outcome, rather than as a safe no-op
 /// or an applied statement. The result rows themselves are normally empty for
 /// DDL, so the mutation acknowledgement is the exact typed metadata contract:
-/// every statement must report a primary-served changed database and the whole
-/// response must report positive changes and rows written.
+/// every statement must report primary service and exact typed metadata, while
+/// the whole response must prove at least one database change plus positive
+/// changes and rows written. A non-mutating statement in a multi-statement
+/// manifest (such as a supported PRAGMA) is therefore acceptable on its own
+/// result set but cannot satisfy the aggregate proof.
 pub(crate) fn validate_d1_manifest_write_result(value: &Value) -> Result<(), Value> {
     let result_sets = value.as_array().ok_or_else(|| {
         d1_manifest_ambiguous_write_evidence(
@@ -531,6 +545,7 @@ pub(crate) fn validate_d1_manifest_write_result(value: &Value) -> Result<(), Val
     }
     let mut total_changes = 0_u64;
     let mut total_rows_written = 0_u64;
+    let mut changed_database = false;
     for result_set in result_sets {
         let result_set = result_set.as_object().ok_or_else(|| {
             d1_manifest_ambiguous_write_evidence(
@@ -580,12 +595,15 @@ pub(crate) fn validate_d1_manifest_write_result(value: &Value) -> Result<(), Val
                 "provider write response did not explicitly prove it was served by the D1 primary",
             ));
         }
-        if meta.get("changed_db").and_then(Value::as_bool) != Some(true) {
-            return Err(d1_manifest_ambiguous_write_evidence(
-                "write_did_not_acknowledge_database_change",
-                "provider write response did not explicitly acknowledge a database change",
-            ));
-        }
+        let changed_db = meta
+            .get("changed_db")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                d1_manifest_ambiguous_write_evidence(
+                    "missing_or_malformed_write_metadata",
+                    "provider write response did not contain a boolean changed_db acknowledgement",
+                )
+            })?;
         let changes = meta.get("changes").and_then(Value::as_u64).ok_or_else(|| {
             d1_manifest_ambiguous_write_evidence(
                 "missing_or_malformed_write_metadata",
@@ -615,6 +633,13 @@ pub(crate) fn validate_d1_manifest_write_result(value: &Value) -> Result<(), Val
                     "provider write response rows_written counts overflowed the supported bound",
                 )
             })?;
+        changed_database |= changed_db;
+    }
+    if !changed_database {
+        return Err(d1_manifest_ambiguous_write_evidence(
+            "write_did_not_acknowledge_database_change",
+            "provider write response did not prove that any result changed the database",
+        ));
     }
     if total_changes == 0 || total_rows_written == 0 {
         return Err(d1_manifest_ambiguous_write_evidence(
@@ -641,10 +666,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        WRANGLER_DEFAULT_D1_MIGRATIONS_TABLE_SQL, d1_manifest_write_result_classification,
-        d1_migrations_table_init_sql, expected_d1_migration_ledger_table_sql,
-        parse_d1_migration_ledger, parse_d1_migration_ledger_authority,
-        validate_d1_manifest_write_result,
+        d1_manifest_write_result_classification, d1_migrations_table_init_sql,
+        expected_d1_migration_ledger_table_sql, parse_d1_migration_ledger,
+        parse_d1_migration_ledger_authority, validate_d1_manifest_write_result,
+        wrangler_d1_migration_ledger_table_sql,
     };
 
     fn authority(table: &str) -> serde_json::Value {
@@ -657,6 +682,21 @@ mod tests {
                 "name": table,
                 "tbl_name": table,
                 "sql": expected_d1_migration_ledger_table_sql(table),
+            }],
+        }])
+    }
+
+    fn wrangler_authority(table: &str) -> serde_json::Value {
+        json!([{
+            "success": true,
+            "errors": [],
+            "meta": {"served_by_primary": true},
+            "results": [{
+                "type": "table",
+                "name": table,
+                "tbl_name": table,
+                "sql": wrangler_d1_migration_ledger_table_sql(table)
+                    .expect("test table is a valid Wrangler identifier"),
             }],
         }])
     }
@@ -752,19 +792,17 @@ mod tests {
     }
 
     #[test]
-    fn manifest_ledger_authority_accepts_only_the_installed_wrangler_default_schema_form() {
-        let wrangler_default = json!([{
-            "success": true,
-            "errors": [],
-            "meta": {"served_by_primary": true},
-            "results": [{
-                "type": "table",
-                "name": "d1_migrations",
-                "tbl_name": "d1_migrations",
-                "sql": WRANGLER_DEFAULT_D1_MIGRATIONS_TABLE_SQL,
-            }],
-        }]);
-        assert!(parse_d1_migration_ledger_authority(&wrangler_default, "d1_migrations").is_ok());
+    fn manifest_ledger_authority_accepts_only_installed_wrangler_schema_forms() {
+        for table in [
+            "d1_migrations",
+            "custom_migrations",
+            "CasePreserving_Ledger",
+        ] {
+            let wrangler = wrangler_authority(table);
+            assert!(parse_d1_migration_ledger_authority(&wrangler, table).is_ok());
+        }
+
+        let wrangler_default = wrangler_authority("d1_migrations");
 
         for sql in [
             "CREATE TABLE d1_migrations(\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tname TEXT UNIQUE,\n\t\tapplied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,\n\t\textra TEXT\n)",
@@ -780,6 +818,17 @@ mod tests {
                 "d1.migration_ledger_authority_invalid"
             );
         }
+
+        let mut case_drift = wrangler_authority("CasePreserving_Ledger");
+        case_drift[0]["results"][0]["sql"] = json!(
+            "CREATE TABLE casepreserving_ledger(\n\t\tid         INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tname       TEXT UNIQUE,\n\t\tapplied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL\n)"
+        );
+        let error = parse_d1_migration_ledger_authority(&case_drift, "CasePreserving_Ledger")
+            .expect_err("case drift must not be normalized");
+        assert_eq!(
+            error.structured_content.expect("structured error")["error"]["code"],
+            "d1.migration_ledger_authority_invalid"
+        );
     }
 
     #[test]
@@ -813,7 +862,7 @@ mod tests {
         );
         assert!(
             validate_d1_manifest_write_result(&json!([
-                {"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": true, "changes": 0, "rows_written": 0}},
+                {"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": false, "changes": 0, "rows_written": 0}},
                 {"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": true, "changes": 1, "rows_written": 1}}
             ]))
             .is_ok()
@@ -870,6 +919,11 @@ mod tests {
                 "replica metadata",
                 json!([{"success": true, "errors": [], "results": [], "meta": {"served_by_primary": false, "changed_db": true, "changes": 1, "rows_written": 1}}]),
                 "write_not_served_by_primary",
+            ),
+            (
+                "non-boolean changed database metadata",
+                json!([{"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": "true", "changes": 1, "rows_written": 1}}]),
+                "missing_or_malformed_write_metadata",
             ),
             (
                 "unchanged metadata",

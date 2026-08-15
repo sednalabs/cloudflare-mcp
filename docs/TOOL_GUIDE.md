@@ -98,11 +98,14 @@ unverifiable custody returns `lease_retained=null` with
 `custody_status=lost_or_unverifiable_after_ambiguous_apply`; it prohibits retry
 and does not turn an absent local file into permission for a new apply.
 For every migration-write result set, success additionally requires literal
-`meta.served_by_primary=true`, `meta.changed_db=true`, and non-negative JSON
-integer `meta.changes` and `meta.rows_written`; their aggregate changes and
-rows-written totals must both be positive. Any missing, false, non-boolean,
-non-integer, zero-total, overflowed, failed, or malformed result is
-`reconciliation_required`, never a successful apply or authorization to retry.
+`meta.served_by_primary=true`, boolean `meta.changed_db`, and non-negative JSON
+integer `meta.changes` and `meta.rows_written`. A non-mutating successful result
+(for example a supported PRAGMA in a multi-statement migration) may report
+`changed_db=false` with zero counts, but the complete response must contain at
+least one `changed_db=true` result and positive aggregate changes and
+rows-written totals. Any missing, non-boolean, non-integer, zero-total,
+overflowed, failed, or malformed result is `reconciliation_required`, never a
+successful apply or authorization to retry.
 The tool derives every target allowed by the selected registry assertion from
 the manifest and rejects omissions, additions, data-producing CREATE forms,
 malformed result metadata, and result sets whose query-bound statement marker
