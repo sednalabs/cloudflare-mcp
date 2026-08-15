@@ -179,10 +179,14 @@ Terminal reconciliation never treats a local receipt write failure as proof that
 no local mutation occurred. If the descriptor-bound receipt can be read back as
 the exact receipt, the result reports it as persisted with one local namespace
 mutation; if absence is proved it reports zero; otherwise both fields are
-`null`. The provider-call count covers only completed provider reads, never
-local receipt storage. Likewise, a failure while moving active evidence through
-`retiring` to `retired` reports the re-read current custody namespace: active
-retention is `lease_retained=true`, terminal retirement is
+`null`. That receipt and namespace result is accepted only after a stable
+descriptor-bound re-read before and after the receipt check; an altered,
+missing, or uninspectable receipt makes both authority claims unknown. The
+provider-call count covers only completed provider reads, never local receipt
+storage. Likewise, a failure while moving active evidence through `retiring` to
+`retired` reports the re-read current custody namespace and the exact completed
+rename count: one for active-to-retiring and two once the terminal retired name
+exists. Active retention is `lease_retained=true`, terminal retirement is
 `lease_retained=false`, and retiring or unverifiable custody is `null`. None of
 these outcomes authorizes replay.
 

@@ -25,6 +25,12 @@ use crate::verification::now_unix_ms;
 pub(crate) const D1_MANIFEST_LEASE_ROOT_ENV: &str = "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT";
 static D1_MANIFEST_LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
+// Kept test-only so production retirement has no injectable branch. The
+// compare-and-clear protocol makes a requested failure single-use even when
+// the focused tests run alongside unrelated lease tests.
+#[cfg(test)]
+static TERMINAL_RETIRE_TEST_FAIL_AFTER_NAMESPACE_MUTATIONS: AtomicU64 = AtomicU64::new(0);
+
 #[cfg(target_os = "linux")]
 const ACTIVE_LEASE_NAME: &str = "active.lease.json";
 #[cfg(target_os = "linux")]
@@ -140,6 +146,34 @@ pub(crate) struct D1TerminalReconciliationReceiptEvidence {
     pub(crate) payload_sha256: String,
     pub(crate) receipt_version: u8,
     pub(crate) effect_assertion_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum D1TerminalCustodyNamespace {
+    Active,
+    Retiring,
+    Retired,
+    Unverified,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct D1TerminalEvidenceReadback {
+    pub(crate) custody: D1TerminalCustodyNamespace,
+    /// `None` means the descriptor-bound receipt readback was contradictory,
+    /// malformed, or changed while being read and therefore proves neither
+    /// presence nor absence.
+    pub(crate) receipt_persisted: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct D1TerminalRetirement {
+    pub(crate) local_namespace_mutations: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct D1TerminalRetirementFailure {
+    pub(crate) result: CallToolResult,
+    pub(crate) local_namespace_mutations: usize,
 }
 
 /// A guard-held, descriptor-bound view of retained migration evidence.
@@ -465,6 +499,91 @@ impl D1RetainedMigrationLease {
         }
     }
 
+    /// Obtain a stable, descriptor-bound view of both the current lease
+    /// namespace and the exact expected receipt. A malformed or changed
+    /// receipt invalidates the whole evidence claim rather than leaving a
+    /// retained namespace to stand in for receipt authority.
+    pub(crate) fn terminal_evidence_readback(
+        &self,
+        expected: &D1TerminalReconciliationReceipt,
+        legacy_expected: Option<&D1TerminalReconciliationReceiptV1>,
+    ) -> D1TerminalEvidenceReadback {
+        #[cfg(target_os = "linux")]
+        {
+            if self.revalidate().is_err() {
+                return D1TerminalEvidenceReadback {
+                    custody: D1TerminalCustodyNamespace::Unverified,
+                    receipt_persisted: None,
+                };
+            }
+            let first_receipt = match linux::compatible_terminal_receipt_state(
+                &self.target,
+                expected,
+                legacy_expected,
+            ) {
+                Ok(receipt) => receipt,
+                Err(_) => {
+                    return D1TerminalEvidenceReadback {
+                        custody: D1TerminalCustodyNamespace::Unverified,
+                        receipt_persisted: None,
+                    };
+                }
+            };
+            if self.revalidate().is_err() {
+                return D1TerminalEvidenceReadback {
+                    custody: D1TerminalCustodyNamespace::Unverified,
+                    receipt_persisted: None,
+                };
+            }
+            let second_receipt = match linux::compatible_terminal_receipt_state(
+                &self.target,
+                expected,
+                legacy_expected,
+            ) {
+                Ok(receipt) => receipt,
+                Err(_) => {
+                    return D1TerminalEvidenceReadback {
+                        custody: D1TerminalCustodyNamespace::Unverified,
+                        receipt_persisted: None,
+                    };
+                }
+            };
+            let receipt_persisted = match (first_receipt, second_receipt) {
+                (None, None) => Some(false),
+                (Some(first), Some(_))
+                    if linux::validate_terminal_receipt_evidence(&self.target, &first).is_ok() =>
+                {
+                    Some(true)
+                }
+                _ => None,
+            };
+            if receipt_persisted.is_none() || self.revalidate().is_err() {
+                return D1TerminalEvidenceReadback {
+                    custody: D1TerminalCustodyNamespace::Unverified,
+                    receipt_persisted: None,
+                };
+            }
+            let custody = match self.identity.namespace.as_str() {
+                "active" => D1TerminalCustodyNamespace::Active,
+                "retiring" => D1TerminalCustodyNamespace::Retiring,
+                "retired" => D1TerminalCustodyNamespace::Retired,
+                _ => D1TerminalCustodyNamespace::Unverified,
+            };
+            D1TerminalEvidenceReadback {
+                custody,
+                receipt_persisted,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (expected, legacy_expected);
+            D1TerminalEvidenceReadback {
+                custody: D1TerminalCustodyNamespace::Unverified,
+                receipt_persisted: None,
+            }
+        }
+    }
+
     pub(crate) fn persist_terminal_receipt(
         &self,
         expected: &D1TerminalReconciliationReceipt,
@@ -490,68 +609,153 @@ impl D1RetainedMigrationLease {
     pub(crate) fn retire_after_terminal_receipt(
         &mut self,
         receipt: &D1TerminalReconciliationReceiptEvidence,
-    ) -> Result<bool, CallToolResult> {
+    ) -> Result<D1TerminalRetirement, D1TerminalRetirementFailure> {
         #[cfg(target_os = "linux")]
         {
-            self.revalidate()?;
-            linux::validate_terminal_receipt_evidence(&self.target, receipt)
-                .map_err(d1_terminal_reconciliation_error)?;
+            let mut local_namespace_mutations = 0;
+            if let Err(result) = self.revalidate() {
+                return Err(D1TerminalRetirementFailure {
+                    result,
+                    local_namespace_mutations,
+                });
+            }
+            if let Err(message) = linux::validate_terminal_receipt_evidence(&self.target, receipt) {
+                return Err(D1TerminalRetirementFailure {
+                    result: d1_terminal_reconciliation_error(message),
+                    local_namespace_mutations,
+                });
+            }
             if self.is_retired() {
-                return Ok(false);
+                return Ok(D1TerminalRetirement {
+                    local_namespace_mutations,
+                });
             }
             let retired_name = format!("retired.{}.lease.json", self.identity.nonce);
-            if retained_entry_present(&self.target, &retired_name)
-                .map_err(d1_terminal_reconciliation_error)?
-            {
-                return Err(d1_terminal_reconciliation_error(
-                    "terminal retirement is already present beside retained evidence",
-                ));
+            match retained_entry_present(&self.target, &retired_name) {
+                Ok(true) => {
+                    return Err(D1TerminalRetirementFailure {
+                        result: d1_terminal_reconciliation_error(
+                            "terminal retirement is already present beside retained evidence",
+                        ),
+                        local_namespace_mutations,
+                    });
+                }
+                Ok(false) => {}
+                Err(message) => {
+                    return Err(D1TerminalRetirementFailure {
+                        result: d1_terminal_reconciliation_error(message),
+                        local_namespace_mutations,
+                    });
+                }
             }
             if self.identity.namespace == "active" {
-                linux::rename_retained_lease_no_replace(
+                if let Err(message) = linux::rename_retained_lease_no_replace(
                     &self.target,
                     ACTIVE_LEASE_NAME,
                     RETIRING_LEASE_NAME,
                     &self.evidence,
                     &self.evidence_file_identity,
                     &self.identity,
-                )
-                .map_err(d1_terminal_reconciliation_error)?;
+                ) {
+                    return Err(D1TerminalRetirementFailure {
+                        result: d1_terminal_reconciliation_error(message),
+                        local_namespace_mutations,
+                    });
+                }
+                local_namespace_mutations += 1;
                 self.evidence_name = RETIRING_LEASE_NAME.to_string();
                 self.identity.namespace = "retiring".to_string();
                 if sync_d1_lease_directory(&self.target).is_err() {
-                    return Err(d1_terminal_reconciliation_error(
-                        "retained lease entered retiring state but the directory sync failed",
-                    ));
+                    return Err(D1TerminalRetirementFailure {
+                        result: d1_terminal_reconciliation_error(
+                            "retained lease entered retiring state but the directory sync failed",
+                        ),
+                        local_namespace_mutations,
+                    });
+                }
+                if terminal_retirement_test_failure_after(local_namespace_mutations) {
+                    return Err(D1TerminalRetirementFailure {
+                        result: d1_terminal_reconciliation_error(
+                            "test-only failure after active lease entered retiring state",
+                        ),
+                        local_namespace_mutations,
+                    });
                 }
             }
-            linux::rename_retained_lease_no_replace(
+            if let Err(message) = linux::rename_retained_lease_no_replace(
                 &self.target,
                 RETIRING_LEASE_NAME,
                 &retired_name,
                 &self.evidence,
                 &self.evidence_file_identity,
                 &self.identity,
-            )
-            .map_err(d1_terminal_reconciliation_error)?;
+            ) {
+                return Err(D1TerminalRetirementFailure {
+                    result: d1_terminal_reconciliation_error(message),
+                    local_namespace_mutations,
+                });
+            }
+            local_namespace_mutations += 1;
             self.evidence_name = retired_name;
             self.identity.namespace = "retired".to_string();
             if sync_d1_lease_directory(&self.target).is_err() {
-                return Err(d1_terminal_reconciliation_error(
-                    "retained lease entered terminal retirement but the directory sync failed",
-                ));
+                return Err(D1TerminalRetirementFailure {
+                    result: d1_terminal_reconciliation_error(
+                        "retained lease entered terminal retirement but the directory sync failed",
+                    ),
+                    local_namespace_mutations,
+                });
             }
-            self.revalidate()?;
-            linux::validate_terminal_receipt_evidence(&self.target, receipt)
-                .map_err(d1_terminal_reconciliation_error)?;
-            Ok(true)
+            if terminal_retirement_test_failure_after(local_namespace_mutations) {
+                return Err(D1TerminalRetirementFailure {
+                    result: d1_terminal_reconciliation_error(
+                        "test-only failure after retiring lease entered terminal retirement",
+                    ),
+                    local_namespace_mutations,
+                });
+            }
+            if let Err(result) = self.revalidate() {
+                return Err(D1TerminalRetirementFailure {
+                    result,
+                    local_namespace_mutations,
+                });
+            }
+            if let Err(message) = linux::validate_terminal_receipt_evidence(&self.target, receipt) {
+                return Err(D1TerminalRetirementFailure {
+                    result: d1_terminal_reconciliation_error(message),
+                    local_namespace_mutations,
+                });
+            }
+            Ok(D1TerminalRetirement {
+                local_namespace_mutations,
+            })
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = receipt;
-            Err(d1_retained_lease_platform_unsupported())
+            Err(D1TerminalRetirementFailure {
+                result: d1_retained_lease_platform_unsupported(),
+                local_namespace_mutations: 0,
+            })
         }
     }
+}
+
+#[cfg(test)]
+fn terminal_retirement_test_failure_after(local_namespace_mutations: usize) -> bool {
+    TERMINAL_RETIRE_TEST_FAIL_AFTER_NAMESPACE_MUTATIONS
+        .compare_exchange(
+            local_namespace_mutations as u64,
+            0,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_ok()
+}
+
+#[cfg(not(test))]
+fn terminal_retirement_test_failure_after(_local_namespace_mutations: usize) -> bool {
+    false
 }
 
 fn d1_terminal_reconciliation_error(message: &'static str) -> CallToolResult {
@@ -3205,10 +3409,12 @@ mod tests {
             .expect("exact receipt replay converges");
         assert!(!created_again);
         assert_eq!(receipt.payload_sha256, replayed.payload_sha256);
-        assert!(
+        assert_eq!(
             retained
                 .retire_after_terminal_receipt(&receipt)
                 .expect("retire")
+                .local_namespace_mutations,
+            2
         );
         assert!(retained.is_retired());
         assert!(
@@ -3237,6 +3443,125 @@ mod tests {
                 .is_some()
         );
         fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_evidence_readback_rejects_an_altered_receipt_as_unknown_custody() {
+        let root = private_test_root("terminal-readback-altered-receipt");
+        let plan = "a".repeat(64);
+        let mut owner =
+            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
+                .expect("create retained evidence");
+        let identity = owner.identity.clone();
+        let target = owner
+            .active_path_for_test()
+            .expect("active path")
+            .parent()
+            .expect("target")
+            .to_path_buf();
+        owner.retain();
+        drop(owner);
+        let expected = terminal_receipt(&identity, &plan);
+        let retained = inspect_terminal_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "db-1",
+            "newsletter-core",
+            &plan,
+            &identity.nonce,
+            &identity.payload_sha256,
+        )
+        .expect("inspect retained lease");
+        retained
+            .persist_terminal_receipt(&expected)
+            .expect("persist exact terminal receipt");
+        let exact = retained.terminal_evidence_readback(&expected, None);
+        assert_eq!(exact.custody, D1TerminalCustodyNamespace::Active);
+        assert_eq!(exact.receipt_persisted, Some(true));
+
+        fs::write(
+            target.join(format!(
+                "terminal-reconciliation.{}.receipt.json",
+                identity.nonce
+            )),
+            b"{}",
+        )
+        .expect("alter terminal receipt after an exact readback");
+        let altered = retained.terminal_evidence_readback(&expected, None);
+        assert_eq!(altered.custody, D1TerminalCustodyNamespace::Unverified);
+        assert_eq!(altered.receipt_persisted, None);
+        drop(retained);
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_retirement_failure_reports_each_physical_partial_namespace_transition() {
+        for (after_mutations, expected_namespace) in [(1, "retiring"), (2, "retired")] {
+            let root = private_test_root(&format!("terminal-partial-{after_mutations}"));
+            let plan = "a".repeat(64);
+            let mut owner = acquire_d1_migration_lease_at(
+                root.clone(),
+                "acct-1",
+                "db-1",
+                "newsletter-core",
+                &plan,
+            )
+            .expect("create retained evidence");
+            let identity = owner.identity.clone();
+            let target = owner
+                .active_path_for_test()
+                .expect("active path")
+                .parent()
+                .expect("target")
+                .to_path_buf();
+            owner.retain();
+            drop(owner);
+            let expected = terminal_receipt(&identity, &plan);
+            let mut retained = inspect_terminal_d1_migration_lease_at(
+                root.clone(),
+                "acct-1",
+                "db-1",
+                "newsletter-core",
+                &plan,
+                &identity.nonce,
+                &identity.payload_sha256,
+            )
+            .expect("inspect retained lease");
+            let (receipt, created) = retained
+                .persist_terminal_receipt(&expected)
+                .expect("persist exact terminal receipt");
+            assert!(created);
+            TERMINAL_RETIRE_TEST_FAIL_AFTER_NAMESPACE_MUTATIONS
+                .store(after_mutations, Ordering::SeqCst);
+            let failure = retained
+                .retire_after_terminal_receipt(&receipt)
+                .expect_err("test failure follows a physical namespace rename");
+            assert_eq!(failure.local_namespace_mutations, after_mutations as usize);
+            assert_eq!(retained.identity.namespace, expected_namespace);
+            let expected_path = if expected_namespace == "retiring" {
+                target.join(RETIRING_LEASE_NAME)
+            } else {
+                target.join(format!("retired.{}.lease.json", identity.nonce))
+            };
+            assert!(
+                expected_path.exists(),
+                "{expected_namespace} evidence exists"
+            );
+            let readback = retained.terminal_evidence_readback(&expected, None);
+            assert_eq!(readback.receipt_persisted, Some(true));
+            assert_eq!(
+                readback.custody,
+                if expected_namespace == "retiring" {
+                    D1TerminalCustodyNamespace::Retiring
+                } else {
+                    D1TerminalCustodyNamespace::Retired
+                }
+            );
+            drop(retained);
+            fs::remove_dir_all(root).expect("test cleanup");
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -3306,10 +3631,13 @@ mod tests {
                     .is_err(),
                 "v1 receipt must not attest the extended/current-only expectation"
             );
-            assert!(
+            let expected_mutations = usize::from(namespace == "active") + 1;
+            assert_eq!(
                 retained
                     .retire_after_terminal_receipt(&evidence)
                     .expect("retire exact predecessor receipt")
+                    .local_namespace_mutations,
+                expected_mutations
             );
             drop(retained);
             let retired = inspect_terminal_d1_migration_lease_at(

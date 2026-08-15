@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::d1_migration_lease::{
-    D1RetainedMigrationLease, D1TerminalReconciliationReceipt,
+    D1RetainedMigrationLease, D1TerminalCustodyNamespace, D1TerminalReconciliationReceipt,
     D1TerminalReconciliationReceiptEvidence, D1TerminalReconciliationReceiptV1,
     inspect_terminal_d1_migration_lease,
 };
@@ -34,6 +34,12 @@ enum TerminalCustodyState {
     RetiringVerified,
     RetiredVerified,
     Unverified,
+}
+
+#[derive(Debug)]
+struct TerminalEvidence {
+    custody: TerminalCustodyState,
+    receipt_persisted: Value,
 }
 
 pub(crate) fn contextualize_terminal_semantic_error(result: CallToolResult) -> CallToolResult {
@@ -244,7 +250,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
                 Vec::new(),
                 Vec::new(),
                 0,
-                false,
+                Value::Null,
             );
         }
     };
@@ -252,8 +258,17 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
         match initial_lease.compatible_terminal_receipt_state(&receipt, legacy_receipt.as_ref()) {
             Ok(evidence) => evidence,
             Err(result) => {
-                let custody = held_terminal_custody(&initial_lease);
-                return terminalize_failure(result, custody, 0, Vec::new(), Vec::new(), 0, false);
+                let evidence =
+                    observed_terminal_evidence(&initial_lease, &receipt, legacy_receipt.as_ref());
+                return terminalize_failure(
+                    result,
+                    evidence.custody,
+                    0,
+                    Vec::new(),
+                    Vec::new(),
+                    0,
+                    evidence.receipt_persisted,
+                );
             }
         };
     let mut active_lease_identity = initial_lease.identity.clone();
@@ -292,6 +307,8 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
             )
         });
     if initial_lease.is_retired() {
+        let evidence =
+            observed_terminal_evidence(&initial_lease, &receipt, legacy_receipt.as_ref());
         return completed_terminal_replay(
             initial_receipt,
             &replay_expectation_proof_sha256,
@@ -303,21 +320,24 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
             legacy_terminal_plan_sha256.as_deref(),
             dry_run,
             approved_terminal_plan_sha256,
+            evidence,
         );
     }
     let initial_receipt_evidence = match initial_receipt {
         Some(evidence) => Some(evidence),
         None if initial_lease.identity.namespace == "active" => None,
         None => {
+            let evidence =
+                observed_terminal_evidence(&initial_lease, &receipt, legacy_receipt.as_ref());
             return terminal_error(
                 "d1.migration_terminal_receipt_absent",
                 "terminal retirement began without its exact durable terminal receipt",
-                held_terminal_custody(&initial_lease),
+                evidence.custody,
                 0,
                 Vec::new(),
                 Vec::new(),
                 0,
-                false,
+                evidence.receipt_persisted,
             );
         }
     };
@@ -335,15 +355,17 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
         && (replay_expectation_proof_sha256 != expected_expectation_proof_sha256
             || recomputed_plan != expected_reconciliation_plan_sha256)
     {
+        let evidence =
+            observed_terminal_evidence(&initial_lease, &receipt, legacy_receipt.as_ref());
         return terminal_error(
             "d1.migration_terminal_approved_evidence_mismatch",
             "supplied replay manifest does not reproduce the receipt-bound reconciliation plan",
-            held_terminal_custody(&initial_lease),
+            evidence.custody,
             0,
             Vec::new(),
             Vec::new(),
             0,
-            false,
+            evidence.receipt_persisted,
         );
     }
     let selected_terminal_plan_sha256 = if initial_receipt_evidence
@@ -357,15 +379,17 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
         terminal_plan_sha256.as_str()
     };
     if !dry_run && approved_terminal_plan_sha256 != Some(selected_terminal_plan_sha256) {
+        let evidence =
+            observed_terminal_evidence(&initial_lease, &receipt, legacy_receipt.as_ref());
         return terminal_error(
             "d1.migration_terminal_plan_mismatch",
             "approved_terminal_plan_sha256 does not match the exact pre-existing terminal plan",
-            held_terminal_custody(&initial_lease),
+            evidence.custody,
             0,
             Vec::new(),
             Vec::new(),
             0,
-            false,
+            evidence.receipt_persisted,
         );
     }
     let recovering_legacy_receipt = initial_receipt_evidence
@@ -409,15 +433,19 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
                 {
                     Ok(evidence) => evidence,
                     Err(receipt_error) => {
-                        let custody = held_terminal_custody(&completed_lease);
+                        let evidence = observed_terminal_evidence(
+                            &completed_lease,
+                            &receipt,
+                            legacy_receipt.as_ref(),
+                        );
                         return Some(terminalize_failure(
                             receipt_error,
-                            custody,
+                            evidence.custody,
                             0,
                             Vec::new(),
                             Vec::new(),
                             0,
-                            false,
+                            evidence.receipt_persisted,
                         ));
                     }
                 };
@@ -432,11 +460,12 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
                     legacy_terminal_plan_sha256.as_deref(),
                     dry_run,
                     approved_terminal_plan_sha256,
+                    observed_terminal_evidence(&completed_lease, &receipt, legacy_receipt.as_ref()),
                 ))
             }) {
                 return completed;
             }
-            let custody = reconciliation_failure_custody(
+            let evidence = reconciliation_failure_evidence(
                 &result,
                 account_id,
                 database_id,
@@ -444,8 +473,18 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
                 approved_plan_sha256,
                 lease_nonce,
                 lease_payload_sha256,
+                &receipt,
+                legacy_receipt.as_ref(),
             );
-            return terminalize_failure(result, custody, 0, Vec::new(), Vec::new(), 0, false);
+            return terminalize_failure(
+                result,
+                evidence.custody,
+                0,
+                Vec::new(),
+                Vec::new(),
+                0,
+                evidence.receipt_persisted,
+            );
         }
     };
     let base_provider_calls = proof.provider_calls();
@@ -480,30 +519,31 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
         || proof.original_prefix_length != expected_original_prefix_length
         || proof.current_prefix_length != expected_current_prefix_length
     {
+        let evidence = observed_terminal_evidence(&proof.lease, &receipt, legacy_receipt.as_ref());
         return terminal_error(
             "d1.migration_terminal_approved_evidence_mismatch",
             "fresh retained-manifest proof does not match every independently approved expectation, query, snapshot, outcome, and prefix",
-            held_terminal_custody(&proof.lease),
+            evidence.custody,
             base_provider_calls,
             response_evidence,
             lifecycle,
             0,
-            false,
+            evidence.receipt_persisted,
         );
     }
 
     if dry_run {
-        let custody = held_terminal_custody(&proof.lease);
-        if custody == TerminalCustodyState::Unverified {
+        let evidence = observed_terminal_evidence(&proof.lease, &receipt, legacy_receipt.as_ref());
+        if evidence.custody == TerminalCustodyState::Unverified {
             return terminal_error(
                 "d1.migration_terminal_custody_unverified",
                 "retained custody could not be revalidated before returning the terminal plan",
-                custody,
+                evidence.custody,
                 base_provider_calls,
                 response_evidence,
                 lifecycle,
                 0,
-                false,
+                evidence.receipt_persisted,
             );
         }
         return terminal_result(
@@ -533,7 +573,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
                 "local_namespace_mutations": 0,
                 "next_action": "independently approve this exact terminal_plan_sha256 before a live call",
             }),
-            custody,
+            evidence.custody,
         );
     }
 
@@ -548,15 +588,16 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
     {
         Ok(refresh) => refresh,
         Err(result) => {
-            let custody = held_terminal_custody(&proof.lease);
+            let evidence =
+                observed_terminal_evidence(&proof.lease, &receipt, legacy_receipt.as_ref());
             return terminalize_failure(
                 result,
-                custody,
+                evidence.custody,
                 base_provider_calls,
                 response_evidence,
                 lifecycle,
                 0,
-                false,
+                evidence.receipt_persisted,
             );
         }
     };
@@ -568,21 +609,21 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
         None => match proof.lease.persist_terminal_receipt(&receipt) {
             Ok(receipt) => receipt,
             Err(result) => {
-                let custody = held_terminal_custody(&proof.lease);
+                let evidence =
+                    observed_terminal_evidence(&proof.lease, &receipt, legacy_receipt.as_ref());
                 // Receipt creation can fail after O_EXCL created the private
                 // file, after bytes were written, or after directory sync.
                 // Re-read the exact descriptor-bound namespace before making
                 // any claim about local mutation. A malformed, contradictory,
                 // or uninspectable entry is deliberately reported as unknown.
-                let (receipt_persisted, local_namespace_mutations) =
-                    terminal_receipt_persistence_state(
-                        &proof.lease,
-                        &receipt,
-                        legacy_receipt.as_ref(),
-                    );
+                let local_namespace_mutations = match evidence.receipt_persisted {
+                    Value::Bool(true) => json!(1),
+                    Value::Bool(false) => json!(0),
+                    _ => Value::Null,
+                };
                 return terminalize_failure(
                     result,
-                    custody,
+                    evidence.custody,
                     // The successful pre-receipt refresh is the one completed
                     // provider call after the prepared proof; receipt storage
                     // itself never calls the provider.
@@ -590,7 +631,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
                     response_evidence,
                     lifecycle,
                     local_namespace_mutations,
-                    receipt_persisted,
+                    evidence.receipt_persisted,
                 );
             }
         },
@@ -608,33 +649,35 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
     {
         Ok(refresh) => refresh,
         Err(result) => {
-            let custody = held_terminal_custody(&proof.lease);
+            let evidence =
+                observed_terminal_evidence(&proof.lease, &receipt, legacy_receipt.as_ref());
             return terminalize_failure(
                 result,
-                custody,
+                evidence.custody,
                 base_provider_calls + 1,
                 response_evidence,
                 lifecycle,
                 local_mutations,
-                true,
+                evidence.receipt_persisted,
             );
         }
     };
     response_evidence.push(before_retirement.response_evidence);
     lifecycle.push(before_retirement.lifecycle);
 
-    let retired_now = match proof.lease.retire_after_terminal_receipt(&receipt_evidence) {
-        Ok(retired) => retired,
-        Err(result) => {
-            let custody = held_terminal_custody(&proof.lease);
+    let retirement = match proof.lease.retire_after_terminal_receipt(&receipt_evidence) {
+        Ok(retirement) => retirement,
+        Err(failure) => {
+            let evidence =
+                observed_terminal_evidence(&proof.lease, &receipt, legacy_receipt.as_ref());
             return terminalize_failure(
-                result,
-                custody,
+                failure.result,
+                evidence.custody,
                 base_provider_calls + 2,
                 response_evidence,
                 lifecycle,
-                local_mutations,
-                true,
+                local_mutations + failure.local_namespace_mutations,
+                evidence.receipt_persisted,
             );
         }
     };
@@ -644,7 +687,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
             "operation": OPERATION,
             "dry_run": false,
             "status": "terminal_reconciliation_complete",
-            "replayed": !receipt_created && !retired_now,
+            "replayed": !receipt_created && retirement.local_namespace_mutations == 0,
             "terminal_plan_sha256": selected_terminal_plan_sha256,
             "terminal_receipt_sha256": receipt_evidence.payload_sha256,
             "terminal_receipt_version": receipt_evidence.receipt_version,
@@ -662,7 +705,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
             "provider_read_lifecycle": lifecycle,
             "response_evidence": response_evidence,
             "provider_mutations": 0,
-            "local_namespace_mutations": local_mutations + usize::from(retired_now),
+            "local_namespace_mutations": local_mutations + retirement.local_namespace_mutations,
         }),
         TerminalCustodyState::RetiredVerified,
     )
@@ -694,18 +737,19 @@ fn completed_terminal_replay(
     legacy_terminal_plan_sha256: Option<&str>,
     dry_run: bool,
     approved_terminal_plan_sha256: Option<&str>,
+    evidence: TerminalEvidence,
 ) -> CallToolResult {
     let receipt_evidence = match receipt_evidence {
         None => {
             return terminal_error(
                 "d1.migration_terminal_receipt_absent",
                 "terminal retirement exists without its exact terminal receipt",
-                TerminalCustodyState::RetiredVerified,
+                evidence.custody,
                 0,
                 Vec::new(),
                 Vec::new(),
                 0,
-                false,
+                evidence.receipt_persisted,
             );
         }
         Some(evidence) => evidence,
@@ -722,12 +766,12 @@ fn completed_terminal_replay(
         return terminal_error(
             "d1.migration_terminal_approved_evidence_mismatch",
             "supplied replay manifest does not reproduce the receipt-bound reconciliation plan",
-            TerminalCustodyState::RetiredVerified,
+            evidence.custody,
             0,
             Vec::new(),
             Vec::new(),
             0,
-            false,
+            evidence.receipt_persisted,
         );
     }
     let selected_terminal_plan_sha256 = if receipt_evidence.receipt_version == 1 {
@@ -739,12 +783,12 @@ fn completed_terminal_replay(
         return terminal_error(
             "d1.migration_terminal_plan_mismatch",
             "approved_terminal_plan_sha256 does not match the exact pre-existing terminal plan",
-            TerminalCustodyState::RetiredVerified,
+            evidence.custody,
             0,
             Vec::new(),
             Vec::new(),
             0,
-            false,
+            evidence.receipt_persisted,
         );
     }
     terminal_result(
@@ -764,7 +808,7 @@ fn completed_terminal_replay(
             "provider_mutations": 0,
             "local_namespace_mutations": 0,
         }),
-        TerminalCustodyState::RetiredVerified,
+        evidence.custody,
     )
 }
 
@@ -909,20 +953,26 @@ fn valid_lower_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn held_terminal_custody(lease: &D1RetainedMigrationLease) -> TerminalCustodyState {
-    if lease.revalidate().is_err() {
-        return TerminalCustodyState::Unverified;
-    }
-    match lease.identity.namespace.as_str() {
-        "active" => TerminalCustodyState::ActiveVerified,
-        "retiring" => TerminalCustodyState::RetiringVerified,
-        "retired" => TerminalCustodyState::RetiredVerified,
-        _ => TerminalCustodyState::Unverified,
+fn observed_terminal_evidence(
+    lease: &D1RetainedMigrationLease,
+    receipt: &D1TerminalReconciliationReceipt,
+    legacy_receipt: Option<&D1TerminalReconciliationReceiptV1>,
+) -> TerminalEvidence {
+    let readback = lease.terminal_evidence_readback(receipt, legacy_receipt);
+    let custody = match readback.custody {
+        D1TerminalCustodyNamespace::Active => TerminalCustodyState::ActiveVerified,
+        D1TerminalCustodyNamespace::Retiring => TerminalCustodyState::RetiringVerified,
+        D1TerminalCustodyNamespace::Retired => TerminalCustodyState::RetiredVerified,
+        D1TerminalCustodyNamespace::Unverified => TerminalCustodyState::Unverified,
+    };
+    TerminalEvidence {
+        custody,
+        receipt_persisted: readback.receipt_persisted.map_or(Value::Null, Value::Bool),
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn reconciliation_failure_custody(
+fn reconciliation_failure_evidence(
     result: &CallToolResult,
     account_id: &str,
     database_id: &str,
@@ -930,16 +980,27 @@ fn reconciliation_failure_custody(
     approved_plan_sha256: &str,
     lease_nonce: &str,
     lease_payload_sha256: &str,
-) -> TerminalCustodyState {
+    receipt: &D1TerminalReconciliationReceipt,
+    legacy_receipt: Option<&D1TerminalReconciliationReceiptV1>,
+) -> TerminalEvidence {
     match result
         .structured_content
         .as_ref()
         .and_then(|content| content.get("custody_status"))
         .and_then(Value::as_str)
     {
-        Some("not_inspected") => TerminalCustodyState::NotInspected,
-        Some("inspection_failed") => TerminalCustodyState::InspectionFailed,
-        Some("retained_evidence_unverified") => TerminalCustodyState::Unverified,
+        Some("not_inspected") => TerminalEvidence {
+            custody: TerminalCustodyState::NotInspected,
+            receipt_persisted: Value::Null,
+        },
+        Some("inspection_failed") => TerminalEvidence {
+            custody: TerminalCustodyState::InspectionFailed,
+            receipt_persisted: Value::Null,
+        },
+        Some("retained_evidence_unverified") => TerminalEvidence {
+            custody: TerminalCustodyState::Unverified,
+            receipt_persisted: Value::Null,
+        },
         Some("retained_evidence_verified") => inspect_terminal_d1_migration_lease(
             account_id,
             database_id,
@@ -948,10 +1009,17 @@ fn reconciliation_failure_custody(
             lease_nonce,
             lease_payload_sha256,
         )
-        .map_or(TerminalCustodyState::Unverified, |lease| {
-            held_terminal_custody(&lease)
-        }),
-        _ => TerminalCustodyState::Unverified,
+        .map_or(
+            TerminalEvidence {
+                custody: TerminalCustodyState::Unverified,
+                receipt_persisted: Value::Null,
+            },
+            |lease| observed_terminal_evidence(&lease, receipt, legacy_receipt),
+        ),
+        _ => TerminalEvidence {
+            custody: TerminalCustodyState::Unverified,
+            receipt_persisted: Value::Null,
+        },
     }
 }
 
@@ -984,18 +1052,6 @@ fn terminal_result(mut content: Value, custody: TerminalCustodyState) -> CallToo
         apply_terminal_custody(map, custody);
     }
     CallToolResult::structured(content)
-}
-
-fn terminal_receipt_persistence_state(
-    lease: &D1RetainedMigrationLease,
-    receipt: &D1TerminalReconciliationReceipt,
-    legacy_receipt: Option<&D1TerminalReconciliationReceiptV1>,
-) -> (Value, Value) {
-    match lease.compatible_terminal_receipt_state(receipt, legacy_receipt) {
-        Ok(Some(_)) => (json!(true), json!(1)),
-        Ok(None) => (json!(false), json!(0)),
-        Err(_) => (Value::Null, Value::Null),
-    }
 }
 
 fn terminalize_failure<L, R>(
@@ -1058,16 +1114,20 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn terminal_error(
+fn terminal_error<L, R>(
     code: &'static str,
     message: &'static str,
     custody: TerminalCustodyState,
     provider_calls: usize,
     response_evidence: Vec<Value>,
     lifecycle: Vec<Value>,
-    local_namespace_mutations: usize,
-    receipt_persisted: bool,
-) -> CallToolResult {
+    local_namespace_mutations: L,
+    receipt_persisted: R,
+) -> CallToolResult
+where
+    L: Serialize,
+    R: Serialize,
+{
     let mut content = json!({
         "ok": false,
         "operation": OPERATION,
