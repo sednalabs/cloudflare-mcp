@@ -959,6 +959,41 @@ mod tests {
     }
 
     #[test]
+    fn manifest_write_result_rejects_false_nonzero_metadata_and_aggregate_overflow() {
+        for (label, value, classification) in [
+            (
+                "false changes only",
+                json!([{"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": false, "changes": 1, "rows_written": 0}}]),
+                "write_metadata_contradictory",
+            ),
+            (
+                "false rows written only",
+                json!([{"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": false, "changes": 0, "rows_written": 1}}]),
+                "write_metadata_contradictory",
+            ),
+            (
+                "changes overflow",
+                json!([
+                    {"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": true, "changes": u64::MAX, "rows_written": 1}},
+                    {"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": true, "changes": 1, "rows_written": 1}}
+                ]),
+                "write_metadata_overflow",
+            ),
+            (
+                "rows written overflow",
+                json!([
+                    {"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": true, "changes": 1, "rows_written": u64::MAX}},
+                    {"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": true, "changes": 1, "rows_written": 1}}
+                ]),
+                "write_metadata_overflow",
+            ),
+        ] {
+            let error = validate_d1_manifest_write_result(&value).expect_err(label);
+            assert_eq!(error["classification"], classification, "{label}");
+        }
+    }
+
+    #[test]
     fn manifest_ledger_requires_explicit_success_clean_errors_and_results_array() {
         let valid = json!([
             {"success": true, "errors": [], "meta": {"served_by_primary": true}, "results": [{"id": 1, "name": "0001_initial.sql"}]}
