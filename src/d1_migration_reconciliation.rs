@@ -1129,6 +1129,17 @@ pub(crate) fn canonical_effect_assertion_id(
     }
 }
 
+pub(crate) fn validate_replay_manifest_expectations(
+    effect_assertion_id: &str,
+    manifest: &[D1MigrationManifestEntry],
+    state_expectations: &[D1MigrationStateExpectation],
+) -> Result<String, CallToolResult> {
+    let selected = canonical_effect_assertion_id(Some(effect_assertion_id))?;
+    let derived_states = derive_effect_assertion(Some(selected), manifest)?;
+    let validated = validate_expectations(&derived_states, state_expectations.to_vec())?;
+    Ok(validated.proof_sha256)
+}
+
 fn effect_assertion_scope(effect_assertion_id: &str) -> &'static [&'static str] {
     match effect_assertion_id {
         EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1 => &["table", "index"],
@@ -2469,6 +2480,54 @@ fn reconciliation_plan_sha256_v1(
         &serde_json::to_vec(&plan)
             .expect("legacy reconciliation transition plan serialization is infallible"),
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn replay_reconciliation_plan_sha256(
+    account_id: &str,
+    database_id: &str,
+    family: &str,
+    migrations_table: &str,
+    manifest: &[D1MigrationManifestEntry],
+    lease: &D1RetainedMigrationLeaseIdentity,
+    original_prefix: usize,
+    current_prefix: usize,
+    outcome: &str,
+    query_sha256: &str,
+    snapshot_sha256: &str,
+    effect_assertion_id: &str,
+    legacy_v1: bool,
+) -> String {
+    if legacy_v1 {
+        reconciliation_plan_sha256_v1(
+            account_id,
+            database_id,
+            family,
+            migrations_table,
+            manifest,
+            lease,
+            original_prefix,
+            current_prefix,
+            outcome,
+            query_sha256,
+            snapshot_sha256,
+        )
+    } else {
+        reconciliation_plan_sha256(
+            account_id,
+            database_id,
+            family,
+            migrations_table,
+            manifest,
+            lease,
+            original_prefix,
+            current_prefix,
+            outcome,
+            query_sha256,
+            snapshot_sha256,
+            effect_assertion_id,
+        )
+    }
 }
 
 fn contextualize_error(

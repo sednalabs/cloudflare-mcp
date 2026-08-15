@@ -17,6 +17,7 @@ use crate::d1_migration_lease::{
 use crate::d1_migration_reconciliation::{
     D1MigrationStateExpectation, canonical_effect_assertion_id,
     prepare_d1_migration_reconciliation, refresh_d1_migration_reconciliation,
+    replay_reconciliation_plan_sha256, validate_replay_manifest_expectations,
 };
 use crate::server::CloudflareMcp;
 use crate::tools::{D1MigrationManifestEntry, sha256_bytes_hex};
@@ -102,6 +103,14 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
 ) -> CallToolResult {
     let selected_effect_assertion_id = match canonical_effect_assertion_id(effect_assertion_id) {
         Ok(id) => id,
+        Err(result) => return contextualize_terminal_semantic_error(result),
+    };
+    let replay_expectation_proof_sha256 = match validate_replay_manifest_expectations(
+        selected_effect_assertion_id,
+        manifest,
+        &state_expectations,
+    ) {
+        Ok(proof_sha256) => proof_sha256,
         Err(result) => return contextualize_terminal_semantic_error(result),
     };
     if let Err(result) = validate_terminal_arguments(
@@ -243,6 +252,41 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
                 return terminalize_failure(result, custody, 0, Vec::new(), Vec::new(), 0, false);
             }
         };
+    let mut active_lease_identity = initial_lease.identity.clone();
+    active_lease_identity.namespace = "active".to_string();
+    let recomputed_current_reconciliation_plan_sha256 = replay_reconciliation_plan_sha256(
+        account_id,
+        database_id,
+        family,
+        migrations_table,
+        manifest,
+        &active_lease_identity,
+        expected_original_prefix_length,
+        expected_current_prefix_length,
+        expected_outcome,
+        expected_query_sha256,
+        expected_canonical_snapshot_sha256,
+        selected_effect_assertion_id,
+        false,
+    );
+    let recomputed_legacy_reconciliation_plan_sha256 =
+        (selected_effect_assertion_id == "schema_create_only_v1").then(|| {
+            replay_reconciliation_plan_sha256(
+                account_id,
+                database_id,
+                family,
+                migrations_table,
+                manifest,
+                &active_lease_identity,
+                expected_original_prefix_length,
+                expected_current_prefix_length,
+                expected_outcome,
+                expected_query_sha256,
+                expected_canonical_snapshot_sha256,
+                selected_effect_assertion_id,
+                true,
+            )
+        });
     if initial_lease.is_retired() {
         let receipt_evidence = match initial_receipt {
             None => {
@@ -259,6 +303,27 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
             }
             Some(evidence) => evidence,
         };
+        let recomputed_plan = if receipt_evidence.receipt_version == 1 {
+            recomputed_legacy_reconciliation_plan_sha256
+                .as_deref()
+                .expect("v1 receipt is reachable only for the legacy assertion")
+        } else {
+            recomputed_current_reconciliation_plan_sha256.as_str()
+        };
+        if replay_expectation_proof_sha256 != expected_expectation_proof_sha256
+            || recomputed_plan != expected_reconciliation_plan_sha256
+        {
+            return terminal_error(
+                "d1.migration_terminal_approved_evidence_mismatch",
+                "supplied replay manifest does not reproduce the receipt-bound reconciliation plan",
+                TerminalCustodyState::RetiredVerified,
+                0,
+                Vec::new(),
+                Vec::new(),
+                0,
+                false,
+            );
+        }
         let selected_terminal_plan_sha256 = if receipt_evidence.receipt_version == 1 {
             legacy_terminal_plan_sha256
                 .as_deref()
@@ -314,6 +379,31 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
             );
         }
     };
+    let recomputed_plan = if initial_receipt_evidence
+        .as_ref()
+        .is_some_and(|evidence| evidence.receipt_version == 1)
+    {
+        recomputed_legacy_reconciliation_plan_sha256
+            .as_deref()
+            .expect("v1 receipt is reachable only for the legacy assertion")
+    } else {
+        recomputed_current_reconciliation_plan_sha256.as_str()
+    };
+    if initial_receipt_evidence.is_some()
+        && (replay_expectation_proof_sha256 != expected_expectation_proof_sha256
+            || recomputed_plan != expected_reconciliation_plan_sha256)
+    {
+        return terminal_error(
+            "d1.migration_terminal_approved_evidence_mismatch",
+            "supplied replay manifest does not reproduce the receipt-bound reconciliation plan",
+            held_terminal_custody(&initial_lease),
+            0,
+            Vec::new(),
+            Vec::new(),
+            0,
+            false,
+        );
+    }
     let selected_terminal_plan_sha256 = if initial_receipt_evidence
         .as_ref()
         .is_some_and(|evidence| evidence.receipt_version == 1)

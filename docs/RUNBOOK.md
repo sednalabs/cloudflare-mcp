@@ -172,6 +172,13 @@ extended assertion. Unknown fields, duplicate keys, malformed/noncanonical
 bytes, or an attempt to pair version 1 with the extended assertion fail closed
 before provider access.
 
+Completed-retirement replay is not receipt-only lookup. Before returning the
+zero-provider success, the terminal boundary reclassifies the supplied manifest,
+validates the complete typed expectations, and locally recomputes the applicable
+historical version-1 or current version-2 reconciliation-plan digest. Changed
+manifest names or bytes, expectation objects/tables, prefixes, or assertion
+scope therefore cannot borrow an incumbent receipt.
+
 The extended classifier keeps an entire trigger body together across internal
 semicolons and nested `CASE ... END`, then accepts only bounded canonical
 trigger identities, a supported event/header, and semicolon-terminated
@@ -326,7 +333,9 @@ Failure after the receipt leaves that durable receipt plus retained or retiring
 evidence for exact replay. A terminal retirement with no exact receipt is an
 order violation and cannot be repaired by creating a receipt afterward. Exact
 replay after completed retirement validates the receipt and retired lease and
-returns with zero provider calls. Null, array, primitive, malformed,
+reproduces the receipt-bound expectation proof and versioned reconciliation
+plan from the supplied manifest before returning with zero provider calls.
+Null, array, primitive, malformed,
 duplicate-keyed, unknown-keyed, noncanonical, contradictory, hard-linked, or
 conflicting namespace evidence fails closed. Never delete, rewrite, rename, or
 copy these products manually.
