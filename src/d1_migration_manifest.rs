@@ -279,6 +279,23 @@ pub(crate) fn parse_d1_migration_ledger(
             ));
         }
     }
+    // Migration names are operational authority only when the result set
+    // explicitly came from D1's primary. A replica response can be internally
+    // well-formed yet lag a concurrent migration, so it cannot support a plan,
+    // apply, reconciliation, or successful release decision. The manifest
+    // client decodes this response with duplicate-key rejection before it
+    // reaches this parser.
+    if result_set
+        .get("meta")
+        .and_then(Value::as_object)
+        .and_then(|meta| meta.get("served_by_primary"))
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Err(d1_manifest_malformed_ledger_result(
+            "provider ledger result set did not explicitly prove it was served by the D1 primary",
+        ));
+    }
     let results = result_set
         .get("results")
         .and_then(Value::as_array)
@@ -744,7 +761,7 @@ mod tests {
     #[test]
     fn manifest_ledger_requires_explicit_success_clean_errors_and_results_array() {
         let valid = json!([
-            {"success": true, "errors": [], "results": [{"id": 1, "name": "0001_initial.sql"}]}
+            {"success": true, "errors": [], "meta": {"served_by_primary": true}, "results": [{"id": 1, "name": "0001_initial.sql"}]}
         ]);
         assert!(parse_d1_migration_ledger(&valid).is_ok());
         let wrapped = json!({"success": true, "errors": [], "result": valid});
@@ -770,6 +787,18 @@ mod tests {
             (
                 "malformed errors",
                 json!([{"success": true, "errors": {}, "results": []}]),
+            ),
+            (
+                "missing primary proof",
+                json!([{"success": true, "errors": [], "results": []}]),
+            ),
+            (
+                "false primary proof",
+                json!([{"success": true, "errors": [], "meta": {"served_by_primary": false}, "results": []}]),
+            ),
+            (
+                "nonboolean primary proof",
+                json!([{"success": true, "errors": [], "meta": {"served_by_primary": "true"}, "results": []}]),
             ),
             (
                 "wrapped missing envelope success",
@@ -1110,6 +1139,63 @@ pub(crate) fn d1_manifest_reconciliation_required_result(
         "lease": lease.identity,
         "operator_handoff": "Reconcile the named provider ledger and this lease owner identity before any subsequent apply. Do not replay a migration from this response.",
         "error": {"code": "d1.migration_apply_outcome_unknown", "message": "provider response after a migration apply was ambiguous; no retry or later migration was attempted", "hint": "Reconcile provider evidence and the exact ledger before clearing the retained target lease.", "cause": d1_manifest_nonretryable_cause(error)},
+    }))
+}
+
+/// A response loss after a non-idempotent write is never permission to retry.
+/// If the local custody chain can no longer be revalidated, it is also not
+/// truthful to claim that this invocation retained the target lease. Preserve
+/// the historical identity for reconciliation, but make no assertion that an
+/// active local blocker still exists: absence is not a safe replay signal.
+pub(crate) fn d1_manifest_reconciliation_custody_lost_result(
+    account_id: &str,
+    database_id: &str,
+    family: &str,
+    migrations_table: &str,
+    manifest: &[D1MigrationManifestEntry],
+    supplied_plan_sha256: Option<&str>,
+    plan_sha256: &str,
+    migration: &D1MigrationManifestEntry,
+    applied: &[Value],
+    last_known_ledger: &[D1ManifestLedgerRow],
+    reconciled_ledger: Option<&[D1ManifestLedgerRow]>,
+    lease: &D1MigrationLease,
+    error: Value,
+) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": "d1_apply_migration_manifest",
+        "account_id": account_id,
+        "database_id": database_id,
+        "migration_family": family,
+        "migrations_table": migrations_table,
+        "manifest": d1_manifest_summaries(manifest),
+        "supplied_plan_sha256": supplied_plan_sha256,
+        "computed_plan_sha256": plan_sha256,
+        "status": "reconciliation_required",
+        "outcome": "unknown",
+        "unknown_ledger": reconciled_ledger.is_none(),
+        "ledger_evidence": {
+            "state": if reconciled_ledger.is_some() { "known" } else { "unknown" },
+            "last_known_ledger": d1_ledger_summaries(last_known_ledger),
+            "reconciled_ledger": reconciled_ledger.map(d1_ledger_summaries),
+        },
+        "exact_provider_evidence": {
+            "state": "unavailable",
+            "reason": "a migration filename in the provider ledger does not attest to the reviewed SQL bytes or the complete provider transaction",
+        },
+        "migration": {"name": migration.name, "sql_sha256": migration.sql_sha256.to_ascii_lowercase()},
+        "applied_migrations": applied,
+        "lease_retained": Value::Null,
+        "custody_status": "lost_or_unverifiable_after_ambiguous_apply",
+        "prior_lease_identity": lease.identity,
+        "operator_handoff": "Do not replay this migration or infer safety from absent local lease evidence. Reconcile the named provider outcome and local custody through the governed recovery path before any subsequent apply.",
+        "error": {
+            "code": "d1.migration_apply_outcome_unknown_custody_lost",
+            "message": "provider response after a migration apply was ambiguous and local target custody could not be revalidated; no retry or later migration was attempted",
+            "hint": "Reconcile provider evidence first. Local lease absence is not authority to replay this migration.",
+            "cause": d1_manifest_nonretryable_cause(error),
+        },
     }))
 }
 

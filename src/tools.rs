@@ -45,7 +45,8 @@ use crate::d1_migration_lease::{
 use crate::d1_migration_manifest::{
     D1ManifestReconciliationEvidence, approved_d1_plan_digest_matches, classify_d1_manifest_ledger,
     d1_ledger_summaries, d1_manifest_contextualize_failure, d1_manifest_plan_mismatch_result,
-    d1_manifest_plan_sha256, d1_manifest_reconciliation_required_result, d1_manifest_summaries,
+    d1_manifest_plan_sha256, d1_manifest_reconciliation_custody_lost_result,
+    d1_manifest_reconciliation_required_result, d1_manifest_summaries,
     d1_manifest_unknown_ledger_result, d1_migrations_table_init_sql, normalize_d1_manifest_target,
     normalize_d1_migration_family, parse_d1_migration_ledger, read_stable_d1_migration_ledger,
     read_stable_d1_migration_ledger_authority, validate_d1_manifest_write_result,
@@ -5008,8 +5009,9 @@ impl CloudflareMcp {
                 }
                 Err(err) => {
                     // A non-idempotent provider write may have committed after its response
-                    // was lost. Obtain two matching ledger reads for evidence, never replay
-                    // the SQL here.
+                    // was lost. Obtain two matching primary ledger reads for evidence, then
+                    // revalidate custody before saying the lease was retained. Never replay
+                    // the SQL here, including when the local lease path disappeared.
                     let reconciliation = read_stable_d1_migration_ledger(
                         self,
                         account_id,
@@ -5018,7 +5020,33 @@ impl CloudflareMcp {
                     )
                     .await
                     .ok();
-                    let payload = d1_manifest_reconciliation_required_result(
+                    if lease.revalidate().is_ok() {
+                        // Preserve the shared lease when outcome remains unknown. This prevents
+                        // another process from re-entering the target before an operator
+                        // reconciles provider evidence and deliberately clears the stale lease.
+                        let payload = d1_manifest_reconciliation_required_result(
+                            account_id,
+                            &args.database_id,
+                            &family,
+                            &migrations_table,
+                            &manifest,
+                            args.approved_plan_sha256.as_deref(),
+                            &plan_sha256,
+                            migration,
+                            &applied,
+                            &ledger,
+                            reconciliation.as_deref(),
+                            &lease,
+                            err,
+                        );
+                        lease.retain();
+                        finish_manifest!(payload);
+                    }
+                    // Do not call retain after failed revalidation: it would only drop the
+                    // held guard while claiming a durable local blocker that we could no
+                    // longer prove. The separate result makes both constraints explicit:
+                    // no retry, and no inference from missing local evidence.
+                    finish_manifest!(d1_manifest_reconciliation_custody_lost_result(
                         account_id,
                         &args.database_id,
                         &family,
@@ -5032,12 +5060,7 @@ impl CloudflareMcp {
                         reconciliation.as_deref(),
                         &lease,
                         err,
-                    );
-                    // Preserve the shared lease when outcome remains unknown. This prevents
-                    // another process from re-entering the target before an operator
-                    // reconciles provider evidence and deliberately clears the stale lease.
-                    lease.retain();
-                    finish_manifest!(payload);
+                    ));
                 }
             }
         }

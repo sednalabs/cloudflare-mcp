@@ -87,6 +87,16 @@ Use `d1_reconcile_migration_manifest` only for exact retained
 `active.lease.json` or `retiring.lease.json` evidence after an ambiguous
 manifest apply. Supply the complete exact-byte manifest and one complete
 expected schema state for every prefix from zero through the full manifest.
+
+For `d1_apply_migration_manifest`, every plan, live, post-apply, and ambiguous
+outcome filename-ledger read requires exactly one successful result set with
+literal boolean `meta.served_by_primary=true`. Missing, false, non-boolean,
+malformed, duplicate, or unstable primary evidence fails closed. After an
+ambiguous non-idempotent apply, the tool rereads that evidence and revalidates
+the local custody chain before it can report `lease_retained=true`. Lost or
+unverifiable custody returns `lease_retained=null` with
+`custody_status=lost_or_unverifiable_after_ambiguous_apply`; it prohibits retry
+and does not turn an absent local file into permission for a new apply.
 The tool derives every target allowed by the selected registry assertion from
 the manifest and rejects omissions, additions, data-producing CREATE forms,
 malformed result metadata, and result sets whose query-bound statement marker

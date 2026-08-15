@@ -117,6 +117,13 @@ new local custody or provider write is created. This is intentionally separate
 from the filename ledger prefix read, which cannot establish what a later
 `INSERT INTO <ledger>` means.
 
+Every filename-ledger read used by the dry plan, live preflight, post-apply
+readback, or ambiguity reconciliation must itself be served by the D1 primary:
+the single result set requires literal boolean `meta.served_by_primary=true`.
+Missing, false, non-boolean, malformed, duplicate, or unstable evidence is not
+a usable ledger and fails closed. The manifest client rejects duplicate JSON
+keys before the result reaches either ledger parser.
+
 After the governed lease and reviewed plan are bound, the MCP repeats that
 stable authority proof immediately before every migration statement, then
 revalidates its held local custody immediately before each dispatch. It repeats
@@ -137,9 +144,16 @@ entry or leaves active/retiring evidence as an explicit blocker. A failed
 creation is retained as
 `aborted-create.<nonce>.lease.json`; production code never unlinks a lease file
 or directory. The manifest tool never reopens a migration directory after
-review and never retries an ambiguous provider write. An unknown outcome retains
-the active target lease: reconcile provider ledger evidence and the reported
-lease identity before any governed recovery. A matching ledger filename is only
+review and never retries an ambiguous provider write. It first performs stable
+primary-ledger reconciliation and then revalidates the exact local custody
+chain before saying the active target lease was retained. If that local custody
+has been lost or is unverifiable, the result reports
+`lease_retained=null` and
+`custody_status=lost_or_unverifiable_after_ambiguous_apply`; it keeps the prior
+identity only as historical reconciliation context, not as a claim that a local
+blocker exists. That result still prohibits replay: the absence of a local lease
+file is never evidence that another process or operator may reapply SQL. A
+matching ledger filename is only
 an observation: it does not attest to the reviewed SQL bytes or complete
 provider transaction, and therefore never authorizes lease release after an
 ambiguous apply. This guarantee is limited to a trusted Linux filesystem that
