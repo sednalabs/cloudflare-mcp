@@ -1079,6 +1079,7 @@ pub(crate) enum SqlToken {
 struct DerivedEffectAssertion {
     states: Vec<Vec<DerivedSchemaObject>>,
     additive_plan: Option<AdditiveManifestPlan>,
+    trigger_body_identifier_references: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1117,6 +1118,7 @@ fn derive_effect_assertion_details(
     };
     let mut cumulative = BTreeMap::<(String, String), DerivedSchemaObject>::new();
     let mut cumulative_names = BTreeSet::new();
+    let mut trigger_body_identifier_references = BTreeSet::new();
     let mut states = vec![Vec::new()];
     for migration in manifest {
         let statements = tokenize_sql_statements(&migration.sql).ok_or_else(|| {
@@ -1134,14 +1136,15 @@ fn derive_effect_assertion_details(
             ));
         }
         for tokens in statements {
-            let object =
-                classify_schema_create(&tokens, allow_views_and_triggers).ok_or_else(|| {
+            let (object, references) = classify_schema_create(&tokens, allow_views_and_triggers)
+                .ok_or_else(|| {
                     reconciliation_error(
                         "capability_gap",
                         "d1.migration_reconciliation_effect_proof_unavailable",
                         unclassified_message,
                     )
                 })?;
+            trigger_body_identifier_references.extend(references);
             let key = (object.object_type.clone(), object.name.clone());
             if !cumulative_names.insert(object.name.clone())
                 || cumulative.insert(key, object).is_some()
@@ -1158,6 +1161,7 @@ fn derive_effect_assertion_details(
     Ok(DerivedEffectAssertion {
         states,
         additive_plan: None,
+        trigger_body_identifier_references,
     })
 }
 
@@ -1165,6 +1169,7 @@ fn derive_additive_effect_assertion(
     manifest: &[D1MigrationManifestEntry],
 ) -> Result<DerivedEffectAssertion, CallToolResult> {
     let mut migrations = Vec::with_capacity(manifest.len());
+    let mut trigger_body_identifier_references = BTreeSet::new();
     for migration in manifest {
         let statements = tokenize_sql_statements(&migration.sql).ok_or_else(|| {
             reconciliation_error(
@@ -1184,7 +1189,8 @@ fn derive_additive_effect_assertion(
         let mut addition_count = 0usize;
         let mut pragma_count = 0usize;
         for tokens in statements {
-            if let Some(object) = classify_schema_create(&tokens, true) {
+            if let Some((object, references)) = classify_schema_create(&tokens, true) {
+                trigger_body_identifier_references.extend(references);
                 effects.push(ClassifiedEffect::Create(object));
                 continue;
             }
@@ -1289,6 +1295,7 @@ fn derive_additive_effect_assertion(
     Ok(DerivedEffectAssertion {
         states,
         additive_plan: Some(AdditiveManifestPlan { prefixes }),
+        trigger_body_identifier_references,
     })
 }
 
@@ -1336,12 +1343,15 @@ fn validate_reserved_migrations_table(
     let conflicts = derived.states.last().into_iter().flatten().any(|object| {
         object.name.eq_ignore_ascii_case(migrations_table)
             || object.table_name.eq_ignore_ascii_case(migrations_table)
-    });
+    }) || derived
+        .trigger_body_identifier_references
+        .iter()
+        .any(|reference| reference.eq_ignore_ascii_case(migrations_table));
     if conflicts {
         return Err(reconciliation_error(
             "contradictory",
             "d1.migration_reconciliation_migrations_table_reserved",
-            "the configured migrations table is reserved and cannot be created, indexed, used as a trigger parent, named as another schema object, or altered by a reconciled manifest",
+            "the configured migrations table is reserved and cannot be created, indexed, used as a trigger parent, referenced as a trigger-body identifier, named as another schema object, or altered by a reconciled manifest",
         ));
     }
     Ok(())
@@ -1375,7 +1385,7 @@ fn effect_assertion_statement_class(effect_assertion_id: &str) -> &'static str {
 fn classify_schema_create(
     tokens: &[SqlToken],
     allow_views_and_triggers: bool,
-) -> Option<DerivedSchemaObject> {
+) -> Option<(DerivedSchemaObject, BTreeSet<String>)> {
     if !token_is_word(tokens.first(), "create") {
         return None;
     }
@@ -1421,11 +1431,14 @@ fn classify_schema_create(
         if !valid_table_suffix(&tokens[after_definition..]) {
             return None;
         }
-        Some(DerivedSchemaObject {
-            object_type: object_type.to_string(),
-            table_name: name.clone(),
-            name,
-        })
+        Some((
+            DerivedSchemaObject {
+                object_type: object_type.to_string(),
+                table_name: name.clone(),
+                name,
+            },
+            BTreeSet::new(),
+        ))
     } else if object_type == "index" {
         if !token_is_word(tokens.get(cursor), "on") {
             return None;
@@ -1439,11 +1452,14 @@ fn classify_schema_create(
         if after_columns < tokens.len() && !token_is_word(tokens.get(after_columns), "where") {
             return None;
         }
-        Some(DerivedSchemaObject {
-            object_type: object_type.to_string(),
-            name,
-            table_name,
-        })
+        Some((
+            DerivedSchemaObject {
+                object_type: object_type.to_string(),
+                name,
+                table_name,
+            },
+            BTreeSet::new(),
+        ))
     } else if object_type == "view" {
         if tokens.get(cursor) == Some(&SqlToken::Symbol('(')) {
             cursor = balanced_parenthesized_end(tokens, cursor)?;
@@ -1461,11 +1477,14 @@ fn classify_schema_create(
         {
             return None;
         }
-        Some(DerivedSchemaObject {
-            object_type: object_type.to_string(),
-            table_name: name.clone(),
-            name,
-        })
+        Some((
+            DerivedSchemaObject {
+                object_type: object_type.to_string(),
+                table_name: name.clone(),
+                name,
+            },
+            BTreeSet::new(),
+        ))
     } else {
         let timing = tokens.get(cursor).and_then(|token| match token {
             SqlToken::Word(word) if word.eq_ignore_ascii_case("before") => Some(1),
@@ -1547,12 +1566,156 @@ fn classify_schema_create(
         {
             return None;
         }
-        Some(DerivedSchemaObject {
-            object_type: object_type.to_string(),
-            name,
-            table_name,
-        })
+        Some((
+            DerivedSchemaObject {
+                object_type: object_type.to_string(),
+                name,
+                table_name,
+            },
+            trigger_body_identifier_references(body),
+        ))
     }
+}
+
+fn trigger_body_identifier_references(tokens: &[SqlToken]) -> BTreeSet<String> {
+    let mut references = BTreeSet::new();
+    let mut statement_start = 0usize;
+    for (statement_end, token) in tokens.iter().enumerate() {
+        if token != &SqlToken::Symbol(';') {
+            continue;
+        }
+        collect_trigger_statement_identifier_references(
+            &tokens[statement_start..statement_end],
+            &mut references,
+        );
+        statement_start = statement_end + 1;
+    }
+    references
+}
+
+fn collect_trigger_statement_identifier_references(
+    tokens: &[SqlToken],
+    references: &mut BTreeSet<String>,
+) {
+    for (index, token) in tokens.iter().enumerate() {
+        // Exact identifier tokens are evidence; string-literal contents are not.
+        // Syntax words remain excluded unless they occupy a table/qualifier slot,
+        // which keeps unusual quoted ledger names fail-closed without substring
+        // matching ordinary literal text or longer identifiers.
+        match token {
+            SqlToken::Identifier(identifier) => {
+                references.insert(identifier.clone());
+            }
+            SqlToken::Word(word) if !trigger_body_keyword(word) => {
+                references.insert(word.clone());
+            }
+            SqlToken::Word(_) | SqlToken::StringLiteral(_) | SqlToken::Symbol(_) => {}
+        }
+        if token_identifier(Some(token)).is_some()
+            && (index
+                .checked_sub(1)
+                .and_then(|previous| tokens.get(previous))
+                == Some(&SqlToken::Symbol('.'))
+                || tokens.get(index + 1) == Some(&SqlToken::Symbol('.')))
+        {
+            collect_trigger_token_identifier(tokens, index, references);
+        }
+        if token_is_word(Some(token), "from")
+            || token_is_word(Some(token), "join")
+            || token_is_word(Some(token), "into")
+        {
+            collect_trigger_token_identifier(tokens, index + 1, references);
+        }
+    }
+
+    if token_is_word(tokens.first(), "update") {
+        let mut target = 1usize;
+        if token_is_word(tokens.get(target), "or") {
+            target += 2;
+        }
+        collect_trigger_token_identifier(tokens, target, references);
+    }
+}
+
+fn collect_trigger_token_identifier(
+    tokens: &[SqlToken],
+    index: usize,
+    references: &mut BTreeSet<String>,
+) {
+    if let Some(identifier) = token_identifier(tokens.get(index)) {
+        references.insert(identifier);
+    }
+}
+
+fn trigger_body_keyword(value: &str) -> bool {
+    matches_ignore_ascii_case(
+        value,
+        &[
+            "abort",
+            "all",
+            "and",
+            "as",
+            "asc",
+            "between",
+            "by",
+            "case",
+            "collate",
+            "conflict",
+            "cross",
+            "delete",
+            "desc",
+            "distinct",
+            "do",
+            "else",
+            "end",
+            "escape",
+            "exists",
+            "fail",
+            "false",
+            "from",
+            "glob",
+            "group",
+            "having",
+            "ignore",
+            "in",
+            "indexed",
+            "inner",
+            "insert",
+            "into",
+            "is",
+            "join",
+            "left",
+            "like",
+            "limit",
+            "match",
+            "natural",
+            "not",
+            "nothing",
+            "null",
+            "offset",
+            "on",
+            "or",
+            "order",
+            "outer",
+            "recursive",
+            "regexp",
+            "replace",
+            "returning",
+            "right",
+            "rollback",
+            "select",
+            "set",
+            "then",
+            "true",
+            "union",
+            "update",
+            "using",
+            "values",
+            "when",
+            "where",
+            "with",
+        ],
+    )
 }
 
 fn valid_trigger_body(tokens: &[SqlToken]) -> bool {
@@ -3296,7 +3459,7 @@ mod tests {
     #[test]
     fn additive_registry_derives_baseline_parent_and_mixed_exact_prefixes() {
         let first = "PRAGMA foreign_keys = ON; ALTER TABLE items ADD COLUMN status TEXT;";
-        let second = "CREATE TABLE audit(id INTEGER PRIMARY KEY); CREATE INDEX audit_by_id ON audit(id); CREATE VIEW audit_ids AS SELECT id FROM audit; CREATE TRIGGER audit_after_insert AFTER INSERT ON audit BEGIN SELECT 1; END;";
+        let second = "CREATE TABLE audit(id INTEGER PRIMARY KEY); CREATE TABLE d1_migrations_archive(id INTEGER PRIMARY KEY); CREATE INDEX audit_by_id ON audit(id); CREATE VIEW audit_ids AS SELECT id FROM audit; CREATE TRIGGER audit_after_insert AFTER INSERT ON audit BEGIN INSERT INTO d1_migrations_archive(id) VALUES (NEW.id); SELECT 'd1_migrations'; END;";
         let manifest = vec![
             D1MigrationManifestEntry {
                 name: "0001_add.sql".to_string(),
@@ -3316,6 +3479,18 @@ mod tests {
                 .expect("derive additive mixed prefixes");
         validate_reserved_migrations_table("d1_migrations", &derived)
             .expect("an unrelated additive trigger must not conflict with the reserved ledger");
+        assert!(
+            derived
+                .trigger_body_identifier_references
+                .contains("d1_migrations_archive"),
+            "the unrelated identifier remains part of semantic trigger-body evidence",
+        );
+        assert!(
+            !derived
+                .trigger_body_identifier_references
+                .contains("d1_migrations"),
+            "a string literal must not become identifier evidence",
+        );
         assert_eq!(
             derived.states,
             vec![
@@ -3339,6 +3514,11 @@ mod tests {
                         object_type: "table".to_string(),
                         name: "audit".to_string(),
                         table_name: "audit".to_string(),
+                    },
+                    DerivedSchemaObject {
+                        object_type: "table".to_string(),
+                        name: "d1_migrations_archive".to_string(),
+                        table_name: "d1_migrations_archive".to_string(),
                     },
                     DerivedSchemaObject {
                         object_type: "table".to_string(),
@@ -3374,6 +3554,7 @@ mod tests {
             BTreeSet::from([
                 ("index".to_string(), "audit_by_id".to_string()),
                 ("table".to_string(), "audit".to_string()),
+                ("table".to_string(), "d1_migrations_archive".to_string()),
                 ("trigger".to_string(), "audit_after_insert".to_string()),
                 ("view".to_string(), "audit_ids".to_string()),
             ]),

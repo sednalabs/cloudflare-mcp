@@ -7099,6 +7099,63 @@ fn d1_reconciliation_reserves_the_migrations_table_before_custody() {
                 "CREATE TRIGGER custom_ledger_after_insert AFTER INSERT ON migrationledger BEGIN SELECT 1; END;",
             ],
         ),
+        (
+            "same entry trigger body delete",
+            "d1_migrations",
+            "schema_create_objects_additive_v1",
+            vec![
+                "CREATE TABLE audit(id INTEGER PRIMARY KEY); CREATE TRIGGER audit_after_delete AFTER DELETE ON audit BEGIN DELETE FROM D1_MIGRATIONS; END;",
+            ],
+        ),
+        (
+            "same entry trigger body insert quoted",
+            "d1_migrations",
+            "schema_create_objects_additive_v1",
+            vec![
+                "CREATE TABLE audit(id INTEGER PRIMARY KEY); CREATE TRIGGER audit_after_insert AFTER INSERT ON audit BEGIN INSERT INTO \"D1_MIGRATIONS\"(id) VALUES (NEW.id); END;",
+            ],
+        ),
+        (
+            "same entry trigger body update bracket quoted",
+            "d1_migrations",
+            "schema_create_objects_additive_v1",
+            vec![
+                "CREATE TABLE audit(id INTEGER PRIMARY KEY); CREATE TRIGGER audit_after_update AFTER UPDATE ON audit BEGIN UPDATE [D1_MIGRATIONS] SET name = 'kept'; END;",
+            ],
+        ),
+        (
+            "same entry trigger body select from backtick quoted",
+            "d1_migrations",
+            "schema_create_tables_indexes_views_triggers_v1",
+            vec![
+                "CREATE TABLE audit(id INTEGER PRIMARY KEY); CREATE TRIGGER audit_after_select AFTER INSERT ON audit BEGIN SELECT id FROM `D1_MIGRATIONS`; END;",
+            ],
+        ),
+        (
+            "same entry trigger body join case variant",
+            "d1_migrations",
+            "schema_create_tables_indexes_views_triggers_v1",
+            vec![
+                "CREATE TABLE audit(id INTEGER PRIMARY KEY); CREATE TRIGGER audit_after_join AFTER INSERT ON audit BEGIN SELECT audit.id FROM audit JOIN D1_MiGrAtIoNs ON D1_MiGrAtIoNs.id = audit.id; END;",
+            ],
+        ),
+        (
+            "same entry trigger body qualified reference",
+            "d1_migrations",
+            "schema_create_objects_additive_v1",
+            vec![
+                "CREATE TABLE audit(id INTEGER PRIMARY KEY); CREATE TRIGGER audit_after_qualified AFTER INSERT ON audit BEGIN SELECT D1_MIGRATIONS.id FROM audit; END;",
+            ],
+        ),
+        (
+            "cross entry trigger body reference",
+            "d1_migrations",
+            "schema_create_objects_additive_v1",
+            vec![
+                "CREATE TABLE audit(id INTEGER PRIMARY KEY);",
+                "CREATE TRIGGER audit_after_cross_prefix AFTER INSERT ON audit BEGIN DELETE FROM d1_migrations; END;",
+            ],
+        ),
     ];
     let (base_url, requests) = spawn_fake_reconciliation_api_for_calls(0);
     let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
@@ -7137,7 +7194,7 @@ fn d1_reconciliation_reserves_the_migrations_table_before_custody() {
         let content = structured_content(&response);
         let expected = expected_d1_reconciliation_semantic_error(
             "d1.migration_reconciliation_migrations_table_reserved",
-            "the configured migrations table is reserved and cannot be created, indexed, used as a trigger parent, named as another schema object, or altered by a reconciled manifest",
+            "the configured migrations table is reserved and cannot be created, indexed, used as a trigger parent, referenced as a trigger-body identifier, named as another schema object, or altered by a reconciled manifest",
             "Retain the exact lease evidence. Do not retry the original migration attempt or mutate D1 from this result.",
         );
         assert_eq!(content, &expected, "{label}: {content}");
@@ -7151,8 +7208,7 @@ fn d1_reconciliation_reserves_the_migrations_table_before_custody() {
         "reserved ledger effects must stop before provider access",
     );
 
-    let terminal_sql =
-        "CREATE TRIGGER ledger_after_insert AFTER INSERT ON D1_MIGRATIONS BEGIN SELECT 1; END;";
+    let terminal_sql = "CREATE TABLE audit(id INTEGER PRIMARY KEY); CREATE TRIGGER audit_after_insert AFTER INSERT ON audit BEGIN UPDATE D1_MIGRATIONS SET name = 'blocked'; END;";
     let terminal_manifest = json!([{
         "name": "0001_reserved.sql",
         "size_bytes": terminal_sql.len(),
@@ -7160,7 +7216,7 @@ fn d1_reconciliation_reserves_the_migrations_table_before_custody() {
         "sql": terminal_sql,
     }]);
     let terminal = mcp.call_tool(
-        872,
+        900,
         "d1_finalize_migration_reconciliation",
         json!({
             "database_id": "db-1",

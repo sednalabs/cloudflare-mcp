@@ -125,8 +125,10 @@ Preserved curated tool families:
   object/operation arrays.
   Every assertion also treats the configured migration-ledger table as a
   reserved SQLite identifier: case variants in CREATE identities, index or
-  trigger parents, and additive ALTER targets fail before custody/provider
-  access, while unrelated trigger targets remain valid.
+  trigger parents, any exact admitted trigger-body identifier, and additive
+  ALTER targets fail before custody/provider access.
+  Exact tokenized matching distinguishes identifiers from string literals and
+  longer unrelated names, while unrelated triggers remain valid.
 - Terminal retained-manifest reconciliation
   (`d1_finalize_migration_reconciliation`) is the separately approval-gated
   local-custody mutation contract. Keep its exact evidence/request/attempt
