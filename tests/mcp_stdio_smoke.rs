@@ -661,6 +661,78 @@ fn spawn_fake_d1_migrations_api(
     (format!("http://{addr}"), requests)
 }
 
+fn is_manifest_ledger_authority_sql(sql: &str) -> bool {
+    sql.starts_with("SELECT type, name, tbl_name, sql FROM sqlite_master ")
+}
+
+fn manifest_ledger_authority_response(table: &str) -> Value {
+    let schema = format!(
+        "CREATE TABLE \"{}\"(\nid INTEGER PRIMARY KEY AUTOINCREMENT,\nname TEXT UNIQUE,\napplied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL\n)",
+        table.replace('"', "\"\"")
+    );
+    json!({
+        "success": true,
+        "errors": [],
+        "messages": [],
+        "result": [{
+            "success": true,
+            "errors": [],
+            "meta": {"served_by_primary": true},
+            "results": [{"type": "table", "name": table, "tbl_name": table, "sql": schema}],
+        }],
+    })
+}
+
+fn manifest_ledger_response(rows: Vec<Value>) -> Value {
+    json!({
+        "success": true,
+        "errors": [],
+        "messages": [],
+        "result": [{"success": true, "errors": [], "results": rows}],
+    })
+}
+
+fn spawn_manifest_authority_rejection_api(
+    authority_responses: Vec<Value>,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind authority rejection D1 API");
+    let addr = listener
+        .local_addr()
+        .expect("authority rejection D1 address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        for (index, stream) in listener
+            .incoming()
+            .take(authority_responses.len().saturating_add(1))
+            .enumerate()
+        {
+            let mut stream = stream.expect("authority rejection request");
+            let (headers, body) = read_http_request(&mut stream);
+            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            let body_json: Value = serde_json::from_slice(&body).expect("authority request JSON");
+            requests_for_thread
+                .lock()
+                .expect("authority request log")
+                .push(body_json.clone());
+            let sql = body_json["sql"].as_str().unwrap_or_default();
+            let response = if index == 0 {
+                assert_eq!(sql, "SELECT * FROM \"d1_migrations\" ORDER BY id");
+                manifest_ledger_response(Vec::new())
+            } else {
+                assert!(is_manifest_ledger_authority_sql(sql));
+                authority_responses[index - 1].clone()
+            };
+            let response = serde_json::to_vec(&response).expect("serialize authority response");
+            write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write authority headers");
+            stream
+                .write_all(&response)
+                .expect("write authority response");
+        }
+    });
+    (format!("http://{addr}"), requests)
+}
+
 fn spawn_fake_manifest_apply_api() -> (String, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake manifest D1 API");
     let addr = listener.local_addr().expect("manifest D1 addr");
@@ -668,7 +740,7 @@ fn spawn_fake_manifest_apply_api() -> (String, Arc<Mutex<Vec<Value>>>) {
     let requests_for_thread = requests.clone();
     thread::spawn(move || {
         let mut apply_seen = false;
-        for stream in listener.incoming().take(6) {
+        for stream in listener.incoming().take(8) {
             let mut stream = stream.expect("fake manifest D1 stream");
             let (headers, body) = read_http_request(&mut stream);
             assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
@@ -686,7 +758,9 @@ fn spawn_fake_manifest_apply_api() -> (String, Arc<Mutex<Vec<Value>>>) {
             } else {
                 vec![json!({"id": 1, "name": "0001_initial.sql"})]
             };
-            let response = if sql == "SELECT * FROM \"d1_migrations\" ORDER BY id" {
+            let response = if is_manifest_ledger_authority_sql(sql) {
+                manifest_ledger_authority_response("d1_migrations")
+            } else if sql == "SELECT * FROM \"d1_migrations\" ORDER BY id" {
                 json!({"success": true, "errors": [], "messages": [], "result": [{"success": true, "results": ledger}]})
             } else if sql
                 .contains("INSERT INTO \"d1_migrations\" (name) VALUES ('0002_second.sql')")
@@ -719,7 +793,7 @@ fn spawn_blocked_manifest_preflight_api() -> (
     let (entered_tx, entered_rx) = mpsc::channel();
     let (resume_tx, resume_rx) = mpsc::channel();
     thread::spawn(move || {
-        for request_index in 0..2 {
+        for request_index in 0..4 {
             let mut stream = listener
                 .accept()
                 .expect("accept blocked manifest request")
@@ -727,24 +801,27 @@ fn spawn_blocked_manifest_preflight_api() -> (
             let (headers, body) = read_http_request(&mut stream);
             assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
             let body_json: Value = serde_json::from_slice(&body).expect("blocked request JSON");
-            assert_eq!(
-                body_json["sql"],
-                json!("SELECT * FROM \"d1_migrations\" ORDER BY id")
-            );
+            let sql = body_json["sql"].as_str().unwrap_or_default();
+            let is_authority = is_manifest_ledger_authority_sql(sql);
+            assert!(is_authority || sql == "SELECT * FROM \"d1_migrations\" ORDER BY id");
             requests_for_thread
                 .lock()
                 .expect("blocked request log")
                 .push(body_json);
-            if request_index == 1 {
+            if request_index == 3 {
                 entered_tx.send(()).expect("notify held active lease");
                 resume_rx.recv().expect("release blocked preflight");
             }
-            let response = serde_json::to_vec(&json!({
-                "success": true,
-                "errors": [],
-                "messages": [],
-                "result": [{"success": true, "results": [{"id": 1, "name": "0001_initial.sql"}]}]
-            }))
+            let response = serde_json::to_vec(&if is_authority {
+                manifest_ledger_authority_response("d1_migrations")
+            } else {
+                json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": [{"success": true, "results": [{"id": 1, "name": "0001_initial.sql"}]}]
+                })
+            })
             .expect("serialize blocked response");
             write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
                 .expect("write blocked response headers");
@@ -760,7 +837,7 @@ fn spawn_fake_manifest_malformed_ledger_api(result_set: Value) -> (String, Arc<M
     let requests = Arc::new(Mutex::new(Vec::new()));
     let requests_for_thread = requests.clone();
     thread::spawn(move || {
-        for stream in listener.incoming().take(1) {
+        for stream in listener.incoming().take(3) {
             let mut stream = stream.expect("fake malformed ledger D1 stream");
             let (headers, body) = read_http_request(&mut stream);
             assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
@@ -770,16 +847,18 @@ fn spawn_fake_manifest_malformed_ledger_api(result_set: Value) -> (String, Arc<M
                 .lock()
                 .expect("request log lock")
                 .push(body_json.clone());
-            assert_eq!(
-                body_json["sql"],
-                json!("SELECT * FROM \"d1_migrations\" ORDER BY id")
-            );
-            let response = serde_json::to_vec(&json!({
-                "success": true,
-                "errors": [],
-                "messages": [],
-                "result": [result_set],
-            }))
+            let sql = body_json["sql"].as_str().unwrap_or_default();
+            let response = serde_json::to_vec(&if is_manifest_ledger_authority_sql(sql) {
+                manifest_ledger_authority_response("d1_migrations")
+            } else {
+                assert_eq!(sql, "SELECT * FROM \"d1_migrations\" ORDER BY id");
+                json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": [result_set],
+                })
+            })
             .expect("serialize malformed ledger response");
             write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write malformed ledger headers");
             stream
@@ -801,7 +880,7 @@ fn spawn_fake_manifest_outer_error_api(
     let requests = Arc::new(Mutex::new(Vec::new()));
     let requests_for_thread = requests.clone();
     thread::spawn(move || {
-        let expected_requests = if error_on_write { 6 } else { 2 };
+        let expected_requests = if error_on_write { 8 } else { 4 };
         let mut ledger_reads = 0usize;
         for stream in listener.incoming().take(expected_requests) {
             let mut stream = stream.expect("fake outer-error manifest D1 stream");
@@ -814,6 +893,16 @@ fn spawn_fake_manifest_outer_error_api(
                 .expect("request log lock")
                 .push(body_json.clone());
             let sql = body_json["sql"].as_str().unwrap_or_default();
+            if is_manifest_ledger_authority_sql(sql) {
+                let response =
+                    serde_json::to_vec(&manifest_ledger_authority_response("d1_migrations"))
+                        .expect("serialize authority response");
+                write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write authority response headers");
+                stream
+                    .write_all(&response)
+                    .expect("write authority response");
+                continue;
+            }
             let is_write = sql.contains("INSERT INTO \"d1_migrations\"");
             let has_outer_error = if error_on_write {
                 is_write
@@ -865,7 +954,7 @@ fn spawn_fake_manifest_ambiguous_api(
     let requests_for_thread = requests.clone();
     thread::spawn(move || {
         let mut apply_seen = false;
-        for stream in listener.incoming().take(6) {
+        for stream in listener.incoming().take(8) {
             let mut stream = stream.expect("fake ambiguous manifest D1 stream");
             let (headers, body) = read_http_request(&mut stream);
             assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
@@ -875,6 +964,16 @@ fn spawn_fake_manifest_ambiguous_api(
                 .expect("request log lock")
                 .push(body_json.clone());
             let sql = body_json["sql"].as_str().unwrap_or_default();
+            if is_manifest_ledger_authority_sql(sql) {
+                let response =
+                    serde_json::to_vec(&manifest_ledger_authority_response("d1_migrations"))
+                        .expect("serialize authority response");
+                write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write authority headers");
+                stream
+                    .write_all(&response)
+                    .expect("write authority response");
+                continue;
+            }
             if sql.contains("INSERT INTO \"d1_migrations\"") {
                 apply_seen = ledger_names_commit_after_ambiguous_response;
                 write!(stream, "HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-length: 0\r\n\r\n").expect("write ambiguous response");
@@ -2971,7 +3070,7 @@ fn spawn_fake_manifest_ambiguous_result_api(
                 })
         });
         let mut apply_seen = false;
-        for stream in listener.incoming().take(6) {
+        for stream in listener.incoming().take(8) {
             let mut stream = stream.expect("fake ambiguous result manifest D1 stream");
             let (headers, body) = read_http_request(&mut stream);
             assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
@@ -2990,6 +3089,8 @@ fn spawn_fake_manifest_ambiguous_result_api(
                     "messages": [],
                     "result": write_result,
                 })
+            } else if is_manifest_ledger_authority_sql(sql) {
+                manifest_ledger_authority_response("d1_migrations")
             } else {
                 assert_eq!(sql, "SELECT * FROM \"d1_migrations\" ORDER BY id");
                 json!({
@@ -3028,7 +3129,7 @@ fn spawn_fake_partial_manifest_ambiguous_api() -> (String, Arc<Mutex<Vec<Value>>
     thread::spawn(move || {
         let mut first_apply_seen = false;
         let mut ambiguous_second_apply_seen = false;
-        for stream in listener.incoming().take(7) {
+        for stream in listener.incoming().take(9) {
             let mut stream = stream.expect("fake partial ambiguous manifest D1 stream");
             let (headers, body) = read_http_request(&mut stream);
             assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
@@ -3039,6 +3140,16 @@ fn spawn_fake_partial_manifest_ambiguous_api() -> (String, Arc<Mutex<Vec<Value>>
                 .expect("request log lock")
                 .push(body_json.clone());
             let sql = body_json["sql"].as_str().unwrap_or_default();
+            if is_manifest_ledger_authority_sql(sql) {
+                let response =
+                    serde_json::to_vec(&manifest_ledger_authority_response("d1_migrations"))
+                        .expect("serialize authority response");
+                write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write authority headers");
+                stream
+                    .write_all(&response)
+                    .expect("write authority response");
+                continue;
+            }
             if sql.contains("INSERT INTO \"d1_migrations\" (name) VALUES ('0001_initial.sql')") {
                 first_apply_seen = true;
                 let response = serde_json::to_vec(&json!({
@@ -5371,7 +5482,7 @@ fn d1_apply_migration_manifest_rejects_malformed_ledger_before_any_provider_writ
             "{label}"
         );
         let observed = requests.lock().expect("requests lock").clone();
-        assert_eq!(observed.len(), 1, "{label}");
+        assert_eq!(observed.len(), 3, "{label}");
         assert!(
             observed.iter().all(|request| !request["sql"]
                 .as_str()
@@ -5380,6 +5491,143 @@ fn d1_apply_migration_manifest_rejects_malformed_ledger_before_any_provider_writ
         );
         assert_released_manifest_target_custody(&lease_root);
         let _ = fs::remove_dir_all(lease_root);
+    }
+}
+
+#[test]
+fn d1_apply_migration_manifest_rejects_unproven_reserved_ledger_authority_before_custody() {
+    let valid_authority = manifest_ledger_authority_response("d1_migrations");
+    let mut missing = valid_authority.clone();
+    missing["result"][0]["results"] = json!([]);
+    let mut duplicate = valid_authority.clone();
+    duplicate["result"][0]["results"]
+        .as_array_mut()
+        .expect("authority rows")
+        .push(json!({
+            "type": "table", "name": "D1_MIGRATIONS", "tbl_name": "D1_MIGRATIONS",
+            "sql": "CREATE TABLE \"D1_MIGRATIONS\"(id INTEGER)"
+        }));
+    let mut trigger = valid_authority.clone();
+    trigger["result"][0]["results"]
+        .as_array_mut()
+        .expect("authority rows")
+        .push(json!({
+            "type": "trigger", "name": "ledger_trigger", "tbl_name": "d1_migrations",
+            "sql": "CREATE TRIGGER ledger_trigger AFTER INSERT ON d1_migrations BEGIN SELECT 1; END"
+        }));
+    let mut not_primary = valid_authority.clone();
+    not_primary["result"][0]["meta"]["served_by_primary"] = json!(false);
+    let mut malformed = valid_authority.clone();
+    malformed["result"][0]["results"] = Value::Null;
+    let mut schema_drift = valid_authority.clone();
+    schema_drift["result"][0]["results"][0]["sql"] =
+        json!("CREATE TABLE d1_migrations(id INTEGER)");
+    let invalid_cases = vec![
+        (
+            "missing ledger row",
+            vec![missing],
+            "d1.migration_ledger_authority_invalid",
+        ),
+        (
+            "case-equivalent duplicate",
+            vec![duplicate],
+            "d1.migration_ledger_authority_invalid",
+        ),
+        (
+            "trigger target",
+            vec![trigger],
+            "d1.migration_ledger_authority_invalid",
+        ),
+        (
+            "not primary",
+            vec![not_primary],
+            "d1.migration_ledger_authority_not_primary",
+        ),
+        (
+            "malformed decoded results",
+            vec![malformed],
+            "d1.migration_ledger_authority_malformed",
+        ),
+        (
+            "schema drift",
+            vec![schema_drift],
+            "d1.migration_ledger_authority_invalid",
+        ),
+    ];
+
+    for (index, (label, authority_responses, expected_code)) in
+        invalid_cases.into_iter().enumerate()
+    {
+        let (base_url, requests) = spawn_manifest_authority_rejection_api(authority_responses);
+        let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+            "cloudflare-mcp-ledger-authority-{index}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&lease_root);
+        fs::create_dir_all(&lease_root).expect("create authority lease root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+                .expect("make authority lease root private");
+        }
+        let mut mcp = McpStdioProcess::start_with_env(vec![
+            ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+            (
+                "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+                lease_root.to_string_lossy().to_string(),
+            ),
+        ]);
+        let sql = "CREATE TABLE submissions(id TEXT);";
+        let manifest = json!([{
+            "name": "0001_initial.sql", "size_bytes": sql.len(), "sql_sha256": sha256_hex(sql), "sql": sql,
+        }]);
+        let dry = mcp.call_tool(1500 + index as u64 * 2, "d1_apply_migration_manifest", json!({
+            "database_id": "db-1", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
+        }));
+        let plan = structured_content(&dry)["plan_sha256"]
+            .as_str()
+            .expect("dry plan")
+            .to_string();
+        let live = mcp.call_tool(
+            1501 + index as u64 * 2,
+            "d1_apply_migration_manifest",
+            json!({
+                "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest,
+                "approved_plan_sha256": plan,
+            }),
+        );
+        let content = structured_content(&live);
+        assert_eq!(content["ok"], json!(false), "{label}: {content}");
+        assert_eq!(
+            content["error"]["code"],
+            json!(expected_code),
+            "{label}: {content}"
+        );
+        let has_provider_write =
+            requests
+                .lock()
+                .expect("authority requests")
+                .iter()
+                .any(|request| {
+                    request
+                        .get("sql")
+                        .and_then(Value::as_str)
+                        .is_some_and(|sql| sql.starts_with("INSERT INTO"))
+                });
+        assert!(
+            !has_provider_write,
+            "{label} must not reach a provider mutation"
+        );
+        assert!(
+            fs::read_dir(&lease_root)
+                .expect("authority lease root")
+                .next()
+                .is_none(),
+            "{label} must not create local custody before authority is proven"
+        );
+        mcp.terminate();
+        let _ = fs::remove_dir_all(&lease_root);
     }
 }
 
@@ -5454,7 +5702,7 @@ fn d1_apply_migration_manifest_outer_ledger_errors_release_pre_write_lease() {
         );
         assert_eq!(content["unknown_ledger"], json!(true), "{label}");
         let observed = requests.lock().expect("requests lock").clone();
-        assert_eq!(observed.len(), 2, "{label}");
+        assert_eq!(observed.len(), 4, "{label}");
         assert!(
             observed.iter().all(|request| !request["sql"]
                 .as_str()
@@ -5543,7 +5791,7 @@ fn d1_apply_migration_manifest_outer_write_errors_remain_unknown_and_retain_leas
             "{label}"
         );
         let observed = requests.lock().expect("requests lock").clone();
-        assert_eq!(observed.len(), 6, "{label} must not retry the write");
+        assert_eq!(observed.len(), 8, "{label} must not retry the write");
         assert_eq!(
             observed
                 .iter()
@@ -5567,7 +5815,7 @@ fn d1_apply_migration_manifest_outer_write_errors_remain_unknown_and_retain_leas
             &manifest,
             &plan,
             &requests,
-            6,
+            8,
             label,
         );
         let _ = fs::remove_dir_all(lease_root);
@@ -5631,17 +5879,17 @@ fn d1_apply_migration_manifest_live_rechecks_plan_and_stably_reads_back_before_r
     let requests = requests.lock().expect("requests lock").clone();
     assert_eq!(
         requests.len(),
-        6,
-        "dry, stable re-read, apply, stable post-apply reads"
+        8,
+        "dry, authority preflight, stable re-read, apply, stable post-apply reads"
     );
     assert!(
-        requests[3]["sql"]
+        requests[5]["sql"]
             .as_str()
             .expect("apply SQL")
             .contains(second_sql)
     );
     assert!(
-        !requests[3]["sql"]
+        !requests[5]["sql"]
             .as_str()
             .expect("apply SQL")
             .contains(first_sql)
@@ -5825,8 +6073,8 @@ fn d1_apply_migration_manifest_response_loss_stops_without_retry_and_next_proces
     let observed = requests.lock().expect("requests lock").clone();
     assert_eq!(
         observed.len(),
-        6,
-        "dry, stable re-read, one apply, stable reconciliation reads; no retry"
+        8,
+        "dry, ledger-authority re-read, stable ledger re-read, one apply, stable reconciliation reads; no retry"
     );
     assert_eq!(
         observed
@@ -5845,7 +6093,7 @@ fn d1_apply_migration_manifest_response_loss_stops_without_retry_and_next_proces
         &manifest,
         &plan,
         &requests,
-        6,
+        8,
         "response loss",
     );
     let _ = fs::remove_dir_all(lease_root);
@@ -11221,7 +11469,7 @@ fn d1_apply_migration_manifest_same_name_after_response_loss_stays_unknown_and_r
     );
     assert_eq!(
         requests.lock().expect("requests lock").len(),
-        6,
+        8,
         "same-name ledger evidence must neither release the lease nor apply the next statement"
     );
     assert_private_regular_active_lease(&lease_root);
@@ -11237,7 +11485,7 @@ fn d1_apply_migration_manifest_same_name_after_response_loss_stays_unknown_and_r
         &manifest,
         &plan,
         &requests,
-        6,
+        8,
         "same-name response loss",
     );
     let _ = fs::remove_dir_all(lease_root);
@@ -11342,7 +11590,7 @@ fn d1_apply_migration_manifest_ambiguous_inner_result_shapes_retain_lease_withou
             "{label} must not claim the statement applied"
         );
         let observed = requests.lock().expect("requests lock").clone();
-        assert_eq!(observed.len(), 6, "{label} must not retry the write");
+        assert_eq!(observed.len(), 8, "{label} must not retry the write");
         assert_eq!(
             observed
                 .iter()
@@ -11366,7 +11614,7 @@ fn d1_apply_migration_manifest_ambiguous_inner_result_shapes_retain_lease_withou
             &manifest,
             &plan,
             &requests,
-            6,
+            8,
             label,
         );
         let _ = fs::remove_dir_all(lease_root);
@@ -11425,7 +11673,7 @@ fn d1_apply_migration_manifest_multiple_successful_query_results_apply_once() {
         content["applied_migrations"].as_array().map(Vec::len),
         Some(1)
     );
-    assert_eq!(requests.lock().expect("requests lock").len(), 6);
+    assert_eq!(requests.lock().expect("requests lock").len(), 8);
     assert_released_manifest_target_custody(&lease_root);
     let _ = fs::remove_dir_all(lease_root);
 }
@@ -11488,8 +11736,8 @@ fn d1_apply_migration_manifest_partial_multi_statement_response_loss_stays_unkno
     );
     assert_eq!(
         requests.lock().expect("requests lock").len(),
-        7,
-        "first statement may have committed; second ambiguity must stop the batch without any retry"
+        9,
+        "ledger-authority preflight adds two reads; the second statement ambiguity must stop the batch without any retry"
     );
     assert_private_regular_active_lease(&lease_root);
     mcp.terminate();
@@ -11504,7 +11752,7 @@ fn d1_apply_migration_manifest_partial_multi_statement_response_loss_stays_unkno
         &manifest,
         &plan,
         &requests,
-        7,
+        9,
         "partial response loss",
     );
     let _ = fs::remove_dir_all(lease_root);

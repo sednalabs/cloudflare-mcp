@@ -105,6 +105,18 @@ moves the supplied manifest into validation without cloning its SQL strings.
 Split a larger migration family before review rather than increasing this
 operator-surface memory bound.
 
+On a live manifest call, the MCP first performs a read-only inspection of any
+existing target custody. It never creates a target or guard during this step;
+an active or retiring entry therefore stops a fresh caller before any provider
+request. Only then, before a new lease or migration SQL, it performs two
+primary-served readbacks of the configured migration-ledger authority. They
+must agree and prove exactly one canonical ledger table with the supported
+schema and no trigger targeting it. A missing, case-conflicting, wrong-type,
+wrong-schema, malformed, non-primary, or unstable result is a hard stop: no
+new local custody or provider write is created. This is intentionally separate
+from the filename ledger prefix read, which cannot establish what a later
+`INSERT INTO <ledger>` means.
+
 A later invocation stops before provider I/O when it sees an active or
 `retiring.lease.json` entry, including one that is malformed, a symlink or
 non-regular. It must be resolved only through the governed recovery path,

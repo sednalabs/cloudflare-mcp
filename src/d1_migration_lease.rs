@@ -777,6 +777,44 @@ pub(crate) fn acquire_d1_migration_lease(
     acquire_d1_migration_lease_at(root, account_id, database_id, family, plan_sha256)
 }
 
+/// Read-only occupancy check for the permanent target namespace.  This runs
+/// before remote authority preflight so retained custody continues to block a
+/// fresh caller without any provider I/O.  It deliberately never creates the
+/// target directory or its guard: an absent target is the only state in which
+/// a later acquisition may create new local custody.
+pub(crate) fn preflight_d1_migration_target_custody(
+    account_id: &str,
+    database_id: &str,
+) -> Result<(), CallToolResult> {
+    let root = std::env::var(D1_MANIFEST_LEASE_ROOT_ENV)
+        .ok()
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| {
+            CallToolResult::structured_error(json!({
+                "ok": false, "operation": "d1_apply_migration_manifest",
+                "error": {"code": "d1.migration_lease_root_unconfigured", "message": "live migration apply requires a configured operator-owned shared lease root", "hint": format!("Set {D1_MANIFEST_LEASE_ROOT_ENV} to a pre-created private directory shared by all MCP processes that can target this D1 database.")}
+            }))
+        })?;
+    preflight_d1_migration_target_custody_at(root, account_id, database_id)
+}
+
+pub(crate) fn preflight_d1_migration_target_custody_at(
+    root: PathBuf,
+    account_id: &str,
+    database_id: &str,
+) -> Result<(), CallToolResult> {
+    #[cfg(target_os = "linux")]
+    {
+        preflight_d1_migration_target_custody_at_linux(root, account_id, database_id)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (root, account_id, database_id);
+        Err(d1_lease_platform_unsupported())
+    }
+}
+
 pub(crate) fn acquire_d1_migration_lease_at(
     root: PathBuf,
     account_id: &str,
@@ -1635,10 +1673,7 @@ mod linux {
         Ok((evidence, true))
     }
 
-    fn active_present_error(
-        target: &fs::File,
-        identity: &D1MigrationLeaseIdentity,
-    ) -> CallToolResult {
+    fn active_present_error(target: &fs::File, target_key_sha256: &str) -> CallToolResult {
         let valid = active_is_private_json(target, ACTIVE_LEASE_NAME);
         let code = if valid {
             "d1.migration_target_lease_held"
@@ -1647,16 +1682,16 @@ mod linux {
         };
         CallToolResult::structured_error(json!({
             "ok": false, "operation": "d1_apply_migration_manifest", "status": if valid { "lease_held" } else { "reconciliation_required" }, "lease_retained": true,
-            "lease": {"target_key_sha256": &identity.target_key_sha256, "ownership": "active_or_unreadable"},
+            "lease": {"target_key_sha256": target_key_sha256, "ownership": "active_or_unreadable"},
             "operator_handoff": "Reconcile the permanent active target lease and its terminal provider evidence through the governed recovery path before another apply. The MCP never auto-reclaims active evidence.",
             "error": {"code": code, "message": "this account/database target already has active migration custody evidence", "hint": "Do not run another migration family against this target until the active evidence is reconciled through the governed recovery path."}
         }))
     }
 
-    fn retiring_present_error(identity: &D1MigrationLeaseIdentity) -> CallToolResult {
+    fn retiring_present_error(target_key_sha256: &str) -> CallToolResult {
         CallToolResult::structured_error(json!({
             "ok": false, "operation": "d1_apply_migration_manifest", "status": "reconciliation_required", "lease_retained": true,
-            "lease": {"target_key_sha256": &identity.target_key_sha256, "ownership": "retiring"},
+            "lease": {"target_key_sha256": target_key_sha256, "ownership": "retiring"},
             "operator_handoff": "A prior terminal retirement did not complete cleanly. Reconcile the permanent retiring evidence through the governed recovery path before another apply.",
             "error": {"code": "d1.migration_target_retirement_unreconciled", "message": "this account/database target has retiring migration custody evidence", "hint": "Do not run another migration family against this target until the retiring evidence is reconciled through the governed recovery path."}
         }))
@@ -1800,7 +1835,7 @@ mod linux {
         )
         .map_err(|message| d1_lease_root_error("d1.migration_lease_custody_changed", message))?;
         match entry_present(&target, ACTIVE_LEASE_NAME) {
-            Ok(true) => return Err(active_present_error(&target, &identity)),
+            Ok(true) => return Err(active_present_error(&target, &identity.target_key_sha256)),
             Ok(false) => {}
             Err(message) => {
                 return Err(d1_lease_root_error(
@@ -1810,7 +1845,7 @@ mod linux {
             }
         }
         match entry_present(&target, RETIRING_LEASE_NAME) {
-            Ok(true) => return Err(retiring_present_error(&identity)),
+            Ok(true) => return Err(retiring_present_error(&identity.target_key_sha256)),
             Ok(false) => {}
             Err(message) => {
                 return Err(d1_lease_root_error(
@@ -1830,7 +1865,7 @@ mod linux {
         ) {
             Ok(active) => active,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                return Err(active_present_error(&target, &identity));
+                return Err(active_present_error(&target, &identity.target_key_sha256));
             }
             Err(_) => {
                 return Err(CallToolResult::structured_error(json!({
@@ -1931,6 +1966,114 @@ mod linux {
             released: false,
             identity,
         })
+    }
+
+    pub(super) fn preflight_d1_migration_target_custody_at_linux(
+        root_path: PathBuf,
+        account_id: &str,
+        database_id: &str,
+    ) -> Result<(), CallToolResult> {
+        validate_root_and_ancestors(&root_path)
+            .map_err(|message| d1_lease_root_error("d1.migration_lease_root_unsafe", message))?;
+        let root_name = c_string_path(&root_path)
+            .map_err(|message| d1_lease_root_error("d1.migration_lease_root_unsafe", message))?;
+        let root = open_directory_at(AT_FDCWD, &root_name).map_err(|_| {
+            d1_lease_root_error(
+                "d1.migration_lease_root_unsafe",
+                "configured migration lease root could not be opened without following a symlink",
+            )
+        })?;
+        let root_metadata = root.metadata().map_err(|_| {
+            d1_lease_root_error(
+                "d1.migration_lease_root_unsafe",
+                "configured migration lease root metadata is unavailable",
+            )
+        })?;
+        if !private_dir(&root_metadata) {
+            return Err(d1_lease_root_error(
+                "d1.migration_lease_root_unsafe",
+                "configured migration lease root is not a private current-operator-owned directory",
+            ));
+        }
+        let root_identity = identity(&root_metadata);
+        validate_root_path_binding(&root_path, &root, &root_identity)
+            .map_err(|message| d1_lease_root_error("d1.migration_lease_root_unsafe", message))?;
+
+        let target_hash = sha256_bytes_hex(format!("{account_id}\0{database_id}").as_bytes());
+        let target_name = format!("d1-migration-target-{target_hash}");
+        let target_name_c = c_string_name(&target_name)
+            .map_err(|message| d1_lease_root_error("d1.migration_lease_target_unsafe", message))?;
+        let target = match open_directory_at(root.as_raw_fd(), &target_name_c) {
+            Ok(target) => target,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => {
+                return Err(d1_lease_root_error(
+                    "d1.migration_lease_target_unsafe",
+                    "existing migration target custody directory could not be opened without following a symlink",
+                ));
+            }
+        };
+        let target_metadata = target.metadata().map_err(|_| {
+            d1_lease_root_error(
+                "d1.migration_lease_target_unsafe",
+                "existing migration target custody metadata is unavailable",
+            )
+        })?;
+        if !private_dir(&target_metadata) {
+            return Err(d1_lease_root_error(
+                "d1.migration_lease_target_unsafe",
+                "existing migration target is not a private current-operator-owned directory",
+            ));
+        }
+        let target_identity = identity(&target_metadata);
+        let (guard, guard_identity) = open_existing_guard(&target)
+            .map_err(|message| d1_lease_root_error("d1.migration_lease_guard_unsafe", message))?;
+        match guard.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(CallToolResult::structured_error(json!({
+                    "ok": false, "operation": "d1_apply_migration_manifest", "status": "lease_held", "lease_retained": true,
+                    "lease": {"target_key_sha256": target_hash, "ownership": "guard_locked"},
+                    "operator_handoff": "Another process is evaluating or applying this target. Do not issue provider SQL from a concurrent migration call.",
+                    "error": {"code": "d1.migration_target_guard_locked", "message": "another MCP process holds the permanent target guard", "hint": "Wait for its terminal result or reconcile its active evidence before retrying."}
+                })));
+            }
+            Err(fs::TryLockError::Error(_)) => {
+                return Err(d1_lease_root_error(
+                    "d1.migration_lease_guard_lock_failed",
+                    "permanent target guard could not be locked",
+                ));
+            }
+        }
+        validate_d1_lease_custody(
+            &root_path,
+            &root,
+            &root_identity,
+            &target_name,
+            &target,
+            &target_identity,
+            &guard,
+            &guard_identity,
+        )
+        .map_err(|message| d1_lease_root_error("d1.migration_lease_custody_changed", message))?;
+        match entry_present(&target, ACTIVE_LEASE_NAME) {
+            Ok(true) => return Err(active_present_error(&target, &target_hash)),
+            Ok(false) => {}
+            Err(message) => {
+                return Err(d1_lease_root_error(
+                    "d1.migration_lease_custody_changed",
+                    message,
+                ));
+            }
+        }
+        match entry_present(&target, RETIRING_LEASE_NAME) {
+            Ok(true) => return Err(retiring_present_error(&target_hash)),
+            Ok(false) => Ok(()),
+            Err(message) => Err(d1_lease_root_error(
+                "d1.migration_lease_custody_changed",
+                message,
+            )),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2274,9 +2417,9 @@ mod linux {
 #[cfg(target_os = "linux")]
 use linux::{
     acquire_d1_migration_lease_at_linux, inspect_retained_d1_migration_lease_at_linux,
-    rename_owned_lease_no_replace, restore_active_or_leave_blocker, retained_entry_present,
-    sync_d1_lease_directory, validate_d1_lease_custody, validate_owned_named_lease,
-    validate_retained_named_lease,
+    preflight_d1_migration_target_custody_at_linux, rename_owned_lease_no_replace,
+    restore_active_or_leave_blocker, retained_entry_present, sync_d1_lease_directory,
+    validate_d1_lease_custody, validate_owned_named_lease, validate_retained_named_lease,
 };
 
 #[cfg(test)]
@@ -2453,6 +2596,38 @@ mod tests {
         .expect_err("restored active evidence must block a fresh owner");
         assert_eq!(
             contender.structured_content.expect("contender")["error"]["code"],
+            json!("d1.migration_target_lease_held")
+        );
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_custody_preflight_is_read_only_when_absent_and_blocks_retained_active() {
+        let root = private_test_root("preflight-existing-target");
+        preflight_d1_migration_target_custody_at(root.clone(), "acct-1", "db-1")
+            .expect("absent target is clear without creating custody");
+        assert_eq!(
+            fs::read_dir(&root).expect("read untouched root").count(),
+            0,
+            "the absence preflight must not create a target directory or guard"
+        );
+
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "db-1",
+            "newsletter-core",
+            &"a".repeat(64),
+        )
+        .expect("create active custody for blocker proof");
+        owner.retain();
+        drop(owner);
+
+        let error = preflight_d1_migration_target_custody_at(root.clone(), "acct-1", "db-1")
+            .expect_err("retained active evidence blocks before a provider read");
+        assert_eq!(
+            error.structured_content.expect("preflight error")["error"]["code"],
             json!("d1.migration_target_lease_held")
         );
         fs::remove_dir_all(root).expect("test cleanup");

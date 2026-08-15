@@ -38,13 +38,17 @@ use crate::cloudflare::{
     AccessAppUpsertRequest, AccessPolicyWrite, BulkRedirectItemWrite, CacheRule, CacheRuleset,
     DnsRecordUpsertRequest, PagesDeploymentTriggerRequest, with_request_api_token_override,
 };
-use crate::d1_migration_lease::{acquire_d1_migration_lease, d1_migration_lease_requirements};
+use crate::d1_migration_lease::{
+    acquire_d1_migration_lease, d1_migration_lease_requirements,
+    preflight_d1_migration_target_custody,
+};
 use crate::d1_migration_manifest::{
     D1ManifestReconciliationEvidence, approved_d1_plan_digest_matches, classify_d1_manifest_ledger,
     d1_ledger_summaries, d1_manifest_contextualize_failure, d1_manifest_plan_mismatch_result,
     d1_manifest_plan_sha256, d1_manifest_reconciliation_required_result, d1_manifest_summaries,
     d1_manifest_unknown_ledger_result, normalize_d1_manifest_target, normalize_d1_migration_family,
-    parse_d1_migration_ledger, read_stable_d1_migration_ledger, validate_d1_manifest_write_result,
+    parse_d1_migration_ledger, read_stable_d1_migration_ledger,
+    read_stable_d1_migration_ledger_authority, validate_d1_manifest_write_result,
     validate_d1_migration_manifest,
 };
 use crate::d1_migration_reconciliation::{
@@ -4674,6 +4678,38 @@ impl CloudflareMcp {
                 "max_rows": max_rows,
                 "dry_run_note": "No D1 writes were issued. This dry run performed one ledger read; a live call independently performs stable pre- and post-apply ledger readback, must supply this exact plan_sha256, and uses the configured shared migration lease root.",
             })));
+        }
+
+        // Existing custody must keep blocking fresh callers before they make a
+        // provider read.  This inspection is read-only and deliberately never
+        // creates a target directory or guard for an absent target.
+        mutation_plan = mutation_plan.step(
+            "preflight_existing_migration_target_custody",
+            false,
+            json!({"target": "account_database"}),
+        );
+        if let Err(result) = preflight_d1_migration_target_custody(account_id, &args.database_id) {
+            finish_manifest!(result);
+        }
+
+        // The ordinary ledger rows prove only migration names. Before this
+        // live path creates any new custody evidence or can reach a provider
+        // write, prove the reserved ledger is the exact primary-served table
+        // with no trigger authority and a stable canonical schema.
+        mutation_plan = mutation_plan.step(
+            "preflight_reserved_migration_ledger_authority",
+            false,
+            json!({"migrations_table": migrations_table}),
+        );
+        if let Err(result) = read_stable_d1_migration_ledger_authority(
+            self,
+            account_id,
+            &args.database_id,
+            &migrations_table,
+        )
+        .await
+        {
+            finish_manifest!(result);
         }
 
         let mut lease = match acquire_d1_migration_lease(

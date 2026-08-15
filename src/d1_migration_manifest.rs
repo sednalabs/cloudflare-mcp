@@ -29,6 +29,17 @@ pub(crate) struct D1ManifestLedgerRow {
     pub(crate) name: String,
 }
 
+/// Read-only authority for the table which records manifest application.
+///
+/// The manifest apply path appends to this table.  A successful `SELECT *`
+/// alone is not enough to establish that it is still the intended ledger: a
+/// view, a case-insensitive sibling, or a trigger targeting the table could
+/// make the following provider write mean something materially different.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct D1ManifestLedgerAuthority {
+    table_sql: String,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct D1ManifestClassification {
     pub(crate) applied_names: Vec<String>,
@@ -313,6 +324,148 @@ pub(crate) fn parse_d1_migration_ledger(
     Ok(ledger)
 }
 
+fn quote_sql_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// The exact SQLite-master spelling produced by this MCP's compatible ledger
+/// initializer. SQLite removes `IF NOT EXISTS` and the terminating semicolon
+/// when it persists the CREATE text in `sqlite_master`.
+fn expected_d1_migration_ledger_table_sql(table: &str) -> String {
+    format!(
+        "CREATE TABLE \"{}\"(\nid INTEGER PRIMARY KEY AUTOINCREMENT,\nname TEXT UNIQUE,\napplied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL\n)",
+        table.replace('"', "\"\"")
+    )
+}
+
+pub(crate) fn d1_migration_ledger_authority_sql(table: &str) -> String {
+    let table = quote_sql_string(table);
+    format!(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master \
+         WHERE lower(name) = lower({table}) \
+            OR (type = 'trigger' AND lower(tbl_name) = lower({table})) \
+         ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'trigger' THEN 1 ELSE 2 END, name COLLATE BINARY"
+    )
+}
+
+fn d1_manifest_ledger_authority_result(
+    code: &'static str,
+    message: &'static str,
+    hint: &'static str,
+) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": "d1_apply_migration_manifest",
+        "status": "reconciliation_required",
+        "unknown_ledger": true,
+        "ledger_authority": "unverified",
+        "error": {"code": code, "message": message, "hint": hint},
+    }))
+}
+
+fn authority_result_set<'a>(value: &'a Value) -> Result<&'a Vec<Value>, CallToolResult> {
+    let result_sets = value.as_array().ok_or_else(|| {
+        d1_manifest_ledger_authority_result(
+            "d1.migration_ledger_authority_malformed",
+            "provider ledger-authority response did not contain a result-set array",
+            "Reconcile the exact migration-ledger schema and primary readback before applying migration SQL.",
+        )
+    })?;
+    let result_set = if result_sets.len() == 1 {
+        result_sets[0].as_object()
+    } else {
+        None
+    }
+    .ok_or_else(|| {
+            d1_manifest_ledger_authority_result(
+                "d1.migration_ledger_authority_malformed",
+                "provider ledger-authority response did not contain exactly one result set",
+                "Reconcile the exact migration-ledger schema and primary readback before applying migration SQL.",
+            )
+        })?;
+    let errors_are_clean = match result_set.get("errors") {
+        None => true,
+        Some(Value::Array(errors)) => errors.is_empty(),
+        _ => false,
+    };
+    if result_set.get("success").and_then(Value::as_bool) != Some(true) || !errors_are_clean {
+        return Err(d1_manifest_ledger_authority_result(
+            "d1.migration_ledger_authority_malformed",
+            "provider ledger-authority result did not explicitly prove one successful statement without errors",
+            "Reconcile the exact migration-ledger schema and primary readback before applying migration SQL.",
+        ));
+    }
+    if result_set
+        .get("meta")
+        .and_then(Value::as_object)
+        .and_then(|meta| meta.get("served_by_primary"))
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Err(d1_manifest_ledger_authority_result(
+            "d1.migration_ledger_authority_not_primary",
+            "provider ledger-authority readback did not explicitly prove it was served by the D1 primary",
+            "Reconcile the migration ledger against an explicit primary readback before applying migration SQL.",
+        ));
+    }
+    result_set.get("results").and_then(Value::as_array).ok_or_else(|| {
+        d1_manifest_ledger_authority_result(
+            "d1.migration_ledger_authority_malformed",
+            "provider ledger-authority result did not contain a results array",
+            "Reconcile the exact migration-ledger schema and primary readback before applying migration SQL.",
+        )
+    })
+}
+
+pub(crate) fn parse_d1_migration_ledger_authority(
+    value: &Value,
+    migrations_table: &str,
+) -> Result<D1ManifestLedgerAuthority, CallToolResult> {
+    let rows = authority_result_set(value)?;
+    if rows.len() != 1 {
+        return Err(d1_manifest_ledger_authority_result(
+            "d1.migration_ledger_authority_invalid",
+            "provider ledger-authority readback did not contain exactly one canonical ledger table and no ledger triggers",
+            "Reconcile the migration-ledger table, case-equivalent objects, and trigger authority before applying migration SQL.",
+        ));
+    }
+    let row = rows[0].as_object().ok_or_else(|| {
+        d1_manifest_ledger_authority_result(
+            "d1.migration_ledger_authority_malformed",
+            "provider ledger-authority row was not an object",
+            "Reconcile the exact migration-ledger schema and primary readback before applying migration SQL.",
+        )
+    })?;
+    if row.len() != 4
+        || row.get("type").and_then(Value::as_str) != Some("table")
+        || row.get("name").and_then(Value::as_str) != Some(migrations_table)
+        || row.get("tbl_name").and_then(Value::as_str) != Some(migrations_table)
+    {
+        return Err(d1_manifest_ledger_authority_result(
+            "d1.migration_ledger_authority_invalid",
+            "provider ledger-authority readback did not prove one exact configured ledger table without conflicting object or trigger evidence",
+            "Reconcile the migration-ledger table, case-equivalent objects, and trigger authority before applying migration SQL.",
+        ));
+    }
+    let table_sql = row.get("sql").and_then(Value::as_str).ok_or_else(|| {
+        d1_manifest_ledger_authority_result(
+            "d1.migration_ledger_authority_malformed",
+            "provider ledger-authority table SQL was not text",
+            "Reconcile the exact migration-ledger schema and primary readback before applying migration SQL.",
+        )
+    })?;
+    if table_sql != expected_d1_migration_ledger_table_sql(migrations_table) {
+        return Err(d1_manifest_ledger_authority_result(
+            "d1.migration_ledger_authority_invalid",
+            "provider ledger-authority table SQL did not match the required canonical migration-ledger schema",
+            "Reconcile or restore the exact migration-ledger schema before applying migration SQL.",
+        ));
+    }
+    Ok(D1ManifestLedgerAuthority {
+        table_sql: table_sql.to_string(),
+    })
+}
+
 /// Accept only a non-empty sequence of complete, successful D1 query results
 /// that lets the manifest coordinator claim a migration was applied. This is deliberately
 /// stricter than the generic D1 query helper: a non-idempotent migration write
@@ -385,9 +538,96 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        d1_manifest_write_result_classification, parse_d1_migration_ledger,
+        d1_manifest_write_result_classification, expected_d1_migration_ledger_table_sql,
+        parse_d1_migration_ledger, parse_d1_migration_ledger_authority,
         validate_d1_manifest_write_result,
     };
+
+    fn authority(table: &str) -> serde_json::Value {
+        json!([{
+            "success": true,
+            "errors": [],
+            "meta": {"served_by_primary": true},
+            "results": [{
+                "type": "table",
+                "name": table,
+                "tbl_name": table,
+                "sql": expected_d1_migration_ledger_table_sql(table),
+            }],
+        }])
+    }
+
+    #[test]
+    fn manifest_ledger_authority_requires_one_exact_primary_table_without_triggers() {
+        assert!(
+            parse_d1_migration_ledger_authority(&authority("d1_migrations"), "d1_migrations")
+                .is_ok()
+        );
+
+        let mut cases = Vec::new();
+        for (label, value) in [
+            ("null response", json!(null)),
+            ("object response", json!({})),
+            ("primitive response", json!(1)),
+            ("empty result sets", json!([])),
+            ("null result set", json!([null])),
+        ] {
+            cases.push((label, value, "d1.migration_ledger_authority_malformed"));
+        }
+        cases.push((
+            "missing primary",
+            json!([{
+                "success": true, "errors": [], "results": []
+            }]),
+            "d1.migration_ledger_authority_not_primary",
+        ));
+        cases.push((
+            "non-primary",
+            json!([{
+                "success": true, "errors": [], "meta": {"served_by_primary": false}, "results": []
+            }]),
+            "d1.migration_ledger_authority_not_primary",
+        ));
+        cases.push(("wrong schema", json!([{
+            "success": true, "errors": [], "meta": {"served_by_primary": true}, "results": [{
+                "type": "table", "name": "d1_migrations", "tbl_name": "d1_migrations", "sql": "CREATE TABLE d1_migrations(id INTEGER)"
+            }]
+        }]), "d1.migration_ledger_authority_invalid"));
+        cases.push(("wrong type", json!([{
+            "success": true, "errors": [], "meta": {"served_by_primary": true}, "results": [{
+                "type": "view", "name": "d1_migrations", "tbl_name": "d1_migrations", "sql": "CREATE VIEW d1_migrations AS SELECT 1"
+            }]
+        }]), "d1.migration_ledger_authority_invalid"));
+        cases.push(("wrong target", json!([{
+            "success": true, "errors": [], "meta": {"served_by_primary": true}, "results": [{
+                "type": "table", "name": "d1_migrations", "tbl_name": "other_table", "sql": expected_d1_migration_ledger_table_sql("d1_migrations")
+            }]
+        }]), "d1.migration_ledger_authority_invalid"));
+        cases.push(("non-text SQL", json!([{
+            "success": true, "errors": [], "meta": {"served_by_primary": true}, "results": [{
+                "type": "table", "name": "d1_migrations", "tbl_name": "d1_migrations", "sql": null
+            }]
+        }]), "d1.migration_ledger_authority_malformed"));
+        let mut duplicate = authority("d1_migrations");
+        duplicate[0]["results"].as_array_mut().expect("results").push(json!({
+            "type": "trigger", "name": "ledger_after_insert", "tbl_name": "d1_migrations", "sql": "CREATE TRIGGER ledger_after_insert AFTER INSERT ON d1_migrations BEGIN SELECT 1; END"
+        }));
+        cases.push((
+            "ledger trigger",
+            duplicate,
+            "d1.migration_ledger_authority_invalid",
+        ));
+
+        for (label, value, code) in cases {
+            let error =
+                parse_d1_migration_ledger_authority(&value, "d1_migrations").expect_err(label);
+            assert_eq!(
+                error.structured_content.expect(label)["error"]["code"],
+                code,
+                "{label}"
+            );
+        }
+    }
 
     #[test]
     fn manifest_write_result_classification_is_closed() {
@@ -716,6 +956,48 @@ pub(crate) async fn read_stable_d1_migration_ledger(
             "unknown_ledger": true,
             "error": {"code": "d1.migration_ledger_unstable", "message": "two terminal provider ledger readbacks disagreed", "hint": "Reconcile concurrent or external migration activity before clearing the retained lease."},
         })));
+    }
+    Ok(first)
+}
+
+/// Before a manifest apply creates local custody or issues migration SQL, make
+/// two primary-served reads of the reserved ledger's schema authority.  This
+/// is deliberately separate from the ordinary filename ledger read: the latter
+/// cannot prove that a same-named view, case-equivalent object, schema drift,
+/// or a trigger on the target will not change the meaning of the next write.
+pub(crate) async fn read_stable_d1_migration_ledger_authority(
+    server: &CloudflareMcp,
+    account_id: &str,
+    database_id: &str,
+    migrations_table: &str,
+) -> Result<D1ManifestLedgerAuthority, CallToolResult> {
+    let read_once = || async {
+        let value = server
+            .cloudflare
+            .query_d1_migration_manifest(
+                account_id,
+                database_id,
+                &d1_migration_ledger_authority_sql(migrations_table),
+                &[],
+            )
+            .await
+            .map_err(|_| {
+                d1_manifest_ledger_authority_result(
+                    "d1.migration_ledger_authority_unreadable",
+                    "could not read the migration-ledger schema authority from D1",
+                    "Reconcile the exact migration-ledger schema and primary readback before applying migration SQL.",
+                )
+            })?;
+        parse_d1_migration_ledger_authority(&value, migrations_table)
+    };
+    let first = read_once().await?;
+    let second = read_once().await?;
+    if first != second {
+        return Err(d1_manifest_ledger_authority_result(
+            "d1.migration_ledger_authority_unstable",
+            "two primary migration-ledger authority readbacks disagreed",
+            "Reconcile concurrent or external ledger changes before applying migration SQL.",
+        ));
     }
     Ok(first)
 }
