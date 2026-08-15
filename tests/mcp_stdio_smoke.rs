@@ -7789,9 +7789,14 @@ fn d1_terminal_replays_canonical_v1_retirement_as_legacy_and_rejects_extended_re
     let changed_prefix_content = structured_content(&changed_prefix);
     assert_eq!(changed_prefix_content["ok"], json!(false));
     assert_eq!(changed_prefix_content["provider_calls"], json!(0));
+    assert_eq!(changed_prefix_content["provider_mutations"], json!(0));
+    assert_eq!(
+        changed_prefix_content["local_namespace_mutations"],
+        json!(0)
+    );
     assert_eq!(
         changed_prefix_content["error"]["code"],
-        json!("d1.migration_terminal_plan_mismatch")
+        json!("d1.migration_terminal_request_invalid")
     );
 
     let (view_trigger_manifest, view_trigger_expectations, _) =
@@ -8476,6 +8481,215 @@ fn d1_finalize_migration_reconciliation_stdio_reports_preinspection_and_inspecti
         }),
     );
     mcp.terminate();
+}
+
+#[test]
+fn d1_terminal_request_rejects_the_complete_manifest_outcome_prefix_negative_matrix() {
+    let (manifest, state_expectations) = seed_prefix_reconciliation_case();
+    let invalid_products = [
+        ("not_committed", 0usize, 1usize),
+        ("not_committed", 1, 0),
+        ("not_committed", 3, 3),
+        ("partial_state_converged", 0, 0),
+        ("partial_state_converged", 0, 2),
+        ("partial_state_converged", 0, 3),
+        ("partial_state_converged", 1, 0),
+        ("full_state_converged", 0, 0),
+        ("full_state_converged", 0, 1),
+        ("full_state_converged", 0, 3),
+        ("full_state_converged", 1, 0),
+    ];
+    let mut mcp = McpStdioProcess::start();
+    for (case_index, (outcome, original_prefix_length, current_prefix_length)) in
+        invalid_products.into_iter().enumerate()
+    {
+        let mut args = terminal_request_args(
+            &manifest,
+            &state_expectations,
+            &"a".repeat(64),
+            &"b".repeat(64),
+            &"c".repeat(64),
+        );
+        args["effect_assertion_id"] = json!("schema_create_objects_additive_seed_rows_v1");
+        args["expected_outcome"] = json!(outcome);
+        args["expected_original_prefix_length"] = json!(original_prefix_length);
+        args["expected_current_prefix_length"] = json!(current_prefix_length);
+        let rejected = mcp.call_tool(
+            1100 + case_index as u64,
+            "d1_finalize_migration_reconciliation",
+            args,
+        );
+        let content = structured_content(&rejected);
+        assert_eq!(content["ok"], false, "{content}");
+        assert_eq!(
+            content["error"]["code"], "d1.migration_terminal_request_invalid",
+            "{outcome}: {original_prefix_length}->{current_prefix_length}"
+        );
+        assert_eq!(content["custody_status"], "not_inspected", "{content}");
+        assert_eq!(content["provider_calls"], 0, "{content}");
+        assert_eq!(content["provider_mutations"], 0, "{content}");
+        assert_eq!(content["local_namespace_mutations"], 0, "{content}");
+        assert_eq!(content["receipt_persisted"], false, "{content}");
+    }
+    mcp.terminate();
+}
+
+#[test]
+fn d1_terminal_restored_v1_v2_semantic_contradictions_fail_read_only_in_every_namespace() {
+    #[derive(Serialize)]
+    struct RestoredReceipt<'a> {
+        version: u8,
+        operation: &'static str,
+        target_key_sha256: &'a str,
+        lease_nonce: &'a str,
+        lease_payload_sha256: &'a str,
+        approved_apply_plan_sha256: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        effect_assertion_id: Option<&'static str>,
+        reconciliation_plan_sha256: &'a str,
+        expectation_proof_sha256: &'a str,
+        query_sha256: &'a str,
+        canonical_snapshot_sha256: &'a str,
+        terminal_request_sha256: &'a str,
+        terminal_attempt_sha256: &'a str,
+        terminal_plan_sha256: &'a str,
+        outcome: &'a str,
+        original_prefix_length: usize,
+        current_prefix_length: usize,
+    }
+
+    let (manifest, state_expectations) = one_table_reconciliation_case();
+    let contradictory_products = [
+        ("not_committed", 0usize, 1usize),
+        ("not_committed", 1, 0),
+        ("partial_state_converged", 0, 0),
+        ("partial_state_converged", 1, 0),
+        ("full_state_converged", 0, 0),
+        ("full_state_converged", 1, 0),
+    ];
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-terminal-semantic-restores-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create semantic restore root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make semantic restore root private");
+    }
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        (
+            "CLOUDFLARE_MCP_API_BASE_URL",
+            "http://127.0.0.1:9".to_string(), // DevSkim: ignore DS137138 -- loopback-only zero-call fixture
+        ),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let target_key_sha256 = sha256_hex("acct-1\0db-1");
+    let reconciliation_plan_sha256 = "1".repeat(64);
+    let expectation_proof_sha256 = "2".repeat(64);
+    let query_sha256 = "3".repeat(64);
+    let canonical_snapshot_sha256 = "4".repeat(64);
+    let terminal_request_sha256 = "5".repeat(64);
+    let terminal_attempt_sha256 = "6".repeat(64);
+    let terminal_plan_sha256 = "7".repeat(64);
+    let mut request_id = 1200u64;
+
+    for receipt_version in [1u8, 2] {
+        for namespace in ["active", "retiring", "retired"] {
+            for (outcome, original_prefix_length, current_prefix_length) in contradictory_products {
+                let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+                    create_retained_reconciliation_fixture(&lease_root, &manifest);
+                let target = manifest_target_path(&lease_root);
+                let receipt = RestoredReceipt {
+                    version: receipt_version,
+                    operation: "d1_finalize_migration_reconciliation",
+                    target_key_sha256: &target_key_sha256,
+                    lease_nonce: &lease_nonce,
+                    lease_payload_sha256: &lease_payload_sha256,
+                    approved_apply_plan_sha256: &approved_plan_sha256,
+                    effect_assertion_id: (receipt_version == 2).then_some("schema_create_only_v1"),
+                    reconciliation_plan_sha256: &reconciliation_plan_sha256,
+                    expectation_proof_sha256: &expectation_proof_sha256,
+                    query_sha256: &query_sha256,
+                    canonical_snapshot_sha256: &canonical_snapshot_sha256,
+                    terminal_request_sha256: &terminal_request_sha256,
+                    terminal_attempt_sha256: &terminal_attempt_sha256,
+                    terminal_plan_sha256: &terminal_plan_sha256,
+                    outcome,
+                    original_prefix_length,
+                    current_prefix_length,
+                };
+                let receipt_bytes =
+                    serde_json::to_vec(&receipt).expect("encode restored semantic receipt");
+                let receipt_path = target.join(format!(
+                    "terminal-reconciliation.{lease_nonce}.receipt.json"
+                ));
+                fs::write(&receipt_path, &receipt_bytes)
+                    .expect("install restored semantic receipt");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600))
+                        .expect("make restored semantic receipt private");
+                }
+                let evidence_path = match namespace {
+                    "active" => target.join("active.lease.json"),
+                    "retiring" => {
+                        let path = target.join("retiring.lease.json");
+                        fs::rename(target.join("active.lease.json"), &path)
+                            .expect("install retiring semantic receipt fixture");
+                        path
+                    }
+                    "retired" => {
+                        let path = target.join(format!("retired.{lease_nonce}.lease.json"));
+                        fs::rename(target.join("active.lease.json"), &path)
+                            .expect("install retired semantic receipt fixture");
+                        path
+                    }
+                    _ => unreachable!(),
+                };
+                let evidence_bytes = fs::read(&evidence_path).expect("read semantic evidence");
+                let args = terminal_request_args(
+                    &manifest,
+                    &state_expectations,
+                    &approved_plan_sha256,
+                    &lease_nonce,
+                    &lease_payload_sha256,
+                );
+                let rejected =
+                    mcp.call_tool(request_id, "d1_finalize_migration_reconciliation", args);
+                request_id += 1;
+                let content = structured_content(&rejected);
+                assert_eq!(content["ok"], false, "{content}");
+                assert_eq!(
+                    content["error"]["code"], "d1.migration_terminal_evidence_invalid",
+                    "v{receipt_version} {namespace} {outcome} {original_prefix_length}->{current_prefix_length}"
+                );
+                assert_eq!(content["provider_calls"], 0, "{content}");
+                assert_eq!(content["provider_mutations"], 0, "{content}");
+                assert_eq!(content["local_namespace_mutations"], 0, "{content}");
+                assert_eq!(content["receipt_persisted"], false, "{content}");
+                assert_eq!(
+                    fs::read(&receipt_path).expect("reread restored receipt"),
+                    receipt_bytes,
+                    "receipt rejection must not mutate local evidence"
+                );
+                assert_eq!(
+                    fs::read(&evidence_path).expect("reread restored custody"),
+                    evidence_bytes,
+                    "custody rejection must not mutate local evidence"
+                );
+                fs::remove_dir_all(&target).expect("remove completed semantic fixture");
+            }
+        }
+    }
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
 }
 
 #[test]

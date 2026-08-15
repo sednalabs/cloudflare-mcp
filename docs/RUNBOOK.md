@@ -381,6 +381,25 @@ complete primary-current batches and returns `terminal_plan_sha256`. Record and
 independently approve that exact digest before a live call. A digest derived
 after the live read is not approval.
 
+Before any custody inspection, confirm that original and current prefixes are
+both bounded by the exact supplied manifest and apply this closed outcome
+matrix:
+
+- `not_committed`: current equals original;
+- `partial_state_converged`: original is less than current and current is less
+  than the manifest length;
+- `full_state_converged`: original is less than current and current equals the
+  manifest length.
+
+No other outcome/prefix product may be planned, persisted, or replayed.
+Canonical v1/v2 receipt readback cannot rederive manifest length, so it first
+enforces the strongest independent subset: equal prefixes only for
+`not_committed`, and strict growth for both converged outcomes. The terminal
+request then rebinds that receipt to the supplied manifest and enforces the
+complete matrix above. Canonical-but-contradictory restored evidence fails
+before provider access or local namespace mutation in active, retiring, and
+retired custody.
+
 Reuse the exact same effect assertion in reconciliation, terminal dry run, and
 live finalization. The terminal path derives and verifies the same complete
 table/index/view/trigger inventory; it does not downgrade the assertion or
@@ -424,7 +443,8 @@ evidence for exact replay. A terminal retirement with no exact receipt is an
 order violation and cannot be repaired by creating a receipt afterward. Exact
 replay after completed retirement validates the receipt and retired lease and
 reproduces the receipt-bound expectation proof and versioned reconciliation
-plan from the supplied manifest before returning with zero provider calls.
+plan from the supplied manifest, including the complete outcome/prefix matrix,
+before returning with zero provider calls.
 If another exact caller completes retirement after initial inspection but
 before reconciliation preparation, a preparation failure with exactly zero
 provider calls permits one fresh custody inspection. It converges only through

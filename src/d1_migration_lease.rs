@@ -18,6 +18,7 @@ use rmcp::model::CallToolResult;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::d1_migration_terminal_semantics::valid_receipt_outcome_prefixes;
 use crate::tools::{invalid_argument_result, sha256_bytes_hex};
 use crate::verification::now_unix_ms;
 
@@ -1402,11 +1403,11 @@ mod linux {
             || !valid_lower_sha256(&receipt.terminal_attempt_sha256)
             || receipt.terminal_request_sha256 == receipt.terminal_attempt_sha256
             || !valid_lower_sha256(&receipt.terminal_plan_sha256)
-            || !matches!(
-                receipt.outcome.as_str(),
-                "not_committed" | "partial_state_converged" | "full_state_converged"
+            || !valid_receipt_outcome_prefixes(
+                &receipt.outcome,
+                receipt.original_prefix_length,
+                receipt.current_prefix_length,
             )
-            || receipt.current_prefix_length < receipt.original_prefix_length
         {
             return Err("terminal reconciliation receipt contains noncanonical authority fields");
         }
@@ -1431,11 +1432,11 @@ mod linux {
             || !valid_lower_sha256(&receipt.terminal_attempt_sha256)
             || receipt.terminal_request_sha256 == receipt.terminal_attempt_sha256
             || !valid_lower_sha256(&receipt.terminal_plan_sha256)
-            || !matches!(
-                receipt.outcome.as_str(),
-                "not_committed" | "partial_state_converged" | "full_state_converged"
+            || !valid_receipt_outcome_prefixes(
+                &receipt.outcome,
+                receipt.original_prefix_length,
+                receipt.current_prefix_length,
             )
-            || receipt.current_prefix_length < receipt.original_prefix_length
         {
             return Err("terminal reconciliation receipt contains noncanonical authority fields");
         }
@@ -3290,6 +3291,121 @@ mod tests {
                 "{label} restored receipt must fail closed"
             );
             fs::remove_dir_all(root).expect("test cleanup");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restored_v1_v2_terminal_receipts_reject_every_semantic_contradiction_in_each_namespace() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let contradictory_products = [
+            ("not_committed", 0, 1),
+            ("not_committed", 1, 0),
+            ("partial_state_converged", 0, 0),
+            ("partial_state_converged", 1, 0),
+            ("full_state_converged", 0, 0),
+            ("full_state_converged", 1, 0),
+        ];
+        for receipt_version in [1, 2] {
+            for namespace in ["active", "retiring", "retired"] {
+                for (outcome, original_prefix_length, current_prefix_length) in
+                    contradictory_products
+                {
+                    let root = private_test_root(&format!(
+                        "terminal-semantic-v{receipt_version}-{namespace}-{outcome}-{original_prefix_length}-{current_prefix_length}"
+                    ));
+                    let plan = "a".repeat(64);
+                    let mut owner = acquire_d1_migration_lease_at(
+                        root.clone(),
+                        "acct-1",
+                        "db-1",
+                        "newsletter-core",
+                        &plan,
+                    )
+                    .expect("create restored semantic fixture");
+                    let identity = owner.identity.clone();
+                    let target = owner
+                        .active_path_for_test()
+                        .expect("active semantic path")
+                        .parent()
+                        .expect("semantic target")
+                        .to_path_buf();
+                    owner.retain();
+                    drop(owner);
+
+                    let mut current = terminal_receipt(&identity, &plan);
+                    current.outcome = outcome.to_string();
+                    current.original_prefix_length = original_prefix_length;
+                    current.current_prefix_length = current_prefix_length;
+                    let mut legacy = terminal_receipt_v1(&identity, &plan);
+                    legacy.outcome = outcome.to_string();
+                    legacy.original_prefix_length = original_prefix_length;
+                    legacy.current_prefix_length = current_prefix_length;
+                    let receipt_bytes = if receipt_version == 1 {
+                        serde_json::to_vec(&legacy).expect("encode restored v1 contradiction")
+                    } else {
+                        serde_json::to_vec(&current).expect("encode restored v2 contradiction")
+                    };
+                    let receipt_path = target.join(format!(
+                        "terminal-reconciliation.{}.receipt.json",
+                        identity.nonce
+                    ));
+                    fs::write(&receipt_path, &receipt_bytes)
+                        .expect("install restored semantic contradiction");
+                    fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600))
+                        .expect("make restored semantic receipt private");
+                    let evidence_path = match namespace {
+                        "active" => target.join(ACTIVE_LEASE_NAME),
+                        "retiring" => {
+                            let path = target.join(RETIRING_LEASE_NAME);
+                            fs::rename(target.join(ACTIVE_LEASE_NAME), &path)
+                                .expect("install retiring semantic fixture");
+                            path
+                        }
+                        "retired" => {
+                            let path =
+                                target.join(format!("retired.{}.lease.json", identity.nonce));
+                            fs::rename(target.join(ACTIVE_LEASE_NAME), &path)
+                                .expect("install retired semantic fixture");
+                            path
+                        }
+                        _ => unreachable!(),
+                    };
+                    let evidence_bytes = fs::read(&evidence_path).expect("read semantic custody");
+
+                    let retained = inspect_terminal_d1_migration_lease_at(
+                        root.clone(),
+                        "acct-1",
+                        "db-1",
+                        "newsletter-core",
+                        &plan,
+                        &identity.nonce,
+                        &identity.payload_sha256,
+                    )
+                    .expect("inspect restored semantic custody");
+                    let expected = terminal_receipt(&identity, &plan);
+                    let expected_legacy = terminal_receipt_v1(&identity, &plan);
+                    assert!(
+                        retained
+                            .compatible_terminal_receipt_state(&expected, Some(&expected_legacy),)
+                            .is_err(),
+                        "v{receipt_version} {namespace} {outcome} {original_prefix_length}->{current_prefix_length} must fail closed"
+                    );
+                    assert_eq!(
+                        fs::read(&receipt_path).expect("reread semantic receipt"),
+                        receipt_bytes,
+                        "receipt rejection must be read-only"
+                    );
+                    assert_eq!(
+                        fs::read(&evidence_path).expect("reread semantic custody"),
+                        evidence_bytes,
+                        "custody rejection must be read-only"
+                    );
+                    assert_eq!(retained.identity.namespace, namespace);
+                    fs::remove_dir_all(root).expect("test cleanup");
+                }
+            }
         }
     }
 

@@ -236,6 +236,15 @@ persistence, repeats that read immediately before retirement, and never issues
 a provider write. Exact replay of a completed receipt/retirement converges with
 zero provider calls; changed, malformed, duplicate, noncanonical, or
 retirement-before-receipt evidence fails closed and retains the blocker.
+The supplied manifest is also outcome authority: both prefixes must be bounded
+by its exact length; `not_committed` requires current equal to original,
+`partial_state_converged` requires original less than current less than manifest
+length, and `full_state_converged` requires original less than current equal to
+manifest length. Canonical v1 and v2 receipt parsing applies the strongest
+manifest-independent part of that contract, so restored `not_committed`
+receipts require equal prefixes while both converged outcomes require strict
+growth. A canonical shape with a contradictory relationship is invalid durable
+evidence, including during zero-provider completed-retirement replay.
 The terminal response claims custody only after fresh physical readback. A
 verified active lease reports `lease_retained=true` with
 `lease_decision=retain`; verified retirement reports `lease_retained=false`
