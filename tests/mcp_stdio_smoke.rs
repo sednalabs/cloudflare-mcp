@@ -7148,6 +7148,46 @@ fn d1_reconciliation_reserves_the_migrations_table_before_custody() {
             ],
         ),
         (
+            "trigger WHEN subquery reference",
+            "d1_migrations",
+            "schema_create_objects_additive_v1",
+            vec![
+                "CREATE TABLE audit(id INTEGER PRIMARY KEY); CREATE TRIGGER audit_when_ledger AFTER INSERT ON audit WHEN EXISTS (SELECT 1 FROM D1_MIGRATIONS) BEGIN SELECT 1; END;",
+            ],
+        ),
+        (
+            "single-quoted DELETE target",
+            "d1_migrations",
+            "schema_create_objects_additive_v1",
+            vec![
+                "CREATE TABLE audit(id INTEGER PRIMARY KEY); CREATE TRIGGER audit_delete_ledger AFTER INSERT ON audit BEGIN DELETE FROM 'D1_MIGRATIONS'; END;",
+            ],
+        ),
+        (
+            "keyword fallback with",
+            "with",
+            "schema_create_objects_additive_v1",
+            vec![
+                "CREATE TABLE audit(id INTEGER PRIMARY KEY); CREATE TRIGGER audit_delete_with AFTER INSERT ON audit BEGIN DELETE FROM with; END;",
+            ],
+        ),
+        (
+            "keyword fallback recursive",
+            "recursive",
+            "schema_create_objects_additive_v1",
+            vec![
+                "CREATE TABLE audit(id INTEGER PRIMARY KEY); CREATE TRIGGER audit_delete_recursive AFTER INSERT ON audit BEGIN DELETE FROM recursive; END;",
+            ],
+        ),
+        (
+            "keyword fallback replace",
+            "replace",
+            "schema_create_objects_additive_v1",
+            vec![
+                "CREATE TABLE audit(id INTEGER PRIMARY KEY); CREATE TRIGGER audit_delete_replace AFTER INSERT ON audit BEGIN DELETE FROM replace; END;",
+            ],
+        ),
+        (
             "cross entry trigger body reference",
             "d1_migrations",
             "schema_create_objects_additive_v1",
@@ -7194,7 +7234,7 @@ fn d1_reconciliation_reserves_the_migrations_table_before_custody() {
         let content = structured_content(&response);
         let expected = expected_d1_reconciliation_semantic_error(
             "d1.migration_reconciliation_migrations_table_reserved",
-            "the configured migrations table is reserved and cannot be created, indexed, used as a trigger parent, referenced as a trigger-body identifier, named as another schema object, or altered by a reconciled manifest",
+            "the configured migrations table is reserved and cannot be created, indexed, used as a trigger parent, present as an exact trigger header/body token, named as another schema object, or altered by a reconciled manifest",
             "Retain the exact lease evidence. Do not retry the original migration attempt or mutate D1 from this result.",
         );
         assert_eq!(content, &expected, "{label}: {content}");
@@ -7207,6 +7247,38 @@ fn d1_reconciliation_reserves_the_migrations_table_before_custody() {
         0,
         "reserved ledger effects must stop before provider access",
     );
+
+    let unrelated_sql = "CREATE TABLE d1_migrations_archive(id INTEGER PRIMARY KEY); CREATE TRIGGER archive_after_insert AFTER INSERT ON d1_migrations_archive WHEN 'd1_migrations_archive' IS NOT NULL BEGIN DELETE FROM d1_migrations_archive; END;";
+    let unrelated = mcp.call_tool(
+        899,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "migrations_table": "d1_migrations",
+            "manifest": [{
+                "name": "0001_unrelated.sql",
+                "size_bytes": unrelated_sql.len(),
+                "sql_sha256": sha256_hex(unrelated_sql),
+                "sql": unrelated_sql,
+            }],
+            "approved_plan_sha256": "a".repeat(64),
+            "lease_nonce": "b".repeat(64),
+            "lease_payload_sha256": "c".repeat(64),
+            "effect_assertion_id": "schema_create_objects_additive_v1",
+            "state_expectations": [],
+        }),
+    );
+    let unrelated_content = structured_content(&unrelated);
+    assert_eq!(unrelated_content["ok"], json!(false), "{unrelated_content}");
+    assert_eq!(
+        unrelated_content["error"]["code"],
+        json!("d1.migration_reconciliation_expectations_incomplete"),
+        "longer unrelated trigger tokens must pass reservation and reach expectation validation",
+    );
+    assert_eq!(unrelated_content["provider_calls"], json!(0));
+    assert_eq!(unrelated_content["provider_mutations"], json!(0));
+    assert_eq!(unrelated_content["local_namespace_mutations"], json!(0));
 
     let terminal_sql = "CREATE TABLE audit(id INTEGER PRIMARY KEY); CREATE TRIGGER audit_after_insert AFTER INSERT ON audit BEGIN UPDATE D1_MIGRATIONS SET name = 'blocked'; END;";
     let terminal_manifest = json!([{

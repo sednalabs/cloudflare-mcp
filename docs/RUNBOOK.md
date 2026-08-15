@@ -188,10 +188,11 @@ reports `schema_create_only`, `schema_create_tables_indexes_views_triggers`, or
 For every assertion, the configured `migrations_table` is a reserved schema
 identifier under SQLite ASCII case-insensitive matching. A manifest must not
 create an object with that name, create an index or trigger on that table, or
-use additive ALTER against it. An admitted trigger body must not name it as an
-`INSERT`, `UPDATE`, or `DELETE` target, a `FROM`/`JOIN` source, a qualified
-identifier, or any other exact tokenized identifier. Quoted and case-varied
-references fail while string literals and longer unrelated names remain valid.
+use additive ALTER against it. Every accepted trigger contributes bounded
+lexical evidence from the complete post-parent header (including `WHEN`) and
+body: each word, quoted identifier, and string-literal value is retained, while
+symbols carry no value. Any exact ASCII-case-insensitive collision fails
+closed, including a string literal; longer unrelated token values remain valid.
 This is rejected before expectation validation, custody
 inspection, or provider access so an injected ledger INSERT cannot activate
 manifest-defined behavior.

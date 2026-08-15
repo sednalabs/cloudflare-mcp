@@ -120,10 +120,12 @@ On success, inspect the complete `effect_assertion.scope` object: its
 closed allowed scope for that selected assertion.
 The configured `migrations_table` remains reserved across all assertions using
 SQLite ASCII case-insensitive identifier equivalence. CREATE object identities,
-index/trigger parents, any exact admitted trigger-body identifier, and additive
+index/trigger parents, any exact admitted trigger header/body lexical token, and additive
 ALTER targets that collide with it fail before custody or provider access.
-Exact tokenized matching ignores string literals and does not reject longer
-unrelated names; unrelated triggers remain supported.
+The bounded evidence retains every word, quoted identifier, and string-literal
+value across the complete post-parent trigger header (including `WHEN`) and
+body. An exact string-literal collision is deliberately rejected; longer
+unrelated token values and unrelated triggers remain supported.
 The boundary also requires every fixed result set in both batches to carry exact
 `meta.served_by_primary=true` evidence; absent, false, null, non-boolean, or
 mixed primary markers are contradictory and cannot support positive
