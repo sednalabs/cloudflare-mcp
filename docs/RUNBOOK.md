@@ -188,14 +188,25 @@ Select one explicit built-in effect assertion:
   cumulative `seed_tables` summary to every prefix expectation: target, ordered
   columns, row count, and local row-set SHA-256. Treat ASCII case variants as
   one SQLite CREATE, ALTER, index, trigger, and seed target while retaining the
-  reviewed `CREATE TABLE` spelling in expectations and fixed queries. Permit
-  only identity-stable affinity pairs: for non-STRICT tables, TEXT literals on
+  reviewed `CREATE TABLE` spelling in expectations and fixed queries. Use the
+  deterministic first-encountered manifest parent spelling for baseline tables
+  not created by this manifest when ALTER/index/trigger parents vary only by
+  SQLite ASCII case. Keep provider and expectation spelling unchanged in the
+  selected fixed proof. Permit only identity-stable affinity pairs: for
+  non-STRICT tables, TEXT literals on
   TEXT/BLOB columns and INTEGER literals on INTEGER/NUMERIC/BLOB columns; for
   STRICT tables, TEXT literals on exact TEXT columns and INTEGER literals on
   exact INT/INTEGER columns. Reject STRICT BLOB seeds before custody/provider
   access. This assertion performs one
   primary-current prefix-selection read followed by two identical complete
-  primary-current schema-and-seed reads. Verify three provider reads, zero
+  primary-current schema-and-seed reads. The full-manifest seed registry must
+  prove three distinct prefix states: no table query before CREATE, an exact
+  zero-row table projection after CREATE and before INSERT without depending on
+  columns added by a later prefix, and the exact typed
+  row set at or after INSERT. Any row in the zero-row window must fail on the
+  first complete proof with two total provider reads and zero mutations.
+  Terminal dry run and live finalization must rederive and repeat that same
+  selected-prefix proof. Otherwise verify three provider reads, zero
   provider mutations, exact aggregate seed summaries, and no raw seed values in
   the response. Any ambiguity or mismatch remains reconciliation-required.
   The predecessor assertions do not accept top-level INSERT.

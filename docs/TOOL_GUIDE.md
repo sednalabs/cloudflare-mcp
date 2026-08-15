@@ -124,6 +124,10 @@ must precede the INSERT and every trigger on that target must follow it, even
 across manifest entries. CREATE, ALTER, index, trigger, seed membership, and
 reuse follow SQLite ASCII case-insensitive identifier identity; expectations
 and fixed read queries retain the one reviewed spelling from `CREATE TABLE`.
+For baseline tables that the supplied manifest does not create, repeated
+case-variant ALTER/index/trigger parents converge on the deterministic first
+encountered manifest spelling for derivation and transition lookup. Provider
+and expectation spellings are still preserved in the selected fixed proof.
 Every `state_expectations`
 prefix adds `seed_tables` with the exact target, ordered columns, row count,
 and locally derived `rows_sha256`. Seed storage is deliberately conservative:
@@ -133,7 +137,14 @@ literals require exact TEXT columns and INTEGER literals require exact INT or
 INTEGER columns. STRICT BLOB and other unproven pairs are rejected before
 custody. The tool first selects the current primary manifest prefix, then
 runs two identical complete primary-current proofs that include exact typed seed
-row readback. Responses return aggregate row-count/digest evidence only; raw
+row readback. Its full-manifest registry records the CREATE and seed prefix for
+every seed target. The selected proof omits a not-yet-created target, requires
+an exact empty table projection after CREATE and before INSERT without
+referencing columns introduced by a later prefix, and requires the
+exact row set at and after INSERT. An unexpected intermediate row stops after
+the first complete proof with zero mutations. Terminal reconciliation rederives
+and repeats the same selected-prefix proof. Responses return aggregate
+row-count/digest evidence only; raw
 seed values are never returned. Implicit columns, INSERT SELECT, expressions,
 NULL/REAL/BLOB values, conflict clauses, qualified or quoted identities,
 duplicate rows/targets, other DML, and any readback mismatch fail closed.

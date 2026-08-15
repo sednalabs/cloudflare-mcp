@@ -77,6 +77,19 @@ pub(crate) struct SeedManifestPlan {
     pub(crate) states: Vec<Vec<SeedTableState>>,
     /// SQLite ASCII-normalized identities of manifest-created STRICT tables.
     pub(crate) strict_table_keys: BTreeSet<String>,
+    /// Full-manifest projection registry. A registered table exists in every
+    /// state at or after `created_prefix`, with zero rows until `seeded_prefix`.
+    pub(crate) registry: Vec<SeedTableRegistration>,
+    /// Deterministic first-seen spellings for baseline/pre-existing table
+    /// identities referenced by additive effects.
+    pub(crate) preexisting_table_spellings: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SeedTableRegistration {
+    pub(crate) state: SeedTableState,
+    pub(crate) created_prefix: usize,
+    pub(crate) seeded_prefix: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -363,6 +376,12 @@ pub(crate) fn seed_select_sql(state: &SeedTableState) -> String {
         .iter()
         .enumerate()
         .flat_map(|(index, column)| {
+            if state.rows.is_empty() {
+                return [
+                    format!("NULL AS \"t{index}\""),
+                    format!("NULL AS \"v{index}\""),
+                ];
+            }
             let column = quote_identifier(column);
             [
                 format!("typeof({column}) AS \"t{index}\""),
@@ -602,6 +621,21 @@ mod tests {
             .expect_err("case alias must reuse one SQLite target");
         assert_eq!(error.code, "d1.migration_reconciliation_seed_target_reused");
         assert_eq!(cumulative["channels"].table_name, "Channels");
+    }
+
+    #[test]
+    fn zero_row_projection_does_not_require_future_seed_columns() {
+        let state = SeedTableState {
+            table_name: "channels".into(),
+            columns: vec!["future_rank".into()],
+            rows: Vec::new(),
+        };
+        let sql = seed_select_sql(&state);
+        assert_eq!(
+            sql,
+            "SELECT NULL AS \"t0\", NULL AS \"v0\" FROM \"channels\" ORDER BY \"t0\", \"v0\" LIMIT 1"
+        );
+        assert!(!sql.contains("future_rank"));
     }
 
     #[test]

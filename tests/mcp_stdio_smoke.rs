@@ -1890,7 +1890,7 @@ fn spawn_fake_canonical_seed_reconciliation_api(
                 .as_str()
                 .expect("canonical seed reconciliation SQL");
             let markers = reconciliation_statement_markers(sql);
-            assert!(matches!(markers.len(), 8 | 10));
+            assert!(matches!(markers.len(), 2 | 10));
             assert!(
                 sql.split(";\n")
                     .all(|statement| statement.starts_with("SELECT "))
@@ -1917,81 +1917,87 @@ fn spawn_fake_canonical_seed_reconciliation_api(
                 tagged_reconciliation_result(
                     &markers[1],
                     &["type", "name", "tbl_name", "sql"],
-                    schema_rows.clone(),
-                    None,
-                ),
-                tagged_reconciliation_result(
-                    &markers[2],
-                    &[
-                        "cid",
-                        "name",
-                        "type",
-                        "notnull",
-                        "dflt_value",
-                        "pk",
-                        "hidden",
-                    ],
-                    publications_xinfo,
-                    None,
-                ),
-                tagged_reconciliation_result(
-                    &markers[3],
-                    &[
-                        "id",
-                        "seq",
-                        "table",
-                        "from",
-                        "to",
-                        "on_update",
-                        "on_delete",
-                        "match",
-                    ],
-                    Vec::new(),
-                    None,
-                ),
-                tagged_reconciliation_result(
-                    &markers[4],
-                    &["table", "rowid", "parent", "fkid"],
-                    Vec::new(),
-                    None,
-                ),
-                tagged_reconciliation_result(
-                    &markers[5],
-                    &[
-                        "cid",
-                        "name",
-                        "type",
-                        "notnull",
-                        "dflt_value",
-                        "pk",
-                        "hidden",
-                    ],
-                    origins_xinfo,
-                    None,
-                ),
-                tagged_reconciliation_result(
-                    &markers[6],
-                    &[
-                        "id",
-                        "seq",
-                        "table",
-                        "from",
-                        "to",
-                        "on_update",
-                        "on_delete",
-                        "match",
-                    ],
-                    Vec::new(),
-                    None,
-                ),
-                tagged_reconciliation_result(
-                    &markers[7],
-                    &["table", "rowid", "parent", "fkid"],
-                    Vec::new(),
+                    if markers.len() == 2 {
+                        Vec::new()
+                    } else {
+                        schema_rows.clone()
+                    },
                     None,
                 ),
             ];
             if markers.len() == 10 {
+                results.extend([
+                    tagged_reconciliation_result(
+                        &markers[2],
+                        &[
+                            "cid",
+                            "name",
+                            "type",
+                            "notnull",
+                            "dflt_value",
+                            "pk",
+                            "hidden",
+                        ],
+                        publications_xinfo,
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[3],
+                        &[
+                            "id",
+                            "seq",
+                            "table",
+                            "from",
+                            "to",
+                            "on_update",
+                            "on_delete",
+                            "match",
+                        ],
+                        Vec::new(),
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[4],
+                        &["table", "rowid", "parent", "fkid"],
+                        Vec::new(),
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[5],
+                        &[
+                            "cid",
+                            "name",
+                            "type",
+                            "notnull",
+                            "dflt_value",
+                            "pk",
+                            "hidden",
+                        ],
+                        origins_xinfo,
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[6],
+                        &[
+                            "id",
+                            "seq",
+                            "table",
+                            "from",
+                            "to",
+                            "on_update",
+                            "on_delete",
+                            "match",
+                        ],
+                        Vec::new(),
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[7],
+                        &["table", "rowid", "parent", "fkid"],
+                        Vec::new(),
+                        None,
+                    ),
+                ]);
                 results.push(tagged_reconciliation_result(
                     &markers[8],
                     &["t0", "v0", "t1", "v1"],
@@ -2045,11 +2051,11 @@ fn spawn_fake_case_variant_seed_reconciliation_api(
                 serde_json::from_slice(&body).expect("case-variant seed request JSON");
             let sql = body_json["sql"].as_str().expect("case-variant seed SQL");
             let markers = reconciliation_statement_markers(sql);
-            assert!(matches!(markers.len(), 5 | 6));
-            assert!(sql.contains("pragma_table_xinfo('Channels')"));
-            assert!(!sql.contains("pragma_table_xinfo('channels')"));
-            assert!(!sql.contains("pragma_table_xinfo('CHANNELS')"));
+            assert!(matches!(markers.len(), 2 | 6));
             if markers.len() == 6 {
+                assert!(sql.contains("pragma_table_xinfo('Channels')"));
+                assert!(!sql.contains("pragma_table_xinfo('channels')"));
+                assert!(!sql.contains("pragma_table_xinfo('CHANNELS')"));
                 assert!(sql.contains("FROM \"Channels\""));
                 assert!(!sql.contains("FROM \"CHANNELS\""));
                 assert!(!sql.contains("FROM \"cHaNnElS\""));
@@ -2059,7 +2065,7 @@ fn spawn_fake_case_variant_seed_reconciliation_api(
                 .expect("case-variant seed request log")
                 .push(body_json);
 
-            let table_sql = "CREATE TABLE Channels(id TEXT PRIMARY KEY, rank INTEGER)";
+            let table_sql = "CREATE TABLE Channels(id TEXT PRIMARY KEY, rank INTEGER, note TEXT)";
             let index_sql = "CREATE INDEX channels_by_rank ON cHaNnElS(rank)";
             let trigger_sql = "CREATE TRIGGER channels_guard BEFORE UPDATE ON CHANNELS BEGIN SELECT RAISE(ABORT, 'immutable'); END";
             let mut results = vec![
@@ -2075,13 +2081,20 @@ fn spawn_fake_case_variant_seed_reconciliation_api(
                 tagged_reconciliation_result(
                     &markers[1],
                     &["type", "name", "tbl_name", "sql"],
-                    vec![
-                        json!({"type": "index", "name": "channels_by_rank", "tbl_name": "Channels", "sql": index_sql}),
-                        json!({"type": "table", "name": "Channels", "tbl_name": "Channels", "sql": table_sql}),
-                        json!({"type": "trigger", "name": "channels_guard", "tbl_name": "CHANNELS", "sql": trigger_sql}),
-                    ],
+                    if markers.len() == 2 {
+                        Vec::new()
+                    } else {
+                        vec![
+                            json!({"type": "index", "name": "channels_by_rank", "tbl_name": "Channels", "sql": index_sql}),
+                            json!({"type": "table", "name": "Channels", "tbl_name": "Channels", "sql": table_sql}),
+                            json!({"type": "trigger", "name": "channels_guard", "tbl_name": "CHANNELS", "sql": trigger_sql}),
+                        ]
+                    },
                     None,
                 ),
+            ];
+            if markers.len() == 6 {
+                results.extend([
                 tagged_reconciliation_result(
                     &markers[2],
                     &[
@@ -2096,6 +2109,7 @@ fn spawn_fake_case_variant_seed_reconciliation_api(
                     vec![
                         json!({"cid": 0, "name": "id", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 1, "hidden": 0}),
                         json!({"cid": 1, "name": "rank", "type": "INTEGER", "notnull": 0, "dflt_value": null, "pk": 0, "hidden": 0}),
+                        json!({"cid": 2, "name": "note", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 0, "hidden": 0}),
                     ],
                     None,
                 ),
@@ -2120,8 +2134,7 @@ fn spawn_fake_case_variant_seed_reconciliation_api(
                     Vec::new(),
                     None,
                 ),
-            ];
-            if markers.len() == 6 {
+                ]);
                 let (integer_type, integer_value) = if wrong_seed_storage {
                     ("text", uppercase_hex(&i64::MIN.to_string()))
                 } else {
@@ -2151,6 +2164,116 @@ fn spawn_fake_case_variant_seed_reconciliation_api(
             stream
                 .write_all(&response)
                 .expect("write case-variant seed response");
+        }
+    });
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
+}
+
+fn spawn_fake_seed_prefix_reconciliation_api(
+    current_prefix: usize,
+    unexpected_intermediate_row: bool,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind seed-prefix D1 API"); // DevSkim: ignore DS162092 -- loopback-only MCP test fixture
+    let addr = listener.local_addr().expect("seed-prefix D1 address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().take(6) {
+            let mut stream = stream.expect("seed-prefix stream");
+            let (headers, body) = read_http_request(&mut stream);
+            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            let body_json: Value = serde_json::from_slice(&body).expect("seed-prefix request JSON");
+            let sql = body_json["sql"].as_str().expect("seed-prefix SQL");
+            let markers = reconciliation_statement_markers(sql);
+            let selection = markers.len() == 2;
+            if selection || current_prefix == 0 {
+                assert_eq!(markers.len(), 2);
+                assert!(!sql.contains("pragma_table_xinfo"));
+                assert!(!sql.contains("FROM \"Channels\""));
+            } else {
+                assert_eq!(markers.len(), 6);
+                assert!(sql.contains("pragma_table_xinfo('Channels')"));
+                assert!(sql.contains("FROM \"Channels\""));
+            }
+            requests_for_thread
+                .lock()
+                .expect("seed-prefix request log")
+                .push(body_json);
+
+            let ledger_rows = [
+                json!({"id": 1, "name": "0001_create.sql"}),
+                json!({"id": 2, "name": "0002_seed.sql"}),
+            ]
+            .into_iter()
+            .take(current_prefix)
+            .collect::<Vec<_>>();
+            let mut results = vec![
+                tagged_reconciliation_result(
+                    &markers[0],
+                    &["id", "name"],
+                    ledger_rows,
+                    Some(json!({"changed_db": false, "changes": 0, "rows_written": 0})),
+                ),
+                tagged_reconciliation_result(
+                    &markers[1],
+                    &["type", "name", "tbl_name", "sql"],
+                    if selection || current_prefix == 0 {
+                        Vec::new()
+                    } else {
+                        vec![json!({
+                            "type": "table",
+                            "name": "Channels",
+                            "tbl_name": "Channels",
+                            "sql": "CREATE TABLE Channels(id TEXT PRIMARY KEY)",
+                        })]
+                    },
+                    None,
+                ),
+            ];
+            if !selection && current_prefix > 0 {
+                results.extend([
+                    tagged_reconciliation_result(
+                        &markers[2],
+                        &["cid", "name", "type", "notnull", "dflt_value", "pk", "hidden"],
+                        vec![json!({"cid": 0, "name": "id", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 1, "hidden": 0})],
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[3],
+                        &["id", "seq", "table", "from", "to", "on_update", "on_delete", "match"],
+                        Vec::new(),
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[4],
+                        &["table", "rowid", "parent", "fkid"],
+                        Vec::new(),
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[5],
+                        &["t0", "v0"],
+                        if current_prefix == 2 || unexpected_intermediate_row {
+                            vec![json!({"t0": "text", "v0": uppercase_hex("daily")})]
+                        } else {
+                            Vec::new()
+                        },
+                        None,
+                    ),
+                ]);
+            }
+            let response = serde_json::to_vec(&json!({
+                "success": true,
+                "errors": [],
+                "messages": [],
+                "result": results,
+            }))
+            .expect("serialize seed-prefix response");
+            write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                .expect("write seed-prefix response headers");
+            stream
+                .write_all(&response)
+                .expect("write seed-prefix response");
         }
     });
     (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
@@ -5935,7 +6058,7 @@ fn d1_canonical_five_seed_rows_bind_reconciliation_terminal_receipt_and_replay()
             .iter()
             .filter(
                 |request| reconciliation_statement_markers(request["sql"].as_str().unwrap()).len()
-                    == 8
+                    == 2
             )
             .count(),
         3,
@@ -5956,10 +6079,185 @@ fn d1_canonical_five_seed_rows_bind_reconciliation_terminal_receipt_and_replay()
 }
 
 #[test]
+fn d1_seed_projection_registry_proves_zero_create_only_and_full_prefixes() {
+    let create_sql = "CREATE TABLE Channels(id TEXT PRIMARY KEY);";
+    let seed_sql = "INSERT INTO channels (id) VALUES ('daily');";
+    let manifest = json!([
+        {
+            "name": "0001_create.sql",
+            "size_bytes": create_sql.len(),
+            "sql_sha256": sha256_hex(create_sql),
+            "sql": create_sql,
+        },
+        {
+            "name": "0002_seed.sql",
+            "size_bytes": seed_sql.len(),
+            "sql_sha256": sha256_hex(seed_sql),
+            "sql": seed_sql,
+        }
+    ]);
+    let empty_seed_sha256 = typed_seed_rowset_sha256("Channels", &["id"], Vec::new());
+    let full_seed_sha256 = typed_seed_rowset_sha256(
+        "Channels",
+        &["id"],
+        vec![vec![json!({
+            "storage_class": "text",
+            "value": uppercase_hex("daily"),
+        })]],
+    );
+    let table_object = json!({
+        "object_type": "table",
+        "name": "Channels",
+        "table_name": "Channels",
+        "sql_sha256": sha256_hex("CREATE TABLE Channels(id TEXT PRIMARY KEY)"),
+    });
+    let table = json!({
+        "name": "Channels",
+        "columns": [{
+            "cid": 0,
+            "name": "id",
+            "declared_type": "TEXT",
+            "not_null": false,
+            "default_value": null,
+            "primary_key_position": 1,
+            "hidden": 0,
+        }],
+        "foreign_keys": [],
+    });
+    let state_expectations = json!([
+        {"manifest_prefix_length": 0, "schema_objects": [], "tables": []},
+        {
+            "manifest_prefix_length": 1,
+            "schema_objects": [table_object.clone()],
+            "tables": [table.clone()],
+            "seed_tables": [{
+                "table_name": "Channels",
+                "columns": ["id"],
+                "row_count": 0,
+                "rows_sha256": empty_seed_sha256,
+            }],
+        },
+        {
+            "manifest_prefix_length": 2,
+            "schema_objects": [table_object],
+            "tables": [table],
+            "seed_tables": [{
+                "table_name": "Channels",
+                "columns": ["id"],
+                "row_count": 1,
+                "rows_sha256": full_seed_sha256,
+            }],
+        },
+    ]);
+
+    for (case_index, (prefix, unexpected_intermediate, expected_outcome)) in [
+        (0usize, false, "not_committed"),
+        (1usize, true, ""),
+        (1usize, false, "partial_state_converged"),
+        (2usize, false, "full_state_converged"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (base_url, requests) =
+            spawn_fake_seed_prefix_reconciliation_api(prefix, unexpected_intermediate);
+        let lease_root = PathBuf::from("/tmp").join(format!(
+            "cloudflare-mcp-seed-prefix-{case_index}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&lease_root);
+        fs::create_dir(&lease_root).expect("create seed-prefix lease root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+                .expect("make seed-prefix root private");
+        }
+        let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+            create_retained_reconciliation_fixture(&lease_root, &manifest);
+        let mut mcp = McpStdioProcess::start_with_env(vec![
+            ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+            (
+                "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+                lease_root.to_string_lossy().to_string(),
+            ),
+        ]);
+        let args = json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest.clone(),
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_objects_additive_seed_rows_v1",
+            "state_expectations": state_expectations.clone(),
+        });
+        let response = mcp.call_tool(
+            847 + case_index as u64,
+            "d1_reconcile_migration_manifest",
+            args,
+        );
+        let content = structured_content(&response).clone();
+        if unexpected_intermediate {
+            assert_eq!(content["ok"], false, "{content}");
+            assert_eq!(
+                content["error"]["code"],
+                "d1.migration_reconciliation_seed_rows_extra"
+            );
+            assert_eq!(content["provider_calls"], 2);
+            assert_eq!(content["provider_mutations"], 0);
+            assert_eq!(content["local_namespace_mutations"], 0);
+            assert_eq!(content["lease_retained"], true);
+            assert_eq!(requests.lock().expect("unexpected-row requests").len(), 2);
+        } else {
+            assert_eq!(content["ok"], true, "{content}");
+            assert_eq!(content["outcome"], expected_outcome);
+            assert_eq!(content["current_manifest_prefix_length"], prefix);
+            assert_eq!(content["provider_calls"], 3);
+            let evidence = content["seed_row_evidence"]
+                .as_array()
+                .expect("seed evidence array");
+            if prefix == 0 {
+                assert!(evidence.is_empty());
+            } else {
+                assert_eq!(evidence.len(), 1);
+                assert_eq!(evidence[0]["row_count"], usize::from(prefix == 2));
+            }
+
+            if prefix == 1 {
+                let mut terminal_args = terminal_args_from_reconciliation(
+                    &manifest,
+                    &state_expectations,
+                    &approved_plan_sha256,
+                    &lease_nonce,
+                    &lease_payload_sha256,
+                    &content,
+                );
+                terminal_args["effect_assertion_id"] =
+                    json!("schema_create_objects_additive_seed_rows_v1");
+                let dry = mcp.call_tool(860, "d1_finalize_migration_reconciliation", terminal_args);
+                let dry_content = structured_content(&dry);
+                assert_eq!(dry_content["ok"], true, "{dry_content}");
+                assert_eq!(dry_content["provider_calls"], 3);
+                assert_eq!(
+                    requests.lock().expect("terminal zero-proof requests").len(),
+                    6,
+                    "terminal planning must rerun selection plus both zero-row proofs",
+                );
+            } else {
+                assert_eq!(requests.lock().expect("prefix requests").len(), 3);
+            }
+        }
+        mcp.terminate();
+        let _ = fs::remove_dir_all(lease_root);
+    }
+}
+
+#[test]
 fn d1_case_variant_parents_and_identity_stable_mixed_seed_storage_converge() {
-    let initial_table_sql = "CREATE TABLE Channels(id TEXT PRIMARY KEY)";
-    let current_table_sql = "CREATE TABLE Channels(id TEXT PRIMARY KEY, rank INTEGER)";
-    let alter_sql = "ALTER TABLE channels ADD COLUMN rank INTEGER";
+    let initial_table_sql = "CREATE TABLE Channels(id TEXT PRIMARY KEY, rank INTEGER)";
+    let current_table_sql = "CREATE TABLE Channels(id TEXT PRIMARY KEY, rank INTEGER, note TEXT)";
+    let alter_sql = "ALTER TABLE channels ADD COLUMN note TEXT";
     let index_sql = "CREATE INDEX channels_by_rank ON cHaNnElS(rank)";
     let insert_sql = "INSERT INTO CHANNELS (ID, RANK) VALUES ('daily', -9223372036854775808)";
     let trigger_sql = "CREATE TRIGGER channels_guard BEFORE UPDATE ON CHANNELS BEGIN SELECT RAISE(ABORT, 'immutable'); END";
@@ -5998,8 +6296,15 @@ fn d1_case_variant_parents_and_identity_stable_mixed_seed_storage_converge() {
                 "name": "Channels",
                 "columns": [
                     {"cid": 0, "name": "id", "declared_type": "TEXT", "not_null": false, "default_value": null, "primary_key_position": 1, "hidden": 0},
+                    {"cid": 1, "name": "rank", "declared_type": "INTEGER", "not_null": false, "default_value": null, "primary_key_position": 0, "hidden": 0},
                 ],
                 "foreign_keys": [],
+            }],
+            "seed_tables": [{
+                "table_name": "Channels",
+                "columns": ["ID", "RANK"],
+                "row_count": 0,
+                "rows_sha256": typed_seed_rowset_sha256("Channels", &["ID", "RANK"], vec![]),
             }],
         },
         {
@@ -6014,6 +6319,7 @@ fn d1_case_variant_parents_and_identity_stable_mixed_seed_storage_converge() {
                 "columns": [
                     {"cid": 0, "name": "id", "declared_type": "TEXT", "not_null": false, "default_value": null, "primary_key_position": 1, "hidden": 0},
                     {"cid": 1, "name": "rank", "declared_type": "INTEGER", "not_null": false, "default_value": null, "primary_key_position": 0, "hidden": 0},
+                    {"cid": 2, "name": "note", "declared_type": "TEXT", "not_null": false, "default_value": null, "primary_key_position": 0, "hidden": 0},
                 ],
                 "foreign_keys": [],
             }],

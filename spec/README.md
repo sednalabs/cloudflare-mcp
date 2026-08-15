@@ -127,13 +127,19 @@ Preserved curated tool families:
   on that table must follow it, including across manifest entries. Each prefix
   supplies the exact table, ordered columns, row count, and aggregate row-set
   SHA-256. SQLite ASCII case variants share one CREATE, ALTER, index, trigger,
-  and seed target and the reviewed CREATE spelling. Non-STRICT tables admit
+  and seed target and the reviewed CREATE spelling. Baseline tables not created
+  by the manifest use the first encountered manifest parent spelling for
+  case-insensitive transition derivation while retaining exact provider and
+  expectation spelling in the fixed proof. Non-STRICT tables admit
   only identity-stable TEXT/BLOB and INTEGER/NUMERIC/BLOB literal affinity
   pairs. STRICT tables admit only TEXT-on-TEXT and INTEGER-on-INT/INTEGER pairs;
   STRICT BLOB seeds fail before custody/provider access. A primary-current
-  selection read chooses the manifest prefix before
-  two complete primary-current proofs read the exact typed rows; responses expose
-  only aggregate summaries. Arbitrary DML, expressions, implicit columns,
+  selection read chooses the manifest prefix before two complete
+  primary-current proofs. A full-manifest registry omits seed-table reads before
+  CREATE, proves exact table emptiness after CREATE and before INSERT without
+  referencing future columns, and reads the exact typed rows at or after INSERT.
+  Terminal reconciliation rederives and repeats that selected-prefix proof;
+  responses expose only aggregate summaries. Arbitrary DML, expressions, implicit columns,
   conflict clauses, reused targets, and malformed or mismatched rows fail closed.
   The three predecessor assertions remain closed to top-level INSERT effects.
   Successful evidence keeps the legacy `schema_create_only` statement-class

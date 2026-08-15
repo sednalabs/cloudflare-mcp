@@ -279,7 +279,11 @@ turn it into a no-op. CREATE must precede the seed, and every trigger on the
 target must follow it across the whole manifest. SQLite ASCII case-insensitive
 target matching governs CREATE, ALTER, index, trigger, seed, and reuse
 authority, while preserving the reviewed `CREATE TABLE` spelling in exact
-expectations and fixed read queries. Expected storage is admitted only when it
+expectations and fixed read queries. For a baseline table not created by the
+manifest, derivation instead selects the first encountered manifest parent
+spelling for each SQLite ASCII identity; transition matching is case-insensitive,
+while the provider and expectation spelling remains unchanged in the fixed
+proof. Expected storage is admitted only when it
 is identity-stable under the reviewed SQLite affinity: for non-STRICT tables,
 TEXT literals on TEXT/BLOB affinity and INTEGER literals on
 INTEGER/NUMERIC/BLOB affinity; for STRICT tables, only TEXT literals on exact
@@ -287,7 +291,15 @@ TEXT columns and INTEGER literals on exact INT/INTEGER columns. STRICT BLOB and
 other unproven literal/type pairs fail before custody or provider access. The
 tool performs one
 primary-current prefix-selection read before two identical complete
-primary-current schema-and-seed reads. It compares storage class and canonical
+primary-current schema-and-seed reads. A full-manifest registry binds every seed
+target to its CREATE and INSERT prefixes: a selected prefix before CREATE does
+not query the table, a prefix after CREATE but before INSERT proves the exact
+zero-row table projection without requiring a column added by a later prefix,
+and a prefix at or after INSERT proves the exact
+typed row set. An unexpected row in the zero-row window fails on the first
+complete proof, before a second complete read and without provider or local
+mutation. Terminal dry run and finalization rederive the registry and repeat
+the same selected-prefix proof. It compares storage class and canonical
 value locally and returns only table/column identity, exact row count, and the
 row-set digest. Arbitrary DML, conflict clauses, expressions, implicit columns,
 qualified identifiers, unsupported storage classes, duplicates, ordering
