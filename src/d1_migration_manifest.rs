@@ -1021,7 +1021,20 @@ pub(crate) async fn read_stable_d1_migration_ledger_authority(
         parse_d1_migration_ledger_authority(&value, migrations_table)
     };
     let first = read_once().await?;
-    let second = read_once().await?;
+    // Once a first primary authority fact has been observed, a malformed or
+    // contradictory second response is instability, not permission to retain
+    // the first fact. This deliberately makes valid-first/invalid-second
+    // drift observable at every apply/release boundary.
+    let second = match read_once().await {
+        Ok(second) => second,
+        Err(_) => {
+            return Err(d1_manifest_ledger_authority_result(
+                "d1.migration_ledger_authority_unstable",
+                "two primary migration-ledger authority readbacks disagreed or the second could not prove the same authority",
+                "Reconcile concurrent or external ledger changes before applying migration SQL.",
+            ));
+        }
+    };
     if first != second {
         return Err(d1_manifest_ledger_authority_result(
             "d1.migration_ledger_authority_unstable",

@@ -740,7 +740,7 @@ fn spawn_fake_manifest_apply_api() -> (String, Arc<Mutex<Vec<Value>>>) {
     let requests_for_thread = requests.clone();
     thread::spawn(move || {
         let mut apply_seen = false;
-        for stream in listener.incoming().take(10) {
+        for stream in listener.incoming().take(12) {
             let mut stream = stream.expect("fake manifest D1 stream");
             let (headers, body) = read_http_request(&mut stream);
             assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
@@ -780,51 +780,64 @@ fn spawn_fake_manifest_apply_api() -> (String, Arc<Mutex<Vec<Value>>>) {
     (format!("http://{addr}"), requests)
 }
 
-fn spawn_manifest_final_authority_drift_api() -> (String, Arc<Mutex<Vec<Value>>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind final-authority drift D1 API");
+/// A bounded provider fixture whose authority responses are consumed exactly
+/// in query order.  It is deliberately separate from the happy-path fixture
+/// so drift tests prove that no hidden adapter retry can turn an unstable
+/// two-read authority proof into a provider mutation.
+fn spawn_manifest_authority_schedule_api(
+    initial_ledger: Vec<Value>,
+    authority_responses: Vec<Value>,
+    expected_requests: usize,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind authority schedule D1 API");
     let addr = listener
         .local_addr()
-        .expect("final-authority drift D1 address");
+        .expect("authority schedule D1 address");
     let requests = Arc::new(Mutex::new(Vec::new()));
     let requests_for_thread = requests.clone();
     thread::spawn(move || {
-        for request_index in 0..6 {
-            let mut stream = listener
-                .accept()
-                .expect("accept final-authority drift request")
-                .0;
+        let mut authority = authority_responses.into_iter();
+        let mut writes = 0_usize;
+        for stream in listener.incoming().take(expected_requests) {
+            let mut stream = stream.expect("authority schedule request");
             let (headers, body) = read_http_request(&mut stream);
             assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
-            let body_json: Value =
-                serde_json::from_slice(&body).expect("final-authority drift request JSON");
+            let body_json: Value = serde_json::from_slice(&body).expect("authority schedule JSON");
             let sql = body_json["sql"].as_str().unwrap_or_default();
             requests_for_thread
                 .lock()
-                .expect("final-authority drift request log")
+                .expect("authority schedule request log")
                 .push(body_json.clone());
-            let response = match request_index {
-                0 | 3 | 4 => {
-                    assert_eq!(sql, "SELECT * FROM \"d1_migrations\" ORDER BY id");
-                    manifest_ledger_response(vec![json!({"id": 1, "name": "0001_initial.sql"})])
+            let response = if is_manifest_ledger_authority_sql(sql) {
+                authority
+                    .next()
+                    .expect("bounded authority response for every authority query")
+            } else if sql == "SELECT * FROM \"d1_migrations\" ORDER BY id" {
+                let mut ledger = initial_ledger.clone();
+                if writes > 0
+                    && !ledger
+                        .iter()
+                        .any(|row| row["name"] == json!("0002_second.sql"))
+                {
+                    ledger.push(json!({"id": 2, "name": "0002_second.sql"}));
                 }
-                1 | 2 => {
-                    assert!(is_manifest_ledger_authority_sql(sql));
-                    manifest_ledger_authority_response("d1_migrations")
-                }
-                5 => {
-                    assert!(is_manifest_ledger_authority_sql(sql));
-                    let mut invalid = manifest_ledger_authority_response("d1_migrations");
-                    invalid["result"][0]["results"][0]["sql"] =
-                        json!("CREATE TABLE \"d1_migrations\"(id INTEGER PRIMARY KEY)");
-                    invalid
-                }
-                _ => unreachable!("bounded loop index"),
+                manifest_ledger_response(ledger)
+            } else if sql.contains("INSERT INTO \"d1_migrations\"") {
+                writes += 1;
+                json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": [{"success": true, "errors": [], "results": [{"ok": true}]}],
+                })
+            } else {
+                panic!("unexpected authority schedule SQL: {sql}");
             };
-            let response = serde_json::to_vec(&response).expect("serialize final-authority drift");
-            write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write final-authority drift headers");
+            let response = serde_json::to_vec(&response).expect("serialize authority schedule");
+            write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write authority schedule headers");
             stream
                 .write_all(&response)
-                .expect("write final-authority drift response");
+                .expect("write authority schedule response");
         }
     });
     (format!("http://{addr}"), requests)
@@ -3120,7 +3133,8 @@ fn spawn_fake_manifest_ambiguous_result_api(
                 })
         });
         let mut apply_seen = false;
-        for stream in listener.incoming().take(10) {
+        let expected_requests = if write_commits { 12 } else { 10 };
+        for stream in listener.incoming().take(expected_requests) {
             let mut stream = stream.expect("fake ambiguous result manifest D1 stream");
             let (headers, body) = read_http_request(&mut stream);
             assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
@@ -3179,7 +3193,7 @@ fn spawn_fake_partial_manifest_ambiguous_api() -> (String, Arc<Mutex<Vec<Value>>
     thread::spawn(move || {
         let mut first_apply_seen = false;
         let mut ambiguous_second_apply_seen = false;
-        for stream in listener.incoming().take(11) {
+        for stream in listener.incoming().take(13) {
             let mut stream = stream.expect("fake partial ambiguous manifest D1 stream");
             let (headers, body) = read_http_request(&mut stream);
             assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
@@ -5910,8 +5924,8 @@ fn d1_apply_migration_manifest_live_rechecks_plan_and_stably_reads_back_before_r
     let requests = requests.lock().expect("requests lock").clone();
     assert_eq!(
         requests.len(),
-        10,
-        "dry, initial and final authority proofs, stable ledger reads, apply, and post-apply reads"
+        12,
+        "dry, initial authority, stable ledger, per-mutation authority, apply, post-apply ledger, and final-release authority proofs"
     );
     assert!(
         requests[7]["sql"]
@@ -5929,19 +5943,28 @@ fn d1_apply_migration_manifest_live_rechecks_plan_and_stably_reads_back_before_r
 }
 
 #[test]
-fn d1_apply_migration_manifest_stops_on_final_ledger_authority_drift_before_write() {
-    let (base_url, requests) = spawn_manifest_final_authority_drift_api();
+fn d1_apply_migration_manifest_rejects_valid_first_invalid_second_authority_read_before_first_write()
+ {
+    let valid = manifest_ledger_authority_response("d1_migrations");
+    let mut invalid = valid.clone();
+    invalid["result"][0]["results"][0]["sql"] =
+        json!("CREATE TABLE \"d1_migrations\"(id INTEGER PRIMARY KEY)");
+    let (base_url, requests) = spawn_manifest_authority_schedule_api(
+        vec![json!({"id": 1, "name": "0001_initial.sql"})],
+        vec![valid.clone(), valid.clone(), valid, invalid],
+        7,
+    );
     let lease_root = PathBuf::from("/tmp").join(format!(
-        "cloudflare-mcp-final-authority-drift-{}",
+        "cloudflare-mcp-first-authority-unstable-{}",
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&lease_root);
-    fs::create_dir_all(&lease_root).expect("create final-authority drift lease root");
+    fs::create_dir_all(&lease_root).expect("create first-authority unstable lease root");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
-            .expect("make final-authority drift root private");
+            .expect("make first-authority unstable root private");
     }
     let mut mcp = McpStdioProcess::start_with_env(vec![
         ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
@@ -5960,7 +5983,7 @@ fn d1_apply_migration_manifest_stops_on_final_ledger_authority_drift_before_writ
     }));
     let plan = structured_content(&dry)["plan_sha256"]
         .as_str()
-        .expect("final-authority drift plan")
+        .expect("first-authority unstable plan")
         .to_string();
     let live = mcp.call_tool(
         802,
@@ -5974,27 +5997,217 @@ fn d1_apply_migration_manifest_stops_on_final_ledger_authority_drift_before_writ
     assert_eq!(content["ok"], json!(false), "{content}");
     assert_eq!(
         content["error"]["code"],
-        json!("d1.migration_ledger_authority_invalid"),
+        json!("d1.migration_ledger_authority_unstable"),
         "{content}"
     );
     assert_eq!(
         requests
             .lock()
-            .expect("final-authority drift requests")
+            .expect("first-authority unstable requests")
             .len(),
-        6
+        7
     );
     assert!(
         requests
             .lock()
-            .expect("final-authority drift requests")
+            .expect("first-authority unstable requests")
             .iter()
             .all(|request| !request["sql"]
                 .as_str()
                 .is_some_and(|sql| sql.contains("INSERT INTO \"d1_migrations\""))),
-        "a final authority failure must prevent the first migration write"
+        "a valid-first/invalid-second authority proof must prevent the first migration write"
     );
     assert_released_manifest_target_custody(&lease_root);
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_apply_migration_manifest_retains_custody_when_second_migration_authority_drifts() {
+    let valid = manifest_ledger_authority_response("d1_migrations");
+    let mut invalid = valid.clone();
+    invalid["result"][0]["results"][0]["sql"] =
+        json!("CREATE TABLE \"d1_migrations\"(id INTEGER PRIMARY KEY)");
+    let (base_url, requests) = spawn_manifest_authority_schedule_api(
+        Vec::new(),
+        vec![
+            valid.clone(),
+            valid.clone(),
+            valid.clone(),
+            valid.clone(),
+            valid,
+            invalid,
+        ],
+        10,
+    );
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-per-migration-authority-drift-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create per-migration authority drift lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make per-migration authority drift root private");
+    }
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let first_sql = "CREATE TABLE submissions(id TEXT);";
+    let second_sql = "ALTER TABLE submissions ADD COLUMN status TEXT;";
+    let manifest = json!([
+        {"name": "0001_initial.sql", "size_bytes": first_sql.len(), "sql_sha256": sha256_hex(first_sql), "sql": first_sql},
+        {"name": "0002_second.sql", "size_bytes": second_sql.len(), "sql_sha256": sha256_hex(second_sql), "sql": second_sql}
+    ]);
+    let dry = mcp.call_tool(803, "d1_apply_migration_manifest", json!({
+        "database_id": "db-1", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
+    }));
+    let plan = structured_content(&dry)["plan_sha256"]
+        .as_str()
+        .expect("per-migration authority drift plan")
+        .to_string();
+    let live = mcp.call_tool(
+        804,
+        "d1_apply_migration_manifest",
+        json!({
+            "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest,
+            "approved_plan_sha256": plan,
+        }),
+    );
+    let content = structured_content(&live);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(
+        content["status"],
+        json!("reconciliation_required"),
+        "{content}"
+    );
+    assert_eq!(content["lease_retained"], json!(true), "{content}");
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.migration_ledger_authority_unstable"),
+        "{content}"
+    );
+    let observed = requests
+        .lock()
+        .expect("per-migration authority drift requests")
+        .clone();
+    assert_eq!(
+        observed.len(),
+        10,
+        "one acknowledged write plus second-proof drift"
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|request| request["sql"]
+                .as_str()
+                .is_some_and(|sql| sql.contains("INSERT INTO \"d1_migrations\"")))
+            .count(),
+        1,
+        "the drift must stop the second migration mutation"
+    );
+    assert_private_regular_active_lease(&lease_root);
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_apply_migration_manifest_retains_custody_when_final_release_authority_drifts() {
+    let valid = manifest_ledger_authority_response("d1_migrations");
+    let mut invalid = valid.clone();
+    invalid["result"][0]["results"][0]["sql"] =
+        json!("CREATE TABLE \"d1_migrations\"(id INTEGER PRIMARY KEY)");
+    let (base_url, requests) = spawn_manifest_authority_schedule_api(
+        vec![json!({"id": 1, "name": "0001_initial.sql"})],
+        vec![
+            valid.clone(),
+            valid.clone(),
+            valid.clone(),
+            valid.clone(),
+            valid.clone(),
+            invalid,
+        ],
+        12,
+    );
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-final-release-authority-drift-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create final-release authority drift lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make final-release authority drift root private");
+    }
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let first_sql = "CREATE TABLE submissions(id TEXT);";
+    let second_sql = "ALTER TABLE submissions ADD COLUMN status TEXT;";
+    let manifest = json!([
+        {"name": "0001_initial.sql", "size_bytes": first_sql.len(), "sql_sha256": sha256_hex(first_sql), "sql": first_sql},
+        {"name": "0002_second.sql", "size_bytes": second_sql.len(), "sql_sha256": sha256_hex(second_sql), "sql": second_sql}
+    ]);
+    let dry = mcp.call_tool(805, "d1_apply_migration_manifest", json!({
+        "database_id": "db-1", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
+    }));
+    let plan = structured_content(&dry)["plan_sha256"]
+        .as_str()
+        .expect("final-release authority drift plan")
+        .to_string();
+    let live = mcp.call_tool(
+        806,
+        "d1_apply_migration_manifest",
+        json!({
+            "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest,
+            "approved_plan_sha256": plan,
+        }),
+    );
+    let content = structured_content(&live);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(
+        content["status"],
+        json!("reconciliation_required"),
+        "{content}"
+    );
+    assert_eq!(content["lease_retained"], json!(true), "{content}");
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.migration_ledger_authority_unstable"),
+        "{content}"
+    );
+    let observed = requests
+        .lock()
+        .expect("final-release authority drift requests")
+        .clone();
+    assert_eq!(
+        observed.len(),
+        12,
+        "final release must perform its own two-read proof"
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|request| request["sql"]
+                .as_str()
+                .is_some_and(|sql| sql.contains("INSERT INTO \"d1_migrations\"")))
+            .count(),
+        1,
+        "final-release drift must not replay the acknowledged write"
+    );
+    assert_private_regular_active_lease(&lease_root);
     mcp.terminate();
     let _ = fs::remove_dir_all(lease_root);
 }
@@ -11775,7 +11988,7 @@ fn d1_apply_migration_manifest_multiple_successful_query_results_apply_once() {
         content["applied_migrations"].as_array().map(Vec::len),
         Some(1)
     );
-    assert_eq!(requests.lock().expect("requests lock").len(), 10);
+    assert_eq!(requests.lock().expect("requests lock").len(), 12);
     assert_released_manifest_target_custody(&lease_root);
     let _ = fs::remove_dir_all(lease_root);
 }
@@ -11838,8 +12051,8 @@ fn d1_apply_migration_manifest_partial_multi_statement_response_loss_stays_unkno
     );
     assert_eq!(
         requests.lock().expect("requests lock").len(),
-        11,
-        "initial and final ledger-authority proofs plus the second statement ambiguity must stop the batch without any retry"
+        13,
+        "per-mutation ledger-authority proofs plus the second statement ambiguity must stop the batch without any retry"
     );
     assert_private_regular_active_lease(&lease_root);
     mcp.terminate();
@@ -11854,7 +12067,7 @@ fn d1_apply_migration_manifest_partial_multi_statement_response_loss_stays_unkno
         &manifest,
         &plan,
         &requests,
-        11,
+        13,
         "partial response loss",
     );
     let _ = fs::remove_dir_all(lease_root);

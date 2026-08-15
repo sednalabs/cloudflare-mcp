@@ -4863,7 +4863,7 @@ impl CloudflareMcp {
                 }),
             )
             .step(
-                "revalidate_reserved_migration_ledger_authority_before_first_mutation",
+                "revalidate_reserved_migration_ledger_authority_before_each_mutation",
                 false,
                 json!({"migrations_table": migrations_table}),
             )
@@ -4876,6 +4876,11 @@ impl CloudflareMcp {
                 "readback_complete_migration_ledger",
                 false,
                 json!({"computed_plan_sha256": plan_sha256}),
+            )
+            .step(
+                "revalidate_reserved_migration_ledger_authority_before_successful_custody_release",
+                false,
+                json!({"migrations_table": migrations_table}),
             );
         if !approved_d1_plan_digest_matches(args.approved_plan_sha256.as_deref(), &plan_sha256) {
             if let Err(release) = lease.release() {
@@ -4926,15 +4931,15 @@ impl CloudflareMcp {
         for migration in &classification.pending {
             let statement =
                 d1_migration_apply_sql(&migration.sql, &migrations_table, &migration.name);
-            if applied.is_empty() {
-                if let Err(result) = read_stable_d1_migration_ledger_authority(
-                    self,
-                    account_id,
-                    &args.database_id,
-                    &migrations_table,
-                )
-                .await
-                {
+            if let Err(result) = read_stable_d1_migration_ledger_authority(
+                self,
+                account_id,
+                &args.database_id,
+                &migrations_table,
+            )
+            .await
+            {
+                if applied.is_empty() {
                     let retained = lease.release().is_err();
                     finish_manifest!(d1_manifest_contextualize_failure(
                         result,
@@ -4953,6 +4958,27 @@ impl CloudflareMcp {
                         retained,
                     ));
                 }
+                // A preceding write may already have committed.  A later
+                // authority failure therefore cannot release custody or allow
+                // a following migration to dispatch: preserve an explicit
+                // reconciliation boundary for the exact provider outcome.
+                lease.retain();
+                finish_manifest!(d1_manifest_contextualize_failure(
+                    result,
+                    account_id,
+                    database_id,
+                    &family,
+                    &migrations_table,
+                    &manifest,
+                    D1ManifestReconciliationEvidence::new(
+                        args.approved_plan_sha256.as_deref(),
+                        Some(&plan_sha256),
+                        Some(&ledger),
+                        true,
+                    ),
+                    &lease,
+                    true,
+                ));
             }
             if let Err(result) = lease.revalidate() {
                 lease.retain();
@@ -5096,6 +5122,40 @@ impl CloudflareMcp {
                     "hint": "Reconcile provider evidence before clearing the retained target lease or applying another migration.",
                 },
             })));
+        }
+        if let Err(result) = read_stable_d1_migration_ledger_authority(
+            self,
+            account_id,
+            &args.database_id,
+            &migrations_table,
+        )
+        .await
+        {
+            // The final ledger rows establish only names. Re-prove the
+            // reserved ledger authority before recording successful terminal
+            // custody; otherwise an acknowledged migration could be followed
+            // by a changed table/trigger authority and be falsely released.
+            lease.retain();
+            finish_manifest!(d1_manifest_contextualize_failure(
+                result,
+                account_id,
+                database_id,
+                &family,
+                &migrations_table,
+                &manifest,
+                D1ManifestReconciliationEvidence::new(
+                    args.approved_plan_sha256.as_deref(),
+                    Some(&plan_sha256),
+                    Some(&final_ledger),
+                    true,
+                ),
+                &lease,
+                true,
+            ));
+        }
+        if let Err(result) = lease.revalidate() {
+            lease.retain();
+            finish_manifest!(result);
         }
         if let Err(result) = lease.release() {
             finish_manifest!(d1_manifest_contextualize_failure(
@@ -15069,11 +15129,17 @@ mod tests {
             "d1_rename_database",
             "d1_delete_database",
             "d1_execute_write",
-            "d1_apply_migrations",
+            "d1_apply_migration_manifest",
         ] {
             assert!(allowed.iter().any(|candidate| candidate == tool), "{tool}");
             assert!(payload["schemas"][tool].is_object(), "{tool} schema");
         }
+        assert!(
+            !allowed
+                .iter()
+                .any(|candidate| candidate == "d1_apply_migrations"),
+            "retired live migration surface must not appear in mutating discovery: {payload}"
+        );
     }
 
     #[tokio::test]

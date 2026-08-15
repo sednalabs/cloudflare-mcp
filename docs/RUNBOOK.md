@@ -118,11 +118,13 @@ from the filename ledger prefix read, which cannot establish what a later
 `INSERT INTO <ledger>` means.
 
 After the governed lease and reviewed plan are bound, the MCP repeats that
-stable authority proof immediately before the first migration statement, then
-revalidates its held local custody immediately before dispatch. This prevents a
-preflight result from becoming stale while local plan/custody work is underway;
-any final-proof failure releases the pre-write lease and stops before a provider
-mutation.
+stable authority proof immediately before every migration statement, then
+revalidates its held local custody immediately before each dispatch. It repeats
+the proof and custody revalidation again before successful terminal custody
+release. This prevents a preflight result from becoming stale while local
+plan/custody work is underway; a failure before the first write releases the
+pre-write lease, while any failure after an acknowledged write retains explicit
+reconciliation custody and stops later provider mutations.
 
 A later invocation stops before provider I/O when it sees an active or
 `retiring.lease.json` entry, including one that is malformed, a symlink or
