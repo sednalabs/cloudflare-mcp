@@ -9238,7 +9238,7 @@ fn d1_finalize_migration_reconciliation_stdio_reports_preinspection_and_inspecti
             "retry_decision": "do_not_retry_same_attempt",
             "lease_retained": null,
             "custody_status": "inspection_failed",
-            "receipt_persisted": false,
+            "receipt_persisted": null,
             "provider_calls": 0,
             "provider_read_lifecycle": [],
             "response_evidence": [],
@@ -9444,7 +9444,7 @@ fn d1_terminal_restored_v1_v2_semantic_contradictions_fail_read_only_in_every_na
                 assert_eq!(content["provider_calls"], 0, "{content}");
                 assert_eq!(content["provider_mutations"], 0, "{content}");
                 assert_eq!(content["local_namespace_mutations"], 0, "{content}");
-                assert_eq!(content["receipt_persisted"], false, "{content}");
+                assert_eq!(content["receipt_persisted"], Value::Null, "{content}");
                 assert_eq!(
                     fs::read(&receipt_path).expect("reread restored receipt"),
                     receipt_bytes,
@@ -9519,7 +9519,7 @@ fn d1_finalize_migration_reconciliation_stdio_distinguishes_verified_retained_an
             "lease_decision": "retain",
             "lease_retained": true,
             "custody_status": "retained_evidence_verified",
-            "receipt_persisted": false,
+            "receipt_persisted": null,
             "provider_calls": 0,
             "provider_read_lifecycle": [],
             "response_evidence": [],
@@ -9703,7 +9703,7 @@ fn d1_finalize_migration_reconciliation_stdio_does_not_claim_retention_after_cus
             "retry_decision": "do_not_retry_same_attempt",
             "lease_retained": null,
             "custody_status": "retained_evidence_unverified",
-            "receipt_persisted": false,
+            "receipt_persisted": null,
             "query_sha256": query_sha256,
             "response_evidence": response_evidence,
             "provider_calls": 1,
@@ -9872,7 +9872,7 @@ fn d1_post_parse_custody_release_overrides_parse_failure_in_reconcile_and_termin
     );
     assert_eq!(content["custody_status"], "retained_evidence_unverified");
     assert_eq!(content["lease_retained"], Value::Null);
-    assert_eq!(content["receipt_persisted"], false);
+    assert_eq!(content["receipt_persisted"], Value::Null);
     assert_eq!(content["retry_decision"], "do_not_retry_same_attempt");
     assert_eq!(content["provider_calls"], 1);
     assert_eq!(content["provider_mutations"], 0);
