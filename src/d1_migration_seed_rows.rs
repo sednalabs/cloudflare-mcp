@@ -75,6 +75,8 @@ pub(crate) struct SeedManifestPlan {
     /// Complete cumulative seed-table state for every manifest prefix,
     /// including prefix zero.
     pub(crate) states: Vec<Vec<SeedTableState>>,
+    /// SQLite ASCII-normalized identities of manifest-created STRICT tables.
+    pub(crate) strict_table_keys: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,8 +260,15 @@ pub(crate) fn sqlite_ascii_identifier_key(value: &str) -> String {
 pub(crate) fn seed_literal_is_identity_stable_for_declared_type(
     literal: &SeedLiteral,
     declared_type: &str,
+    strict_table: bool,
 ) -> bool {
     let declared_type = declared_type.to_ascii_uppercase();
+    if strict_table {
+        return matches!(
+            (literal, declared_type.as_str()),
+            (SeedLiteral::Text(_), "TEXT") | (SeedLiteral::Integer(_), "INT" | "INTEGER")
+        );
+    }
     let affinity = if declared_type.contains("INT") {
         "integer"
     } else if ["CHAR", "CLOB", "TEXT"]
@@ -603,25 +612,52 @@ mod tests {
         for declared_type in ["TEXT", "VARCHAR(12)", "CLOB", "", "BLOB"] {
             assert!(seed_literal_is_identity_stable_for_declared_type(
                 &text,
-                declared_type
+                declared_type,
+                false,
             ));
         }
         for declared_type in ["INTEGER", "BIGINT", "BOOLEAN", "NUMERIC", "", "BLOB"] {
             assert!(seed_literal_is_identity_stable_for_declared_type(
                 &integer,
-                declared_type
+                declared_type,
+                false,
             ));
         }
         for declared_type in ["INTEGER", "NUMERIC", "BOOLEAN", "REAL", "DOUBLE"] {
             assert!(!seed_literal_is_identity_stable_for_declared_type(
                 &text,
-                declared_type
+                declared_type,
+                false,
             ));
         }
         for declared_type in ["TEXT", "VARCHAR(12)", "REAL", "DOUBLE"] {
             assert!(!seed_literal_is_identity_stable_for_declared_type(
                 &integer,
-                declared_type
+                declared_type,
+                false,
+            ));
+        }
+
+        assert!(seed_literal_is_identity_stable_for_declared_type(
+            &text, "TEXT", true,
+        ));
+        assert!(seed_literal_is_identity_stable_for_declared_type(
+            &integer, "INT", true,
+        ));
+        assert!(seed_literal_is_identity_stable_for_declared_type(
+            &integer, "INTEGER", true,
+        ));
+        for (literal, declared_type) in [
+            (&text, "BLOB"),
+            (&integer, "BLOB"),
+            (&text, "ANY"),
+            (&integer, "ANY"),
+            (&integer, "NUMERIC"),
+        ] {
+            assert!(!seed_literal_is_identity_stable_for_declared_type(
+                literal,
+                declared_type,
+                true,
             ));
         }
 
@@ -630,11 +666,9 @@ mod tests {
             columns: vec!["value".into()],
             rows: vec![vec![text], vec![integer]],
         };
-        assert!(
-            mixed_blob.rows.iter().flatten().all(|literal| {
-                seed_literal_is_identity_stable_for_declared_type(literal, "BLOB")
-            })
-        );
+        assert!(mixed_blob.rows.iter().flatten().all(|literal| {
+            seed_literal_is_identity_stable_for_declared_type(literal, "BLOB", false)
+        }));
     }
 
     #[test]

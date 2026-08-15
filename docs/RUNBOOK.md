@@ -187,10 +187,13 @@ Select one explicit built-in effect assertion:
   unconditional creation. Add the exact
   cumulative `seed_tables` summary to every prefix expectation: target, ordered
   columns, row count, and local row-set SHA-256. Treat ASCII case variants as
-  one SQLite target while retaining the reviewed `CREATE TABLE` spelling in
-  expectations and fixed queries. Permit only identity-stable affinity pairs:
-  TEXT literals on TEXT/BLOB columns and INTEGER literals on
-  INTEGER/NUMERIC/BLOB columns. This assertion performs one
+  one SQLite CREATE, ALTER, index, trigger, and seed target while retaining the
+  reviewed `CREATE TABLE` spelling in expectations and fixed queries. Permit
+  only identity-stable affinity pairs: for non-STRICT tables, TEXT literals on
+  TEXT/BLOB columns and INTEGER literals on INTEGER/NUMERIC/BLOB columns; for
+  STRICT tables, TEXT literals on exact TEXT columns and INTEGER literals on
+  exact INT/INTEGER columns. Reject STRICT BLOB seeds before custody/provider
+  access. This assertion performs one
   primary-current prefix-selection read followed by two identical complete
   primary-current schema-and-seed reads. Verify three provider reads, zero
   provider mutations, exact aggregate seed summaries, and no raw seed values in

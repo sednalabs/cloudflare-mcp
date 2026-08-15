@@ -2046,6 +2046,9 @@ fn spawn_fake_case_variant_seed_reconciliation_api(
             let sql = body_json["sql"].as_str().expect("case-variant seed SQL");
             let markers = reconciliation_statement_markers(sql);
             assert!(matches!(markers.len(), 5 | 6));
+            assert!(sql.contains("pragma_table_xinfo('Channels')"));
+            assert!(!sql.contains("pragma_table_xinfo('channels')"));
+            assert!(!sql.contains("pragma_table_xinfo('CHANNELS')"));
             if markers.len() == 6 {
                 assert!(sql.contains("FROM \"Channels\""));
                 assert!(!sql.contains("FROM \"CHANNELS\""));
@@ -2056,14 +2059,17 @@ fn spawn_fake_case_variant_seed_reconciliation_api(
                 .expect("case-variant seed request log")
                 .push(body_json);
 
-            let table_sql = "CREATE TABLE Channels(id TEXT PRIMARY KEY, rank INTEGER NOT NULL)";
+            let table_sql = "CREATE TABLE Channels(id TEXT PRIMARY KEY, rank INTEGER)";
             let index_sql = "CREATE INDEX channels_by_rank ON cHaNnElS(rank)";
             let trigger_sql = "CREATE TRIGGER channels_guard BEFORE UPDATE ON CHANNELS BEGIN SELECT RAISE(ABORT, 'immutable'); END";
             let mut results = vec![
                 tagged_reconciliation_result(
                     &markers[0],
                     &["id", "name"],
-                    vec![json!({"id": 1, "name": "0001_channels.sql"})],
+                    vec![
+                        json!({"id": 1, "name": "0001_channels.sql"}),
+                        json!({"id": 2, "name": "0002_seed.sql"}),
+                    ],
                     Some(json!({"changed_db": false, "changes": 0, "rows_written": 0})),
                 ),
                 tagged_reconciliation_result(
@@ -2089,7 +2095,7 @@ fn spawn_fake_case_variant_seed_reconciliation_api(
                     ],
                     vec![
                         json!({"cid": 0, "name": "id", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 1, "hidden": 0}),
-                        json!({"cid": 1, "name": "rank", "type": "INTEGER", "notnull": 1, "dflt_value": null, "pk": 0, "hidden": 0}),
+                        json!({"cid": 1, "name": "rank", "type": "INTEGER", "notnull": 0, "dflt_value": null, "pk": 0, "hidden": 0}),
                     ],
                     None,
                 ),
@@ -5951,17 +5957,28 @@ fn d1_canonical_five_seed_rows_bind_reconciliation_terminal_receipt_and_replay()
 
 #[test]
 fn d1_case_variant_parents_and_identity_stable_mixed_seed_storage_converge() {
-    let table_sql = "CREATE TABLE Channels(id TEXT PRIMARY KEY, rank INTEGER NOT NULL)";
+    let initial_table_sql = "CREATE TABLE Channels(id TEXT PRIMARY KEY)";
+    let current_table_sql = "CREATE TABLE Channels(id TEXT PRIMARY KEY, rank INTEGER)";
+    let alter_sql = "ALTER TABLE channels ADD COLUMN rank INTEGER";
     let index_sql = "CREATE INDEX channels_by_rank ON cHaNnElS(rank)";
     let insert_sql = "INSERT INTO CHANNELS (ID, RANK) VALUES ('daily', -9223372036854775808)";
     let trigger_sql = "CREATE TRIGGER channels_guard BEFORE UPDATE ON CHANNELS BEGIN SELECT RAISE(ABORT, 'immutable'); END";
-    let migration_sql = format!("{table_sql}; {index_sql}; {insert_sql}; {trigger_sql};");
-    let manifest = json!([{
-        "name": "0001_channels.sql",
-        "size_bytes": migration_sql.len(),
-        "sql_sha256": sha256_hex(&migration_sql),
-        "sql": migration_sql,
-    }]);
+    let first_migration_sql = format!("{initial_table_sql};");
+    let second_migration_sql = format!("{alter_sql}; {index_sql}; {insert_sql}; {trigger_sql};");
+    let manifest = json!([
+        {
+            "name": "0001_channels.sql",
+            "size_bytes": first_migration_sql.len(),
+            "sql_sha256": sha256_hex(&first_migration_sql),
+            "sql": first_migration_sql,
+        },
+        {
+            "name": "0002_seed.sql",
+            "size_bytes": second_migration_sql.len(),
+            "sql_sha256": sha256_hex(&second_migration_sql),
+            "sql": second_migration_sql,
+        }
+    ]);
     let seed_rows_sha256 = typed_seed_rowset_sha256(
         "Channels",
         &["ID", "RANK"],
@@ -5975,15 +5992,28 @@ fn d1_case_variant_parents_and_identity_stable_mixed_seed_storage_converge() {
         {
             "manifest_prefix_length": 1,
             "schema_objects": [
+                {"object_type": "table", "name": "Channels", "table_name": "Channels", "sql_sha256": sha256_hex(initial_table_sql)},
+            ],
+            "tables": [{
+                "name": "Channels",
+                "columns": [
+                    {"cid": 0, "name": "id", "declared_type": "TEXT", "not_null": false, "default_value": null, "primary_key_position": 1, "hidden": 0},
+                ],
+                "foreign_keys": [],
+            }],
+        },
+        {
+            "manifest_prefix_length": 2,
+            "schema_objects": [
                 {"object_type": "index", "name": "channels_by_rank", "table_name": "Channels", "sql_sha256": sha256_hex(index_sql)},
-                {"object_type": "table", "name": "Channels", "table_name": "Channels", "sql_sha256": sha256_hex(table_sql)},
+                {"object_type": "table", "name": "Channels", "table_name": "Channels", "sql_sha256": sha256_hex(current_table_sql)},
                 {"object_type": "trigger", "name": "channels_guard", "table_name": "Channels", "sql_sha256": sha256_hex(trigger_sql)},
             ],
             "tables": [{
                 "name": "Channels",
                 "columns": [
                     {"cid": 0, "name": "id", "declared_type": "TEXT", "not_null": false, "default_value": null, "primary_key_position": 1, "hidden": 0},
-                    {"cid": 1, "name": "rank", "declared_type": "INTEGER", "not_null": true, "default_value": null, "primary_key_position": 0, "hidden": 0},
+                    {"cid": 1, "name": "rank", "declared_type": "INTEGER", "not_null": false, "default_value": null, "primary_key_position": 0, "hidden": 0},
                 ],
                 "foreign_keys": [],
             }],
@@ -7837,11 +7867,62 @@ fn d1_canonical_seed_table_case_aliases_fail_before_custody_or_provider_access()
     let affinity_content = structured_content(&affinity_response);
     let mut expected_affinity = expected_d1_reconciliation_semantic_error(
         "d1.migration_reconciliation_seed_affinity_unstable",
-        "a seed literal and reviewed SQLite column affinity could change storage class or value",
+        "a seed literal and reviewed SQLite table/column contract could reject or change its storage class or value",
         "Retain the exact lease evidence. Do not retry the original migration attempt or mutate D1 from this result.",
     );
     expected_affinity["capability_state"] = json!("capability_gap");
     assert_eq!(affinity_content, &expected_affinity, "{affinity_content}");
+
+    let strict_blob_sql = "CREATE TABLE StrictRows(value BLOB) STRICT; INSERT INTO strictrows (value) VALUES ('text');";
+    let strict_blob_response = mcp.call_tool(
+        763,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": [{
+                "name": "0001.sql",
+                "size_bytes": strict_blob_sql.len(),
+                "sql_sha256": sha256_hex(strict_blob_sql),
+                "sql": strict_blob_sql,
+            }],
+            "approved_plan_sha256": "a".repeat(64),
+            "lease_nonce": "b".repeat(64),
+            "lease_payload_sha256": "c".repeat(64),
+            "effect_assertion_id": "schema_create_objects_additive_seed_rows_v1",
+            "state_expectations": [
+                {"manifest_prefix_length": 0, "schema_objects": [], "tables": []},
+                {
+                    "manifest_prefix_length": 1,
+                    "schema_objects": [{
+                        "object_type": "table",
+                        "name": "StrictRows",
+                        "table_name": "StrictRows",
+                        "sql_sha256": sha256_hex("CREATE TABLE StrictRows(value BLOB) STRICT"),
+                    }],
+                    "tables": [{
+                        "name": "StrictRows",
+                        "columns": [{
+                            "cid": 0,
+                            "name": "value",
+                            "declared_type": "BLOB",
+                            "not_null": false,
+                            "default_value": null,
+                            "primary_key_position": 0,
+                            "hidden": 0,
+                        }],
+                        "foreign_keys": [],
+                    }],
+                    "seed_tables": [],
+                },
+            ],
+        }),
+    );
+    let strict_blob_content = structured_content(&strict_blob_response);
+    assert_eq!(
+        strict_blob_content, &expected_affinity,
+        "{strict_blob_content}"
+    );
     mcp.terminate();
 }
 

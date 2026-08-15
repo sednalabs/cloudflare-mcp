@@ -126,9 +126,12 @@ Preserved curated tool families:
   `IF NOT EXISTS` is rejected. CREATE must precede the seed and every trigger
   on that table must follow it, including across manifest entries. Each prefix
   supplies the exact table, ordered columns, row count, and aggregate row-set
-  SHA-256. SQLite ASCII case variants share one target and the reviewed CREATE
-  spelling. Only identity-stable TEXT/BLOB and INTEGER/NUMERIC/BLOB literal
-  affinity pairs are admitted. A primary-current selection read chooses the manifest prefix before
+  SHA-256. SQLite ASCII case variants share one CREATE, ALTER, index, trigger,
+  and seed target and the reviewed CREATE spelling. Non-STRICT tables admit
+  only identity-stable TEXT/BLOB and INTEGER/NUMERIC/BLOB literal affinity
+  pairs. STRICT tables admit only TEXT-on-TEXT and INTEGER-on-INT/INTEGER pairs;
+  STRICT BLOB seeds fail before custody/provider access. A primary-current
+  selection read chooses the manifest prefix before
   two complete primary-current proofs read the exact typed rows; responses expose
   only aggregate summaries. Arbitrary DML, expressions, implicit columns,
   conflict clauses, reused targets, and malformed or mismatched rows fail closed.

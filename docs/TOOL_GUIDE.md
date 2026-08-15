@@ -121,14 +121,17 @@ TEXT or signed INTEGER literals, and each target may be seeded once. Every
 classified CREATE is unconditional; `IF NOT EXISTS` is rejected because an
 incumbent object would make the manifest effect a no-op. The CREATE
 must precede the INSERT and every trigger on that target must follow it, even
-across manifest entries. Table membership and reuse follow SQLite ASCII
-case-insensitive identifier identity; expectations and fixed read queries retain
-the one reviewed spelling from `CREATE TABLE`. Every `state_expectations`
+across manifest entries. CREATE, ALTER, index, trigger, seed membership, and
+reuse follow SQLite ASCII case-insensitive identifier identity; expectations
+and fixed read queries retain the one reviewed spelling from `CREATE TABLE`.
+Every `state_expectations`
 prefix adds `seed_tables` with the exact target, ordered columns, row count,
 and locally derived `rows_sha256`. Seed storage is deliberately conservative:
-TEXT literals require TEXT or BLOB affinity, while INTEGER literals require
-INTEGER, NUMERIC, or BLOB affinity; pairs that SQLite could coerce are rejected
-before custody. The tool first selects the current primary manifest prefix, then
+on non-STRICT tables, TEXT literals require TEXT or BLOB affinity while INTEGER
+literals require INTEGER, NUMERIC, or BLOB affinity; on STRICT tables, TEXT
+literals require exact TEXT columns and INTEGER literals require exact INT or
+INTEGER columns. STRICT BLOB and other unproven pairs are rejected before
+custody. The tool first selects the current primary manifest prefix, then
 runs two identical complete primary-current proofs that include exact typed seed
 row readback. Responses return aggregate row-count/digest evidence only; raw
 seed values are never returned. Implicit columns, INSERT SELECT, expressions,

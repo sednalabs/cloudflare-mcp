@@ -965,7 +965,11 @@ fn validate_expectations(
             .and_then(|plan| plan.states.get(expected_prefix))
             .cloned()
             .unwrap_or_default();
-        validate_seed_storage_affinity(&derived_seed_state, &state.tables)?;
+        validate_seed_storage_affinity(
+            &derived_seed_state,
+            &state.tables,
+            seed_plan.map(|plan| &plan.strict_table_keys),
+        )?;
         let derived_seed_summaries = state_summaries(&derived_seed_state);
         if state.seed_tables != derived_seed_summaries {
             return Err(reconciliation_error(
@@ -1145,6 +1149,7 @@ fn validate_expectations(
 fn validate_seed_storage_affinity(
     seed_tables: &[SeedTableState],
     tables: &[D1MigrationTableExpectation],
+    strict_table_keys: Option<&BTreeSet<String>>,
 ) -> Result<(), CallToolResult> {
     if seed_tables.is_empty() {
         return Ok(());
@@ -1161,15 +1166,14 @@ fn validate_seed_storage_affinity(
         }
     }
     for seed_table in seed_tables {
-        let table = reviewed_tables
-            .get(&sqlite_ascii_identifier_key(&seed_table.table_name))
-            .ok_or_else(|| {
-                reconciliation_error(
-                    "contradictory",
-                    "d1.migration_reconciliation_seed_affinity_unavailable",
-                    "seed storage affinity requires one unambiguous reviewed table and column identity",
-                )
-            })?;
+        let table_key = sqlite_ascii_identifier_key(&seed_table.table_name);
+        let table = reviewed_tables.get(&table_key).ok_or_else(|| {
+            reconciliation_error(
+                "contradictory",
+                "d1.migration_reconciliation_seed_affinity_unavailable",
+                "seed storage affinity requires one unambiguous reviewed table and column identity",
+            )
+        })?;
         let mut reviewed_columns = BTreeMap::new();
         for column in &table.columns {
             let key = sqlite_ascii_identifier_key(&column.name);
@@ -1195,12 +1199,13 @@ fn validate_seed_storage_affinity(
                 !seed_literal_is_identity_stable_for_declared_type(
                     &row[column_index],
                     &column.declared_type,
+                    strict_table_keys.is_some_and(|keys| keys.contains(&table_key)),
                 )
             }) {
                 return Err(reconciliation_error(
                     "capability_gap",
                     "d1.migration_reconciliation_seed_affinity_unstable",
-                    "a seed literal and reviewed SQLite column affinity could change storage class or value",
+                    "a seed literal and reviewed SQLite table/column contract could reject or change its storage class or value",
                 ));
             }
         }
@@ -1415,6 +1420,7 @@ fn derive_additive_effect_assertion(
     let mut manifest_created_tables = BTreeMap::<String, String>::new();
     let mut trigger_seen = BTreeSet::new();
     let mut seeded_tables = BTreeSet::new();
+    let mut strict_seed_table_keys = BTreeSet::new();
     for migration in manifest {
         let statements = tokenize_sql_statements(&migration.sql).ok_or_else(|| {
             reconciliation_error(
@@ -1445,7 +1451,7 @@ fn derive_additive_effect_assertion(
                 if allow_seed_rows && object.object_type == "table" {
                     let authority_key = sqlite_ascii_identifier_key(&object.name);
                     if manifest_created_tables
-                        .insert(authority_key, object.name.clone())
+                        .insert(authority_key.clone(), object.name.clone())
                         .is_some()
                     {
                         return Err(reconciliation_error(
@@ -1453,6 +1459,9 @@ fn derive_additive_effect_assertion(
                             "d1.migration_reconciliation_create_target_reused",
                             "the manifest reuses a CREATE or additive parent identity and cannot derive exact prefix states",
                         ));
+                    }
+                    if schema_create_table_is_strict(&tokens) {
+                        strict_seed_table_keys.insert(authority_key);
                     }
                 } else if allow_seed_rows
                     && matches!(object.object_type.as_str(), "index" | "trigger")
@@ -1470,7 +1479,14 @@ fn derive_additive_effect_assertion(
                 continue;
             }
             match classify_additive_statement(&tokens).map_err(additive_contract_error)? {
-                Some(AdditiveStatement::AddColumn(effect)) => {
+                Some(AdditiveStatement::AddColumn(mut effect)) => {
+                    if allow_seed_rows {
+                        if let Some(reviewed_table_name) = manifest_created_tables
+                            .get(&sqlite_ascii_identifier_key(&effect.table_name))
+                        {
+                            effect.table_name = reviewed_table_name.clone();
+                        }
+                    }
                     addition_count += 1;
                     effects.push(ClassifiedEffect::AddColumn(effect));
                 }
@@ -1534,15 +1550,23 @@ fn derive_additive_effect_assertion(
         migrations.push(effects);
     }
 
+    let identity_key = |name: &str| {
+        if allow_seed_rows {
+            sqlite_ascii_identifier_key(name)
+        } else {
+            name.to_string()
+        }
+    };
     let mut created_names = BTreeMap::<String, (String, usize)>::new();
-    let mut preexisting_tables = BTreeSet::new();
+    let mut preexisting_tables = BTreeMap::<String, String>::new();
     for (prefix, effects) in migrations.iter().enumerate() {
         for effect in effects {
             match effect {
                 ClassifiedEffect::Create(object) => {
-                    if preexisting_tables.contains(&object.name)
+                    let object_key = identity_key(&object.name);
+                    if preexisting_tables.contains_key(&object_key)
                         || created_names
-                            .insert(object.name.clone(), (object.object_type.clone(), prefix))
+                            .insert(object_key, (object.object_type.clone(), prefix))
                             .is_some()
                     {
                         return Err(reconciliation_error(
@@ -1553,9 +1577,8 @@ fn derive_additive_effect_assertion(
                     }
                 }
                 ClassifiedEffect::AddColumn(effect) => {
-                    if let Some((object_type, created_prefix)) =
-                        created_names.get(&effect.table_name)
-                    {
+                    let table_key = identity_key(&effect.table_name);
+                    if let Some((object_type, created_prefix)) = created_names.get(&table_key) {
                         if object_type != "table" || *created_prefix >= prefix {
                             return Err(reconciliation_error(
                                 "contradictory",
@@ -1564,7 +1587,9 @@ fn derive_additive_effect_assertion(
                             ));
                         }
                     } else {
-                        preexisting_tables.insert(effect.table_name.clone());
+                        preexisting_tables
+                            .entry(table_key)
+                            .or_insert_with(|| effect.table_name.clone());
                     }
                 }
                 ClassifiedEffect::ForeignKeysOn => {}
@@ -1574,7 +1599,7 @@ fn derive_additive_effect_assertion(
     }
 
     let mut cumulative = preexisting_tables
-        .into_iter()
+        .into_values()
         .map(|name| {
             (
                 ("table".to_string(), name.clone()),
@@ -1617,6 +1642,7 @@ fn derive_additive_effect_assertion(
         additive_plan: Some(AdditiveManifestPlan { prefixes }),
         seed_plan: allow_seed_rows.then_some(SeedManifestPlan {
             states: seed_states,
+            strict_table_keys: strict_seed_table_keys,
         }),
         trigger_lexical_token_values,
     })
@@ -2033,6 +2059,21 @@ fn valid_table_suffix(tokens: &[SqlToken]) -> bool {
         }
     }
     true
+}
+
+fn schema_create_table_is_strict(tokens: &[SqlToken]) -> bool {
+    let Some(definition_start) = tokens
+        .iter()
+        .position(|token| token == &SqlToken::Symbol('('))
+    else {
+        return false;
+    };
+    let Some(after_definition) = balanced_parenthesized_end(tokens, definition_start) else {
+        return false;
+    };
+    tokens[after_definition..]
+        .iter()
+        .any(|token| token_is_word(Some(token), "strict"))
 }
 
 fn tokenize_sql_statements(sql: &str) -> Option<Vec<Vec<SqlToken>>> {
@@ -3893,6 +3934,51 @@ mod tests {
         assert_eq!(
             seed_select_sql(seed_state).matches("\"Channels\"").count(),
             1
+        );
+
+        let strict = derive_effect_assertion_details(
+            Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1),
+            &manifest(
+                "CREATE TABLE StrictRows(value BLOB) STRICT; INSERT INTO strictrows (value) VALUES ('text');",
+            ),
+        )
+        .expect("STRICT table identity is retained for affinity validation");
+        assert_eq!(
+            strict
+                .seed_plan
+                .expect("strict seed plan")
+                .strict_table_keys,
+            BTreeSet::from(["strictrows".to_string()]),
+        );
+
+        let create = "CREATE TABLE Channels(id TEXT PRIMARY KEY)";
+        let alter_and_seed = "ALTER TABLE channels ADD COLUMN rank INTEGER; INSERT INTO CHANNELS (id, rank) VALUES ('daily', 1)";
+        let case_variant_addition = [create, alter_and_seed]
+            .into_iter()
+            .enumerate()
+            .map(|(index, sql)| D1MigrationManifestEntry {
+                name: format!("{:04}.sql", index + 1),
+                size_bytes: sql.len() as u64,
+                sql_sha256: sha256_bytes_hex(sql.as_bytes()),
+                sql: sql.to_string(),
+            })
+            .collect::<Vec<_>>();
+        let derived = derive_effect_assertion_details(
+            Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1),
+            &case_variant_addition,
+        )
+        .expect("ALTER and seed aliases share the reviewed CREATE spelling");
+        assert_eq!(
+            derived.additive_plan.expect("additive plan").prefixes[1]
+                .addition
+                .as_ref()
+                .expect("case-variant addition")
+                .table_name,
+            "Channels",
+        );
+        assert_eq!(
+            derived.seed_plan.expect("seed plan").states[2][0].table_name,
+            "Channels",
         );
 
         let cross_entry = [format!("{table}; {seed};"), format!("{trigger};")]
