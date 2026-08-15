@@ -158,6 +158,12 @@ Select one explicit built-in effect assertion:
   `foreign_key_list`, and `foreign_key_check` expectations; views and triggers
   remain covered by the complete exact `sqlite_master` union.
 
+The successful response names the selected assertion and its exact object-type
+scope. That ID is also part of the reconciliation-plan digest, terminal-plan
+digest, version-2 durable receipt, and exact replay. Never change it between
+approval and finalization, even when both assertions derive identical state for
+a table/index-only manifest.
+
 The extended classifier keeps an entire trigger body together across internal
 semicolons and nested `CASE ... END`, then accepts only bounded canonical
 trigger identities, a supported event/header, and semicolon-terminated

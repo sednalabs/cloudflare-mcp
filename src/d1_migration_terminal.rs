@@ -14,8 +14,8 @@ use crate::d1_migration_lease::{
     D1RetainedMigrationLease, D1TerminalReconciliationReceipt, inspect_terminal_d1_migration_lease,
 };
 use crate::d1_migration_reconciliation::{
-    D1MigrationStateExpectation, prepare_d1_migration_reconciliation,
-    refresh_d1_migration_reconciliation,
+    D1MigrationStateExpectation, canonical_effect_assertion_id,
+    prepare_d1_migration_reconciliation, refresh_d1_migration_reconciliation,
 };
 use crate::server::CloudflareMcp;
 use crate::tools::{D1MigrationManifestEntry, sha256_bytes_hex};
@@ -99,6 +99,10 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
     dry_run: bool,
     approved_terminal_plan_sha256: Option<&str>,
 ) -> CallToolResult {
+    let selected_effect_assertion_id = match canonical_effect_assertion_id(effect_assertion_id) {
+        Ok(id) => id,
+        Err(result) => return contextualize_terminal_semantic_error(result),
+    };
     if let Err(result) = validate_terminal_arguments(
         approved_plan_sha256,
         lease_nonce,
@@ -133,6 +137,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
         expected_current_prefix_length,
         terminal_request_sha256,
         terminal_attempt_sha256,
+        selected_effect_assertion_id,
     );
     if !dry_run && approved_terminal_plan_sha256 != Some(terminal_plan_sha256.as_str()) {
         return terminal_error(
@@ -147,12 +152,13 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
         );
     }
     let receipt = D1TerminalReconciliationReceipt {
-        version: 1,
+        version: 2,
         operation: OPERATION.to_string(),
         target_key_sha256,
         lease_nonce: lease_nonce.to_string(),
         lease_payload_sha256: lease_payload_sha256.to_string(),
         approved_apply_plan_sha256: approved_plan_sha256.to_string(),
+        effect_assertion_id: selected_effect_assertion_id.to_string(),
         reconciliation_plan_sha256: expected_reconciliation_plan_sha256.to_string(),
         expectation_proof_sha256: expected_expectation_proof_sha256.to_string(),
         query_sha256: expected_query_sha256.to_string(),
@@ -215,6 +221,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
                 "replayed": true,
                 "terminal_plan_sha256": terminal_plan_sha256,
                 "terminal_receipt_sha256": receipt_evidence.payload_sha256,
+                "effect_assertion_id": selected_effect_assertion_id,
                 "provider_calls": 0,
                 "provider_read_lifecycle": [],
                 "response_evidence": [],
@@ -330,7 +337,9 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
                 "dry_run": true,
                 "status": "terminal_reconciliation_plan_ready",
                 "terminal_plan_sha256": terminal_plan_sha256,
+                "effect_assertion_id": proof.effect_assertion_id,
                 "approved_evidence": {
+                    "effect_assertion_id": proof.effect_assertion_id,
                     "reconciliation_plan_sha256": expected_reconciliation_plan_sha256,
                     "expectation_proof_sha256": expected_expectation_proof_sha256,
                     "query_sha256": expected_query_sha256,
@@ -426,7 +435,9 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
             "replayed": !receipt_created && !retired_now,
             "terminal_plan_sha256": terminal_plan_sha256,
             "terminal_receipt_sha256": receipt_evidence.payload_sha256,
+            "effect_assertion_id": proof.effect_assertion_id,
             "approved_evidence": {
+                "effect_assertion_id": proof.effect_assertion_id,
                 "reconciliation_plan_sha256": expected_reconciliation_plan_sha256,
                 "expectation_proof_sha256": expected_expectation_proof_sha256,
                 "query_sha256": expected_query_sha256,
@@ -511,6 +522,7 @@ fn terminal_plan_sha256(
     current_prefix_length: usize,
     terminal_request_sha256: &str,
     terminal_attempt_sha256: &str,
+    effect_assertion_id: &str,
 ) -> String {
     let plan = json!({
         "version": 1,
@@ -519,6 +531,7 @@ fn terminal_plan_sha256(
         "lease_nonce": lease_nonce,
         "lease_payload_sha256": lease_payload_sha256,
         "approved_apply_plan_sha256": approved_plan_sha256,
+        "effect_assertion_id": effect_assertion_id,
         "reconciliation_plan_sha256": reconciliation_plan_sha256,
         "expectation_proof_sha256": expectation_proof_sha256,
         "query_sha256": query_sha256,

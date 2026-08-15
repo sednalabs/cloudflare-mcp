@@ -65,8 +65,8 @@ pub(crate) fn contextualize_d1_reconciliation_semantic_error(
         "error": error,
     }))
 }
-const EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1: &str = "schema_create_only_v1";
-const EFFECT_ASSERTION_SCHEMA_CREATE_OBJECTS_V1: &str =
+pub(crate) const EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1: &str = "schema_create_only_v1";
+pub(crate) const EFFECT_ASSERTION_SCHEMA_CREATE_OBJECTS_V1: &str =
     "schema_create_tables_indexes_views_triggers_v1";
 const MAX_STATE_EXPECTATIONS: usize = 128;
 const MAX_SCHEMA_OBJECTS: usize = 128;
@@ -244,6 +244,7 @@ pub(crate) struct D1MigrationReconciliationProof {
     pub(crate) expectation_proof_sha256: String,
     pub(crate) canonical_snapshot_sha256: String,
     pub(crate) reconciliation_plan_sha256: String,
+    pub(crate) effect_assertion_id: String,
     pub(crate) original_prefix_length: usize,
     pub(crate) current_prefix_length: usize,
     pub(crate) outcome: String,
@@ -289,7 +290,12 @@ impl D1MigrationReconciliationProof {
             &self.outcome,
             &self.query.sha256,
             &self.canonical_snapshot_sha256,
+            &self.effect_assertion_id,
         )
+    }
+
+    pub(crate) fn effect_assertion_scope(&self) -> &'static [&'static str] {
+        effect_assertion_scope(&self.effect_assertion_id)
     }
 }
 
@@ -306,7 +312,12 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
     effect_assertion_id: Option<&str>,
     state_expectations: Vec<D1MigrationStateExpectation>,
 ) -> Result<D1MigrationReconciliationProof, CallToolResult> {
-    let derived_states = match derive_effect_assertion(effect_assertion_id, manifest) {
+    let selected_effect_assertion_id = match canonical_effect_assertion_id(effect_assertion_id) {
+        Ok(id) => id,
+        Err(result) => return Err(prelease_error(result, "not_inspected", None)),
+    };
+    let derived_states = match derive_effect_assertion(Some(selected_effect_assertion_id), manifest)
+    {
         Ok(derived_states) => derived_states,
         Err(result) => return Err(prelease_error(result, "not_inspected", None)),
     };
@@ -516,6 +527,7 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
         outcome,
         &query.sha256,
         &snapshot_sha256,
+        selected_effect_assertion_id,
     );
     Ok(D1MigrationReconciliationProof {
         lease,
@@ -525,6 +537,7 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
         expectation_proof_sha256: validated.proof_sha256,
         canonical_snapshot_sha256: snapshot_sha256,
         reconciliation_plan_sha256,
+        effect_assertion_id: selected_effect_assertion_id.to_string(),
         original_prefix_length: original_prefix,
         current_prefix_length: current_prefix,
         outcome: outcome.to_string(),
@@ -597,10 +610,14 @@ pub(crate) async fn reconcile_d1_migration_manifest(
             "table_xinfo": "complete_exact_declared_table_union",
             "foreign_key_list": "complete_exact_declared_table_union",
             "foreign_key_check": "bounded_zero_violation_proof_for_every_declared_table",
-            "migration_effects": EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1,
+            "migration_effects": proof.effect_assertion_id,
         },
         "effect_assertion": {
-            "id": EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1,
+            "id": proof.effect_assertion_id,
+            "scope": {
+                "statement_class": "schema_create_only",
+                "schema_object_types": proof.effect_assertion_scope(),
+            },
             "source": "built_in_registry_and_exact_manifest_sql_classification",
             "caller_schema_only_declaration_used": false,
         },
@@ -1014,22 +1031,17 @@ fn derive_effect_assertion(
     effect_assertion_id: Option<&str>,
     manifest: &[D1MigrationManifestEntry],
 ) -> Result<Vec<Vec<DerivedSchemaObject>>, CallToolResult> {
-    let (allow_views_and_triggers, unclassified_message) = match effect_assertion_id {
-        Some(EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1) => (
+    let selected = canonical_effect_assertion_id(effect_assertion_id)?;
+    let (allow_views_and_triggers, unclassified_message) = match selected {
+        EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1 => (
             false,
             "the built-in effect registry cannot exactly prove arbitrary DML, ALTER, DROP, PRAGMA, trigger, view, virtual table, or data-producing CREATE effects",
         ),
-        Some(EFFECT_ASSERTION_SCHEMA_CREATE_OBJECTS_V1) => (
+        EFFECT_ASSERTION_SCHEMA_CREATE_OBJECTS_V1 => (
             true,
             "the selected effect assertion cannot exactly prove this statement or any arbitrary top-level DML, ALTER, DROP, PRAGMA, virtual table, or data-producing CREATE effect",
         ),
-        _ => {
-            return Err(reconciliation_error(
-                "capability_gap",
-                "d1.migration_reconciliation_effect_assertion_missing",
-                "a supported registry-backed migration effect assertion is required",
-            ));
-        }
+        _ => unreachable!("canonical registry assertion"),
     };
     let mut cumulative = BTreeMap::<(String, String), DerivedSchemaObject>::new();
     let mut cumulative_names = BTreeSet::new();
@@ -1072,6 +1084,30 @@ fn derive_effect_assertion(
         states.push(cumulative.values().cloned().collect());
     }
     Ok(states)
+}
+
+pub(crate) fn canonical_effect_assertion_id(
+    effect_assertion_id: Option<&str>,
+) -> Result<&'static str, CallToolResult> {
+    match effect_assertion_id {
+        Some(EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1) => Ok(EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1),
+        Some(EFFECT_ASSERTION_SCHEMA_CREATE_OBJECTS_V1) => {
+            Ok(EFFECT_ASSERTION_SCHEMA_CREATE_OBJECTS_V1)
+        }
+        _ => Err(reconciliation_error(
+            "capability_gap",
+            "d1.migration_reconciliation_effect_assertion_missing",
+            "a supported registry-backed migration effect assertion is required",
+        )),
+    }
+}
+
+fn effect_assertion_scope(effect_assertion_id: &str) -> &'static [&'static str] {
+    match effect_assertion_id {
+        EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1 => &["table", "index"],
+        EFFECT_ASSERTION_SCHEMA_CREATE_OBJECTS_V1 => &["table", "index", "view", "trigger"],
+        _ => &[],
+    }
 }
 
 fn classify_schema_create(
@@ -2343,6 +2379,7 @@ fn reconciliation_plan_sha256(
     outcome: &str,
     query_sha256: &str,
     snapshot_sha256: &str,
+    effect_assertion_id: &str,
 ) -> String {
     let plan = json!({
         "version": 1,
@@ -2358,6 +2395,7 @@ fn reconciliation_plan_sha256(
         "outcome": outcome,
         "query_sha256": query_sha256,
         "canonical_snapshot_sha256": snapshot_sha256,
+        "effect_assertion_id": effect_assertion_id,
         "retry_decision": "do_not_retry_same_attempt",
         "lease_decision": "retain",
         "next_slice": "persist_terminal_reconciliation_receipt_then_guarded_retirement",

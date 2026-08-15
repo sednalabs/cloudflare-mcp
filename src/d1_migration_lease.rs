@@ -94,6 +94,7 @@ pub(crate) struct D1TerminalReconciliationReceipt {
     pub(crate) lease_nonce: String,
     pub(crate) lease_payload_sha256: String,
     pub(crate) approved_apply_plan_sha256: String,
+    pub(crate) effect_assertion_id: String,
     pub(crate) reconciliation_plan_sha256: String,
     pub(crate) expectation_proof_sha256: String,
     pub(crate) query_sha256: String,
@@ -1338,12 +1339,16 @@ mod linux {
     fn canonical_terminal_receipt_bytes(
         receipt: &D1TerminalReconciliationReceipt,
     ) -> Result<Vec<u8>, &'static str> {
-        if receipt.version != 1
+        if receipt.version != 2
             || receipt.operation != "d1_finalize_migration_reconciliation"
             || !valid_lower_sha256(&receipt.target_key_sha256)
             || !valid_retained_nonce(&receipt.lease_nonce)
             || !valid_lower_sha256(&receipt.lease_payload_sha256)
             || !valid_lower_sha256(&receipt.approved_apply_plan_sha256)
+            || !matches!(
+                receipt.effect_assertion_id.as_str(),
+                "schema_create_only_v1" | "schema_create_tables_indexes_views_triggers_v1"
+            )
             || !valid_lower_sha256(&receipt.reconciliation_plan_sha256)
             || !valid_lower_sha256(&receipt.expectation_proof_sha256)
             || !valid_lower_sha256(&receipt.query_sha256)
@@ -2158,12 +2163,13 @@ mod tests {
         approved_plan_sha256: &str,
     ) -> D1TerminalReconciliationReceipt {
         D1TerminalReconciliationReceipt {
-            version: 1,
+            version: 2,
             operation: "d1_finalize_migration_reconciliation".to_string(),
             target_key_sha256: identity.target_key_sha256.clone(),
             lease_nonce: identity.nonce.clone(),
             lease_payload_sha256: identity.payload_sha256.clone(),
             approved_apply_plan_sha256: approved_plan_sha256.to_string(),
+            effect_assertion_id: "schema_create_only_v1".to_string(),
             reconciliation_plan_sha256: "c".repeat(64),
             expectation_proof_sha256: "d".repeat(64),
             query_sha256: "e".repeat(64),
@@ -3031,6 +3037,15 @@ mod tests {
         assert!(
             retained.persist_terminal_receipt(&conflict).is_err(),
             "changed request or evidence must conflict with the incumbent receipt"
+        );
+        let mut assertion_conflict = expected.clone();
+        assertion_conflict.effect_assertion_id =
+            "schema_create_tables_indexes_views_triggers_v1".to_string();
+        assert!(
+            retained
+                .persist_terminal_receipt(&assertion_conflict)
+                .is_err(),
+            "changed effect assertion must conflict with the incumbent receipt"
         );
         let receipt_path = root
             .join(format!(

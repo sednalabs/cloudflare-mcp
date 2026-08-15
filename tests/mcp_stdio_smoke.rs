@@ -4802,6 +4802,14 @@ fn d1_reconciliation_and_terminal_finalize_share_view_trigger_effect_proof() {
     assert_eq!(reconciled["outcome"], json!("full_state_converged"));
     assert_eq!(reconciled["provider_calls"], json!(2));
     assert_eq!(reconciled["provider_mutations"], json!(0));
+    assert_eq!(
+        reconciled["effect_assertion"]["id"],
+        json!("schema_create_tables_indexes_views_triggers_v1")
+    );
+    assert_eq!(
+        reconciled["effect_assertion"]["scope"]["schema_object_types"],
+        json!(["table", "index", "view", "trigger"])
+    );
 
     let mut terminal_args = reconciliation_args;
     terminal_args["expected_reconciliation_plan_sha256"] =
@@ -4834,7 +4842,11 @@ fn d1_reconciliation_and_terminal_finalize_share_view_trigger_effect_proof() {
 
     terminal_args["dry_run"] = json!(false);
     terminal_args["approved_terminal_plan_sha256"] = dry_content["terminal_plan_sha256"].clone();
-    let live = mcp.call_tool(812, "d1_finalize_migration_reconciliation", terminal_args);
+    let live = mcp.call_tool(
+        812,
+        "d1_finalize_migration_reconciliation",
+        terminal_args.clone(),
+    );
     let live_content = structured_content(&live);
     assert_eq!(live_content["ok"], json!(true), "{live_content}");
     assert_eq!(
@@ -4844,7 +4856,45 @@ fn d1_reconciliation_and_terminal_finalize_share_view_trigger_effect_proof() {
     assert_eq!(live_content["provider_calls"], json!(4));
     assert_eq!(live_content["provider_mutations"], json!(0));
     assert_eq!(live_content["lease_retained"], json!(false));
+    assert_eq!(
+        live_content["effect_assertion_id"],
+        json!("schema_create_tables_indexes_views_triggers_v1")
+    );
     assert_released_manifest_target_custody(&lease_root);
+
+    let target = manifest_target_path(&lease_root);
+    let receipt_path = fs::read_dir(&target)
+        .expect("read terminal target")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .starts_with("terminal-reconciliation.")
+            })
+        })
+        .expect("durable terminal receipt");
+    let receipt: Value =
+        serde_json::from_slice(&fs::read(receipt_path).expect("read durable terminal receipt"))
+            .expect("parse durable terminal receipt");
+    assert_eq!(receipt["version"], json!(2));
+    assert_eq!(
+        receipt["effect_assertion_id"],
+        json!("schema_create_tables_indexes_views_triggers_v1")
+    );
+
+    let replay = mcp.call_tool(815, "d1_finalize_migration_reconciliation", terminal_args);
+    let replay_content = structured_content(&replay);
+    assert_eq!(replay_content["ok"], json!(true), "{replay_content}");
+    assert_eq!(
+        replay_content["status"],
+        json!("terminal_reconciliation_already_complete")
+    );
+    assert_eq!(
+        replay_content["effect_assertion_id"],
+        json!("schema_create_tables_indexes_views_triggers_v1")
+    );
+    assert_eq!(replay_content["provider_calls"], json!(0));
 
     let observed = requests.lock().expect("schema-object request log");
     assert_eq!(observed.len(), 8);
@@ -4857,6 +4907,101 @@ fn d1_reconciliation_and_terminal_finalize_share_view_trigger_effect_proof() {
         assert!(sql.contains("'items_after_update'"));
     }
     drop(observed);
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_terminal_plan_rejects_effect_assertion_change_after_approval_for_identical_table_state() {
+    let (base_url, requests) = spawn_fake_reconciliation_api_for_calls(6);
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-terminal-assertion-binding-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create assertion-binding lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make assertion-binding root private");
+    }
+    let (manifest, state_expectations) = one_table_reconciliation_case();
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&lease_root, &manifest);
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let reconciliation_args = json!({
+        "database_id": "db-1",
+        "migration_family": "newsletter-core",
+        "manifest": manifest,
+        "approved_plan_sha256": approved_plan_sha256,
+        "lease_nonce": lease_nonce,
+        "lease_payload_sha256": lease_payload_sha256,
+        "effect_assertion_id": "schema_create_only_v1",
+        "state_expectations": state_expectations,
+    });
+    let reconciliation = mcp.call_tool(
+        816,
+        "d1_reconcile_migration_manifest",
+        reconciliation_args.clone(),
+    );
+    let reconciled = structured_content(&reconciliation).clone();
+    assert_eq!(reconciled["ok"], json!(true), "{reconciled}");
+
+    let mut extended_reconciliation_args = reconciliation_args;
+    extended_reconciliation_args["effect_assertion_id"] =
+        json!("schema_create_tables_indexes_views_triggers_v1");
+    let extended_reconciliation = mcp.call_tool(
+        819,
+        "d1_reconcile_migration_manifest",
+        extended_reconciliation_args,
+    );
+    let extended = structured_content(&extended_reconciliation);
+    assert_eq!(extended["ok"], json!(true), "{extended}");
+    assert_eq!(
+        extended["canonical_snapshot_sha256"],
+        reconciled["canonical_snapshot_sha256"]
+    );
+    assert_eq!(extended["query_sha256"], reconciled["query_sha256"]);
+    assert_ne!(
+        extended["reconciliation_plan_sha256"], reconciled["reconciliation_plan_sha256"],
+        "selected assertion must change approval identity even for identical table state"
+    );
+    let mut terminal_args = terminal_args_from_reconciliation(
+        &manifest,
+        &state_expectations,
+        &approved_plan_sha256,
+        &lease_nonce,
+        &lease_payload_sha256,
+        &reconciled,
+    );
+    let dry = mcp.call_tool(
+        817,
+        "d1_finalize_migration_reconciliation",
+        terminal_args.clone(),
+    );
+    let dry_content = structured_content(&dry).clone();
+    assert_eq!(dry_content["ok"], json!(true), "{dry_content}");
+
+    terminal_args["effect_assertion_id"] = json!("schema_create_tables_indexes_views_triggers_v1");
+    terminal_args["dry_run"] = json!(false);
+    terminal_args["approved_terminal_plan_sha256"] = dry_content["terminal_plan_sha256"].clone();
+    let rejected = mcp.call_tool(818, "d1_finalize_migration_reconciliation", terminal_args);
+    let rejected_content = structured_content(&rejected);
+    assert_eq!(rejected_content["ok"], json!(false), "{rejected_content}");
+    assert_eq!(
+        rejected_content["error"]["code"],
+        json!("d1.migration_terminal_plan_mismatch")
+    );
+    assert_eq!(rejected_content["provider_calls"], json!(0));
+    assert_private_regular_active_lease(&lease_root);
+    assert_eq!(requests.lock().expect("request log").len(), 6);
     mcp.terminate();
     let _ = fs::remove_dir_all(lease_root);
 }
