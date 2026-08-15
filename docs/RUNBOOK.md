@@ -135,13 +135,16 @@ reconciliation custody and stops later provider mutations.
 
 An `applied` response is stronger than a clean HTTP envelope or an empty D1
 result array. Every provider result set for the migration write must explicitly
-prove `meta.served_by_primary=true` and `meta.changed_db=true`, with typed
-`changes` and `rows_written` counts whose complete response totals are both
-positive. The MCP then requires the stable primary ledger readback to contain
-the complete manifest and repeats the reserved-ledger authority proof before it
-can release custody. Missing, replica-served, unchanged, zero-count, malformed,
-or contradictory write metadata is an unknown outcome: the lease is retained
-when its custody can still be proved and the SQL is never retried.
+prove `meta.served_by_primary=true`, a boolean `meta.changed_db`, and typed
+non-negative integer `changes` and `rows_written` counts. A result with
+`changed_db=false` is valid only when both counts are zero. The complete
+response must contain at least one `changed_db=true` result and have positive
+aggregate changes and rows-written totals. The MCP then requires the stable
+primary ledger readback to contain the complete manifest and repeats the
+reserved-ledger authority proof before it can release custody. Missing,
+replica-served, malformed, zero-total, or contradictory write metadata is
+`reconciliation_required`: the lease is retained when its custody can still be
+proved and the SQL is never retried.
 
 A later invocation stops before provider I/O when it sees an active or
 `retiring.lease.json` entry, including one that is malformed, a symlink or
