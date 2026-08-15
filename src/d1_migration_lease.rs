@@ -1392,6 +1392,7 @@ mod linux {
                 "schema_create_only_v1"
                     | "schema_create_tables_indexes_views_triggers_v1"
                     | "schema_create_objects_additive_v1"
+                    | "schema_create_objects_additive_seed_rows_v1"
             )
             || !valid_lower_sha256(&receipt.reconciliation_plan_sha256)
             || !valid_lower_sha256(&receipt.expectation_proof_sha256)

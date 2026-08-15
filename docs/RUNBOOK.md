@@ -178,12 +178,61 @@ Select one explicit built-in effect assertion:
   migration intent. It does not execute caller SQL or claim that the provider
   connection retained PRAGMA state; proof remains the fixed read-only schema
   and foreign-key snapshot.
+- `effect_assertion_id=schema_create_objects_additive_seed_rows_v1` extends the
+  additive assertion with one canonical top-level seed INSERT per
+  manifest-created target. Require plain unqualified table/column identifiers,
+  explicit columns, bounded literal `VALUES` tuples, CREATE-before-seed, and
+  seed-before-trigger ordering across the complete manifest. Reject every
+  classified `CREATE ... IF NOT EXISTS`; seed authority requires an actual
+  unconditional creation. Add the exact
+  cumulative `seed_tables` summary to every prefix expectation: target, ordered
+  columns, row count, and local row-set SHA-256. Treat ASCII case variants as
+  one SQLite CREATE, ALTER, index, trigger, and seed target while retaining the
+  reviewed `CREATE TABLE` spelling in expectations and fixed queries. Use the
+  deterministic first-encountered manifest parent spelling for baseline tables
+  not created by this manifest when ALTER/index/trigger parents vary only by
+  SQLite ASCII case. Keep provider and expectation spelling unchanged in the
+  selected fixed proof. Permit only identity-stable affinity pairs: for
+  non-STRICT tables, TEXT literals on
+  TEXT/BLOB columns and INTEGER literals on INTEGER/NUMERIC/BLOB columns; for
+  STRICT tables, TEXT literals on exact TEXT columns and INTEGER literals on
+  exact INT/INTEGER columns. Reject STRICT BLOB seeds before custody/provider
+  access. This assertion performs one
+  primary-current prefix-selection read followed by two identical complete
+  primary-current reads. Each complete read covers the bounded full-manifest
+  `sqlite_master` object union and safe table-valued PRAGMAs for the bounded
+  full-manifest physical-table union; every prefix therefore proves future
+  objects and future table structure absent as well as current facts present.
+  Match schema-object membership under SQLite ASCII `NOCASE`, retain exact
+  observed spelling and canonical type/name ordering, and reject aliases or
+  conflicting spellings.
+  Seed-row SELECTs remain selected-prefix and existence-aware. The full-manifest
+  seed registry must prove three distinct prefix states: no seed-row SELECT from
+  a table before CREATE, an exact zero-row table projection after CREATE and
+  before INSERT without depending on columns added by a later prefix, and the
+  exact typed row set at or after INSERT. Any row in the zero-row window must
+  fail on the first complete proof with two total provider reads and zero
+  mutations.
+  Terminal dry run and live finalization must rederive and repeat that same
+  selected-prefix proof. Require each complete proof ledger to equal the exact
+  initial selected ledger, then separately require the two complete snapshots
+  to be canonically equal. An equal pair at a different prefix is a
+  reconciliation contradiction, not authority to reselect. Record only the
+  aggregate-safe `selection_binding` query/ledger digests and selected prefix;
+  do not copy raw provider rows. Parse every provider response locally, then
+  freshly revalidate retained lease custody before reporting either the parsed
+  snapshot or a parse failure as verified custody. Otherwise verify three
+  provider reads, zero provider mutations, exact aggregate seed summaries, and
+  no raw seed values in the response. Any ambiguity or mismatch remains
+  reconciliation-required.
+  The predecessor assertions do not accept top-level INSERT.
 
 The successful response identifies that same closed scope without flattening
 the broader assertions back to the legacy label: `effect_assertion.scope`
 reports `schema_create_only`, `schema_create_tables_indexes_views_triggers`, or
-`schema_create_objects_additive` respectively, alongside the complete allowed
-`schema_object_types` array.
+`schema_create_objects_additive`, or
+`schema_create_objects_additive_seed_rows` respectively, alongside the complete
+allowed `schema_object_types` array.
 
 For every assertion, the configured `migrations_table` is a reserved schema
 identifier under SQLite ASCII case-insensitive matching. A manifest must not
@@ -376,6 +425,14 @@ order violation and cannot be repaired by creating a receipt afterward. Exact
 replay after completed retirement validates the receipt and retired lease and
 reproduces the receipt-bound expectation proof and versioned reconciliation
 plan from the supplied manifest before returning with zero provider calls.
+If another exact caller completes retirement after initial inspection but
+before reconciliation preparation, a preparation failure with exactly zero
+provider calls permits one fresh custody inspection. It converges only through
+the same exact completed-retirement replay validation. Once any provider call
+has been attempted, the failure is not eligible for this convergence path and
+remains reconciliation-required. Once a refresh or read reports unverified
+custody, preserve that negative classification through terminal error handling;
+a later physical inspection that appears restored cannot overwrite it.
 Null, array, primitive, malformed,
 duplicate-keyed, unknown-keyed, noncanonical, contradictory, hard-linked, or
 conflicting namespace evidence fails closed. Never delete, rewrite, rename, or

@@ -638,6 +638,7 @@ mod tests {
                 columns,
                 foreign_keys: Vec::new(),
             }],
+            seed_tables: Vec::new(),
         }
     }
 

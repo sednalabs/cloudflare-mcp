@@ -1812,6 +1812,34 @@
             ],
             "type": "object"
           },
+          "D1MigrationSeedTableExpectation": {
+            "properties": {
+              "columns": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "row_count": {
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "rows_sha256": {
+                "type": "string"
+              },
+              "table_name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "table_name",
+              "columns",
+              "row_count",
+              "rows_sha256"
+            ],
+            "type": "object"
+          },
           "D1MigrationStateExpectation": {
             "properties": {
               "manifest_prefix_length": {
@@ -1822,6 +1850,12 @@
               "schema_objects": {
                 "items": {
                   "$ref": "#/$defs/D1MigrationSchemaObjectExpectation"
+                },
+                "type": "array"
+              },
+              "seed_tables": {
+                "items": {
+                  "$ref": "#/$defs/D1MigrationSeedTableExpectation"
                 },
                 "type": "array"
               },
@@ -2264,6 +2298,34 @@
             ],
             "type": "object"
           },
+          "D1MigrationSeedTableExpectation": {
+            "properties": {
+              "columns": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "row_count": {
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "rows_sha256": {
+                "type": "string"
+              },
+              "table_name": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "table_name",
+              "columns",
+              "row_count",
+              "rows_sha256"
+            ],
+            "type": "object"
+          },
           "D1MigrationStateExpectation": {
             "properties": {
               "manifest_prefix_length": {
@@ -2274,6 +2336,12 @@
               "schema_objects": {
                 "items": {
                   "$ref": "#/$defs/D1MigrationSchemaObjectExpectation"
+                },
+                "type": "array"
+              },
+              "seed_tables": {
+                "items": {
+                  "$ref": "#/$defs/D1MigrationSeedTableExpectation"
                 },
                 "type": "array"
               },

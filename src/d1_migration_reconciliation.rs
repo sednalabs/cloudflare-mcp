@@ -29,6 +29,13 @@ use crate::d1_migration_manifest::{
     D1ManifestLedgerRow, classify_d1_manifest_ledger, d1_ledger_summaries, d1_manifest_plan_sha256,
     d1_manifest_summaries,
 };
+use crate::d1_migration_seed_rows::{
+    D1MigrationSeedTableExpectation, EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1,
+    SeedContractError, SeedInsertEffect, SeedManifestPlan, SeedTableRegistration, SeedTableState,
+    classify_seed_insert, insert_seed_effect, observed_seed_summary, seed_data_fields,
+    seed_literal_is_identity_stable_for_declared_type, seed_select_sql,
+    sqlite_ascii_identifier_key, state_summaries,
+};
 use crate::server::CloudflareMcp;
 use crate::tools::{D1MigrationManifestEntry, sha256_bytes_hex};
 
@@ -101,6 +108,8 @@ pub struct D1MigrationStateExpectation {
     pub manifest_prefix_length: usize,
     pub schema_objects: Vec<D1MigrationSchemaObjectExpectation>,
     pub tables: Vec<D1MigrationTableExpectation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seed_tables: Vec<D1MigrationSeedTableExpectation>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -148,6 +157,7 @@ struct ValidatedExpectations {
     states: Vec<D1MigrationStateExpectation>,
     object_names: Vec<String>,
     table_names: Vec<String>,
+    seed_states: Vec<Vec<SeedTableState>>,
     proof_sha256: String,
 }
 
@@ -163,6 +173,8 @@ struct CanonicalSnapshot {
     ledger: Vec<D1ManifestLedgerRow>,
     schema_objects: Vec<ObservedSchemaObject>,
     tables: Vec<ObservedTable>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    seed_tables: Vec<D1MigrationSeedTableExpectation>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -187,6 +199,7 @@ enum BatchStatement {
     TableXinfo(String),
     ForeignKeyList(String),
     ForeignKeyCheck(String),
+    SeedRows(SeedTableState),
 }
 
 impl BatchStatement {
@@ -197,6 +210,13 @@ impl BatchStatement {
             Self::TableXinfo(table) => format!("table_xinfo\0{table}"),
             Self::ForeignKeyList(table) => format!("foreign_key_list\0{table}"),
             Self::ForeignKeyCheck(table) => format!("foreign_key_check\0{table}"),
+            Self::SeedRows(state) => {
+                format!(
+                    "seed_rows\0{}\0{}",
+                    state.table_name,
+                    state.columns.join("\0")
+                )
+            }
         };
         sha256_bytes_hex(
             format!("d1-reconciliation-statement-v1\0{proof_sha256}\0{logical_identity}")
@@ -204,11 +224,14 @@ impl BatchStatement {
         )
     }
 
-    fn data_fields(&self) -> &'static [&'static str] {
+    fn data_fields(&self) -> Vec<String> {
         match self {
-            Self::Ledger => &["id", "name"],
-            Self::Schema => &["type", "name", "tbl_name", "sql"],
-            Self::TableXinfo(_) => &[
+            Self::Ledger => ["id", "name"].into_iter().map(str::to_string).collect(),
+            Self::Schema => ["type", "name", "tbl_name", "sql"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            Self::TableXinfo(_) => [
                 "cid",
                 "name",
                 "type",
@@ -216,8 +239,11 @@ impl BatchStatement {
                 "dflt_value",
                 "pk",
                 "hidden",
-            ],
-            Self::ForeignKeyList(_) => &[
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            Self::ForeignKeyList(_) => [
                 "id",
                 "seq",
                 "table",
@@ -226,8 +252,15 @@ impl BatchStatement {
                 "on_update",
                 "on_delete",
                 "match",
-            ],
-            Self::ForeignKeyCheck(_) => &["table", "rowid", "parent", "fkid"],
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            Self::ForeignKeyCheck(_) => ["table", "rowid", "parent", "fkid"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            Self::SeedRows(state) => seed_data_fields(state.columns.len()),
         }
     }
 }
@@ -238,11 +271,14 @@ struct FixedQuery {
     sha256: String,
     proof_sha256: String,
     statements: Vec<BatchStatement>,
+    table_identity_spellings: BTreeMap<String, String>,
 }
 
 #[derive(Debug)]
 pub(crate) struct D1MigrationReconciliationProof {
     pub(crate) lease: D1RetainedMigrationLease,
+    selection: Option<ParsedBatch>,
+    selection_query_sha256: Option<String>,
     query: FixedQuery,
     first: ParsedBatch,
     second: ParsedBatch,
@@ -261,14 +297,19 @@ impl D1MigrationReconciliationProof {
     }
 
     pub(crate) fn response_evidence(&self) -> Vec<Value> {
-        vec![
-            response_digest_summary(&self.first),
-            response_digest_summary(&self.second),
-        ]
+        self.selection
+            .iter()
+            .chain([&self.first, &self.second])
+            .map(response_digest_summary)
+            .collect()
     }
 
     pub(crate) fn provider_read_lifecycle(&self) -> Vec<Value> {
-        vec![json!(self.first.lifecycle), json!(self.second.lifecycle)]
+        self.selection
+            .iter()
+            .chain([&self.first, &self.second])
+            .map(|batch| json!(batch.lifecycle))
+            .collect()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -333,6 +374,18 @@ impl D1MigrationReconciliationProof {
     pub(crate) fn effect_assertion_statement_class(&self) -> &'static str {
         effect_assertion_statement_class(&self.effect_assertion_id)
     }
+
+    pub(crate) fn provider_calls(&self) -> usize {
+        2 + usize::from(self.selection.is_some())
+    }
+
+    fn query_sha256s(&self) -> Vec<&str> {
+        self.selection_query_sha256
+            .iter()
+            .map(String::as_str)
+            .chain([self.query.sha256.as_str(), self.query.sha256.as_str()])
+            .collect()
+    }
 }
 
 pub(crate) async fn prepare_d1_migration_reconciliation(
@@ -360,12 +413,20 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
     if let Err(result) = validate_reserved_migrations_table(migrations_table, &derived) {
         return Err(prelease_error(result, "not_inspected", None));
     }
-    let validated = match validate_expectations(&derived.states, state_expectations) {
+    let validated = match validate_expectations(
+        &derived.states,
+        derived.seed_plan.as_ref(),
+        state_expectations,
+    ) {
         Ok(validated) => validated,
         Err(result) => return Err(prelease_error(result, "not_inspected", None)),
     };
     if let Some(plan) = derived.additive_plan.as_ref() {
-        if let Err(error) = validate_additive_transitions(plan, &validated.states) {
+        if let Err(error) = validate_additive_transitions_with_seed_identity(
+            plan,
+            &validated.states,
+            derived.seed_plan.as_ref(),
+        ) {
             return Err(prelease_error(
                 additive_contract_error(error),
                 "not_inspected",
@@ -373,12 +434,24 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
             ));
         }
     }
-    let query = build_fixed_query(
+    let seed_assertion =
+        selected_effect_assertion_id == EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1;
+    let (selection_object_names, selection_table_names) = if seed_assertion {
+        (&[][..], &[][..])
+    } else {
+        (
+            validated.object_names.as_slice(),
+            validated.table_names.as_slice(),
+        )
+    };
+    let selection_query = build_fixed_query(
         migrations_table,
         manifest.len(),
-        &validated.object_names,
-        &validated.table_names,
+        selection_object_names,
+        selection_table_names,
+        &[],
         &validated.proof_sha256,
+        seed_assertion,
     );
     let lease = match inspect_retained_d1_migration_lease(
         account_id,
@@ -393,16 +466,78 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
             return Err(prelease_error(
                 result,
                 "inspection_failed",
-                Some(&query.sha256),
+                Some(&selection_query.sha256),
             ));
         }
+    };
+
+    let selection = if seed_assertion {
+        let batch = match read_complete_batch(
+            server,
+            &lease,
+            account_id,
+            database_id,
+            &selection_query,
+            manifest,
+        )
+        .await
+        {
+            Ok(batch) => batch,
+            Err(result) => return Err(result),
+        };
+        if classify_d1_manifest_ledger(manifest, &batch.snapshot.ledger).is_err() {
+            return Err(contextualize_error(
+                reconciliation_error_with_evidence(
+                    "contradictory",
+                    "d1.migration_reconciliation_ledger_not_manifest_prefix",
+                    "seed-row selection evidence did not contain an exact manifest ledger prefix",
+                    Some(&selection_query.sha256),
+                    &[response_digest_summary(&batch)],
+                ),
+                Some(&selection_query.sha256),
+                &[],
+                1,
+            ));
+        }
+        Some(batch)
+    } else {
+        None
+    };
+    let selected_prefix = selection.as_ref().map(|batch| batch.snapshot.ledger.len());
+    let selected_seed_state = selected_prefix
+        .and_then(|prefix| validated.seed_states.get(prefix))
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let selection_query_sha256 = selection.as_ref().map(|_| selection_query.sha256.clone());
+    let query = if selection.is_some() {
+        build_fixed_query(
+            migrations_table,
+            manifest.len(),
+            &validated.object_names,
+            &validated.table_names,
+            selected_seed_state,
+            &validated.proof_sha256,
+            seed_assertion,
+        )
+    } else {
+        selection_query
     };
 
     let first = match read_complete_batch(server, &lease, account_id, database_id, &query, manifest)
         .await
     {
         Ok(batch) => batch,
-        Err(result) => return Err(result),
+        Err(result) => {
+            if let Some(selection) = selection.as_ref() {
+                return Err(contextualize_error(
+                    result,
+                    Some(&query.sha256),
+                    &[response_digest_summary(selection)],
+                    1,
+                ));
+            }
+            return Err(result);
+        }
     };
     let first_digest = batch_digest(&first);
     let second = match read_complete_batch(
@@ -417,41 +552,83 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
     {
         Ok(batch) => batch,
         Err(result) => {
+            let mut prior = selection
+                .iter()
+                .map(response_digest_summary)
+                .collect::<Vec<_>>();
+            prior.push(response_digest_summary(&first));
             return Err(contextualize_error(
                 result,
                 Some(&query.sha256),
-                &[response_digest_summary(&first)],
-                1,
+                &prior,
+                prior.len(),
             ));
         }
     };
+    let mut stable_evidence = selection
+        .iter()
+        .map(response_digest_summary)
+        .collect::<Vec<_>>();
+    stable_evidence.push(response_digest_summary(&first));
+    stable_evidence.push(response_digest_summary(&second));
+    let stable_provider_calls = stable_evidence.len();
     if let Err(result) = lease.revalidate() {
         return Err(contextualize_unverified_custody_error(
             result,
             Some(&query.sha256),
-            &[
-                response_digest_summary(&first),
-                response_digest_summary(&second),
-            ],
-            2,
+            &stable_evidence,
+            stable_provider_calls,
         ));
     }
     let second_digest = batch_digest(&second);
     if first.snapshot != second.snapshot || first_digest != second_digest {
+        let mut result = reconciliation_error_with_evidence(
+            "contradictory",
+            "d1.migration_reconciliation_evidence_unstable",
+            "two complete read-only reconciliation batches were not canonically equivalent",
+            Some(&query.sha256),
+            &stable_evidence,
+        );
+        if let (Some(selection), Some(selection_query_sha256)) =
+            (selection.as_ref(), selection_query_sha256.as_deref())
+        {
+            add_selection_binding_evidence(
+                &mut result,
+                selection,
+                selection_query_sha256,
+                &[&first, &second],
+            );
+        }
         return Err(contextualize_error(
-            reconciliation_error_with_evidence(
-                "contradictory",
-                "d1.migration_reconciliation_evidence_unstable",
-                "two complete read-only reconciliation batches were not canonically equivalent",
-                Some(&query.sha256),
-                &[
-                    response_digest_summary(&first),
-                    response_digest_summary(&second),
-                ],
-            ),
+            result,
             Some(&query.sha256),
             &[],
-            2,
+            stable_provider_calls,
+        ));
+    }
+    if let (Some(selection), Some(selection_query_sha256)) =
+        (selection.as_ref(), selection_query_sha256.as_deref())
+        && (first.snapshot.ledger != selection.snapshot.ledger
+            || second.snapshot.ledger != selection.snapshot.ledger)
+    {
+        let mut result = reconciliation_error_with_evidence(
+            "contradictory",
+            "d1.migration_reconciliation_selected_ledger_changed",
+            "complete proof ledgers did not equal the exact initial selected ledger",
+            Some(&query.sha256),
+            &stable_evidence,
+        );
+        add_selection_binding_evidence(
+            &mut result,
+            selection,
+            selection_query_sha256,
+            &[&first, &second],
+        );
+        return Err(contextualize_error(
+            result,
+            Some(&query.sha256),
+            &[],
+            stable_provider_calls,
         ));
     }
 
@@ -465,14 +642,11 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
                     "d1.migration_reconciliation_ledger_not_manifest_prefix",
                     "stable migration ledger is not an exact prefix of the supplied manifest",
                     Some(&query.sha256),
-                    &[
-                        response_digest_summary(&first),
-                        response_digest_summary(&second),
-                    ],
+                    &stable_evidence,
                 ),
                 Some(&query.sha256),
                 &[],
-                2,
+                stable_provider_calls,
             ));
         }
     };
@@ -490,11 +664,8 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
             return Err(contextualize_error(
                 result,
                 Some(&query.sha256),
-                &[
-                    response_digest_summary(&first),
-                    response_digest_summary(&second),
-                ],
-                2,
+                &stable_evidence,
+                stable_provider_calls,
             ));
         }
     };
@@ -512,26 +683,28 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
                     "d1.migration_reconciliation_state_expectation_missing",
                     "no bounded reviewed state expectation covers the stable current manifest prefix",
                     Some(&query.sha256),
-                    &[
-                        response_digest_summary(&first),
-                        response_digest_summary(&second),
-                    ],
+                    &stable_evidence,
                 ),
                 Some(&query.sha256),
                 &[],
-                2,
+                stable_provider_calls,
             ));
         }
     };
-    if let Err(result) = verify_expected_state(expected_state, &validated, &first.snapshot) {
+    if let Err(result) = verify_expected_state(
+        expected_state,
+        query
+            .statements
+            .iter()
+            .filter(|statement| matches!(statement, BatchStatement::TableXinfo(_)))
+            .count(),
+        &first.snapshot,
+    ) {
         return Err(contextualize_error(
             result,
             Some(&query.sha256),
-            &[
-                response_digest_summary(&first),
-                response_digest_summary(&second),
-            ],
-            2,
+            &stable_evidence,
+            stable_provider_calls,
         ));
     }
 
@@ -551,14 +724,11 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
                 "d1.migration_reconciliation_plan_relationship_contradictory",
                 "stable ledger precedes the uniquely reconstructed approved-plan prefix",
                 Some(&query.sha256),
-                &[
-                    response_digest_summary(&first),
-                    response_digest_summary(&second),
-                ],
+                &stable_evidence,
             ),
             Some(&query.sha256),
             &[],
-            2,
+            stable_provider_calls,
         ));
     }
 
@@ -579,6 +749,8 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
     );
     Ok(D1MigrationReconciliationProof {
         lease,
+        selection,
+        selection_query_sha256,
         query,
         first,
         second,
@@ -623,7 +795,11 @@ pub(crate) async fn reconcile_d1_migration_manifest(
         Ok(proof) => proof,
         Err(result) => return result,
     };
-    CallToolResult::structured(json!({
+    let response_evidence = proof.response_evidence();
+    let provider_read_lifecycle = proof.provider_read_lifecycle();
+    let provider_calls = proof.provider_calls();
+    let query_sha256s = proof.query_sha256s();
+    let mut content = json!({
         "ok": true,
         "operation": OPERATION,
         "dry_run": true,
@@ -648,9 +824,9 @@ pub(crate) async fn reconcile_d1_migration_manifest(
         "lease": proof.lease.identity,
         "query_sha256": proof.query.sha256,
         "expectation_proof_sha256": proof.expectation_proof_sha256,
-        "query_sha256s": [&proof.query.sha256, &proof.query.sha256],
-        "response_evidence": [response_digest_summary(&proof.first), response_digest_summary(&proof.second)],
-        "provider_read_lifecycle": [proof.first.lifecycle, proof.second.lifecycle],
+        "query_sha256s": query_sha256s,
+        "response_evidence": response_evidence,
+        "provider_read_lifecycle": provider_read_lifecycle,
         "canonical_snapshot_sha256": proof.canonical_snapshot_sha256,
         "scope_completeness": {
             "ledger": "complete_bounded_manifest_prefix",
@@ -671,10 +847,26 @@ pub(crate) async fn reconcile_d1_migration_manifest(
         },
         "reconciliation_plan_sha256": proof.reconciliation_plan_sha256,
         "future_live_transition": "use_d1_finalize_migration_reconciliation_after_independent_approval",
-        "provider_calls": 2,
+        "provider_calls": provider_calls,
         "provider_mutations": 0,
         "local_namespace_mutations": 0,
-    }))
+    });
+    if proof.effect_assertion_id == EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1 {
+        content["scope_completeness"]["seed_rows"] =
+            json!("complete_selected_prefix_manifest_derived_storage_class_and_value_row_set");
+        content["seed_row_evidence"] = json!(proof.first.snapshot.seed_tables);
+    }
+    if let (Some(selection), Some(selection_query_sha256)) = (
+        proof.selection.as_ref(),
+        proof.selection_query_sha256.as_deref(),
+    ) {
+        content["selection_binding"] = selection_binding_evidence(
+            selection,
+            selection_query_sha256,
+            &[&proof.first, &proof.second],
+        );
+    }
+    CallToolResult::structured(content)
 }
 
 #[derive(Debug, Clone)]
@@ -768,6 +960,13 @@ async fn read_complete_batch(
             });
         }
     };
+    let snapshot = parse_complete_batch(
+        &batch.result,
+        &query.statements,
+        &query.proof_sha256,
+        manifest,
+        &query.table_identity_spellings,
+    );
     lease.revalidate().map_err(|result| {
         contextualize_unverified_custody_error(
             result,
@@ -776,13 +975,7 @@ async fn read_complete_batch(
             1,
         )
     })?;
-    let snapshot = parse_complete_batch(
-        &batch.result,
-        &query.statements,
-        &query.proof_sha256,
-        manifest,
-    )
-    .map_err(|result| {
+    let snapshot = snapshot.map_err(|result| {
         contextualize_error(
             result,
             Some(&query.sha256),
@@ -800,6 +993,7 @@ async fn read_complete_batch(
 
 fn validate_expectations(
     derived_states: &[Vec<DerivedSchemaObject>],
+    seed_plan: Option<&SeedManifestPlan>,
     states: Vec<D1MigrationStateExpectation>,
 ) -> Result<ValidatedExpectations, CallToolResult> {
     let manifest_len = derived_states.len().saturating_sub(1);
@@ -813,6 +1007,8 @@ fn validate_expectations(
     let mut previous_prefix = None;
     let mut object_names = BTreeSet::new();
     let mut table_names = BTreeSet::new();
+    let mut table_identity_expectation_spellings = BTreeMap::<String, String>::new();
+    let mut seed_states = Vec::with_capacity(states.len());
     for (expected_prefix, state) in states.iter().enumerate() {
         if state.manifest_prefix_length != expected_prefix
             || state.manifest_prefix_length > manifest_len
@@ -832,6 +1028,48 @@ fn validate_expectations(
                 "a state expectation exceeds the schema object or table proof bound",
             ));
         }
+        let derived_seed_state = seed_plan
+            .and_then(|plan| plan.states.get(expected_prefix))
+            .cloned()
+            .unwrap_or_default();
+        validate_seed_storage_affinity(
+            &derived_seed_state,
+            &state.tables,
+            seed_plan.map(|plan| &plan.strict_table_keys),
+        )?;
+        let derived_seed_summaries = state_summaries(&derived_seed_state);
+        if state.seed_tables != derived_seed_summaries {
+            return Err(reconciliation_error(
+                "contradictory",
+                if seed_plan.is_some() {
+                    "d1.migration_reconciliation_seed_expectation_incomplete"
+                } else {
+                    "d1.migration_reconciliation_seed_expectation_not_allowed"
+                },
+                if seed_plan.is_some() {
+                    "seed table, column, count, and row-set digest expectations must exactly match the canonical literal rows derived from every manifest prefix"
+                } else {
+                    "predecessor effect assertions cannot attest seed-row expectations"
+                },
+            ));
+        }
+        for seed_table in &state.seed_tables {
+            validate_identifier("seed table name", &seed_table.table_name)?;
+            if seed_table.columns.is_empty()
+                || seed_table
+                    .columns
+                    .iter()
+                    .any(|column| validate_identifier("seed column", column).is_err())
+                || !valid_sha256(&seed_table.rows_sha256)
+            {
+                return Err(reconciliation_error(
+                    "contradictory",
+                    "d1.migration_reconciliation_seed_expectation_invalid",
+                    "seed expectations must contain bounded canonical identities, an exact row count, and a lowercase row-set SHA-256",
+                ));
+            }
+        }
+        seed_states.push(derived_seed_state);
         let mut previous_object = None::<(String, String)>;
         let mut state_table_objects = BTreeSet::new();
         let mut supplied_derived_objects = Vec::new();
@@ -884,7 +1122,37 @@ fn validate_expectations(
             });
             object_names.insert(object.name.clone());
         }
-        if supplied_derived_objects != derived_states[expected_prefix] {
+        let mut normalized_supplied_objects = supplied_derived_objects.clone();
+        if let Some(plan) = seed_plan {
+            for object in &mut normalized_supplied_objects {
+                if object.object_type == "table" {
+                    if let Some(spelling) = plan
+                        .preexisting_table_spellings
+                        .get(&sqlite_ascii_identifier_key(&object.name))
+                    {
+                        object.name = spelling.clone();
+                        object.table_name = spelling.clone();
+                    }
+                } else if matches!(object.object_type.as_str(), "index" | "trigger") {
+                    if let Some(spelling) = plan
+                        .preexisting_table_spellings
+                        .get(&sqlite_ascii_identifier_key(&object.table_name))
+                    {
+                        object.table_name = spelling.clone();
+                    }
+                }
+            }
+        }
+        let identity_order = |object: &DerivedSchemaObject| {
+            (
+                object.object_type.clone(),
+                sqlite_ascii_identifier_key(&object.name),
+            )
+        };
+        normalized_supplied_objects.sort_by_key(identity_order);
+        let mut normalized_derived_objects = derived_states[expected_prefix].clone();
+        normalized_derived_objects.sort_by_key(identity_order);
+        if normalized_supplied_objects != normalized_derived_objects {
             return Err(reconciliation_error(
                 "contradictory",
                 "d1.migration_reconciliation_schema_expectation_incomplete",
@@ -894,6 +1162,19 @@ fn validate_expectations(
         let mut previous_table = None::<String>;
         for table in &state.tables {
             validate_identifier("table expectation name", &table.name)?;
+            if seed_plan.is_some() {
+                let key = sqlite_ascii_identifier_key(&table.name);
+                if table_identity_expectation_spellings
+                    .insert(key, table.name.clone())
+                    .is_some_and(|existing| existing != table.name)
+                {
+                    return Err(reconciliation_error(
+                        "contradictory",
+                        "d1.migration_reconciliation_expectations_noncanonical",
+                        "one SQLite ASCII table identity must retain one exact provider/expectation spelling across every prefix",
+                    ));
+                }
+            }
             if previous_table
                 .as_ref()
                 .is_some_and(|previous| previous >= &table.name)
@@ -969,8 +1250,79 @@ fn validate_expectations(
         states,
         object_names: object_names.into_iter().collect(),
         table_names: table_names.into_iter().collect(),
+        seed_states,
         proof_sha256,
     })
+}
+
+fn validate_seed_storage_affinity(
+    seed_tables: &[SeedTableState],
+    tables: &[D1MigrationTableExpectation],
+    strict_table_keys: Option<&BTreeSet<String>>,
+) -> Result<(), CallToolResult> {
+    if seed_tables.is_empty() {
+        return Ok(());
+    }
+    let mut reviewed_tables = BTreeMap::new();
+    for table in tables {
+        let key = sqlite_ascii_identifier_key(&table.name);
+        if reviewed_tables.insert(key, table).is_some() {
+            return Err(reconciliation_error(
+                "contradictory",
+                "d1.migration_reconciliation_seed_affinity_unavailable",
+                "seed storage affinity requires one unambiguous reviewed table and column identity",
+            ));
+        }
+    }
+    for seed_table in seed_tables {
+        let table_key = sqlite_ascii_identifier_key(&seed_table.table_name);
+        let table = reviewed_tables.get(&table_key).ok_or_else(|| {
+            reconciliation_error(
+                "contradictory",
+                "d1.migration_reconciliation_seed_affinity_unavailable",
+                "seed storage affinity requires one unambiguous reviewed table and column identity",
+            )
+        })?;
+        if seed_table.rows.is_empty() {
+            continue;
+        }
+        let mut reviewed_columns = BTreeMap::new();
+        for column in &table.columns {
+            let key = sqlite_ascii_identifier_key(&column.name);
+            if reviewed_columns.insert(key, column).is_some() {
+                return Err(reconciliation_error(
+                    "contradictory",
+                    "d1.migration_reconciliation_seed_affinity_unavailable",
+                    "seed storage affinity requires one unambiguous reviewed table and column identity",
+                ));
+            }
+        }
+        for (column_index, seed_column) in seed_table.columns.iter().enumerate() {
+            let column = reviewed_columns
+                .get(&sqlite_ascii_identifier_key(seed_column))
+                .ok_or_else(|| {
+                    reconciliation_error(
+                        "contradictory",
+                        "d1.migration_reconciliation_seed_affinity_unavailable",
+                        "seed storage affinity requires one unambiguous reviewed table and column identity",
+                    )
+                })?;
+            if seed_table.rows.iter().any(|row| {
+                !seed_literal_is_identity_stable_for_declared_type(
+                    &row[column_index],
+                    &column.declared_type,
+                    strict_table_keys.is_some_and(|keys| keys.contains(&table_key)),
+                )
+            }) {
+                return Err(reconciliation_error(
+                    "capability_gap",
+                    "d1.migration_reconciliation_seed_affinity_unstable",
+                    "a seed literal and reviewed SQLite table/column contract could reject or change its storage class or value",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_columns(columns: &[D1MigrationColumnExpectation]) -> Result<(), CallToolResult> {
@@ -1079,6 +1431,7 @@ pub(crate) enum SqlToken {
 struct DerivedEffectAssertion {
     states: Vec<Vec<DerivedSchemaObject>>,
     additive_plan: Option<AdditiveManifestPlan>,
+    seed_plan: Option<SeedManifestPlan>,
     trigger_lexical_token_values: BTreeSet<String>,
 }
 
@@ -1087,6 +1440,7 @@ enum ClassifiedEffect {
     Create(DerivedSchemaObject),
     AddColumn(AddColumnEffect),
     ForeignKeysOn,
+    SeedRows(SeedInsertEffect),
 }
 
 #[cfg(test)]
@@ -1112,7 +1466,10 @@ fn derive_effect_assertion_details(
             "the selected effect assertion cannot exactly prove this statement or any arbitrary top-level DML, ALTER, DROP, PRAGMA, virtual table, or data-producing CREATE effect",
         ),
         EFFECT_ASSERTION_SCHEMA_ADDITIVE_V1 => {
-            return derive_additive_effect_assertion(manifest);
+            return derive_additive_effect_assertion(manifest, false);
+        }
+        EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1 => {
+            return derive_additive_effect_assertion(manifest, true);
         }
         _ => unreachable!("canonical registry assertion"),
     };
@@ -1161,15 +1518,22 @@ fn derive_effect_assertion_details(
     Ok(DerivedEffectAssertion {
         states,
         additive_plan: None,
+        seed_plan: None,
         trigger_lexical_token_values,
     })
 }
 
 fn derive_additive_effect_assertion(
     manifest: &[D1MigrationManifestEntry],
+    allow_seed_rows: bool,
 ) -> Result<DerivedEffectAssertion, CallToolResult> {
     let mut migrations = Vec::with_capacity(manifest.len());
     let mut trigger_lexical_token_values = BTreeSet::new();
+    let mut manifest_created_tables = BTreeMap::<String, String>::new();
+    let mut trigger_seen = BTreeSet::new();
+    let mut seeded_tables = BTreeSet::new();
+    let mut strict_seed_table_keys = BTreeSet::new();
+    let mut table_identity_spellings = BTreeMap::<String, String>::new();
     for migration in manifest {
         let statements = tokenize_sql_statements(&migration.sql).ok_or_else(|| {
             reconciliation_error(
@@ -1189,13 +1553,57 @@ fn derive_additive_effect_assertion(
         let mut addition_count = 0usize;
         let mut pragma_count = 0usize;
         for tokens in statements {
-            if let Some((object, trigger_tokens)) = classify_schema_create(&tokens, true) {
+            if let Some((mut object, trigger_tokens)) = classify_schema_create(&tokens, true) {
+                if allow_seed_rows && schema_create_uses_if_not_exists(&tokens) {
+                    return Err(reconciliation_error(
+                        "capability_gap",
+                        "d1.migration_reconciliation_seed_create_if_not_exists_unavailable",
+                        "the seed-row assertion requires every classified CREATE object to be an unconditional actual creation",
+                    ));
+                }
+                if allow_seed_rows && object.object_type == "table" {
+                    let authority_key = sqlite_ascii_identifier_key(&object.name);
+                    if manifest_created_tables
+                        .insert(authority_key.clone(), object.name.clone())
+                        .is_some()
+                    {
+                        return Err(reconciliation_error(
+                            "contradictory",
+                            "d1.migration_reconciliation_create_target_reused",
+                            "the manifest reuses a CREATE or additive parent identity and cannot derive exact prefix states",
+                        ));
+                    }
+                    if schema_create_table_is_strict(&tokens) {
+                        strict_seed_table_keys.insert(authority_key.clone());
+                    }
+                    table_identity_spellings
+                        .entry(authority_key)
+                        .or_insert_with(|| object.name.clone());
+                } else if allow_seed_rows
+                    && matches!(object.object_type.as_str(), "index" | "trigger")
+                {
+                    let authority_key = sqlite_ascii_identifier_key(&object.table_name);
+                    object.table_name = table_identity_spellings
+                        .entry(authority_key.clone())
+                        .or_insert_with(|| object.table_name.clone())
+                        .clone();
+                    if object.object_type == "trigger" {
+                        trigger_seen.insert(authority_key);
+                    }
+                }
                 trigger_lexical_token_values.extend(trigger_tokens);
                 effects.push(ClassifiedEffect::Create(object));
                 continue;
             }
             match classify_additive_statement(&tokens).map_err(additive_contract_error)? {
-                Some(AdditiveStatement::AddColumn(effect)) => {
+                Some(AdditiveStatement::AddColumn(mut effect)) => {
+                    if allow_seed_rows {
+                        let authority_key = sqlite_ascii_identifier_key(&effect.table_name);
+                        effect.table_name = table_identity_spellings
+                            .entry(authority_key)
+                            .or_insert_with(|| effect.table_name.clone())
+                            .clone();
+                    }
                     addition_count += 1;
                     effects.push(ClassifiedEffect::AddColumn(effect));
                 }
@@ -1204,10 +1612,47 @@ fn derive_additive_effect_assertion(
                     effects.push(ClassifiedEffect::ForeignKeysOn);
                 }
                 None => {
+                    if allow_seed_rows {
+                        if let Some(mut effect) =
+                            classify_seed_insert(&tokens).map_err(seed_contract_error)?
+                        {
+                            let authority_key = sqlite_ascii_identifier_key(&effect.table_name);
+                            let reviewed_table_name = manifest_created_tables
+                                .get(&authority_key)
+                                .ok_or_else(|| {
+                                    reconciliation_error(
+                                        "contradictory",
+                                        "d1.migration_reconciliation_seed_parent_missing",
+                                        "a canonical seed INSERT must follow CREATE TABLE for its target in the same manifest history",
+                                    )
+                                })?;
+                            if trigger_seen.contains(&authority_key) {
+                                return Err(reconciliation_error(
+                                    "contradictory",
+                                    "d1.migration_reconciliation_seed_after_trigger",
+                                    "a canonical seed INSERT must precede every trigger on its target, including across manifest entries",
+                                ));
+                            }
+                            if !seeded_tables.insert(authority_key) {
+                                return Err(reconciliation_error(
+                                    "contradictory",
+                                    "d1.migration_reconciliation_seed_target_reused",
+                                    "each manifest-created seed table may have exactly one canonical top-level seed INSERT",
+                                ));
+                            }
+                            effect.table_name = reviewed_table_name.clone();
+                            effects.push(ClassifiedEffect::SeedRows(effect));
+                            continue;
+                        }
+                    }
                     return Err(reconciliation_error(
                         "capability_gap",
                         "d1.migration_reconciliation_effect_proof_unavailable",
-                        "the additive assertion cannot prove this statement or any arbitrary DML, ALTER, DROP, PRAGMA, virtual table, or data-producing CREATE effect",
+                        if allow_seed_rows {
+                            "the additive seed-row assertion cannot prove this statement or any arbitrary DML, noncanonical INSERT, ALTER, DROP, PRAGMA, virtual table, or data-producing CREATE effect"
+                        } else {
+                            "the additive assertion cannot prove this statement or any arbitrary DML, ALTER, DROP, PRAGMA, virtual table, or data-producing CREATE effect"
+                        },
                     ));
                 }
             }
@@ -1222,15 +1667,23 @@ fn derive_additive_effect_assertion(
         migrations.push(effects);
     }
 
+    let identity_key = |name: &str| {
+        if allow_seed_rows {
+            sqlite_ascii_identifier_key(name)
+        } else {
+            name.to_string()
+        }
+    };
     let mut created_names = BTreeMap::<String, (String, usize)>::new();
-    let mut preexisting_tables = BTreeSet::new();
+    let mut preexisting_tables = BTreeMap::<String, String>::new();
     for (prefix, effects) in migrations.iter().enumerate() {
         for effect in effects {
             match effect {
                 ClassifiedEffect::Create(object) => {
-                    if preexisting_tables.contains(&object.name)
+                    let object_key = identity_key(&object.name);
+                    if preexisting_tables.contains_key(&object_key)
                         || created_names
-                            .insert(object.name.clone(), (object.object_type.clone(), prefix))
+                            .insert(object_key, (object.object_type.clone(), prefix))
                             .is_some()
                     {
                         return Err(reconciliation_error(
@@ -1239,11 +1692,28 @@ fn derive_additive_effect_assertion(
                             "the manifest reuses a CREATE or additive parent identity and cannot derive exact prefix states",
                         ));
                     }
+                    if allow_seed_rows && matches!(object.object_type.as_str(), "index" | "trigger")
+                    {
+                        let parent_key = identity_key(&object.table_name);
+                        if let Some((object_type, created_prefix)) = created_names.get(&parent_key)
+                        {
+                            if object_type != "table" || *created_prefix > prefix {
+                                return Err(reconciliation_error(
+                                    "contradictory",
+                                    "d1.migration_reconciliation_additive_parent_missing",
+                                    "an index or trigger parent must be a manifest-created or baseline table under SQLite ASCII identity",
+                                ));
+                            }
+                        } else {
+                            preexisting_tables
+                                .entry(parent_key)
+                                .or_insert_with(|| object.table_name.clone());
+                        }
+                    }
                 }
                 ClassifiedEffect::AddColumn(effect) => {
-                    if let Some((object_type, created_prefix)) =
-                        created_names.get(&effect.table_name)
-                    {
+                    let table_key = identity_key(&effect.table_name);
+                    if let Some((object_type, created_prefix)) = created_names.get(&table_key) {
                         if object_type != "table" || *created_prefix >= prefix {
                             return Err(reconciliation_error(
                                 "contradictory",
@@ -1252,16 +1722,91 @@ fn derive_additive_effect_assertion(
                             ));
                         }
                     } else {
-                        preexisting_tables.insert(effect.table_name.clone());
+                        preexisting_tables
+                            .entry(table_key)
+                            .or_insert_with(|| effect.table_name.clone());
                     }
                 }
                 ClassifiedEffect::ForeignKeysOn => {}
+                ClassifiedEffect::SeedRows(_) => {}
             }
         }
     }
 
-    let mut cumulative = preexisting_tables
+    let preexisting_table_spellings = preexisting_tables.clone();
+    let mut full_seed_states = BTreeMap::new();
+    let mut seed_locations = BTreeMap::new();
+    if allow_seed_rows {
+        for (seed_index, effects) in migrations.iter().enumerate() {
+            for effect in effects {
+                if let ClassifiedEffect::SeedRows(effect) = effect {
+                    let authority_key = sqlite_ascii_identifier_key(&effect.table_name);
+                    let (object_type, created_index) = created_names
+                        .get(&authority_key)
+                        .ok_or_else(|| {
+                            reconciliation_error(
+                                "contradictory",
+                                "d1.migration_reconciliation_seed_parent_missing",
+                                "a canonical seed INSERT must follow CREATE TABLE for its target in the same manifest history",
+                            )
+                        })?;
+                    if object_type != "table" {
+                        return Err(reconciliation_error(
+                            "contradictory",
+                            "d1.migration_reconciliation_seed_parent_missing",
+                            "a canonical seed INSERT must follow CREATE TABLE for its target in the same manifest history",
+                        ));
+                    }
+                    insert_seed_effect(&mut full_seed_states, effect.clone())
+                        .map_err(seed_contract_error)?;
+                    seed_locations.insert(
+                        authority_key,
+                        (
+                            created_index.saturating_add(1),
+                            seed_index.saturating_add(1),
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    let seed_registry = full_seed_states
         .into_iter()
+        .map(|(authority_key, state)| -> Result<_, CallToolResult> {
+            let (created_prefix, seeded_prefix) = seed_locations
+                .remove(&authority_key)
+                .ok_or_else(|| {
+                    reconciliation_error(
+                        "contradictory",
+                        "d1.migration_reconciliation_seed_parent_missing",
+                        "a canonical seed INSERT must bind one bounded full-manifest projection registry entry",
+                    )
+                })?;
+            Ok(SeedTableRegistration {
+                state,
+                created_prefix,
+                seeded_prefix,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let seed_states = (0..=migrations.len())
+        .map(|prefix| {
+            seed_registry
+                .iter()
+                .filter(|registration| registration.created_prefix <= prefix)
+                .map(|registration| {
+                    let mut state = registration.state.clone();
+                    if prefix < registration.seeded_prefix {
+                        state.rows.clear();
+                    }
+                    state
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    let mut cumulative = preexisting_tables
+        .into_values()
         .map(|name| {
             (
                 ("table".to_string(), name.clone()),
@@ -1287,6 +1832,7 @@ fn derive_additive_effect_assertion(
                 }
                 ClassifiedEffect::AddColumn(effect) => prefix.addition = Some(effect),
                 ClassifiedEffect::ForeignKeysOn => prefix.foreign_keys_on = true,
+                ClassifiedEffect::SeedRows(_) => {}
             }
         }
         states.push(cumulative.values().cloned().collect());
@@ -1295,11 +1841,61 @@ fn derive_additive_effect_assertion(
     Ok(DerivedEffectAssertion {
         states,
         additive_plan: Some(AdditiveManifestPlan { prefixes }),
+        seed_plan: allow_seed_rows.then_some(SeedManifestPlan {
+            states: seed_states,
+            strict_table_keys: strict_seed_table_keys,
+            registry: seed_registry,
+            preexisting_table_spellings,
+        }),
         trigger_lexical_token_values,
     })
 }
 
 fn additive_contract_error(error: AdditiveContractError) -> CallToolResult {
+    reconciliation_error(error.capability_state, error.code, error.message)
+}
+
+fn validate_additive_transitions_with_seed_identity(
+    plan: &AdditiveManifestPlan,
+    states: &[D1MigrationStateExpectation],
+    seed_plan: Option<&SeedManifestPlan>,
+) -> Result<(), AdditiveContractError> {
+    let Some(seed_plan) = seed_plan else {
+        return validate_additive_transitions(plan, states);
+    };
+    let mut normalized = states.to_vec();
+    for state in &mut normalized {
+        for object in &mut state.schema_objects {
+            if object.object_type == "table" {
+                if let Some(spelling) = seed_plan
+                    .preexisting_table_spellings
+                    .get(&sqlite_ascii_identifier_key(&object.name))
+                {
+                    object.name = spelling.clone();
+                    object.table_name = spelling.clone();
+                }
+            } else if matches!(object.object_type.as_str(), "index" | "trigger") {
+                if let Some(spelling) = seed_plan
+                    .preexisting_table_spellings
+                    .get(&sqlite_ascii_identifier_key(&object.table_name))
+                {
+                    object.table_name = spelling.clone();
+                }
+            }
+        }
+        for table in &mut state.tables {
+            if let Some(spelling) = seed_plan
+                .preexisting_table_spellings
+                .get(&sqlite_ascii_identifier_key(&table.name))
+            {
+                table.name = spelling.clone();
+            }
+        }
+    }
+    validate_additive_transitions(plan, &normalized)
+}
+
+fn seed_contract_error(error: SeedContractError) -> CallToolResult {
     reconciliation_error(error.capability_state, error.code, error.message)
 }
 
@@ -1312,6 +1908,9 @@ pub(crate) fn canonical_effect_assertion_id(
             Ok(EFFECT_ASSERTION_SCHEMA_CREATE_OBJECTS_V1)
         }
         Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_V1) => Ok(EFFECT_ASSERTION_SCHEMA_ADDITIVE_V1),
+        Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1) => {
+            Ok(EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1)
+        }
         _ => Err(reconciliation_error(
             "capability_gap",
             "d1.migration_reconciliation_effect_assertion_missing",
@@ -1329,9 +1928,18 @@ pub(crate) fn validate_replay_manifest_expectations(
     let selected = canonical_effect_assertion_id(Some(effect_assertion_id))?;
     let derived = derive_effect_assertion_details(Some(selected), manifest)?;
     validate_reserved_migrations_table(migrations_table, &derived)?;
-    let validated = validate_expectations(&derived.states, state_expectations.to_vec())?;
+    let validated = validate_expectations(
+        &derived.states,
+        derived.seed_plan.as_ref(),
+        state_expectations.to_vec(),
+    )?;
     if let Some(plan) = derived.additive_plan.as_ref() {
-        validate_additive_transitions(plan, &validated.states).map_err(additive_contract_error)?;
+        validate_additive_transitions_with_seed_identity(
+            plan,
+            &validated.states,
+            derived.seed_plan.as_ref(),
+        )
+        .map_err(additive_contract_error)?;
     }
     Ok(validated.proof_sha256)
 }
@@ -1369,6 +1977,15 @@ fn effect_assertion_scope(effect_assertion_id: &str) -> &'static [&'static str] 
             "alter_table_add_column",
             "pragma_foreign_keys_on",
         ],
+        EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1 => &[
+            "table",
+            "index",
+            "view",
+            "trigger",
+            "alter_table_add_column",
+            "pragma_foreign_keys_on",
+            "insert_seed_values",
+        ],
         _ => &[],
     }
 }
@@ -1378,6 +1995,7 @@ fn effect_assertion_statement_class(effect_assertion_id: &str) -> &'static str {
         EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1 => "schema_create_only",
         EFFECT_ASSERTION_SCHEMA_CREATE_OBJECTS_V1 => "schema_create_tables_indexes_views_triggers",
         EFFECT_ASSERTION_SCHEMA_ADDITIVE_V1 => "schema_create_objects_additive",
+        EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1 => "schema_create_objects_additive_seed_rows",
         _ => "unsupported",
     }
 }
@@ -1577,6 +2195,27 @@ fn classify_schema_create(
     }
 }
 
+fn schema_create_uses_if_not_exists(tokens: &[SqlToken]) -> bool {
+    if !token_is_word(tokens.first(), "create") {
+        return false;
+    }
+    let mut cursor = 1;
+    if token_is_word(tokens.get(cursor), "unique") {
+        cursor += 1;
+    }
+    if !matches!(
+        tokens.get(cursor),
+        Some(SqlToken::Word(object_type))
+            if matches_ignore_ascii_case(object_type, &["table", "index", "view", "trigger"])
+    ) {
+        return false;
+    }
+    cursor += 1;
+    token_is_word(tokens.get(cursor), "if")
+        && token_is_word(tokens.get(cursor + 1), "not")
+        && token_is_word(tokens.get(cursor + 2), "exists")
+}
+
 fn trigger_lexical_token_values(header_suffix: &[SqlToken], body: &[SqlToken]) -> BTreeSet<String> {
     header_suffix
         .iter()
@@ -1668,6 +2307,21 @@ fn valid_table_suffix(tokens: &[SqlToken]) -> bool {
         }
     }
     true
+}
+
+fn schema_create_table_is_strict(tokens: &[SqlToken]) -> bool {
+    let Some(definition_start) = tokens
+        .iter()
+        .position(|token| token == &SqlToken::Symbol('('))
+    else {
+        return false;
+    };
+    let Some(after_definition) = balanced_parenthesized_end(tokens, definition_start) else {
+        return false;
+    };
+    tokens[after_definition..]
+        .iter()
+        .any(|token| token_is_word(Some(token), "strict"))
 }
 
 fn tokenize_sql_statements(sql: &str) -> Option<Vec<Vec<SqlToken>>> {
@@ -1879,7 +2533,9 @@ fn build_fixed_query(
     manifest_len: usize,
     object_names: &[String],
     table_names: &[String],
+    seed_states: &[SeedTableState],
     proof_sha256: &str,
+    normalize_sqlite_table_identities: bool,
 ) -> FixedQuery {
     let mut sql = Vec::new();
     let mut statements = Vec::new();
@@ -1909,7 +2565,7 @@ fn build_fixed_query(
         &schema,
         proof_sha256,
         &format!(
-            "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name IN ({names}) ORDER BY type, name LIMIT {}",
+            "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name COLLATE NOCASE IN ({names}) ORDER BY type, name LIMIT {}",
             object_names.len() + 1
         ),
         &[3, 4],
@@ -1950,12 +2606,33 @@ fn build_fixed_query(
         ));
         statements.push(foreign_key_check);
     }
+    for state in seed_states {
+        let seed_rows = BatchStatement::SeedRows(state.clone());
+        let value_positions = (0..state.columns.len())
+            .flat_map(|index| [3 + index * 2, 4 + index * 2])
+            .collect::<Vec<_>>();
+        sql.push(tagged_statement(
+            &seed_rows,
+            proof_sha256,
+            &seed_select_sql(state),
+            &value_positions,
+        ));
+        statements.push(seed_rows);
+    }
     let sql = sql.join(";\n");
     FixedQuery {
         sha256: sha256_bytes_hex(sql.as_bytes()),
         sql,
         proof_sha256: proof_sha256.to_string(),
         statements,
+        table_identity_spellings: if normalize_sqlite_table_identities {
+            table_names
+                .iter()
+                .map(|table| (sqlite_ascii_identifier_key(table), table.clone()))
+                .collect()
+        } else {
+            BTreeMap::new()
+        },
     }
 }
 
@@ -1966,8 +2643,8 @@ fn tagged_statement(
     data_order_positions: &[usize],
 ) -> String {
     let marker = quote_string(&statement.marker(proof_sha256));
-    let null_fields = statement
-        .data_fields()
+    let data_fields = statement.data_fields();
+    let null_fields = data_fields
         .iter()
         .map(|field| format!("NULL AS {}", quote_identifier(field)))
         .collect::<Vec<_>>()
@@ -1993,6 +2670,7 @@ fn parse_complete_batch(
     statements: &[BatchStatement],
     proof_sha256: &str,
     manifest: &[D1MigrationManifestEntry],
+    table_identity_spellings: &BTreeMap<String, String>,
 ) -> Result<CanonicalSnapshot, CallToolResult> {
     let result_sets = value.as_array().ok_or_else(|| {
         reconciliation_error(
@@ -2011,6 +2689,7 @@ fn parse_complete_batch(
     let mut ledger = None;
     let mut schema_objects = None;
     let mut tables: BTreeMap<String, ObservedTable> = BTreeMap::new();
+    let mut seed_tables = Vec::new();
     for (result_set, statement) in result_sets.iter().zip(statements) {
         let rows = result_rows(result_set, statement, proof_sha256)?;
         match statement {
@@ -2032,7 +2711,17 @@ fn parse_complete_batch(
                         "sqlite_master evidence exceeded the declared object bound",
                     ));
                 }
-                schema_objects = Some(parse_schema_rows(&rows)?);
+                let mut parsed = parse_schema_rows(&rows)?;
+                for object in &mut parsed {
+                    if matches!(object.object_type.as_str(), "index" | "trigger") {
+                        if let Some(reviewed) = table_identity_spellings
+                            .get(&sqlite_ascii_identifier_key(&object.table_name))
+                        {
+                            object.table_name = reviewed.clone();
+                        }
+                    }
+                }
+                schema_objects = Some(parsed);
             }
             BatchStatement::TableXinfo(table) => {
                 if rows.len() > MAX_COLUMNS_PER_TABLE {
@@ -2078,6 +2767,9 @@ fn parse_complete_batch(
                     ));
                 }
             }
+            BatchStatement::SeedRows(state) => {
+                seed_tables.push(observed_seed_summary(state, &rows).map_err(seed_contract_error)?);
+            }
         }
     }
     Ok(CanonicalSnapshot {
@@ -2096,6 +2788,7 @@ fn parse_complete_batch(
             )
         })?,
         tables: tables.into_values().collect(),
+        seed_tables,
     })
 }
 
@@ -2191,21 +2884,20 @@ fn parse_tagged_rows(
         .and_then(Value::as_str)
         .filter(|value| *value == statement.marker(proof_sha256))
         .ok_or_else(statement_marker_malformed)?;
+    let data_fields = statement.data_fields();
     if first_object
         .get("__cf_mcp_row_kind")
         .and_then(Value::as_i64)
         != Some(0)
-        || statement
-            .data_fields()
+        || data_fields
             .iter()
-            .any(|field| first_object.get(*field) != Some(&Value::Null))
+            .any(|field| first_object.get(field) != Some(&Value::Null))
     {
         return Err(statement_marker_malformed());
     }
-    let expected_keys = statement
-        .data_fields()
+    let expected_keys = data_fields
         .iter()
-        .copied()
+        .map(String::as_str)
         .chain(["__cf_mcp_row_kind", "__cf_mcp_statement_id"])
         .collect::<BTreeSet<_>>();
     if first_object
@@ -2227,11 +2919,11 @@ fn parse_tagged_rows(
             return Err(statement_marker_malformed());
         }
         let mut data = Map::new();
-        for field in statement.data_fields() {
+        for field in &data_fields {
             data.insert(
-                (*field).to_string(),
+                field.to_string(),
                 object
-                    .get(*field)
+                    .get(field)
                     .cloned()
                     .ok_or_else(statement_marker_malformed)?,
             );
@@ -2296,9 +2988,10 @@ fn parse_schema_rows(rows: &[Value]) -> Result<Vec<ObservedSchemaObject>, CallTo
         let name = exact_string(object, "name")?;
         let table_name = exact_string(object, "tbl_name")?;
         let sql = exact_string(object, "sql")?;
+        let identity_key = sqlite_ascii_identifier_key(&name);
         let key = (object_type.clone(), name.clone());
         if !matches!(object_type.as_str(), "table" | "index" | "view" | "trigger")
-            || !names.insert(name.clone())
+            || !names.insert(identity_key)
             || previous.as_ref().is_some_and(|prior| prior >= &key)
         {
             return Err(reconciliation_error(
@@ -2462,7 +3155,7 @@ fn exact_nonnegative_i64(object: &Map<String, Value>, key: &str) -> Result<i64, 
 
 fn verify_expected_state(
     expected: &D1MigrationStateExpectation,
-    validated: &ValidatedExpectations,
+    proof_table_count: usize,
     snapshot: &CanonicalSnapshot,
 ) -> Result<(), CallToolResult> {
     let expected_objects = expected
@@ -2521,7 +3214,7 @@ fn verify_expected_state(
             }
         }
     }
-    if snapshot.tables.len() != validated.table_names.len()
+    if snapshot.tables.len() != proof_table_count
         || expected_tables
             .keys()
             .any(|name| !snapshot.tables.iter().any(|table| &table.name == name))
@@ -2530,6 +3223,13 @@ fn verify_expected_state(
             "contradictory",
             "d1.migration_reconciliation_table_proof_missing",
             "stable batch omitted one or more declared table proof result sets",
+        ));
+    }
+    if snapshot.seed_tables != expected.seed_tables {
+        return Err(reconciliation_error(
+            "contradictory",
+            "d1.migration_reconciliation_seed_rows_mismatch",
+            "stable seed-row storage classes, values, row count, or complete row-set digest did not match the canonical manifest-derived expectation",
         ));
     }
     Ok(())
@@ -2587,6 +3287,42 @@ fn batch_digest(batch: &ParsedBatch) -> String {
     let bytes = serde_json::to_vec(&batch.snapshot)
         .expect("canonical reconciliation snapshot serialization is infallible");
     sha256_bytes_hex(&bytes)
+}
+
+fn ledger_digest(ledger: &[D1ManifestLedgerRow]) -> String {
+    let bytes = serde_json::to_vec(ledger)
+        .expect("canonical reconciliation ledger serialization is infallible");
+    sha256_bytes_hex(&bytes)
+}
+
+fn selection_binding_evidence(
+    selection: &ParsedBatch,
+    selection_query_sha256: &str,
+    complete_batches: &[&ParsedBatch],
+) -> Value {
+    json!({
+        "selection_query_sha256": selection_query_sha256,
+        "selected_ledger_sha256": ledger_digest(&selection.snapshot.ledger),
+        "selected_manifest_prefix_length": selection.snapshot.ledger.len(),
+        "complete_ledger_sha256s": complete_batches
+            .iter()
+            .map(|batch| ledger_digest(&batch.snapshot.ledger))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn add_selection_binding_evidence(
+    result: &mut CallToolResult,
+    selection: &ParsedBatch,
+    selection_query_sha256: &str,
+    complete_batches: &[&ParsedBatch],
+) {
+    if let Some(Value::Object(content)) = result.structured_content.as_mut() {
+        content.insert(
+            "selection_binding".to_string(),
+            selection_binding_evidence(selection, selection_query_sha256, complete_batches),
+        );
+    }
 }
 
 fn response_digest_summary(batch: &ParsedBatch) -> Value {
@@ -3139,6 +3875,7 @@ mod tests {
             manifest_prefix_length: 0,
             schema_objects: Vec::new(),
             tables: Vec::new(),
+            seed_tables: Vec::new(),
         }
     }
 
@@ -3154,7 +3891,7 @@ mod tests {
         sentinel.insert("__cf_mcp_statement_id".to_string(), json!(marker));
         sentinel.insert("__cf_mcp_row_kind".to_string(), json!(0));
         for field in statement.data_fields() {
-            sentinel.insert((*field).to_string(), Value::Null);
+            sentinel.insert(field, Value::Null);
         }
         tagged.push(Value::Object(sentinel));
         for row in rows {
@@ -3445,6 +4182,396 @@ mod tests {
     }
 
     #[test]
+    fn canonical_seed_registry_enforces_parent_and_trigger_order_across_entries() {
+        let table = "CREATE TABLE channels(id TEXT PRIMARY KEY)";
+        let seed = "INSERT INTO channels (id) VALUES ('daily'), ('weekly')";
+        let trigger = "CREATE TRIGGER channels_guard BEFORE UPDATE ON channels BEGIN SELECT RAISE(ABORT, 'immutable'); END";
+        for sql in [
+            format!("{table}; {seed}; {trigger};"),
+            format!("{table}; {seed};"),
+        ] {
+            let derived = derive_effect_assertion_details(
+                Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1),
+                &manifest(&sql),
+            )
+            .expect("canonical seed follows its manifest CREATE");
+            let seed_plan = derived.seed_plan.expect("versioned seed plan");
+            assert_eq!(seed_plan.states[1][0].rows.len(), 2);
+        }
+
+        let case_variant_parent = manifest(
+            "CREATE TABLE Channels(id TEXT PRIMARY KEY); CREATE INDEX channels_by_id ON CHANNELS(id); INSERT INTO CHANNELS (id) VALUES ('daily'); CREATE TRIGGER channels_guard BEFORE UPDATE ON cHaNnElS BEGIN SELECT RAISE(ABORT, 'immutable'); END;",
+        );
+        let derived = derive_effect_assertion_details(
+            Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1),
+            &case_variant_parent,
+        )
+        .expect("SQLite case aliases share the reviewed CREATE spelling");
+        assert!(
+            derived.states[1]
+                .iter()
+                .filter(|object| matches!(object.object_type.as_str(), "index" | "trigger"))
+                .all(|object| object.table_name == "Channels"),
+            "index and trigger parents retain the reviewed CREATE spelling",
+        );
+        let seed_state = &derived.seed_plan.expect("seed plan").states[1][0];
+        assert_eq!(seed_state.table_name, "Channels");
+        assert_eq!(
+            seed_select_sql(seed_state).matches("\"Channels\"").count(),
+            1
+        );
+
+        let strict = derive_effect_assertion_details(
+            Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1),
+            &manifest(
+                "CREATE TABLE StrictRows(value BLOB) STRICT; INSERT INTO strictrows (value) VALUES ('text');",
+            ),
+        )
+        .expect("STRICT table identity is retained for affinity validation");
+        assert_eq!(
+            strict
+                .seed_plan
+                .expect("strict seed plan")
+                .strict_table_keys,
+            BTreeSet::from(["strictrows".to_string()]),
+        );
+
+        let create = "CREATE TABLE Channels(id TEXT PRIMARY KEY)";
+        let alter_and_seed = "ALTER TABLE channels ADD COLUMN rank INTEGER; INSERT INTO CHANNELS (id, rank) VALUES ('daily', 1)";
+        let case_variant_addition = [create, alter_and_seed]
+            .into_iter()
+            .enumerate()
+            .map(|(index, sql)| D1MigrationManifestEntry {
+                name: format!("{:04}.sql", index + 1),
+                size_bytes: sql.len() as u64,
+                sql_sha256: sha256_bytes_hex(sql.as_bytes()),
+                sql: sql.to_string(),
+            })
+            .collect::<Vec<_>>();
+        let derived = derive_effect_assertion_details(
+            Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1),
+            &case_variant_addition,
+        )
+        .expect("ALTER and seed aliases share the reviewed CREATE spelling");
+        assert_eq!(
+            derived.additive_plan.expect("additive plan").prefixes[1]
+                .addition
+                .as_ref()
+                .expect("case-variant addition")
+                .table_name,
+            "Channels",
+        );
+        let seed_plan = derived.seed_plan.expect("seed plan");
+        assert!(seed_plan.states[0].is_empty());
+        assert_eq!(seed_plan.states[1][0].table_name, "Channels");
+        assert!(seed_plan.states[1][0].rows.is_empty());
+        assert_eq!(seed_plan.states[2][0].table_name, "Channels");
+        assert_eq!(seed_plan.states[2][0].rows.len(), 1);
+        assert_eq!(seed_plan.registry.len(), 1);
+        assert_eq!(seed_plan.registry[0].created_prefix, 1);
+        assert_eq!(seed_plan.registry[0].seeded_prefix, 2);
+        validate_seed_storage_affinity(
+            &seed_plan.states[1],
+            &[D1MigrationTableExpectation {
+                name: "Channels".to_string(),
+                columns: vec![D1MigrationColumnExpectation {
+                    cid: 0,
+                    name: "id".to_string(),
+                    declared_type: "TEXT".to_string(),
+                    not_null: false,
+                    default_value: None,
+                    primary_key_position: 1,
+                    hidden: 0,
+                }],
+                foreign_keys: Vec::new(),
+            }],
+            Some(&seed_plan.strict_table_keys),
+        )
+        .expect("the zero-row prefix need not expose a later seed column");
+
+        let cross_entry = [format!("{table}; {seed};"), format!("{trigger};")]
+            .into_iter()
+            .enumerate()
+            .map(|(index, sql)| D1MigrationManifestEntry {
+                name: format!("{:04}.sql", index + 1),
+                size_bytes: sql.len() as u64,
+                sql_sha256: sha256_bytes_hex(sql.as_bytes()),
+                sql,
+            })
+            .collect::<Vec<_>>();
+        let derived = derive_effect_assertion_details(
+            Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1),
+            &cross_entry,
+        )
+        .expect("later trigger remains after canonical seed");
+        assert_eq!(
+            derived
+                .seed_plan
+                .expect("seed plan")
+                .states
+                .last()
+                .expect("final state")[0]
+                .rows
+                .len(),
+            2
+        );
+
+        let rejected = [
+            format!("{seed}; {table};"),
+            format!("{table}; {trigger}; {seed};"),
+            format!("{table}; {seed}; {seed};"),
+            "CREATE TABLE channels(id TEXT); CREATE TRIGGER channels_guard BEFORE UPDATE ON CHANNELS BEGIN SELECT 1; END; INSERT INTO channels (id) VALUES ('daily');".to_string(),
+            "CREATE TABLE channels(id TEXT); INSERT INTO channels (id) VALUES ('daily'); INSERT INTO CHANNELS (id) VALUES ('weekly');".to_string(),
+        ];
+        for sql in rejected {
+            assert!(
+                derive_effect_assertion_details(
+                    Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1),
+                    &manifest(&sql),
+                )
+                .is_err(),
+                "invalid seed authority ordering must fail closed: {sql}",
+            );
+        }
+
+        let trigger_then_seed = [format!("{table}; {trigger};"), format!("{seed};")]
+            .into_iter()
+            .enumerate()
+            .map(|(index, sql)| D1MigrationManifestEntry {
+                name: format!("{:04}.sql", index + 1),
+                size_bytes: sql.len() as u64,
+                sql_sha256: sha256_bytes_hex(sql.as_bytes()),
+                sql,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            derive_effect_assertion_details(
+                Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1),
+                &trigger_then_seed,
+            )
+            .is_err(),
+            "a trigger in an earlier prefix closes seed authority for that target",
+        );
+
+        let case_variant_trigger_then_seed = [
+            "CREATE TABLE channels(id TEXT); CREATE TRIGGER channels_guard BEFORE UPDATE ON CHANNELS BEGIN SELECT 1; END;".to_string(),
+            "INSERT INTO cHaNnElS (id) VALUES ('daily');".to_string(),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, sql)| D1MigrationManifestEntry {
+            name: format!("{:04}.sql", index + 1),
+            size_bytes: sql.len() as u64,
+            sql_sha256: sha256_bytes_hex(sql.as_bytes()),
+            sql,
+        })
+        .collect::<Vec<_>>();
+        assert!(
+            derive_effect_assertion_details(
+                Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1),
+                &case_variant_trigger_then_seed,
+            )
+            .is_err(),
+            "case variants cannot bypass a trigger in an earlier prefix",
+        );
+
+        for sql in [
+            "CREATE TABLE IF NOT EXISTS channels(id TEXT);",
+            "CREATE TABLE channels(id TEXT); CREATE INDEX IF NOT EXISTS channels_by_id ON channels(id);",
+            "CREATE VIEW IF NOT EXISTS channels_view AS SELECT 1;",
+            "CREATE TABLE channels(id TEXT); CREATE TRIGGER IF NOT EXISTS channels_guard BEFORE UPDATE ON channels BEGIN SELECT 1; END;",
+        ] {
+            let error = derive_effect_assertion_details(
+                Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1),
+                &manifest(sql),
+            )
+            .expect_err("seed authority requires unconditional CREATE effects");
+            assert_eq!(
+                error.structured_content.as_ref().unwrap()["error"]["code"],
+                "d1.migration_reconciliation_seed_create_if_not_exists_unavailable",
+            );
+            derive_effect_assertion_details(
+                Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_V1),
+                &manifest(sql),
+            )
+            .expect("the predecessor additive assertion remains unchanged");
+        }
+    }
+
+    #[test]
+    fn seed_registry_normalizes_preexisting_table_parents_and_preserves_expectation_spelling() {
+        let single = derive_effect_assertion_details(
+            Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1),
+            &manifest(
+                "CREATE INDEX records_by_id ON Records(id); CREATE TRIGGER records_guard BEFORE UPDATE ON records BEGIN SELECT 1; END;",
+            ),
+        )
+        .expect("index and trigger establish one pre-existing table identity");
+        assert_eq!(
+            single.states[0],
+            vec![DerivedSchemaObject {
+                object_type: "table".to_string(),
+                name: "Records".to_string(),
+                table_name: "Records".to_string(),
+            }],
+        );
+        assert!(
+            single.states[1]
+                .iter()
+                .filter(|object| matches!(object.object_type.as_str(), "index" | "trigger"))
+                .all(|object| object.table_name == "Records")
+        );
+
+        let first = "ALTER TABLE Items ADD COLUMN status TEXT; CREATE INDEX items_by_status ON items(status); CREATE TRIGGER items_guard BEFORE UPDATE ON ITEMS BEGIN SELECT 1; END;";
+        let second = "ALTER TABLE iTeMs ADD COLUMN rank INTEGER;";
+        let repeated = [first, second]
+            .into_iter()
+            .enumerate()
+            .map(|(index, sql)| D1MigrationManifestEntry {
+                name: format!("{:04}.sql", index + 1),
+                size_bytes: sql.len() as u64,
+                sql_sha256: sha256_bytes_hex(sql.as_bytes()),
+                sql: sql.to_string(),
+            })
+            .collect::<Vec<_>>();
+        let derived = derive_effect_assertion_details(
+            Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1),
+            &repeated,
+        )
+        .expect("repeated ALTER aliases share first-seen SQLite spelling");
+        let seed_plan = derived.seed_plan.as_ref().expect("seed identity plan");
+        assert_eq!(
+            seed_plan.preexisting_table_spellings,
+            BTreeMap::from([("items".to_string(), "Items".to_string())]),
+        );
+        assert!(
+            derived
+                .additive_plan
+                .as_ref()
+                .expect("additive plan")
+                .prefixes
+                .iter()
+                .filter_map(|prefix| prefix.addition.as_ref())
+                .all(|addition| addition.table_name == "Items")
+        );
+        assert!(
+            derived.states[1]
+                .iter()
+                .filter(|object| matches!(object.object_type.as_str(), "index" | "trigger"))
+                .all(|object| object.table_name == "Items")
+        );
+
+        let column = |cid, name: &str, declared_type: &str, primary_key_position| {
+            D1MigrationColumnExpectation {
+                cid,
+                name: name.to_string(),
+                declared_type: declared_type.to_string(),
+                not_null: false,
+                default_value: None,
+                primary_key_position,
+                hidden: 0,
+            }
+        };
+        let table_object = |sql_sha256: String| D1MigrationSchemaObjectExpectation {
+            object_type: "table".to_string(),
+            name: "ITEMS".to_string(),
+            table_name: "ITEMS".to_string(),
+            sql_sha256,
+        };
+        let table_state =
+            |columns: Vec<D1MigrationColumnExpectation>| D1MigrationTableExpectation {
+                name: "ITEMS".to_string(),
+                columns,
+                foreign_keys: Vec::new(),
+            };
+        let baseline_columns = vec![column(0, "id", "INTEGER", 1)];
+        let mut status_columns = baseline_columns.clone();
+        status_columns.push(column(1, "status", "TEXT", 0));
+        let mut rank_columns = status_columns.clone();
+        rank_columns.push(column(2, "rank", "INTEGER", 0));
+        let index = D1MigrationSchemaObjectExpectation {
+            object_type: "index".to_string(),
+            name: "items_by_status".to_string(),
+            table_name: "ITEMS".to_string(),
+            sql_sha256: sha256_bytes_hex(
+                "CREATE INDEX items_by_status ON items(status)".as_bytes(),
+            ),
+        };
+        let trigger = D1MigrationSchemaObjectExpectation {
+            object_type: "trigger".to_string(),
+            name: "items_guard".to_string(),
+            table_name: "ITEMS".to_string(),
+            sql_sha256: sha256_bytes_hex(
+                "CREATE TRIGGER items_guard BEFORE UPDATE ON ITEMS BEGIN SELECT 1; END".as_bytes(),
+            ),
+        };
+        let states = vec![
+            D1MigrationStateExpectation {
+                manifest_prefix_length: 0,
+                schema_objects: vec![table_object("a".repeat(64))],
+                tables: vec![table_state(baseline_columns)],
+                seed_tables: Vec::new(),
+            },
+            D1MigrationStateExpectation {
+                manifest_prefix_length: 1,
+                schema_objects: vec![index.clone(), table_object("b".repeat(64)), trigger.clone()],
+                tables: vec![table_state(status_columns)],
+                seed_tables: Vec::new(),
+            },
+            D1MigrationStateExpectation {
+                manifest_prefix_length: 2,
+                schema_objects: vec![index, table_object("c".repeat(64)), trigger],
+                tables: vec![table_state(rank_columns)],
+                seed_tables: Vec::new(),
+            },
+        ];
+        let validated = validate_expectations(&derived.states, Some(seed_plan), states)
+            .expect("provider/expectation spelling may differ by SQLite ASCII case");
+        validate_additive_transitions_with_seed_identity(
+            derived.additive_plan.as_ref().expect("additive plan"),
+            &validated.states,
+            Some(seed_plan),
+        )
+        .expect("case-insensitive transition lookup preserves provider spelling");
+        assert_eq!(validated.table_names, vec!["ITEMS"]);
+    }
+
+    #[test]
+    fn canonical_seed_registry_is_closed_to_predecessors_and_arbitrary_dml() {
+        let canonical = manifest(
+            "CREATE TABLE channels(id TEXT PRIMARY KEY); INSERT INTO channels (id) VALUES ('daily');",
+        );
+        for predecessor in [
+            EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1,
+            EFFECT_ASSERTION_SCHEMA_CREATE_OBJECTS_V1,
+            EFFECT_ASSERTION_SCHEMA_ADDITIVE_V1,
+        ] {
+            assert!(
+                derive_effect_assertion_details(Some(predecessor), &canonical).is_err(),
+                "predecessor assertion must remain closed: {predecessor}",
+            );
+        }
+        for dml in [
+            "CREATE TABLE channels(id TEXT); INSERT OR IGNORE INTO channels (id) VALUES ('daily');",
+            "CREATE TABLE channels(id TEXT); INSERT INTO channels SELECT 'daily';",
+            "CREATE TABLE channels(id TEXT); INSERT INTO channels VALUES ('daily');",
+            "CREATE TABLE channels(id TEXT); INSERT INTO channels (id) VALUES (lower('daily'));",
+            "CREATE TABLE channels(id TEXT); INSERT INTO channels (id) VALUES (NULL);",
+            "CREATE TABLE channels(id TEXT); UPDATE channels SET id = 'weekly';",
+            "CREATE TABLE channels(id TEXT); DELETE FROM channels;",
+        ] {
+            assert!(
+                derive_effect_assertion_details(
+                    Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1),
+                    &manifest(dml),
+                )
+                .is_err(),
+                "arbitrary or ambiguous DML must fail closed: {dml}",
+            );
+        }
+    }
+
+    #[test]
     fn additive_registry_rejects_unsupported_ddl_and_pragma_before_expectations() {
         for sql in [
             "ALTER TABLE items RENAME TO renamed;",
@@ -3610,15 +4737,17 @@ mod tests {
                 },
             ],
             tables: vec![table.clone()],
+            seed_tables: Vec::new(),
         };
-        let validated = validate_expectations(&derived, vec![empty_state(), expected.clone()])
-            .expect("only the physical table needs xinfo/FK expectations");
+        let validated =
+            validate_expectations(&derived, None, vec![empty_state(), expected.clone()])
+                .expect("only the physical table needs xinfo/FK expectations");
         assert_eq!(validated.table_names, vec!["items"]);
 
         let mut omitted = expected.clone();
         omitted.schema_objects.remove(1);
         assert!(
-            validate_expectations(&derived, vec![empty_state(), omitted]).is_err(),
+            validate_expectations(&derived, None, vec![empty_state(), omitted]).is_err(),
             "a trigger omitted from a selected prefix must fail before provider access",
         );
 
@@ -3632,14 +4761,14 @@ mod tests {
                 sql_sha256: "e".repeat(64),
             });
         assert!(
-            validate_expectations(&derived, vec![empty_state(), added]).is_err(),
+            validate_expectations(&derived, None, vec![empty_state(), added]).is_err(),
             "an added schema object must fail before provider access",
         );
 
         let mut wrong_parent = expected.clone();
         wrong_parent.schema_objects[1].table_name = "other_items".to_string();
         assert!(
-            validate_expectations(&derived, vec![empty_state(), wrong_parent]).is_err(),
+            validate_expectations(&derived, None, vec![empty_state(), wrong_parent]).is_err(),
             "a trigger parent mismatch must fail before provider access",
         );
 
@@ -3660,9 +4789,10 @@ mod tests {
                 sql_sha256: "f".repeat(64),
             }],
             tables: Vec::new(),
+            seed_tables: Vec::new(),
         };
         let orphan_error =
-            validate_expectations(&orphan_derived, vec![empty_state(), orphan_expected])
+            validate_expectations(&orphan_derived, None, vec![empty_state(), orphan_expected])
                 .expect_err("a trigger cannot bind an absent table");
         assert_eq!(
             orphan_error
@@ -3698,9 +4828,10 @@ mod tests {
                 columns: table.columns,
                 foreign_keys: Vec::new(),
             }],
+            seed_tables: Vec::new(),
         };
         assert!(
-            verify_expected_state(&expected, &validated, &snapshot).is_err(),
+            verify_expected_state(&expected, validated.table_names.len(), &snapshot).is_err(),
             "a wrong sqlite_master SQL digest must not converge",
         );
     }
@@ -3711,12 +4842,12 @@ mod tests {
         let derived =
             derive_effect_assertion(Some(EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1), &create)
                 .expect("derive exact CREATE target");
-        assert!(validate_expectations(&derived, vec![empty_state()]).is_err());
+        assert!(validate_expectations(&derived, None, vec![empty_state()]).is_err());
 
         let mut omitted = empty_state();
         omitted.manifest_prefix_length = 1;
         assert!(
-            validate_expectations(&derived, vec![empty_state(), omitted]).is_err(),
+            validate_expectations(&derived, None, vec![empty_state(), omitted]).is_err(),
             "caller omission cannot produce a converged schema proof"
         );
 
@@ -3796,7 +4927,9 @@ mod tests {
             2,
             &["items".to_string(), "items_by_name".to_string()],
             &["items".to_string()],
+            &[],
             PROOF,
+            false,
         );
         assert_eq!(query.statements.len(), 5);
         assert!(query.sql.split(';').all(|statement| {
@@ -3805,19 +4938,46 @@ mod tests {
         assert!(!query.sql.contains("INSERT"));
         assert!(!query.sql.contains("UPDATE"));
         assert!(!query.sql.contains("DELETE"));
+        assert!(query.sql.contains("WHERE name COLLATE NOCASE IN"));
+    }
+
+    #[test]
+    fn schema_rows_reject_sqlite_ascii_case_aliases() {
+        let result = parse_schema_rows(&[
+            json!({"type": "index", "name": "ITEMS_BY_NAME", "tbl_name": "items", "sql": "CREATE INDEX ITEMS_BY_NAME ON items(name)"}),
+            json!({"type": "index", "name": "items_by_name", "tbl_name": "items", "sql": "CREATE INDEX items_by_name ON items(name)"}),
+        ])
+        .expect_err("case aliases are one SQLite schema identity");
+        assert_eq!(
+            result
+                .structured_content
+                .expect("schema alias error content")["error"]["code"],
+            "d1.migration_reconciliation_schema_malformed"
+        );
     }
 
     #[test]
     fn malformed_partial_and_fk_violation_batches_fail_closed() {
         let manifest = manifest("CREATE TABLE items(id INTEGER PRIMARY KEY);");
-        let query = build_fixed_query("d1_migrations", 1, &[], &[], PROOF);
-        assert!(parse_complete_batch(&json!([]), &query.statements, PROOF, &manifest).is_err());
+        let query = build_fixed_query("d1_migrations", 1, &[], &[], &[], PROOF, false);
+        assert!(
+            parse_complete_batch(
+                &json!([]),
+                &query.statements,
+                PROOF,
+                &manifest,
+                &query.table_identity_spellings,
+            )
+            .is_err()
+        );
         let table_query = build_fixed_query(
             "d1_migrations",
             1,
             &["items".to_string()],
             &["items".to_string()],
+            &[],
             PROOF,
+            false,
         );
         let mut result_sets = table_query
             .statements
@@ -3835,7 +4995,8 @@ mod tests {
                 &json!(result_sets),
                 &table_query.statements,
                 PROOF,
-                &manifest
+                &manifest,
+                &table_query.table_identity_spellings,
             )
             .is_err()
         );
@@ -3905,7 +5066,7 @@ mod tests {
     #[test]
     fn complete_batch_requires_primary_evidence_for_every_fixed_result_set() {
         let manifest = manifest("CREATE TABLE items(id INTEGER PRIMARY KEY);");
-        let query = build_fixed_query("d1_migrations", 1, &[], &[], PROOF);
+        let query = build_fixed_query("d1_migrations", 1, &[], &[], &[], PROOF, false);
         let valid_result_sets = query
             .statements
             .iter()
@@ -3914,9 +5075,14 @@ mod tests {
         for index in 0..valid_result_sets.len() {
             let mut mixed = valid_result_sets.clone();
             mixed[index]["meta"]["served_by_primary"] = json!(false);
-            let error =
-                parse_complete_batch(&Value::Array(mixed), &query.statements, PROOF, &manifest)
-                    .expect_err("one non-primary result set must fail the complete batch");
+            let error = parse_complete_batch(
+                &Value::Array(mixed),
+                &query.statements,
+                PROOF,
+                &manifest,
+                &query.table_identity_spellings,
+            )
+            .expect_err("one non-primary result set must fail the complete batch");
             let content = error.structured_content.expect("structured primary error");
             assert_eq!(
                 content["error"]["code"],
@@ -4513,6 +5679,7 @@ mod tests {
                 }],
                 foreign_keys: Vec::new(),
             }],
+            seed_tables: Vec::new(),
         };
         let derived = vec![
             Vec::new(),
@@ -4522,8 +5689,9 @@ mod tests {
                 table_name: "items".to_string(),
             }],
         ];
-        let validated = validate_expectations(&derived, vec![empty_state(), expected.clone()])
-            .expect("expectations");
+        let validated =
+            validate_expectations(&derived, None, vec![empty_state(), expected.clone()])
+                .expect("expectations");
         let snapshot = CanonicalSnapshot {
             ledger: vec![D1ManifestLedgerRow {
                 id: 1,
@@ -4535,7 +5703,8 @@ mod tests {
                 columns: Vec::new(),
                 foreign_keys: Vec::new(),
             }],
+            seed_tables: Vec::new(),
         };
-        assert!(verify_expected_state(&expected, &validated, &snapshot).is_err());
+        assert!(verify_expected_state(&expected, validated.table_names.len(), &snapshot).is_err());
     }
 }

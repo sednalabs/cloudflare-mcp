@@ -113,11 +113,53 @@ constraint or SQL effect. The PRAGMA is classified intent, not a claim about
 persistent connection state. No manifest SQL is ever sent to the provider by
 this tool.
 The two predecessor assertions continue to reject ALTER and PRAGMA unchanged.
+Use `schema_create_objects_additive_seed_rows_v1` only for a bounded canonical
+top-level seed INSERT on a table created by the supplied manifest. Its closed
+form is `INSERT INTO <table> (<explicit columns>) VALUES (<literal tuples>)`:
+the table and columns are plain unqualified identifiers, values are canonical
+TEXT or signed INTEGER literals, and each target may be seeded once. Every
+classified CREATE is unconditional; `IF NOT EXISTS` is rejected because an
+incumbent object would make the manifest effect a no-op. The CREATE
+must precede the INSERT and every trigger on that target must follow it, even
+across manifest entries. CREATE, ALTER, index, trigger, seed membership, and
+reuse follow SQLite ASCII case-insensitive identifier identity; expectations
+and fixed read queries retain the one reviewed spelling from `CREATE TABLE`.
+For baseline tables that the supplied manifest does not create, repeated
+case-variant ALTER/index/trigger parents converge on the deterministic first
+encountered manifest spelling for derivation and transition lookup. Provider
+and expectation spellings are still preserved in the selected fixed proof.
+Every `state_expectations`
+prefix adds `seed_tables` with the exact target, ordered columns, row count,
+and locally derived `rows_sha256`. Seed storage is deliberately conservative:
+on non-STRICT tables, TEXT literals require TEXT or BLOB affinity while INTEGER
+literals require INTEGER, NUMERIC, or BLOB affinity; on STRICT tables, TEXT
+literals require exact TEXT columns and INTEGER literals require exact INT or
+INTEGER columns. STRICT BLOB and other unproven pairs are rejected before
+custody. The tool first selects the current primary manifest prefix, then
+runs two identical complete primary-current proofs that include exact typed seed
+row readback. Its full-manifest registry records the CREATE and seed prefix for
+every seed target. The selected proof omits a not-yet-created target, requires
+an exact empty table projection after CREATE and before INSERT without
+referencing columns introduced by a later prefix, and requires the
+exact row set at and after INSERT. An unexpected intermediate row stops after
+the first complete proof with zero mutations. Terminal reconciliation rederives
+and repeats the same selected-prefix proof. Both complete proof ledgers must
+equal the exact initial selected ledger, and the two complete snapshots must
+also remain canonically equal; two mutually consistent responses at another
+prefix are contradictory. Inspect aggregate-safe `selection_binding` for the
+selection-query digest, selected-ledger digest and prefix, and both
+complete-ledger digests. Responses return aggregate
+row-count/digest evidence only; raw
+seed values are never returned. Implicit columns, INSERT SELECT, expressions,
+NULL/REAL/BLOB values, conflict clauses, qualified or quoted identities,
+duplicate rows/targets, other DML, and any readback mismatch fail closed.
+Predecessor assertions remain closed to top-level INSERT.
 On success, inspect the complete `effect_assertion.scope` object: its
 `statement_class` is assertion-specific (`schema_create_only`,
 `schema_create_tables_indexes_views_triggers`, or
-`schema_create_objects_additive`) and its `schema_object_types` array is the
-closed allowed scope for that selected assertion.
+`schema_create_objects_additive`, or
+`schema_create_objects_additive_seed_rows`) and its `schema_object_types` array
+is the closed allowed scope for that selected assertion.
 The configured `migrations_table` remains reserved across all assertions using
 SQLite ASCII case-insensitive identifier equivalence. CREATE object identities,
 index/trigger parents, any exact admitted trigger header/body lexical token, and additive

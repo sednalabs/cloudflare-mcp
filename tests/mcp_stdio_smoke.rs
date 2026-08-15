@@ -916,6 +916,7 @@ enum ReconciliationFault {
     HttpStatusCustodyDrift(u16, PathBuf),
     OversizedHttpStatus(u16),
     CustodyDrift(PathBuf),
+    CustodyRelease(PathBuf, PathBuf),
     SecondBatchCustodyDrift(PathBuf),
     PrimaryMetaMissing,
     PrimaryMarkerMissing,
@@ -1205,6 +1206,247 @@ fn additive_reconciliation_case() -> (Value, Value, Vec<Value>) {
     let schema_rows =
         vec![json!({"type": "table", "name": "items", "tbl_name": "items", "sql": current_sql})];
     (manifest, expectations, schema_rows)
+}
+
+fn uppercase_hex(value: &str) -> String {
+    value
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect()
+}
+
+fn seed_rowset_sha256(table_name: &str, columns: &[&str], rows: &[&[&str]]) -> String {
+    let mut rows = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|value| {
+                    json!({
+                        "storage_class": "text",
+                        "value": uppercase_hex(value),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        serde_json::to_vec(left)
+            .expect("seed row serialization")
+            .cmp(&serde_json::to_vec(right).expect("seed row serialization"))
+    });
+    sha256_hex(
+        &serde_json::to_string(&json!({
+            "version": 1,
+            "table_name": table_name,
+            "columns": columns,
+            "rows": rows,
+        }))
+        .expect("seed row-set proof serialization"),
+    )
+}
+
+fn typed_seed_rowset_sha256(
+    table_name: &str,
+    columns: &[&str],
+    mut rows: Vec<Vec<Value>>,
+) -> String {
+    rows.sort_by(|left, right| {
+        serde_json::to_vec(left)
+            .expect("typed seed row serialization")
+            .cmp(&serde_json::to_vec(right).expect("typed seed row serialization"))
+    });
+    sha256_hex(
+        &serde_json::to_string(&json!({
+            "version": 1,
+            "table_name": table_name,
+            "columns": columns,
+            "rows": rows,
+        }))
+        .expect("typed seed row-set proof serialization"),
+    )
+}
+
+fn canonical_seed_row_reconciliation_case() -> (Value, Value, Vec<Value>, Vec<Value>) {
+    let publications_table_sql =
+        "CREATE TABLE publications(publication TEXT PRIMARY KEY, display_name TEXT NOT NULL)";
+    let publications_insert_sql = "INSERT INTO publications (publication, display_name) VALUES ('daily', 'Daily'), ('events', 'Events'), ('weekly', 'Weekly')";
+    let origins_table_sql = "CREATE TABLE trusted_first_party_origins(origin TEXT PRIMARY KEY)";
+    let origins_insert_sql = "INSERT INTO trusted_first_party_origins (origin) VALUES ('https://example.com'), ('https://www.example.com')";
+    let origins_trigger_sql = "CREATE TRIGGER trusted_first_party_origins_no_update BEFORE UPDATE ON trusted_first_party_origins BEGIN SELECT RAISE(ABORT, 'immutable seed'); END";
+    let migration_one_sql = format!("{publications_table_sql};\n{publications_insert_sql};");
+    let migration_two_sql =
+        format!("{origins_table_sql};\n{origins_insert_sql};\n{origins_trigger_sql};");
+    let manifest = json!([
+        {
+            "name": "0001_publications.sql",
+            "size_bytes": migration_one_sql.len(),
+            "sql_sha256": sha256_hex(&migration_one_sql),
+            "sql": migration_one_sql,
+        },
+        {
+            "name": "0002_trusted_origins.sql",
+            "size_bytes": migration_two_sql.len(),
+            "sql_sha256": sha256_hex(&migration_two_sql),
+            "sql": migration_two_sql,
+        },
+    ]);
+    let publication_seed = json!({
+        "table_name": "publications",
+        "columns": ["publication", "display_name"],
+        "row_count": 3,
+        "rows_sha256": seed_rowset_sha256(
+            "publications",
+            &["publication", "display_name"],
+            &[
+                &["daily", "Daily"],
+                &["events", "Events"],
+                &["weekly", "Weekly"],
+            ],
+        ),
+    });
+    let origin_seed = json!({
+        "table_name": "trusted_first_party_origins",
+        "columns": ["origin"],
+        "row_count": 2,
+        "rows_sha256": seed_rowset_sha256(
+            "trusted_first_party_origins",
+            &["origin"],
+            &[
+                &["https://example.com"],
+                &["https://www.example.com"],
+            ],
+        ),
+    });
+    let publications_object = json!({
+        "object_type": "table",
+        "name": "publications",
+        "table_name": "publications",
+        "sql_sha256": sha256_hex(publications_table_sql),
+    });
+    let origins_object = json!({
+        "object_type": "table",
+        "name": "trusted_first_party_origins",
+        "table_name": "trusted_first_party_origins",
+        "sql_sha256": sha256_hex(origins_table_sql),
+    });
+    let trigger_object = json!({
+        "object_type": "trigger",
+        "name": "trusted_first_party_origins_no_update",
+        "table_name": "trusted_first_party_origins",
+        "sql_sha256": sha256_hex(origins_trigger_sql),
+    });
+    let publications_table = json!({
+        "name": "publications",
+        "columns": [
+            {"cid": 0, "name": "publication", "declared_type": "TEXT", "not_null": false, "default_value": null, "primary_key_position": 1, "hidden": 0},
+            {"cid": 1, "name": "display_name", "declared_type": "TEXT", "not_null": true, "default_value": null, "primary_key_position": 0, "hidden": 0},
+        ],
+        "foreign_keys": [],
+    });
+    let origins_table = json!({
+        "name": "trusted_first_party_origins",
+        "columns": [
+            {"cid": 0, "name": "origin", "declared_type": "TEXT", "not_null": false, "default_value": null, "primary_key_position": 1, "hidden": 0},
+        ],
+        "foreign_keys": [],
+    });
+    let expectations = json!([
+        {"manifest_prefix_length": 0, "schema_objects": [], "tables": []},
+        {
+            "manifest_prefix_length": 1,
+            "schema_objects": [publications_object.clone()],
+            "tables": [publications_table.clone()],
+            "seed_tables": [publication_seed.clone()],
+        },
+        {
+            "manifest_prefix_length": 2,
+            "schema_objects": [publications_object, origins_object, trigger_object],
+            "tables": [publications_table, origins_table],
+            "seed_tables": [publication_seed, origin_seed],
+        },
+    ]);
+    let schema_rows = vec![
+        json!({"type": "table", "name": "publications", "tbl_name": "publications", "sql": publications_table_sql}),
+        json!({"type": "table", "name": "trusted_first_party_origins", "tbl_name": "trusted_first_party_origins", "sql": origins_table_sql}),
+        json!({"type": "trigger", "name": "trusted_first_party_origins_no_update", "tbl_name": "trusted_first_party_origins", "sql": origins_trigger_sql}),
+    ];
+    let ledger_rows = vec![
+        json!({"id": 1, "name": "0001_publications.sql"}),
+        json!({"id": 2, "name": "0002_trusted_origins.sql"}),
+    ];
+    (manifest, expectations, schema_rows, ledger_rows)
+}
+
+fn seed_prefix_reconciliation_case() -> (Value, Value) {
+    let create_sql = "CREATE TABLE Channels(id TEXT PRIMARY KEY);";
+    let seed_sql = "INSERT INTO channels (id) VALUES ('daily');";
+    let manifest = json!([
+        {
+            "name": "0001_create.sql",
+            "size_bytes": create_sql.len(),
+            "sql_sha256": sha256_hex(create_sql),
+            "sql": create_sql,
+        },
+        {
+            "name": "0002_seed.sql",
+            "size_bytes": seed_sql.len(),
+            "sql_sha256": sha256_hex(seed_sql),
+            "sql": seed_sql,
+        }
+    ]);
+    let table_object = json!({
+        "object_type": "table",
+        "name": "Channels",
+        "table_name": "Channels",
+        "sql_sha256": sha256_hex("CREATE TABLE Channels(id TEXT PRIMARY KEY)"),
+    });
+    let table = json!({
+        "name": "Channels",
+        "columns": [{
+            "cid": 0,
+            "name": "id",
+            "declared_type": "TEXT",
+            "not_null": false,
+            "default_value": null,
+            "primary_key_position": 1,
+            "hidden": 0,
+        }],
+        "foreign_keys": [],
+    });
+    let expectations = json!([
+        {"manifest_prefix_length": 0, "schema_objects": [], "tables": []},
+        {
+            "manifest_prefix_length": 1,
+            "schema_objects": [table_object.clone()],
+            "tables": [table.clone()],
+            "seed_tables": [{
+                "table_name": "Channels",
+                "columns": ["id"],
+                "row_count": 0,
+                "rows_sha256": typed_seed_rowset_sha256("Channels", &["id"], Vec::new()),
+            }],
+        },
+        {
+            "manifest_prefix_length": 2,
+            "schema_objects": [table_object],
+            "tables": [table],
+            "seed_tables": [{
+                "table_name": "Channels",
+                "columns": ["id"],
+                "row_count": 1,
+                "rows_sha256": typed_seed_rowset_sha256(
+                    "Channels",
+                    &["id"],
+                    vec![vec![json!({
+                        "storage_class": "text",
+                        "value": uppercase_hex("daily"),
+                    })]],
+                ),
+            }],
+        },
+    ]);
+    (manifest, expectations)
 }
 
 fn additive_check_reconciliation_case() -> (Value, Value, Vec<Value>, Vec<Value>, Vec<Value>) {
@@ -1600,6 +1842,19 @@ fn spawn_fake_reconciliation_api_with_fault_and_calls(
                     fs::write(path, b"tampered retained evidence")
                         .expect("tamper retained evidence fixture");
                 }
+                ReconciliationFault::CustodyRelease(active, retiring) => {
+                    results[0]["meta"]["changes"] = json!("0");
+                    fs::rename(active, retiring)
+                        .expect("move retained evidence during provider read");
+                    fs::File::open(
+                        retiring
+                            .parent()
+                            .expect("retained evidence target directory"),
+                    )
+                    .expect("open retained evidence target")
+                    .sync_all()
+                    .expect("sync retained evidence move");
+                }
                 ReconciliationFault::SecondBatchCustodyDrift(path) if request_index == 1 => {
                     fs::write(path, b"tampered retained evidence")
                         .expect("tamper retained evidence after second provider read");
@@ -1695,6 +1950,906 @@ fn spawn_fake_schema_object_reconciliation_api(
             json!({"cid": 1, "name": "name", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 0, "hidden": 0}),
         ],
     )
+}
+
+fn spawn_fake_canonical_seed_reconciliation_api(
+    call_count: usize,
+    schema_rows: Vec<Value>,
+    ledger_rows: Vec<Value>,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").expect("bind canonical seed reconciliation D1 API"); // DevSkim: ignore DS162092 -- loopback-only MCP test fixture
+    let addr = listener
+        .local_addr()
+        .expect("canonical seed reconciliation D1 address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().take(call_count) {
+            let mut stream = stream.expect("canonical seed reconciliation stream");
+            let (headers, body) = read_http_request(&mut stream);
+            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            let body_json: Value =
+                serde_json::from_slice(&body).expect("canonical seed request JSON");
+            let sql = body_json["sql"]
+                .as_str()
+                .expect("canonical seed reconciliation SQL");
+            let markers = reconciliation_statement_markers(sql);
+            assert!(matches!(markers.len(), 2 | 10));
+            assert!(
+                sql.split(";\n")
+                    .all(|statement| statement.starts_with("SELECT "))
+            );
+            requests_for_thread
+                .lock()
+                .expect("canonical seed request log lock")
+                .push(body_json);
+
+            let publications_xinfo = vec![
+                json!({"cid": 0, "name": "publication", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 1, "hidden": 0}),
+                json!({"cid": 1, "name": "display_name", "type": "TEXT", "notnull": 1, "dflt_value": null, "pk": 0, "hidden": 0}),
+            ];
+            let origins_xinfo = vec![
+                json!({"cid": 0, "name": "origin", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 1, "hidden": 0}),
+            ];
+            let mut results = vec![
+                tagged_reconciliation_result(
+                    &markers[0],
+                    &["id", "name"],
+                    ledger_rows.clone(),
+                    Some(json!({"changed_db": false, "changes": 0, "rows_written": 0})),
+                ),
+                tagged_reconciliation_result(
+                    &markers[1],
+                    &["type", "name", "tbl_name", "sql"],
+                    if markers.len() == 2 {
+                        Vec::new()
+                    } else {
+                        schema_rows.clone()
+                    },
+                    None,
+                ),
+            ];
+            if markers.len() == 10 {
+                results.extend([
+                    tagged_reconciliation_result(
+                        &markers[2],
+                        &[
+                            "cid",
+                            "name",
+                            "type",
+                            "notnull",
+                            "dflt_value",
+                            "pk",
+                            "hidden",
+                        ],
+                        publications_xinfo,
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[3],
+                        &[
+                            "id",
+                            "seq",
+                            "table",
+                            "from",
+                            "to",
+                            "on_update",
+                            "on_delete",
+                            "match",
+                        ],
+                        Vec::new(),
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[4],
+                        &["table", "rowid", "parent", "fkid"],
+                        Vec::new(),
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[5],
+                        &[
+                            "cid",
+                            "name",
+                            "type",
+                            "notnull",
+                            "dflt_value",
+                            "pk",
+                            "hidden",
+                        ],
+                        origins_xinfo,
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[6],
+                        &[
+                            "id",
+                            "seq",
+                            "table",
+                            "from",
+                            "to",
+                            "on_update",
+                            "on_delete",
+                            "match",
+                        ],
+                        Vec::new(),
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[7],
+                        &["table", "rowid", "parent", "fkid"],
+                        Vec::new(),
+                        None,
+                    ),
+                ]);
+                results.push(tagged_reconciliation_result(
+                    &markers[8],
+                    &["t0", "v0", "t1", "v1"],
+                    vec![
+                        json!({"t0": "text", "v0": uppercase_hex("daily"), "t1": "text", "v1": uppercase_hex("Daily")}),
+                        json!({"t0": "text", "v0": uppercase_hex("events"), "t1": "text", "v1": uppercase_hex("Events")}),
+                        json!({"t0": "text", "v0": uppercase_hex("weekly"), "t1": "text", "v1": uppercase_hex("Weekly")}),
+                    ],
+                    None,
+                ));
+                results.push(tagged_reconciliation_result(
+                    &markers[9],
+                    &["t0", "v0"],
+                    vec![
+                        json!({"t0": "text", "v0": uppercase_hex("https://example.com")}),
+                        json!({"t0": "text", "v0": uppercase_hex("https://www.example.com")}),
+                    ],
+                    None,
+                ));
+            }
+            let response = serde_json::to_vec(&json!({
+                "success": true,
+                "errors": [],
+                "messages": [],
+                "result": results,
+            }))
+            .expect("serialize canonical seed response");
+            write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                .expect("write canonical seed response headers");
+            stream
+                .write_all(&response)
+                .expect("write canonical seed response");
+        }
+    });
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
+}
+
+fn spawn_fake_case_variant_seed_reconciliation_api(
+    wrong_seed_storage: bool,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind case-variant seed D1 API"); // DevSkim: ignore DS162092 -- loopback-only MCP test fixture
+    let addr = listener.local_addr().expect("case-variant seed D1 address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().take(3) {
+            let mut stream = stream.expect("case-variant seed stream");
+            let (headers, body) = read_http_request(&mut stream);
+            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            let body_json: Value =
+                serde_json::from_slice(&body).expect("case-variant seed request JSON");
+            let sql = body_json["sql"].as_str().expect("case-variant seed SQL");
+            let markers = reconciliation_statement_markers(sql);
+            assert!(matches!(markers.len(), 2 | 6));
+            if markers.len() == 6 {
+                assert!(sql.contains("pragma_table_xinfo('Channels')"));
+                assert!(!sql.contains("pragma_table_xinfo('channels')"));
+                assert!(!sql.contains("pragma_table_xinfo('CHANNELS')"));
+                assert!(sql.contains("FROM \"Channels\""));
+                assert!(!sql.contains("FROM \"CHANNELS\""));
+                assert!(!sql.contains("FROM \"cHaNnElS\""));
+            }
+            requests_for_thread
+                .lock()
+                .expect("case-variant seed request log")
+                .push(body_json);
+
+            let table_sql = "CREATE TABLE Channels(id TEXT PRIMARY KEY, rank INTEGER, note TEXT)";
+            let index_sql = "CREATE INDEX channels_by_rank ON cHaNnElS(rank)";
+            let trigger_sql = "CREATE TRIGGER channels_guard BEFORE UPDATE ON CHANNELS BEGIN SELECT RAISE(ABORT, 'immutable'); END";
+            let mut results = vec![
+                tagged_reconciliation_result(
+                    &markers[0],
+                    &["id", "name"],
+                    vec![
+                        json!({"id": 1, "name": "0001_channels.sql"}),
+                        json!({"id": 2, "name": "0002_seed.sql"}),
+                    ],
+                    Some(json!({"changed_db": false, "changes": 0, "rows_written": 0})),
+                ),
+                tagged_reconciliation_result(
+                    &markers[1],
+                    &["type", "name", "tbl_name", "sql"],
+                    if markers.len() == 2 {
+                        Vec::new()
+                    } else {
+                        vec![
+                            json!({"type": "index", "name": "channels_by_rank", "tbl_name": "Channels", "sql": index_sql}),
+                            json!({"type": "table", "name": "Channels", "tbl_name": "Channels", "sql": table_sql}),
+                            json!({"type": "trigger", "name": "channels_guard", "tbl_name": "CHANNELS", "sql": trigger_sql}),
+                        ]
+                    },
+                    None,
+                ),
+            ];
+            if markers.len() == 6 {
+                results.extend([
+                tagged_reconciliation_result(
+                    &markers[2],
+                    &[
+                        "cid",
+                        "name",
+                        "type",
+                        "notnull",
+                        "dflt_value",
+                        "pk",
+                        "hidden",
+                    ],
+                    vec![
+                        json!({"cid": 0, "name": "id", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 1, "hidden": 0}),
+                        json!({"cid": 1, "name": "rank", "type": "INTEGER", "notnull": 0, "dflt_value": null, "pk": 0, "hidden": 0}),
+                        json!({"cid": 2, "name": "note", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 0, "hidden": 0}),
+                    ],
+                    None,
+                ),
+                tagged_reconciliation_result(
+                    &markers[3],
+                    &[
+                        "id",
+                        "seq",
+                        "table",
+                        "from",
+                        "to",
+                        "on_update",
+                        "on_delete",
+                        "match",
+                    ],
+                    Vec::new(),
+                    None,
+                ),
+                tagged_reconciliation_result(
+                    &markers[4],
+                    &["table", "rowid", "parent", "fkid"],
+                    Vec::new(),
+                    None,
+                ),
+                ]);
+                let (integer_type, integer_value) = if wrong_seed_storage {
+                    ("text", uppercase_hex(&i64::MIN.to_string()))
+                } else {
+                    ("integer", i64::MIN.to_string())
+                };
+                results.push(tagged_reconciliation_result(
+                    &markers[5],
+                    &["t0", "v0", "t1", "v1"],
+                    vec![json!({
+                        "t0": "text",
+                        "v0": uppercase_hex("daily"),
+                        "t1": integer_type,
+                        "v1": integer_value,
+                    })],
+                    None,
+                ));
+            }
+            let response = serde_json::to_vec(&json!({
+                "success": true,
+                "errors": [],
+                "messages": [],
+                "result": results,
+            }))
+            .expect("serialize case-variant seed response");
+            write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                .expect("write case-variant seed response headers");
+            stream
+                .write_all(&response)
+                .expect("write case-variant seed response");
+        }
+    });
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
+}
+
+fn spawn_fake_seed_prefix_reconciliation_api(
+    current_prefix: usize,
+    unexpected_intermediate_row: bool,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind seed-prefix D1 API"); // DevSkim: ignore DS162092 -- loopback-only MCP test fixture
+    let addr = listener.local_addr().expect("seed-prefix D1 address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().take(6) {
+            let mut stream = stream.expect("seed-prefix stream");
+            let (headers, body) = read_http_request(&mut stream);
+            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            let body_json: Value = serde_json::from_slice(&body).expect("seed-prefix request JSON");
+            let sql = body_json["sql"].as_str().expect("seed-prefix SQL");
+            let markers = reconciliation_statement_markers(sql);
+            let selection = markers.len() == 2;
+            if selection {
+                assert_eq!(markers.len(), 2);
+                assert!(!sql.contains("pragma_table_xinfo"));
+                assert!(!sql.contains("FROM \"Channels\""));
+            } else {
+                assert_eq!(markers.len(), if current_prefix == 0 { 5 } else { 6 });
+                assert!(sql.contains("pragma_table_xinfo('Channels')"));
+                assert_eq!(sql.contains("FROM \"Channels\""), current_prefix > 0);
+            }
+            requests_for_thread
+                .lock()
+                .expect("seed-prefix request log")
+                .push(body_json);
+
+            let ledger_rows = [
+                json!({"id": 1, "name": "0001_create.sql"}),
+                json!({"id": 2, "name": "0002_seed.sql"}),
+            ]
+            .into_iter()
+            .take(current_prefix)
+            .collect::<Vec<_>>();
+            let mut results = vec![
+                tagged_reconciliation_result(
+                    &markers[0],
+                    &["id", "name"],
+                    ledger_rows,
+                    Some(json!({"changed_db": false, "changes": 0, "rows_written": 0})),
+                ),
+                tagged_reconciliation_result(
+                    &markers[1],
+                    &["type", "name", "tbl_name", "sql"],
+                    if selection || current_prefix == 0 {
+                        Vec::new()
+                    } else {
+                        vec![json!({
+                            "type": "table",
+                            "name": "Channels",
+                            "tbl_name": "Channels",
+                            "sql": "CREATE TABLE Channels(id TEXT PRIMARY KEY)",
+                        })]
+                    },
+                    None,
+                ),
+            ];
+            if !selection {
+                results.extend([
+                    tagged_reconciliation_result(
+                        &markers[2],
+                        &["cid", "name", "type", "notnull", "dflt_value", "pk", "hidden"],
+                        if current_prefix == 0 {
+                            Vec::new()
+                        } else {
+                            vec![json!({"cid": 0, "name": "id", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 1, "hidden": 0})]
+                        },
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[3],
+                        &["id", "seq", "table", "from", "to", "on_update", "on_delete", "match"],
+                        Vec::new(),
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[4],
+                        &["table", "rowid", "parent", "fkid"],
+                        Vec::new(),
+                        None,
+                    ),
+                ]);
+                if current_prefix > 0 {
+                    results.push(tagged_reconciliation_result(
+                        &markers[5],
+                        &["t0", "v0"],
+                        if current_prefix == 2 || unexpected_intermediate_row {
+                            vec![json!({"t0": "text", "v0": uppercase_hex("daily")})]
+                        } else {
+                            Vec::new()
+                        },
+                        None,
+                    ));
+                }
+            }
+            let response = serde_json::to_vec(&json!({
+                "success": true,
+                "errors": [],
+                "messages": [],
+                "result": results,
+            }))
+            .expect("serialize seed-prefix response");
+            write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                .expect("write seed-prefix response headers");
+            stream
+                .write_all(&response)
+                .expect("write seed-prefix response");
+        }
+    });
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
+}
+
+fn spawn_fake_seed_ledger_sequence_api(
+    ledger_prefixes: Vec<usize>,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind seed-ledger D1 API"); // DevSkim: ignore DS162092 -- loopback-only MCP test fixture
+    let addr = listener.local_addr().expect("seed-ledger D1 address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        for (stream, ledger_prefix) in listener.incoming().zip(ledger_prefixes) {
+            let mut stream = stream.expect("seed-ledger stream");
+            let (headers, body) = read_http_request(&mut stream);
+            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            let body_json: Value = serde_json::from_slice(&body).expect("seed-ledger request JSON");
+            let sql = body_json["sql"].as_str().expect("seed-ledger SQL");
+            let markers = reconciliation_statement_markers(sql);
+            let selection = markers.len() == 2;
+            if selection {
+                assert!(!sql.contains("pragma_table_xinfo"));
+                assert!(!sql.contains("FROM \"Channels\""));
+            } else {
+                assert_eq!(markers.len(), 6);
+                assert!(sql.contains("pragma_table_xinfo('Channels')"));
+                assert!(sql.contains("FROM \"Channels\""));
+            }
+            requests_for_thread
+                .lock()
+                .expect("seed-ledger request log")
+                .push(body_json);
+
+            let ledger_rows = [
+                json!({"id": 1, "name": "0001_create.sql"}),
+                json!({"id": 2, "name": "0002_seed.sql"}),
+            ]
+            .into_iter()
+            .take(ledger_prefix)
+            .collect::<Vec<_>>();
+            let mut results = vec![
+                tagged_reconciliation_result(
+                    &markers[0],
+                    &["id", "name"],
+                    ledger_rows,
+                    Some(json!({"changed_db": false, "changes": 0, "rows_written": 0})),
+                ),
+                tagged_reconciliation_result(
+                    &markers[1],
+                    &["type", "name", "tbl_name", "sql"],
+                    if selection {
+                        Vec::new()
+                    } else {
+                        vec![json!({
+                            "type": "table",
+                            "name": "Channels",
+                            "tbl_name": "Channels",
+                            "sql": "CREATE TABLE Channels(id TEXT PRIMARY KEY)",
+                        })]
+                    },
+                    None,
+                ),
+            ];
+            if !selection {
+                results.extend([
+                    tagged_reconciliation_result(
+                        &markers[2],
+                        &["cid", "name", "type", "notnull", "dflt_value", "pk", "hidden"],
+                        vec![json!({"cid": 0, "name": "id", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 1, "hidden": 0})],
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[3],
+                        &["id", "seq", "table", "from", "to", "on_update", "on_delete", "match"],
+                        Vec::new(),
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[4],
+                        &["table", "rowid", "parent", "fkid"],
+                        Vec::new(),
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[5],
+                        &["t0", "v0"],
+                        if ledger_prefix == 2 {
+                            vec![json!({"t0": "text", "v0": uppercase_hex("daily")})]
+                        } else {
+                            Vec::new()
+                        },
+                        None,
+                    ),
+                ]);
+            }
+            let response = serde_json::to_vec(&json!({
+                "success": true,
+                "errors": [],
+                "messages": [],
+                "result": results,
+            }))
+            .expect("serialize seed-ledger response");
+            write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                .expect("write seed-ledger response headers");
+            stream
+                .write_all(&response)
+                .expect("write seed-ledger response");
+        }
+    });
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PrematureManifestFact {
+    Table,
+    Index,
+    View,
+    Trigger,
+    AlteredTableStructure,
+    CaseVariantTable,
+    CaseVariantIndex,
+    CaseVariantView,
+    CaseVariantTrigger,
+}
+
+fn premature_manifest_fact_reconciliation_case() -> (Value, Value) {
+    let current_create = "CREATE TABLE Current(id TEXT PRIMARY KEY)";
+    let current_after_alter = "CREATE TABLE Current(id TEXT PRIMARY KEY, rank INTEGER)";
+    let future_create = "CREATE TABLE Future(id TEXT PRIMARY KEY)";
+    let future_index = "CREATE INDEX current_by_rank ON Current(rank)";
+    let future_view = "CREATE VIEW current_ids AS SELECT id FROM Current";
+    let future_trigger = "CREATE TRIGGER current_guard BEFORE DELETE ON Current BEGIN SELECT RAISE(ABORT, 'immutable'); END";
+    let first_sql = format!("{current_create}; INSERT INTO Current (id) VALUES ('base');");
+    let second_sql = format!(
+        "ALTER TABLE Current ADD COLUMN rank INTEGER; {future_create}; {future_index}; {future_view}; INSERT INTO Future (id) VALUES ('future'); {future_trigger};"
+    );
+    let manifest = json!([
+        {
+            "name": "0001_current.sql",
+            "size_bytes": first_sql.len(),
+            "sql_sha256": sha256_hex(&first_sql),
+            "sql": first_sql,
+        },
+        {
+            "name": "0002_future.sql",
+            "size_bytes": second_sql.len(),
+            "sql_sha256": sha256_hex(&second_sql),
+            "sql": second_sql,
+        },
+    ]);
+    let current_column = json!({
+        "cid": 0,
+        "name": "id",
+        "declared_type": "TEXT",
+        "not_null": false,
+        "default_value": null,
+        "primary_key_position": 1,
+        "hidden": 0,
+    });
+    let rank_column = json!({
+        "cid": 1,
+        "name": "rank",
+        "declared_type": "INTEGER",
+        "not_null": false,
+        "default_value": null,
+        "primary_key_position": 0,
+        "hidden": 0,
+    });
+    let current_seed = json!({
+        "table_name": "Current",
+        "columns": ["id"],
+        "row_count": 1,
+        "rows_sha256": typed_seed_rowset_sha256(
+            "Current",
+            &["id"],
+            vec![vec![json!({
+                "storage_class": "text",
+                "value": uppercase_hex("base"),
+            })]],
+        ),
+    });
+    let future_seed = json!({
+        "table_name": "Future",
+        "columns": ["id"],
+        "row_count": 1,
+        "rows_sha256": typed_seed_rowset_sha256(
+            "Future",
+            &["id"],
+            vec![vec![json!({
+                "storage_class": "text",
+                "value": uppercase_hex("future"),
+            })]],
+        ),
+    });
+    let expectations = json!([
+        {"manifest_prefix_length": 0, "schema_objects": [], "tables": []},
+        {
+            "manifest_prefix_length": 1,
+            "schema_objects": [{
+                "object_type": "table",
+                "name": "Current",
+                "table_name": "Current",
+                "sql_sha256": sha256_hex(current_create),
+            }],
+            "tables": [{
+                "name": "Current",
+                "columns": [current_column.clone()],
+                "foreign_keys": [],
+            }],
+            "seed_tables": [current_seed.clone()],
+        },
+        {
+            "manifest_prefix_length": 2,
+            "schema_objects": [
+                {"object_type": "index", "name": "current_by_rank", "table_name": "Current", "sql_sha256": sha256_hex(future_index)},
+                {"object_type": "table", "name": "Current", "table_name": "Current", "sql_sha256": sha256_hex(current_after_alter)},
+                {"object_type": "table", "name": "Future", "table_name": "Future", "sql_sha256": sha256_hex(future_create)},
+                {"object_type": "trigger", "name": "current_guard", "table_name": "Current", "sql_sha256": sha256_hex(future_trigger)},
+                {"object_type": "view", "name": "current_ids", "table_name": "current_ids", "sql_sha256": sha256_hex(future_view)},
+            ],
+            "tables": [
+                {"name": "Current", "columns": [current_column.clone(), rank_column], "foreign_keys": []},
+                {"name": "Future", "columns": [current_column], "foreign_keys": []},
+            ],
+            "seed_tables": [current_seed, future_seed],
+        },
+    ]);
+    (manifest, expectations)
+}
+
+fn spawn_fake_premature_manifest_fact_api(
+    selected_prefix: usize,
+    fact: PrematureManifestFact,
+    clean_first_cycle: bool,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind premature-manifest-fact D1 API"); // DevSkim: ignore DS162092 -- loopback-only MCP test fixture
+    let addr = listener
+        .local_addr()
+        .expect("premature-manifest-fact D1 address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    let call_count = if clean_first_cycle { 6 } else { 3 };
+    thread::spawn(move || {
+        for (call_index, stream) in listener.incoming().take(call_count).enumerate() {
+            let mut stream = stream.expect("premature-manifest-fact stream");
+            let (headers, body) = read_http_request(&mut stream);
+            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            let body_json: Value =
+                serde_json::from_slice(&body).expect("premature-manifest-fact request JSON");
+            let sql = body_json["sql"]
+                .as_str()
+                .expect("premature-manifest-fact SQL");
+            let markers = reconciliation_statement_markers(sql);
+            let selection = markers.len() == 2;
+            if selection {
+                assert!(!sql.contains("pragma_table_xinfo"));
+                assert!(!sql.contains("FROM \"Current\""));
+                assert!(!sql.contains("FROM \"Future\""));
+            } else {
+                assert_eq!(markers.len(), if selected_prefix == 0 { 8 } else { 9 });
+                assert!(sql.contains("WHERE name COLLATE NOCASE IN"));
+                for object in [
+                    "Current",
+                    "Future",
+                    "current_by_rank",
+                    "current_ids",
+                    "current_guard",
+                ] {
+                    assert!(
+                        sql.contains(object),
+                        "full object union omitted {object}: {sql}"
+                    );
+                }
+                assert!(sql.contains("pragma_table_xinfo('Current')"));
+                assert!(sql.contains("pragma_table_xinfo('Future')"));
+                assert_eq!(sql.contains("FROM \"Current\""), selected_prefix == 1);
+                assert!(!sql.contains("FROM \"Future\""));
+            }
+            requests_for_thread
+                .lock()
+                .expect("premature-manifest-fact request log")
+                .push(body_json);
+
+            let ledger_rows = [json!({"id": 1, "name": "0001_current.sql"})]
+                .into_iter()
+                .take(selected_prefix)
+                .collect::<Vec<_>>();
+            let flawed = !selection && (!clean_first_cycle || call_index >= 3);
+            let current_object = json!({
+                "type": "table",
+                "name": "Current",
+                "tbl_name": "Current",
+                "sql": "CREATE TABLE Current(id TEXT PRIMARY KEY)",
+            });
+            let mut schema_rows = if selection || selected_prefix == 0 {
+                Vec::new()
+            } else {
+                vec![current_object.clone()]
+            };
+            if flawed {
+                schema_rows = match fact {
+                    PrematureManifestFact::Table if selected_prefix == 0 => vec![current_object],
+                    PrematureManifestFact::Table => vec![
+                        current_object,
+                        json!({"type": "table", "name": "Future", "tbl_name": "Future", "sql": "CREATE TABLE Future(id TEXT PRIMARY KEY)"}),
+                    ],
+                    PrematureManifestFact::Index => vec![
+                        json!({"type": "index", "name": "current_by_rank", "tbl_name": "Current", "sql": "CREATE INDEX current_by_rank ON Current(rank)"}),
+                        current_object,
+                    ],
+                    PrematureManifestFact::View => vec![
+                        current_object,
+                        json!({"type": "view", "name": "current_ids", "tbl_name": "current_ids", "sql": "CREATE VIEW current_ids AS SELECT id FROM Current"}),
+                    ],
+                    PrematureManifestFact::Trigger => vec![
+                        current_object,
+                        json!({"type": "trigger", "name": "current_guard", "tbl_name": "Current", "sql": "CREATE TRIGGER current_guard BEFORE DELETE ON Current BEGIN SELECT RAISE(ABORT, 'immutable'); END"}),
+                    ],
+                    PrematureManifestFact::AlteredTableStructure => vec![current_object],
+                    PrematureManifestFact::CaseVariantTable if selected_prefix == 0 => vec![
+                        json!({"type": "table", "name": "CURRENT", "tbl_name": "CURRENT", "sql": "CREATE TABLE CURRENT(id TEXT PRIMARY KEY)"}),
+                    ],
+                    PrematureManifestFact::CaseVariantTable => vec![
+                        current_object,
+                        json!({"type": "table", "name": "FUTURE", "tbl_name": "FUTURE", "sql": "CREATE TABLE FUTURE(id TEXT PRIMARY KEY)"}),
+                    ],
+                    PrematureManifestFact::CaseVariantIndex => vec![
+                        json!({"type": "index", "name": "CURRENT_BY_RANK", "tbl_name": "CURRENT", "sql": "CREATE INDEX CURRENT_BY_RANK ON CURRENT(rank)"}),
+                        current_object,
+                    ],
+                    PrematureManifestFact::CaseVariantView => vec![
+                        current_object,
+                        json!({"type": "view", "name": "CURRENT_IDS", "tbl_name": "CURRENT_IDS", "sql": "CREATE VIEW CURRENT_IDS AS SELECT id FROM CURRENT"}),
+                    ],
+                    PrematureManifestFact::CaseVariantTrigger => vec![
+                        current_object,
+                        json!({"type": "trigger", "name": "CURRENT_GUARD", "tbl_name": "CURRENT", "sql": "CREATE TRIGGER CURRENT_GUARD BEFORE DELETE ON CURRENT BEGIN SELECT RAISE(ABORT, 'immutable'); END"}),
+                    ],
+                };
+            }
+            let current_exists = selected_prefix == 1
+                || (flawed
+                    && selected_prefix == 0
+                    && matches!(
+                        fact,
+                        PrematureManifestFact::Table | PrematureManifestFact::CaseVariantTable
+                    ));
+            let current_altered = flawed
+                && selected_prefix == 1
+                && matches!(fact, PrematureManifestFact::AlteredTableStructure);
+            let future_exists = flawed
+                && selected_prefix == 1
+                && matches!(
+                    fact,
+                    PrematureManifestFact::Table | PrematureManifestFact::CaseVariantTable
+                );
+            let mut current_columns = if current_exists {
+                vec![
+                    json!({"cid": 0, "name": "id", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 1, "hidden": 0}),
+                ]
+            } else {
+                Vec::new()
+            };
+            if current_altered {
+                current_columns.push(json!({"cid": 1, "name": "rank", "type": "INTEGER", "notnull": 0, "dflt_value": null, "pk": 0, "hidden": 0}));
+            }
+            let future_columns = if future_exists {
+                vec![
+                    json!({"cid": 0, "name": "id", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 1, "hidden": 0}),
+                ]
+            } else {
+                Vec::new()
+            };
+            let mut results = vec![
+                tagged_reconciliation_result(
+                    &markers[0],
+                    &["id", "name"],
+                    ledger_rows,
+                    Some(json!({"changed_db": false, "changes": 0, "rows_written": 0})),
+                ),
+                tagged_reconciliation_result(
+                    &markers[1],
+                    &["type", "name", "tbl_name", "sql"],
+                    schema_rows,
+                    None,
+                ),
+            ];
+            if !selection {
+                results.extend([
+                    tagged_reconciliation_result(
+                        &markers[2],
+                        &[
+                            "cid",
+                            "name",
+                            "type",
+                            "notnull",
+                            "dflt_value",
+                            "pk",
+                            "hidden",
+                        ],
+                        current_columns,
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[3],
+                        &[
+                            "id",
+                            "seq",
+                            "table",
+                            "from",
+                            "to",
+                            "on_update",
+                            "on_delete",
+                            "match",
+                        ],
+                        Vec::new(),
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[4],
+                        &["table", "rowid", "parent", "fkid"],
+                        Vec::new(),
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[5],
+                        &[
+                            "cid",
+                            "name",
+                            "type",
+                            "notnull",
+                            "dflt_value",
+                            "pk",
+                            "hidden",
+                        ],
+                        future_columns,
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[6],
+                        &[
+                            "id",
+                            "seq",
+                            "table",
+                            "from",
+                            "to",
+                            "on_update",
+                            "on_delete",
+                            "match",
+                        ],
+                        Vec::new(),
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[7],
+                        &["table", "rowid", "parent", "fkid"],
+                        Vec::new(),
+                        None,
+                    ),
+                ]);
+                if selected_prefix == 1 {
+                    results.push(tagged_reconciliation_result(
+                        &markers[8],
+                        &["t0", "v0"],
+                        vec![json!({"t0": "text", "v0": uppercase_hex("base")})],
+                        None,
+                    ));
+                }
+            }
+            let response = serde_json::to_vec(&json!({
+                "success": true,
+                "errors": [],
+                "messages": [],
+                "result": results,
+            }))
+            .expect("serialize premature-manifest-fact response");
+            write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                .expect("write premature-manifest-fact response headers");
+            stream
+                .write_all(&response)
+                .expect("write premature-manifest-fact response");
+        }
+    });
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
 }
 
 fn spawn_fake_custom_schema_reconciliation_api(
@@ -5308,6 +6463,912 @@ fn d1_reconciliation_and_terminal_finalize_share_additive_effect_proof() {
 }
 
 #[test]
+fn d1_canonical_five_seed_rows_bind_reconciliation_terminal_receipt_and_replay() {
+    let (manifest, state_expectations, schema_rows, ledger_rows) =
+        canonical_seed_row_reconciliation_case();
+    assert!(state_expectations[0].get("seed_tables").is_none());
+    assert_eq!(
+        state_expectations[1]["seed_tables"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        state_expectations[2]["seed_tables"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    let (base_url, requests) =
+        spawn_fake_canonical_seed_reconciliation_api(11, schema_rows, ledger_rows);
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-reconcile-canonical-seeds-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create canonical seed reconciliation root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make canonical seed reconciliation root private");
+    }
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&lease_root, &manifest);
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let reconciliation_args = json!({
+        "database_id": "db-1",
+        "migration_family": "newsletter-core",
+        "manifest": manifest,
+        "approved_plan_sha256": approved_plan_sha256,
+        "lease_nonce": lease_nonce,
+        "lease_payload_sha256": lease_payload_sha256,
+        "effect_assertion_id": "schema_create_objects_additive_seed_rows_v1",
+        "state_expectations": state_expectations,
+    });
+    let reconciliation = mcp.call_tool(
+        841,
+        "d1_reconcile_migration_manifest",
+        reconciliation_args.clone(),
+    );
+    let reconciled = structured_content(&reconciliation).clone();
+    assert_eq!(reconciled["ok"], json!(true), "{reconciled}");
+    assert_eq!(reconciled["outcome"], json!("full_state_converged"));
+    assert_eq!(reconciled["provider_calls"], json!(3));
+    assert_eq!(reconciled["provider_mutations"], json!(0));
+    assert_eq!(
+        reconciled["seed_row_evidence"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(reconciled["seed_row_evidence"][0]["row_count"], json!(3));
+    assert_eq!(reconciled["seed_row_evidence"][1]["row_count"], json!(2));
+    assert_eq!(
+        reconciled["effect_assertion"]["scope"],
+        json!({
+            "statement_class": "schema_create_objects_additive_seed_rows",
+            "schema_object_types": [
+                "table",
+                "index",
+                "view",
+                "trigger",
+                "alter_table_add_column",
+                "pragma_foreign_keys_on",
+                "insert_seed_values",
+            ],
+        })
+    );
+    let response_json = serde_json::to_string(&reconciled).expect("serialize seed response");
+    for private_value in ["Daily", "Events", "Weekly", "example.com"] {
+        assert!(
+            !response_json.contains(private_value),
+            "aggregate response must not expose seed values: {private_value}"
+        );
+    }
+
+    let mut terminal_args = reconciliation_args;
+    terminal_args["expected_reconciliation_plan_sha256"] =
+        reconciled["reconciliation_plan_sha256"].clone();
+    terminal_args["expected_expectation_proof_sha256"] =
+        reconciled["expectation_proof_sha256"].clone();
+    terminal_args["expected_query_sha256"] = reconciled["query_sha256"].clone();
+    terminal_args["expected_canonical_snapshot_sha256"] =
+        reconciled["canonical_snapshot_sha256"].clone();
+    terminal_args["expected_outcome"] = reconciled["outcome"].clone();
+    terminal_args["expected_original_prefix_length"] =
+        reconciled["reconstructed_original_prefix_length"].clone();
+    terminal_args["expected_current_prefix_length"] =
+        reconciled["current_manifest_prefix_length"].clone();
+    terminal_args["terminal_request_sha256"] = json!("9".repeat(64));
+    terminal_args["terminal_attempt_sha256"] = json!("a".repeat(64));
+    terminal_args["dry_run"] = json!(true);
+    let dry = mcp.call_tool(
+        842,
+        "d1_finalize_migration_reconciliation",
+        terminal_args.clone(),
+    );
+    let dry_content = structured_content(&dry).clone();
+    assert_eq!(dry_content["ok"], json!(true), "{dry_content}");
+    assert_eq!(dry_content["provider_calls"], json!(3));
+
+    terminal_args["dry_run"] = json!(false);
+    terminal_args["approved_terminal_plan_sha256"] = dry_content["terminal_plan_sha256"].clone();
+    let live = mcp.call_tool(
+        843,
+        "d1_finalize_migration_reconciliation",
+        terminal_args.clone(),
+    );
+    let live_content = structured_content(&live);
+    assert_eq!(live_content["ok"], json!(true), "{live_content}");
+    assert_eq!(live_content["provider_calls"], json!(5));
+    assert_eq!(live_content["provider_mutations"], json!(0));
+    assert_eq!(live_content["lease_retained"], json!(false));
+    assert_eq!(
+        live_content["effect_assertion_id"],
+        json!("schema_create_objects_additive_seed_rows_v1")
+    );
+
+    let target = manifest_target_path(&lease_root);
+    let receipt_path = fs::read_dir(&target)
+        .expect("read canonical seed terminal target")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .starts_with("terminal-reconciliation.")
+            })
+        })
+        .expect("canonical seed terminal receipt");
+    let receipt: Value = serde_json::from_slice(
+        &fs::read(receipt_path).expect("read canonical seed terminal receipt"),
+    )
+    .expect("parse canonical seed terminal receipt");
+    assert_eq!(receipt["version"], json!(2));
+    assert_eq!(
+        receipt["effect_assertion_id"],
+        json!("schema_create_objects_additive_seed_rows_v1")
+    );
+
+    let replay = mcp.call_tool(844, "d1_finalize_migration_reconciliation", terminal_args);
+    let replay_content = structured_content(&replay);
+    assert_eq!(replay_content["ok"], json!(true), "{replay_content}");
+    assert_eq!(
+        replay_content["status"],
+        json!("terminal_reconciliation_already_complete")
+    );
+    assert_eq!(replay_content["provider_calls"], json!(0));
+
+    let observed = requests.lock().expect("canonical seed request log");
+    assert_eq!(observed.len(), 11);
+    assert_eq!(
+        observed
+            .iter()
+            .filter(
+                |request| reconciliation_statement_markers(request["sql"].as_str().unwrap()).len()
+                    == 2
+            )
+            .count(),
+        3,
+        "one no-seed selection read precedes each complete proof"
+    );
+    for request in observed.iter() {
+        let sql = request["sql"].as_str().expect("canonical seed proof SQL");
+        assert!(
+            sql.split(";\n")
+                .all(|statement| statement.starts_with("SELECT "))
+        );
+        assert!(!sql.contains("Daily"));
+        assert!(!sql.contains("example.com"));
+    }
+    drop(observed);
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_seed_projection_registry_proves_zero_create_only_and_full_prefixes() {
+    let (manifest, state_expectations) = seed_prefix_reconciliation_case();
+
+    for (case_index, (prefix, unexpected_intermediate, expected_outcome)) in [
+        (0usize, false, "not_committed"),
+        (1usize, true, ""),
+        (1usize, false, "partial_state_converged"),
+        (2usize, false, "full_state_converged"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (base_url, requests) =
+            spawn_fake_seed_prefix_reconciliation_api(prefix, unexpected_intermediate);
+        let lease_root = PathBuf::from("/tmp").join(format!(
+            "cloudflare-mcp-seed-prefix-{case_index}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&lease_root);
+        fs::create_dir(&lease_root).expect("create seed-prefix lease root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+                .expect("make seed-prefix root private");
+        }
+        let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+            create_retained_reconciliation_fixture(&lease_root, &manifest);
+        let mut mcp = McpStdioProcess::start_with_env(vec![
+            ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+            (
+                "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+                lease_root.to_string_lossy().to_string(),
+            ),
+        ]);
+        let args = json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest.clone(),
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_objects_additive_seed_rows_v1",
+            "state_expectations": state_expectations.clone(),
+        });
+        let response = mcp.call_tool(
+            847 + case_index as u64,
+            "d1_reconcile_migration_manifest",
+            args,
+        );
+        let content = structured_content(&response).clone();
+        if unexpected_intermediate {
+            assert_eq!(content["ok"], false, "{content}");
+            assert_eq!(
+                content["error"]["code"],
+                "d1.migration_reconciliation_seed_rows_extra"
+            );
+            assert_eq!(content["provider_calls"], 2);
+            assert_eq!(content["provider_mutations"], 0);
+            assert_eq!(content["local_namespace_mutations"], 0);
+            assert_eq!(content["lease_retained"], true);
+            assert_eq!(requests.lock().expect("unexpected-row requests").len(), 2);
+        } else {
+            assert_eq!(content["ok"], true, "{content}");
+            assert_eq!(content["outcome"], expected_outcome);
+            assert_eq!(content["current_manifest_prefix_length"], prefix);
+            assert_eq!(content["provider_calls"], 3);
+            assert_eq!(
+                content["scope_completeness"]["sqlite_master"],
+                "complete_exact_declared_object_union"
+            );
+            assert_eq!(
+                content["scope_completeness"]["table_xinfo"],
+                "complete_exact_declared_table_union"
+            );
+            assert_eq!(
+                content["scope_completeness"]["seed_rows"],
+                "complete_selected_prefix_manifest_derived_storage_class_and_value_row_set"
+            );
+            let evidence = content["seed_row_evidence"]
+                .as_array()
+                .expect("seed evidence array");
+            if prefix == 0 {
+                assert!(evidence.is_empty());
+            } else {
+                assert_eq!(evidence.len(), 1);
+                assert_eq!(evidence[0]["row_count"], usize::from(prefix == 2));
+            }
+
+            if prefix == 1 {
+                let mut terminal_args = terminal_args_from_reconciliation(
+                    &manifest,
+                    &state_expectations,
+                    &approved_plan_sha256,
+                    &lease_nonce,
+                    &lease_payload_sha256,
+                    &content,
+                );
+                terminal_args["effect_assertion_id"] =
+                    json!("schema_create_objects_additive_seed_rows_v1");
+                let dry = mcp.call_tool(860, "d1_finalize_migration_reconciliation", terminal_args);
+                let dry_content = structured_content(&dry);
+                assert_eq!(dry_content["ok"], true, "{dry_content}");
+                assert_eq!(dry_content["provider_calls"], 3);
+                assert_eq!(
+                    requests.lock().expect("terminal zero-proof requests").len(),
+                    6,
+                    "terminal planning must rerun selection plus both zero-row proofs",
+                );
+            } else {
+                assert_eq!(requests.lock().expect("prefix requests").len(), 3);
+            }
+        }
+        mcp.terminate();
+        let _ = fs::remove_dir_all(lease_root);
+    }
+}
+
+#[test]
+fn d1_seed_complete_proofs_bind_the_exact_selected_ledger_in_reconcile_and_terminal_paths() {
+    let (manifest, state_expectations) = seed_prefix_reconciliation_case();
+    let ledger_digest = |prefix: usize| {
+        let rows = [
+            json!({"id": 1, "name": "0001_create.sql"}),
+            json!({"id": 2, "name": "0002_seed.sql"}),
+        ]
+        .into_iter()
+        .take(prefix)
+        .collect::<Vec<_>>();
+        sha256_hex(&serde_json::to_string(&rows).expect("serialize expected ledger"))
+    };
+
+    for (case_index, (sequence, expected_code)) in [
+        (
+            vec![2usize, 1, 1],
+            "d1.migration_reconciliation_selected_ledger_changed",
+        ),
+        (
+            vec![2usize, 2, 1],
+            "d1.migration_reconciliation_evidence_unstable",
+        ),
+        (
+            vec![2usize, 1, 2],
+            "d1.migration_reconciliation_evidence_unstable",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let expected_complete_prefixes = [sequence[1], sequence[2]];
+        let (base_url, requests) = spawn_fake_seed_ledger_sequence_api(sequence);
+        let lease_root = PathBuf::from("/tmp").join(format!(
+            "cloudflare-mcp-seed-ledger-drift-{case_index}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&lease_root);
+        fs::create_dir(&lease_root).expect("create seed-ledger drift lease root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+                .expect("make seed-ledger drift root private");
+        }
+        let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+            create_retained_reconciliation_fixture(&lease_root, &manifest);
+        let mut mcp = McpStdioProcess::start_with_env(vec![
+            ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+            (
+                "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+                lease_root.to_string_lossy().to_string(),
+            ),
+        ]);
+        let response = mcp.call_tool(
+            870 + case_index as u64,
+            "d1_reconcile_migration_manifest",
+            json!({
+                "database_id": "db-1",
+                "migration_family": "newsletter-core",
+                "manifest": manifest.clone(),
+                "approved_plan_sha256": approved_plan_sha256,
+                "lease_nonce": lease_nonce,
+                "lease_payload_sha256": lease_payload_sha256,
+                "effect_assertion_id": "schema_create_objects_additive_seed_rows_v1",
+                "state_expectations": state_expectations.clone(),
+            }),
+        );
+        let content = structured_content(&response);
+        assert_eq!(content["ok"], false, "{content}");
+        assert_eq!(content["error"]["code"], expected_code);
+        assert_eq!(content["provider_calls"], 3);
+        assert_eq!(content["provider_mutations"], 0);
+        assert_eq!(content["local_namespace_mutations"], 0);
+        assert_eq!(content["retry_decision"], "do_not_retry_same_attempt");
+        assert_eq!(content["lease_retained"], true);
+        assert_eq!(content["custody_status"], "retained_evidence_verified");
+        assert_eq!(
+            content["response_evidence"]
+                .as_array()
+                .expect("drift response evidence")
+                .len(),
+            3,
+        );
+        assert_eq!(
+            content["selection_binding"]["selected_manifest_prefix_length"],
+            2
+        );
+        assert_eq!(
+            content["selection_binding"]["selected_ledger_sha256"],
+            ledger_digest(2),
+        );
+        assert_eq!(
+            content["selection_binding"]["selection_query_sha256"]
+                .as_str()
+                .expect("selection query digest")
+                .len(),
+            64,
+        );
+        assert_eq!(
+            content["selection_binding"]["complete_ledger_sha256s"],
+            json!([
+                ledger_digest(expected_complete_prefixes[0]),
+                ledger_digest(expected_complete_prefixes[1]),
+            ]),
+        );
+        assert_eq!(requests.lock().expect("drift requests").len(), 3);
+        mcp.terminate();
+        let _ = fs::remove_dir_all(lease_root);
+    }
+
+    let (base_url, requests) = spawn_fake_seed_ledger_sequence_api(vec![2usize, 2, 2, 2, 1, 1]);
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-seed-terminal-ledger-drift-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create terminal seed-ledger drift lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make terminal seed-ledger root private");
+    }
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&lease_root, &manifest);
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let args = json!({
+        "database_id": "db-1",
+        "migration_family": "newsletter-core",
+        "manifest": manifest.clone(),
+        "approved_plan_sha256": approved_plan_sha256,
+        "lease_nonce": lease_nonce,
+        "lease_payload_sha256": lease_payload_sha256,
+        "effect_assertion_id": "schema_create_objects_additive_seed_rows_v1",
+        "state_expectations": state_expectations.clone(),
+    });
+    let reconciliation = mcp.call_tool(880, "d1_reconcile_migration_manifest", args);
+    let reconciliation_content = structured_content(&reconciliation).clone();
+    assert_eq!(
+        reconciliation_content["ok"], true,
+        "{reconciliation_content}"
+    );
+    assert_eq!(
+        reconciliation_content["selection_binding"]["selected_ledger_sha256"],
+        ledger_digest(2),
+    );
+    assert_eq!(
+        reconciliation_content["selection_binding"]["complete_ledger_sha256s"],
+        json!([ledger_digest(2), ledger_digest(2)]),
+    );
+
+    let mut terminal_args = terminal_args_from_reconciliation(
+        &manifest,
+        &state_expectations,
+        &approved_plan_sha256,
+        &lease_nonce,
+        &lease_payload_sha256,
+        &reconciliation_content,
+    );
+    terminal_args["effect_assertion_id"] = json!("schema_create_objects_additive_seed_rows_v1");
+    let terminal = mcp.call_tool(881, "d1_finalize_migration_reconciliation", terminal_args);
+    let terminal_content = structured_content(&terminal);
+    assert_eq!(terminal_content["ok"], false, "{terminal_content}");
+    assert_eq!(
+        terminal_content["error"]["code"],
+        "d1.migration_reconciliation_selected_ledger_changed",
+    );
+    assert_eq!(terminal_content["provider_calls"], 3);
+    assert_eq!(terminal_content["provider_mutations"], 0);
+    assert_eq!(terminal_content["local_namespace_mutations"], 0);
+    assert_eq!(
+        terminal_content["retry_decision"],
+        "do_not_retry_same_attempt"
+    );
+    assert_eq!(terminal_content["lease_retained"], true);
+    assert_eq!(
+        terminal_content["custody_status"],
+        "retained_evidence_verified"
+    );
+    assert_eq!(
+        terminal_content["selection_binding"]["complete_ledger_sha256s"],
+        json!([ledger_digest(1), ledger_digest(1)]),
+    );
+    assert_eq!(
+        terminal_content["response_evidence"]
+            .as_array()
+            .expect("terminal drift response evidence")
+            .len(),
+        3,
+    );
+    assert_eq!(requests.lock().expect("terminal drift requests").len(), 6);
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_seed_complete_proofs_reject_every_premature_manifest_fact_in_reconcile_and_terminal_paths() {
+    let (manifest, state_expectations) = premature_manifest_fact_reconciliation_case();
+    let cases = [
+        (
+            0usize,
+            PrematureManifestFact::Table,
+            "d1.migration_reconciliation_schema_mismatch",
+        ),
+        (
+            1usize,
+            PrematureManifestFact::Table,
+            "d1.migration_reconciliation_schema_mismatch",
+        ),
+        (
+            1usize,
+            PrematureManifestFact::Index,
+            "d1.migration_reconciliation_schema_mismatch",
+        ),
+        (
+            1usize,
+            PrematureManifestFact::View,
+            "d1.migration_reconciliation_schema_mismatch",
+        ),
+        (
+            1usize,
+            PrematureManifestFact::Trigger,
+            "d1.migration_reconciliation_schema_mismatch",
+        ),
+        (
+            1usize,
+            PrematureManifestFact::AlteredTableStructure,
+            "d1.migration_reconciliation_table_proof_mismatch",
+        ),
+        (
+            0usize,
+            PrematureManifestFact::CaseVariantTable,
+            "d1.migration_reconciliation_schema_mismatch",
+        ),
+        (
+            1usize,
+            PrematureManifestFact::CaseVariantIndex,
+            "d1.migration_reconciliation_schema_mismatch",
+        ),
+        (
+            1usize,
+            PrematureManifestFact::CaseVariantView,
+            "d1.migration_reconciliation_schema_mismatch",
+        ),
+        (
+            1usize,
+            PrematureManifestFact::CaseVariantTrigger,
+            "d1.migration_reconciliation_schema_mismatch",
+        ),
+    ];
+
+    for (case_index, (prefix, fact, expected_code)) in cases.into_iter().enumerate() {
+        let (base_url, requests) = spawn_fake_premature_manifest_fact_api(prefix, fact, false);
+        let lease_root = PathBuf::from("/tmp").join(format!(
+            "cloudflare-mcp-premature-manifest-reconcile-{case_index}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&lease_root);
+        fs::create_dir(&lease_root).expect("create premature-manifest reconcile root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+                .expect("make premature-manifest reconcile root private");
+        }
+        let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+            create_retained_reconciliation_fixture(&lease_root, &manifest);
+        let mut mcp = McpStdioProcess::start_with_env(vec![
+            ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+            (
+                "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+                lease_root.to_string_lossy().to_string(),
+            ),
+        ]);
+        let args = json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest.clone(),
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_objects_additive_seed_rows_v1",
+            "state_expectations": state_expectations.clone(),
+        });
+        let response = mcp.call_tool(
+            890 + case_index as u64,
+            "d1_reconcile_migration_manifest",
+            args,
+        );
+        let content = structured_content(&response);
+        assert_eq!(content["ok"], false, "{fact:?}: {content}");
+        assert_eq!(
+            content["error"]["code"], expected_code,
+            "{fact:?}: {content}"
+        );
+        assert_eq!(content["provider_calls"], 3);
+        assert_eq!(content["provider_mutations"], 0);
+        assert_eq!(content["local_namespace_mutations"], 0);
+        assert_eq!(content["retry_decision"], "do_not_retry_same_attempt");
+        assert_eq!(content["lease_retained"], true);
+        assert_eq!(content["custody_status"], "retained_evidence_verified");
+        assert_eq!(
+            content["response_evidence"]
+                .as_array()
+                .expect("premature reconcile evidence")
+                .len(),
+            3,
+        );
+        assert_eq!(
+            requests.lock().expect("premature reconcile requests").len(),
+            3
+        );
+        assert_private_regular_active_lease(&lease_root);
+        mcp.terminate();
+        let _ = fs::remove_dir_all(lease_root);
+    }
+
+    for (case_index, (prefix, fact, expected_code)) in cases.into_iter().enumerate() {
+        let (base_url, requests) = spawn_fake_premature_manifest_fact_api(prefix, fact, true);
+        let lease_root = PathBuf::from("/tmp").join(format!(
+            "cloudflare-mcp-premature-manifest-terminal-{case_index}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&lease_root);
+        fs::create_dir(&lease_root).expect("create premature-manifest terminal root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+                .expect("make premature-manifest terminal root private");
+        }
+        let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+            create_retained_reconciliation_fixture(&lease_root, &manifest);
+        let mut mcp = McpStdioProcess::start_with_env(vec![
+            ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+            (
+                "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+                lease_root.to_string_lossy().to_string(),
+            ),
+        ]);
+        let args = json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest.clone(),
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_objects_additive_seed_rows_v1",
+            "state_expectations": state_expectations.clone(),
+        });
+        let reconciliation = mcp.call_tool(
+            910 + case_index as u64,
+            "d1_reconcile_migration_manifest",
+            args,
+        );
+        let reconciled = structured_content(&reconciliation).clone();
+        assert_eq!(reconciled["ok"], true, "{fact:?}: {reconciled}");
+        let mut terminal_args = terminal_args_from_reconciliation(
+            &manifest,
+            &state_expectations,
+            &approved_plan_sha256,
+            &lease_nonce,
+            &lease_payload_sha256,
+            &reconciled,
+        );
+        terminal_args["effect_assertion_id"] = json!("schema_create_objects_additive_seed_rows_v1");
+        let terminal = mcp.call_tool(
+            930 + case_index as u64,
+            "d1_finalize_migration_reconciliation",
+            terminal_args,
+        );
+        let content = structured_content(&terminal);
+        assert_eq!(content["ok"], false, "{fact:?}: {content}");
+        assert_eq!(
+            content["error"]["code"], expected_code,
+            "{fact:?}: {content}"
+        );
+        assert_eq!(content["provider_calls"], 3);
+        assert_eq!(content["provider_mutations"], 0);
+        assert_eq!(content["local_namespace_mutations"], 0);
+        assert_eq!(content["retry_decision"], "do_not_retry_same_attempt");
+        assert_eq!(content["lease_retained"], true);
+        assert_eq!(content["custody_status"], "retained_evidence_verified");
+        assert_eq!(
+            content["response_evidence"]
+                .as_array()
+                .expect("premature terminal evidence")
+                .len(),
+            3,
+        );
+        assert_eq!(
+            requests.lock().expect("premature terminal requests").len(),
+            6
+        );
+        assert_private_regular_active_lease(&lease_root);
+        mcp.terminate();
+        let _ = fs::remove_dir_all(lease_root);
+    }
+}
+
+#[test]
+fn d1_case_variant_parents_and_identity_stable_mixed_seed_storage_converge() {
+    let initial_table_sql = "CREATE TABLE Channels(id TEXT PRIMARY KEY, rank INTEGER)";
+    let current_table_sql = "CREATE TABLE Channels(id TEXT PRIMARY KEY, rank INTEGER, note TEXT)";
+    let alter_sql = "ALTER TABLE channels ADD COLUMN note TEXT";
+    let index_sql = "CREATE INDEX channels_by_rank ON cHaNnElS(rank)";
+    let insert_sql = "INSERT INTO CHANNELS (ID, RANK) VALUES ('daily', -9223372036854775808)";
+    let trigger_sql = "CREATE TRIGGER channels_guard BEFORE UPDATE ON CHANNELS BEGIN SELECT RAISE(ABORT, 'immutable'); END";
+    let first_migration_sql = format!("{initial_table_sql};");
+    let second_migration_sql = format!("{alter_sql}; {index_sql}; {insert_sql}; {trigger_sql};");
+    let manifest = json!([
+        {
+            "name": "0001_channels.sql",
+            "size_bytes": first_migration_sql.len(),
+            "sql_sha256": sha256_hex(&first_migration_sql),
+            "sql": first_migration_sql,
+        },
+        {
+            "name": "0002_seed.sql",
+            "size_bytes": second_migration_sql.len(),
+            "sql_sha256": sha256_hex(&second_migration_sql),
+            "sql": second_migration_sql,
+        }
+    ]);
+    let seed_rows_sha256 = typed_seed_rowset_sha256(
+        "Channels",
+        &["ID", "RANK"],
+        vec![vec![
+            json!({"storage_class": "text", "value": uppercase_hex("daily")}),
+            json!({"storage_class": "integer", "value": i64::MIN.to_string()}),
+        ]],
+    );
+    let state_expectations = json!([
+        {"manifest_prefix_length": 0, "schema_objects": [], "tables": []},
+        {
+            "manifest_prefix_length": 1,
+            "schema_objects": [
+                {"object_type": "table", "name": "Channels", "table_name": "Channels", "sql_sha256": sha256_hex(initial_table_sql)},
+            ],
+            "tables": [{
+                "name": "Channels",
+                "columns": [
+                    {"cid": 0, "name": "id", "declared_type": "TEXT", "not_null": false, "default_value": null, "primary_key_position": 1, "hidden": 0},
+                    {"cid": 1, "name": "rank", "declared_type": "INTEGER", "not_null": false, "default_value": null, "primary_key_position": 0, "hidden": 0},
+                ],
+                "foreign_keys": [],
+            }],
+            "seed_tables": [{
+                "table_name": "Channels",
+                "columns": ["ID", "RANK"],
+                "row_count": 0,
+                "rows_sha256": typed_seed_rowset_sha256("Channels", &["ID", "RANK"], vec![]),
+            }],
+        },
+        {
+            "manifest_prefix_length": 2,
+            "schema_objects": [
+                {"object_type": "index", "name": "channels_by_rank", "table_name": "Channels", "sql_sha256": sha256_hex(index_sql)},
+                {"object_type": "table", "name": "Channels", "table_name": "Channels", "sql_sha256": sha256_hex(current_table_sql)},
+                {"object_type": "trigger", "name": "channels_guard", "table_name": "Channels", "sql_sha256": sha256_hex(trigger_sql)},
+            ],
+            "tables": [{
+                "name": "Channels",
+                "columns": [
+                    {"cid": 0, "name": "id", "declared_type": "TEXT", "not_null": false, "default_value": null, "primary_key_position": 1, "hidden": 0},
+                    {"cid": 1, "name": "rank", "declared_type": "INTEGER", "not_null": false, "default_value": null, "primary_key_position": 0, "hidden": 0},
+                    {"cid": 2, "name": "note", "declared_type": "TEXT", "not_null": false, "default_value": null, "primary_key_position": 0, "hidden": 0},
+                ],
+                "foreign_keys": [],
+            }],
+            "seed_tables": [{
+                "table_name": "Channels",
+                "columns": ["ID", "RANK"],
+                "row_count": 1,
+                "rows_sha256": seed_rows_sha256,
+            }],
+        },
+    ]);
+    let (base_url, requests) = spawn_fake_case_variant_seed_reconciliation_api(false);
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-reconcile-case-variant-seed-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create case-variant seed reconciliation root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make case-variant seed reconciliation root private");
+    }
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&lease_root, &manifest);
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let response = mcp.call_tool(
+        845,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest.clone(),
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_objects_additive_seed_rows_v1",
+            "state_expectations": state_expectations.clone(),
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(true), "{content}");
+    assert_eq!(content["outcome"], json!("full_state_converged"));
+    assert_eq!(content["provider_calls"], json!(3));
+    assert_eq!(content["provider_mutations"], json!(0));
+    assert_eq!(content["local_namespace_mutations"], json!(0));
+    assert_eq!(content["seed_row_evidence"][0]["table_name"], "Channels");
+    assert_eq!(
+        content["seed_row_evidence"][0]["columns"],
+        json!(["ID", "RANK"])
+    );
+    assert_eq!(content["seed_row_evidence"][0]["row_count"], 1);
+    let response_json = serde_json::to_string(content).expect("serialize case-variant result");
+    assert!(!response_json.contains("daily"));
+    assert!(!response_json.contains("9223372036854775808"));
+    assert_eq!(requests.lock().expect("case-variant request log").len(), 3);
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+
+    let (mismatch_base_url, mismatch_requests) =
+        spawn_fake_case_variant_seed_reconciliation_api(true);
+    let mismatch_lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-reconcile-case-variant-seed-mismatch-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&mismatch_lease_root);
+    fs::create_dir(&mismatch_lease_root).expect("create seed mismatch reconciliation root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&mismatch_lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make seed mismatch reconciliation root private");
+    }
+    let (mismatch_plan, mismatch_nonce, mismatch_payload) =
+        create_retained_reconciliation_fixture(&mismatch_lease_root, &manifest);
+    let mut mismatch_mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", mismatch_base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            mismatch_lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let mismatch = mismatch_mcp.call_tool(
+        846,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest,
+            "approved_plan_sha256": mismatch_plan,
+            "lease_nonce": mismatch_nonce,
+            "lease_payload_sha256": mismatch_payload,
+            "effect_assertion_id": "schema_create_objects_additive_seed_rows_v1",
+            "state_expectations": state_expectations,
+        }),
+    );
+    let mismatch_content = structured_content(&mismatch);
+    assert_eq!(mismatch_content["ok"], json!(false), "{mismatch_content}");
+    assert_eq!(
+        mismatch_content["error"]["code"],
+        "d1.migration_reconciliation_seed_rows_mismatch"
+    );
+    assert_eq!(mismatch_content["provider_calls"], 3);
+    assert_eq!(mismatch_content["provider_mutations"], 0);
+    assert_eq!(mismatch_content["local_namespace_mutations"], 0);
+    assert_eq!(mismatch_content["lease_retained"], true);
+    assert_eq!(
+        mismatch_requests
+            .lock()
+            .expect("seed mismatch request log")
+            .len(),
+        3
+    );
+    mismatch_mcp.terminate();
+    let _ = fs::remove_dir_all(mismatch_lease_root);
+}
+
+#[test]
 fn d1_additive_reconciliation_proves_five_prefixes_with_bounded_checks() {
     let (manifest, state_expectations, schema_rows, ledger_rows, xinfo_rows) =
         additive_check_reconciliation_case();
@@ -6677,6 +8738,184 @@ fn d1_finalize_migration_reconciliation_stdio_does_not_claim_retention_after_cus
 }
 
 #[test]
+fn d1_post_parse_custody_release_overrides_parse_failure_in_reconcile_and_terminal_paths() {
+    let (manifest, state_expectations) = one_table_reconciliation_case();
+    let reconcile_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-post-parse-release-reconcile-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&reconcile_root);
+    fs::create_dir(&reconcile_root).expect("create post-parse reconcile root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&reconcile_root, fs::Permissions::from_mode(0o700))
+            .expect("make post-parse reconcile root private");
+    }
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&reconcile_root, &manifest);
+    let active = assert_private_regular_active_lease(&reconcile_root);
+    let retiring = active.with_file_name("retiring.lease.json");
+    let (base_url, requests) = spawn_fake_reconciliation_api_with_fault(
+        ReconciliationFault::CustodyRelease(active.clone(), retiring.clone()),
+    );
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            reconcile_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let response = mcp.call_tool(
+        884,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest.clone(),
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_only_v1",
+            "state_expectations": state_expectations.clone(),
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], false, "{content}");
+    assert_eq!(
+        content["error"]["code"], "d1.migration_reconciliation_lease_changed",
+        "{content}"
+    );
+    assert_eq!(content["custody_status"], "retained_evidence_unverified");
+    assert_eq!(content["lease_retained"], Value::Null);
+    assert_eq!(content["retry_decision"], "do_not_retry_same_attempt");
+    assert_eq!(content["provider_calls"], 1);
+    assert_eq!(content["provider_mutations"], 0);
+    assert_eq!(content["local_namespace_mutations"], 0);
+    assert_eq!(
+        content["response_evidence"]
+            .as_array()
+            .expect("post-parse reconcile response evidence")
+            .len(),
+        1
+    );
+    assert_eq!(
+        requests
+            .lock()
+            .expect("post-parse reconcile requests")
+            .len(),
+        1
+    );
+    assert!(!active.exists());
+    assert!(retiring.exists());
+    mcp.terminate();
+    let _ = fs::remove_dir_all(&reconcile_root);
+
+    let terminal_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-post-parse-release-terminal-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&terminal_root);
+    fs::create_dir(&terminal_root).expect("create post-parse terminal root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&terminal_root, fs::Permissions::from_mode(0o700))
+            .expect("make post-parse terminal root private");
+    }
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&terminal_root, &manifest);
+    let (baseline_url, baseline_requests) = spawn_fake_reconciliation_api();
+    let mut baseline_mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", baseline_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            terminal_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let reconciliation = baseline_mcp.call_tool(
+        885,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest.clone(),
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_only_v1",
+            "state_expectations": state_expectations.clone(),
+        }),
+    );
+    let reconciled = structured_content(&reconciliation).clone();
+    assert_eq!(reconciled["ok"], true, "{reconciled}");
+    assert_eq!(
+        baseline_requests.lock().expect("baseline requests").len(),
+        2
+    );
+    baseline_mcp.terminate();
+
+    let active = assert_private_regular_active_lease(&terminal_root);
+    let retiring = active.with_file_name("retiring.lease.json");
+    let (release_url, release_requests) = spawn_fake_reconciliation_api_with_fault(
+        ReconciliationFault::CustodyRelease(active.clone(), retiring.clone()),
+    );
+    let mut release_mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", release_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            terminal_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let terminal = release_mcp.call_tool(
+        886,
+        "d1_finalize_migration_reconciliation",
+        terminal_args_from_reconciliation(
+            &manifest,
+            &state_expectations,
+            &approved_plan_sha256,
+            &lease_nonce,
+            &lease_payload_sha256,
+            &reconciled,
+        ),
+    );
+    let content = structured_content(&terminal);
+    assert_eq!(content["ok"], false, "{content}");
+    assert_eq!(
+        content["error"]["code"], "d1.migration_reconciliation_lease_changed",
+        "{content}"
+    );
+    assert_eq!(content["custody_status"], "retained_evidence_unverified");
+    assert_eq!(content["lease_retained"], Value::Null);
+    assert_eq!(content["receipt_persisted"], false);
+    assert_eq!(content["retry_decision"], "do_not_retry_same_attempt");
+    assert_eq!(content["provider_calls"], 1);
+    assert_eq!(content["provider_mutations"], 0);
+    assert_eq!(content["local_namespace_mutations"], 0);
+    assert_eq!(
+        content["response_evidence"]
+            .as_array()
+            .expect("post-parse terminal response evidence")
+            .len(),
+        1
+    );
+    assert_eq!(release_requests.lock().expect("release requests").len(), 1);
+    assert!(!active.exists());
+    assert!(retiring.exists());
+    assert!(
+        fs::read_dir(manifest_target_path(&terminal_root))
+            .expect("read post-parse terminal target")
+            .filter_map(Result::ok)
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("terminal-reconciliation."))
+    );
+    release_mcp.terminate();
+    let _ = fs::remove_dir_all(&terminal_root);
+}
+
+#[test]
 fn d1_reconcile_migration_manifest_stdio_rejects_unproven_effects_and_incomplete_expectations_before_custody()
  {
     let data_create = "CREATE TABLE items AS VALUES (1);";
@@ -6861,6 +9100,236 @@ fn d1_reconcile_migration_manifest_stdio_rejects_unproven_effects_and_incomplete
             }
         }),
         "{content}"
+    );
+    mcp.terminate();
+}
+
+#[test]
+fn d1_canonical_seed_table_case_aliases_fail_before_custody_or_provider_access() {
+    let cases = [
+        (
+            vec![
+                "CREATE TABLE channels(id TEXT PRIMARY KEY); CREATE TRIGGER channels_guard BEFORE UPDATE ON CHANNELS BEGIN SELECT RAISE(ABORT, 'immutable'); END; INSERT INTO channels (id) VALUES ('daily');",
+            ],
+            "d1.migration_reconciliation_seed_after_trigger",
+            "a canonical seed INSERT must precede every trigger on its target, including across manifest entries",
+        ),
+        (
+            vec![
+                "CREATE TABLE channels(id TEXT PRIMARY KEY); CREATE TRIGGER channels_guard BEFORE UPDATE ON CHANNELS BEGIN SELECT RAISE(ABORT, 'immutable'); END;",
+                "INSERT INTO cHaNnElS (id) VALUES ('daily');",
+            ],
+            "d1.migration_reconciliation_seed_after_trigger",
+            "a canonical seed INSERT must precede every trigger on its target, including across manifest entries",
+        ),
+        (
+            vec![
+                "CREATE TABLE Channels(id TEXT PRIMARY KEY); INSERT INTO channels (id) VALUES ('daily');",
+                "INSERT INTO CHANNELS (id) VALUES ('weekly');",
+            ],
+            "d1.migration_reconciliation_seed_target_reused",
+            "each manifest-created seed table may have exactly one canonical top-level seed INSERT",
+        ),
+    ];
+
+    let mut mcp = McpStdioProcess::start();
+    for (offset, (sql_entries, code, message)) in cases.into_iter().enumerate() {
+        let manifest = sql_entries
+            .into_iter()
+            .enumerate()
+            .map(|(index, sql)| {
+                json!({
+                    "name": format!("{:04}.sql", index + 1),
+                    "size_bytes": sql.len(),
+                    "sql_sha256": sha256_hex(sql),
+                    "sql": sql,
+                })
+            })
+            .collect::<Vec<_>>();
+        let response = mcp.call_tool(
+            757 + offset as u64,
+            "d1_reconcile_migration_manifest",
+            json!({
+                "database_id": "db-1",
+                "migration_family": "newsletter-core",
+                "manifest": manifest,
+                "approved_plan_sha256": "a".repeat(64),
+                "lease_nonce": "b".repeat(64),
+                "lease_payload_sha256": "c".repeat(64),
+                "effect_assertion_id": "schema_create_objects_additive_seed_rows_v1",
+                "state_expectations": [],
+            }),
+        );
+        let content = structured_content(&response);
+        assert_eq!(
+            content,
+            &expected_d1_reconciliation_semantic_error(
+                code,
+                message,
+                "Retain the exact lease evidence. Do not retry the original migration attempt or mutate D1 from this result.",
+            ),
+            "{content}",
+        );
+    }
+
+    let no_op_sql = "CREATE TABLE IF NOT EXISTS Channels(id TEXT PRIMARY KEY); CREATE TRIGGER IF NOT EXISTS channels_guard BEFORE UPDATE ON CHANNELS BEGIN SELECT RAISE(ABORT, 'immutable'); END; INSERT INTO channels (id) VALUES ('daily');";
+    let no_op_response = mcp.call_tool(
+        760,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": [{
+                "name": "0001.sql",
+                "size_bytes": no_op_sql.len(),
+                "sql_sha256": sha256_hex(no_op_sql),
+                "sql": no_op_sql,
+            }],
+            "approved_plan_sha256": "a".repeat(64),
+            "lease_nonce": "b".repeat(64),
+            "lease_payload_sha256": "c".repeat(64),
+            "effect_assertion_id": "schema_create_objects_additive_seed_rows_v1",
+            "state_expectations": [],
+        }),
+    );
+    let no_op_content = structured_content(&no_op_response);
+    let mut expected_no_op = expected_d1_reconciliation_semantic_error(
+        "d1.migration_reconciliation_seed_create_if_not_exists_unavailable",
+        "the seed-row assertion requires every classified CREATE object to be an unconditional actual creation",
+        "Retain the exact lease evidence. Do not retry the original migration attempt or mutate D1 from this result.",
+    );
+    expected_no_op["capability_state"] = json!("capability_gap");
+    assert_eq!(no_op_content, &expected_no_op, "{no_op_content}");
+
+    let trigger_no_op_sql = "CREATE TABLE Channels(id TEXT PRIMARY KEY); INSERT INTO channels (id) VALUES ('daily'); CREATE TRIGGER IF NOT EXISTS channels_guard BEFORE UPDATE ON CHANNELS BEGIN SELECT RAISE(ABORT, 'immutable'); END;";
+    let trigger_no_op_response = mcp.call_tool(
+        761,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": [{
+                "name": "0001.sql",
+                "size_bytes": trigger_no_op_sql.len(),
+                "sql_sha256": sha256_hex(trigger_no_op_sql),
+                "sql": trigger_no_op_sql,
+            }],
+            "approved_plan_sha256": "a".repeat(64),
+            "lease_nonce": "b".repeat(64),
+            "lease_payload_sha256": "c".repeat(64),
+            "effect_assertion_id": "schema_create_objects_additive_seed_rows_v1",
+            "state_expectations": [],
+        }),
+    );
+    let trigger_no_op_content = structured_content(&trigger_no_op_response);
+    assert_eq!(
+        trigger_no_op_content, &expected_no_op,
+        "{trigger_no_op_content}"
+    );
+
+    let affinity_sql = "CREATE TABLE metrics(value TEXT); INSERT INTO metrics (value) VALUES (1);";
+    let affinity_response = mcp.call_tool(
+        762,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": [{
+                "name": "0001.sql",
+                "size_bytes": affinity_sql.len(),
+                "sql_sha256": sha256_hex(affinity_sql),
+                "sql": affinity_sql,
+            }],
+            "approved_plan_sha256": "a".repeat(64),
+            "lease_nonce": "b".repeat(64),
+            "lease_payload_sha256": "c".repeat(64),
+            "effect_assertion_id": "schema_create_objects_additive_seed_rows_v1",
+            "state_expectations": [
+                {"manifest_prefix_length": 0, "schema_objects": [], "tables": []},
+                {
+                    "manifest_prefix_length": 1,
+                    "schema_objects": [{
+                        "object_type": "table",
+                        "name": "metrics",
+                        "table_name": "metrics",
+                        "sql_sha256": sha256_hex("CREATE TABLE metrics(value TEXT)"),
+                    }],
+                    "tables": [{
+                        "name": "metrics",
+                        "columns": [{
+                            "cid": 0,
+                            "name": "value",
+                            "declared_type": "TEXT",
+                            "not_null": false,
+                            "default_value": null,
+                            "primary_key_position": 0,
+                            "hidden": 0,
+                        }],
+                        "foreign_keys": [],
+                    }],
+                    "seed_tables": [],
+                },
+            ],
+        }),
+    );
+    let affinity_content = structured_content(&affinity_response);
+    let mut expected_affinity = expected_d1_reconciliation_semantic_error(
+        "d1.migration_reconciliation_seed_affinity_unstable",
+        "a seed literal and reviewed SQLite table/column contract could reject or change its storage class or value",
+        "Retain the exact lease evidence. Do not retry the original migration attempt or mutate D1 from this result.",
+    );
+    expected_affinity["capability_state"] = json!("capability_gap");
+    assert_eq!(affinity_content, &expected_affinity, "{affinity_content}");
+
+    let strict_blob_sql = "CREATE TABLE StrictRows(value BLOB) STRICT; INSERT INTO strictrows (value) VALUES ('text');";
+    let strict_blob_response = mcp.call_tool(
+        763,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": [{
+                "name": "0001.sql",
+                "size_bytes": strict_blob_sql.len(),
+                "sql_sha256": sha256_hex(strict_blob_sql),
+                "sql": strict_blob_sql,
+            }],
+            "approved_plan_sha256": "a".repeat(64),
+            "lease_nonce": "b".repeat(64),
+            "lease_payload_sha256": "c".repeat(64),
+            "effect_assertion_id": "schema_create_objects_additive_seed_rows_v1",
+            "state_expectations": [
+                {"manifest_prefix_length": 0, "schema_objects": [], "tables": []},
+                {
+                    "manifest_prefix_length": 1,
+                    "schema_objects": [{
+                        "object_type": "table",
+                        "name": "StrictRows",
+                        "table_name": "StrictRows",
+                        "sql_sha256": sha256_hex("CREATE TABLE StrictRows(value BLOB) STRICT"),
+                    }],
+                    "tables": [{
+                        "name": "StrictRows",
+                        "columns": [{
+                            "cid": 0,
+                            "name": "value",
+                            "declared_type": "BLOB",
+                            "not_null": false,
+                            "default_value": null,
+                            "primary_key_position": 0,
+                            "hidden": 0,
+                        }],
+                        "foreign_keys": [],
+                    }],
+                    "seed_tables": [],
+                },
+            ],
+        }),
+    );
+    let strict_blob_content = structured_content(&strict_blob_response);
+    assert_eq!(
+        strict_blob_content, &expected_affinity,
+        "{strict_blob_content}"
     );
     mcp.terminate();
 }

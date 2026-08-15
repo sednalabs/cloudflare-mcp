@@ -12,6 +12,7 @@ pub(crate) mod d1_migration_additive;
 pub(crate) mod d1_migration_lease;
 pub(crate) mod d1_migration_manifest;
 pub(crate) mod d1_migration_reconciliation;
+pub(crate) mod d1_migration_seed_rows;
 pub(crate) mod d1_migration_terminal;
 pub mod dns_route;
 pub mod mutation;

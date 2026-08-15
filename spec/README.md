@@ -118,11 +118,40 @@ Preserved curated tool families:
   before custody. It never executes manifest SQL or treats connection
   PRAGMA state as persistent evidence. The predecessor assertions remain
   byte-for-byte behaviorally closed to ALTER and PRAGMA.
+  `schema_create_objects_additive_seed_rows_v1` is the distinct canonical
+  seed-row assertion. It extends the additive scope with one bounded,
+  unqualified `INSERT INTO <manifest-created-table> (<explicit columns>)
+  VALUES (<literal tuples>)` per target table. Only canonical TEXT and signed
+  INTEGER literals are admitted. Every classified CREATE is unconditional;
+  `IF NOT EXISTS` is rejected. CREATE must precede the seed and every trigger
+  on that table must follow it, including across manifest entries. Each prefix
+  supplies the exact table, ordered columns, row count, and aggregate row-set
+  SHA-256. SQLite ASCII case variants share one CREATE, ALTER, index, trigger,
+  and seed target and the reviewed CREATE spelling. Baseline tables not created
+  by the manifest use the first encountered manifest parent spelling for
+  case-insensitive transition derivation while retaining exact provider and
+  expectation spelling in the fixed proof. Non-STRICT tables admit
+  only identity-stable TEXT/BLOB and INTEGER/NUMERIC/BLOB literal affinity
+  pairs. STRICT tables admit only TEXT-on-TEXT and INTEGER-on-INT/INTEGER pairs;
+  STRICT BLOB seeds fail before custody/provider access. A primary-current
+  selection read chooses the manifest prefix before two complete
+  primary-current proofs. A full-manifest registry omits seed-table reads before
+  CREATE, proves exact table emptiness after CREATE and before INSERT without
+  referencing future columns, and reads the exact typed rows at or after INSERT.
+  Each complete proof ledger must equal the exact initial selected ledger, and
+  the two complete snapshots must remain canonically equal to each other; two
+  equal complete responses at another prefix fail closed. Aggregate-safe
+  selection-query and ledger digests bind this relationship. Terminal
+  reconciliation rederives and repeats that selected-prefix proof;
+  responses expose only aggregate summaries. Arbitrary DML, expressions, implicit columns,
+  conflict clauses, reused targets, and malformed or mismatched rows fail closed.
+  The three predecessor assertions remain closed to top-level INSERT effects.
   Successful evidence keeps the legacy `schema_create_only` statement-class
   label only for the legacy assertion; the extended and additive assertions
   report `schema_create_tables_indexes_views_triggers` and
-  `schema_create_objects_additive` respectively, with their complete closed
-  object/operation arrays.
+  `schema_create_objects_additive`, while the seed assertion reports
+  `schema_create_objects_additive_seed_rows`, each with its complete closed
+  object/operation array.
   Every assertion also treats the configured migration-ledger table as a
   reserved SQLite identifier: case variants in CREATE identities, index or
   trigger parents, any exact admitted trigger header/body lexical token, and additive
