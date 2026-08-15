@@ -627,7 +627,7 @@ fn spawn_fake_d1_migrations_api(
                         "result": [{
                             "success": true,
                             "results": [{"id": 1, "name": "0001_initial.sql"}],
-                            "meta": {"served_by": "ledger"}
+                            "meta": {"served_by_primary": true}
                         }]
                     })
                 }
@@ -887,7 +887,7 @@ fn spawn_blocked_manifest_preflight_api() -> (
                     "success": true,
                     "errors": [],
                     "messages": [],
-                    "result": [{"success": true, "results": [{"id": 1, "name": "0001_initial.sql"}]}]
+                    "result": [{"success": true, "meta": {"served_by_primary": true}, "results": [{"id": 1, "name": "0001_initial.sql"}]}]
                 })
             })
             .expect("serialize blocked response");
