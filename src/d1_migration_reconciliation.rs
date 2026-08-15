@@ -66,6 +66,8 @@ pub(crate) fn contextualize_d1_reconciliation_semantic_error(
     }))
 }
 const EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1: &str = "schema_create_only_v1";
+const EFFECT_ASSERTION_SCHEMA_CREATE_OBJECTS_V1: &str =
+    "schema_create_tables_indexes_views_triggers_v1";
 const MAX_STATE_EXPECTATIONS: usize = 128;
 const MAX_SCHEMA_OBJECTS: usize = 128;
 const MAX_TABLES: usize = 64;
@@ -771,13 +773,15 @@ fn validate_expectations(
         for object in &state.schema_objects {
             validate_identifier("schema object name", &object.name)?;
             validate_identifier("schema object table_name", &object.table_name)?;
-            if !matches!(object.object_type.as_str(), "table" | "index")
-                || !valid_sha256(&object.sql_sha256)
+            if !matches!(
+                object.object_type.as_str(),
+                "table" | "index" | "view" | "trigger"
+            ) || !valid_sha256(&object.sql_sha256)
             {
                 return Err(reconciliation_error(
                     "capability_gap",
                     "d1.migration_reconciliation_schema_expectation_invalid",
-                    "schema objects must be table/index entries with lowercase exact SQL SHA-256 digests",
+                    "schema objects must be table/index/view/trigger entries with lowercase exact SQL SHA-256 digests",
                 ));
             }
             let key = (object.object_type.clone(), object.name.clone());
@@ -801,6 +805,12 @@ fn validate_expectations(
                     ));
                 }
                 state_table_objects.insert(object.name.clone());
+            } else if object.object_type == "view" && object.name != object.table_name {
+                return Err(reconciliation_error(
+                    "contradictory",
+                    "d1.migration_reconciliation_schema_expectation_invalid",
+                    "a view schema object must bind its own exact sqlite_master table name",
+                ));
             }
             supplied_derived_objects.push(DerivedSchemaObject {
                 object_type: object.object_type.clone(),
@@ -863,6 +873,19 @@ fn validate_expectations(
                 "contradictory",
                 "d1.migration_reconciliation_index_parent_missing",
                 "every expected index must bind an expected table in the same state",
+            ));
+        }
+        if state.schema_objects.iter().any(|object| {
+            object.object_type == "trigger"
+                && !state
+                    .tables
+                    .iter()
+                    .any(|table| table.name == object.table_name)
+        }) {
+            return Err(reconciliation_error(
+                "contradictory",
+                "d1.migration_reconciliation_trigger_parent_missing",
+                "every expected trigger must bind an expected table in the same state",
             ));
         }
     }
@@ -991,14 +1014,25 @@ fn derive_effect_assertion(
     effect_assertion_id: Option<&str>,
     manifest: &[D1MigrationManifestEntry],
 ) -> Result<Vec<Vec<DerivedSchemaObject>>, CallToolResult> {
-    if effect_assertion_id != Some(EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1) {
-        return Err(reconciliation_error(
-            "capability_gap",
-            "d1.migration_reconciliation_effect_assertion_missing",
-            "a supported registry-backed migration effect assertion is required",
-        ));
-    }
+    let (allow_views_and_triggers, unclassified_message) = match effect_assertion_id {
+        Some(EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1) => (
+            false,
+            "the built-in effect registry cannot exactly prove arbitrary DML, ALTER, DROP, PRAGMA, trigger, view, virtual table, or data-producing CREATE effects",
+        ),
+        Some(EFFECT_ASSERTION_SCHEMA_CREATE_OBJECTS_V1) => (
+            true,
+            "the selected effect assertion cannot exactly prove this statement or any arbitrary top-level DML, ALTER, DROP, PRAGMA, virtual table, or data-producing CREATE effect",
+        ),
+        _ => {
+            return Err(reconciliation_error(
+                "capability_gap",
+                "d1.migration_reconciliation_effect_assertion_missing",
+                "a supported registry-backed migration effect assertion is required",
+            ));
+        }
+    };
     let mut cumulative = BTreeMap::<(String, String), DerivedSchemaObject>::new();
+    let mut cumulative_names = BTreeSet::new();
     let mut states = vec![Vec::new()];
     for migration in manifest {
         let statements = tokenize_sql_statements(&migration.sql).ok_or_else(|| {
@@ -1016,19 +1050,22 @@ fn derive_effect_assertion(
             ));
         }
         for tokens in statements {
-            let object = schema_create_only(&tokens).ok_or_else(|| {
-                reconciliation_error(
-                    "capability_gap",
-                    "d1.migration_reconciliation_effect_proof_unavailable",
-                    "the built-in effect registry cannot exactly prove arbitrary DML, ALTER, DROP, PRAGMA, trigger, view, virtual table, or data-producing CREATE effects",
-                )
-            })?;
+            let object =
+                classify_schema_create(&tokens, allow_views_and_triggers).ok_or_else(|| {
+                    reconciliation_error(
+                        "capability_gap",
+                        "d1.migration_reconciliation_effect_proof_unavailable",
+                        unclassified_message,
+                    )
+                })?;
             let key = (object.object_type.clone(), object.name.clone());
-            if cumulative.insert(key, object).is_some() {
+            if !cumulative_names.insert(object.name.clone())
+                || cumulative.insert(key, object).is_some()
+            {
                 return Err(reconciliation_error(
                     "contradictory",
                     "d1.migration_reconciliation_create_target_reused",
-                    "the manifest reuses a CREATE object identity and cannot derive one exact schema state per prefix",
+                    "the manifest reuses a CREATE schema identity and cannot derive one exact schema state per prefix",
                 ));
             }
         }
@@ -1037,7 +1074,10 @@ fn derive_effect_assertion(
     Ok(states)
 }
 
-fn schema_create_only(tokens: &[SqlToken]) -> Option<DerivedSchemaObject> {
+fn classify_schema_create(
+    tokens: &[SqlToken],
+    allow_views_and_triggers: bool,
+) -> Option<DerivedSchemaObject> {
     if !token_is_word(tokens.first(), "create") {
         return None;
     }
@@ -1054,6 +1094,12 @@ fn schema_create_only(tokens: &[SqlToken]) -> Option<DerivedSchemaObject> {
     } else if token_is_word(tokens.get(cursor), "index") {
         cursor += 1;
         "index"
+    } else if allow_views_and_triggers && token_is_word(tokens.get(cursor), "view") && !unique {
+        cursor += 1;
+        "view"
+    } else if allow_views_and_triggers && token_is_word(tokens.get(cursor), "trigger") && !unique {
+        cursor += 1;
+        "trigger"
     } else {
         return None;
     };
@@ -1082,7 +1128,7 @@ fn schema_create_only(tokens: &[SqlToken]) -> Option<DerivedSchemaObject> {
             table_name: name.clone(),
             name,
         })
-    } else {
+    } else if object_type == "index" {
         if !token_is_word(tokens.get(cursor), "on") {
             return None;
         }
@@ -1100,7 +1146,144 @@ fn schema_create_only(tokens: &[SqlToken]) -> Option<DerivedSchemaObject> {
             name,
             table_name,
         })
+    } else if object_type == "view" {
+        if tokens.get(cursor) == Some(&SqlToken::Symbol('(')) {
+            cursor = balanced_parenthesized_end(tokens, cursor)?;
+        }
+        if !token_is_word(tokens.get(cursor), "as")
+            || !matches!(
+                tokens.get(cursor + 1),
+                Some(SqlToken::Word(word))
+                    if matches_ignore_ascii_case(word, &["select", "with", "values"])
+            )
+            || cursor + 2 >= tokens.len()
+            || tokens[cursor + 1..]
+                .iter()
+                .any(|token| token == &SqlToken::Symbol(';'))
+        {
+            return None;
+        }
+        Some(DerivedSchemaObject {
+            object_type: object_type.to_string(),
+            table_name: name.clone(),
+            name,
+        })
+    } else {
+        let timing = tokens.get(cursor).and_then(|token| match token {
+            SqlToken::Word(word) if word.eq_ignore_ascii_case("before") => Some(1),
+            SqlToken::Word(word) if word.eq_ignore_ascii_case("after") => Some(1),
+            SqlToken::Word(word) if word.eq_ignore_ascii_case("instead") => {
+                token_is_word(tokens.get(cursor + 1), "of").then_some(2)
+            }
+            _ => None,
+        });
+        if let Some(width) = timing {
+            cursor += width;
+        }
+        if token_is_word(tokens.get(cursor), "delete")
+            || token_is_word(tokens.get(cursor), "insert")
+        {
+            cursor += 1;
+        } else if token_is_word(tokens.get(cursor), "update") {
+            cursor += 1;
+            if token_is_word(tokens.get(cursor), "of") {
+                cursor += 1;
+                let mut needs_identifier = true;
+                loop {
+                    if needs_identifier {
+                        let column = token_identifier(tokens.get(cursor))?;
+                        validate_identifier("derived CREATE TRIGGER update column", &column)
+                            .ok()?;
+                        cursor += 1;
+                        needs_identifier = false;
+                    } else if tokens.get(cursor) == Some(&SqlToken::Symbol(',')) {
+                        cursor += 1;
+                        needs_identifier = true;
+                    } else {
+                        break;
+                    }
+                }
+                if needs_identifier {
+                    return None;
+                }
+            }
+        } else {
+            return None;
+        }
+        if !token_is_word(tokens.get(cursor), "on") {
+            return None;
+        }
+        let table_name = token_identifier(tokens.get(cursor + 1))?;
+        validate_identifier("derived CREATE TRIGGER parent", &table_name).ok()?;
+        cursor += 2;
+        if tokens.get(cursor) == Some(&SqlToken::Symbol('.')) {
+            return None;
+        }
+        let begin = tokens[cursor..]
+            .iter()
+            .position(|token| token_is_word(Some(token), "begin"))?
+            + cursor;
+        let end = tokens.len().checked_sub(1)?;
+        let header_suffix = &tokens[cursor..begin];
+        let mut header_cursor = 0usize;
+        if token_is_word(header_suffix.get(header_cursor), "for")
+            && token_is_word(header_suffix.get(header_cursor + 1), "each")
+            && token_is_word(header_suffix.get(header_cursor + 2), "row")
+        {
+            header_cursor += 3;
+        }
+        if token_is_word(header_suffix.get(header_cursor), "when") {
+            header_cursor += 1;
+            if header_cursor >= header_suffix.len() {
+                return None;
+            }
+            header_cursor = header_suffix.len();
+        }
+        let body = tokens.get(begin + 1..end)?;
+        if !token_is_word(tokens.get(end), "end")
+            || header_cursor != header_suffix.len()
+            || header_suffix
+                .iter()
+                .any(|token| token == &SqlToken::Symbol(';'))
+            || !valid_trigger_body(body)
+        {
+            return None;
+        }
+        Some(DerivedSchemaObject {
+            object_type: object_type.to_string(),
+            name,
+            table_name,
+        })
     }
+}
+
+fn valid_trigger_body(tokens: &[SqlToken]) -> bool {
+    if tokens.is_empty() || tokens.last() != Some(&SqlToken::Symbol(';')) {
+        return false;
+    }
+    let mut statement_start = 0usize;
+    for (index, token) in tokens.iter().enumerate() {
+        if token != &SqlToken::Symbol(';') {
+            continue;
+        }
+        if statement_start == index
+            || !matches!(
+                tokens.get(statement_start),
+                Some(SqlToken::Word(word))
+                    if matches_ignore_ascii_case(word, &["delete", "insert", "select", "update"])
+            )
+        {
+            return false;
+        }
+        statement_start = index + 1;
+    }
+    statement_start == tokens.len()
+}
+
+fn matches_ignore_ascii_case(value: &str, allowed: &[&str]) -> bool {
+    allowed
+        .iter()
+        .any(|candidate| value.eq_ignore_ascii_case(candidate))
 }
 
 fn token_is_word(token: Option<&SqlToken>, value: &str) -> bool {
@@ -1167,7 +1350,6 @@ fn tokenize_sql_statements(sql: &str) -> Option<Vec<Vec<SqlToken>>> {
     }
     let bytes = sql.as_bytes();
     let mut mode = Mode::Normal;
-    let mut statements = Vec::new();
     let mut tokens = Vec::new();
     let mut token = Vec::new();
     let mut quoted = Vec::new();
@@ -1214,11 +1396,9 @@ fn tokenize_sql_statements(sql: &str) -> Option<Vec<Vec<SqlToken>>> {
                 }
                 (b';', _) => {
                     flush_token(&mut token, &mut tokens);
-                    if !tokens.is_empty() {
-                        statements.push(std::mem::take(&mut tokens));
-                    }
+                    tokens.push(SqlToken::Symbol(';'));
                 }
-                (b'(' | b')' | b',', _) => {
+                (b'(' | b')' | b',' | b'.', _) => {
                     flush_token(&mut token, &mut tokens);
                     tokens.push(SqlToken::Symbol(byte as char));
                 }
@@ -1293,10 +1473,61 @@ fn tokenize_sql_statements(sql: &str) -> Option<Vec<Vec<SqlToken>>> {
         return None;
     }
     flush_token(&mut token, &mut tokens);
-    if !tokens.is_empty() {
-        statements.push(tokens);
+    split_top_level_statements(tokens)
+}
+
+fn split_top_level_statements(tokens: Vec<SqlToken>) -> Option<Vec<Vec<SqlToken>>> {
+    let mut statements = Vec::new();
+    let mut current = Vec::new();
+    let mut trigger = false;
+    let mut trigger_body = false;
+    let mut trigger_closed = false;
+    let mut case_depth = 0usize;
+    for token in tokens {
+        if !trigger && create_trigger_prefix(&current, Some(&token)) {
+            trigger = true;
+        }
+        if trigger && !trigger_body && token_is_word(Some(&token), "begin") {
+            trigger_body = true;
+        } else if trigger_body && !trigger_closed {
+            if token_is_word(Some(&token), "case") {
+                case_depth = case_depth.checked_add(1)?;
+            } else if token_is_word(Some(&token), "end") {
+                if case_depth > 0 {
+                    case_depth -= 1;
+                } else {
+                    trigger_closed = true;
+                }
+            }
+        }
+        if token == SqlToken::Symbol(';') && (!trigger || trigger_closed) {
+            if !current.is_empty() {
+                statements.push(std::mem::take(&mut current));
+            }
+            trigger = false;
+            trigger_body = false;
+            trigger_closed = false;
+            case_depth = 0;
+        } else {
+            current.push(token);
+        }
+    }
+    if trigger && (!trigger_body || !trigger_closed || case_depth != 0) {
+        return None;
+    }
+    if !current.is_empty() {
+        statements.push(current);
     }
     Some(statements)
+}
+
+fn create_trigger_prefix(current: &[SqlToken], next: Option<&SqlToken>) -> bool {
+    token_is_word(current.first(), "create")
+        && ((current.len() == 1 && token_is_word(next, "trigger"))
+            || (current.len() == 2
+                && (token_is_word(current.get(1), "temp")
+                    || token_is_word(current.get(1), "temporary"))
+                && token_is_word(next, "trigger")))
 }
 
 fn build_fixed_query(
@@ -1722,7 +1953,7 @@ fn parse_schema_rows(rows: &[Value]) -> Result<Vec<ObservedSchemaObject>, CallTo
         let table_name = exact_string(object, "tbl_name")?;
         let sql = exact_string(object, "sql")?;
         let key = (object_type.clone(), name.clone());
-        if !matches!(object_type.as_str(), "table" | "index")
+        if !matches!(object_type.as_str(), "table" | "index" | "view" | "trigger")
             || !names.insert(name.clone())
             || previous.as_ref().is_some_and(|prior| prior >= &key)
         {
@@ -2543,6 +2774,279 @@ mod tests {
                 "must reject data-producing or non-schema-only CREATE: {sql}"
             );
         }
+    }
+
+    #[test]
+    fn extended_registry_derives_views_and_complete_trigger_bodies() {
+        let sql = r#"
+            CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT, touched INTEGER);
+            CREATE INDEX items_by_name ON items(name);
+            CREATE VIEW item_names AS SELECT id, name FROM items;
+            CREATE TRIGGER items_after_update AFTER UPDATE OF name ON items
+            WHEN NEW.name IS NOT OLD.name
+            BEGIN
+                INSERT INTO item_audit(item_id, value)
+                VALUES (NEW.id, CASE WHEN NEW.name = '' THEN 'empty' ELSE NEW.name END);
+                UPDATE items SET touched = 1 WHERE id = NEW.id;
+            END;
+        "#;
+        let derived = derive_effect_assertion(
+            Some(EFFECT_ASSERTION_SCHEMA_CREATE_OBJECTS_V1),
+            &manifest(sql),
+        )
+        .expect("derive table, index, view, and whole trigger");
+        assert_eq!(
+            derived[1],
+            vec![
+                DerivedSchemaObject {
+                    object_type: "index".to_string(),
+                    name: "items_by_name".to_string(),
+                    table_name: "items".to_string(),
+                },
+                DerivedSchemaObject {
+                    object_type: "table".to_string(),
+                    name: "items".to_string(),
+                    table_name: "items".to_string(),
+                },
+                DerivedSchemaObject {
+                    object_type: "trigger".to_string(),
+                    name: "items_after_update".to_string(),
+                    table_name: "items".to_string(),
+                },
+                DerivedSchemaObject {
+                    object_type: "view".to_string(),
+                    name: "item_names".to_string(),
+                    table_name: "item_names".to_string(),
+                },
+            ]
+        );
+        assert!(
+            derive_effect_assertion(Some(EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1), &manifest(sql))
+                .is_err(),
+            "the backward-compatible assertion must keep rejecting view/trigger effects",
+        );
+    }
+
+    #[test]
+    fn extended_registry_rejects_unsupported_and_malformed_effects() {
+        for sql in [
+            "CREATE TEMP VIEW item_names AS SELECT id FROM items;",
+            "CREATE TEMPORARY TRIGGER item_change AFTER UPDATE ON items BEGIN SELECT 1; END;",
+            "CREATE VIEW main.item_names AS SELECT id FROM items;",
+            "CREATE TRIGGER main.item_change AFTER UPDATE ON items BEGIN SELECT 1; END;",
+            "CREATE TRIGGER item_change AFTER UPDATE ON main.items BEGIN SELECT 1; END;",
+            "CREATE TABLE items AS SELECT 1;",
+            "CREATE VIRTUAL TABLE items USING fts5(value);",
+            "INSERT INTO items(id) VALUES (1);",
+            "ALTER TABLE items ADD COLUMN name TEXT;",
+            "DROP TABLE items;",
+            "PRAGMA foreign_keys = ON;",
+            "CREATE VIEW item_names AS DELETE FROM items;",
+            "CREATE TRIGGER item_change AFTER SELECT ON items BEGIN SELECT 1; END;",
+            "CREATE TRIGGER item_change AFTER UPDATE ON items BEGIN SELECT 'unterminated; END;",
+            "CREATE TRIGGER item_change AFTER UPDATE ON items BEGIN SELECT 1; /* unclosed",
+            "CREATE TRIGGER item_change AFTER UPDATE ON items BEGIN SELECT CASE WHEN 1 THEN 1 END;",
+            "CREATE TRIGGER item_change AFTER UPDATE ON items BEGIN END;",
+            "CREATE TRIGGER item_change AFTER UPDATE ON items; DELETE FROM items; BEGIN SELECT 1; END;",
+            "CREATE TRIGGER item_change AFTER UPDATE ON items BEGIN CREATE TABLE hidden(id); END;",
+            "CREATE TRIGGER item_change AFTER UPDATE ON items BEGIN PRAGMA foreign_keys; END;",
+            "CREATE TRIGGER item_change AFTER UPDATE ON items WHEN BEGIN SELECT 1; END;",
+        ] {
+            assert!(
+                derive_effect_assertion(
+                    Some(EFFECT_ASSERTION_SCHEMA_CREATE_OBJECTS_V1),
+                    &manifest(sql),
+                )
+                .is_err(),
+                "unsupported or malformed effect must fail closed: {sql}",
+            );
+        }
+
+        let first_trigger = "CREATE TRIGGER item_change AFTER UPDATE ON items BEGIN SELECT 1; END;";
+        let second_trigger =
+            "CREATE TRIGGER item_change AFTER UPDATE ON items BEGIN SELECT 2; END;";
+        let repeated = vec![
+            D1MigrationManifestEntry {
+                name: "0001.sql".to_string(),
+                size_bytes: first_trigger.len() as u64,
+                sql_sha256: sha256_bytes_hex(first_trigger.as_bytes()),
+                sql: first_trigger.to_string(),
+            },
+            D1MigrationManifestEntry {
+                name: "0002.sql".to_string(),
+                size_bytes: second_trigger.len() as u64,
+                sql_sha256: sha256_bytes_hex(second_trigger.as_bytes()),
+                sql: second_trigger.to_string(),
+            },
+        ];
+        assert!(
+            derive_effect_assertion(Some(EFFECT_ASSERTION_SCHEMA_CREATE_OBJECTS_V1), &repeated)
+                .is_err(),
+            "a CREATE identity cannot be reused in a later prefix",
+        );
+        assert!(
+            derive_effect_assertion(
+                Some(EFFECT_ASSERTION_SCHEMA_CREATE_OBJECTS_V1),
+                &manifest(
+                    "CREATE TABLE shared_name(id INTEGER); CREATE VIEW shared_name AS SELECT id FROM shared_name;",
+                ),
+            )
+            .is_err(),
+            "schema identities cannot be reused across object types",
+        );
+    }
+
+    #[test]
+    fn view_and_trigger_expectations_bind_exact_rows_without_structural_table_proofs() {
+        let derived = vec![
+            Vec::new(),
+            vec![
+                DerivedSchemaObject {
+                    object_type: "table".to_string(),
+                    name: "items".to_string(),
+                    table_name: "items".to_string(),
+                },
+                DerivedSchemaObject {
+                    object_type: "trigger".to_string(),
+                    name: "item_change".to_string(),
+                    table_name: "items".to_string(),
+                },
+                DerivedSchemaObject {
+                    object_type: "view".to_string(),
+                    name: "item_names".to_string(),
+                    table_name: "item_names".to_string(),
+                },
+            ],
+        ];
+        let table = D1MigrationTableExpectation {
+            name: "items".to_string(),
+            columns: vec![D1MigrationColumnExpectation {
+                cid: 0,
+                name: "id".to_string(),
+                declared_type: "INTEGER".to_string(),
+                not_null: false,
+                default_value: None,
+                primary_key_position: 1,
+                hidden: 0,
+            }],
+            foreign_keys: Vec::new(),
+        };
+        let expected = D1MigrationStateExpectation {
+            manifest_prefix_length: 1,
+            schema_objects: vec![
+                D1MigrationSchemaObjectExpectation {
+                    object_type: "table".to_string(),
+                    name: "items".to_string(),
+                    table_name: "items".to_string(),
+                    sql_sha256: "a".repeat(64),
+                },
+                D1MigrationSchemaObjectExpectation {
+                    object_type: "trigger".to_string(),
+                    name: "item_change".to_string(),
+                    table_name: "items".to_string(),
+                    sql_sha256: "b".repeat(64),
+                },
+                D1MigrationSchemaObjectExpectation {
+                    object_type: "view".to_string(),
+                    name: "item_names".to_string(),
+                    table_name: "item_names".to_string(),
+                    sql_sha256: "c".repeat(64),
+                },
+            ],
+            tables: vec![table.clone()],
+        };
+        let validated = validate_expectations(&derived, vec![empty_state(), expected.clone()])
+            .expect("only the physical table needs xinfo/FK expectations");
+        assert_eq!(validated.table_names, vec!["items"]);
+
+        let mut omitted = expected.clone();
+        omitted.schema_objects.remove(1);
+        assert!(
+            validate_expectations(&derived, vec![empty_state(), omitted]).is_err(),
+            "a trigger omitted from a selected prefix must fail before provider access",
+        );
+
+        let mut added = expected.clone();
+        added
+            .schema_objects
+            .push(D1MigrationSchemaObjectExpectation {
+                object_type: "view".to_string(),
+                name: "unexpected_view".to_string(),
+                table_name: "unexpected_view".to_string(),
+                sql_sha256: "e".repeat(64),
+            });
+        assert!(
+            validate_expectations(&derived, vec![empty_state(), added]).is_err(),
+            "an added schema object must fail before provider access",
+        );
+
+        let mut wrong_parent = expected.clone();
+        wrong_parent.schema_objects[1].table_name = "other_items".to_string();
+        assert!(
+            validate_expectations(&derived, vec![empty_state(), wrong_parent]).is_err(),
+            "a trigger parent mismatch must fail before provider access",
+        );
+
+        let orphan_derived = vec![
+            Vec::new(),
+            vec![DerivedSchemaObject {
+                object_type: "trigger".to_string(),
+                name: "orphan_trigger".to_string(),
+                table_name: "missing_table".to_string(),
+            }],
+        ];
+        let orphan_expected = D1MigrationStateExpectation {
+            manifest_prefix_length: 1,
+            schema_objects: vec![D1MigrationSchemaObjectExpectation {
+                object_type: "trigger".to_string(),
+                name: "orphan_trigger".to_string(),
+                table_name: "missing_table".to_string(),
+                sql_sha256: "f".repeat(64),
+            }],
+            tables: Vec::new(),
+        };
+        let orphan_error =
+            validate_expectations(&orphan_derived, vec![empty_state(), orphan_expected])
+                .expect_err("a trigger cannot bind an absent table");
+        assert_eq!(
+            orphan_error
+                .structured_content
+                .expect("structured trigger-parent error")["error"]["code"],
+            "d1.migration_reconciliation_trigger_parent_missing",
+        );
+
+        let snapshot = CanonicalSnapshot {
+            ledger: vec![],
+            schema_objects: vec![
+                ObservedSchemaObject {
+                    object_type: "table".to_string(),
+                    name: "items".to_string(),
+                    table_name: "items".to_string(),
+                    sql_sha256: "a".repeat(64),
+                },
+                ObservedSchemaObject {
+                    object_type: "trigger".to_string(),
+                    name: "item_change".to_string(),
+                    table_name: "items".to_string(),
+                    sql_sha256: "d".repeat(64),
+                },
+                ObservedSchemaObject {
+                    object_type: "view".to_string(),
+                    name: "item_names".to_string(),
+                    table_name: "item_names".to_string(),
+                    sql_sha256: "c".repeat(64),
+                },
+            ],
+            tables: vec![ObservedTable {
+                name: "items".to_string(),
+                columns: table.columns,
+                foreign_keys: Vec::new(),
+            }],
+        };
+        assert!(
+            verify_expected_state(&expected, &validated, &snapshot).is_err(),
+            "a wrong sqlite_master SQL digest must not converge",
+        );
     }
 
     #[test]

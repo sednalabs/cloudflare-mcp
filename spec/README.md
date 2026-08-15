@@ -102,7 +102,12 @@ Preserved curated tool families:
   expectation schema, manifest-derived complete prefix inventory, query-bound
   statement markers, bounded streaming, truthful custody classification, and
   real MCP stdio negative/no-retry/no-custody-mutation proof aligned with the
-  snapshot.
+  snapshot. `schema_create_only_v1` is the stable table/index assertion;
+  `schema_create_tables_indexes_views_triggers_v1` is the explicit extended
+  assertion. The latter must preserve exact type/name/parent/SQL-digest proof
+  for every view and trigger without issuing table PRAGMAs for those objects,
+  and must keep trigger-body semicolons plus nested `CASE ... END` inside one
+  fail-closed classified statement.
 - Terminal retained-manifest reconciliation
   (`d1_finalize_migration_reconciliation`) is the separately approval-gated
   local-custody mutation contract. Keep its exact evidence/request/attempt

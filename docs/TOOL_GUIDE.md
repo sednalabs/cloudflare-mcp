@@ -85,9 +85,18 @@ Use `d1_reconcile_migration_manifest` only for exact retained
 `active.lease.json` or `retiring.lease.json` evidence after an ambiguous
 manifest apply. Supply the complete exact-byte manifest and one complete
 expected schema state for every prefix from zero through the full manifest.
-The tool derives every CREATE TABLE/INDEX target from the manifest and rejects
-omissions, additions, data-producing CREATE forms, malformed result metadata,
-and result sets whose query-bound statement marker is absent or changed. It
+The tool derives every target allowed by the selected registry assertion from
+the manifest and rejects omissions, additions, data-producing CREATE forms,
+malformed result metadata, and result sets whose query-bound statement marker
+is absent or changed. Use `schema_create_only_v1` for the backward-compatible
+table/index-only contract. Use
+`schema_create_tables_indexes_views_triggers_v1` only when every prefix also
+declares exact view and trigger `sqlite_master` type/name/parent/SQL-digest
+evidence. Trigger parents must be tables in the same selected state; views and
+triggers do not receive table_xinfo or foreign-key PRAGMA expectations. The
+extended registry safely keeps trigger-body semicolons and nested `CASE ...
+END` inside one statement while rejecting temporary/schema-qualified objects,
+malformed bodies, unsupported top-level effects, and reused identities. It
 also requires every fixed result set in both batches to carry exact
 `meta.served_by_primary=true` evidence; absent, false, null, non-boolean, or
 mixed primary markers are contradictory and cannot support positive
@@ -164,6 +173,9 @@ and unverified/drifted custody report `lease_retained=null` with the
 corresponding `custody_status` and no fabricated lease decision.
 Retired-without-receipt is a verified-retired order violation, not evidence
 that an active lease was retained.
+The effect assertion must be byte-for-byte identical to the read-only
+reconciliation input; terminal dry run and live execution consume the same
+complete view/trigger-capable proof when the extended assertion is selected.
 
 For D1 usage-spike investigations, start with `account_billing_usage` to read
 Cloudflare billing usage records, then use `graphql_analytics_query` for
