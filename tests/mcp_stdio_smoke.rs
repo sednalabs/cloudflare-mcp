@@ -12051,7 +12051,15 @@ fn d1_apply_migration_manifest_ambiguous_inner_result_shapes_retain_lease_withou
         (
             "unchanged write metadata",
             json!([{"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": false, "changes": 1, "rows_written": 1}}]),
-            "write_did_not_acknowledge_database_change",
+            "write_metadata_contradictory",
+        ),
+        (
+            "mixed contradictory non-mutating metadata",
+            json!([
+                {"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": false, "changes": 1, "rows_written": 1}},
+                {"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": true, "changes": 0, "rows_written": 0}}
+            ]),
+            "write_metadata_contradictory",
         ),
         (
             "empty mutation metadata",
