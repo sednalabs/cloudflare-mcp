@@ -36,6 +36,12 @@ export CLOUDFLARE_MCP_R2_ACCESS_KEY_ID=<r2_access_key_id>
 export CLOUDFLARE_MCP_R2_SECRET_ACCESS_KEY=<r2_secret_access_key>
 ```
 
+Scope the access-key token to the intended operations and buckets:
+`r2_inspect_object`/`r2_get_object` need
+`Workers R2 Storage Bucket Item Read`, while `r2_put_object` needs
+`Workers R2 Storage Bucket Item Write`. Read success alone does not prove that
+uploads will work.
+
 For deployments, prefer secret files outside the repository when supported by
 the corresponding `*_FILE` settings.
 

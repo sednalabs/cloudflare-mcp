@@ -75,10 +75,15 @@ JSON-RPC envelope shape:
   present.
 - The OAuth callback consumes a bounded, expiring, single-use PKCE transaction.
   Clients must never log or copy its `code` or `state` query values.
-- R2 object reads use independent S3-compatible R2 credentials:
+- R2 object tools use independent S3-compatible R2 credentials:
   set `CLOUDFLARE_MCP_R2_ACCESS_KEY_ID` and `CLOUDFLARE_MCP_R2_SECRET_ACCESS_KEY`,
   or their `_FILE` variants. `CLOUDFLARE_MCP_R2_ENDPOINT` is optional and
   defaults to `https://<account_id>.r2.cloudflarestorage.com`.
+- R2 credentials are capability-specific. `HEAD`/`GET` need
+  `Workers R2 Storage Bucket Item Read`; `PUT` needs
+  `Workers R2 Storage Bucket Item Write`. A successful read probe does not
+  prove write readiness. Keep write scoped only to buckets the workflow must
+  mutate.
 
 ## Optional elicitation behavior
 

@@ -1436,10 +1436,14 @@ impl CloudflareClient {
         let headers = response.headers().clone();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
+            let (code, hint) = r2_rejection_guidance(&method, status);
             return Err(AdapterError::new(
-                "cloudflare.r2_request_rejected",
-                format!("R2 object {} returned HTTP {status}: {body}", method.as_str()),
-                "Check R2 credentials, bucket permissions, bucket name, object key, and optional byte range.",
+                code,
+                format!(
+                    "R2 object {} returned HTTP {status}: {body}",
+                    method.as_str()
+                ),
+                hint,
             )
             .with_status(Some(status.as_u16()))
             .with_retryable(matches!(
@@ -4138,6 +4142,30 @@ fn http_status_error(status: StatusCode, body: &str) -> AdapterError {
     }
 }
 
+fn r2_rejection_guidance(
+    method: &reqwest::Method,
+    status: StatusCode,
+) -> (&'static str, &'static str) {
+    if status == StatusCode::FORBIDDEN && method == reqwest::Method::PUT {
+        return (
+            "cloudflare.r2_write_permission_denied",
+            "The configured R2 credential needs Workers R2 Storage Bucket Item Write for the target bucket. Inspect the access-key token with account_api_tokens, preserve existing policy resources and permissions, add only the required bucket and write permission through guarded dry-run/apply, then prove PUT and HEAD.",
+        );
+    }
+    if status == StatusCode::FORBIDDEN
+        && matches!(*method, reqwest::Method::GET | reqwest::Method::HEAD)
+    {
+        return (
+            "cloudflare.r2_read_permission_denied",
+            "The configured R2 credential needs Workers R2 Storage Bucket Item Read for the target bucket. Inspect the access-key token with account_api_tokens, preserve existing policy resources and permissions, add only the required bucket and read permission through guarded dry-run/apply, then prove HEAD and a bounded GET.",
+        );
+    }
+    (
+        "cloudflare.r2_request_rejected",
+        "Check R2 credentials, bucket permissions, bucket name, object key, and optional byte range.",
+    )
+}
+
 fn invalid_or_expired_token_classification() -> ErrorClassificationPayload {
     ErrorClassificationPayload {
         code: "invalid_or_expired_token",
@@ -5616,6 +5644,56 @@ mod tests {
 
         assert_eq!(result.status, 200);
         assert_eq!(result.etag.as_deref(), Some("\"etag-write\""));
+    }
+
+    #[tokio::test]
+    async fn r2_forbidden_errors_name_the_required_read_or_write_permission() {
+        async fn forbidden() -> (StatusCode, &'static str) {
+            (
+                StatusCode::FORBIDDEN,
+                "<Error><Code>AccessDenied</Code></Error>",
+            )
+        }
+
+        let base = spawn_router(Router::new().route(
+            "/{bucket}/{*key}",
+            get(forbidden).head(forbidden).put(forbidden),
+        ))
+        .await;
+        let client = CloudflareClient::new(test_config_with_r2_endpoint(
+            "http://127.0.0.1:9".to_string(),
+            base,
+        ))
+        .expect("client");
+
+        let read_error = client
+            .inspect_r2_object("acct-1", "bucket-a", "folder/file.txt")
+            .await
+            .expect_err("read permission error");
+        assert_eq!(read_error.code, "cloudflare.r2_read_permission_denied");
+        assert!(
+            read_error
+                .hint
+                .contains("Workers R2 Storage Bucket Item Read")
+        );
+
+        let write_error = client
+            .put_r2_object(
+                "acct-1",
+                "bucket-a",
+                "folder/file.txt",
+                b"hello write".to_vec(),
+                Some("text/plain"),
+                &[],
+            )
+            .await
+            .expect_err("write permission error");
+        assert_eq!(write_error.code, "cloudflare.r2_write_permission_denied");
+        assert!(
+            write_error
+                .hint
+                .contains("Workers R2 Storage Bucket Item Write")
+        );
     }
 
     #[tokio::test]
