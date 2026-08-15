@@ -117,6 +117,13 @@ new local custody or provider write is created. This is intentionally separate
 from the filename ledger prefix read, which cannot establish what a later
 `INSERT INTO <ledger>` means.
 
+After the governed lease and reviewed plan are bound, the MCP repeats that
+stable authority proof immediately before the first migration statement, then
+revalidates its held local custody immediately before dispatch. This prevents a
+preflight result from becoming stale while local plan/custody work is underway;
+any final-proof failure releases the pre-write lease and stops before a provider
+mutation.
+
 A later invocation stops before provider I/O when it sees an active or
 `retiring.lease.json` entry, including one that is malformed, a symlink or
 non-regular. It must be resolved only through the governed recovery path,

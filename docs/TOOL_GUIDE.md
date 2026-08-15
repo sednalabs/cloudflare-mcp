@@ -71,7 +71,7 @@ Use curated D1 tools instead of generic API calls for database workflows:
 - `d1_validate_query`
 - `d1_query_read_only`
 - `d1_execute_write`
-- `d1_apply_migrations`
+- `d1_apply_migrations` (dry-run inspection only; live mutation is retired)
 - `d1_apply_migration_manifest`
 - `d1_reconcile_migration_manifest`
 - `d1_finalize_migration_reconciliation`
@@ -79,7 +79,9 @@ Use curated D1 tools instead of generic API calls for database workflows:
 - `d1_delete_database`
 
 Read/query tools use restricted SQL checks. Write and migration tools preserve
-dry-run discipline and fail closed on unsafe or ambiguous state.
+dry-run discipline and fail closed on unsafe or ambiguous state. Use
+`d1_apply_migration_manifest` for every live migration; the legacy
+directory-backed `d1_apply_migrations` tool refuses live mutation.
 
 Use `d1_reconcile_migration_manifest` only for exact retained
 `active.lease.json` or `retiring.lease.json` evidence after an ambiguous

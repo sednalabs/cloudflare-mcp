@@ -144,7 +144,7 @@ fn tool_capabilities() -> Vec<ToolCapability> {
             .with_read_only(false),
         cap("d1_apply_migrations")
             .with_group("d1")
-            .with_read_only(false),
+            .with_read_only(true),
         cap("d1_apply_migration_manifest")
             .with_group("d1")
             .with_read_only(false),

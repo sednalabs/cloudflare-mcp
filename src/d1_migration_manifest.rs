@@ -328,14 +328,26 @@ fn quote_sql_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-/// The exact SQLite-master spelling produced by this MCP's compatible ledger
-/// initializer. SQLite removes `IF NOT EXISTS` and the terminating semicolon
-/// when it persists the CREATE text in `sqlite_master`.
-fn expected_d1_migration_ledger_table_sql(table: &str) -> String {
+fn quote_sql_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+/// The sole supported initializer for the reserved migration ledger.
+pub(crate) fn d1_migrations_table_init_sql(table: &str) -> String {
+    let table = quote_sql_identifier(table);
     format!(
-        "CREATE TABLE \"{}\"(\nid INTEGER PRIMARY KEY AUTOINCREMENT,\nname TEXT UNIQUE,\napplied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL\n)",
-        table.replace('"', "\"\"")
+        "CREATE TABLE IF NOT EXISTS {table}(\n    id INTEGER PRIMARY KEY AUTOINCREMENT,\n    name TEXT UNIQUE,\n    applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL\n);"
     )
+}
+
+/// The exact SQLite-master spelling derived from this MCP's compatible ledger
+/// initializer. SQLite removes `IF NOT EXISTS` and the terminating semicolon
+/// while preserving the remaining text, including indentation.
+fn expected_d1_migration_ledger_table_sql(table: &str) -> String {
+    d1_migrations_table_init_sql(table)
+        .strip_suffix(';')
+        .expect("reserved migration-ledger initializer has one trailing semicolon")
+        .replacen("CREATE TABLE IF NOT EXISTS", "CREATE TABLE", 1)
 }
 
 pub(crate) fn d1_migration_ledger_authority_sql(table: &str) -> String {
@@ -538,9 +550,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        d1_manifest_write_result_classification, expected_d1_migration_ledger_table_sql,
-        parse_d1_migration_ledger, parse_d1_migration_ledger_authority,
-        validate_d1_manifest_write_result,
+        d1_manifest_write_result_classification, d1_migrations_table_init_sql,
+        expected_d1_migration_ledger_table_sql, parse_d1_migration_ledger,
+        parse_d1_migration_ledger_authority, validate_d1_manifest_write_result,
     };
 
     fn authority(table: &str) -> serde_json::Value {
@@ -627,6 +639,24 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    #[test]
+    fn manifest_ledger_authority_schema_is_derived_from_the_live_initializer() {
+        let initialized = d1_migrations_table_init_sql("d1_migrations");
+        let expected = expected_d1_migration_ledger_table_sql("d1_migrations");
+        assert_eq!(
+            expected,
+            initialized
+                .strip_suffix(';')
+                .expect("initializer trailing semicolon")
+                .replacen("CREATE TABLE IF NOT EXISTS", "CREATE TABLE", 1),
+            "the authority proof must derive its SQLite-master SQL from the same initializer"
+        );
+        assert!(
+            expected.contains("\n    id INTEGER PRIMARY KEY AUTOINCREMENT,"),
+            "SQLite preserves the initializer indentation in sqlite_master"
+        );
     }
 
     #[test]
