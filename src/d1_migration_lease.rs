@@ -18,6 +18,7 @@ use rmcp::model::CallToolResult;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::d1_migration_terminal_semantics::valid_receipt_outcome_prefixes;
 use crate::tools::{invalid_argument_result, sha256_bytes_hex};
 use crate::verification::now_unix_ms;
 
@@ -1402,11 +1403,11 @@ mod linux {
             || !valid_lower_sha256(&receipt.terminal_attempt_sha256)
             || receipt.terminal_request_sha256 == receipt.terminal_attempt_sha256
             || !valid_lower_sha256(&receipt.terminal_plan_sha256)
-            || !matches!(
-                receipt.outcome.as_str(),
-                "not_committed" | "partial_state_converged" | "full_state_converged"
+            || !valid_receipt_outcome_prefixes(
+                &receipt.outcome,
+                receipt.original_prefix_length,
+                receipt.current_prefix_length,
             )
-            || receipt.current_prefix_length < receipt.original_prefix_length
         {
             return Err("terminal reconciliation receipt contains noncanonical authority fields");
         }
@@ -1431,11 +1432,11 @@ mod linux {
             || !valid_lower_sha256(&receipt.terminal_attempt_sha256)
             || receipt.terminal_request_sha256 == receipt.terminal_attempt_sha256
             || !valid_lower_sha256(&receipt.terminal_plan_sha256)
-            || !matches!(
-                receipt.outcome.as_str(),
-                "not_committed" | "partial_state_converged" | "full_state_converged"
+            || !valid_receipt_outcome_prefixes(
+                &receipt.outcome,
+                receipt.original_prefix_length,
+                receipt.current_prefix_length,
             )
-            || receipt.current_prefix_length < receipt.original_prefix_length
         {
             return Err("terminal reconciliation receipt contains noncanonical authority fields");
         }

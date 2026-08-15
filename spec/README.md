@@ -169,5 +169,12 @@ Preserved curated tool families:
   schema, stdio proof, and runbook. Only freshly verified active custody may
   claim retained/retain; unknown, uninspected, failed-inspection, or retiring
   states must not fabricate that authority.
+  Canonical v1/v2 receipt parsing must reject semantic contradictions without a
+  manifest: `not_committed` means equal original/current prefixes, while either
+  converged outcome requires strict prefix growth. New finalization and
+  completed-retirement replay must additionally bind both prefixes to the exact
+  supplied manifest: partial convergence ends strictly before manifest length
+  and full convergence ends exactly at it. Every rejected outcome/prefix or
+  out-of-bounds product has zero provider and local namespace mutations.
 - Workers Analytics Engine read tools (`analytics_engine_list_datasets`, `analytics_engine_query`, `analytics_engine_describe_schema`, `analytics_engine_validate_query`) are first-class contract tools for Account Analytics Read workflows and must remain present even when broad API parity is available.
 - Queues readback tools (`queues_list`, `queues_get`, `queues_get_metrics`, `queues_list_consumers`, `queues_health`) are first-class contract tools and must remain present for operational backlog/DLQ/consumer diagnostics.

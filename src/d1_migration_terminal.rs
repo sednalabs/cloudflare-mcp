@@ -20,6 +20,7 @@ use crate::d1_migration_reconciliation::{
     prepare_d1_migration_reconciliation, refresh_d1_migration_reconciliation,
     replay_reconciliation_plan_sha256, validate_replay_manifest_expectations,
 };
+use crate::d1_migration_terminal_semantics::valid_manifest_outcome_prefixes;
 use crate::server::CloudflareMcp;
 use crate::tools::{D1MigrationManifestEntry, sha256_bytes_hex};
 
@@ -126,6 +127,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
         expected_outcome,
         expected_original_prefix_length,
         expected_current_prefix_length,
+        manifest.len(),
         terminal_request_sha256,
         terminal_attempt_sha256,
         dry_run,
@@ -764,6 +766,7 @@ fn validate_terminal_arguments(
     expected_outcome: &str,
     expected_original_prefix_length: usize,
     expected_current_prefix_length: usize,
+    manifest_length: usize,
     terminal_request_sha256: &str,
     terminal_attempt_sha256: &str,
     dry_run: bool,
@@ -782,11 +785,12 @@ fn validate_terminal_arguments(
     ];
     if hashes.into_iter().any(|value| !valid_lower_sha256(value))
         || terminal_request_sha256 == terminal_attempt_sha256
-        || !matches!(
+        || !valid_manifest_outcome_prefixes(
             expected_outcome,
-            "not_committed" | "partial_state_converged" | "full_state_converged"
+            expected_original_prefix_length,
+            expected_current_prefix_length,
+            manifest_length,
         )
-        || expected_current_prefix_length < expected_original_prefix_length
         || (!dry_run
             && approved_terminal_plan_sha256.is_none_or(|value| !valid_lower_sha256(value)))
     {
