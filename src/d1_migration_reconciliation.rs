@@ -508,32 +508,13 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
         .and_then(|prefix| validated.seed_states.get(prefix))
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    let selected_state = selected_prefix.and_then(|prefix| validated.states.get(prefix));
-    let selected_object_names = selected_state
-        .map(|state| {
-            state
-                .schema_objects
-                .iter()
-                .map(|object| object.name.clone())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let selected_table_names = selected_state
-        .map(|state| {
-            state
-                .tables
-                .iter()
-                .map(|table| table.name.clone())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
     let selection_query_sha256 = selection.as_ref().map(|_| selection_query.sha256.clone());
     let query = if selection.is_some() {
         build_fixed_query(
             migrations_table,
             manifest.len(),
-            &selected_object_names,
-            &selected_table_names,
+            &validated.object_names,
+            &validated.table_names,
             selected_seed_state,
             &validated.proof_sha256,
             seed_assertion,
@@ -712,7 +693,6 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
     };
     if let Err(result) = verify_expected_state(
         expected_state,
-        &validated,
         query
             .statements
             .iter()
@@ -873,7 +853,7 @@ pub(crate) async fn reconcile_d1_migration_manifest(
     });
     if proof.effect_assertion_id == EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1 {
         content["scope_completeness"]["seed_rows"] =
-            json!("complete_manifest_derived_storage_class_and_value_row_set");
+            json!("complete_selected_prefix_manifest_derived_storage_class_and_value_row_set");
         content["seed_row_evidence"] = json!(proof.first.snapshot.seed_tables);
     }
     if let (Some(selection), Some(selection_query_sha256)) = (
@@ -3174,7 +3154,6 @@ fn exact_nonnegative_i64(object: &Map<String, Value>, key: &str) -> Result<i64, 
 
 fn verify_expected_state(
     expected: &D1MigrationStateExpectation,
-    validated: &ValidatedExpectations,
     proof_table_count: usize,
     snapshot: &CanonicalSnapshot,
 ) -> Result<(), CallToolResult> {
@@ -4851,13 +4830,7 @@ mod tests {
             seed_tables: Vec::new(),
         };
         assert!(
-            verify_expected_state(
-                &expected,
-                &validated,
-                validated.table_names.len(),
-                &snapshot
-            )
-            .is_err(),
+            verify_expected_state(&expected, validated.table_names.len(), &snapshot).is_err(),
             "a wrong sqlite_master SQL digest must not converge",
         );
     }
@@ -5715,14 +5688,6 @@ mod tests {
             }],
             seed_tables: Vec::new(),
         };
-        assert!(
-            verify_expected_state(
-                &expected,
-                &validated,
-                validated.table_names.len(),
-                &snapshot
-            )
-            .is_err()
-        );
+        assert!(verify_expected_state(&expected, validated.table_names.len(), &snapshot).is_err());
     }
 }

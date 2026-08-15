@@ -199,11 +199,15 @@ Select one explicit built-in effect assertion:
   exact INT/INTEGER columns. Reject STRICT BLOB seeds before custody/provider
   access. This assertion performs one
   primary-current prefix-selection read followed by two identical complete
-  primary-current schema-and-seed reads. The full-manifest seed registry must
-  prove three distinct prefix states: no table query before CREATE, an exact
-  zero-row table projection after CREATE and before INSERT without depending on
-  columns added by a later prefix, and the exact typed
-  row set at or after INSERT. Any row in the zero-row window must fail on the
+  primary-current reads. Each complete read covers the bounded full-manifest
+  `sqlite_master` object union and safe table-valued PRAGMAs for the bounded
+  full-manifest physical-table union; every prefix therefore proves future
+  objects and future table structure absent as well as current facts present.
+  Seed-row SELECTs remain selected-prefix and existence-aware. The full-manifest
+  seed registry must prove three distinct prefix states: no seed-row SELECT from
+  a table before CREATE, an exact zero-row table projection after CREATE and
+  before INSERT without depending on columns added by a later prefix, and the
+  exact typed row set at or after INSERT. Any row in the zero-row window must fail on the
   first complete proof with two total provider reads and zero mutations.
   Terminal dry run and live finalization must rederive and repeat that same
   selected-prefix proof. Require each complete proof ledger to equal the exact

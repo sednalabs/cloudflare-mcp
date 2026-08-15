@@ -291,12 +291,16 @@ TEXT columns and INTEGER literals on exact INT/INTEGER columns. STRICT BLOB and
 other unproven literal/type pairs fail before custody or provider access. The
 tool performs one
 primary-current prefix-selection read before two identical complete
-primary-current schema-and-seed reads. A full-manifest registry binds every seed
-target to its CREATE and INSERT prefixes: a selected prefix before CREATE does
-not query the table, a prefix after CREATE but before INSERT proves the exact
-zero-row table projection without requiring a column added by a later prefix,
-and a prefix at or after INSERT proves the exact
-typed row set. An unexpected row in the zero-row window fails on the first
+primary-current reads. Each complete read queries the bounded full-manifest
+`sqlite_master` object union and safe table-valued PRAGMAs for the bounded
+full-manifest physical-table union, so every selected-prefix expectation proves
+both exact presence and exact absence of all declared schema facts. Seed-row
+SELECTs remain selected-prefix and existence-aware. A full-manifest registry
+binds every seed target to its CREATE and INSERT prefixes: a selected prefix
+before CREATE does not run a seed-row SELECT from that table, a prefix after
+CREATE but before INSERT proves the exact zero-row table projection without
+requiring a column added by a later prefix, and a prefix at or after INSERT
+proves the exact typed row set. An unexpected row in the zero-row window fails on the first
 complete proof, before a second complete read and without provider or local
 mutation. Terminal dry run and finalization rederive the registry and repeat
 the same selected-prefix proof. Neither complete response may choose another
