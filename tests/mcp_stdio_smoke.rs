@@ -916,6 +916,7 @@ enum ReconciliationFault {
     HttpStatusCustodyDrift(u16, PathBuf),
     OversizedHttpStatus(u16),
     CustodyDrift(PathBuf),
+    CustodyRelease(PathBuf, PathBuf),
     SecondBatchCustodyDrift(PathBuf),
     PrimaryMetaMissing,
     PrimaryMarkerMissing,
@@ -1841,6 +1842,19 @@ fn spawn_fake_reconciliation_api_with_fault_and_calls(
                     fs::write(path, b"tampered retained evidence")
                         .expect("tamper retained evidence fixture");
                 }
+                ReconciliationFault::CustodyRelease(active, retiring) => {
+                    results[0]["meta"]["changes"] = json!("0");
+                    fs::rename(active, retiring)
+                        .expect("move retained evidence during provider read");
+                    fs::File::open(
+                        retiring
+                            .parent()
+                            .expect("retained evidence target directory"),
+                    )
+                    .expect("open retained evidence target")
+                    .sync_all()
+                    .expect("sync retained evidence move");
+                }
                 ReconciliationFault::SecondBatchCustodyDrift(path) if request_index == 1 => {
                     fs::write(path, b"tampered retained evidence")
                         .expect("tamper retained evidence after second provider read");
@@ -2471,6 +2485,10 @@ enum PrematureManifestFact {
     View,
     Trigger,
     AlteredTableStructure,
+    CaseVariantTable,
+    CaseVariantIndex,
+    CaseVariantView,
+    CaseVariantTrigger,
 }
 
 fn premature_manifest_fact_reconciliation_case() -> (Value, Value) {
@@ -2608,6 +2626,7 @@ fn spawn_fake_premature_manifest_fact_api(
                 assert!(!sql.contains("FROM \"Future\""));
             } else {
                 assert_eq!(markers.len(), if selected_prefix == 0 { 8 } else { 9 });
+                assert!(sql.contains("WHERE name COLLATE NOCASE IN"));
                 for object in [
                     "Current",
                     "Future",
@@ -2666,15 +2685,43 @@ fn spawn_fake_premature_manifest_fact_api(
                         json!({"type": "trigger", "name": "current_guard", "tbl_name": "Current", "sql": "CREATE TRIGGER current_guard BEFORE DELETE ON Current BEGIN SELECT RAISE(ABORT, 'immutable'); END"}),
                     ],
                     PrematureManifestFact::AlteredTableStructure => vec![current_object],
+                    PrematureManifestFact::CaseVariantTable if selected_prefix == 0 => vec![
+                        json!({"type": "table", "name": "CURRENT", "tbl_name": "CURRENT", "sql": "CREATE TABLE CURRENT(id TEXT PRIMARY KEY)"}),
+                    ],
+                    PrematureManifestFact::CaseVariantTable => vec![
+                        current_object,
+                        json!({"type": "table", "name": "FUTURE", "tbl_name": "FUTURE", "sql": "CREATE TABLE FUTURE(id TEXT PRIMARY KEY)"}),
+                    ],
+                    PrematureManifestFact::CaseVariantIndex => vec![
+                        json!({"type": "index", "name": "CURRENT_BY_RANK", "tbl_name": "CURRENT", "sql": "CREATE INDEX CURRENT_BY_RANK ON CURRENT(rank)"}),
+                        current_object,
+                    ],
+                    PrematureManifestFact::CaseVariantView => vec![
+                        current_object,
+                        json!({"type": "view", "name": "CURRENT_IDS", "tbl_name": "CURRENT_IDS", "sql": "CREATE VIEW CURRENT_IDS AS SELECT id FROM CURRENT"}),
+                    ],
+                    PrematureManifestFact::CaseVariantTrigger => vec![
+                        current_object,
+                        json!({"type": "trigger", "name": "CURRENT_GUARD", "tbl_name": "CURRENT", "sql": "CREATE TRIGGER CURRENT_GUARD BEFORE DELETE ON CURRENT BEGIN SELECT RAISE(ABORT, 'immutable'); END"}),
+                    ],
                 };
             }
             let current_exists = selected_prefix == 1
-                || (flawed && selected_prefix == 0 && matches!(fact, PrematureManifestFact::Table));
+                || (flawed
+                    && selected_prefix == 0
+                    && matches!(
+                        fact,
+                        PrematureManifestFact::Table | PrematureManifestFact::CaseVariantTable
+                    ));
             let current_altered = flawed
                 && selected_prefix == 1
                 && matches!(fact, PrematureManifestFact::AlteredTableStructure);
-            let future_exists =
-                flawed && selected_prefix == 1 && matches!(fact, PrematureManifestFact::Table);
+            let future_exists = flawed
+                && selected_prefix == 1
+                && matches!(
+                    fact,
+                    PrematureManifestFact::Table | PrematureManifestFact::CaseVariantTable
+                );
             let mut current_columns = if current_exists {
                 vec![
                     json!({"cid": 0, "name": "id", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 1, "hidden": 0}),
@@ -6959,6 +7006,26 @@ fn d1_seed_complete_proofs_reject_every_premature_manifest_fact_in_reconcile_and
             PrematureManifestFact::AlteredTableStructure,
             "d1.migration_reconciliation_table_proof_mismatch",
         ),
+        (
+            0usize,
+            PrematureManifestFact::CaseVariantTable,
+            "d1.migration_reconciliation_schema_mismatch",
+        ),
+        (
+            1usize,
+            PrematureManifestFact::CaseVariantIndex,
+            "d1.migration_reconciliation_schema_mismatch",
+        ),
+        (
+            1usize,
+            PrematureManifestFact::CaseVariantView,
+            "d1.migration_reconciliation_schema_mismatch",
+        ),
+        (
+            1usize,
+            PrematureManifestFact::CaseVariantTrigger,
+            "d1.migration_reconciliation_schema_mismatch",
+        ),
     ];
 
     for (case_index, (prefix, fact, expected_code)) in cases.into_iter().enumerate() {
@@ -8668,6 +8735,184 @@ fn d1_finalize_migration_reconciliation_stdio_does_not_claim_retention_after_cus
     assert_eq!(drift_requests.lock().expect("drift request log").len(), 1);
     drift_mcp.terminate();
     let _ = fs::remove_dir_all(&lease_root);
+}
+
+#[test]
+fn d1_post_parse_custody_release_overrides_parse_failure_in_reconcile_and_terminal_paths() {
+    let (manifest, state_expectations) = one_table_reconciliation_case();
+    let reconcile_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-post-parse-release-reconcile-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&reconcile_root);
+    fs::create_dir(&reconcile_root).expect("create post-parse reconcile root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&reconcile_root, fs::Permissions::from_mode(0o700))
+            .expect("make post-parse reconcile root private");
+    }
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&reconcile_root, &manifest);
+    let active = assert_private_regular_active_lease(&reconcile_root);
+    let retiring = active.with_file_name("retiring.lease.json");
+    let (base_url, requests) = spawn_fake_reconciliation_api_with_fault(
+        ReconciliationFault::CustodyRelease(active.clone(), retiring.clone()),
+    );
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            reconcile_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let response = mcp.call_tool(
+        884,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest.clone(),
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_only_v1",
+            "state_expectations": state_expectations.clone(),
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], false, "{content}");
+    assert_eq!(
+        content["error"]["code"], "d1.migration_reconciliation_lease_changed",
+        "{content}"
+    );
+    assert_eq!(content["custody_status"], "retained_evidence_unverified");
+    assert_eq!(content["lease_retained"], Value::Null);
+    assert_eq!(content["retry_decision"], "do_not_retry_same_attempt");
+    assert_eq!(content["provider_calls"], 1);
+    assert_eq!(content["provider_mutations"], 0);
+    assert_eq!(content["local_namespace_mutations"], 0);
+    assert_eq!(
+        content["response_evidence"]
+            .as_array()
+            .expect("post-parse reconcile response evidence")
+            .len(),
+        1
+    );
+    assert_eq!(
+        requests
+            .lock()
+            .expect("post-parse reconcile requests")
+            .len(),
+        1
+    );
+    assert!(!active.exists());
+    assert!(retiring.exists());
+    mcp.terminate();
+    let _ = fs::remove_dir_all(&reconcile_root);
+
+    let terminal_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-post-parse-release-terminal-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&terminal_root);
+    fs::create_dir(&terminal_root).expect("create post-parse terminal root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&terminal_root, fs::Permissions::from_mode(0o700))
+            .expect("make post-parse terminal root private");
+    }
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&terminal_root, &manifest);
+    let (baseline_url, baseline_requests) = spawn_fake_reconciliation_api();
+    let mut baseline_mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", baseline_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            terminal_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let reconciliation = baseline_mcp.call_tool(
+        885,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest.clone(),
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_only_v1",
+            "state_expectations": state_expectations.clone(),
+        }),
+    );
+    let reconciled = structured_content(&reconciliation).clone();
+    assert_eq!(reconciled["ok"], true, "{reconciled}");
+    assert_eq!(
+        baseline_requests.lock().expect("baseline requests").len(),
+        2
+    );
+    baseline_mcp.terminate();
+
+    let active = assert_private_regular_active_lease(&terminal_root);
+    let retiring = active.with_file_name("retiring.lease.json");
+    let (release_url, release_requests) = spawn_fake_reconciliation_api_with_fault(
+        ReconciliationFault::CustodyRelease(active.clone(), retiring.clone()),
+    );
+    let mut release_mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", release_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            terminal_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let terminal = release_mcp.call_tool(
+        886,
+        "d1_finalize_migration_reconciliation",
+        terminal_args_from_reconciliation(
+            &manifest,
+            &state_expectations,
+            &approved_plan_sha256,
+            &lease_nonce,
+            &lease_payload_sha256,
+            &reconciled,
+        ),
+    );
+    let content = structured_content(&terminal);
+    assert_eq!(content["ok"], false, "{content}");
+    assert_eq!(
+        content["error"]["code"], "d1.migration_reconciliation_lease_changed",
+        "{content}"
+    );
+    assert_eq!(content["custody_status"], "retained_evidence_unverified");
+    assert_eq!(content["lease_retained"], Value::Null);
+    assert_eq!(content["receipt_persisted"], false);
+    assert_eq!(content["retry_decision"], "do_not_retry_same_attempt");
+    assert_eq!(content["provider_calls"], 1);
+    assert_eq!(content["provider_mutations"], 0);
+    assert_eq!(content["local_namespace_mutations"], 0);
+    assert_eq!(
+        content["response_evidence"]
+            .as_array()
+            .expect("post-parse terminal response evidence")
+            .len(),
+        1
+    );
+    assert_eq!(release_requests.lock().expect("release requests").len(), 1);
+    assert!(!active.exists());
+    assert!(retiring.exists());
+    assert!(
+        fs::read_dir(manifest_target_path(&terminal_root))
+            .expect("read post-parse terminal target")
+            .filter_map(Result::ok)
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("terminal-reconciliation."))
+    );
+    release_mcp.terminate();
+    let _ = fs::remove_dir_all(&terminal_root);
 }
 
 #[test]

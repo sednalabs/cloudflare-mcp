@@ -960,6 +960,13 @@ async fn read_complete_batch(
             });
         }
     };
+    let snapshot = parse_complete_batch(
+        &batch.result,
+        &query.statements,
+        &query.proof_sha256,
+        manifest,
+        &query.table_identity_spellings,
+    );
     lease.revalidate().map_err(|result| {
         contextualize_unverified_custody_error(
             result,
@@ -968,14 +975,7 @@ async fn read_complete_batch(
             1,
         )
     })?;
-    let snapshot = parse_complete_batch(
-        &batch.result,
-        &query.statements,
-        &query.proof_sha256,
-        manifest,
-        &query.table_identity_spellings,
-    )
-    .map_err(|result| {
+    let snapshot = snapshot.map_err(|result| {
         contextualize_error(
             result,
             Some(&query.sha256),
@@ -2565,7 +2565,7 @@ fn build_fixed_query(
         &schema,
         proof_sha256,
         &format!(
-            "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name IN ({names}) ORDER BY type, name LIMIT {}",
+            "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name COLLATE NOCASE IN ({names}) ORDER BY type, name LIMIT {}",
             object_names.len() + 1
         ),
         &[3, 4],
@@ -2988,9 +2988,10 @@ fn parse_schema_rows(rows: &[Value]) -> Result<Vec<ObservedSchemaObject>, CallTo
         let name = exact_string(object, "name")?;
         let table_name = exact_string(object, "tbl_name")?;
         let sql = exact_string(object, "sql")?;
+        let identity_key = sqlite_ascii_identifier_key(&name);
         let key = (object_type.clone(), name.clone());
         if !matches!(object_type.as_str(), "table" | "index" | "view" | "trigger")
-            || !names.insert(name.clone())
+            || !names.insert(identity_key)
             || previous.as_ref().is_some_and(|prior| prior >= &key)
         {
             return Err(reconciliation_error(
@@ -4937,6 +4938,22 @@ mod tests {
         assert!(!query.sql.contains("INSERT"));
         assert!(!query.sql.contains("UPDATE"));
         assert!(!query.sql.contains("DELETE"));
+        assert!(query.sql.contains("WHERE name COLLATE NOCASE IN"));
+    }
+
+    #[test]
+    fn schema_rows_reject_sqlite_ascii_case_aliases() {
+        let result = parse_schema_rows(&[
+            json!({"type": "index", "name": "ITEMS_BY_NAME", "tbl_name": "items", "sql": "CREATE INDEX ITEMS_BY_NAME ON items(name)"}),
+            json!({"type": "index", "name": "items_by_name", "tbl_name": "items", "sql": "CREATE INDEX items_by_name ON items(name)"}),
+        ])
+        .expect_err("case aliases are one SQLite schema identity");
+        assert_eq!(
+            result
+                .structured_content
+                .expect("schema alias error content")["error"]["code"],
+            "d1.migration_reconciliation_schema_malformed"
+        );
     }
 
     #[test]

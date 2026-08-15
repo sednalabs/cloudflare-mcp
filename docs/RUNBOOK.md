@@ -203,21 +203,28 @@ Select one explicit built-in effect assertion:
   `sqlite_master` object union and safe table-valued PRAGMAs for the bounded
   full-manifest physical-table union; every prefix therefore proves future
   objects and future table structure absent as well as current facts present.
+  Match schema-object membership under SQLite ASCII `NOCASE`, retain exact
+  observed spelling and canonical type/name ordering, and reject aliases or
+  conflicting spellings.
   Seed-row SELECTs remain selected-prefix and existence-aware. The full-manifest
   seed registry must prove three distinct prefix states: no seed-row SELECT from
   a table before CREATE, an exact zero-row table projection after CREATE and
   before INSERT without depending on columns added by a later prefix, and the
-  exact typed row set at or after INSERT. Any row in the zero-row window must fail on the
-  first complete proof with two total provider reads and zero mutations.
+  exact typed row set at or after INSERT. Any row in the zero-row window must
+  fail on the first complete proof with two total provider reads and zero
+  mutations.
   Terminal dry run and live finalization must rederive and repeat that same
   selected-prefix proof. Require each complete proof ledger to equal the exact
   initial selected ledger, then separately require the two complete snapshots
   to be canonically equal. An equal pair at a different prefix is a
   reconciliation contradiction, not authority to reselect. Record only the
   aggregate-safe `selection_binding` query/ledger digests and selected prefix;
-  do not copy raw provider rows. Otherwise verify three provider reads, zero
-  provider mutations, exact aggregate seed summaries, and no raw seed values in
-  the response. Any ambiguity or mismatch remains reconciliation-required.
+  do not copy raw provider rows. Parse every provider response locally, then
+  freshly revalidate retained lease custody before reporting either the parsed
+  snapshot or a parse failure as verified custody. Otherwise verify three
+  provider reads, zero provider mutations, exact aggregate seed summaries, and
+  no raw seed values in the response. Any ambiguity or mismatch remains
+  reconciliation-required.
   The predecessor assertions do not accept top-level INSERT.
 
 The successful response identifies that same closed scope without flattening
