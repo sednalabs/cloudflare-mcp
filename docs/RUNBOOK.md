@@ -179,6 +179,12 @@ Select one explicit built-in effect assertion:
   connection retained PRAGMA state; proof remains the fixed read-only schema
   and foreign-key snapshot.
 
+The successful response identifies that same closed scope without flattening
+the broader assertions back to the legacy label: `effect_assertion.scope`
+reports `schema_create_only`, `schema_create_tables_indexes_views_triggers`, or
+`schema_create_objects_additive` respectively, alongside the complete allowed
+`schema_object_types` array.
+
 The successful response names the selected assertion and its exact object-type
 scope. That ID is also part of the reconciliation-plan digest, terminal-plan
 digest, version-2 durable receipt, and exact replay. Never change it between

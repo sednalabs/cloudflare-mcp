@@ -329,6 +329,10 @@ impl D1MigrationReconciliationProof {
     pub(crate) fn effect_assertion_scope(&self) -> &'static [&'static str] {
         effect_assertion_scope(&self.effect_assertion_id)
     }
+
+    pub(crate) fn effect_assertion_statement_class(&self) -> &'static str {
+        effect_assertion_statement_class(&self.effect_assertion_id)
+    }
 }
 
 pub(crate) async fn prepare_d1_migration_reconciliation(
@@ -656,7 +660,7 @@ pub(crate) async fn reconcile_d1_migration_manifest(
         "effect_assertion": {
             "id": proof.effect_assertion_id,
             "scope": {
-                "statement_class": "schema_create_only",
+                "statement_class": proof.effect_assertion_statement_class(),
                 "schema_object_types": proof.effect_assertion_scope(),
             },
             "source": "built_in_registry_and_exact_manifest_sql_classification",
@@ -1333,6 +1337,15 @@ fn effect_assertion_scope(effect_assertion_id: &str) -> &'static [&'static str] 
             "pragma_foreign_keys_on",
         ],
         _ => &[],
+    }
+}
+
+fn effect_assertion_statement_class(effect_assertion_id: &str) -> &'static str {
+    match effect_assertion_id {
+        EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1 => "schema_create_only",
+        EFFECT_ASSERTION_SCHEMA_CREATE_OBJECTS_V1 => "schema_create_tables_indexes_views_triggers",
+        EFFECT_ASSERTION_SCHEMA_ADDITIVE_V1 => "schema_create_objects_additive",
+        _ => "unsupported",
     }
 }
 

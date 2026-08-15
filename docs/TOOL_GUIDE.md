@@ -113,6 +113,11 @@ constraint or SQL effect. The PRAGMA is classified intent, not a claim about
 persistent connection state. No manifest SQL is ever sent to the provider by
 this tool.
 The two predecessor assertions continue to reject ALTER and PRAGMA unchanged.
+On success, inspect the complete `effect_assertion.scope` object: its
+`statement_class` is assertion-specific (`schema_create_only`,
+`schema_create_tables_indexes_views_triggers`, or
+`schema_create_objects_additive`) and its `schema_object_types` array is the
+closed allowed scope for that selected assertion.
 The boundary also requires every fixed result set in both batches to carry exact
 `meta.served_by_primary=true` evidence; absent, false, null, non-boolean, or
 mixed primary markers are contradictory and cannot support positive

@@ -4933,6 +4933,13 @@ fn d1_reconcile_migration_manifest_proves_stable_full_state_without_retry_or_mut
     );
     assert_eq!(content["provider_mutations"], json!(0));
     assert_eq!(content["local_namespace_mutations"], json!(0));
+    assert_eq!(
+        content["effect_assertion"]["scope"],
+        json!({
+            "statement_class": "schema_create_only",
+            "schema_object_types": ["table", "index"],
+        })
+    );
     assert!(content["query_sha256"].as_str().is_some());
     assert!(content["canonical_snapshot_sha256"].as_str().is_some());
     assert!(content["reconciliation_plan_sha256"].as_str().is_some());
@@ -5014,8 +5021,11 @@ fn d1_reconciliation_and_terminal_finalize_share_view_trigger_effect_proof() {
         json!("schema_create_tables_indexes_views_triggers_v1")
     );
     assert_eq!(
-        reconciled["effect_assertion"]["scope"]["schema_object_types"],
-        json!(["table", "index", "view", "trigger"])
+        reconciled["effect_assertion"]["scope"],
+        json!({
+            "statement_class": "schema_create_tables_indexes_views_triggers",
+            "schema_object_types": ["table", "index", "view", "trigger"],
+        })
     );
 
     let mut terminal_args = reconciliation_args;
@@ -5168,15 +5178,18 @@ fn d1_reconciliation_and_terminal_finalize_share_additive_effect_proof() {
         json!("schema_create_objects_additive_v1")
     );
     assert_eq!(
-        reconciled["effect_assertion"]["scope"]["schema_object_types"],
-        json!([
-            "table",
-            "index",
-            "view",
-            "trigger",
-            "alter_table_add_column",
-            "pragma_foreign_keys_on",
-        ])
+        reconciled["effect_assertion"]["scope"],
+        json!({
+            "statement_class": "schema_create_objects_additive",
+            "schema_object_types": [
+                "table",
+                "index",
+                "view",
+                "trigger",
+                "alter_table_add_column",
+                "pragma_foreign_keys_on",
+            ],
+        })
     );
 
     let mut terminal_args = reconciliation_args;

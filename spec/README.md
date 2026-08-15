@@ -118,6 +118,11 @@ Preserved curated tool families:
   before custody. It never executes manifest SQL or treats connection
   PRAGMA state as persistent evidence. The predecessor assertions remain
   byte-for-byte behaviorally closed to ALTER and PRAGMA.
+  Successful evidence keeps the legacy `schema_create_only` statement-class
+  label only for the legacy assertion; the extended and additive assertions
+  report `schema_create_tables_indexes_views_triggers` and
+  `schema_create_objects_additive` respectively, with their complete closed
+  object/operation arrays.
 - Terminal retained-manifest reconciliation
   (`d1_finalize_migration_reconciliation`) is the separately approval-gated
   local-custody mutation contract. Keep its exact evidence/request/attempt
