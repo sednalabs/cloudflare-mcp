@@ -122,10 +122,13 @@ Preserved curated tool families:
   seed-row assertion. It extends the additive scope with one bounded,
   unqualified `INSERT INTO <manifest-created-table> (<explicit columns>)
   VALUES (<literal tuples>)` per target table. Only canonical TEXT and signed
-  INTEGER literals are admitted. CREATE must precede the seed and every trigger
+  INTEGER literals are admitted. Every classified CREATE is unconditional;
+  `IF NOT EXISTS` is rejected. CREATE must precede the seed and every trigger
   on that table must follow it, including across manifest entries. Each prefix
   supplies the exact table, ordered columns, row count, and aggregate row-set
-  SHA-256. A primary-current selection read chooses the manifest prefix before
+  SHA-256. SQLite ASCII case variants share one target and the reviewed CREATE
+  spelling. Only identity-stable TEXT/BLOB and INTEGER/NUMERIC/BLOB literal
+  affinity pairs are admitted. A primary-current selection read chooses the manifest prefix before
   two complete primary-current proofs read the exact typed rows; responses expose
   only aggregate summaries. Arbitrary DML, expressions, implicit columns,
   conflict clauses, reused targets, and malformed or mismatched rows fail closed.
@@ -133,8 +136,9 @@ Preserved curated tool families:
   Successful evidence keeps the legacy `schema_create_only` statement-class
   label only for the legacy assertion; the extended and additive assertions
   report `schema_create_tables_indexes_views_triggers` and
-  `schema_create_objects_additive` respectively, with their complete closed
-  object/operation arrays.
+  `schema_create_objects_additive`, while the seed assertion reports
+  `schema_create_objects_additive_seed_rows`, each with its complete closed
+  object/operation array.
   Every assertion also treats the configured migration-ledger table as a
   reserved SQLite identifier: case variants in CREATE identities, index or
   trigger parents, any exact admitted trigger header/body lexical token, and additive

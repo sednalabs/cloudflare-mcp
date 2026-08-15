@@ -182,11 +182,15 @@ Select one explicit built-in effect assertion:
   additive assertion with one canonical top-level seed INSERT per
   manifest-created target. Require plain unqualified table/column identifiers,
   explicit columns, bounded literal `VALUES` tuples, CREATE-before-seed, and
-  seed-before-trigger ordering across the complete manifest. Add the exact
+  seed-before-trigger ordering across the complete manifest. Reject every
+  classified `CREATE ... IF NOT EXISTS`; seed authority requires an actual
+  unconditional creation. Add the exact
   cumulative `seed_tables` summary to every prefix expectation: target, ordered
   columns, row count, and local row-set SHA-256. Treat ASCII case variants as
   one SQLite target while retaining the reviewed `CREATE TABLE` spelling in
-  expectations and fixed queries. This assertion performs one
+  expectations and fixed queries. Permit only identity-stable affinity pairs:
+  TEXT literals on TEXT/BLOB columns and INTEGER literals on
+  INTEGER/NUMERIC/BLOB columns. This assertion performs one
   primary-current prefix-selection read followed by two identical complete
   primary-current schema-and-seed reads. Verify three provider reads, zero
   provider mutations, exact aggregate seed summaries, and no raw seed values in
@@ -196,8 +200,9 @@ Select one explicit built-in effect assertion:
 The successful response identifies that same closed scope without flattening
 the broader assertions back to the legacy label: `effect_assertion.scope`
 reports `schema_create_only`, `schema_create_tables_indexes_views_triggers`, or
-`schema_create_objects_additive` respectively, alongside the complete allowed
-`schema_object_types` array.
+`schema_create_objects_additive`, or
+`schema_create_objects_additive_seed_rows` respectively, alongside the complete
+allowed `schema_object_types` array.
 
 For every assertion, the configured `migrations_table` is a reserved schema
 identifier under SQLite ASCII case-insensitive matching. A manifest must not

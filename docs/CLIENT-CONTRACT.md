@@ -249,6 +249,13 @@ contains the current template plus a read-only-only optional approval override.
 | `emergency_unpublish` | `hostname`; `zone_id` unless default zone configured | `reason`, `dry_run` | Idempotent emergency route disable. |
 | `portal_agent_request` | `url` | `method`, `body`, `use_agent_token`, `use_access_service_token`, `dry_run` | Allowlisted bridge to operator endpoints. Dry-run reports request/auth metadata without sending the request; live calls attach configured server-held credentials only when requested. |
 
+Successful `d1_reconcile_migration_manifest` evidence enumerates four closed
+`effect_assertion.scope.statement_class` values:
+`schema_create_only`, `schema_create_tables_indexes_views_triggers`,
+`schema_create_objects_additive`, and
+`schema_create_objects_additive_seed_rows`. The adjacent
+`schema_object_types` array is the complete scope for the selected class.
+
 ## Structured payload details for complex tools
 
 For `effect_assertion_id=schema_create_objects_additive_seed_rows_v1`, every
@@ -266,11 +273,16 @@ For `effect_assertion_id=schema_create_objects_additive_seed_rows_v1`, every
 
 The assertion admits only one plain unqualified `INSERT INTO <table>
 (<explicit columns>) VALUES (<bounded canonical TEXT or INTEGER tuples>)` per
-manifest-created table. CREATE must precede the seed, and every trigger on the
+manifest-created table. Every classified CREATE must be unconditional;
+`CREATE ... IF NOT EXISTS` is rejected because an incumbent schema object could
+turn it into a no-op. CREATE must precede the seed, and every trigger on the
 target must follow it across the whole manifest. SQLite ASCII case-insensitive
 target matching governs parent, trigger, and reuse
 authority, while preserving the reviewed `CREATE TABLE` spelling in exact
-expectations and fixed read queries. The tool performs one
+expectations and fixed read queries. Expected storage is admitted only when it
+is identity-stable under the reviewed SQLite affinity: TEXT literals on
+TEXT/BLOB affinity and INTEGER literals on INTEGER/NUMERIC/BLOB affinity. The
+tool performs one
 primary-current prefix-selection read before two identical complete
 primary-current schema-and-seed reads. It compares storage class and canonical
 value locally and returns only table/column identity, exact row count, and the

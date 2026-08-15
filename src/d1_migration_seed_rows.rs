@@ -255,6 +255,35 @@ pub(crate) fn sqlite_ascii_identifier_key(value: &str) -> String {
     value.to_ascii_lowercase()
 }
 
+pub(crate) fn seed_literal_is_identity_stable_for_declared_type(
+    literal: &SeedLiteral,
+    declared_type: &str,
+) -> bool {
+    let declared_type = declared_type.to_ascii_uppercase();
+    let affinity = if declared_type.contains("INT") {
+        "integer"
+    } else if ["CHAR", "CLOB", "TEXT"]
+        .iter()
+        .any(|fragment| declared_type.contains(fragment))
+    {
+        "text"
+    } else if declared_type.is_empty() || declared_type.contains("BLOB") {
+        "blob"
+    } else if ["REAL", "FLOA", "DOUB"]
+        .iter()
+        .any(|fragment| declared_type.contains(fragment))
+    {
+        "real"
+    } else {
+        "numeric"
+    };
+    matches!(
+        (literal, affinity),
+        (SeedLiteral::Text(_), "text" | "blob")
+            | (SeedLiteral::Integer(_), "integer" | "numeric" | "blob")
+    )
+}
+
 pub(crate) fn insert_seed_effect(
     cumulative: &mut BTreeMap<String, SeedTableState>,
     effect: SeedInsertEffect,
@@ -564,6 +593,48 @@ mod tests {
             .expect_err("case alias must reuse one SQLite target");
         assert_eq!(error.code, "d1.migration_reconciliation_seed_target_reused");
         assert_eq!(cumulative["channels"].table_name, "Channels");
+    }
+
+    #[test]
+    fn seed_literals_require_identity_stable_sqlite_affinity() {
+        let text = SeedLiteral::Text("42".into());
+        let integer = SeedLiteral::Integer(i64::MIN);
+
+        for declared_type in ["TEXT", "VARCHAR(12)", "CLOB", "", "BLOB"] {
+            assert!(seed_literal_is_identity_stable_for_declared_type(
+                &text,
+                declared_type
+            ));
+        }
+        for declared_type in ["INTEGER", "BIGINT", "BOOLEAN", "NUMERIC", "", "BLOB"] {
+            assert!(seed_literal_is_identity_stable_for_declared_type(
+                &integer,
+                declared_type
+            ));
+        }
+        for declared_type in ["INTEGER", "NUMERIC", "BOOLEAN", "REAL", "DOUBLE"] {
+            assert!(!seed_literal_is_identity_stable_for_declared_type(
+                &text,
+                declared_type
+            ));
+        }
+        for declared_type in ["TEXT", "VARCHAR(12)", "REAL", "DOUBLE"] {
+            assert!(!seed_literal_is_identity_stable_for_declared_type(
+                &integer,
+                declared_type
+            ));
+        }
+
+        let mixed_blob = SeedTableState {
+            table_name: "mixed".into(),
+            columns: vec!["value".into()],
+            rows: vec![vec![text], vec![integer]],
+        };
+        assert!(
+            mixed_blob.rows.iter().flatten().all(|literal| {
+                seed_literal_is_identity_stable_for_declared_type(literal, "BLOB")
+            })
+        );
     }
 
     #[test]

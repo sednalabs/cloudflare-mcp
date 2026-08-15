@@ -117,13 +117,18 @@ Use `schema_create_objects_additive_seed_rows_v1` only for a bounded canonical
 top-level seed INSERT on a table created by the supplied manifest. Its closed
 form is `INSERT INTO <table> (<explicit columns>) VALUES (<literal tuples>)`:
 the table and columns are plain unqualified identifiers, values are canonical
-TEXT or signed INTEGER literals, and each target may be seeded once. The CREATE
+TEXT or signed INTEGER literals, and each target may be seeded once. Every
+classified CREATE is unconditional; `IF NOT EXISTS` is rejected because an
+incumbent object would make the manifest effect a no-op. The CREATE
 must precede the INSERT and every trigger on that target must follow it, even
 across manifest entries. Table membership and reuse follow SQLite ASCII
 case-insensitive identifier identity; expectations and fixed read queries retain
 the one reviewed spelling from `CREATE TABLE`. Every `state_expectations`
 prefix adds `seed_tables` with the exact target, ordered columns, row count,
-and locally derived `rows_sha256`. The tool first selects the current primary manifest prefix, then
+and locally derived `rows_sha256`. Seed storage is deliberately conservative:
+TEXT literals require TEXT or BLOB affinity, while INTEGER literals require
+INTEGER, NUMERIC, or BLOB affinity; pairs that SQLite could coerce are rejected
+before custody. The tool first selects the current primary manifest prefix, then
 runs two identical complete primary-current proofs that include exact typed seed
 row readback. Responses return aggregate row-count/digest evidence only; raw
 seed values are never returned. Implicit columns, INSERT SELECT, expressions,
@@ -133,8 +138,9 @@ Predecessor assertions remain closed to top-level INSERT.
 On success, inspect the complete `effect_assertion.scope` object: its
 `statement_class` is assertion-specific (`schema_create_only`,
 `schema_create_tables_indexes_views_triggers`, or
-`schema_create_objects_additive`) and its `schema_object_types` array is the
-closed allowed scope for that selected assertion.
+`schema_create_objects_additive`, or
+`schema_create_objects_additive_seed_rows`) and its `schema_object_types` array
+is the closed allowed scope for that selected assertion.
 The configured `migrations_table` remains reserved across all assertions using
 SQLite ASCII case-insensitive identifier equivalence. CREATE object identities,
 index/trigger parents, any exact admitted trigger header/body lexical token, and additive
