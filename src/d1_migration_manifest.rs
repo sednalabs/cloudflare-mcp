@@ -367,6 +367,18 @@ fn expected_d1_migration_ledger_table_sql(table: &str) -> String {
         .replacen("CREATE TABLE IF NOT EXISTS", "CREATE TABLE", 1)
 }
 
+// Wrangler 4.87.0 `src/d1/migrations/apply.ts` emits this source shape for
+// its default ledger. SQLite retains its unquoted identifier and tab alignment
+// in `sqlite_master.sql`. Keep this as a closed accepted form rather than
+// normalizing arbitrary SQL: the helper-generated spelling remains accepted,
+// but an extra constraint, column, statement, or changed default never does.
+const WRANGLER_DEFAULT_D1_MIGRATIONS_TABLE_SQL: &str = "CREATE TABLE d1_migrations(\n\t\tid         INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tname       TEXT UNIQUE,\n\t\tapplied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL\n)";
+
+fn is_supported_d1_migration_ledger_table_sql(table_sql: &str, table: &str) -> bool {
+    table_sql == expected_d1_migration_ledger_table_sql(table)
+        || (table == "d1_migrations" && table_sql == WRANGLER_DEFAULT_D1_MIGRATIONS_TABLE_SQL)
+}
+
 pub(crate) fn d1_migration_ledger_authority_sql(table: &str) -> String {
     let table = quote_sql_string(table);
     format!(
@@ -483,7 +495,7 @@ pub(crate) fn parse_d1_migration_ledger_authority(
             "Reconcile the exact migration-ledger schema and primary readback before applying migration SQL.",
         )
     })?;
-    if table_sql != expected_d1_migration_ledger_table_sql(migrations_table) {
+    if !is_supported_d1_migration_ledger_table_sql(table_sql, migrations_table) {
         return Err(d1_manifest_ledger_authority_result(
             "d1.migration_ledger_authority_invalid",
             "provider ledger-authority table SQL did not match the required canonical migration-ledger schema",
@@ -629,9 +641,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        d1_manifest_write_result_classification, d1_migrations_table_init_sql,
-        expected_d1_migration_ledger_table_sql, parse_d1_migration_ledger,
-        parse_d1_migration_ledger_authority, validate_d1_manifest_write_result,
+        WRANGLER_DEFAULT_D1_MIGRATIONS_TABLE_SQL, d1_manifest_write_result_classification,
+        d1_migrations_table_init_sql, expected_d1_migration_ledger_table_sql,
+        parse_d1_migration_ledger, parse_d1_migration_ledger_authority,
+        validate_d1_manifest_write_result,
     };
 
     fn authority(table: &str) -> serde_json::Value {
@@ -736,6 +749,37 @@ mod tests {
             expected.contains("\n    id INTEGER PRIMARY KEY AUTOINCREMENT,"),
             "SQLite preserves the initializer indentation in sqlite_master"
         );
+    }
+
+    #[test]
+    fn manifest_ledger_authority_accepts_only_the_installed_wrangler_default_schema_form() {
+        let wrangler_default = json!([{
+            "success": true,
+            "errors": [],
+            "meta": {"served_by_primary": true},
+            "results": [{
+                "type": "table",
+                "name": "d1_migrations",
+                "tbl_name": "d1_migrations",
+                "sql": WRANGLER_DEFAULT_D1_MIGRATIONS_TABLE_SQL,
+            }],
+        }]);
+        assert!(parse_d1_migration_ledger_authority(&wrangler_default, "d1_migrations").is_ok());
+
+        for sql in [
+            "CREATE TABLE d1_migrations(\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tname TEXT UNIQUE,\n\t\tapplied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,\n\t\textra TEXT\n)",
+            "CREATE TABLE other_migrations(\n\t\tid         INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tname       TEXT UNIQUE,\n\t\tapplied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL\n)",
+            "CREATE TABLE d1_migrations(\n\t\tid         INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tname       TEXT UNIQUE,\n\t\tapplied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n)",
+        ] {
+            let mut malformed = wrangler_default.clone();
+            malformed[0]["results"][0]["sql"] = json!(sql);
+            let error = parse_d1_migration_ledger_authority(&malformed, "d1_migrations")
+                .expect_err("only the helper and installed Wrangler forms are accepted");
+            assert_eq!(
+                error.structured_content.expect("structured error")["error"]["code"],
+                "d1.migration_ledger_authority_invalid"
+            );
+        }
     }
 
     #[test]
