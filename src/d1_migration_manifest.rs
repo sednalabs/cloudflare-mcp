@@ -495,11 +495,15 @@ pub(crate) fn parse_d1_migration_ledger_authority(
     })
 }
 
-/// Accept only a non-empty sequence of complete, successful D1 query results
-/// that lets the manifest coordinator claim a migration was applied. This is deliberately
-/// stricter than the generic D1 query helper: a non-idempotent migration write
-/// must treat a missing, malformed, or failed inner D1 result as an unknown
-/// external outcome, rather than as a safe no-op or an applied statement.
+/// Accept only a non-empty sequence of primary-served, mutation-acknowledged
+/// D1 results that lets the manifest coordinator claim a migration was
+/// applied. This is deliberately stricter than the generic D1 query helper: a
+/// non-idempotent migration write must treat a missing, malformed, or failed
+/// inner D1 result as an unknown external outcome, rather than as a safe no-op
+/// or an applied statement. The result rows themselves are normally empty for
+/// DDL, so the mutation acknowledgement is the exact typed metadata contract:
+/// every statement must report a primary-served changed database and the whole
+/// response must report positive changes and rows written.
 pub(crate) fn validate_d1_manifest_write_result(value: &Value) -> Result<(), Value> {
     let result_sets = value.as_array().ok_or_else(|| {
         d1_manifest_ambiguous_write_evidence(
@@ -513,6 +517,8 @@ pub(crate) fn validate_d1_manifest_write_result(value: &Value) -> Result<(), Val
             "provider write response did not contain any D1 result set",
         ));
     }
+    let mut total_changes = 0_u64;
+    let mut total_rows_written = 0_u64;
     for result_set in result_sets {
         let result_set = result_set.as_object().ok_or_else(|| {
             d1_manifest_ambiguous_write_evidence(
@@ -547,6 +553,62 @@ pub(crate) fn validate_d1_manifest_write_result(value: &Value) -> Result<(), Val
                 "provider write response did not contain an inner D1 results array",
             ));
         }
+        let meta = result_set
+            .get("meta")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                d1_manifest_ambiguous_write_evidence(
+                    "missing_or_malformed_write_metadata",
+                    "provider write response did not contain exact D1 mutation metadata",
+                )
+            })?;
+        if meta.get("served_by_primary").and_then(Value::as_bool) != Some(true) {
+            return Err(d1_manifest_ambiguous_write_evidence(
+                "write_not_served_by_primary",
+                "provider write response did not explicitly prove it was served by the D1 primary",
+            ));
+        }
+        if meta.get("changed_db").and_then(Value::as_bool) != Some(true) {
+            return Err(d1_manifest_ambiguous_write_evidence(
+                "write_did_not_acknowledge_database_change",
+                "provider write response did not explicitly acknowledge a database change",
+            ));
+        }
+        let changes = meta.get("changes").and_then(Value::as_u64).ok_or_else(|| {
+            d1_manifest_ambiguous_write_evidence(
+                "missing_or_malformed_write_metadata",
+                "provider write response did not contain a non-negative integer changes count",
+            )
+        })?;
+        let rows_written = meta
+            .get("rows_written")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                d1_manifest_ambiguous_write_evidence(
+                    "missing_or_malformed_write_metadata",
+                    "provider write response did not contain a non-negative integer rows_written count",
+                )
+            })?;
+        total_changes = total_changes.checked_add(changes).ok_or_else(|| {
+            d1_manifest_ambiguous_write_evidence(
+                "write_metadata_overflow",
+                "provider write response changes counts overflowed the supported bound",
+            )
+        })?;
+        total_rows_written = total_rows_written
+            .checked_add(rows_written)
+            .ok_or_else(|| {
+                d1_manifest_ambiguous_write_evidence(
+                    "write_metadata_overflow",
+                    "provider write response rows_written counts overflowed the supported bound",
+                )
+            })?;
+    }
+    if total_changes == 0 || total_rows_written == 0 {
+        return Err(d1_manifest_ambiguous_write_evidence(
+            "write_metadata_did_not_prove_mutation",
+            "provider write response did not prove at least one changed row and one row written",
+        ));
     }
     Ok(())
 }
@@ -686,6 +748,11 @@ mod tests {
             "inner_statement_error",
             "malformed_inner_errors",
             "missing_or_malformed_inner_results",
+            "missing_or_malformed_write_metadata",
+            "write_not_served_by_primary",
+            "write_did_not_acknowledge_database_change",
+            "write_metadata_overflow",
+            "write_metadata_did_not_prove_mutation",
         ] {
             assert_eq!(d1_manifest_write_result_classification(value), Some(value));
         }
@@ -693,17 +760,17 @@ mod tests {
     }
 
     #[test]
-    fn manifest_write_result_requires_non_empty_complete_successful_inner_results() {
+    fn manifest_write_result_requires_primary_mutation_metadata() {
         assert!(
             validate_d1_manifest_write_result(&json!([
-                {"success": true, "errors": [], "results": []}
+                {"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": true, "changes": 1, "rows_written": 1}}
             ]))
             .is_ok()
         );
         assert!(
             validate_d1_manifest_write_result(&json!([
-                {"success": true, "errors": [], "results": []},
-                {"success": true, "errors": [], "results": []}
+                {"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": true, "changes": 0, "rows_written": 0}},
+                {"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": true, "changes": 1, "rows_written": 1}}
             ]))
             .is_ok()
         );
@@ -740,7 +807,7 @@ mod tests {
             (
                 "mixed inner success and failure",
                 json!([
-                    {"success": true, "errors": [], "results": []},
+                    {"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": true, "changes": 1, "rows_written": 1}},
                     {"success": false, "errors": [], "results": []}
                 ]),
                 "inner_statement_failure_or_missing_success",
@@ -749,6 +816,26 @@ mod tests {
                 "inner error",
                 json!([{"success": true, "errors": [{"code": 1}], "results": []}]),
                 "inner_statement_error",
+            ),
+            (
+                "missing metadata",
+                json!([{"success": true, "errors": [], "results": []}]),
+                "missing_or_malformed_write_metadata",
+            ),
+            (
+                "replica metadata",
+                json!([{"success": true, "errors": [], "results": [], "meta": {"served_by_primary": false, "changed_db": true, "changes": 1, "rows_written": 1}}]),
+                "write_not_served_by_primary",
+            ),
+            (
+                "unchanged metadata",
+                json!([{"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": false, "changes": 1, "rows_written": 1}}]),
+                "write_did_not_acknowledge_database_change",
+            ),
+            (
+                "empty mutation counts",
+                json!([{"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": true, "changes": 0, "rows_written": 0}}]),
+                "write_metadata_did_not_prove_mutation",
             ),
         ] {
             let error = validate_d1_manifest_write_result(&value)
@@ -1290,6 +1377,13 @@ fn d1_manifest_write_result_classification(value: &str) -> Option<&'static str> 
         "inner_statement_error" => Some("inner_statement_error"),
         "malformed_inner_errors" => Some("malformed_inner_errors"),
         "missing_or_malformed_inner_results" => Some("missing_or_malformed_inner_results"),
+        "missing_or_malformed_write_metadata" => Some("missing_or_malformed_write_metadata"),
+        "write_not_served_by_primary" => Some("write_not_served_by_primary"),
+        "write_did_not_acknowledge_database_change" => {
+            Some("write_did_not_acknowledge_database_change")
+        }
+        "write_metadata_overflow" => Some("write_metadata_overflow"),
+        "write_metadata_did_not_prove_mutation" => Some("write_metadata_did_not_prove_mutation"),
         _ => None,
     }
 }

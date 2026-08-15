@@ -7,7 +7,7 @@
 
 use rmcp::model::CallToolResult;
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::d1_migration_lease::{
@@ -569,14 +569,28 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
             Ok(receipt) => receipt,
             Err(result) => {
                 let custody = held_terminal_custody(&proof.lease);
+                // Receipt creation can fail after O_EXCL created the private
+                // file, after bytes were written, or after directory sync.
+                // Re-read the exact descriptor-bound namespace before making
+                // any claim about local mutation. A malformed, contradictory,
+                // or uninspectable entry is deliberately reported as unknown.
+                let (receipt_persisted, local_namespace_mutations) =
+                    terminal_receipt_persistence_state(
+                        &proof.lease,
+                        &receipt,
+                        legacy_receipt.as_ref(),
+                    );
                 return terminalize_failure(
                     result,
                     custody,
+                    // The successful pre-receipt refresh is the one completed
+                    // provider call after the prepared proof; receipt storage
+                    // itself never calls the provider.
                     base_provider_calls + 1,
                     response_evidence,
                     lifecycle,
-                    0,
-                    false,
+                    local_namespace_mutations,
+                    receipt_persisted,
                 );
             }
         },
@@ -972,15 +986,31 @@ fn terminal_result(mut content: Value, custody: TerminalCustodyState) -> CallToo
     CallToolResult::structured(content)
 }
 
-fn terminalize_failure(
+fn terminal_receipt_persistence_state(
+    lease: &D1RetainedMigrationLease,
+    receipt: &D1TerminalReconciliationReceipt,
+    legacy_receipt: Option<&D1TerminalReconciliationReceiptV1>,
+) -> (Value, Value) {
+    match lease.compatible_terminal_receipt_state(receipt, legacy_receipt) {
+        Ok(Some(_)) => (json!(true), json!(1)),
+        Ok(None) => (json!(false), json!(0)),
+        Err(_) => (Value::Null, Value::Null),
+    }
+}
+
+fn terminalize_failure<L, R>(
     result: CallToolResult,
     mut custody: TerminalCustodyState,
     completed_provider_calls: usize,
     prior_response_evidence: Vec<Value>,
     prior_lifecycle: Vec<Value>,
-    local_namespace_mutations: usize,
-    receipt_persisted: bool,
-) -> CallToolResult {
+    local_namespace_mutations: L,
+    receipt_persisted: R,
+) -> CallToolResult
+where
+    L: Serialize,
+    R: Serialize,
+{
     let mut content = result.structured_content.unwrap_or_else(|| {
         json!({"error": {"code": "d1.migration_terminal_failed", "message": "terminal reconciliation failed closed"}})
     });
@@ -1216,6 +1246,74 @@ mod tests {
                 lease_decision,
             );
             assert_eq!(actual, expected, "{custody:?}");
+        }
+    }
+
+    #[test]
+    fn terminal_receipt_persistence_uncertainty_never_claims_a_clean_local_state() {
+        let upstream = CallToolResult::structured_error(json!({
+            "error": {
+                "code": "d1.migration_terminal_evidence_invalid",
+                "message": "receipt write or sync failed after creation may have begun"
+            }
+        }));
+        let actual = terminalize_failure(
+            upstream,
+            TerminalCustodyState::ActiveVerified,
+            3,
+            Vec::new(),
+            Vec::new(),
+            Value::Null,
+            Value::Null,
+        )
+        .structured_content
+        .expect("structured terminal persistence uncertainty");
+        assert_eq!(actual["provider_calls"], 3);
+        assert_eq!(actual["receipt_persisted"], Value::Null);
+        assert_eq!(actual["local_namespace_mutations"], Value::Null);
+        assert_eq!(actual["lease_retained"], json!(true));
+        assert_eq!(actual["custody_status"], "retained_evidence_verified");
+    }
+
+    #[test]
+    fn terminal_namespace_transition_failure_reports_current_custody_not_a_retention_guess() {
+        for (custody, expected_status, expected_retained) in [
+            (
+                TerminalCustodyState::ActiveVerified,
+                "retained_evidence_verified",
+                json!(true),
+            ),
+            (
+                TerminalCustodyState::RetiringVerified,
+                "retiring_evidence_verified",
+                Value::Null,
+            ),
+            (
+                TerminalCustodyState::RetiredVerified,
+                "retired_evidence_verified",
+                json!(false),
+            ),
+            (
+                TerminalCustodyState::Unverified,
+                "retained_evidence_unverified",
+                Value::Null,
+            ),
+        ] {
+            let upstream = CallToolResult::structured_error(json!({
+                "lease_retained": null,
+                "error": {
+                    "code": "d1.migration_terminal_evidence_invalid",
+                    "message": "terminal namespace transition could not be completed"
+                }
+            }));
+            let actual = terminalize_failure(upstream, custody, 2, Vec::new(), Vec::new(), 1, true)
+                .structured_content
+                .expect("structured terminal transition failure");
+            assert_eq!(actual["provider_calls"], 2, "{custody:?}");
+            assert_eq!(actual["custody_status"], expected_status, "{custody:?}");
+            assert_eq!(actual["lease_retained"], expected_retained, "{custody:?}");
+            assert_eq!(actual["receipt_persisted"], json!(true), "{custody:?}");
+            assert_eq!(actual["local_namespace_mutations"], json!(1), "{custody:?}");
         }
     }
 

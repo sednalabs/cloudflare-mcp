@@ -133,6 +133,16 @@ plan/custody work is underway; a failure before the first write releases the
 pre-write lease, while any failure after an acknowledged write retains explicit
 reconciliation custody and stops later provider mutations.
 
+An `applied` response is stronger than a clean HTTP envelope or an empty D1
+result array. Every provider result set for the migration write must explicitly
+prove `meta.served_by_primary=true` and `meta.changed_db=true`, with typed
+`changes` and `rows_written` counts whose complete response totals are both
+positive. The MCP then requires the stable primary ledger readback to contain
+the complete manifest and repeats the reserved-ledger authority proof before it
+can release custody. Missing, replica-served, unchanged, zero-count, malformed,
+or contradictory write metadata is an unknown outcome: the lease is retained
+when its custody can still be proved and the SQL is never retried.
+
 A later invocation stops before provider I/O when it sees an active or
 `retiring.lease.json` entry, including one that is malformed, a symlink or
 non-regular. It must be resolved only through the governed recovery path,
@@ -164,6 +174,17 @@ Separate provider/distributed coordination remains required when MCP instances
 do not share that root. The product-neutral governed recovery path remains
 required for retained, malformed, or tampered evidence. Non-Linux installations or
 unsupported filesystems fail closed before provider I/O.
+
+Terminal reconciliation never treats a local receipt write failure as proof that
+no local mutation occurred. If the descriptor-bound receipt can be read back as
+the exact receipt, the result reports it as persisted with one local namespace
+mutation; if absence is proved it reports zero; otherwise both fields are
+`null`. The provider-call count covers only completed provider reads, never
+local receipt storage. Likewise, a failure while moving active evidence through
+`retiring` to `retired` reports the re-read current custody namespace: active
+retention is `lease_retained=true`, terminal retirement is
+`lease_retained=false`, and retiring or unverifiable custody is `null`. None of
+these outcomes authorizes replay.
 
 ### Read-only retained-manifest reconciliation
 

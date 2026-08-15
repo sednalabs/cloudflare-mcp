@@ -638,7 +638,7 @@ fn spawn_fake_d1_migrations_api(
                     "success": true,
                     "errors": [],
                     "messages": [],
-                    "result": [{"success": true, "results": [{"ok": true}]}]
+                    "result": [{"success": true, "results": [{"ok": true}], "meta": {"served_by_primary": true, "changed_db": true, "changes": 1, "rows_written": 1}}]
                 })
             } else {
                 json!({
@@ -771,7 +771,7 @@ fn spawn_fake_manifest_apply_api() -> (String, Arc<Mutex<Vec<Value>>>) {
                 .contains("INSERT INTO \"d1_migrations\" (name) VALUES ('0002_second.sql')")
             {
                 apply_seen = true;
-                json!({"success": true, "errors": [], "messages": [], "result": [{"success": true, "results": [{"ok": true}]}]})
+                json!({"success": true, "errors": [], "messages": [], "result": [{"success": true, "results": [{"ok": true}], "meta": {"served_by_primary": true, "changed_db": true, "changes": 1, "rows_written": 1}}]})
             } else {
                 panic!("unexpected manifest migration SQL: {sql}");
             };
@@ -833,7 +833,7 @@ fn spawn_manifest_authority_schedule_api(
                     "success": true,
                     "errors": [],
                     "messages": [],
-                    "result": [{"success": true, "errors": [], "results": [{"ok": true}]}],
+                    "result": [{"success": true, "errors": [], "results": [{"ok": true}], "meta": {"served_by_primary": true, "changed_db": true, "changes": 1, "rows_written": 1}}],
                 })
             } else {
                 panic!("unexpected authority schedule SQL: {sql}");
@@ -3191,7 +3191,17 @@ fn spawn_fake_manifest_ambiguous_result_api(
                     result_set["success"] == json!(true)
                         && result_set["errors"].as_array().is_none_or(Vec::is_empty)
                         && result_set["results"].is_array()
+                        && result_set["meta"]["served_by_primary"] == json!(true)
+                        && result_set["meta"]["changed_db"] == json!(true)
+                        && result_set["meta"]["changes"].as_u64().is_some()
+                        && result_set["meta"]["rows_written"].as_u64().is_some()
                 })
+                && result_sets
+                    .iter()
+                    .any(|result_set| result_set["meta"]["changes"].as_u64().unwrap_or(0) > 0)
+                && result_sets
+                    .iter()
+                    .any(|result_set| result_set["meta"]["rows_written"].as_u64().unwrap_or(0) > 0)
         });
         let mut apply_seen = false;
         let expected_requests = if write_commits { 12 } else { 10 };
@@ -3274,7 +3284,7 @@ fn spawn_fake_partial_manifest_ambiguous_api() -> (String, Arc<Mutex<Vec<Value>>
                 first_apply_seen = true;
                 let response = serde_json::to_vec(&json!({
                     "success": true, "errors": [], "messages": [],
-                    "result": [{"success": true, "results": [{"ok": true}]}]
+                    "result": [{"success": true, "results": [{"ok": true}], "meta": {"served_by_primary": true, "changed_db": true, "changes": 1, "rows_written": 1}}]
                 }))
                 .expect("serialize first apply response");
                 write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write first apply headers");
@@ -12018,7 +12028,7 @@ fn d1_apply_migration_manifest_ambiguous_inner_result_shapes_retain_lease_withou
         (
             "mixed success and failure",
             json!([
-                {"success": true, "errors": [], "results": []},
+                {"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": true, "changes": 1, "rows_written": 1}},
                 {"success": false, "errors": [], "results": []}
             ]),
             "inner_statement_failure_or_missing_success",
@@ -12027,6 +12037,26 @@ fn d1_apply_migration_manifest_ambiguous_inner_result_shapes_retain_lease_withou
             "inner error",
             json!([{"success": true, "errors": [{"code": 1}], "results": []}]),
             "inner_statement_error",
+        ),
+        (
+            "missing mutation metadata",
+            json!([{"success": true, "errors": [], "results": []}]),
+            "missing_or_malformed_write_metadata",
+        ),
+        (
+            "replica write metadata",
+            json!([{"success": true, "errors": [], "results": [], "meta": {"served_by_primary": false, "changed_db": true, "changes": 1, "rows_written": 1}}]),
+            "write_not_served_by_primary",
+        ),
+        (
+            "unchanged write metadata",
+            json!([{"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": false, "changes": 1, "rows_written": 1}}]),
+            "write_did_not_acknowledge_database_change",
+        ),
+        (
+            "empty mutation metadata",
+            json!([{"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": true, "changes": 0, "rows_written": 0}}]),
+            "write_metadata_did_not_prove_mutation",
         ),
     ]
     .into_iter()
@@ -12137,8 +12167,8 @@ fn d1_apply_migration_manifest_ambiguous_inner_result_shapes_retain_lease_withou
 #[test]
 fn d1_apply_migration_manifest_multiple_successful_query_results_apply_once() {
     let (base_url, requests) = spawn_fake_manifest_ambiguous_result_api(json!([
-        {"success": true, "errors": [], "results": []},
-        {"success": true, "errors": [], "results": []}
+        {"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": true, "changes": 0, "rows_written": 0}},
+        {"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": true, "changes": 1, "rows_written": 1}}
     ]));
     let lease_root = std::path::PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-multi-result-manifest-lease-{}",

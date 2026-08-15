@@ -560,8 +560,13 @@ fn d1_terminal_reconciliation_error(message: &'static str) -> CallToolResult {
         "operation": "d1_finalize_migration_reconciliation",
         "status": "reconciliation_required",
         "retry_decision": "do_not_retry_same_attempt",
-        "lease_decision": "retain",
-        "lease_retained": true,
+        // A namespace rename can succeed before a later directory sync or
+        // descriptor validation fails. This lower custody primitive cannot
+        // honestly infer whether active evidence remains, retirement is now
+        // terminal, or the namespace became uninspectable. The terminal
+        // coordinator re-reads its held descriptors and supplies the precise
+        // retained/retired/unverifiable state to the operator result.
+        "lease_retained": Value::Null,
         "error": {
             "code": "d1.migration_terminal_evidence_invalid",
             "message": message,
