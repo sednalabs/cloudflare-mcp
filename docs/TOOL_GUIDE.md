@@ -143,7 +143,12 @@ an exact empty table projection after CREATE and before INSERT without
 referencing columns introduced by a later prefix, and requires the
 exact row set at and after INSERT. An unexpected intermediate row stops after
 the first complete proof with zero mutations. Terminal reconciliation rederives
-and repeats the same selected-prefix proof. Responses return aggregate
+and repeats the same selected-prefix proof. Both complete proof ledgers must
+equal the exact initial selected ledger, and the two complete snapshots must
+also remain canonically equal; two mutually consistent responses at another
+prefix are contradictory. Inspect aggregate-safe `selection_binding` for the
+selection-query digest, selected-ledger digest and prefix, and both
+complete-ledger digests. Responses return aggregate
 row-count/digest evidence only; raw
 seed values are never returned. Implicit columns, INSERT SELECT, expressions,
 NULL/REAL/BLOB values, conflict clauses, qualified or quoted identities,

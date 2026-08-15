@@ -601,14 +601,50 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
     }
     let second_digest = batch_digest(&second);
     if first.snapshot != second.snapshot || first_digest != second_digest {
+        let mut result = reconciliation_error_with_evidence(
+            "contradictory",
+            "d1.migration_reconciliation_evidence_unstable",
+            "two complete read-only reconciliation batches were not canonically equivalent",
+            Some(&query.sha256),
+            &stable_evidence,
+        );
+        if let (Some(selection), Some(selection_query_sha256)) =
+            (selection.as_ref(), selection_query_sha256.as_deref())
+        {
+            add_selection_binding_evidence(
+                &mut result,
+                selection,
+                selection_query_sha256,
+                &[&first, &second],
+            );
+        }
         return Err(contextualize_error(
-            reconciliation_error_with_evidence(
-                "contradictory",
-                "d1.migration_reconciliation_evidence_unstable",
-                "two complete read-only reconciliation batches were not canonically equivalent",
-                Some(&query.sha256),
-                &stable_evidence,
-            ),
+            result,
+            Some(&query.sha256),
+            &[],
+            stable_provider_calls,
+        ));
+    }
+    if let (Some(selection), Some(selection_query_sha256)) =
+        (selection.as_ref(), selection_query_sha256.as_deref())
+        && (first.snapshot.ledger != selection.snapshot.ledger
+            || second.snapshot.ledger != selection.snapshot.ledger)
+    {
+        let mut result = reconciliation_error_with_evidence(
+            "contradictory",
+            "d1.migration_reconciliation_selected_ledger_changed",
+            "complete proof ledgers did not equal the exact initial selected ledger",
+            Some(&query.sha256),
+            &stable_evidence,
+        );
+        add_selection_binding_evidence(
+            &mut result,
+            selection,
+            selection_query_sha256,
+            &[&first, &second],
+        );
+        return Err(contextualize_error(
+            result,
             Some(&query.sha256),
             &[],
             stable_provider_calls,
@@ -839,6 +875,16 @@ pub(crate) async fn reconcile_d1_migration_manifest(
         content["scope_completeness"]["seed_rows"] =
             json!("complete_manifest_derived_storage_class_and_value_row_set");
         content["seed_row_evidence"] = json!(proof.first.snapshot.seed_tables);
+    }
+    if let (Some(selection), Some(selection_query_sha256)) = (
+        proof.selection.as_ref(),
+        proof.selection_query_sha256.as_deref(),
+    ) {
+        content["selection_binding"] = selection_binding_evidence(
+            selection,
+            selection_query_sha256,
+            &[&proof.first, &proof.second],
+        );
     }
     CallToolResult::structured(content)
 }
@@ -3261,6 +3307,42 @@ fn batch_digest(batch: &ParsedBatch) -> String {
     let bytes = serde_json::to_vec(&batch.snapshot)
         .expect("canonical reconciliation snapshot serialization is infallible");
     sha256_bytes_hex(&bytes)
+}
+
+fn ledger_digest(ledger: &[D1ManifestLedgerRow]) -> String {
+    let bytes = serde_json::to_vec(ledger)
+        .expect("canonical reconciliation ledger serialization is infallible");
+    sha256_bytes_hex(&bytes)
+}
+
+fn selection_binding_evidence(
+    selection: &ParsedBatch,
+    selection_query_sha256: &str,
+    complete_batches: &[&ParsedBatch],
+) -> Value {
+    json!({
+        "selection_query_sha256": selection_query_sha256,
+        "selected_ledger_sha256": ledger_digest(&selection.snapshot.ledger),
+        "selected_manifest_prefix_length": selection.snapshot.ledger.len(),
+        "complete_ledger_sha256s": complete_batches
+            .iter()
+            .map(|batch| ledger_digest(&batch.snapshot.ledger))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn add_selection_binding_evidence(
+    result: &mut CallToolResult,
+    selection: &ParsedBatch,
+    selection_query_sha256: &str,
+    complete_batches: &[&ParsedBatch],
+) {
+    if let Some(Value::Object(content)) = result.structured_content.as_mut() {
+        content.insert(
+            "selection_binding".to_string(),
+            selection_binding_evidence(selection, selection_query_sha256, complete_batches),
+        );
+    }
 }
 
 fn response_digest_summary(batch: &ParsedBatch) -> Value {

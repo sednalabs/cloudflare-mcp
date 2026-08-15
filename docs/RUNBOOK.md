@@ -206,7 +206,12 @@ Select one explicit built-in effect assertion:
   row set at or after INSERT. Any row in the zero-row window must fail on the
   first complete proof with two total provider reads and zero mutations.
   Terminal dry run and live finalization must rederive and repeat that same
-  selected-prefix proof. Otherwise verify three provider reads, zero
+  selected-prefix proof. Require each complete proof ledger to equal the exact
+  initial selected ledger, then separately require the two complete snapshots
+  to be canonically equal. An equal pair at a different prefix is a
+  reconciliation contradiction, not authority to reselect. Record only the
+  aggregate-safe `selection_binding` query/ledger digests and selected prefix;
+  do not copy raw provider rows. Otherwise verify three provider reads, zero
   provider mutations, exact aggregate seed summaries, and no raw seed values in
   the response. Any ambiguity or mismatch remains reconciliation-required.
   The predecessor assertions do not accept top-level INSERT.

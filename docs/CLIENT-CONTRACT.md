@@ -299,7 +299,12 @@ and a prefix at or after INSERT proves the exact
 typed row set. An unexpected row in the zero-row window fails on the first
 complete proof, before a second complete read and without provider or local
 mutation. Terminal dry run and finalization rederive the registry and repeat
-the same selected-prefix proof. It compares storage class and canonical
+the same selected-prefix proof. Neither complete response may choose another
+ledger prefix: both complete ledgers must exactly equal the initial selected
+ledger, while the two complete snapshots must also remain canonically equal to
+each other. Aggregate-safe `selection_binding` reports only the selection-query
+digest, selected-ledger digest and prefix length, and both complete-ledger
+digests. It compares storage class and canonical
 value locally and returns only table/column identity, exact row count, and the
 row-set digest. Arbitrary DML, conflict clauses, expressions, implicit columns,
 qualified identifiers, unsupported storage classes, duplicates, ordering

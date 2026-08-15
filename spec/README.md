@@ -138,7 +138,11 @@ Preserved curated tool families:
   primary-current proofs. A full-manifest registry omits seed-table reads before
   CREATE, proves exact table emptiness after CREATE and before INSERT without
   referencing future columns, and reads the exact typed rows at or after INSERT.
-  Terminal reconciliation rederives and repeats that selected-prefix proof;
+  Each complete proof ledger must equal the exact initial selected ledger, and
+  the two complete snapshots must remain canonically equal to each other; two
+  equal complete responses at another prefix fail closed. Aggregate-safe
+  selection-query and ledger digests bind this relationship. Terminal
+  reconciliation rederives and repeats that selected-prefix proof;
   responses expose only aggregate summaries. Arbitrary DML, expressions, implicit columns,
   conflict clauses, reused targets, and malformed or mismatched rows fail closed.
   The three predecessor assertions remain closed to top-level INSERT effects.
