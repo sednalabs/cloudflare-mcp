@@ -135,3 +135,13 @@ jobs:
             dist/cloudflare-mcp-linux-${{ matrix.arch }}-stdio-${{ github.sha }}.tar.gz.sha256
           if-no-files-found: error
           retention-days: 14
+
+  test-required-gate:
+    name: Test And Tool Contract
+    if: always()
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require the complete native matrix
+        run: test '${{ needs.test.result }}' = success
