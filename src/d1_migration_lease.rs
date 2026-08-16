@@ -3353,6 +3353,7 @@ use linux::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[cfg(target_os = "linux")]
     fn terminal_receipt(
