@@ -82,10 +82,15 @@ release artifact bundle so agents can compare:
 Use `d1_apply_migration_manifest` for an approval-gated D1 migration family.
 First run it with `dry_run=true`; retain the returned `plan_sha256`, which is
 bound to the exact SQL bytes and current Wrangler ledger prefix. A live call
-must submit that value as `approved_plan_sha256` and configure
+must submit that exact lowercase value, without whitespace or case changes, as
+`approved_plan_sha256` and configure
 `CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT` to a pre-created, operator-owned,
 non-group/world-writable directory shared by every MCP process that can target
-the database. On Linux the root must be an absolute real directory owned by the
+the database. Manifest names may be current Wrangler paths relative to
+`migrations_dir`, including nested layouts such as `0001_init/migration.sql`.
+Supply them in Wrangler's segment-wise numeric order with lexical tie-breaking;
+absolute, backslash, empty, dot, traversal, and NUL path forms fail closed. On
+Linux the root must be an absolute real directory owned by the
 current operator with mode `0700` (or stricter), and every non-sticky ancestor
 must be non-writable. The MCP permanently creates one private target directory
 per account/database. It retains held root, target, guard and active file
@@ -105,6 +110,47 @@ moves the supplied manifest into validation without cloning its SQL strings.
 Split a larger migration family before review rather than increasing this
 operator-surface memory bound.
 
+On a live manifest call, the MCP first performs a read-only inspection of any
+existing target custody. It never creates a target or guard during this step;
+an active or retiring entry therefore stops a fresh caller before any provider
+request. Only then, before a new lease or migration SQL, it performs two
+primary-served readbacks of the configured migration-ledger authority. They
+must agree and prove exactly one canonical ledger table with the supported
+schema and no trigger targeting it. A missing, case-conflicting, wrong-type,
+wrong-schema, malformed, non-primary, or unstable result is a hard stop: no
+new local custody or provider write is created. This is intentionally separate
+from the filename ledger prefix read, which cannot establish what a later
+`INSERT INTO <ledger>` means.
+
+Every filename-ledger read used by the dry plan, live preflight, post-apply
+readback, or ambiguity reconciliation must itself be served by the D1 primary:
+the single result set requires literal boolean `meta.served_by_primary=true`.
+Missing, false, non-boolean, malformed, duplicate, or unstable evidence is not
+a usable ledger and fails closed. The manifest client rejects duplicate JSON
+keys before the result reaches either ledger parser.
+
+After the governed lease and reviewed plan are bound, the MCP repeats that
+stable authority proof immediately before every migration statement, then
+revalidates its held local custody immediately before each dispatch. It repeats
+the proof and custody revalidation again before successful terminal custody
+release. This prevents a preflight result from becoming stale while local
+plan/custody work is underway; a failure before the first write releases the
+pre-write lease, while any failure after an acknowledged write retains explicit
+reconciliation custody and stops later provider mutations.
+
+An `applied` response is stronger than a clean HTTP envelope or an empty D1
+result array. Every provider result set for the migration write must explicitly
+prove `meta.served_by_primary=true`, a boolean `meta.changed_db`, and typed
+non-negative integer `changes` and `rows_written` counts. A result with
+`changed_db=false` is valid only when both counts are zero. The complete
+response must contain at least one `changed_db=true` result and have positive
+aggregate changes and rows-written totals. The MCP then requires the stable
+primary ledger readback to contain the complete manifest and repeats the
+reserved-ledger authority proof before it can release custody. Missing,
+replica-served, malformed, zero-total, or contradictory write metadata is
+`reconciliation_required`: the lease is retained when its custody can still be
+proved and the SQL is never retried.
+
 A later invocation stops before provider I/O when it sees an active or
 `retiring.lease.json` entry, including one that is malformed, a symlink or
 non-regular. It must be resolved only through the governed recovery path,
@@ -116,9 +162,16 @@ entry or leaves active/retiring evidence as an explicit blocker. A failed
 creation is retained as
 `aborted-create.<nonce>.lease.json`; production code never unlinks a lease file
 or directory. The manifest tool never reopens a migration directory after
-review and never retries an ambiguous provider write. An unknown outcome retains
-the active target lease: reconcile provider ledger evidence and the reported
-lease identity before any governed recovery. A matching ledger filename is only
+review and never retries an ambiguous provider write. It first performs stable
+primary-ledger reconciliation and then revalidates the exact local custody
+chain before saying the active target lease was retained. If that local custody
+has been lost or is unverifiable, the result reports
+`lease_retained=null` and
+`custody_status=lost_or_unverifiable_after_ambiguous_apply`; it keeps the prior
+identity only as historical reconciliation context, not as a claim that a local
+blocker exists. That result still prohibits replay: the absence of a local lease
+file is never evidence that another process or operator may reapply SQL. A
+matching ledger filename is only
 an observation: it does not attest to the reviewed SQL bytes or complete
 provider transaction, and therefore never authorizes lease release after an
 ambiguous apply. This guarantee is limited to a trusted Linux filesystem that
@@ -129,6 +182,21 @@ Separate provider/distributed coordination remains required when MCP instances
 do not share that root. The product-neutral governed recovery path remains
 required for retained, malformed, or tampered evidence. Non-Linux installations or
 unsupported filesystems fail closed before provider I/O.
+
+Terminal reconciliation never treats a local receipt write failure as proof that
+no local mutation occurred. If the descriptor-bound receipt can be read back as
+the exact receipt, the result reports it as persisted with one local namespace
+mutation; if absence is proved it reports zero; otherwise both fields are
+`null`. That receipt and namespace result is accepted only after a stable
+descriptor-bound re-read before and after the receipt check; an altered,
+missing, or uninspectable receipt makes both authority claims unknown. The
+provider-call count covers only completed provider reads, never local receipt
+storage. Likewise, a failure while moving active evidence through `retiring` to
+`retired` reports the re-read current custody namespace and the exact completed
+rename count: one for active-to-retiring and two once the terminal retired name
+exists. Active retention is `lease_retained=true`, terminal retirement is
+`lease_retained=false`, and retiring or unverifiable custody is `null`. None of
+these outcomes authorizes replay.
 
 ### Read-only retained-manifest reconciliation
 

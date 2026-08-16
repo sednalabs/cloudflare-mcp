@@ -71,7 +71,7 @@ Use curated D1 tools instead of generic API calls for database workflows:
 - `d1_validate_query`
 - `d1_query_read_only`
 - `d1_execute_write`
-- `d1_apply_migrations`
+- `d1_apply_migrations` (dry-run inspection only; live mutation is retired)
 - `d1_apply_migration_manifest`
 - `d1_reconcile_migration_manifest`
 - `d1_finalize_migration_reconciliation`
@@ -79,12 +79,33 @@ Use curated D1 tools instead of generic API calls for database workflows:
 - `d1_delete_database`
 
 Read/query tools use restricted SQL checks. Write and migration tools preserve
-dry-run discipline and fail closed on unsafe or ambiguous state.
+dry-run discipline and fail closed on unsafe or ambiguous state. Use
+`d1_apply_migration_manifest` for every live migration; the legacy
+directory-backed `d1_apply_migrations` tool refuses live mutation.
 
 Use `d1_reconcile_migration_manifest` only for exact retained
 `active.lease.json` or `retiring.lease.json` evidence after an ambiguous
 manifest apply. Supply the complete exact-byte manifest and one complete
 expected schema state for every prefix from zero through the full manifest.
+
+For `d1_apply_migration_manifest`, every plan, live, post-apply, and ambiguous
+outcome filename-ledger read requires exactly one successful result set with
+literal boolean `meta.served_by_primary=true`. Missing, false, non-boolean,
+malformed, duplicate, or unstable primary evidence fails closed. After an
+ambiguous non-idempotent apply, the tool rereads that evidence and revalidates
+the local custody chain before it can report `lease_retained=true`. Lost or
+unverifiable custody returns `lease_retained=null` with
+`custody_status=lost_or_unverifiable_after_ambiguous_apply`; it prohibits retry
+and does not turn an absent local file into permission for a new apply.
+For every migration-write result set, success additionally requires literal
+`meta.served_by_primary=true`, boolean `meta.changed_db`, and non-negative JSON
+integer `meta.changes` and `meta.rows_written`. A non-mutating successful result
+(for example a supported PRAGMA in a multi-statement migration) must report
+`changed_db=false` with both counts zero. The complete response must contain at
+least one `changed_db=true` result and positive aggregate changes and
+rows-written totals. Any missing, non-boolean, non-integer, zero-total,
+overflowed, failed, or malformed result is `reconciliation_required`, never a
+successful apply or authorization to retry.
 The tool derives every target allowed by the selected registry assertion from
 the manifest and rejects omissions, additions, data-producing CREATE forms,
 malformed result metadata, and result sets whose query-bound statement marker

@@ -1495,6 +1495,7 @@
           },
           "approved_plan_sha256": {
             "default": null,
+            "description": "Exact lowercase `plan_sha256` returned by the dry run. Case changes and\nsurrounding whitespace are rejected so apply and recovery share one\ncanonical approval identity.",
             "type": [
               "string",
               "null"
@@ -1543,7 +1544,7 @@
       "name": "d1_apply_migration_manifest"
     },
     {
-      "description": "Apply local Wrangler-style D1 SQL migration files in lexical order with dry-run safety.",
+      "description": "Inspect local Wrangler-style D1 SQL migration files in lexical order; live mutation is retired in favour of approved exact-byte manifests.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {

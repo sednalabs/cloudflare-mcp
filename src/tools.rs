@@ -38,13 +38,18 @@ use crate::cloudflare::{
     AccessAppUpsertRequest, AccessPolicyWrite, BulkRedirectItemWrite, CacheRule, CacheRuleset,
     DnsRecordUpsertRequest, PagesDeploymentTriggerRequest, with_request_api_token_override,
 };
-use crate::d1_migration_lease::{acquire_d1_migration_lease, d1_migration_lease_requirements};
+use crate::d1_migration_lease::{
+    acquire_d1_migration_lease, d1_migration_lease_requirements,
+    preflight_d1_migration_target_custody,
+};
 use crate::d1_migration_manifest::{
     D1ManifestReconciliationEvidence, approved_d1_plan_digest_matches, classify_d1_manifest_ledger,
     d1_ledger_summaries, d1_manifest_contextualize_failure, d1_manifest_plan_mismatch_result,
-    d1_manifest_plan_sha256, d1_manifest_reconciliation_required_result, d1_manifest_summaries,
-    d1_manifest_unknown_ledger_result, normalize_d1_manifest_target, normalize_d1_migration_family,
-    parse_d1_migration_ledger, read_stable_d1_migration_ledger, validate_d1_manifest_write_result,
+    d1_manifest_plan_sha256, d1_manifest_reconciliation_custody_lost_result,
+    d1_manifest_reconciliation_required_result, d1_manifest_summaries,
+    d1_manifest_unknown_ledger_result, d1_migrations_table_init_sql, normalize_d1_manifest_target,
+    normalize_d1_migration_family, parse_d1_migration_ledger, read_stable_d1_migration_ledger,
+    read_stable_d1_migration_ledger_authority, validate_d1_manifest_write_result,
     validate_d1_migration_manifest,
 };
 use crate::d1_migration_reconciliation::{
@@ -935,6 +940,9 @@ pub struct D1ApplyMigrationManifestArgs {
     #[serde(default)]
     pub dry_run: bool,
     #[serde(default)]
+    /// Exact lowercase `plan_sha256` returned by the dry run. Case changes and
+    /// surrounding whitespace are rejected so apply and recovery share one
+    /// canonical approval identity.
     pub approved_plan_sha256: Option<String>,
     #[serde(default)]
     pub max_rows: Option<usize>,
@@ -4341,7 +4349,7 @@ impl CloudflareMcp {
 
     #[tool(
         name = "d1_apply_migrations",
-        description = "Apply local Wrangler-style D1 SQL migration files in lexical order with dry-run safety."
+        description = "Inspect local Wrangler-style D1 SQL migration files in lexical order; live mutation is retired in favour of approved exact-byte manifests."
     )]
     async fn cloudflare_d1_apply_migrations(
         &self,
@@ -4398,6 +4406,29 @@ impl CloudflareMcp {
                 "unknown_ledger": false,
                 "max_rows": max_rows,
                 "dry_run_note": "No D1 writes applied; remote migration ledger was read to classify already-applied and pending migrations.",
+            })));
+        }
+
+        // This directory-backed mutation surface cannot prove the approved
+        // exact-byte manifest/custody contract required for a provider write.
+        // Keep its useful read-only classification mode, but permanently deny
+        // live execution rather than leaving a second migration bypass beside
+        // the guarded manifest coordinator.
+        if !args.dry_run {
+            return Ok(CallToolResult::structured_error(json!({
+                "ok": false,
+                "operation": "d1_apply_migrations",
+                "status": "retired",
+                "dry_run": false,
+                "provider_calls": 0,
+                "provider_mutations": 0,
+                "migration_count": migrations.len(),
+                "candidate_migrations": d1_migration_summaries(&migrations),
+                "error": {
+                    "code": "d1.legacy_migration_apply_retired",
+                    "message": "directory-backed D1 migration mutation is retired; no provider request was issued",
+                    "hint": "Use d1_apply_migration_manifest with an exact approved dry-run plan and the governed custody contract."
+                }
             })));
         }
 
@@ -4676,6 +4707,38 @@ impl CloudflareMcp {
             })));
         }
 
+        // Existing custody must keep blocking fresh callers before they make a
+        // provider read.  This inspection is read-only and deliberately never
+        // creates a target directory or guard for an absent target.
+        mutation_plan = mutation_plan.step(
+            "preflight_existing_migration_target_custody",
+            false,
+            json!({"target": "account_database"}),
+        );
+        if let Err(result) = preflight_d1_migration_target_custody(account_id, &args.database_id) {
+            finish_manifest!(result);
+        }
+
+        // The ordinary ledger rows prove only migration names. Before this
+        // live path creates any new custody evidence or can reach a provider
+        // write, prove the reserved ledger is the exact primary-served table
+        // with no trigger authority and a stable canonical schema.
+        mutation_plan = mutation_plan.step(
+            "preflight_reserved_migration_ledger_authority",
+            false,
+            json!({"migrations_table": migrations_table}),
+        );
+        if let Err(result) = read_stable_d1_migration_ledger_authority(
+            self,
+            account_id,
+            &args.database_id,
+            &migrations_table,
+        )
+        .await
+        {
+            finish_manifest!(result);
+        }
+
         let mut lease = match acquire_d1_migration_lease(
             account_id,
             &args.database_id,
@@ -4804,6 +4867,11 @@ impl CloudflareMcp {
                 }),
             )
             .step(
+                "revalidate_reserved_migration_ledger_authority_before_each_mutation",
+                false,
+                json!({"migrations_table": migrations_table}),
+            )
+            .step(
                 "apply_pending_migration_statements",
                 true,
                 json!({"pending_migrations": d1_manifest_summaries(&classification.pending)}),
@@ -4812,6 +4880,11 @@ impl CloudflareMcp {
                 "readback_complete_migration_ledger",
                 false,
                 json!({"computed_plan_sha256": plan_sha256}),
+            )
+            .step(
+                "revalidate_reserved_migration_ledger_authority_before_successful_custody_release",
+                false,
+                json!({"migrations_table": migrations_table}),
             );
         if !approved_d1_plan_digest_matches(args.approved_plan_sha256.as_deref(), &plan_sha256) {
             if let Err(release) = lease.release() {
@@ -4860,12 +4933,61 @@ impl CloudflareMcp {
 
         let mut applied = Vec::new();
         for migration in &classification.pending {
+            let statement =
+                d1_migration_apply_sql(&migration.sql, &migrations_table, &migration.name);
+            if let Err(result) = read_stable_d1_migration_ledger_authority(
+                self,
+                account_id,
+                &args.database_id,
+                &migrations_table,
+            )
+            .await
+            {
+                if applied.is_empty() {
+                    let retained = lease.release().is_err();
+                    finish_manifest!(d1_manifest_contextualize_failure(
+                        result,
+                        account_id,
+                        database_id,
+                        &family,
+                        &migrations_table,
+                        &manifest,
+                        D1ManifestReconciliationEvidence::new(
+                            args.approved_plan_sha256.as_deref(),
+                            Some(&plan_sha256),
+                            Some(&ledger),
+                            true,
+                        ),
+                        &lease,
+                        retained,
+                    ));
+                }
+                // A preceding write may already have committed.  A later
+                // authority failure therefore cannot release custody or allow
+                // a following migration to dispatch: preserve an explicit
+                // reconciliation boundary for the exact provider outcome.
+                lease.retain();
+                finish_manifest!(d1_manifest_contextualize_failure(
+                    result,
+                    account_id,
+                    database_id,
+                    &family,
+                    &migrations_table,
+                    &manifest,
+                    D1ManifestReconciliationEvidence::new(
+                        args.approved_plan_sha256.as_deref(),
+                        Some(&plan_sha256),
+                        Some(&ledger),
+                        true,
+                    ),
+                    &lease,
+                    true,
+                ));
+            }
             if let Err(result) = lease.revalidate() {
                 lease.retain();
                 finish_manifest!(result);
             }
-            let statement =
-                d1_migration_apply_sql(&migration.sql, &migrations_table, &migration.name);
             let write_result = self
                 .cloudflare
                 .execute_d1_migration_manifest_write(account_id, &args.database_id, &statement, &[])
@@ -4890,8 +5012,9 @@ impl CloudflareMcp {
                 }
                 Err(err) => {
                     // A non-idempotent provider write may have committed after its response
-                    // was lost. Obtain two matching ledger reads for evidence, never replay
-                    // the SQL here.
+                    // was lost. Obtain two matching primary ledger reads for evidence, then
+                    // revalidate custody before saying the lease was retained. Never replay
+                    // the SQL here, including when the local lease path disappeared.
                     let reconciliation = read_stable_d1_migration_ledger(
                         self,
                         account_id,
@@ -4900,7 +5023,33 @@ impl CloudflareMcp {
                     )
                     .await
                     .ok();
-                    let payload = d1_manifest_reconciliation_required_result(
+                    if lease.revalidate().is_ok() {
+                        // Preserve the shared lease when outcome remains unknown. This prevents
+                        // another process from re-entering the target before an operator
+                        // reconciles provider evidence and deliberately clears the stale lease.
+                        let payload = d1_manifest_reconciliation_required_result(
+                            account_id,
+                            &args.database_id,
+                            &family,
+                            &migrations_table,
+                            &manifest,
+                            args.approved_plan_sha256.as_deref(),
+                            &plan_sha256,
+                            migration,
+                            &applied,
+                            &ledger,
+                            reconciliation.as_deref(),
+                            &lease,
+                            err,
+                        );
+                        lease.retain();
+                        finish_manifest!(payload);
+                    }
+                    // Do not call retain after failed revalidation: it would only drop the
+                    // held guard while claiming a durable local blocker that we could no
+                    // longer prove. The separate result makes both constraints explicit:
+                    // no retry, and no inference from missing local evidence.
+                    finish_manifest!(d1_manifest_reconciliation_custody_lost_result(
                         account_id,
                         &args.database_id,
                         &family,
@@ -4914,12 +5063,7 @@ impl CloudflareMcp {
                         reconciliation.as_deref(),
                         &lease,
                         err,
-                    );
-                    // Preserve the shared lease when outcome remains unknown. This prevents
-                    // another process from re-entering the target before an operator
-                    // reconciles provider evidence and deliberately clears the stale lease.
-                    lease.retain();
-                    finish_manifest!(payload);
+                    ));
                 }
             }
         }
@@ -5004,6 +5148,40 @@ impl CloudflareMcp {
                     "hint": "Reconcile provider evidence before clearing the retained target lease or applying another migration.",
                 },
             })));
+        }
+        if let Err(result) = read_stable_d1_migration_ledger_authority(
+            self,
+            account_id,
+            &args.database_id,
+            &migrations_table,
+        )
+        .await
+        {
+            // The final ledger rows establish only names. Re-prove the
+            // reserved ledger authority before recording successful terminal
+            // custody; otherwise an acknowledged migration could be followed
+            // by a changed table/trigger authority and be falsely released.
+            lease.retain();
+            finish_manifest!(d1_manifest_contextualize_failure(
+                result,
+                account_id,
+                database_id,
+                &family,
+                &migrations_table,
+                &manifest,
+                D1ManifestReconciliationEvidence::new(
+                    args.approved_plan_sha256.as_deref(),
+                    Some(&plan_sha256),
+                    Some(&final_ledger),
+                    true,
+                ),
+                &lease,
+                true,
+            ));
+        }
+        if let Err(result) = lease.revalidate() {
+            lease.retain();
+            finish_manifest!(result);
         }
         if let Err(result) = lease.release() {
             finish_manifest!(d1_manifest_contextualize_failure(
@@ -12798,17 +12976,6 @@ fn read_d1_migration_sql(migration: &D1MigrationFile) -> Result<String, CallTool
     })
 }
 
-fn d1_migrations_table_init_sql(table: &str) -> String {
-    let table = quote_sql_identifier(table);
-    format!(
-        "CREATE TABLE IF NOT EXISTS {table}(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT UNIQUE,
-    applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
-);"
-    )
-}
-
 pub(crate) fn d1_applied_migrations_sql(table: &str) -> String {
     format!("SELECT * FROM {} ORDER BY id", quote_sql_identifier(table))
 }
@@ -14988,11 +15155,17 @@ mod tests {
             "d1_rename_database",
             "d1_delete_database",
             "d1_execute_write",
-            "d1_apply_migrations",
+            "d1_apply_migration_manifest",
         ] {
             assert!(allowed.iter().any(|candidate| candidate == tool), "{tool}");
             assert!(payload["schemas"][tool].is_object(), "{tool} schema");
         }
+        assert!(
+            !allowed
+                .iter()
+                .any(|candidate| candidate == "d1_apply_migrations"),
+            "retired live migration surface must not appear in mutating discovery: {payload}"
+        );
     }
 
     #[tokio::test]
@@ -16468,7 +16641,7 @@ mod tests {
         let ledger = parse_d1_migration_ledger(&json!({
             "success": true,
             "errors": [],
-            "result": [{"success": true, "results": [{"id": 1, "name": "9999_external.sql"}]}]
+            "result": [{"success": true, "meta": {"served_by_primary": true}, "results": [{"id": 1, "name": "9999_external.sql"}]}]
         }))
         .expect("parse ledger");
         let error = classify_d1_manifest_ledger(&manifest, &ledger)
@@ -16568,7 +16741,7 @@ mod tests {
                 expected_d1_reconciliation_semantic_error(
                     "d1.empty_migration_manifest",
                     "manifest must contain at least one exact migration",
-                    "Provide the complete approved migration manifest in lexical Wrangler order.",
+                    "Provide the complete approved migration manifest in current Wrangler migration order.",
                 ),
             ),
             (
@@ -16732,7 +16905,7 @@ mod tests {
         let ledger = parse_d1_migration_ledger(&json!({
             "success": true,
             "errors": [],
-            "result": [{"success": true, "results": [{"id": 1, "name": "9999_external.sql"}]}]
+            "result": [{"success": true, "meta": {"served_by_primary": true}, "results": [{"id": 1, "name": "9999_external.sql"}]}]
         }))
         .expect("known contradictory ledger");
         let root = d1_migration_test_dir("d1-manifest-evidence");
@@ -16919,7 +17092,7 @@ mod tests {
                 "success": true,
                 "errors": [],
                 "messages": [],
-                "result": [{"success": true, "results": [{"id": 1, "name": "0001_initial.sql"}]}]
+                "result": [{"success": true, "meta": {"served_by_primary": true}, "results": [{"id": 1, "name": "0001_initial.sql"}]}]
             }))
         }
         let state = CallState {
@@ -17084,7 +17257,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn d1_apply_migrations_applies_only_pending_files_in_wrangler_order() {
+    async fn d1_apply_migrations_retires_live_mutation_without_provider_access() {
         #[derive(Clone)]
         struct CallState {
             bodies: Arc<Mutex<Vec<Value>>>,
@@ -17160,64 +17333,21 @@ mod tests {
             .await
             .expect("d1 apply");
 
-        assert_eq!(result.is_error, Some(false));
+        assert_eq!(result.is_error, Some(true));
         let bodies = state.bodies.lock().expect("bodies lock").clone();
-        assert_eq!(bodies.len(), 4);
-        assert!(
-            bodies[0]["sql"]
-                .as_str()
-                .unwrap()
-                .contains("CREATE TABLE IF NOT EXISTS \"custom_migrations\"")
-        );
-        assert_eq!(
-            bodies[1]["sql"],
-            json!("SELECT * FROM \"custom_migrations\" ORDER BY id")
-        );
-        let first_apply = bodies[2]["sql"].as_str().unwrap();
-        let second_apply = bodies[3]["sql"].as_str().unwrap();
-        assert!(first_apply.contains("ADD COLUMN two"));
-        assert!(
-            first_apply
-                .contains("INSERT INTO \"custom_migrations\" (name) VALUES ('2_second.sql')")
-        );
-        assert!(second_apply.contains("ADD COLUMN ten"));
-        assert!(
-            second_apply
-                .contains("INSERT INTO \"custom_migrations\" (name) VALUES ('10_tenth.sql')")
-        );
-        assert!(!first_apply.contains("0001_initial"));
-        assert!(!second_apply.contains("0001_initial"));
+        assert!(bodies.is_empty(), "retired live tool must not call D1");
 
         let payload = result.structured_content.expect("payload");
-        assert_eq!(payload["already_applied"][0], json!("0001_initial.sql"));
         assert_eq!(
-            payload["skipped_migrations"][0]["name"],
-            json!("0001_initial.sql")
+            payload["error"]["code"],
+            json!("d1.legacy_migration_apply_retired")
         );
-        assert_eq!(
-            payload["pending_migrations"][0]["name"],
-            json!("2_second.sql")
-        );
-        assert_eq!(
-            payload["pending_migrations"][1]["name"],
-            json!("10_tenth.sql")
-        );
-        assert_eq!(
-            payload["applied_migrations"][0]["name"],
-            json!("2_second.sql")
-        );
-        assert_eq!(
-            payload["applied_migrations"][1]["name"],
-            json!("10_tenth.sql")
-        );
-        let payload_text = serde_json::to_string(&payload).expect("payload json");
-        assert!(!payload_text.contains("ADD COLUMN two"));
-        assert!(!payload_text.contains("ADD COLUMN ten"));
+        assert_eq!(payload["provider_calls"], json!(0));
         let _ = fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
-    async fn d1_apply_migrations_fails_closed_when_ledger_cannot_be_read() {
+    async fn d1_apply_migrations_retires_before_ledger_read() {
         #[derive(Clone)]
         struct CallState {
             bodies: Arc<Mutex<Vec<Value>>>,
@@ -17277,12 +17407,11 @@ mod tests {
 
         assert_eq!(result.is_error, Some(true));
         let bodies = state.bodies.lock().expect("bodies lock").clone();
-        assert_eq!(bodies.len(), 2);
+        assert!(bodies.is_empty(), "retired live tool must not probe D1");
         let payload = result.structured_content.expect("payload");
-        assert_eq!(payload["unknown_ledger"], json!(true));
         assert_eq!(
             payload["error"]["code"],
-            json!("d1.migration_ledger_unreadable")
+            json!("d1.legacy_migration_apply_retired")
         );
         assert_eq!(
             payload["candidate_migrations"][0]["name"],

@@ -3357,8 +3357,16 @@ where
 fn decode_strict_d1_migration_manifest_envelope(
     body: &str,
 ) -> Result<CloudflareEnvelope<Value>, AdapterError> {
+    let value = decode_json_rejecting_duplicate_object_keys(body).map_err(|error| match error {
+        DuplicateSafeJsonError::DuplicateObjectKey => manifest_duplicate_object_key_error(),
+        DuplicateSafeJsonError::Malformed(error) => AdapterError::new(
+            "cloudflare.d1.migration_manifest_malformed_envelope",
+            format!("failed decoding strict D1 migration-manifest envelope: {error}"),
+            "Treat the manifest operation as ambiguous and reconcile the exact provider ledger before another apply.",
+        ),
+    })?;
     let envelope: StrictD1MigrationManifestEnvelope<Value> =
-        serde_json::from_str(body).map_err(|err| {
+        serde_json::from_value(value).map_err(|err| {
             AdapterError::new(
                 "cloudflare.d1.migration_manifest_malformed_envelope",
                 format!("failed decoding strict D1 migration-manifest envelope: {err}"),
@@ -3560,6 +3568,14 @@ fn reconciliation_duplicate_object_key_error() -> AdapterError {
         "cloudflare.d1.migration_reconciliation_duplicate_object_key",
         "Cloudflare reconciliation response contained a duplicate JSON object key",
         "Treat the provider evidence as contradictory and retain the lease.",
+    )
+}
+
+fn manifest_duplicate_object_key_error() -> AdapterError {
+    AdapterError::new(
+        "cloudflare.d1.migration_manifest_duplicate_object_key",
+        "Cloudflare migration-manifest response contained a duplicate JSON object key",
+        "Treat the manifest operation as ambiguous and do not create custody or submit migration SQL.",
     )
 }
 
@@ -4180,6 +4196,7 @@ mod tests {
 
     use super::{
         AdapterError, CloudflareApiError, CloudflareClient, D1MigrationReconciliationReadLifecycle,
+        decode_strict_d1_migration_manifest_envelope,
         decode_strict_d1_migration_reconciliation_envelope, is_d1_sqlite_auth_error, path_segment,
         with_request_api_token_override, worker_listing_identity, worker_version_id,
         worker_version_page_metadata,
@@ -4539,6 +4556,31 @@ mod tests {
         .expect("duplicate-free nested reconciliation envelope");
         assert!(envelope.success);
         assert!(envelope.result.is_some());
+    }
+
+    #[test]
+    fn manifest_decoder_rejects_recursive_duplicate_authority_keys_in_both_orders() {
+        for (first, second) in [("false", "true"), ("true", "false")] {
+            for body in [
+                format!(r#"{{"success":{first},"success":{second},"errors":[],"result":[]}}"#),
+                r#"{"success":true,"errors":[],"result":[{"success":true,"errors":[],"results":[{"type":"table","name":"d1_migrations","tbl_name":"d1_migrations","sql":"CREATE TABLE x","sql":"CREATE TABLE y"}],"meta":{"served_by_primary":true}}]}"#.to_string(),
+                [
+                    r#"{"success":true,"errors":[],"result":[{"success":true,"errors":[],"results":[{"type":"table","name":"d1_migrations","name":"D1_MIGRATIONS","tbl_name":"d1_migrations","sql":"CREATE TABLE x"}],"meta":{"served_by_primary":"#,
+                    first,
+                    r#","served_by_primary":"#,
+                    second,
+                    r#"}}]}"#,
+                ]
+                .concat(),
+            ] {
+                let error = decode_strict_d1_migration_manifest_envelope(&body)
+                    .expect_err("every recursive duplicate authority key must fail closed");
+                assert_eq!(
+                    error.code,
+                    "cloudflare.d1.migration_manifest_duplicate_object_key"
+                );
+            }
+        }
     }
 
     #[tokio::test]

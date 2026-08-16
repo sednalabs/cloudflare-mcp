@@ -547,17 +547,18 @@ pub const TOOL_DISCOVERY: &[ToolDiscoveryEntry] = &[
     ToolDiscoveryEntry {
         name: "d1_apply_migrations",
         group: "d1",
-        read_only: false,
-        description: "Apply local Wrangler-style D1 SQL migration files with dry-run safety.",
+        read_only: true,
+        description: "Inspect local Wrangler-style D1 SQL migration files; live mutation is retired in favour of the exact-byte manifest workflow.",
         keywords: &[
             "d1",
             "database",
             "migration",
             "migrations",
             "sql",
-            "apply",
+            "inspect",
             "wrangler",
-            "mutate",
+            "dry-run",
+            "retired",
         ],
     },
     ToolDiscoveryEntry {
