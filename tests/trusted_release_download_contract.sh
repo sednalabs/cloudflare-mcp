@@ -26,7 +26,8 @@ chmod 0755 "$scratch/bin/gh"
 export PATH="$scratch/bin:$PATH"
 export MOCK_RUN_JSON="$scratch/run.json"
 export MOCK_DOWNLOAD_LOG="$scratch/download.log"
-readonly sha="0123456789abcdef0123456789abcdef01234567"
+printf -v sha '%040x' 1
+readonly sha
 
 write_run() {
   jq -n \
@@ -70,7 +71,7 @@ for field in status conclusion event head_branch head_sha repository workflow_na
     conclusion) conclusion="failure" ;;
     event) event="pull_request" ;;
     head_branch) head_branch="release-candidate" ;;
-    head_sha) head_sha="ffffffffffffffffffffffffffffffffffffffff" ;;
+    head_sha) printf -v head_sha '%040x' 2 ;;
     repository) repository="example/cloudflare-mcp" ;;
     workflow_name) workflow_name="Other Validation" ;;
     workflow_path) workflow_path=".github/workflows/other.yml" ;;
