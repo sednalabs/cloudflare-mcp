@@ -76,6 +76,10 @@ See [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) for the longer version.
 cargo build
 ```
 
+Pull requests and `main` builds validate the same tool contract on native
+GitHub-hosted x86-64 and Arm64 Linux runners. Each architecture publishes a
+separately named release binary bundle with its provenance manifest.
+
 The server depends on the public Rust MCP Toolkit repository by pinned git
 revision, so a fresh clone of this repository is enough for normal builds.
 
