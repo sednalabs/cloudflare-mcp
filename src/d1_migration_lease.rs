@@ -1522,21 +1522,15 @@ fn d1_migration_lease_nonce(target_hash: &str, plan_sha256: &str) -> String {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+    use libc::{
+        AT_FDCWD, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_PATH, O_RDONLY, O_RDWR,
+    };
     use std::ffi::{CStr, CString, c_char};
     use std::io;
     use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 
-    const AT_FDCWD: i32 = -100;
-    const O_RDONLY: i32 = 0;
-    const O_RDWR: i32 = 2;
-    const O_CREAT: i32 = 0o100;
-    const O_EXCL: i32 = 0o200;
-    const O_DIRECTORY: i32 = 0o200000;
-    const O_NOFOLLOW: i32 = 0o400000;
-    const O_CLOEXEC: i32 = 0o2000000;
-    const O_PATH: i32 = 0o10000000;
     const RENAME_NOREPLACE: u32 = 1;
     const MAX_LEASE_PAYLOAD_BYTES: u64 = 4096;
     pub(super) const MAX_TARGET_CUSTODY_DIRECTORY_ENTRIES: usize = 4096;
@@ -1580,7 +1574,6 @@ mod linux {
 
     unsafe extern "C" {
         fn geteuid() -> u32;
-        fn openat(dirfd: i32, pathname: *const std::ffi::c_char, flags: i32, mode: u32) -> i32;
         fn mkdirat(dirfd: i32, pathname: *const std::ffi::c_char, mode: u32) -> i32;
         fn renameat2(
             olddirfd: i32,
@@ -1630,7 +1623,7 @@ mod linux {
     }
 
     fn open_at(dirfd: i32, name: &CString, flags: i32, mode: u32) -> io::Result<fs::File> {
-        let fd = unsafe { openat(dirfd, name.as_ptr(), flags, mode) };
+        let fd = unsafe { libc::openat(dirfd, name.as_ptr(), flags, mode) };
         if fd < 0 {
             Err(io::Error::last_os_error())
         } else {
@@ -3353,6 +3346,7 @@ use linux::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[cfg(target_os = "linux")]
     fn terminal_receipt(
@@ -3581,7 +3575,9 @@ mod tests {
         let first = std::thread::spawn(move || {
             acquire_d1_migration_lease_at(first_root, "acct-1", "db-1", "first", &"a".repeat(64))
         });
-        entered_rx.recv().expect("first holds guard");
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first holds guard within the bounded test window");
         let unrelated_root = private_test_root("race-unrelated");
         let mut unrelated = acquire_d1_migration_lease_at(
             unrelated_root.clone(),
