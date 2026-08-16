@@ -16741,7 +16741,7 @@ mod tests {
                 expected_d1_reconciliation_semantic_error(
                     "d1.empty_migration_manifest",
                     "manifest must contain at least one exact migration",
-                    "Provide the complete approved migration manifest in lexical Wrangler order.",
+                    "Provide the complete approved migration manifest in current Wrangler migration order.",
                 ),
             ),
             (

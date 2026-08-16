@@ -6785,7 +6785,7 @@ fn d1_reconcile_migration_manifest_stdio_wraps_semantic_validation_in_fixed_orde
             expected_d1_reconciliation_semantic_error(
                 "d1.empty_migration_manifest",
                 "manifest must contain at least one exact migration",
-                "Provide the complete approved migration manifest in lexical Wrangler order.",
+                "Provide the complete approved migration manifest in current Wrangler migration order.",
             ),
         ),
         (
