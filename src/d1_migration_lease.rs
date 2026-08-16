@@ -45,6 +45,18 @@ static TERMINAL_RECEIPT_READBACK_PAUSE_HOOK: OnceLock<
     Mutex<Option<TerminalReceiptReadbackPauseHook>>,
 > = OnceLock::new();
 
+#[cfg(test)]
+struct TerminalLeaseNamespaceReadbackPauseHook {
+    lease_nonce: String,
+    entered: mpsc::Sender<()>,
+    resume: mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static TERMINAL_LEASE_NAMESPACE_READBACK_PAUSE_HOOK: OnceLock<
+    Mutex<Option<TerminalLeaseNamespaceReadbackPauseHook>>,
+> = OnceLock::new();
+
 #[cfg(target_os = "linux")]
 const ACTIVE_LEASE_NAME: &str = "active.lease.json";
 #[cfg(target_os = "linux")]
@@ -617,6 +629,13 @@ impl D1RetainedMigrationLease {
                     receipt_persisted: None,
                 };
             }
+            maybe_pause_terminal_lease_namespace_readback_for_test(&expected.lease_nonce);
+            if self.revalidate().is_err() {
+                return D1TerminalEvidenceReadback {
+                    custody: D1TerminalCustodyNamespace::Unverified,
+                    receipt_persisted: None,
+                };
+            }
             let custody = match self.identity.namespace.as_str() {
                 "active" => D1TerminalCustodyNamespace::Active,
                 "retiring" => D1TerminalCustodyNamespace::Retiring,
@@ -844,6 +863,52 @@ fn maybe_pause_terminal_receipt_readback_for_test(lease_nonce: &str) {
 
 #[cfg(not(test))]
 fn maybe_pause_terminal_receipt_readback_for_test(_lease_nonce: &str) {}
+
+#[cfg(test)]
+fn install_terminal_lease_namespace_readback_pause_hook(
+    lease_nonce: String,
+    entered: mpsc::Sender<()>,
+    resume: mpsc::Receiver<()>,
+) {
+    let mut hook = TERMINAL_LEASE_NAMESPACE_READBACK_PAUSE_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("terminal lease namespace readback pause hook lock");
+    *hook = Some(TerminalLeaseNamespaceReadbackPauseHook {
+        lease_nonce,
+        entered,
+        resume,
+    });
+}
+
+#[cfg(test)]
+fn maybe_pause_terminal_lease_namespace_readback_for_test(lease_nonce: &str) {
+    let hook = {
+        let mut hook = TERMINAL_LEASE_NAMESPACE_READBACK_PAUSE_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("terminal lease namespace readback pause hook lock");
+        if hook
+            .as_ref()
+            .is_some_and(|candidate| candidate.lease_nonce == lease_nonce)
+        {
+            hook.take()
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        hook.entered
+            .send(())
+            .expect("terminal lease namespace readback pause receiver");
+        hook.resume
+            .recv()
+            .expect("terminal lease namespace readback resume signal");
+    }
+}
+
+#[cfg(not(test))]
+fn maybe_pause_terminal_lease_namespace_readback_for_test(_lease_nonce: &str) {}
 
 #[cfg(test)]
 fn terminal_retirement_test_failure_after(local_namespace_mutations: usize) -> bool {
@@ -1193,7 +1258,7 @@ mod linux {
     const O_PATH: i32 = 0o10000000;
     const RENAME_NOREPLACE: u32 = 1;
     const MAX_LEASE_PAYLOAD_BYTES: u64 = 4096;
-    const MAX_TERMINAL_RECEIPT_NAMESPACE_ENTRIES: usize = 4096;
+    pub(super) const MAX_TARGET_CUSTODY_DIRECTORY_ENTRIES: usize = 4096;
     const TERMINAL_RECEIPT_PREFIX: &str = "terminal-reconciliation.";
     const TERMINAL_RECEIPT_SUFFIX: &str = ".receipt.json";
 
@@ -1320,6 +1385,11 @@ mod linux {
                 }
                 let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
                 if name != b"." && name != b".." {
+                    if names.len() == MAX_TARGET_CUSTODY_DIRECTORY_ENTRIES {
+                        return Err(
+                            "target custody directory exceeds the finite enumeration limit",
+                        );
+                    }
                     names.push(name.to_vec());
                 }
             }
@@ -1963,9 +2033,6 @@ mod linux {
         for name in directory_entry_names(target)? {
             if !name.starts_with(TERMINAL_RECEIPT_PREFIX.as_bytes()) {
                 continue;
-            }
-            if receipts.len() == MAX_TERMINAL_RECEIPT_NAMESPACE_ENTRIES {
-                return Err("terminal reconciliation receipt namespace exceeds the custody limit");
             }
             let name = String::from_utf8(name)
                 .map_err(|_| "terminal reconciliation receipt namespace is not valid UTF-8")?;
@@ -3873,6 +3940,122 @@ mod tests {
         let result = readback.join().expect("readback thread");
         assert_eq!(result.custody, D1TerminalCustodyNamespace::Unverified);
         assert_eq!(result.receipt_persisted, None);
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_evidence_readback_rechecks_lease_namespace_after_final_receipt_read() {
+        let root = private_test_root("terminal-readback-final-lease-recheck");
+        let plan = "a".repeat(64);
+        let mut owner =
+            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
+                .expect("create retained evidence");
+        let identity = owner.identity.clone();
+        let target = owner
+            .active_path_for_test()
+            .expect("active path")
+            .parent()
+            .expect("target")
+            .to_path_buf();
+        owner.retain();
+        drop(owner);
+        let expected = terminal_receipt(&identity, &plan);
+        let retained = inspect_terminal_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "db-1",
+            "newsletter-core",
+            &plan,
+            &identity.nonce,
+            &identity.payload_sha256,
+        )
+        .expect("inspect retained lease");
+        retained
+            .persist_terminal_receipt(&expected)
+            .expect("persist exact terminal receipt");
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        install_terminal_lease_namespace_readback_pause_hook(
+            identity.nonce.clone(),
+            entered_tx,
+            resume_rx,
+        );
+        let expected_for_readback = expected.clone();
+        let readback = std::thread::spawn(move || {
+            retained.terminal_evidence_readback(&expected_for_readback, None)
+        });
+        entered_rx
+            .recv()
+            .expect("final stable receipt snapshot completed");
+        fs::rename(
+            target.join(ACTIVE_LEASE_NAME),
+            target.join(RETIRING_LEASE_NAME),
+        )
+        .expect("change lease namespace after final receipt readback");
+        resume_tx
+            .send(())
+            .expect("resume final lease namespace validation");
+        let result = readback.join().expect("readback thread");
+        assert_eq!(result.custody, D1TerminalCustodyNamespace::Unverified);
+        assert_eq!(result.receipt_persisted, None);
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_directory_enumeration_fails_closed_at_total_entry_limit() {
+        let root = private_test_root("terminal-enumeration-total-limit");
+        let plan = "a".repeat(64);
+        let mut owner =
+            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
+                .expect("create retained evidence");
+        let identity = owner.identity.clone();
+        let target = owner
+            .active_path_for_test()
+            .expect("active path")
+            .parent()
+            .expect("target")
+            .to_path_buf();
+        owner.retain();
+        drop(owner);
+        let retained = inspect_terminal_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "db-1",
+            "newsletter-core",
+            &plan,
+            &identity.nonce,
+            &identity.payload_sha256,
+        )
+        .expect("inspect retained lease");
+        for index in 0..linux::MAX_TARGET_CUSTODY_DIRECTORY_ENTRIES {
+            let name = match index % 3 {
+                0 => format!("retired.excess-{index}.lease.json"),
+                1 => format!("aborted-create.excess-{index}.lease.json"),
+                _ => format!("unrelated-evidence-{index}.json"),
+            };
+            fs::write(target.join(name), b"").expect("install bounded namespace entry");
+        }
+        let expected = terminal_receipt(&identity, &plan);
+        assert!(
+            retained.terminal_receipt_state(&expected).is_err(),
+            "mixed retired, aborted, and unrelated entries must hit the total enumeration cap"
+        );
+        assert!(
+            retained.persist_terminal_receipt(&expected).is_err(),
+            "enumeration exhaustion must fail before receipt creation"
+        );
+        assert!(
+            !target
+                .join(format!(
+                    "terminal-reconciliation.{}.receipt.json",
+                    identity.nonce
+                ))
+                .exists(),
+            "fail-closed enumeration must preserve create-only absence"
+        );
         fs::remove_dir_all(root).expect("test cleanup");
     }
 
