@@ -276,6 +276,7 @@ dependencies = [
  "futures",
  "hmac",
  "jsonwebtoken",
+ "libc",
  "mcp-toolkit-auth",
  "mcp-toolkit-core",
  "mcp-toolkit-http",
