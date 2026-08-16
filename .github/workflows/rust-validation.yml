@@ -83,14 +83,31 @@ jobs:
             *) echo "unsupported architecture: ${{ matrix.arch }}" >&2; exit 1 ;;
           esac
           readelf -h dist/package/cloudflare-mcp | grep -F 'Machine:' | grep -F "$expected_machine"
+          required_glibc="$({ readelf --version-info dist/package/cloudflare-mcp || true; } \
+            | grep -oE 'GLIBC_[0-9]+\.[0-9]+' \
+            | sed 's/^GLIBC_//' \
+            | sort -Vu \
+            | tail -n 1)"
+          test "$required_glibc" = 2.39
           test "$(sha256sum dist/package/cloudflare-mcp | cut -d ' ' -f 1)" = \
             "$(jq -r '.binary.sha256' dist/package/release-provenance.json)"
+          printf '%s\n' \
+            'format-version=1' \
+            'target-os=linux' \
+            'target-arch=${{ matrix.arch }}' \
+            'libc=glibc' \
+            "minimum-glibc=${required_glibc}" \
+            > dist/package/cloudflare-mcp.build-info
 
           (
             cd dist/package
-            sha256sum cloudflare-mcp release-provenance.json > SHA256SUMS
+            sha256sum cloudflare-mcp cloudflare-mcp.build-info release-provenance.json > SHA256SUMS
             sha256sum -c SHA256SUMS
-            tar -czf "../${artifact}.tar.gz" cloudflare-mcp release-provenance.json SHA256SUMS
+            tar -czf "../${artifact}.tar.gz" \
+              cloudflare-mcp \
+              cloudflare-mcp.build-info \
+              release-provenance.json \
+              SHA256SUMS
           )
           (
             cd dist
@@ -102,6 +119,10 @@ jobs:
           test "$(stat -c '%a' dist/verify/cloudflare-mcp)" = 755
           (cd dist/verify && sha256sum -c SHA256SUMS)
           readelf -h dist/verify/cloudflare-mcp | grep -F 'Machine:' | grep -F "$expected_machine"
+          grep -Fx 'target-os=linux' dist/verify/cloudflare-mcp.build-info
+          grep -Fx 'target-arch=${{ matrix.arch }}' dist/verify/cloudflare-mcp.build-info
+          grep -Fx 'libc=glibc' dist/verify/cloudflare-mcp.build-info
+          grep -Fx 'minimum-glibc=2.39' dist/verify/cloudflare-mcp.build-info
 
       - name: Upload release binary bundle
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'

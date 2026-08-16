@@ -531,6 +531,9 @@ Validation` workflow uploads a native artifact for each supported Linux
 architecture. Pull-request runs validate the same build and tool contract but
 do not publish installable bundles:
 
+The hosted binaries target GNU/Linux with glibc 2.39 or newer. Matching the CPU
+architecture is not sufficient, and these bundles do not support musl hosts.
+
 - `cloudflare-mcp-linux-x86_64-stdio-<git-sha>`
 - `cloudflare-mcp-linux-aarch64-stdio-<git-sha>`
 
@@ -539,6 +542,7 @@ artifact with `.tar.gz` appended, plus that archive's `.sha256` file. The tar
 archive contains:
 
 - `cloudflare-mcp` (mode `0755`)
+- `cloudflare-mcp.build-info`
 - `release-provenance.json`
 - `SHA256SUMS`
 
@@ -546,6 +550,9 @@ This is the preferred install source when the operator wants the local machine
 to run exactly the binary GitHub Actions validated. Example retrieval:
 
 ```bash
+set -euo pipefail
+umask 077
+
 arch="$(uname -m)"
 case "$arch" in
   x86_64|aarch64) ;;
@@ -553,7 +560,8 @@ case "$arch" in
 esac
 sha="<git-sha>"
 run_id="<run-id>"
-destination="/tmp/cloudflare-mcp-release-${arch}-${sha}"
+destination="$(mktemp -d)"
+trap 'find "$destination" -depth -delete' EXIT
 
 gh run download "$run_id" \
   --repo sednalabs/cloudflare-mcp \
@@ -563,10 +571,28 @@ gh run download "$run_id" \
 cd "$destination"
 bundle="cloudflare-mcp-linux-${arch}-stdio-${sha}.tar.gz"
 sha256sum -c "${bundle}.sha256"
-tar -xzf "${bundle}"
-sha256sum -c SHA256SUMS
-test "$(stat -c '%a' cloudflare-mcp)" = 755
-file cloudflare-mcp
+mkdir extracted
+tar -xzf "${bundle}" -C extracted
+(cd extracted && sha256sum -c SHA256SUMS)
+test "$(stat -c '%a' extracted/cloudflare-mcp)" = 755
+grep -Fx "target-arch=${arch}" extracted/cloudflare-mcp.build-info
+grep -Fx 'minimum-glibc=2.39' extracted/cloudflare-mcp.build-info
+test "$(jq -r '.source.commit' extracted/release-provenance.json)" = "$sha"
+
+glibc_identity="$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
+case "$glibc_identity" in
+  'glibc '*) host_glibc="${glibc_identity#glibc }" ;;
+  *) echo 'hosted cloudflare-mcp binaries require glibc 2.39 or newer' >&2; exit 1 ;;
+esac
+if ! printf '%s\n' 2.39 "$host_glibc" | sort -V -C; then
+  echo "hosted cloudflare-mcp binaries require glibc 2.39 or newer; found ${host_glibc}" >&2
+  exit 1
+fi
+
+version_dir="$HOME/.local/libexec/cloudflare-mcp/${sha}"
+install -Dm0755 extracted/cloudflare-mcp "$version_dir/cloudflare-mcp"
+install -m0644 extracted/cloudflare-mcp.build-info extracted/release-provenance.json \
+  extracted/SHA256SUMS "$version_dir/"
 ```
 
 After download, compare the installed file and the artifact manifest before
