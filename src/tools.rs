@@ -940,6 +940,9 @@ pub struct D1ApplyMigrationManifestArgs {
     #[serde(default)]
     pub dry_run: bool,
     #[serde(default)]
+    /// Exact lowercase `plan_sha256` returned by the dry run. Case changes and
+    /// surrounding whitespace are rejected so apply and recovery share one
+    /// canonical approval identity.
     pub approved_plan_sha256: Option<String>,
     #[serde(default)]
     pub max_rows: Option<usize>,
