@@ -526,9 +526,15 @@ duplicate-keyed, unknown-keyed, noncanonical, contradictory, hard-linked, or
 conflicting namespace evidence fails closed. Never delete, rewrite, rename, or
 copy these products manually.
 
-For CI-built release bundles, the `Rust Validation` workflow uploads a
-downloadable artifact named `cloudflare-mcp-linux-x86_64-stdio-<git-sha>` that
-contains:
+For CI-built release bundles, a trusted `main` push through the `Rust
+Validation` workflow uploads a native artifact for each supported Linux
+architecture. Pull-request runs validate the same build and tool contract but
+do not publish installable bundles:
+
+- `cloudflare-mcp-linux-x86_64-stdio-<git-sha>`
+- `cloudflare-mcp-linux-aarch64-stdio-<git-sha>`
+
+Each artifact contains:
 
 - `target/release/cloudflare-mcp`
 - `.tmp/release-provenance.json`
@@ -539,13 +545,14 @@ to run exactly the binary GitHub Actions validated. Example retrieval:
 ```bash
 gh run download <run-id> \
   --repo sednalabs/cloudflare-mcp \
-  --name cloudflare-mcp-linux-x86_64-stdio-<git-sha> \
-  --dir /tmp/cloudflare-mcp-release-<git-sha>
+  --name cloudflare-mcp-linux-<x86_64-or-aarch64>-stdio-<git-sha> \
+  --dir /tmp/cloudflare-mcp-release-<arch>-<git-sha>
 ```
 
 After download, compare the installed file and the artifact manifest before
 promoting a new `current` symlink or replacing the current binary in a versioned
-install directory.
+install directory. Require the manifest source commit and the downloaded
+artifact name to match the exact trusted `main` commit selected for install.
 
 ## Safety Profiles
 
