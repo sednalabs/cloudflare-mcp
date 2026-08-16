@@ -3581,7 +3581,9 @@ mod tests {
         let first = std::thread::spawn(move || {
             acquire_d1_migration_lease_at(first_root, "acct-1", "db-1", "first", &"a".repeat(64))
         });
-        entered_rx.recv().expect("first holds guard");
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first holds guard within the bounded test window");
         let unrelated_root = private_test_root("race-unrelated");
         let mut unrelated = acquire_d1_migration_lease_at(
             unrelated_root.clone(),
