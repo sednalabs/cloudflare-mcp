@@ -33,6 +33,9 @@ jobs:
       - name: Format check
         run: cargo fmt --check
 
+      - name: Trusted release download contract
+        run: tests/trusted_release_download_contract.sh
+
       - name: Unit and integration tests
         run: cargo test
 

@@ -558,15 +558,16 @@ case "$arch" in
   x86_64|aarch64) ;;
   *) echo "unsupported architecture: $arch" >&2; exit 1 ;;
 esac
-sha="<git-sha>"
-run_id="<run-id>"
+sha="<exact-40-character-main-commit-sha>"
+run_id="<trusted-main-push-run-id>"
 destination="$(mktemp -d)"
 trap 'find "$destination" -depth -delete' EXIT
 
-gh run download "$run_id" \
-  --repo sednalabs/cloudflare-mcp \
-  --name "cloudflare-mcp-linux-${arch}-stdio-${sha}" \
-  --dir "$destination"
+scripts/download-trusted-release-bundle.sh \
+  --run-id "$run_id" \
+  --sha "$sha" \
+  --arch "$arch" \
+  --destination "$destination"
 
 cd "$destination"
 bundle="cloudflare-mcp-linux-${arch}-stdio-${sha}.tar.gz"
@@ -599,6 +600,12 @@ After download, compare the installed file and the artifact manifest before
 promoting a new `current` symlink or replacing the current binary in a versioned
 install directory. Require the manifest source commit and the downloaded
 artifact name to match the exact trusted `main` commit selected for install.
+The download helper fails closed before requesting an artifact unless the
+GitHub Actions API identifies the selected run as completed successfully from a
+`push` to `main`, at that exact commit, in `sednalabs/cloudflare-mcp`, using
+the `Rust Validation` workflow at `.github/workflows/rust-validation.yml`. Do
+not replace this check with a PR run, a branch-name inference, or a manually
+reconstructed commit identity.
 
 ## Safety Profiles
 
