@@ -33,10 +33,22 @@ static D1_MANIFEST_LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 // are keyed by the exact lease nonce so a parallel retirement cannot consume
 // another test's single-use failure.
 #[cfg(test)]
-static TERMINAL_RETIRE_TEST_FAILURES: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+static TERMINAL_TEST_HOOK_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+struct TerminalRetirementTestFailure {
+    registration_id: u64,
+    local_namespace_mutations: usize,
+}
+
+#[cfg(test)]
+static TERMINAL_RETIRE_TEST_FAILURES: OnceLock<
+    Mutex<HashMap<String, TerminalRetirementTestFailure>>,
+> = OnceLock::new();
 
 #[cfg(test)]
 struct TerminalReceiptPreCreatePauseHook {
+    registration_id: u64,
     entered: mpsc::Sender<()>,
     resume: mpsc::Receiver<()>,
 }
@@ -48,6 +60,7 @@ static TERMINAL_RECEIPT_PRE_CREATE_PAUSE_HOOK: OnceLock<
 
 #[cfg(test)]
 struct TerminalReceiptReadbackPauseHook {
+    registration_id: u64,
     entered: mpsc::Sender<()>,
     resume: mpsc::Receiver<()>,
 }
@@ -59,6 +72,7 @@ static TERMINAL_RECEIPT_READBACK_PAUSE_HOOK: OnceLock<
 
 #[cfg(test)]
 struct TerminalLeaseNamespaceReadbackPauseHook {
+    registration_id: u64,
     entered: mpsc::Sender<()>,
     resume: mpsc::Receiver<()>,
 }
@@ -67,6 +81,22 @@ struct TerminalLeaseNamespaceReadbackPauseHook {
 static TERMINAL_LEASE_NAMESPACE_READBACK_PAUSE_HOOK: OnceLock<
     Mutex<HashMap<String, TerminalLeaseNamespaceReadbackPauseHook>>,
 > = OnceLock::new();
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum TerminalTestHookRegistry {
+    ReceiptPreCreate,
+    ReceiptReadback,
+    LeaseNamespaceReadback,
+    RetirementFailure,
+}
+
+#[cfg(test)]
+struct TerminalTestHookGuard {
+    registry: TerminalTestHookRegistry,
+    lease_nonce: String,
+    registration_id: u64,
+}
 
 #[cfg(target_os = "linux")]
 const ACTIVE_LEASE_NAME: &str = "active.lease.json";
@@ -901,11 +931,78 @@ impl D1RetainedMigrationLease {
 }
 
 #[cfg(test)]
+impl TerminalTestHookGuard {
+    fn new(registry: TerminalTestHookRegistry, lease_nonce: String) -> Self {
+        Self {
+            registry,
+            lease_nonce,
+            registration_id: TERMINAL_TEST_HOOK_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TerminalTestHookGuard {
+    fn drop(&mut self) {
+        match self.registry {
+            TerminalTestHookRegistry::ReceiptPreCreate => {
+                let mut hooks = TERMINAL_RECEIPT_PRE_CREATE_PAUSE_HOOK
+                    .get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock()
+                    .expect("terminal receipt pre-create pause hook lock");
+                if hooks
+                    .get(&self.lease_nonce)
+                    .is_some_and(|hook| hook.registration_id == self.registration_id)
+                {
+                    hooks.remove(&self.lease_nonce);
+                }
+            }
+            TerminalTestHookRegistry::ReceiptReadback => {
+                let mut hooks = TERMINAL_RECEIPT_READBACK_PAUSE_HOOK
+                    .get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock()
+                    .expect("terminal receipt readback pause hook lock");
+                if hooks
+                    .get(&self.lease_nonce)
+                    .is_some_and(|hook| hook.registration_id == self.registration_id)
+                {
+                    hooks.remove(&self.lease_nonce);
+                }
+            }
+            TerminalTestHookRegistry::LeaseNamespaceReadback => {
+                let mut hooks = TERMINAL_LEASE_NAMESPACE_READBACK_PAUSE_HOOK
+                    .get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock()
+                    .expect("terminal lease namespace readback pause hook lock");
+                if hooks
+                    .get(&self.lease_nonce)
+                    .is_some_and(|hook| hook.registration_id == self.registration_id)
+                {
+                    hooks.remove(&self.lease_nonce);
+                }
+            }
+            TerminalTestHookRegistry::RetirementFailure => {
+                let mut failures = TERMINAL_RETIRE_TEST_FAILURES
+                    .get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock()
+                    .expect("terminal retirement test failure lock");
+                if failures
+                    .get(&self.lease_nonce)
+                    .is_some_and(|failure| failure.registration_id == self.registration_id)
+                {
+                    failures.remove(&self.lease_nonce);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 fn install_terminal_receipt_readback_pause_hook(
     lease_nonce: String,
     entered: mpsc::Sender<()>,
     resume: mpsc::Receiver<()>,
-) -> Result<(), &'static str> {
+) -> Result<TerminalTestHookGuard, &'static str> {
     let mut hooks = TERMINAL_RECEIPT_READBACK_PAUSE_HOOK
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -913,11 +1010,19 @@ fn install_terminal_receipt_readback_pause_hook(
     if hooks.contains_key(&lease_nonce) {
         return Err("terminal receipt readback pause hook nonce is already installed");
     }
+    let guard = TerminalTestHookGuard::new(
+        TerminalTestHookRegistry::ReceiptReadback,
+        lease_nonce.clone(),
+    );
     hooks.insert(
         lease_nonce,
-        TerminalReceiptReadbackPauseHook { entered, resume },
+        TerminalReceiptReadbackPauseHook {
+            registration_id: guard.registration_id,
+            entered,
+            resume,
+        },
     );
-    Ok(())
+    Ok(guard)
 }
 
 #[cfg(test)]
@@ -947,7 +1052,7 @@ fn install_terminal_lease_namespace_readback_pause_hook(
     lease_nonce: String,
     entered: mpsc::Sender<()>,
     resume: mpsc::Receiver<()>,
-) -> Result<(), &'static str> {
+) -> Result<TerminalTestHookGuard, &'static str> {
     let mut hooks = TERMINAL_LEASE_NAMESPACE_READBACK_PAUSE_HOOK
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -955,11 +1060,19 @@ fn install_terminal_lease_namespace_readback_pause_hook(
     if hooks.contains_key(&lease_nonce) {
         return Err("terminal lease namespace readback pause hook nonce is already installed");
     }
+    let guard = TerminalTestHookGuard::new(
+        TerminalTestHookRegistry::LeaseNamespaceReadback,
+        lease_nonce.clone(),
+    );
     hooks.insert(
         lease_nonce,
-        TerminalLeaseNamespaceReadbackPauseHook { entered, resume },
+        TerminalLeaseNamespaceReadbackPauseHook {
+            registration_id: guard.registration_id,
+            entered,
+            resume,
+        },
     );
-    Ok(())
+    Ok(guard)
 }
 
 #[cfg(test)]
@@ -989,7 +1102,7 @@ fn install_terminal_receipt_pre_create_pause_hook(
     lease_nonce: String,
     entered: mpsc::Sender<()>,
     resume: mpsc::Receiver<()>,
-) -> Result<(), &'static str> {
+) -> Result<TerminalTestHookGuard, &'static str> {
     let mut hooks = TERMINAL_RECEIPT_PRE_CREATE_PAUSE_HOOK
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -997,11 +1110,19 @@ fn install_terminal_receipt_pre_create_pause_hook(
     if hooks.contains_key(&lease_nonce) {
         return Err("terminal receipt pre-create pause hook nonce is already installed");
     }
+    let guard = TerminalTestHookGuard::new(
+        TerminalTestHookRegistry::ReceiptPreCreate,
+        lease_nonce.clone(),
+    );
     hooks.insert(
         lease_nonce,
-        TerminalReceiptPreCreatePauseHook { entered, resume },
+        TerminalReceiptPreCreatePauseHook {
+            registration_id: guard.registration_id,
+            entered,
+            resume,
+        },
     );
-    Ok(())
+    Ok(guard)
 }
 
 #[cfg(test)]
@@ -1030,7 +1151,7 @@ fn maybe_pause_terminal_receipt_pre_create_for_test(_lease_nonce: &str) {}
 fn install_terminal_retirement_failure_after(
     lease_nonce: String,
     local_namespace_mutations: usize,
-) -> Result<(), &'static str> {
+) -> Result<TerminalTestHookGuard, &'static str> {
     if !(1..=2).contains(&local_namespace_mutations) {
         return Err("terminal retirement failure count must name a physical transition");
     }
@@ -1041,8 +1162,18 @@ fn install_terminal_retirement_failure_after(
     if failures.contains_key(&lease_nonce) {
         return Err("terminal retirement failure nonce is already installed");
     }
-    failures.insert(lease_nonce, local_namespace_mutations);
-    Ok(())
+    let guard = TerminalTestHookGuard::new(
+        TerminalTestHookRegistry::RetirementFailure,
+        lease_nonce.clone(),
+    );
+    failures.insert(
+        lease_nonce,
+        TerminalRetirementTestFailure {
+            registration_id: guard.registration_id,
+            local_namespace_mutations,
+        },
+    );
+    Ok(guard)
 }
 
 #[cfg(test)]
@@ -1054,7 +1185,10 @@ fn terminal_retirement_test_failure_after(
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .expect("terminal retirement test failure lock");
-    if failures.get(lease_nonce).copied() == Some(local_namespace_mutations) {
+    if failures
+        .get(lease_nonce)
+        .is_some_and(|failure| failure.local_namespace_mutations == local_namespace_mutations)
+    {
         failures.remove(lease_nonce);
         true
     } else {
@@ -3318,7 +3452,8 @@ mod tests {
         use std::sync::mpsc::{Receiver, Sender};
         use std::time::Duration;
 
-        type Installer = fn(String, Sender<()>, Receiver<()>) -> Result<(), &'static str>;
+        type Installer =
+            fn(String, Sender<()>, Receiver<()>) -> Result<TerminalTestHookGuard, &'static str>;
         type Pauser = fn(&str);
 
         fn exercise_registry(label: &str, install: Installer, pause: Pauser) {
@@ -3328,9 +3463,9 @@ mod tests {
             let (first_resume_tx, first_resume_rx) = mpsc::channel();
             let (second_entered_tx, second_entered_rx) = mpsc::channel();
             let (second_resume_tx, second_resume_rx) = mpsc::channel();
-            install(first_nonce.clone(), first_entered_tx, first_resume_rx)
+            let first_guard = install(first_nonce.clone(), first_entered_tx, first_resume_rx)
                 .expect("install first nonce-scoped pause hook");
-            install(second_nonce.clone(), second_entered_tx, second_resume_rx)
+            let second_guard = install(second_nonce.clone(), second_entered_tx, second_resume_rx)
                 .expect("install second nonce-scoped pause hook");
             let (duplicate_entered_tx, _duplicate_entered_rx) = mpsc::channel();
             let (_duplicate_resume_tx, duplicate_resume_rx) = mpsc::channel();
@@ -3356,8 +3491,30 @@ mod tests {
             second_resume_tx.send(()).expect("resume second nonce");
             first.join().expect("first nonce pause thread");
             second.join().expect("second nonce pause thread");
+            drop(first_guard);
+            drop(second_guard);
         }
 
+        fn exercise_unreached_disarm(label: &str, install: Installer) {
+            let nonce = format!("{label}-unreached-reuse");
+            let (entered_tx, _entered_rx) = mpsc::channel();
+            let (_resume_tx, resume_rx) = mpsc::channel();
+            let guard = install(nonce.clone(), entered_tx, resume_rx)
+                .expect("install unreached nonce-scoped pause hook");
+            drop(guard);
+
+            let (replacement_entered_tx, _replacement_entered_rx) = mpsc::channel();
+            let (_replacement_resume_tx, replacement_resume_rx) = mpsc::channel();
+            let replacement = install(nonce, replacement_entered_tx, replacement_resume_rx)
+                .expect("dropped unreached hook permits exact nonce reuse");
+            drop(replacement);
+        }
+
+        exercise_registry(
+            "receipt-pre-create",
+            install_terminal_receipt_pre_create_pause_hook,
+            maybe_pause_terminal_receipt_pre_create_for_test,
+        );
         exercise_registry(
             "receipt",
             install_terminal_receipt_readback_pause_hook,
@@ -3368,6 +3525,43 @@ mod tests {
             install_terminal_lease_namespace_readback_pause_hook,
             maybe_pause_terminal_lease_namespace_readback_for_test,
         );
+        exercise_unreached_disarm(
+            "receipt-pre-create",
+            install_terminal_receipt_pre_create_pause_hook,
+        );
+        exercise_unreached_disarm("receipt", install_terminal_receipt_readback_pause_hook);
+        exercise_unreached_disarm(
+            "lease-namespace",
+            install_terminal_lease_namespace_readback_pause_hook,
+        );
+    }
+
+    #[test]
+    fn nonce_keyed_terminal_retirement_fault_guard_disarms_and_cannot_remove_reuse() {
+        let nonce = "terminal-retirement-fault-guard-reuse".to_string();
+        let unreached = install_terminal_retirement_failure_after(nonce.clone(), 2)
+            .expect("install unreached retirement fault");
+        assert!(
+            !terminal_retirement_test_failure_after(&nonce, 1),
+            "an earlier transition must not consume the later fault"
+        );
+        drop(unreached);
+
+        let consumed = install_terminal_retirement_failure_after(nonce.clone(), 1)
+            .expect("dropped unreached fault permits exact nonce reuse");
+        assert!(terminal_retirement_test_failure_after(&nonce, 1));
+        let replacement = install_terminal_retirement_failure_after(nonce.clone(), 2)
+            .expect("consumed fault permits a newer same-nonce registration");
+        drop(consumed);
+        assert!(
+            terminal_retirement_test_failure_after(&nonce, 2),
+            "stale guard must not remove the newer same-nonce registration"
+        );
+        drop(replacement);
+
+        let final_reuse = install_terminal_retirement_failure_after(nonce, 1)
+            .expect("consumed replacement leaves the nonce reusable");
+        drop(final_reuse);
     }
 
     #[cfg(target_os = "linux")]
@@ -4118,7 +4312,7 @@ mod tests {
         let expected = terminal_receipt(&identity, &plan);
         let (entered_tx, entered_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
-        install_terminal_receipt_pre_create_pause_hook(
+        let _pre_create_guard = install_terminal_receipt_pre_create_pause_hook(
             identity.nonce.clone(),
             entered_tx,
             resume_rx,
@@ -4187,11 +4381,29 @@ mod tests {
 
         let mut invalid = expected.clone();
         invalid.version = 9;
+        let (entered_tx, _entered_rx) = mpsc::channel();
+        let (_resume_tx, resume_rx) = mpsc::channel();
+        let unreached_guard = install_terminal_receipt_pre_create_pause_hook(
+            identity.nonce.clone(),
+            entered_tx,
+            resume_rx,
+        )
+        .expect("install pre-create hook before earlier validation failure");
         let pre_create = retained
             .persist_terminal_receipt(&invalid)
             .expect_err("noncanonical authority fails before exclusive creation");
         assert_eq!(pre_create.local_namespace_mutations, 0);
         drop(pre_create);
+        drop(unreached_guard);
+        let (replacement_entered_tx, _replacement_entered_rx) = mpsc::channel();
+        let (_replacement_resume_tx, replacement_resume_rx) = mpsc::channel();
+        let replacement_guard = install_terminal_receipt_pre_create_pause_hook(
+            identity.nonce.clone(),
+            replacement_entered_tx,
+            replacement_resume_rx,
+        )
+        .expect("early validation exit cleanup permits same-nonce hook reuse");
+        drop(replacement_guard);
         assert!(
             !target
                 .join(format!(
@@ -4302,8 +4514,12 @@ mod tests {
 
         let (entered_tx, entered_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
-        install_terminal_receipt_readback_pause_hook(identity.nonce.clone(), entered_tx, resume_rx)
-            .expect("install nonce-scoped terminal receipt readback pause");
+        let _readback_guard = install_terminal_receipt_readback_pause_hook(
+            identity.nonce.clone(),
+            entered_tx,
+            resume_rx,
+        )
+        .expect("install nonce-scoped terminal receipt readback pause");
         let expected_for_readback = expected.clone();
         let readback = std::thread::spawn(move || {
             retained.terminal_evidence_readback(&expected_for_readback, None)
@@ -4362,7 +4578,7 @@ mod tests {
 
         let (entered_tx, entered_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
-        install_terminal_lease_namespace_readback_pause_hook(
+        let _namespace_guard = install_terminal_lease_namespace_readback_pause_hook(
             identity.nonce.clone(),
             entered_tx,
             resume_rx,
@@ -4429,7 +4645,7 @@ mod tests {
 
             let (entered_tx, entered_rx) = mpsc::channel();
             let (resume_tx, resume_rx) = mpsc::channel();
-            install_terminal_lease_namespace_readback_pause_hook(
+            let _namespace_guard = install_terminal_lease_namespace_readback_pause_hook(
                 identity.nonce.clone(),
                 entered_tx,
                 resume_rx,
@@ -4881,7 +5097,7 @@ mod tests {
                 .persist_terminal_receipt(&expected)
                 .expect("persist exact terminal receipt");
             assert!(created);
-            install_terminal_retirement_failure_after(
+            let _retirement_fault_guard = install_terminal_retirement_failure_after(
                 identity.nonce.clone(),
                 after_mutations as usize,
             )
@@ -4961,7 +5177,7 @@ mod tests {
             prepared_retirement("terminal-retire-faulted-parallel");
         let (unrelated_root, mut unrelated, unrelated_receipt, _unrelated_nonce) =
             prepared_retirement("terminal-retire-unrelated-parallel");
-        install_terminal_retirement_failure_after(faulted_nonce, 1)
+        let _retirement_fault_guard = install_terminal_retirement_failure_after(faulted_nonce, 1)
             .expect("install exact nonce-scoped retirement fault");
         let start = std::sync::Arc::new(std::sync::Barrier::new(3));
         let faulted_start = std::sync::Arc::clone(&start);
