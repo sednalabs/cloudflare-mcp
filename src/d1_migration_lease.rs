@@ -1580,7 +1580,12 @@ mod linux {
 
     unsafe extern "C" {
         fn geteuid() -> u32;
-        fn openat(dirfd: i32, pathname: *const std::ffi::c_char, flags: i32, mode: u32) -> i32;
+        // `openat(2)` is variadic because the mode argument is consumed only
+        // when creation flags require it.  Keep the C variadic declaration:
+        // AArch64 uses a distinct variadic calling convention, so declaring a
+        // fixed fourth argument can corrupt otherwise valid calls even though
+        // the same declaration happens to work on x86_64.
+        fn openat(dirfd: i32, pathname: *const std::ffi::c_char, flags: i32, ...) -> i32;
         fn mkdirat(dirfd: i32, pathname: *const std::ffi::c_char, mode: u32) -> i32;
         fn renameat2(
             olddirfd: i32,
