@@ -4,6 +4,8 @@
 //! evidence, not garbage: later processes stop for reconciliation when it is
 //! present. This module deliberately owns no MCP registration or provider I/O.
 
+#[cfg(test)]
+use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::path::Path;
 use std::path::PathBuf;
@@ -35,26 +37,24 @@ static TERMINAL_RETIRE_TEST_FAIL_AFTER_NAMESPACE_MUTATIONS: AtomicU64 = AtomicU6
 
 #[cfg(test)]
 struct TerminalReceiptReadbackPauseHook {
-    lease_nonce: String,
     entered: mpsc::Sender<()>,
     resume: mpsc::Receiver<()>,
 }
 
 #[cfg(test)]
 static TERMINAL_RECEIPT_READBACK_PAUSE_HOOK: OnceLock<
-    Mutex<Option<TerminalReceiptReadbackPauseHook>>,
+    Mutex<HashMap<String, TerminalReceiptReadbackPauseHook>>,
 > = OnceLock::new();
 
 #[cfg(test)]
 struct TerminalLeaseNamespaceReadbackPauseHook {
-    lease_nonce: String,
     entered: mpsc::Sender<()>,
     resume: mpsc::Receiver<()>,
 }
 
 #[cfg(test)]
 static TERMINAL_LEASE_NAMESPACE_READBACK_PAUSE_HOOK: OnceLock<
-    Mutex<Option<TerminalLeaseNamespaceReadbackPauseHook>>,
+    Mutex<HashMap<String, TerminalLeaseNamespaceReadbackPauseHook>>,
 > = OnceLock::new();
 
 #[cfg(target_os = "linux")]
@@ -867,33 +867,29 @@ fn install_terminal_receipt_readback_pause_hook(
     lease_nonce: String,
     entered: mpsc::Sender<()>,
     resume: mpsc::Receiver<()>,
-) {
-    let mut hook = TERMINAL_RECEIPT_READBACK_PAUSE_HOOK
-        .get_or_init(|| Mutex::new(None))
+) -> Result<(), &'static str> {
+    let mut hooks = TERMINAL_RECEIPT_READBACK_PAUSE_HOOK
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .expect("terminal receipt readback pause hook lock");
-    *hook = Some(TerminalReceiptReadbackPauseHook {
+    if hooks.contains_key(&lease_nonce) {
+        return Err("terminal receipt readback pause hook nonce is already installed");
+    }
+    hooks.insert(
         lease_nonce,
-        entered,
-        resume,
-    });
+        TerminalReceiptReadbackPauseHook { entered, resume },
+    );
+    Ok(())
 }
 
 #[cfg(test)]
 fn maybe_pause_terminal_receipt_readback_for_test(lease_nonce: &str) {
     let hook = {
-        let mut hook = TERMINAL_RECEIPT_READBACK_PAUSE_HOOK
-            .get_or_init(|| Mutex::new(None))
+        let mut hooks = TERMINAL_RECEIPT_READBACK_PAUSE_HOOK
+            .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .expect("terminal receipt readback pause hook lock");
-        if hook
-            .as_ref()
-            .is_some_and(|candidate| candidate.lease_nonce == lease_nonce)
-        {
-            hook.take()
-        } else {
-            None
-        }
+        hooks.remove(lease_nonce)
     };
     if let Some(hook) = hook {
         hook.entered
@@ -913,33 +909,29 @@ fn install_terminal_lease_namespace_readback_pause_hook(
     lease_nonce: String,
     entered: mpsc::Sender<()>,
     resume: mpsc::Receiver<()>,
-) {
-    let mut hook = TERMINAL_LEASE_NAMESPACE_READBACK_PAUSE_HOOK
-        .get_or_init(|| Mutex::new(None))
+) -> Result<(), &'static str> {
+    let mut hooks = TERMINAL_LEASE_NAMESPACE_READBACK_PAUSE_HOOK
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .expect("terminal lease namespace readback pause hook lock");
-    *hook = Some(TerminalLeaseNamespaceReadbackPauseHook {
+    if hooks.contains_key(&lease_nonce) {
+        return Err("terminal lease namespace readback pause hook nonce is already installed");
+    }
+    hooks.insert(
         lease_nonce,
-        entered,
-        resume,
-    });
+        TerminalLeaseNamespaceReadbackPauseHook { entered, resume },
+    );
+    Ok(())
 }
 
 #[cfg(test)]
 fn maybe_pause_terminal_lease_namespace_readback_for_test(lease_nonce: &str) {
     let hook = {
-        let mut hook = TERMINAL_LEASE_NAMESPACE_READBACK_PAUSE_HOOK
-            .get_or_init(|| Mutex::new(None))
+        let mut hooks = TERMINAL_LEASE_NAMESPACE_READBACK_PAUSE_HOOK
+            .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .expect("terminal lease namespace readback pause hook lock");
-        if hook
-            .as_ref()
-            .is_some_and(|candidate| candidate.lease_nonce == lease_nonce)
-        {
-            hook.take()
-        } else {
-            None
-        }
+        hooks.remove(lease_nonce)
     };
     if let Some(hook) = hook {
         hook.entered
@@ -2266,6 +2258,11 @@ mod linux {
         let bytes = canonical_terminal_receipt_bytes(expected)?;
         let name = terminal_receipt_name(&expected.lease_nonce);
         let name_c = c_string_name(&name)?;
+        if directory_entry_names(target)?.len() >= MAX_TARGET_CUSTODY_DIRECTORY_ENTRIES {
+            return Err(
+                "target custody directory has no capacity for a terminal reconciliation receipt",
+            );
+        }
         let mut file = open_at(
             target.as_raw_fd(),
             &name_c,
@@ -3156,6 +3153,63 @@ mod tests {
         assert_eq!(content["lease_retained"], json!(true), "{label}");
     }
 
+    #[test]
+    fn nonce_keyed_terminal_readback_pause_hooks_are_parallel_and_collision_safe() {
+        use std::sync::mpsc::{Receiver, Sender};
+        use std::time::Duration;
+
+        type Installer = fn(String, Sender<()>, Receiver<()>) -> Result<(), &'static str>;
+        type Pauser = fn(&str);
+
+        fn exercise_registry(label: &str, install: Installer, pause: Pauser) {
+            let first_nonce = format!("{label}-nonce-first");
+            let second_nonce = format!("{label}-nonce-second");
+            let (first_entered_tx, first_entered_rx) = mpsc::channel();
+            let (first_resume_tx, first_resume_rx) = mpsc::channel();
+            let (second_entered_tx, second_entered_rx) = mpsc::channel();
+            let (second_resume_tx, second_resume_rx) = mpsc::channel();
+            install(first_nonce.clone(), first_entered_tx, first_resume_rx)
+                .expect("install first nonce-scoped pause hook");
+            install(second_nonce.clone(), second_entered_tx, second_resume_rx)
+                .expect("install second nonce-scoped pause hook");
+            let (duplicate_entered_tx, _duplicate_entered_rx) = mpsc::channel();
+            let (_duplicate_resume_tx, duplicate_resume_rx) = mpsc::channel();
+            assert!(
+                install(
+                    first_nonce.clone(),
+                    duplicate_entered_tx,
+                    duplicate_resume_rx,
+                )
+                .is_err(),
+                "{label} registry must reject duplicate nonce installation"
+            );
+
+            let first = std::thread::spawn(move || pause(&first_nonce));
+            let second = std::thread::spawn(move || pause(&second_nonce));
+            first_entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("first nonce reached its independent pause");
+            second_entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("second nonce reached its independent pause");
+            first_resume_tx.send(()).expect("resume first nonce");
+            second_resume_tx.send(()).expect("resume second nonce");
+            first.join().expect("first nonce pause thread");
+            second.join().expect("second nonce pause thread");
+        }
+
+        exercise_registry(
+            "receipt",
+            install_terminal_receipt_readback_pause_hook,
+            maybe_pause_terminal_receipt_readback_for_test,
+        );
+        exercise_registry(
+            "lease-namespace",
+            install_terminal_lease_namespace_readback_pause_hook,
+            maybe_pause_terminal_lease_namespace_readback_for_test,
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn held_permanent_guard_blocks_another_thread_before_active_creation() {
@@ -3962,7 +4016,8 @@ mod tests {
 
         let (entered_tx, entered_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
-        install_terminal_receipt_readback_pause_hook(identity.nonce.clone(), entered_tx, resume_rx);
+        install_terminal_receipt_readback_pause_hook(identity.nonce.clone(), entered_tx, resume_rx)
+            .expect("install nonce-scoped terminal receipt readback pause");
         let expected_for_readback = expected.clone();
         let readback = std::thread::spawn(move || {
             retained.terminal_evidence_readback(&expected_for_readback, None)
@@ -4025,7 +4080,8 @@ mod tests {
             identity.nonce.clone(),
             entered_tx,
             resume_rx,
-        );
+        )
+        .expect("install nonce-scoped terminal lease namespace pause");
         let expected_for_readback = expected.clone();
         let readback = std::thread::spawn(move || {
             retained.terminal_evidence_readback(&expected_for_readback, None)
@@ -4091,7 +4147,8 @@ mod tests {
                 identity.nonce.clone(),
                 entered_tx,
                 resume_rx,
-            );
+            )
+            .expect("install nonce-scoped terminal lease namespace pause");
             let expected_for_readback = expected.clone();
             let readback = std::thread::spawn(move || {
                 retained.terminal_evidence_readback(&expected_for_readback, None)
@@ -4190,6 +4247,118 @@ mod tests {
             "fail-closed enumeration must preserve create-only absence"
         );
         fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_receipt_creation_respects_exact_total_directory_capacity_boundary() {
+        for (label, entries_before_persist, should_create) in [
+            (
+                "one-slot",
+                linux::MAX_TARGET_CUSTODY_DIRECTORY_ENTRIES - 1,
+                true,
+            ),
+            (
+                "at-capacity",
+                linux::MAX_TARGET_CUSTODY_DIRECTORY_ENTRIES,
+                false,
+            ),
+        ] {
+            let root = private_test_root(&format!("terminal-capacity-{label}"));
+            let plan = "a".repeat(64);
+            let mut owner = acquire_d1_migration_lease_at(
+                root.clone(),
+                "acct-1",
+                "db-1",
+                "newsletter-core",
+                &plan,
+            )
+            .expect("create retained evidence");
+            let identity = owner.identity.clone();
+            let target = owner
+                .active_path_for_test()
+                .expect("active path")
+                .parent()
+                .expect("target")
+                .to_path_buf();
+            owner.retain();
+            drop(owner);
+            let retained = inspect_terminal_d1_migration_lease_at(
+                root.clone(),
+                "acct-1",
+                "db-1",
+                "newsletter-core",
+                &plan,
+                &identity.nonce,
+                &identity.payload_sha256,
+            )
+            .expect("inspect retained lease");
+            let existing_entries = fs::read_dir(&target)
+                .expect("read initial target directory")
+                .count();
+            assert_eq!(
+                existing_entries, 2,
+                "permanent guard and retained lease consume two entries"
+            );
+            for index in existing_entries..entries_before_persist {
+                fs::write(target.join(format!("capacity-evidence-{index}.json")), b"")
+                    .expect("fill exact target directory capacity");
+            }
+            assert_eq!(
+                fs::read_dir(&target)
+                    .expect("read filled target directory")
+                    .count(),
+                entries_before_persist,
+                "{label} fixture must reach the exact pre-persist boundary"
+            );
+
+            let expected = terminal_receipt(&identity, &plan);
+            if should_create {
+                let (receipt, created) = retained
+                    .persist_terminal_receipt(&expected)
+                    .expect("one remaining entry must permit receipt creation");
+                assert!(created);
+                assert_eq!(
+                    fs::read_dir(&target)
+                        .expect("read target directory at cap")
+                        .count(),
+                    linux::MAX_TARGET_CUSTODY_DIRECTORY_ENTRIES
+                );
+                let (replayed, created_again) = retained
+                    .persist_terminal_receipt(&expected)
+                    .expect("exact replay must remain readable at the cap");
+                assert!(!created_again);
+                assert!(linux::same_terminal_receipt_evidence(&receipt, &replayed));
+                assert_eq!(
+                    retained
+                        .terminal_evidence_readback(&expected, None)
+                        .receipt_persisted,
+                    Some(true),
+                    "exact stable readback must remain valid at the cap"
+                );
+            } else {
+                assert!(
+                    retained.persist_terminal_receipt(&expected).is_err(),
+                    "a full target directory must fail before O_EXCL receipt creation"
+                );
+                assert!(
+                    !target
+                        .join(format!(
+                            "terminal-reconciliation.{}.receipt.json",
+                            identity.nonce
+                        ))
+                        .exists(),
+                    "capacity failure must preserve receipt absence"
+                );
+                assert_eq!(
+                    fs::read_dir(&target)
+                        .expect("read unchanged full target directory")
+                        .count(),
+                    linux::MAX_TARGET_CUSTODY_DIRECTORY_ENTRIES
+                );
+            }
+            fs::remove_dir_all(root).expect("test cleanup");
+        }
     }
 
     #[cfg(target_os = "linux")]
