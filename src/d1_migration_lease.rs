@@ -29,11 +29,22 @@ use crate::verification::now_unix_ms;
 pub(crate) const D1_MANIFEST_LEASE_ROOT_ENV: &str = "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT";
 static D1_MANIFEST_LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-// Kept test-only so production retirement has no injectable branch. The
-// compare-and-clear protocol makes a requested failure single-use even when
-// the focused tests run alongside unrelated lease tests.
+// Kept test-only so production retirement has no injectable branch. Faults
+// are keyed by the exact lease nonce so a parallel retirement cannot consume
+// another test's single-use failure.
 #[cfg(test)]
-static TERMINAL_RETIRE_TEST_FAIL_AFTER_NAMESPACE_MUTATIONS: AtomicU64 = AtomicU64::new(0);
+static TERMINAL_RETIRE_TEST_FAILURES: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+
+#[cfg(test)]
+struct TerminalReceiptPreCreatePauseHook {
+    entered: mpsc::Sender<()>,
+    resume: mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static TERMINAL_RECEIPT_PRE_CREATE_PAUSE_HOOK: OnceLock<
+    Mutex<HashMap<String, TerminalReceiptPreCreatePauseHook>>,
+> = OnceLock::new();
 
 #[cfg(test)]
 struct TerminalReceiptReadbackPauseHook {
@@ -200,6 +211,12 @@ pub(crate) struct D1TerminalRetirement {
 
 #[derive(Debug)]
 pub(crate) struct D1TerminalRetirementFailure {
+    pub(crate) result: CallToolResult,
+    pub(crate) local_namespace_mutations: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct D1TerminalReceiptPersistenceFailure {
     pub(crate) result: CallToolResult,
     pub(crate) local_namespace_mutations: usize,
 }
@@ -704,22 +721,37 @@ impl D1RetainedMigrationLease {
     pub(crate) fn persist_terminal_receipt(
         &self,
         expected: &D1TerminalReconciliationReceipt,
-    ) -> Result<(D1TerminalReconciliationReceiptEvidence, bool), CallToolResult> {
+    ) -> Result<(D1TerminalReconciliationReceiptEvidence, bool), D1TerminalReceiptPersistenceFailure>
+    {
         #[cfg(target_os = "linux")]
         {
-            self.revalidate()?;
+            self.revalidate()
+                .map_err(|result| D1TerminalReceiptPersistenceFailure {
+                    result,
+                    local_namespace_mutations: 0,
+                })?;
             if self.is_retired() {
-                return Err(d1_terminal_reconciliation_error(
-                    "terminal retirement exists without an exact durable terminal receipt",
-                ));
+                return Err(D1TerminalReceiptPersistenceFailure {
+                    result: d1_terminal_reconciliation_error(
+                        "terminal retirement exists without an exact durable terminal receipt",
+                    ),
+                    local_namespace_mutations: 0,
+                });
             }
-            linux::persist_terminal_receipt(&self.target, expected)
-                .map_err(d1_terminal_reconciliation_error)
+            linux::persist_terminal_receipt(&self.target, expected).map_err(|failure| {
+                D1TerminalReceiptPersistenceFailure {
+                    result: d1_terminal_reconciliation_error(failure.message),
+                    local_namespace_mutations: failure.local_namespace_mutations,
+                }
+            })
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = expected;
-            Err(d1_retained_lease_platform_unsupported())
+            Err(D1TerminalReceiptPersistenceFailure {
+                result: d1_retained_lease_platform_unsupported(),
+                local_namespace_mutations: 0,
+            })
         }
     }
 
@@ -792,7 +824,10 @@ impl D1RetainedMigrationLease {
                         local_namespace_mutations,
                     });
                 }
-                if terminal_retirement_test_failure_after(local_namespace_mutations) {
+                if terminal_retirement_test_failure_after(
+                    &self.identity.nonce,
+                    local_namespace_mutations,
+                ) {
                     return Err(D1TerminalRetirementFailure {
                         result: d1_terminal_reconciliation_error(
                             "test-only failure after active lease entered retiring state",
@@ -825,7 +860,10 @@ impl D1RetainedMigrationLease {
                     local_namespace_mutations,
                 });
             }
-            if terminal_retirement_test_failure_after(local_namespace_mutations) {
+            if terminal_retirement_test_failure_after(
+                &self.identity.nonce,
+                local_namespace_mutations,
+            ) {
                 return Err(D1TerminalRetirementFailure {
                     result: d1_terminal_reconciliation_error(
                         "test-only failure after retiring lease entered terminal retirement",
@@ -947,19 +985,88 @@ fn maybe_pause_terminal_lease_namespace_readback_for_test(lease_nonce: &str) {
 fn maybe_pause_terminal_lease_namespace_readback_for_test(_lease_nonce: &str) {}
 
 #[cfg(test)]
-fn terminal_retirement_test_failure_after(local_namespace_mutations: usize) -> bool {
-    TERMINAL_RETIRE_TEST_FAIL_AFTER_NAMESPACE_MUTATIONS
-        .compare_exchange(
-            local_namespace_mutations as u64,
-            0,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        )
-        .is_ok()
+fn install_terminal_receipt_pre_create_pause_hook(
+    lease_nonce: String,
+    entered: mpsc::Sender<()>,
+    resume: mpsc::Receiver<()>,
+) -> Result<(), &'static str> {
+    let mut hooks = TERMINAL_RECEIPT_PRE_CREATE_PAUSE_HOOK
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("terminal receipt pre-create pause hook lock");
+    if hooks.contains_key(&lease_nonce) {
+        return Err("terminal receipt pre-create pause hook nonce is already installed");
+    }
+    hooks.insert(
+        lease_nonce,
+        TerminalReceiptPreCreatePauseHook { entered, resume },
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+fn maybe_pause_terminal_receipt_pre_create_for_test(lease_nonce: &str) {
+    let hook = {
+        let mut hooks = TERMINAL_RECEIPT_PRE_CREATE_PAUSE_HOOK
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .expect("terminal receipt pre-create pause hook lock");
+        hooks.remove(lease_nonce)
+    };
+    if let Some(hook) = hook {
+        hook.entered
+            .send(())
+            .expect("terminal receipt pre-create pause receiver");
+        hook.resume
+            .recv()
+            .expect("terminal receipt pre-create resume signal");
+    }
 }
 
 #[cfg(not(test))]
-fn terminal_retirement_test_failure_after(_local_namespace_mutations: usize) -> bool {
+fn maybe_pause_terminal_receipt_pre_create_for_test(_lease_nonce: &str) {}
+
+#[cfg(test)]
+fn install_terminal_retirement_failure_after(
+    lease_nonce: String,
+    local_namespace_mutations: usize,
+) -> Result<(), &'static str> {
+    if !(1..=2).contains(&local_namespace_mutations) {
+        return Err("terminal retirement failure count must name a physical transition");
+    }
+    let mut failures = TERMINAL_RETIRE_TEST_FAILURES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("terminal retirement test failure lock");
+    if failures.contains_key(&lease_nonce) {
+        return Err("terminal retirement failure nonce is already installed");
+    }
+    failures.insert(lease_nonce, local_namespace_mutations);
+    Ok(())
+}
+
+#[cfg(test)]
+fn terminal_retirement_test_failure_after(
+    lease_nonce: &str,
+    local_namespace_mutations: usize,
+) -> bool {
+    let mut failures = TERMINAL_RETIRE_TEST_FAILURES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("terminal retirement test failure lock");
+    if failures.get(lease_nonce).copied() == Some(local_namespace_mutations) {
+        failures.remove(lease_nonce);
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(not(test))]
+fn terminal_retirement_test_failure_after(
+    _lease_nonce: &str,
+    _local_namespace_mutations: usize,
+) -> bool {
     false
 }
 
@@ -1297,6 +1404,27 @@ mod linux {
     pub(super) const MAX_TARGET_CUSTODY_DIRECTORY_ENTRIES: usize = 4096;
     const TERMINAL_RECEIPT_PREFIX: &str = "terminal-reconciliation.";
     const TERMINAL_RECEIPT_SUFFIX: &str = ".receipt.json";
+
+    pub(super) struct TerminalReceiptPersistenceFailure {
+        pub(super) message: &'static str,
+        pub(super) local_namespace_mutations: usize,
+    }
+
+    impl TerminalReceiptPersistenceFailure {
+        fn before_create(message: &'static str) -> Self {
+            Self {
+                message,
+                local_namespace_mutations: 0,
+            }
+        }
+
+        fn after_create(message: &'static str) -> Self {
+            Self {
+                message,
+                local_namespace_mutations: 1,
+            }
+        }
+    }
 
     #[repr(C)]
     struct CDirectoryStream {
@@ -2251,42 +2379,73 @@ mod linux {
     pub(super) fn persist_terminal_receipt(
         target: &fs::File,
         expected: &D1TerminalReconciliationReceipt,
-    ) -> Result<(D1TerminalReconciliationReceiptEvidence, bool), &'static str> {
-        if let Some(existing) = terminal_receipt_state(target, expected)? {
+    ) -> Result<(D1TerminalReconciliationReceiptEvidence, bool), TerminalReceiptPersistenceFailure>
+    {
+        if let Some(existing) = terminal_receipt_state(target, expected)
+            .map_err(TerminalReceiptPersistenceFailure::before_create)?
+        {
             return Ok((existing, false));
         }
-        let bytes = canonical_terminal_receipt_bytes(expected)?;
+        let bytes = canonical_terminal_receipt_bytes(expected)
+            .map_err(TerminalReceiptPersistenceFailure::before_create)?;
         let name = terminal_receipt_name(&expected.lease_nonce);
-        let name_c = c_string_name(&name)?;
-        if directory_entry_names(target)?.len() >= MAX_TARGET_CUSTODY_DIRECTORY_ENTRIES {
-            return Err(
+        let name_c =
+            c_string_name(&name).map_err(TerminalReceiptPersistenceFailure::before_create)?;
+        if directory_entry_names(target)
+            .map_err(TerminalReceiptPersistenceFailure::before_create)?
+            .len()
+            >= MAX_TARGET_CUSTODY_DIRECTORY_ENTRIES
+        {
+            return Err(TerminalReceiptPersistenceFailure::before_create(
                 "target custody directory has no capacity for a terminal reconciliation receipt",
-            );
+            ));
         }
-        let mut file = open_at(
+        maybe_pause_terminal_receipt_pre_create_for_test(&expected.lease_nonce);
+        let mut file = match open_at(
             target.as_raw_fd(),
             &name_c,
             O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
             0o600,
-        )
-        .map_err(|_| "terminal reconciliation receipt could not be created without replacement")?;
-        let metadata = file
-            .metadata()
-            .map_err(|_| "terminal reconciliation receipt identity is unavailable")?;
+        ) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return match terminal_receipt_state(target, expected) {
+                    Ok(Some(existing)) => Ok((existing, false)),
+                    Ok(None) => Err(TerminalReceiptPersistenceFailure::before_create(
+                        "terminal reconciliation receipt namespace changed after the exclusive-create race",
+                    )),
+                    Err(message) => Err(TerminalReceiptPersistenceFailure::before_create(message)),
+                };
+            }
+            Err(_) => {
+                return Err(TerminalReceiptPersistenceFailure::before_create(
+                    "terminal reconciliation receipt could not be created without replacement",
+                ));
+            }
+        };
+        let metadata = file.metadata().map_err(|_| {
+            TerminalReceiptPersistenceFailure::after_create(
+                "terminal reconciliation receipt identity is unavailable",
+            )
+        })?;
         if !private_file(&metadata) || metadata.nlink() != 1 {
-            return Err(
+            return Err(TerminalReceiptPersistenceFailure::after_create(
                 "terminal reconciliation receipt is not one private unaliased regular file",
-            );
+            ));
         }
         if file
             .write_all(&bytes)
             .and_then(|()| file.sync_all())
             .is_err()
         {
-            return Err("terminal reconciliation receipt could not be durably written");
+            return Err(TerminalReceiptPersistenceFailure::after_create(
+                "terminal reconciliation receipt could not be durably written",
+            ));
         }
         if sync_d1_lease_directory(target).is_err() {
-            return Err("terminal reconciliation receipt directory could not be synchronized");
+            return Err(TerminalReceiptPersistenceFailure::after_create(
+                "terminal reconciliation receipt directory could not be synchronized",
+            ));
         }
         let file_identity = identity(&metadata);
         let evidence = D1TerminalReconciliationReceiptEvidence {
@@ -2299,7 +2458,8 @@ mod linux {
             target_key_sha256: expected.target_key_sha256.clone(),
             lease_nonce: expected.lease_nonce.clone(),
         };
-        validate_stable_terminal_receipt_evidence(target, &evidence)?;
+        validate_stable_terminal_receipt_evidence(target, &evidence)
+            .map_err(TerminalReceiptPersistenceFailure::after_create)?;
         Ok((evidence, true))
     }
 
@@ -3934,6 +4094,132 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn terminal_receipt_exclusive_create_race_attributes_only_the_creator() {
+        let root = private_test_root("terminal-receipt-exclusive-create-race");
+        let plan = "a".repeat(64);
+        let mut owner =
+            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
+                .expect("create retained evidence");
+        let identity = owner.identity.clone();
+        owner.retain();
+        drop(owner);
+        let retained = std::sync::Arc::new(
+            inspect_terminal_d1_migration_lease_at(
+                root.clone(),
+                "acct-1",
+                "db-1",
+                "newsletter-core",
+                &plan,
+                &identity.nonce,
+                &identity.payload_sha256,
+            )
+            .expect("inspect retained lease"),
+        );
+        let expected = terminal_receipt(&identity, &plan);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        install_terminal_receipt_pre_create_pause_hook(
+            identity.nonce.clone(),
+            entered_tx,
+            resume_rx,
+        )
+        .expect("install exact pre-create pause");
+
+        let delayed_retained = std::sync::Arc::clone(&retained);
+        let delayed_expected = expected.clone();
+        let delayed = std::thread::spawn(move || {
+            delayed_retained.persist_terminal_receipt(&delayed_expected)
+        });
+        entered_rx
+            .recv()
+            .expect("delayed contender passed stable absence readback");
+        let (created_receipt, creator_mutated) = retained
+            .persist_terminal_receipt(&expected)
+            .expect("unpaused creator wins exclusive creation");
+        assert!(creator_mutated, "exclusive creator owns one mutation");
+        resume_tx.send(()).expect("resume delayed contender");
+        let (raced_receipt, delayed_mutated) = delayed
+            .join()
+            .expect("delayed contender thread")
+            .expect("exact O_EXCL loser converges on the incumbent receipt");
+        assert!(
+            !delayed_mutated,
+            "the losing O_EXCL racer must not claim the creator's mutation"
+        );
+        assert!(linux::same_terminal_receipt_evidence(
+            &created_receipt,
+            &raced_receipt
+        ));
+        drop(raced_receipt);
+        drop(created_receipt);
+        drop(retained);
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_receipt_failures_distinguish_pre_create_from_post_create_mutation() {
+        let root = private_test_root("terminal-receipt-failure-accounting");
+        let plan = "a".repeat(64);
+        let mut owner =
+            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
+                .expect("create retained evidence");
+        let identity = owner.identity.clone();
+        let target = owner
+            .active_path_for_test()
+            .expect("active path")
+            .parent()
+            .expect("target")
+            .to_path_buf();
+        owner.retain();
+        drop(owner);
+        let expected = terminal_receipt(&identity, &plan);
+        let retained = inspect_terminal_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "db-1",
+            "newsletter-core",
+            &plan,
+            &identity.nonce,
+            &identity.payload_sha256,
+        )
+        .expect("inspect retained lease");
+
+        let mut invalid = expected.clone();
+        invalid.version = 9;
+        let pre_create = retained
+            .persist_terminal_receipt(&invalid)
+            .expect_err("noncanonical authority fails before exclusive creation");
+        assert_eq!(pre_create.local_namespace_mutations, 0);
+        drop(pre_create);
+        assert!(
+            !target
+                .join(format!(
+                    "terminal-reconciliation.{}.receipt.json",
+                    identity.nonce
+                ))
+                .exists(),
+            "pre-create failure leaves the receipt namespace absent"
+        );
+
+        linux::fail_next_directory_sync_for_test();
+        let post_create = retained
+            .persist_terminal_receipt(&expected)
+            .expect_err("directory sync fails after exclusive creation");
+        assert_eq!(post_create.local_namespace_mutations, 1);
+        assert_eq!(
+            retained
+                .terminal_evidence_readback(&expected, None)
+                .receipt_persisted,
+            Some(true),
+            "post-create failure leaves exact receipt evidence"
+        );
+        drop(retained);
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn terminal_evidence_readback_rejects_an_altered_receipt_as_unknown_custody() {
         let root = private_test_root("terminal-readback-altered-receipt");
         let plan = "a".repeat(64);
@@ -4595,8 +4881,11 @@ mod tests {
                 .persist_terminal_receipt(&expected)
                 .expect("persist exact terminal receipt");
             assert!(created);
-            TERMINAL_RETIRE_TEST_FAIL_AFTER_NAMESPACE_MUTATIONS
-                .store(after_mutations, Ordering::SeqCst);
+            install_terminal_retirement_failure_after(
+                identity.nonce.clone(),
+                after_mutations as usize,
+            )
+            .expect("install nonce-scoped retirement fault");
             let failure = retained
                 .retire_after_terminal_receipt(&receipt)
                 .expect_err("test failure follows a physical namespace rename");
@@ -4624,6 +4913,80 @@ mod tests {
             drop(retained);
             fs::remove_dir_all(root).expect("test cleanup");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_retirement_fault_isolation_survives_parallel_unrelated_retirement() {
+        fn prepared_retirement(
+            label: &str,
+        ) -> (
+            PathBuf,
+            D1RetainedMigrationLease,
+            D1TerminalReconciliationReceiptEvidence,
+            String,
+        ) {
+            let root = private_test_root(label);
+            let plan = "a".repeat(64);
+            let mut owner = acquire_d1_migration_lease_at(
+                root.clone(),
+                "acct-1",
+                "db-1",
+                "newsletter-core",
+                &plan,
+            )
+            .expect("create retained evidence");
+            let identity = owner.identity.clone();
+            owner.retain();
+            drop(owner);
+            let expected = terminal_receipt(&identity, &plan);
+            let retained = inspect_terminal_d1_migration_lease_at(
+                root.clone(),
+                "acct-1",
+                "db-1",
+                "newsletter-core",
+                &plan,
+                &identity.nonce,
+                &identity.payload_sha256,
+            )
+            .expect("inspect retained lease");
+            let (receipt, created) = retained
+                .persist_terminal_receipt(&expected)
+                .expect("persist exact receipt");
+            assert!(created);
+            (root, retained, receipt, identity.nonce)
+        }
+
+        let (faulted_root, mut faulted, faulted_receipt, faulted_nonce) =
+            prepared_retirement("terminal-retire-faulted-parallel");
+        let (unrelated_root, mut unrelated, unrelated_receipt, _unrelated_nonce) =
+            prepared_retirement("terminal-retire-unrelated-parallel");
+        install_terminal_retirement_failure_after(faulted_nonce, 1)
+            .expect("install exact nonce-scoped retirement fault");
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let faulted_start = std::sync::Arc::clone(&start);
+        let faulted_thread = std::thread::spawn(move || {
+            faulted_start.wait();
+            faulted.retire_after_terminal_receipt(&faulted_receipt)
+        });
+        let unrelated_start = std::sync::Arc::clone(&start);
+        let unrelated_thread = std::thread::spawn(move || {
+            unrelated_start.wait();
+            unrelated.retire_after_terminal_receipt(&unrelated_receipt)
+        });
+        start.wait();
+        let unrelated_result = unrelated_thread
+            .join()
+            .expect("unrelated retirement thread")
+            .expect("unrelated retirement cannot consume scoped fault");
+        assert_eq!(unrelated_result.local_namespace_mutations, 2);
+        let faulted_result = faulted_thread
+            .join()
+            .expect("faulted retirement thread")
+            .expect_err("exact scoped retirement fails after its first transition");
+        assert_eq!(faulted_result.local_namespace_mutations, 1);
+        fs::remove_dir_all(faulted_root).expect("faulted test cleanup");
+        fs::remove_dir_all(unrelated_root).expect("unrelated test cleanup");
     }
 
     #[cfg(target_os = "linux")]

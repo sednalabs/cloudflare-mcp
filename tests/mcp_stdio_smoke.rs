@@ -7105,6 +7105,7 @@ fn d1_reconciliation_and_terminal_finalize_share_view_trigger_effect_proof() {
     );
     assert_eq!(live_content["provider_calls"], json!(4));
     assert_eq!(live_content["provider_mutations"], json!(0));
+    assert_eq!(live_content["local_namespace_mutations"], json!(3));
     assert_eq!(live_content["lease_retained"], json!(false));
     assert_eq!(
         live_content["effect_assertion_id"],
@@ -7269,6 +7270,7 @@ fn d1_reconciliation_and_terminal_finalize_share_additive_effect_proof() {
     );
     assert_eq!(live_content["provider_calls"], json!(4));
     assert_eq!(live_content["provider_mutations"], json!(0));
+    assert_eq!(live_content["local_namespace_mutations"], json!(3));
     assert_eq!(live_content["lease_retained"], json!(false));
     assert_eq!(
         live_content["effect_assertion_id"],
@@ -8892,6 +8894,8 @@ fn d1_terminal_resumes_canonical_v1_receipt_from_retiring_namespace() {
     );
     assert_eq!(resumed_content["terminal_receipt_version"], json!(1));
     assert_eq!(resumed_content["provider_calls"], json!(4));
+    assert_eq!(resumed_content["provider_mutations"], json!(0));
+    assert_eq!(resumed_content["local_namespace_mutations"], json!(1));
     assert_eq!(requests.lock().expect("request log").len(), 6);
     assert_released_manifest_target_custody(&lease_root);
     mcp.terminate();
@@ -9044,6 +9048,7 @@ fn d1_finalize_migration_reconciliation_stdio_requires_preapproval_and_retires_a
     );
     assert_eq!(live_content["provider_calls"], json!(4));
     assert_eq!(live_content["provider_mutations"], json!(0));
+    assert_eq!(live_content["local_namespace_mutations"], json!(3));
     assert_eq!(live_content["lease_retained"], json!(false));
     assert_eq!(
         live_content["custody_status"],
@@ -9083,6 +9088,8 @@ fn d1_finalize_migration_reconciliation_stdio_requires_preapproval_and_retires_a
     );
     assert_eq!(replay_content["replayed"], json!(true));
     assert_eq!(replay_content["provider_calls"], json!(0));
+    assert_eq!(replay_content["provider_mutations"], json!(0));
+    assert_eq!(replay_content["local_namespace_mutations"], json!(0));
     assert_eq!(replay_content["lease_retained"], json!(false));
     assert_eq!(
         replay_content["custody_status"],
@@ -9195,6 +9202,8 @@ fn d1_finalize_migration_reconciliation_resumes_exact_receipt_from_retiring_name
         "{interrupted_content}"
     );
     assert_eq!(interrupted_content["provider_calls"], json!(4));
+    assert_eq!(interrupted_content["provider_mutations"], json!(0));
+    assert_eq!(interrupted_content["local_namespace_mutations"], json!(1));
     assert_eq!(interrupted_content["lease_retained"], json!(true));
     assert_eq!(
         interrupted_content["custody_status"],
@@ -9246,6 +9255,7 @@ fn d1_finalize_migration_reconciliation_resumes_exact_receipt_from_retiring_name
     );
     assert_eq!(resumed_content["provider_calls"], json!(4));
     assert_eq!(resumed_content["provider_mutations"], json!(0));
+    assert_eq!(resumed_content["local_namespace_mutations"], json!(1));
     assert_eq!(resumed_content["lease_retained"], json!(false));
     assert_eq!(
         resumed_content["custody_status"],

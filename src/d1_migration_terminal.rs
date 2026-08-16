@@ -608,21 +608,11 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
         Some(evidence) => (evidence, false),
         None => match proof.lease.persist_terminal_receipt(&receipt) {
             Ok(receipt) => receipt,
-            Err(result) => {
+            Err(failure) => {
                 let evidence =
                     observed_terminal_evidence(&proof.lease, &receipt, legacy_receipt.as_ref());
-                // Receipt creation can fail after O_EXCL created the private
-                // file, after bytes were written, or after directory sync.
-                // Re-read the exact descriptor-bound namespace before making
-                // any claim about local mutation. A malformed, contradictory,
-                // or uninspectable entry is deliberately reported as unknown.
-                let local_namespace_mutations = match evidence.receipt_persisted {
-                    Value::Bool(true) => json!(1),
-                    Value::Bool(false) => json!(0),
-                    _ => Value::Null,
-                };
                 return terminalize_failure(
-                    result,
+                    failure.result,
                     evidence.custody,
                     // The successful pre-receipt refresh is the one completed
                     // provider call after the prepared proof; receipt storage
@@ -630,7 +620,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
                     base_provider_calls + 1,
                     response_evidence,
                     lifecycle,
-                    local_namespace_mutations,
+                    failure.local_namespace_mutations,
                     evidence.receipt_persisted,
                 );
             }
