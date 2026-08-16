@@ -151,6 +151,12 @@ fn tool_capabilities() -> Vec<ToolCapability> {
         cap("d1_bootstrap_migration_ledger")
             .with_group("d1")
             .with_read_only(false),
+        cap("d1_reconcile_bootstrap_migration_ledger")
+            .with_group("d1")
+            .with_read_only(true),
+        cap("d1_finalize_bootstrap_migration_ledger")
+            .with_group("d1")
+            .with_read_only(false),
         cap("d1_reconcile_migration_manifest")
             .with_group("d1")
             .with_read_only(true),

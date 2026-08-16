@@ -110,6 +110,54 @@ chain, and reports the single mutation attempt. Escalate that exact evidence to
 the governed reconciliation path. A canonical empty ledger observed afterward
 does not prove whether this call created it, so it is not permission to replay.
 
+### Recover retained bootstrap custody
+
+This recovery is bootstrap-specific. Never substitute an empty migration
+manifest and never issue the initializer again.
+
+1. Preserve the exact `active.lease.json` or `retiring.lease.json` and record
+   the original bootstrap result's plan, nonce, payload digest, account,
+   database, and migrations-table identity.
+2. Call `d1_reconcile_bootstrap_migration_ledger` with those exact fields. It
+   locks and validates the existing `migration-ledger-bootstrap-v1` custody,
+   then makes two stable primary proof windows. Each window contains two schema
+   inventory reads and two empty-ledger reads. Every read is one HTTP attempt,
+   never follows a redirect, and records exact response-byte digest, size, and
+   lifecycle evidence. A successful response therefore reports eight actual
+   provider dispatches, zero provider mutations, zero local namespace mutations,
+   and four approval products: reconciliation plan, initializer
+   authority, query authority, and canonical snapshot digests.
+3. Stop on any nonterminal product. Physical ledger absence or any non-ledger
+   object is `conflicting`; a non-empty ledger is also conflicting. Malformed,
+   non-primary, unreadable, unstable, or custody-drifted evidence is `unknown`.
+   Every state keeps initializer retry forbidden and leaves custody in place.
+4. Record the four successful reconciliation digests and choose two distinct
+   operator-controlled lowercase SHA-256 request and attempt identities. Call
+   `d1_finalize_bootstrap_migration_ledger` with `dry_run=true`; independently
+   approve the returned terminal-plan digest.
+5. Repeat with `dry_run=false` and the exact approved terminal plan. The tool
+   repeats the eight-read proof, performs one additional four-read proof before
+   creating the canonical private receipt, performs another four-read proof
+   before retirement, and issues no provider write. Only then may it durably
+   move custody from active to retiring to `retired.<nonce>.lease.json`. If
+   custody changes during either refresh, require `lease_retained=null` and
+   `retained_evidence_unverified`; after receipt creation the response must also
+   report that receipt and its one local namespace mutation without retiring it.
+6. Require `bootstrap_terminal_complete`, verified retired custody, the exact
+   receipt digest, `provider_mutations=0`, and truthful local mutation counts.
+   Treat the final descriptor-bound readback as current receipt authority: a
+   failed readback must report its observed true/false/null receipt state, not
+   merely the earlier successful creation event.
+   An exact completed replay validates the receipt and retirement with zero
+   provider calls. A receipt without matching provider proof, or retirement
+   without the exact receipt, is a blocker rather than cleanup authority.
+
+The only terminal provider product is the exact schema produced by the
+approved canonical initializer, with that ledger as the sole application-owned
+object and zero ledger rows. This proves current convergence, not which caller
+created it. General manifest reconciliation remains a separate authority and
+cannot reconcile or retire bootstrap-family custody.
+
 ## Exact-byte D1 migration manifests
 
 Use `d1_apply_migration_manifest` for an approval-gated D1 migration family.

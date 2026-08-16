@@ -1719,6 +1719,83 @@
       "name": "d1_execute_write"
     },
     {
+      "description": "Persist an approval-bound terminal receipt and retire one exactly re-proven retained migration-ledger bootstrap without any provider write.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "approved_bootstrap_plan_sha256": {
+            "type": "string"
+          },
+          "approved_terminal_plan_sha256": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "database_id": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "expected_canonical_snapshot_sha256": {
+            "type": "string"
+          },
+          "expected_initializer_authority_sha256": {
+            "type": "string"
+          },
+          "expected_query_authority_sha256": {
+            "type": "string"
+          },
+          "expected_reconciliation_plan_sha256": {
+            "type": "string"
+          },
+          "lease_nonce": {
+            "type": "string"
+          },
+          "lease_payload_sha256": {
+            "type": "string"
+          },
+          "migrations_table": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "terminal_attempt_sha256": {
+            "type": "string"
+          },
+          "terminal_request_sha256": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "database_id",
+          "approved_bootstrap_plan_sha256",
+          "lease_nonce",
+          "lease_payload_sha256",
+          "expected_reconciliation_plan_sha256",
+          "expected_initializer_authority_sha256",
+          "expected_query_authority_sha256",
+          "expected_canonical_snapshot_sha256",
+          "terminal_request_sha256",
+          "terminal_attempt_sha256"
+        ],
+        "type": "object"
+      },
+      "name": "d1_finalize_bootstrap_migration_ledger"
+    },
+    {
       "description": "Create an approval-bound terminal reconciliation receipt and retire one exactly re-proven retained D1 migration lease without provider writes.",
       "inputSchema": {
         "$defs": {
@@ -2203,6 +2280,48 @@
         "type": "object"
       },
       "name": "d1_query_read_only"
+    },
+    {
+      "description": "Read-only reconciliation of one exact retained migration-ledger bootstrap against two stable primary canonical empty-ledger proof windows.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "approved_bootstrap_plan_sha256": {
+            "type": "string"
+          },
+          "database_id": {
+            "type": "string"
+          },
+          "lease_nonce": {
+            "type": "string"
+          },
+          "lease_payload_sha256": {
+            "type": "string"
+          },
+          "migrations_table": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "database_id",
+          "approved_bootstrap_plan_sha256",
+          "lease_nonce",
+          "lease_payload_sha256"
+        ],
+        "type": "object"
+      },
+      "name": "d1_reconcile_bootstrap_migration_ledger"
     },
     {
       "description": "Build stable read-only ledger, schema, table_xinfo, and foreign-key reconciliation evidence for one exact retained D1 migration manifest.",

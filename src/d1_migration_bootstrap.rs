@@ -117,6 +117,30 @@ impl D1BootstrapInventory {
     }
 }
 
+/// SQLite persists the initializer without its `IF NOT EXISTS` clause and
+/// trailing statement terminator. Bootstrap recovery accepts only this exact
+/// installed product; the broader manifest reader's legacy Wrangler variants
+/// are not bootstrap authority.
+pub(crate) fn d1_bootstrap_installed_schema_sql(migrations_table: &str) -> String {
+    d1_migrations_table_init_sql(migrations_table)
+        .strip_suffix(';')
+        .expect("canonical D1 migration-ledger initializer has a trailing semicolon")
+        .replacen("CREATE TABLE IF NOT EXISTS", "CREATE TABLE", 1)
+}
+
+fn is_exact_d1_bootstrap_schema(
+    objects: &[D1BootstrapInventoryObject],
+    migrations_table: &str,
+) -> bool {
+    objects
+        == [D1BootstrapInventoryObject {
+            object_type: "table".to_string(),
+            name: migrations_table.to_string(),
+            table_name: migrations_table.to_string(),
+            sql: Some(d1_bootstrap_installed_schema_sql(migrations_table)),
+        }]
+}
+
 pub(crate) struct D1BootstrapReadFailure {
     pub(crate) result: CallToolResult,
     pub(crate) provider_calls: usize,
@@ -497,7 +521,9 @@ pub(crate) fn parse_d1_bootstrap_inventory(
 
     let state = if objects.is_empty() {
         D1BootstrapInventoryState::Empty
-    } else if parse_d1_migration_ledger_authority(value, migrations_table).is_ok() {
+    } else if parse_d1_migration_ledger_authority(value, migrations_table).is_ok()
+        && is_exact_d1_bootstrap_schema(&objects, migrations_table)
+    {
         D1BootstrapInventoryState::CanonicalLedger
     } else {
         D1BootstrapInventoryState::Conflicting
@@ -1321,6 +1347,25 @@ mod tests {
         assert_eq!(
             canonical.state(),
             D1BootstrapInventoryState::CanonicalLedger
+        );
+
+        let broader_wrangler_schema = parse_d1_bootstrap_inventory(
+            &response(
+                json!([{
+                    "type": "table",
+                    "name": "d1_migrations",
+                    "tbl_name": "d1_migrations",
+                    "sql": "CREATE TABLE \"d1_migrations\"(\n\t\tid         INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tname       TEXT UNIQUE,\n\t\tapplied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL\n)",
+                }]),
+                json!(true),
+            ),
+            "d1_migrations",
+        )
+        .expect("legacy Wrangler spelling remains parseable conflict evidence");
+        assert_eq!(
+            broader_wrangler_schema.state(),
+            D1BootstrapInventoryState::Conflicting,
+            "bootstrap recovery accepts only the exact initializer-installed schema"
         );
 
         let conflicting = parse_d1_bootstrap_inventory(

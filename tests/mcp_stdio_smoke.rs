@@ -844,6 +844,107 @@ fn spawn_fake_bootstrap_api(
     (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
 }
 
+enum BootstrapRecoveryFixtureFault {
+    CustodyDrift(PathBuf),
+    TargetReadOnly(PathBuf),
+}
+
+fn spawn_fake_initialized_bootstrap_recovery_api(
+    expected_requests: usize,
+    fault: Option<(usize, BootstrapRecoveryFixtureFault)>,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").expect("bind initialized bootstrap recovery API"); // DevSkim: ignore DS162092 -- loopback-only MCP test fixture
+    let addr = listener
+        .local_addr()
+        .expect("initialized bootstrap recovery address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        for (index, stream) in listener.incoming().take(expected_requests).enumerate() {
+            let mut stream = stream.expect("initialized bootstrap recovery stream");
+            let (headers, body) = read_http_request(&mut stream);
+            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            let body_json: Value =
+                serde_json::from_slice(&body).expect("bootstrap recovery request JSON");
+            requests_for_thread
+                .lock()
+                .expect("bootstrap recovery request log")
+                .push(body_json.clone());
+            let sql = body_json["sql"].as_str().unwrap_or_default();
+            let response = if is_bootstrap_inventory_sql(sql) {
+                bootstrap_inventory_response(true, false, false)
+            } else if sql == "SELECT * FROM \"d1_migrations\" ORDER BY id" {
+                manifest_ledger_response(Vec::new())
+            } else {
+                panic!("unexpected initialized bootstrap recovery SQL: {sql}");
+            };
+            let response =
+                serde_json::to_vec(&response).expect("serialize bootstrap recovery response");
+            if fault
+                .as_ref()
+                .is_some_and(|(request, _)| *request == index + 1)
+            {
+                match &fault.as_ref().expect("selected bootstrap fault").1 {
+                    BootstrapRecoveryFixtureFault::CustodyDrift(active) => {
+                        fs::rename(active, active.with_extension("custody-drifted"))
+                            .expect("displace active bootstrap custody before response completion");
+                    }
+                    BootstrapRecoveryFixtureFault::TargetReadOnly(target) => {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            fs::set_permissions(target, fs::Permissions::from_mode(0o500))
+                                .expect("make bootstrap target read-only before retirement");
+                        }
+                    }
+                }
+            }
+            write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                .expect("write initialized bootstrap recovery headers");
+            stream
+                .write_all(&response)
+                .expect("write initialized bootstrap recovery response");
+        }
+    });
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
+}
+
+fn spawn_fake_bootstrap_recovery_http_failure_api() -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind bootstrap recovery failure API"); // DevSkim: ignore DS162092 -- loopback-only MCP test fixture
+    let addr = listener
+        .local_addr()
+        .expect("bootstrap recovery failure address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        let (mut stream, _) = listener
+            .accept()
+            .expect("bootstrap recovery failure stream");
+        let (headers, body) = read_http_request(&mut stream);
+        assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+        let body_json: Value =
+            serde_json::from_slice(&body).expect("bootstrap recovery failure request JSON");
+        requests_for_thread
+            .lock()
+            .expect("bootstrap recovery failure request log")
+            .push(body_json);
+        let response = serde_json::to_vec(&json!({
+            "success": false,
+            "errors": [{"code": 7500, "message": "provider unavailable"}],
+            "messages": [],
+            "result": null,
+        }))
+        .expect("serialize bootstrap recovery failure response");
+        write!(stream, "HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+            .expect("write bootstrap recovery failure headers");
+        stream
+            .write_all(&response)
+            .expect("write bootstrap recovery failure response");
+    });
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
+}
+
 fn spawn_manifest_authority_rejection_api(
     authority_responses: Vec<Value>,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
@@ -4899,7 +5000,7 @@ fn stdio_tool_calls_cover_context_and_body_normalization_edges() {
         "find_tools",
         json!({
             "query": "d1",
-            "limit": 20,
+            "limit": 30,
             "include_schema": false
         }),
     );
@@ -4917,6 +5018,11 @@ fn stdio_tool_calls_cover_context_and_body_normalization_edges() {
     assert!(
         result_names.contains(&"d1_bootstrap_migration_ledger"),
         "find_tools should expose the guarded ledger bootstrap: {tools_content}"
+    );
+    assert!(
+        result_names.contains(&"d1_reconcile_bootstrap_migration_ledger")
+            && result_names.contains(&"d1_finalize_bootstrap_migration_ledger"),
+        "find_tools should expose the bootstrap-specific recovery boundary: {tools_content}"
     );
 }
 
@@ -5922,6 +6028,887 @@ fn d1_bootstrap_migration_ledger_response_loss_retains_custody_and_never_retries
         1,
         "ambiguous initializer is dispatched once and never retried"
     );
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_bootstrap_response_loss_reconciles_and_retires_without_retrying_initializer() {
+    let (base_url, requests) = spawn_fake_bootstrap_api(41, false, true, true);
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-bootstrap-terminal-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create bootstrap terminal lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make bootstrap terminal lease root private");
+    }
+    let env = vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ];
+    let mut mcp = McpStdioProcess::start_with_env(env.clone());
+    let dry = mcp.call_tool(
+        200,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "dry_run": true}),
+    );
+    let bootstrap_plan = structured_content(&dry)["plan_sha256"]
+        .as_str()
+        .expect("bootstrap plan")
+        .to_string();
+    let ambiguous = mcp.call_tool(
+        201,
+        "d1_bootstrap_migration_ledger",
+        json!({
+            "database_id": "db-1",
+            "approved_plan_sha256": bootstrap_plan,
+        }),
+    );
+    let ambiguous = structured_content(&ambiguous);
+    assert_eq!(ambiguous["status"], json!("reconciliation_required"));
+    assert_eq!(ambiguous["lease_retained"], json!(true));
+    let lease_nonce = ambiguous["lease"]["nonce"]
+        .as_str()
+        .expect("retained bootstrap nonce")
+        .to_string();
+    let lease_payload_sha256 = ambiguous["lease"]["payload_sha256"]
+        .as_str()
+        .expect("retained bootstrap payload digest")
+        .to_string();
+
+    let reconcile = mcp.call_tool(
+        202,
+        "d1_reconcile_bootstrap_migration_ledger",
+        json!({
+            "database_id": "db-1",
+            "approved_bootstrap_plan_sha256": bootstrap_plan,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+        }),
+    );
+    let reconcile = structured_content(&reconcile);
+    assert_eq!(reconcile["ok"], json!(true), "{reconcile}");
+    assert_eq!(reconcile["status"], json!("bootstrap_reconciled"));
+    assert_eq!(reconcile["capability_state"], json!("terminal_proof_ready"));
+    assert_eq!(reconcile["outcome"], json!("canonical_empty_ledger"));
+    assert_eq!(reconcile["provider_calls"], json!(8));
+    assert_eq!(reconcile["provider_mutations"], json!(0));
+    assert_eq!(reconcile["local_namespace_mutations"], json!(0));
+    let reconcile_lifecycle = reconcile["provider_read_lifecycle"]
+        .as_array()
+        .expect("bootstrap reconciliation lifecycle");
+    assert_eq!(reconcile_lifecycle.len(), 8);
+    assert!(reconcile_lifecycle.iter().all(|entry| {
+        entry["provider_call_attempted"] == json!(true)
+            && entry["lifecycle"]["dispatch_stage"] == json!("attempted")
+            && entry["lifecycle"]["response_stage"] == json!("received")
+            && entry["lifecycle"]["body_stage"] == json!("completely_read")
+            && entry["response"]["body_sha256"]
+                .as_str()
+                .is_some_and(|value| value.len() == 64)
+            && entry["response"]["body_size_bytes"].as_u64().is_some()
+    }));
+    assert_eq!(
+        reconcile["response_evidence"]
+            .as_array()
+            .expect("bootstrap reconciliation response evidence")
+            .len(),
+        9,
+        "eight exact response-byte products plus the stable before/after snapshot"
+    );
+    assert_eq!(reconcile["lease_retained"], json!(true));
+    assert_eq!(
+        reconcile["retry_decision"],
+        json!("do_not_retry_initializer")
+    );
+    let reconciliation_plan = reconcile["reconciliation_plan_sha256"]
+        .as_str()
+        .expect("bootstrap reconciliation plan")
+        .to_string();
+    let initializer_authority = reconcile["initializer_authority_sha256"]
+        .as_str()
+        .expect("initializer authority")
+        .to_string();
+    let query_authority = reconcile["query_authority_sha256"]
+        .as_str()
+        .expect("query authority")
+        .to_string();
+    let canonical_snapshot = reconcile["canonical_snapshot_sha256"]
+        .as_str()
+        .expect("canonical bootstrap snapshot")
+        .to_string();
+    let terminal_request = "7".repeat(64);
+    let terminal_attempt = "8".repeat(64);
+    let terminal_args = |snapshot: &str, dry_run: bool, approved: Option<&str>| {
+        let mut args = json!({
+            "database_id": "db-1",
+            "approved_bootstrap_plan_sha256": bootstrap_plan,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "expected_reconciliation_plan_sha256": reconciliation_plan,
+            "expected_initializer_authority_sha256": initializer_authority,
+            "expected_query_authority_sha256": query_authority,
+            "expected_canonical_snapshot_sha256": snapshot,
+            "terminal_request_sha256": terminal_request,
+            "terminal_attempt_sha256": terminal_attempt,
+            "dry_run": dry_run,
+        });
+        if let Some(approved) = approved {
+            args["approved_terminal_plan_sha256"] = json!(approved);
+        }
+        args
+    };
+
+    let contradictory = mcp.call_tool(
+        203,
+        "d1_finalize_bootstrap_migration_ledger",
+        terminal_args(&"9".repeat(64), true, None),
+    );
+    let contradictory = structured_content(&contradictory);
+    assert_eq!(contradictory["ok"], json!(false), "{contradictory}");
+    assert_eq!(
+        contradictory["error"]["code"],
+        json!("d1.bootstrap_terminal_reconciliation_plan_mismatch")
+    );
+    assert_eq!(contradictory["provider_calls"], json!(0));
+    assert_eq!(contradictory["provider_mutations"], json!(0));
+    assert_eq!(contradictory["local_namespace_mutations"], json!(0));
+    assert_private_regular_active_lease(&lease_root);
+
+    let terminal_dry = mcp.call_tool(
+        204,
+        "d1_finalize_bootstrap_migration_ledger",
+        terminal_args(&canonical_snapshot, true, None),
+    );
+    let terminal_dry = structured_content(&terminal_dry);
+    assert_eq!(terminal_dry["ok"], json!(true), "{terminal_dry}");
+    assert_eq!(
+        terminal_dry["status"],
+        json!("bootstrap_terminal_plan_ready")
+    );
+    assert_eq!(terminal_dry["provider_calls"], json!(8));
+    assert_eq!(terminal_dry["provider_mutations"], json!(0));
+    assert_eq!(terminal_dry["local_namespace_mutations"], json!(0));
+    let terminal_plan = terminal_dry["terminal_plan_sha256"]
+        .as_str()
+        .expect("bootstrap terminal plan")
+        .to_string();
+
+    let terminal_live = mcp.call_tool(
+        205,
+        "d1_finalize_bootstrap_migration_ledger",
+        terminal_args(&canonical_snapshot, false, Some(&terminal_plan)),
+    );
+    let terminal_live = structured_content(&terminal_live);
+    assert_eq!(terminal_live["ok"], json!(true), "{terminal_live}");
+    assert_eq!(
+        terminal_live["status"],
+        json!("bootstrap_terminal_complete")
+    );
+    assert_eq!(terminal_live["provider_calls"], json!(16));
+    assert_eq!(terminal_live["provider_mutations"], json!(0));
+    assert_eq!(terminal_live["local_namespace_mutations"], json!(3));
+    assert_eq!(terminal_live["lease_retained"], json!(false));
+    assert_eq!(
+        terminal_live["provider_read_lifecycle"]
+            .as_array()
+            .expect("bootstrap terminal lifecycle")
+            .len(),
+        16
+    );
+    assert_eq!(
+        terminal_live["response_evidence"]
+            .as_array()
+            .expect("bootstrap terminal response evidence")
+            .len(),
+        19,
+        "sixteen exact response-byte products plus three canonical snapshot products"
+    );
+    assert_eq!(
+        terminal_live["custody_status"],
+        json!("retired_evidence_verified")
+    );
+
+    let target = manifest_target_path(&lease_root);
+    assert!(!target.join("active.lease.json").exists());
+    assert!(!target.join("retiring.lease.json").exists());
+    assert!(
+        target
+            .join(format!("retired.{lease_nonce}.lease.json"))
+            .is_file()
+    );
+    assert!(
+        target
+            .join(format!(
+                "terminal-reconciliation.{lease_nonce}.receipt.json"
+            ))
+            .is_file()
+    );
+
+    let mut replay = McpStdioProcess::start_with_env(env);
+    let replay_result = replay.call_tool(
+        206,
+        "d1_finalize_bootstrap_migration_ledger",
+        terminal_args(&canonical_snapshot, false, Some(&terminal_plan)),
+    );
+    let replay_result = structured_content(&replay_result);
+    assert_eq!(replay_result["ok"], json!(true), "{replay_result}");
+    assert_eq!(
+        replay_result["status"],
+        json!("bootstrap_terminal_already_complete")
+    );
+    assert_eq!(replay_result["provider_calls"], json!(0));
+    assert_eq!(replay_result["provider_mutations"], json!(0));
+    assert_eq!(replay_result["local_namespace_mutations"], json!(0));
+
+    let requests = requests
+        .lock()
+        .expect("bootstrap recovery requests")
+        .clone();
+    assert_eq!(requests.len(), 41);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request["sql"]
+                .as_str()
+                .is_some_and(|sql| sql.starts_with("CREATE TABLE IF NOT EXISTS")))
+            .count(),
+        1,
+        "bootstrap recovery never retries the initializer"
+    );
+    assert!(requests.iter().all(|request| {
+        request["sql"]
+            .as_str()
+            .is_some_and(|sql| !sql.contains("INSERT INTO") && !sql.contains("ALTER TABLE"))
+    }));
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_bootstrap_terminal_custody_drift_never_claims_stale_retention() {
+    for (label, drift_after_request, expected_receipt, expected_local_mutations) in [
+        ("before-receipt", 12usize, false, 0usize),
+        ("before-retirement", 16usize, true, 1usize),
+    ] {
+        let (bootstrap_url, bootstrap_requests) = spawn_fake_bootstrap_api(9, false, true, true);
+        let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+            "cloudflare-mcp-bootstrap-terminal-drift-{label}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&lease_root);
+        fs::create_dir_all(&lease_root).expect("create bootstrap drift lease root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+                .expect("make bootstrap drift lease root private");
+        }
+        let bootstrap_env = vec![
+            ("CLOUDFLARE_MCP_API_BASE_URL", bootstrap_url),
+            (
+                "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+                lease_root.to_string_lossy().to_string(),
+            ),
+        ];
+        let mut bootstrap = McpStdioProcess::start_with_env(bootstrap_env);
+        let dry = bootstrap.call_tool(
+            220,
+            "d1_bootstrap_migration_ledger",
+            json!({"database_id": "db-1", "dry_run": true}),
+        );
+        let bootstrap_plan = structured_content(&dry)["plan_sha256"]
+            .as_str()
+            .expect("bootstrap drift plan")
+            .to_string();
+        let ambiguous = bootstrap.call_tool(
+            221,
+            "d1_bootstrap_migration_ledger",
+            json!({
+                "database_id": "db-1",
+                "approved_plan_sha256": bootstrap_plan,
+            }),
+        );
+        let ambiguous = structured_content(&ambiguous);
+        let lease_nonce = ambiguous["lease"]["nonce"]
+            .as_str()
+            .expect("bootstrap drift nonce")
+            .to_string();
+        let lease_payload_sha256 = ambiguous["lease"]["payload_sha256"]
+            .as_str()
+            .expect("bootstrap drift payload")
+            .to_string();
+        assert_eq!(bootstrap_requests.lock().expect("request log").len(), 9);
+        bootstrap.terminate();
+
+        let (proof_url, proof_requests) = spawn_fake_initialized_bootstrap_recovery_api(16, None);
+        let proof_env = vec![
+            ("CLOUDFLARE_MCP_API_BASE_URL", proof_url),
+            (
+                "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+                lease_root.to_string_lossy().to_string(),
+            ),
+        ];
+        let mut proof_process = McpStdioProcess::start_with_env(proof_env);
+        let reconcile = proof_process.call_tool(
+            222,
+            "d1_reconcile_bootstrap_migration_ledger",
+            json!({
+                "database_id": "db-1",
+                "approved_bootstrap_plan_sha256": bootstrap_plan,
+                "lease_nonce": lease_nonce,
+                "lease_payload_sha256": lease_payload_sha256,
+            }),
+        );
+        let reconcile = structured_content(&reconcile);
+        assert_eq!(reconcile["ok"], json!(true), "{label}: {reconcile}");
+        let reconciliation_plan = reconcile["reconciliation_plan_sha256"]
+            .as_str()
+            .expect("bootstrap drift reconciliation plan")
+            .to_string();
+        let initializer_authority = reconcile["initializer_authority_sha256"]
+            .as_str()
+            .expect("bootstrap drift initializer authority")
+            .to_string();
+        let query_authority = reconcile["query_authority_sha256"]
+            .as_str()
+            .expect("bootstrap drift query authority")
+            .to_string();
+        let canonical_snapshot = reconcile["canonical_snapshot_sha256"]
+            .as_str()
+            .expect("bootstrap drift snapshot")
+            .to_string();
+        let terminal_request = "7".repeat(64);
+        let terminal_attempt = "8".repeat(64);
+        let terminal_arguments = |dry_run: bool, approved: Option<&str>| {
+            let mut args = json!({
+                "database_id": "db-1",
+                "approved_bootstrap_plan_sha256": bootstrap_plan,
+                "lease_nonce": lease_nonce,
+                "lease_payload_sha256": lease_payload_sha256,
+                "expected_reconciliation_plan_sha256": reconciliation_plan,
+                "expected_initializer_authority_sha256": initializer_authority,
+                "expected_query_authority_sha256": query_authority,
+                "expected_canonical_snapshot_sha256": canonical_snapshot,
+                "terminal_request_sha256": terminal_request,
+                "terminal_attempt_sha256": terminal_attempt,
+                "dry_run": dry_run,
+            });
+            if let Some(approved) = approved {
+                args["approved_terminal_plan_sha256"] = json!(approved);
+            }
+            args
+        };
+        let terminal_dry = proof_process.call_tool(
+            223,
+            "d1_finalize_bootstrap_migration_ledger",
+            terminal_arguments(true, None),
+        );
+        let terminal_dry = structured_content(&terminal_dry);
+        assert_eq!(terminal_dry["ok"], json!(true), "{label}: {terminal_dry}");
+        let terminal_plan = terminal_dry["terminal_plan_sha256"]
+            .as_str()
+            .expect("bootstrap drift terminal plan")
+            .to_string();
+        assert_eq!(proof_requests.lock().expect("proof requests").len(), 16);
+        proof_process.terminate();
+
+        let active = assert_private_regular_active_lease(&lease_root);
+        let (drift_url, drift_requests) = spawn_fake_initialized_bootstrap_recovery_api(
+            drift_after_request,
+            Some((
+                drift_after_request,
+                BootstrapRecoveryFixtureFault::CustodyDrift(active.clone()),
+            )),
+        );
+        let mut terminal = McpStdioProcess::start_with_env(vec![
+            ("CLOUDFLARE_MCP_API_BASE_URL", drift_url),
+            (
+                "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+                lease_root.to_string_lossy().to_string(),
+            ),
+        ]);
+        let result = terminal.call_tool(
+            224,
+            "d1_finalize_bootstrap_migration_ledger",
+            terminal_arguments(false, Some(&terminal_plan)),
+        );
+        let content = structured_content(&result);
+        assert_eq!(content["ok"], json!(false), "{label}: {content}");
+        assert_eq!(
+            content["status"],
+            json!("reconciliation_required"),
+            "{label}: {content}"
+        );
+        assert_eq!(
+            content["custody_status"],
+            json!("retained_evidence_unverified"),
+            "{label}: {content}"
+        );
+        assert_eq!(content["lease_retained"], Value::Null, "{label}: {content}");
+        assert_eq!(content["lease_decision"], Value::Null, "{label}: {content}");
+        assert_eq!(
+            content["provider_calls"],
+            json!(drift_after_request),
+            "{label}: {content}"
+        );
+        assert_eq!(content["provider_mutations"], json!(0), "{label}");
+        assert_eq!(
+            content["local_namespace_mutations"],
+            json!(expected_local_mutations),
+            "{label}: {content}"
+        );
+        assert_eq!(
+            content["receipt_persisted"],
+            json!(expected_receipt),
+            "{label}: {content}"
+        );
+        assert_eq!(
+            content["response_evidence"]
+                .as_array()
+                .expect("bootstrap drift response evidence")
+                .len(),
+            drift_after_request,
+            "{label}: every attempted read retains exact response-byte evidence"
+        );
+        let observed = drift_requests.lock().expect("drift requests").clone();
+        assert_eq!(observed.len(), drift_after_request, "{label}");
+        assert!(observed.iter().all(|request| {
+            request["sql"].as_str().is_some_and(|sql| {
+                is_bootstrap_inventory_sql(sql)
+                    || sql == "SELECT * FROM \"d1_migrations\" ORDER BY id"
+            })
+        }));
+        assert!(
+            active.with_extension("custody-drifted").is_file(),
+            "{label}"
+        );
+        let receipt = manifest_target_path(&lease_root).join(format!(
+            "terminal-reconciliation.{lease_nonce}.receipt.json"
+        ));
+        assert_eq!(receipt.is_file(), expected_receipt, "{label}");
+        terminal.terminate();
+        let _ = fs::remove_dir_all(lease_root);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn d1_bootstrap_retirement_failure_preserves_persisted_receipt_accounting() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (bootstrap_url, bootstrap_requests) = spawn_fake_bootstrap_api(9, false, true, true);
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-bootstrap-retirement-failure-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create bootstrap retirement-failure lease root");
+    fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+        .expect("make bootstrap retirement-failure lease root private");
+    let mut bootstrap = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", bootstrap_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let dry = bootstrap.call_tool(
+        240,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "dry_run": true}),
+    );
+    let bootstrap_plan = structured_content(&dry)["plan_sha256"]
+        .as_str()
+        .expect("bootstrap retirement-failure plan")
+        .to_string();
+    let ambiguous = bootstrap.call_tool(
+        241,
+        "d1_bootstrap_migration_ledger",
+        json!({
+            "database_id": "db-1",
+            "approved_plan_sha256": bootstrap_plan,
+        }),
+    );
+    let ambiguous = structured_content(&ambiguous);
+    let lease_nonce = ambiguous["lease"]["nonce"]
+        .as_str()
+        .expect("bootstrap retirement-failure nonce")
+        .to_string();
+    let lease_payload_sha256 = ambiguous["lease"]["payload_sha256"]
+        .as_str()
+        .expect("bootstrap retirement-failure payload")
+        .to_string();
+    assert_eq!(bootstrap_requests.lock().expect("request log").len(), 9);
+    bootstrap.terminate();
+
+    let (proof_url, proof_requests) = spawn_fake_initialized_bootstrap_recovery_api(16, None);
+    let mut proof_process = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", proof_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let reconcile = proof_process.call_tool(
+        242,
+        "d1_reconcile_bootstrap_migration_ledger",
+        json!({
+            "database_id": "db-1",
+            "approved_bootstrap_plan_sha256": bootstrap_plan,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+        }),
+    );
+    let reconcile = structured_content(&reconcile);
+    assert_eq!(reconcile["ok"], json!(true), "{reconcile}");
+    let reconciliation_plan = reconcile["reconciliation_plan_sha256"]
+        .as_str()
+        .expect("bootstrap retirement-failure reconciliation plan")
+        .to_string();
+    let initializer_authority = reconcile["initializer_authority_sha256"]
+        .as_str()
+        .expect("bootstrap retirement-failure initializer authority")
+        .to_string();
+    let query_authority = reconcile["query_authority_sha256"]
+        .as_str()
+        .expect("bootstrap retirement-failure query authority")
+        .to_string();
+    let canonical_snapshot = reconcile["canonical_snapshot_sha256"]
+        .as_str()
+        .expect("bootstrap retirement-failure snapshot")
+        .to_string();
+    let terminal_request = "7".repeat(64);
+    let terminal_attempt = "8".repeat(64);
+    let terminal_arguments = |dry_run: bool, approved: Option<&str>| {
+        let mut args = json!({
+            "database_id": "db-1",
+            "approved_bootstrap_plan_sha256": bootstrap_plan,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "expected_reconciliation_plan_sha256": reconciliation_plan,
+            "expected_initializer_authority_sha256": initializer_authority,
+            "expected_query_authority_sha256": query_authority,
+            "expected_canonical_snapshot_sha256": canonical_snapshot,
+            "terminal_request_sha256": terminal_request,
+            "terminal_attempt_sha256": terminal_attempt,
+            "dry_run": dry_run,
+        });
+        if let Some(approved) = approved {
+            args["approved_terminal_plan_sha256"] = json!(approved);
+        }
+        args
+    };
+    let terminal_dry = proof_process.call_tool(
+        243,
+        "d1_finalize_bootstrap_migration_ledger",
+        terminal_arguments(true, None),
+    );
+    let terminal_plan = structured_content(&terminal_dry)["terminal_plan_sha256"]
+        .as_str()
+        .expect("bootstrap retirement-failure terminal plan")
+        .to_string();
+    assert_eq!(proof_requests.lock().expect("proof requests").len(), 16);
+    proof_process.terminate();
+
+    let target = manifest_target_path(&lease_root);
+    let (failure_url, failure_requests) = spawn_fake_initialized_bootstrap_recovery_api(
+        16,
+        Some((
+            16,
+            BootstrapRecoveryFixtureFault::TargetReadOnly(target.clone()),
+        )),
+    );
+    let mut terminal = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", failure_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let result = terminal.call_tool(
+        244,
+        "d1_finalize_bootstrap_migration_ledger",
+        terminal_arguments(false, Some(&terminal_plan)),
+    );
+    let content = structured_content(&result);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["status"], json!("reconciliation_required"));
+    assert_eq!(content["provider_calls"], json!(16), "{content}");
+    assert_eq!(content["provider_mutations"], json!(0), "{content}");
+    assert_eq!(content["receipt_persisted"], json!(true), "{content}");
+    assert_eq!(content["local_namespace_mutations"], json!(1), "{content}");
+    assert_eq!(failure_requests.lock().expect("failure requests").len(), 16);
+    assert!(target.join("active.lease.json").is_file());
+    assert!(!target.join("retiring.lease.json").exists());
+    assert!(
+        target
+            .join(format!(
+                "terminal-reconciliation.{lease_nonce}.receipt.json"
+            ))
+            .is_file()
+    );
+    terminal.terminate();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
+        .expect("restore bootstrap target permissions for cleanup");
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_bootstrap_reconciliation_reports_provider_conflict_and_keeps_custody() {
+    let (bootstrap_url, bootstrap_requests) = spawn_fake_bootstrap_api(9, false, true, true);
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-bootstrap-conflict-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create bootstrap conflict lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make bootstrap conflict lease root private");
+    }
+    let mut bootstrap = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", bootstrap_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let dry = bootstrap.call_tool(
+        210,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "dry_run": true}),
+    );
+    let plan = structured_content(&dry)["plan_sha256"]
+        .as_str()
+        .expect("bootstrap conflict plan")
+        .to_string();
+    let ambiguous = bootstrap.call_tool(
+        211,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "approved_plan_sha256": plan}),
+    );
+    let ambiguous = structured_content(&ambiguous);
+    let nonce = ambiguous["lease"]["nonce"]
+        .as_str()
+        .expect("bootstrap conflict nonce")
+        .to_string();
+    let payload = ambiguous["lease"]["payload_sha256"]
+        .as_str()
+        .expect("bootstrap conflict payload")
+        .to_string();
+    assert_eq!(bootstrap_requests.lock().expect("request log").len(), 9);
+
+    let (conflict_url, conflict_requests) = spawn_fake_bootstrap_api(2, true, false, true);
+    let mut reconcile = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", conflict_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let result = reconcile.call_tool(
+        212,
+        "d1_reconcile_bootstrap_migration_ledger",
+        json!({
+            "database_id": "db-1",
+            "approved_bootstrap_plan_sha256": plan,
+            "lease_nonce": nonce,
+            "lease_payload_sha256": payload,
+        }),
+    );
+    let content = structured_content(&result);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["capability_state"], json!("conflicting"));
+    assert_eq!(content["outcome"], json!("conflict"));
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.bootstrap_recovery_schema_conflict")
+    );
+    assert_eq!(content["provider_calls"], json!(2));
+    assert_eq!(content["provider_mutations"], json!(0));
+    assert_eq!(content["local_namespace_mutations"], json!(0));
+    assert_eq!(content["lease_retained"], json!(true));
+    assert_private_regular_active_lease(&lease_root);
+    assert_eq!(
+        conflict_requests.lock().expect("conflict requests").len(),
+        2
+    );
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_bootstrap_reconciliation_provider_failure_is_one_attempt_and_nonterminal() {
+    let (bootstrap_url, bootstrap_requests) = spawn_fake_bootstrap_api(9, false, true, true);
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-bootstrap-provider-failure-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create bootstrap provider-failure lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make bootstrap provider-failure lease root private");
+    }
+    let mut bootstrap = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", bootstrap_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let dry = bootstrap.call_tool(
+        230,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "dry_run": true}),
+    );
+    let plan = structured_content(&dry)["plan_sha256"]
+        .as_str()
+        .expect("bootstrap provider-failure plan")
+        .to_string();
+    let ambiguous = bootstrap.call_tool(
+        231,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "approved_plan_sha256": plan}),
+    );
+    let ambiguous = structured_content(&ambiguous);
+    let nonce = ambiguous["lease"]["nonce"]
+        .as_str()
+        .expect("bootstrap provider-failure nonce")
+        .to_string();
+    let payload = ambiguous["lease"]["payload_sha256"]
+        .as_str()
+        .expect("bootstrap provider-failure payload")
+        .to_string();
+    assert_eq!(bootstrap_requests.lock().expect("request log").len(), 9);
+    bootstrap.terminate();
+
+    let (failure_url, failure_requests) = spawn_fake_bootstrap_recovery_http_failure_api();
+    let mut reconcile = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", failure_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let result = reconcile.call_tool(
+        232,
+        "d1_reconcile_bootstrap_migration_ledger",
+        json!({
+            "database_id": "db-1",
+            "approved_bootstrap_plan_sha256": plan,
+            "lease_nonce": nonce,
+            "lease_payload_sha256": payload,
+        }),
+    );
+    let content = structured_content(&result);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["capability_state"], json!("unknown"), "{content}");
+    assert_eq!(content["outcome"], json!("unknown"), "{content}");
+    assert_eq!(content["provider_calls"], json!(1), "{content}");
+    assert_eq!(content["provider_mutations"], json!(0), "{content}");
+    assert_eq!(content["local_namespace_mutations"], json!(0), "{content}");
+    assert_eq!(content["lease_retained"], json!(true), "{content}");
+    assert_eq!(
+        content["provider_read_lifecycle"][0]["lifecycle"]["http_status"],
+        json!(503),
+        "{content}"
+    );
+    assert_eq!(
+        content["provider_read_lifecycle"][0]["lifecycle"]["body_stage"],
+        json!("completely_read"),
+        "{content}"
+    );
+    assert!(
+        content["response_evidence"][0]["response"]["body_sha256"]
+            .as_str()
+            .is_some_and(|value| value.len() == 64),
+        "{content}"
+    );
+    assert_eq!(failure_requests.lock().expect("failure requests").len(), 1);
+    assert_private_regular_active_lease(&lease_root);
+    reconcile.terminate();
+
+    let mut pre_dispatch = McpStdioProcess::start_with_env(vec![
+        (
+            "CLOUDFLARE_MCP_API_BASE_URL",
+            "http://127.0.0.1:9".to_string(),
+        ),
+        ("CLOUDFLARE_API_TOKEN", String::new()),
+        ("CLOUDFLARE_MCP_API_TOKEN", String::new()),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let result = pre_dispatch.call_tool(
+        233,
+        "d1_reconcile_bootstrap_migration_ledger",
+        json!({
+            "database_id": "db-1",
+            "approved_bootstrap_plan_sha256": plan,
+            "lease_nonce": nonce,
+            "lease_payload_sha256": payload,
+        }),
+    );
+    let content = structured_content(&result);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["provider_calls"], json!(0), "{content}");
+    assert_eq!(
+        content["provider_read_lifecycle"][0]["lifecycle"]["dispatch_stage"],
+        json!("pre_dispatch"),
+        "{content}"
+    );
+    assert_eq!(content["response_evidence"], json!([]), "{content}");
+    assert_eq!(content["lease_retained"], json!(true), "{content}");
+    assert_private_regular_active_lease(&lease_root);
+    pre_dispatch.terminate();
+
+    let active = assert_private_regular_active_lease(&lease_root);
+    let retiring = active.with_file_name("retiring.lease.json");
+    fs::rename(&active, &retiring).expect("move bootstrap fixture into retiring custody");
+    let (retiring_url, retiring_requests) = spawn_fake_initialized_bootstrap_recovery_api(8, None);
+    let mut retiring_reconcile = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", retiring_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let result = retiring_reconcile.call_tool(
+        234,
+        "d1_reconcile_bootstrap_migration_ledger",
+        json!({
+            "database_id": "db-1",
+            "approved_bootstrap_plan_sha256": plan,
+            "lease_nonce": nonce,
+            "lease_payload_sha256": payload,
+        }),
+    );
+    let content = structured_content(&result);
+    assert_eq!(content["ok"], json!(true), "{content}");
+    assert_eq!(
+        content["custody_status"],
+        json!("retiring_evidence_verified"),
+        "{content}"
+    );
+    assert_eq!(content["lease_retained"], Value::Null, "{content}");
+    assert_eq!(content["lease_decision"], Value::Null, "{content}");
+    assert_eq!(
+        retiring_requests.lock().expect("retiring requests").len(),
+        8
+    );
+    retiring_reconcile.terminate();
     let _ = fs::remove_dir_all(lease_root);
 }
 

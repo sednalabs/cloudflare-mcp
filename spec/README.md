@@ -104,6 +104,18 @@ Preserved curated tool families:
   stdio negative-path coverage aligned with the snapshot. It must never become
   a compatibility path for application-bearing or partially initialized D1
   databases.
+- Bootstrap recovery (`d1_reconcile_bootstrap_migration_ledger` and
+  `d1_finalize_bootstrap_migration_ledger`) is its own retained-custody
+  contract. Keep the fixed bootstrap family, exact bootstrap-plan/initializer/
+  installed-schema authority, two stable primary before/after proof windows made
+  from exact one-attempt/no-redirect reads with response-byte evidence,
+  canonical empty-ledger-only success, explicit conflict/unknown products,
+  create-only terminal receipt, fresh proof before guarded retirement, zero
+  provider writes, exact provider-dispatch and local mutation accounting, no
+  initializer retry, and zero-call completed replay aligned across schema, stdio
+  tests, and runbook. Custody drift must erase stale retention claims while
+  preserving known receipt state. An empty manifest must never substitute for
+  this authority.
 - Retained-manifest reconciliation (`d1_reconcile_migration_manifest`) is a
   first-class read-only D1 recovery contract. Keep its exact structured
   expectation schema, manifest-derived complete prefix inventory, query-bound

@@ -181,6 +181,25 @@ pub(crate) struct D1TerminalReconciliationReceipt {
     pub(crate) current_prefix_length: usize,
 }
 
+fn valid_terminal_receipt_authority(receipt: &D1TerminalReconciliationReceipt) -> bool {
+    match receipt.operation.as_str() {
+        "d1_finalize_migration_reconciliation" => matches!(
+            receipt.effect_assertion_id.as_str(),
+            "schema_create_only_v1"
+                | "schema_create_tables_indexes_views_triggers_v1"
+                | "schema_create_objects_additive_v1"
+                | "schema_create_objects_additive_seed_rows_v1"
+        ),
+        "d1_finalize_bootstrap_migration_ledger" => {
+            receipt.effect_assertion_id == "bootstrap_canonical_empty_ledger_v1"
+                && receipt.outcome == "full_state_converged"
+                && receipt.original_prefix_length == 0
+                && receipt.current_prefix_length == 1
+        }
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct D1TerminalReconciliationReceiptV1 {
@@ -2168,18 +2187,11 @@ mod linux {
         receipt: &D1TerminalReconciliationReceipt,
     ) -> Result<Vec<u8>, &'static str> {
         if receipt.version != 2
-            || receipt.operation != "d1_finalize_migration_reconciliation"
+            || !valid_terminal_receipt_authority(receipt)
             || !valid_lower_sha256(&receipt.target_key_sha256)
             || !valid_retained_nonce(&receipt.lease_nonce)
             || !valid_lower_sha256(&receipt.lease_payload_sha256)
             || !valid_lower_sha256(&receipt.approved_apply_plan_sha256)
-            || !matches!(
-                receipt.effect_assertion_id.as_str(),
-                "schema_create_only_v1"
-                    | "schema_create_tables_indexes_views_triggers_v1"
-                    | "schema_create_objects_additive_v1"
-                    | "schema_create_objects_additive_seed_rows_v1"
-            )
             || !valid_lower_sha256(&receipt.reconciliation_plan_sha256)
             || !valid_lower_sha256(&receipt.expectation_proof_sha256)
             || !valid_lower_sha256(&receipt.query_sha256)
@@ -3403,6 +3415,28 @@ mod tests {
             original_prefix_length: 0,
             current_prefix_length: 1,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bootstrap_terminal_receipt_authority_is_operation_and_effect_exact() {
+        let identity = D1MigrationLeaseIdentity {
+            target_key_sha256: "a".repeat(64),
+            nonce: "b".repeat(64),
+            payload_sha256: "c".repeat(64),
+        };
+        let mut receipt = terminal_receipt(&identity, &"d".repeat(64));
+        receipt.operation = "d1_finalize_bootstrap_migration_ledger".to_string();
+        receipt.effect_assertion_id = "bootstrap_canonical_empty_ledger_v1".to_string();
+        assert!(valid_terminal_receipt_authority(&receipt));
+
+        let mut wrong_effect = receipt.clone();
+        wrong_effect.effect_assertion_id = "schema_create_only_v1".to_string();
+        assert!(!valid_terminal_receipt_authority(&wrong_effect));
+
+        let mut wrong_operation = receipt;
+        wrong_operation.operation = "d1_finalize_migration_reconciliation".to_string();
+        assert!(!valid_terminal_receipt_authority(&wrong_operation));
     }
 
     #[cfg(target_os = "linux")]

@@ -73,6 +73,8 @@ Use curated D1 tools instead of generic API calls for database workflows:
 - `d1_execute_write`
 - `d1_apply_migrations` (dry-run inspection only; live mutation is retired)
 - `d1_bootstrap_migration_ledger`
+- `d1_reconcile_bootstrap_migration_ledger`
+- `d1_finalize_bootstrap_migration_ledger`
 - `d1_apply_migration_manifest`
 - `d1_reconcile_migration_manifest`
 - `d1_finalize_migration_reconciliation`
@@ -99,6 +101,33 @@ names in either the `sqlite_*` or `_cf_*` reserved family are rejected. The
 single DDL acknowledgement may truthfully carry zero row counts; it must still
 prove primary service and `changed_db=true`, after which stable schema and
 empty-ledger readback supplies the effect proof.
+
+If that one initializer dispatch has an ambiguous result, use
+`d1_reconcile_bootstrap_migration_ledger`; do not supply an empty manifest to
+the general manifest recovery tool. Bind the exact account/database,
+`migration-ledger-bootstrap-v1` custody family, bootstrap plan, lease nonce and
+payload, ledger table, canonical initializer, and exact installed schema. The
+read-only tool performs two stable primary proof windows. Each window uses two
+bounded schema reads followed by two empty-ledger reads. Every read is one HTTP
+attempt, never follows redirects, and retains response-byte digest, size, and
+request-lifecycle evidence; `provider_calls` counts actual dispatches. Only the same exact
+canonical initializer schema with zero ledger rows in both windows returns
+`terminal_proof_ready`; attribution remains unknown and initializer retry
+remains forbidden.
+
+Use `d1_finalize_bootstrap_migration_ledger` only after independently recording
+all four reconciliation digests. Its dry run re-proves those products and
+returns a terminal-plan digest. A live call requires that exact approval,
+re-proves the provider state before create-only receipt persistence and again
+before guarded active -> retiring -> retired custody transitions, and performs
+no provider mutation. Ledger absence, any other object, a non-empty ledger,
+malformed/non-primary/unstable evidence, changed approval pins, custody drift,
+or a receipt conflict is nonterminal: preserve custody and never retry the
+initializer. Custody drift reports no stale retain decision; drift after receipt
+persistence reports the durable receipt and local mutation while leaving
+retirement blocked. The final descriptor-bound readback remains authoritative:
+if it fails, its exact true/false/null receipt evidence replaces any earlier
+creation-time claim.
 
 Use `d1_reconcile_migration_manifest` only for exact retained
 `active.lease.json` or `retiring.lease.json` evidence after an ambiguous
