@@ -68,6 +68,41 @@ jobs:
           jq '{source, binary: {sha256: .binary.sha256, size_bytes: .binary.size_bytes}, tools, contracts, dependencies}' \
             .tmp/release-provenance.json
 
+      - name: Package release binary bundle
+        run: |
+          set -euo pipefail
+          artifact="cloudflare-mcp-linux-${{ matrix.arch }}-stdio-${GITHUB_SHA}"
+          mkdir -p dist/package dist/verify
+          install -m 0755 target/release/cloudflare-mcp dist/package/cloudflare-mcp
+          install -m 0644 .tmp/release-provenance.json dist/package/release-provenance.json
+
+          test "$(stat -c '%a' dist/package/cloudflare-mcp)" = 755
+          case "${{ matrix.arch }}" in
+            x86_64) expected_machine='Advanced Micro Devices X86-64' ;;
+            aarch64) expected_machine='AArch64' ;;
+            *) echo "unsupported architecture: ${{ matrix.arch }}" >&2; exit 1 ;;
+          esac
+          readelf -h dist/package/cloudflare-mcp | grep -F 'Machine:' | grep -F "$expected_machine"
+          test "$(sha256sum dist/package/cloudflare-mcp | cut -d ' ' -f 1)" = \
+            "$(jq -r '.binary.sha256' dist/package/release-provenance.json)"
+
+          (
+            cd dist/package
+            sha256sum cloudflare-mcp release-provenance.json > SHA256SUMS
+            sha256sum -c SHA256SUMS
+            tar -czf "../${artifact}.tar.gz" cloudflare-mcp release-provenance.json SHA256SUMS
+          )
+          (
+            cd dist
+            sha256sum "${artifact}.tar.gz" > "${artifact}.tar.gz.sha256"
+            sha256sum -c "${artifact}.tar.gz.sha256"
+          )
+
+          tar -xzf "dist/${artifact}.tar.gz" -C dist/verify
+          test "$(stat -c '%a' dist/verify/cloudflare-mcp)" = 755
+          (cd dist/verify && sha256sum -c SHA256SUMS)
+          readelf -h dist/verify/cloudflare-mcp | grep -F 'Machine:' | grep -F "$expected_machine"
+
       - name: Upload release binary bundle
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         # actions/upload-artifact v7
@@ -75,7 +110,7 @@ jobs:
         with:
           name: cloudflare-mcp-linux-${{ matrix.arch }}-stdio-${{ github.sha }}
           path: |
-            target/release/cloudflare-mcp
-            .tmp/release-provenance.json
+            dist/cloudflare-mcp-linux-${{ matrix.arch }}-stdio-${{ github.sha }}.tar.gz
+            dist/cloudflare-mcp-linux-${{ matrix.arch }}-stdio-${{ github.sha }}.tar.gz.sha256
           if-no-files-found: error
           retention-days: 14

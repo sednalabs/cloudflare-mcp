@@ -79,7 +79,8 @@ cargo build
 Pull requests and `main` builds validate the same tool contract on native
 GitHub-hosted x86-64 and Arm64 Linux runners. Only a trusted `main` push
 publishes the separately named release binary bundle and provenance manifest
-for each architecture; pull requests never publish installable bundles.
+for each architecture as a mode-preserving tar archive with inner and outer
+checksums; pull requests verify but never publish installable bundles.
 
 The server depends on the public Rust MCP Toolkit repository by pinned git
 revision, so a fresh clone of this repository is enough for normal builds.

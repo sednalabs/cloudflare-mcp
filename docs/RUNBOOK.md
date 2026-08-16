@@ -534,19 +534,39 @@ do not publish installable bundles:
 - `cloudflare-mcp-linux-x86_64-stdio-<git-sha>`
 - `cloudflare-mcp-linux-aarch64-stdio-<git-sha>`
 
-Each artifact contains:
+Each GitHub artifact contains the mode-preserving archive named after the
+artifact with `.tar.gz` appended, plus that archive's `.sha256` file. The tar
+archive contains:
 
-- `target/release/cloudflare-mcp`
-- `.tmp/release-provenance.json`
+- `cloudflare-mcp` (mode `0755`)
+- `release-provenance.json`
+- `SHA256SUMS`
 
 This is the preferred install source when the operator wants the local machine
 to run exactly the binary GitHub Actions validated. Example retrieval:
 
 ```bash
-gh run download <run-id> \
+arch="$(uname -m)"
+case "$arch" in
+  x86_64|aarch64) ;;
+  *) echo "unsupported architecture: $arch" >&2; exit 1 ;;
+esac
+sha="<git-sha>"
+run_id="<run-id>"
+destination="/tmp/cloudflare-mcp-release-${arch}-${sha}"
+
+gh run download "$run_id" \
   --repo sednalabs/cloudflare-mcp \
-  --name cloudflare-mcp-linux-<x86_64-or-aarch64>-stdio-<git-sha> \
-  --dir /tmp/cloudflare-mcp-release-<arch>-<git-sha>
+  --name "cloudflare-mcp-linux-${arch}-stdio-${sha}" \
+  --dir "$destination"
+
+cd "$destination"
+bundle="cloudflare-mcp-linux-${arch}-stdio-${sha}.tar.gz"
+sha256sum -c "${bundle}.sha256"
+tar -xzf "${bundle}"
+sha256sum -c SHA256SUMS
+test "$(stat -c '%a' cloudflare-mcp)" = 755
+file cloudflare-mcp
 ```
 
 After download, compare the installed file and the artifact manifest before
