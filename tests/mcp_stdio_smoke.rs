@@ -685,7 +685,8 @@ fn manifest_ledger_authority_response(table: &str) -> Value {
 
 fn wrangler_manifest_ledger_authority_response(table: &str) -> Value {
     let schema = format!(
-        "CREATE TABLE {table}(\n\t\tid         INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tname       TEXT UNIQUE,\n\t\tapplied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL\n)"
+        "CREATE TABLE \"{}\"(\n\t\tid         INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tname       TEXT UNIQUE,\n\t\tapplied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL\n)",
+        table.replace('"', "\"\"")
     );
     json!({
         "success": true,

@@ -422,18 +422,33 @@ fn expected_d1_migration_ledger_table_sql(table: &str) -> String {
         .replacen("CREATE TABLE IF NOT EXISTS", "CREATE TABLE", 1)
 }
 
-// Wrangler 4.87.0 `src/d1/migrations/apply.ts` interpolates the already
-// validated configured table identifier into this source form. SQLite retains
-// that unquoted, case-preserving identifier and the tab alignment in
-// `sqlite_master.sql`. Keep this as a closed accepted form rather than
-// normalizing arbitrary SQL: the helper-generated spelling remains accepted,
-// but an extra constraint, column, statement, or changed default never does.
-fn wrangler_d1_migration_ledger_table_sql(table: &str) -> Option<String> {
+fn is_wrangler_d1_migration_table_identifier(table: &str) -> bool {
     let mut characters = table.chars();
-    let valid_identifier = matches!(characters.next(), Some(ch) if ch == '_' || ch.is_ascii_alphabetic())
+    matches!(characters.next(), Some(ch) if ch == '_' || ch.is_ascii_alphabetic())
         && characters.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-        && table.len() <= 64;
-    valid_identifier.then(|| {
+        && table.len() <= 64
+}
+
+// Current Wrangler escapes the configured ledger identifier and emits this
+// tab-aligned source form. SQLite removes `IF NOT EXISTS` and the terminating
+// semicolon while retaining the quoted, case-preserving identifier and tabs in
+// `sqlite_master.sql`. Keep the accepted form exact rather than normalizing
+// arbitrary SQL: an extra constraint, column, statement, or changed default
+// must remain fail-closed.
+fn current_wrangler_d1_migration_ledger_table_sql(table: &str) -> Option<String> {
+    is_wrangler_d1_migration_table_identifier(table).then(|| {
+        let table = quote_sql_identifier(table);
+        format!(
+            "CREATE TABLE {table}(\n\t\tid         INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tname       TEXT UNIQUE,\n\t\tapplied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL\n)"
+        )
+    })
+}
+
+// Wrangler 4.87.0 emitted the same schema with an unquoted identifier. Retain
+// that exact installed form for existing databases without allowing broader
+// SQL normalization.
+fn legacy_wrangler_d1_migration_ledger_table_sql(table: &str) -> Option<String> {
+    is_wrangler_d1_migration_table_identifier(table).then(|| {
         format!(
             "CREATE TABLE {table}(\n\t\tid         INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tname       TEXT UNIQUE,\n\t\tapplied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL\n)"
         )
@@ -442,7 +457,8 @@ fn wrangler_d1_migration_ledger_table_sql(table: &str) -> Option<String> {
 
 fn is_supported_d1_migration_ledger_table_sql(table_sql: &str, table: &str) -> bool {
     table_sql == expected_d1_migration_ledger_table_sql(table)
-        || wrangler_d1_migration_ledger_table_sql(table).as_deref() == Some(table_sql)
+        || current_wrangler_d1_migration_ledger_table_sql(table).as_deref() == Some(table_sql)
+        || legacy_wrangler_d1_migration_ledger_table_sql(table).as_deref() == Some(table_sql)
 }
 
 pub(crate) fn d1_migration_ledger_authority_sql(table: &str) -> String {
@@ -727,11 +743,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        approved_d1_plan_digest_matches, d1_manifest_write_result_classification,
-        d1_migrations_table_init_sql, expected_d1_migration_ledger_table_sql,
+        approved_d1_plan_digest_matches, current_wrangler_d1_migration_ledger_table_sql,
+        d1_manifest_write_result_classification, d1_migrations_table_init_sql,
+        expected_d1_migration_ledger_table_sql, legacy_wrangler_d1_migration_ledger_table_sql,
         parse_d1_migration_ledger, parse_d1_migration_ledger_authority,
         validate_d1_manifest_write_result, validate_d1_migration_manifest,
-        wrangler_d1_migration_ledger_table_sql,
     };
     use crate::tools::{D1MigrationManifestEntry, sha256_hex};
 
@@ -749,7 +765,7 @@ mod tests {
         }])
     }
 
-    fn wrangler_authority(table: &str) -> serde_json::Value {
+    fn current_wrangler_authority(table: &str) -> serde_json::Value {
         json!([{
             "success": true,
             "errors": [],
@@ -758,10 +774,19 @@ mod tests {
                 "type": "table",
                 "name": table,
                 "tbl_name": table,
-                "sql": wrangler_d1_migration_ledger_table_sql(table)
+                "sql": current_wrangler_d1_migration_ledger_table_sql(table)
                     .expect("test table is a valid Wrangler identifier"),
             }],
         }])
+    }
+
+    fn legacy_wrangler_authority(table: &str) -> serde_json::Value {
+        let mut authority = current_wrangler_authority(table);
+        authority[0]["results"][0]["sql"] = json!(
+            legacy_wrangler_d1_migration_ledger_table_sql(table)
+                .expect("test table is a valid Wrangler identifier")
+        );
+        authority
     }
 
     #[test]
@@ -861,11 +886,15 @@ mod tests {
             "custom_migrations",
             "CasePreserving_Ledger",
         ] {
-            let wrangler = wrangler_authority(table);
-            assert!(parse_d1_migration_ledger_authority(&wrangler, table).is_ok());
+            for wrangler in [
+                current_wrangler_authority(table),
+                legacy_wrangler_authority(table),
+            ] {
+                assert!(parse_d1_migration_ledger_authority(&wrangler, table).is_ok());
+            }
         }
 
-        let wrangler_default = wrangler_authority("d1_migrations");
+        let wrangler_default = current_wrangler_authority("d1_migrations");
 
         for sql in [
             "CREATE TABLE d1_migrations(\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tname TEXT UNIQUE,\n\t\tapplied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,\n\t\textra TEXT\n)",
@@ -882,7 +911,7 @@ mod tests {
             );
         }
 
-        let mut case_drift = wrangler_authority("CasePreserving_Ledger");
+        let mut case_drift = current_wrangler_authority("CasePreserving_Ledger");
         case_drift[0]["results"][0]["sql"] = json!(
             "CREATE TABLE casepreserving_ledger(\n\t\tid         INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tname       TEXT UNIQUE,\n\t\tapplied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL\n)"
         );
