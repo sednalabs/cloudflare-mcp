@@ -608,14 +608,14 @@ impl D1RetainedMigrationLease {
                     };
                 }
             };
-            let receipt_persisted = match (second_receipt, final_receipt) {
+            let receipt_persisted = match (&second_receipt, &final_receipt) {
                 (None, None) if preliminary_receipt_persisted == Some(false) => Some(false),
                 (Some(second), Some(final_receipt))
                     if preliminary_receipt_persisted == Some(true)
-                        && linux::same_terminal_receipt_evidence(&second, &final_receipt)
+                        && linux::same_terminal_receipt_evidence(second, final_receipt)
                         && linux::validate_stable_terminal_receipt_evidence(
                             &self.target,
-                            &final_receipt,
+                            final_receipt,
                         )
                         .is_ok() =>
                 {
@@ -631,6 +631,50 @@ impl D1RetainedMigrationLease {
             }
             maybe_pause_terminal_lease_namespace_readback_for_test(&expected.lease_nonce);
             if self.revalidate().is_err() {
+                return D1TerminalEvidenceReadback {
+                    custody: D1TerminalCustodyNamespace::Unverified,
+                    receipt_persisted: None,
+                };
+            }
+            // Linearization contract: the permanent target guard remains held
+            // across the exact lease-namespace revalidation above and this one
+            // final compatible receipt read. Controlled custody writers honor
+            // that guard, so convergence here is the bounded joint decision.
+            // Do not alternate back to another lease read: an endless sequence
+            // cannot create stronger atomicity against an out-of-contract local
+            // filesystem writer.
+            let linearized_receipt = match linux::compatible_terminal_receipt_state(
+                &self.target,
+                expected,
+                legacy_expected,
+            ) {
+                Ok(receipt) => receipt,
+                Err(_) => {
+                    return D1TerminalEvidenceReadback {
+                        custody: D1TerminalCustodyNamespace::Unverified,
+                        receipt_persisted: None,
+                    };
+                }
+            };
+            let receipt_persisted = match (&final_receipt, &linearized_receipt) {
+                (None, None) if receipt_persisted == Some(false) => Some(false),
+                (Some(final_receipt), Some(linearized_receipt))
+                    if receipt_persisted == Some(true)
+                        && linux::same_terminal_receipt_evidence(
+                            final_receipt,
+                            linearized_receipt,
+                        )
+                        && linux::validate_stable_terminal_receipt_evidence(
+                            &self.target,
+                            linearized_receipt,
+                        )
+                        .is_ok() =>
+                {
+                    Some(true)
+                }
+                _ => None,
+            };
+            if receipt_persisted.is_none() {
                 return D1TerminalEvidenceReadback {
                     custody: D1TerminalCustodyNamespace::Unverified,
                     receipt_persisted: None,
@@ -4001,6 +4045,95 @@ mod tests {
         assert_eq!(result.custody, D1TerminalCustodyNamespace::Unverified);
         assert_eq!(result.receipt_persisted, None);
         fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_evidence_linearization_rejects_receipt_drift_during_final_lease_pause() {
+        for variant in ["mutated", "removed", "replaced"] {
+            let root = private_test_root(&format!("terminal-linearization-{variant}"));
+            let plan = "a".repeat(64);
+            let mut owner = acquire_d1_migration_lease_at(
+                root.clone(),
+                "acct-1",
+                "db-1",
+                "newsletter-core",
+                &plan,
+            )
+            .expect("create retained evidence");
+            let identity = owner.identity.clone();
+            let target = owner
+                .active_path_for_test()
+                .expect("active path")
+                .parent()
+                .expect("target")
+                .to_path_buf();
+            owner.retain();
+            drop(owner);
+            let expected = terminal_receipt(&identity, &plan);
+            let retained = inspect_terminal_d1_migration_lease_at(
+                root.clone(),
+                "acct-1",
+                "db-1",
+                "newsletter-core",
+                &plan,
+                &identity.nonce,
+                &identity.payload_sha256,
+            )
+            .expect("inspect retained lease");
+            retained
+                .persist_terminal_receipt(&expected)
+                .expect("persist exact terminal receipt");
+
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            install_terminal_lease_namespace_readback_pause_hook(
+                identity.nonce.clone(),
+                entered_tx,
+                resume_rx,
+            );
+            let expected_for_readback = expected.clone();
+            let readback = std::thread::spawn(move || {
+                retained.terminal_evidence_readback(&expected_for_readback, None)
+            });
+            entered_rx
+                .recv()
+                .expect("final stable receipt snapshot completed");
+            let receipt_path = target.join(format!(
+                "terminal-reconciliation.{}.receipt.json",
+                identity.nonce
+            ));
+            match variant {
+                "mutated" => fs::write(&receipt_path, b"{}")
+                    .expect("mutate receipt during final lease pause"),
+                "removed" => {
+                    fs::remove_file(&receipt_path).expect("remove receipt during final lease pause")
+                }
+                "replaced" => {
+                    fs::rename(&receipt_path, root.join("displaced-terminal-receipt.json"))
+                        .expect("displace receipt during final lease pause");
+                    write_private_test_file(
+                        &receipt_path,
+                        &serde_json::to_vec(&expected).expect("canonical replacement receipt"),
+                    );
+                }
+                _ => unreachable!(),
+            }
+            resume_tx
+                .send(())
+                .expect("resume final lease namespace validation");
+            let result = readback.join().expect("readback thread");
+            assert_eq!(
+                result.custody,
+                D1TerminalCustodyNamespace::Unverified,
+                "{variant} receipt must invalidate custody"
+            );
+            assert_eq!(
+                result.receipt_persisted, None,
+                "{variant} receipt must make persistence unknown"
+            );
+            fs::remove_dir_all(root).expect("test cleanup");
+        }
     }
 
     #[cfg(target_os = "linux")]
