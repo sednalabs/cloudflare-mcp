@@ -5541,7 +5541,7 @@ fn d1_apply_migration_manifest_dry_run_reaches_stdio_and_never_sends_sql_bytes()
                     "sql": first_sql,
                 },
                 {
-                    "name": "0002_second.sql",
+                    "name": "2_second/migration.sql",
                     "size_bytes": second_sql.len(),
                     "sql_sha256": sha256_hex(second_sql),
                     "sql": second_sql,
@@ -5553,7 +5553,7 @@ fn d1_apply_migration_manifest_dry_run_reaches_stdio_and_never_sends_sql_bytes()
     assert_eq!(content["ok"], json!(true), "{content}");
     assert_eq!(
         content["pending_migrations"][0]["name"],
-        json!("0002_second.sql")
+        json!("2_second/migration.sql")
     );
     assert_eq!(content["plan_sha256"].as_str().map(str::len), Some(64));
     assert_eq!(requests.lock().expect("requests lock").len(), 1);

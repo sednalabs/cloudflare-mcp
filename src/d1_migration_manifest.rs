@@ -7,6 +7,7 @@
 use rmcp::model::CallToolResult;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
 use crate::d1_migration_lease::D1MigrationLease;
@@ -118,6 +119,64 @@ pub(crate) fn normalize_d1_migration_family(value: &str) -> Result<String, CallT
     }
 }
 
+fn wrangler_leading_migration_number(segment: &str) -> Option<f64> {
+    let prefix = segment.split('_').next().unwrap_or_default().trim_start();
+    let bytes = prefix.as_bytes();
+    let (sign, start) = match bytes.first() {
+        Some(b'+') => (1.0, 1),
+        Some(b'-') => (-1.0, 1),
+        _ => (1.0, 0),
+    };
+    let mut value = 0.0_f64;
+    let mut found = false;
+    for byte in bytes.iter().skip(start) {
+        if !byte.is_ascii_digit() {
+            break;
+        }
+        found = true;
+        value = value * 10.0 + f64::from(*byte - b'0');
+    }
+    (found && value.is_finite()).then_some(sign * value)
+}
+
+fn wrangler_migration_segment_cmp(left: &str, right: &str) -> Ordering {
+    match (
+        wrangler_leading_migration_number(left),
+        wrangler_leading_migration_number(right),
+    ) {
+        (Some(left_number), Some(right_number)) if left_number != right_number => left_number
+            .partial_cmp(&right_number)
+            .expect("finite migration numbers are totally ordered"),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        _ => left.encode_utf16().cmp(right.encode_utf16()),
+    }
+}
+
+fn wrangler_migration_path_cmp(left: &str, right: &str) -> Ordering {
+    let left_segments = left.split('/').collect::<Vec<_>>();
+    let right_segments = right.split('/').collect::<Vec<_>>();
+    for (left_segment, right_segment) in left_segments.iter().zip(&right_segments) {
+        let ordering = wrangler_migration_segment_cmp(left_segment, right_segment);
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    left_segments.len().cmp(&right_segments.len())
+}
+
+fn valid_wrangler_migration_path(name: &str) -> bool {
+    name == name.trim()
+        && !name.is_empty()
+        && name.len() <= 255
+        && name.ends_with(".sql")
+        && !name.contains('\\')
+        && !name.contains('\0')
+        && name
+            .split('/')
+            .all(|segment| !segment.is_empty() && !matches!(segment, "." | ".."))
+}
+
 pub(crate) fn validate_d1_migration_manifest(
     manifest: Vec<D1MigrationManifestEntry>,
 ) -> Result<Vec<D1MigrationManifestEntry>, CallToolResult> {
@@ -125,7 +184,7 @@ pub(crate) fn validate_d1_migration_manifest(
         return Err(invalid_argument_result(
             "d1.empty_migration_manifest",
             "manifest must contain at least one exact migration",
-            "Provide the complete approved migration manifest in lexical Wrangler order.",
+            "Provide the complete approved migration manifest in current Wrangler migration order.",
         ));
     }
     if manifest.len() > MAX_D1_MIGRATION_COUNT {
@@ -138,26 +197,22 @@ pub(crate) fn validate_d1_migration_manifest(
     let mut previous = None::<String>;
     let mut manifest_size_bytes = 0_u64;
     for migration in &manifest {
-        let name = migration.name.trim();
-        if name != migration.name
-            || name.is_empty()
-            || name.len() > 255
-            || !name.ends_with(".sql")
-            || name.contains('/')
-            || name.contains('\\')
-            || name.contains('\0')
-        {
+        let name = migration.name.as_str();
+        if !valid_wrangler_migration_path(name) {
             return Err(invalid_argument_result(
                 "d1.invalid_manifest_migration_name",
-                "manifest migration names must be non-empty .sql basenames of at most 255 bytes without path separators",
-                "Use the exact Wrangler migration filename, for example 0001_initial.sql.",
+                "manifest migration names must be canonical relative POSIX .sql paths of at most 255 bytes without empty, dot, traversal, backslash, or NUL segments",
+                "Use the exact path Wrangler records relative to migrations_dir, for example 0001_initial.sql or 0001_init/migration.sql.",
             ));
         }
-        if previous.as_deref().is_some_and(|prior| prior >= name) {
+        if previous
+            .as_deref()
+            .is_some_and(|prior| wrangler_migration_path_cmp(prior, name) != Ordering::Less)
+        {
             return Err(invalid_argument_result(
                 "d1.manifest_not_lexical",
-                "manifest migration names must be unique and strictly lexical",
-                "Supply the complete manifest in the same lexical order that Wrangler uses.",
+                "manifest migration names must be unique and follow Wrangler's segment-wise numeric order with lexical tie-breaking",
+                "Supply the complete manifest in the same order returned by the current Wrangler migration discovery path.",
             ));
         }
         if migration.size_bytes > MAX_D1_MIGRATION_BYTES
@@ -675,8 +730,10 @@ mod tests {
         approved_d1_plan_digest_matches, d1_manifest_write_result_classification,
         d1_migrations_table_init_sql, expected_d1_migration_ledger_table_sql,
         parse_d1_migration_ledger, parse_d1_migration_ledger_authority,
-        validate_d1_manifest_write_result, wrangler_d1_migration_ledger_table_sql,
+        validate_d1_manifest_write_result, validate_d1_migration_manifest,
+        wrangler_d1_migration_ledger_table_sql,
     };
+    use crate::tools::{D1MigrationManifestEntry, sha256_hex};
 
     fn authority(table: &str) -> serde_json::Value {
         json!([{
@@ -1090,6 +1147,57 @@ mod tests {
             Some(&format!("{expected}\n")),
             &expected
         ));
+    }
+
+    fn migration(name: &str) -> D1MigrationManifestEntry {
+        let sql = format!("SELECT '{name}';");
+        D1MigrationManifestEntry {
+            name: name.to_string(),
+            size_bytes: sql.len() as u64,
+            sql_sha256: sha256_hex(&sql),
+            sql,
+        }
+    }
+
+    #[test]
+    fn manifest_accepts_current_wrangler_paths_and_numeric_segment_order() {
+        for names in [
+            vec!["2_init.sql", "10_next.sql", "alpha.sql"],
+            vec!["0001_init/migration.sql", "0002_next/migration.sql"],
+            vec!["0001_init/2_seed.sql", "0001_init/10_seed.sql"],
+        ] {
+            let manifest = names.into_iter().map(migration).collect();
+            validate_d1_migration_manifest(manifest)
+                .expect("current Wrangler path and ordering must be accepted");
+        }
+
+        let reversed = vec![migration("10_next.sql"), migration("2_init.sql")];
+        let error = validate_d1_migration_manifest(reversed)
+            .expect_err("lexical order must not override Wrangler numeric order");
+        assert_eq!(
+            error.structured_content.expect("structured error")["error"]["code"],
+            "d1.manifest_not_lexical"
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_noncanonical_or_escaping_relative_paths() {
+        for name in [
+            "/0001.sql",
+            "./0001.sql",
+            "nested/../0001.sql",
+            "nested//0001.sql",
+            "nested\\0001.sql",
+            " 0001.sql",
+        ] {
+            let error = validate_d1_migration_manifest(vec![migration(name)])
+                .expect_err("noncanonical migration path must fail closed");
+            assert_eq!(
+                error.structured_content.expect("structured error")["error"]["code"],
+                "d1.invalid_manifest_migration_name",
+                "{name}"
+            );
+        }
     }
 }
 

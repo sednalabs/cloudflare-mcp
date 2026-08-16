@@ -86,7 +86,11 @@ must submit that exact lowercase value, without whitespace or case changes, as
 `approved_plan_sha256` and configure
 `CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT` to a pre-created, operator-owned,
 non-group/world-writable directory shared by every MCP process that can target
-the database. On Linux the root must be an absolute real directory owned by the
+the database. Manifest names may be current Wrangler paths relative to
+`migrations_dir`, including nested layouts such as `0001_init/migration.sql`.
+Supply them in Wrangler's segment-wise numeric order with lexical tie-breaking;
+absolute, backslash, empty, dot, traversal, and NUL path forms fail closed. On
+Linux the root must be an absolute real directory owned by the
 current operator with mode `0700` (or stricter), and every non-sticky ancestor
 must be non-writable. The MCP permanently creates one private target directory
 per account/database. It retains held root, target, guard and active file
