@@ -72,6 +72,7 @@ Use curated D1 tools instead of generic API calls for database workflows:
 - `d1_query_read_only`
 - `d1_execute_write`
 - `d1_apply_migrations` (dry-run inspection only; live mutation is retired)
+- `d1_bootstrap_migration_ledger`
 - `d1_apply_migration_manifest`
 - `d1_reconcile_migration_manifest`
 - `d1_finalize_migration_reconciliation`
@@ -82,6 +83,22 @@ Read/query tools use restricted SQL checks. Write and migration tools preserve
 dry-run discipline and fail closed on unsafe or ambiguous state. Use
 `d1_apply_migration_manifest` for every live migration; the legacy
 directory-backed `d1_apply_migrations` tool refuses live mutation.
+
+Use `d1_bootstrap_migration_ledger` only before the first migration on a
+separately selected, genuinely empty D1 database. Its dry run binds the exact
+account, database, ledger table, canonical initializer, and two matching
+primary-served empty-schema reads. Live apply shares the manifest target lease,
+repeats that proof, and may issue exactly one ledger-table initializer. It does
+not execute migration SQL, add a ledger to a database containing application
+objects, repair a partial ledger, or retry after an ambiguous provider result.
+Successful post-state proof requires the canonical table to be the only
+application-owned object and its filename ledger to remain empty. SQLite
+internals and Cloudflare's reserved `_cf_*` objects are provider-owned and do
+not make an otherwise empty D1 an application-bearing target. Custom ledger
+names in either the `sqlite_*` or `_cf_*` reserved family are rejected. The
+single DDL acknowledgement may truthfully carry zero row counts; it must still
+prove primary service and `changed_db=true`, after which stable schema and
+empty-ledger readback supplies the effect proof.
 
 Use `d1_reconcile_migration_manifest` only for exact retained
 `active.lease.json` or `retiring.lease.json` evidence after an ambiguous

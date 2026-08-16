@@ -77,6 +77,39 @@ release artifact bundle so agents can compare:
 - schema snapshot hash versus `spec/tool_schema_snapshot.v1.json`,
 - `/proc/<pid>/exe` hash for any already-running stdio process.
 
+## First-ledger bootstrap for an empty D1 target
+
+Use `d1_bootstrap_migration_ledger` only for a separately selected database
+that is intended to be empty before its first migration. Do not use it to add a
+ledger to an existing application database, repair a partial initialization,
+or bypass `d1_apply_migration_manifest`.
+
+1. Configure `CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT` to the same trusted,
+   private Linux custody root used by manifest apply.
+2. Call the bootstrap with `dry_run=true` and the exact account, database, and
+   optional canonical ledger-table identifier. Confirm that the response
+   reports two provider reads, zero mutations, `target_inventory.state=empty`,
+   and a lowercase `plan_sha256`.
+3. Independently confirm that this is the intended empty target. Approval of a
+   manifest apply, an account default, or a similarly named database is not
+   bootstrap approval.
+4. Call the same tool live with the exact dry-run `plan_sha256`. The tool
+   repeats the stable primary empty preflight under the account/database target
+   lease and issues at most one non-idempotent canonical initializer.
+5. Treat success as proven only when the response reports one provider
+   mutation, the canonical ledger as the only non-internal schema object, an
+   empty filename ledger, and released custody. A DDL acknowledgement may
+   report zero changed rows, but it must report primary service,
+   `changed_db=true`, and typed non-negative counts before the stable post-state
+   can authorize success. Continue with a separate `d1_apply_migration_manifest`
+   dry-run; bootstrap approval never approves migration SQL.
+
+If the initializer response is lost or malformed, do not retry. The tool makes
+read-only reconciliation calls, retains custody when it can prove the local
+chain, and reports the single mutation attempt. Escalate that exact evidence to
+the governed reconciliation path. A canonical empty ledger observed afterward
+does not prove whether this call created it, so it is not permission to replay.
+
 ## Exact-byte D1 migration manifests
 
 Use `d1_apply_migration_manifest` for an approval-gated D1 migration family.

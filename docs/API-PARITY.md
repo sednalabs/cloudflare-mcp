@@ -20,7 +20,8 @@ preferred path for safety-sensitive operations.
 - Product workflows with curated safety policy remain specialized tools. D1
   workflows use `d1_list_databases`, `d1_get_database`, `d1_inspect_schema`,
   `d1_query_read_only`, `d1_validate_query`, `d1_execute_write`,
-  `d1_apply_migrations`, `d1_apply_migration_manifest`,
+  `d1_apply_migrations`, `d1_bootstrap_migration_ledger`,
+  `d1_apply_migration_manifest`,
   `d1_reconcile_migration_manifest`, `d1_finalize_migration_reconciliation`,
   `d1_rename_database`, and `d1_delete_database`;
   Workers Analytics Engine workflows use

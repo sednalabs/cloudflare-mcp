@@ -9,6 +9,7 @@ pub mod cache;
 pub mod cloudflare;
 pub mod config;
 pub(crate) mod d1_migration_additive;
+pub(crate) mod d1_migration_bootstrap;
 pub(crate) mod d1_migration_lease;
 pub(crate) mod d1_migration_manifest;
 pub(crate) mod d1_migration_reconciliation;

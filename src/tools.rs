@@ -38,6 +38,10 @@ use crate::cloudflare::{
     AccessAppUpsertRequest, AccessPolicyWrite, BulkRedirectItemWrite, CacheRule, CacheRuleset,
     DnsRecordUpsertRequest, PagesDeploymentTriggerRequest, with_request_api_token_override,
 };
+use crate::d1_migration_bootstrap::{
+    D1_BOOTSTRAP_OPERATION, D1BootstrapExecutionInput, d1_bootstrap_mutation_plan,
+    d1_bootstrap_mutation_target, execute_d1_bootstrap_migration_ledger,
+};
 use crate::d1_migration_lease::{
     acquire_d1_migration_lease, d1_migration_lease_requirements,
     preflight_d1_migration_target_custody,
@@ -946,6 +950,21 @@ pub struct D1ApplyMigrationManifestArgs {
     pub approved_plan_sha256: Option<String>,
     #[serde(default)]
     pub max_rows: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct D1BootstrapMigrationLedgerArgs {
+    #[serde(default)]
+    pub account_id: Option<String>,
+    pub database_id: String,
+    #[serde(default)]
+    pub migrations_table: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    /// Exact lowercase `plan_sha256` returned by the dry run. Live bootstrap
+    /// rejects case changes, whitespace, stale targets, and stale preflight.
+    pub approved_plan_sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -4538,6 +4557,94 @@ impl CloudflareMcp {
             "unknown_ledger": false,
             "max_rows": max_rows,
         })))
+    }
+
+    #[tool(
+        name = "d1_bootstrap_migration_ledger",
+        description = "Bootstrap only the canonical empty Wrangler-compatible migration ledger on an independently selected empty D1 target under an approved dry-run plan."
+    )]
+    async fn cloudflare_d1_bootstrap_migration_ledger(
+        &self,
+        Parameters(args): Parameters<D1BootstrapMigrationLedgerArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let D1BootstrapMigrationLedgerArgs {
+            account_id: requested_account_id,
+            database_id: requested_database_id,
+            migrations_table: requested_migrations_table,
+            dry_run,
+            approved_plan_sha256,
+        } = args;
+        let zero_call_error = |result: CallToolResult| {
+            CallToolResult::structured_error(json!({
+                "ok": false,
+                "operation": D1_BOOTSTRAP_OPERATION,
+                "status": "blocked",
+                "provider_calls": 0,
+                "provider_mutations": 0,
+                "automatic_retry_permitted": false,
+                "error": d1_call_tool_error_value(result),
+            }))
+        };
+
+        if let Some(account_id) = requested_account_id.as_deref() {
+            if let Err(result) = normalize_d1_manifest_target(account_id, &requested_database_id) {
+                return Ok(zero_call_error(result));
+            }
+        }
+        let resolved_account_id = resolve_account_id(self, requested_account_id.as_deref())?;
+        let target = match normalize_d1_manifest_target(resolved_account_id, &requested_database_id)
+        {
+            Ok(target) => target,
+            Err(result) => return Ok(zero_call_error(result)),
+        };
+        if requested_migrations_table
+            .as_deref()
+            .is_some_and(|table| table.is_empty() || table.trim() != table)
+        {
+            return Ok(zero_call_error(invalid_argument_result(
+                "d1.invalid_migrations_table",
+                "an explicit migrations_table must already be one exact canonical ASCII SQL identifier",
+                "Omit migrations_table for d1_migrations or provide the exact unpadded canonical identifier.",
+            )));
+        }
+        let migrations_table =
+            match normalize_d1_migrations_table(requested_migrations_table.as_deref()) {
+                Ok(table) => table,
+                Err(result) => return Ok(zero_call_error(result)),
+            };
+        let migrations_table_lower = migrations_table.to_ascii_lowercase();
+        if migrations_table_lower.starts_with("sqlite_")
+            || migrations_table_lower.starts_with("_cf_")
+        {
+            return Ok(zero_call_error(invalid_argument_result(
+                "d1.bootstrap_reserved_migrations_table",
+                "bootstrap migrations_table must not use a SQLite or Cloudflare-reserved identifier family",
+                "Use d1_migrations or another application-owned ASCII identifier.",
+            )));
+        }
+        let input = D1BootstrapExecutionInput {
+            account_id: target.account_id,
+            database_id: target.database_id,
+            migrations_table,
+            dry_run,
+            approved_plan_sha256,
+        };
+        let mutation_target = d1_bootstrap_mutation_target(&input);
+        let mutation_plan = d1_bootstrap_mutation_plan(&input);
+        let mut audit = MutationAuditSession::start(
+            Some(&parts),
+            D1_BOOTSTRAP_OPERATION,
+            mutation_target,
+            dry_run,
+        );
+        let result = execute_d1_bootstrap_migration_ledger(self, input, &mut audit).await;
+        Ok(finalize_mutation_result(
+            result,
+            &mutation_plan,
+            audit,
+            dry_run,
+        ))
     }
 
     #[tool(

@@ -97,6 +97,13 @@ Preserved curated tool families:
   `d1_inspect_schema` supports targeted `include_tables`/`include_table_pattern`
   filtering and must keep Cloudflare internal `_cf_*` objects out of
   application `column_errors`.
+- The first-ledger bootstrap (`d1_bootstrap_migration_ledger`) is a distinct
+  mutating contract from manifest apply. Keep its exact empty-target dry-run
+  digest, shared target custody, one-initializer maximum, no-retry ambiguity,
+  stable canonical-schema/empty-ledger readback, mutation accounting, and MCP
+  stdio negative-path coverage aligned with the snapshot. It must never become
+  a compatibility path for application-bearing or partially initialized D1
+  databases.
 - Retained-manifest reconciliation (`d1_reconcile_migration_manifest`) is a
   first-class read-only D1 recovery contract. Keep its exact structured
   expectation schema, manifest-derived complete prefix inventory, query-bound

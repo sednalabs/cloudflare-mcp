@@ -715,6 +715,135 @@ fn manifest_ledger_response(rows: Vec<Value>) -> Value {
     })
 }
 
+fn bootstrap_inventory_response(
+    initialized: bool,
+    conflict: bool,
+    cloudflare_internal_visible: bool,
+) -> Value {
+    let mut results = if conflict {
+        vec![json!({
+            "type": "table",
+            "name": "application_rows",
+            "tbl_name": "application_rows",
+            "sql": "CREATE TABLE application_rows(id INTEGER)",
+        })]
+    } else if initialized {
+        manifest_ledger_authority_response("d1_migrations")["result"][0]["results"]
+            .as_array()
+            .expect("canonical authority rows")
+            .clone()
+    } else {
+        Vec::new()
+    };
+    if cloudflare_internal_visible {
+        results.insert(
+            0,
+            json!({
+                "type": "table",
+                "name": "_cf_KV",
+                "tbl_name": "_cf_KV",
+                "sql": "CREATE TABLE _cf_KV (key TEXT PRIMARY KEY, value BLOB) WITHOUT ROWID",
+            }),
+        );
+        results.truncate(2);
+    }
+    json!({
+        "success": true,
+        "errors": [],
+        "messages": [],
+        "result": [{
+            "success": true,
+            "errors": [],
+            "meta": {"served_by_primary": true},
+            "results": results,
+        }],
+    })
+}
+
+fn is_bootstrap_inventory_sql(sql: &str) -> bool {
+    sql.starts_with("SELECT type, name, tbl_name, sql FROM sqlite_master ")
+        && sql.contains("lower(name) NOT GLOB 'sqlite_*'")
+        && sql.ends_with("LIMIT 2")
+}
+
+fn spawn_fake_bootstrap_api(
+    expected_requests: usize,
+    conflict: bool,
+    ambiguous_initializer: bool,
+    cloudflare_internal_present: bool,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind bootstrap D1 API");
+    let addr = listener.local_addr().expect("bootstrap D1 address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        let mut initialized = false;
+        for stream in listener.incoming().take(expected_requests) {
+            let mut stream = stream.expect("bootstrap D1 stream");
+            let (headers, body) = read_http_request(&mut stream);
+            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            let body_json: Value = serde_json::from_slice(&body).expect("bootstrap request JSON");
+            requests_for_thread
+                .lock()
+                .expect("bootstrap request log")
+                .push(body_json.clone());
+            let sql = body_json["sql"].as_str().unwrap_or_default();
+            if sql.starts_with("CREATE TABLE IF NOT EXISTS \"d1_migrations\"") {
+                initialized = true;
+                if ambiguous_initializer {
+                    write!(stream, "HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-length: 0\r\n\r\n")
+                        .expect("write ambiguous initializer response");
+                    continue;
+                }
+                let response = serde_json::to_vec(&json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": [{
+                        "success": true,
+                        "errors": [],
+                        "results": [],
+                        "meta": {
+                            "served_by_primary": true,
+                            "changed_db": true,
+                            "changes": 0,
+                            "rows_written": 0,
+                        },
+                    }],
+                }))
+                .expect("serialize initializer response");
+                write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                    .expect("write initializer headers");
+                stream
+                    .write_all(&response)
+                    .expect("write initializer response");
+                continue;
+            }
+            let response = if is_bootstrap_inventory_sql(sql) {
+                let filters_cloudflare_internal = sql.contains("lower(name) NOT GLOB '_cf_*'")
+                    && sql.contains("lower(tbl_name) NOT GLOB '_cf_*'");
+                bootstrap_inventory_response(
+                    initialized,
+                    conflict,
+                    cloudflare_internal_present && !filters_cloudflare_internal,
+                )
+            } else if sql == "SELECT * FROM \"d1_migrations\" ORDER BY id" {
+                assert!(initialized, "ledger reads follow initializer dispatch");
+                manifest_ledger_response(Vec::new())
+            } else {
+                panic!("unexpected bootstrap SQL: {sql}");
+            };
+            let response = serde_json::to_vec(&response).expect("serialize bootstrap response");
+            write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                .expect("write bootstrap headers");
+            stream
+                .write_all(&response)
+                .expect("write bootstrap response");
+        }
+    });
+    (format!("http://{addr}"), requests)
+}
+
 fn spawn_manifest_authority_rejection_api(
     authority_responses: Vec<Value>,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
@@ -5519,6 +5648,277 @@ fn d1_apply_migrations_retires_before_any_ledger_or_provider_access() {
         "retired migration path must not probe or mutate the provider"
     );
     let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn d1_bootstrap_migration_ledger_dry_run_and_live_prove_one_initializer_only() {
+    let (base_url, requests) = spawn_fake_bootstrap_api(9, false, false, true);
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-bootstrap-ledger-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create bootstrap lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make bootstrap lease root private");
+    }
+    let env = vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ];
+    let mut mcp = McpStdioProcess::start_with_env(env);
+
+    let invalid = mcp.call_tool(
+        30,
+        "d1_bootstrap_migration_ledger",
+        json!({
+            "database_id": "db-1",
+            "migrations_table": " d1_migrations",
+            "dry_run": true,
+        }),
+    );
+    let invalid = structured_content(&invalid);
+    assert_eq!(invalid["ok"], json!(false), "{invalid}");
+    assert_eq!(invalid["provider_calls"], json!(0));
+    assert_eq!(invalid["provider_mutations"], json!(0));
+    assert!(requests.lock().expect("request log").is_empty());
+
+    for (id, migrations_table) in [(31, "_cf_ledger"), (32, "SQLITE_ledger")] {
+        let reserved = mcp.call_tool(
+            id,
+            "d1_bootstrap_migration_ledger",
+            json!({
+                "database_id": "db-1",
+                "migrations_table": migrations_table,
+                "dry_run": true,
+            }),
+        );
+        let reserved = structured_content(&reserved);
+        assert_eq!(reserved["ok"], json!(false), "{reserved}");
+        assert_eq!(
+            reserved["error"]["code"],
+            json!("d1.bootstrap_reserved_migrations_table")
+        );
+        assert_eq!(reserved["provider_calls"], json!(0));
+        assert_eq!(reserved["provider_mutations"], json!(0));
+    }
+    assert!(requests.lock().expect("request log").is_empty());
+
+    let dry = mcp.call_tool(
+        33,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "dry_run": true}),
+    );
+    let dry = structured_content(&dry);
+    assert_eq!(dry["ok"], json!(true), "{dry}");
+    assert_eq!(dry["status"], json!("previewed"));
+    assert_eq!(dry["target_inventory"]["state"], json!("empty"));
+    assert_eq!(dry["provider_calls"], json!(2));
+    assert_eq!(dry["provider_mutations"], json!(0));
+    let plan = dry["plan_sha256"].as_str().expect("bootstrap plan");
+
+    let live = mcp.call_tool(
+        34,
+        "d1_bootstrap_migration_ledger",
+        json!({
+            "database_id": "db-1",
+            "approved_plan_sha256": plan,
+        }),
+    );
+    let live = structured_content(&live);
+    assert_eq!(live["ok"], json!(true), "{live}");
+    assert_eq!(live["status"], json!("applied_proven"));
+    assert_eq!(live["provider_calls"], json!(7));
+    assert_eq!(live["provider_mutations"], json!(1));
+    assert_eq!(live["migration_sql_executed"], json!(false));
+    assert_eq!(live["post_write"]["ledger_row_count"], json!(0));
+    assert_eq!(
+        live["post_write"]["target_inventory"]["state"],
+        json!("canonical_ledger_only")
+    );
+    assert_released_manifest_target_custody(&lease_root);
+
+    let requests = requests.lock().expect("request log").clone();
+    assert_eq!(requests.len(), 9);
+    let initializer_requests = requests
+        .iter()
+        .filter(|request| {
+            request["sql"]
+                .as_str()
+                .is_some_and(|sql| sql.starts_with("CREATE TABLE IF NOT EXISTS \"d1_migrations\""))
+        })
+        .count();
+    assert_eq!(initializer_requests, 1, "exactly one initializer dispatch");
+    assert!(requests.iter().all(|request| {
+        request["sql"]
+            .as_str()
+            .is_some_and(|sql| !sql.contains("INSERT INTO") && !sql.contains("ALTER TABLE"))
+    }));
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_bootstrap_migration_ledger_rejects_application_objects_without_write() {
+    let (base_url, requests) = spawn_fake_bootstrap_api(2, true, false, true);
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let response = mcp.call_tool(
+        33,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "dry_run": true}),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.bootstrap_target_not_empty")
+    );
+    assert_eq!(content["provider_calls"], json!(2));
+    assert_eq!(content["provider_mutations"], json!(0));
+    let requests = requests.lock().expect("request log").clone();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| is_bootstrap_inventory_sql(request["sql"].as_str().unwrap_or_default()))
+    );
+}
+
+#[test]
+fn d1_bootstrap_migration_ledger_rejects_stale_plan_after_fresh_empty_preflight() {
+    let (base_url, requests) = spawn_fake_bootstrap_api(2, false, false, true);
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-bootstrap-stale-plan-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create stale-plan bootstrap lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make stale-plan lease root private");
+    }
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let response = mcp.call_tool(
+        34,
+        "d1_bootstrap_migration_ledger",
+        json!({
+            "database_id": "db-1",
+            "approved_plan_sha256": "a".repeat(64),
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.bootstrap_plan_digest_mismatch")
+    );
+    assert_eq!(content["provider_calls"], json!(2));
+    assert_eq!(content["provider_mutations"], json!(0));
+    assert_eq!(content["automatic_retry_permitted"], json!(false));
+    assert_released_manifest_target_custody(&lease_root);
+    let requests = requests.lock().expect("request log").clone();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|request| {
+        is_bootstrap_inventory_sql(request["sql"].as_str().unwrap_or_default())
+    }));
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_bootstrap_migration_ledger_response_loss_retains_custody_and_never_retries() {
+    let (base_url, requests) = spawn_fake_bootstrap_api(9, false, true, true);
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-bootstrap-ambiguous-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create ambiguous bootstrap lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make ambiguous lease root private");
+    }
+    let env = vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ];
+    let mut mcp = McpStdioProcess::start_with_env(env.clone());
+    let dry = mcp.call_tool(
+        34,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "dry_run": true}),
+    );
+    let plan = structured_content(&dry)["plan_sha256"]
+        .as_str()
+        .expect("ambiguous bootstrap plan")
+        .to_string();
+    let live = mcp.call_tool(
+        35,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "approved_plan_sha256": plan}),
+    );
+    let content = structured_content(&live);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["status"], json!("reconciliation_required"));
+    assert_eq!(content["provider_calls"], json!(7));
+    assert_eq!(content["provider_mutations"], json!(1));
+    assert_eq!(content["provider_outcome"], json!("unknown"));
+    assert_eq!(content["lease_retained"], json!(true));
+    assert_eq!(content["automatic_retry_permitted"], json!(false));
+    assert_eq!(
+        content["reconciliation_evidence"]["state"],
+        json!("canonical_empty_ledger_observed")
+    );
+    assert_eq!(
+        content["reconciliation_evidence"]["effect_attribution"],
+        json!("unknown")
+    );
+    assert_private_regular_active_lease(&lease_root);
+
+    let mut fresh = McpStdioProcess::start_with_env(env);
+    let blocked = fresh.call_tool(
+        36,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "approved_plan_sha256": "a".repeat(64)}),
+    );
+    let blocked = structured_content(&blocked);
+    assert_eq!(blocked["ok"], json!(false), "{blocked}");
+    assert_eq!(
+        blocked["error"]["code"],
+        json!("d1.migration_target_lease_held")
+    );
+    assert_eq!(blocked["provider_calls"], json!(0));
+
+    let requests = requests.lock().expect("request log").clone();
+    assert_eq!(requests.len(), 9);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request["sql"]
+                .as_str()
+                .is_some_and(|sql| sql.starts_with("CREATE TABLE IF NOT EXISTS")))
+            .count(),
+        1,
+        "ambiguous initializer is dispatched once and never retried"
+    );
+    let _ = fs::remove_dir_all(lease_root);
 }
 
 #[test]

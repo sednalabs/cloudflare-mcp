@@ -1591,6 +1591,48 @@
       "name": "d1_apply_migrations"
     },
     {
+      "description": "Bootstrap only the canonical empty Wrangler-compatible migration ledger on an independently selected empty D1 target under an approved dry-run plan.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "approved_plan_sha256": {
+            "default": null,
+            "description": "Exact lowercase `plan_sha256` returned by the dry run. Live bootstrap\nrejects case changes, whitespace, stale targets, and stale preflight.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "database_id": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "migrations_table": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "database_id"
+        ],
+        "type": "object"
+      },
+      "name": "d1_bootstrap_migration_ledger"
+    },
+    {
       "description": "Delete a Cloudflare D1 database through the curated high-risk endpoint. Dry-run emits a required confirmation token.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
