@@ -82,7 +82,8 @@ release artifact bundle so agents can compare:
 Use `d1_apply_migration_manifest` for an approval-gated D1 migration family.
 First run it with `dry_run=true`; retain the returned `plan_sha256`, which is
 bound to the exact SQL bytes and current Wrangler ledger prefix. A live call
-must submit that value as `approved_plan_sha256` and configure
+must submit that exact lowercase value, without whitespace or case changes, as
+`approved_plan_sha256` and configure
 `CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT` to a pre-created, operator-owned,
 non-group/world-writable directory shared by every MCP process that can target
 the database. On Linux the root must be an absolute real directory owned by the

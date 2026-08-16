@@ -1412,12 +1412,16 @@ pub(crate) fn acquire_d1_migration_lease(
     approved_plan_sha256: Option<&str>,
 ) -> Result<D1MigrationLease, CallToolResult> {
     let plan_sha256 = approved_plan_sha256
-        .map(str::trim)
-        .filter(|v| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit()))
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
         .ok_or_else(|| {
             invalid_argument_result(
                 "d1.approved_plan_sha256_required",
-                "approved_plan_sha256 is required for live apply and must be a SHA-256 hex digest",
+                "approved_plan_sha256 is required for live apply and must be the exact lowercase SHA-256 digest returned by dry run",
                 "Use the exact plan_sha256 from a successful manifest dry run.",
             )
         })?;
@@ -3246,7 +3250,7 @@ mod linux {
         .map_err(|message| d1_lease_root_error("d1.migration_lease_custody_changed", message))?;
         maybe_pause_after_guard_for_test(&root_path);
         let nonce = d1_migration_lease_nonce(&target_hash, plan_sha256);
-        let payload = json!({"version": 2, "target_key_sha256": &target_hash, "nonce": &nonce, "approved_plan_sha256": plan_sha256.to_ascii_lowercase(), "migration_family": family, "created_at_unix_ms": now_unix_ms()});
+        let payload = json!({"version": 2, "target_key_sha256": &target_hash, "nonce": &nonce, "approved_plan_sha256": plan_sha256, "migration_family": family, "created_at_unix_ms": now_unix_ms()});
         let encoded =
             serde_json::to_vec(&payload).expect("serializing lease payload is infallible");
         let identity = D1MigrationLeaseIdentity {

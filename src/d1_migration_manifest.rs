@@ -672,10 +672,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        d1_manifest_write_result_classification, d1_migrations_table_init_sql,
-        expected_d1_migration_ledger_table_sql, parse_d1_migration_ledger,
-        parse_d1_migration_ledger_authority, validate_d1_manifest_write_result,
-        wrangler_d1_migration_ledger_table_sql,
+        approved_d1_plan_digest_matches, d1_manifest_write_result_classification,
+        d1_migrations_table_init_sql, expected_d1_migration_ledger_table_sql,
+        parse_d1_migration_ledger, parse_d1_migration_ledger_authority,
+        validate_d1_manifest_write_result, wrangler_d1_migration_ledger_table_sql,
     };
 
     fn authority(table: &str) -> serde_json::Value {
@@ -1073,6 +1073,24 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn approved_plan_digest_requires_the_exact_canonical_wire_value() {
+        let expected = "ab".repeat(32);
+        assert!(approved_d1_plan_digest_matches(Some(&expected), &expected));
+        assert!(!approved_d1_plan_digest_matches(
+            Some(&expected.to_ascii_uppercase()),
+            &expected
+        ));
+        assert!(!approved_d1_plan_digest_matches(
+            Some(&format!(" {expected}")),
+            &expected
+        ));
+        assert!(!approved_d1_plan_digest_matches(
+            Some(&format!("{expected}\n")),
+            &expected
+        ));
+    }
 }
 
 fn d1_manifest_malformed_ledger_result(message: &'static str) -> CallToolResult {
@@ -1172,9 +1190,13 @@ pub(crate) fn d1_manifest_plan_sha256(
 
 pub(crate) fn approved_d1_plan_digest_matches(provided: Option<&str>, expected: &str) -> bool {
     provided
-        .map(str::trim)
-        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .is_some_and(|value| value.eq_ignore_ascii_case(expected))
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        .is_some_and(|value| value == expected)
 }
 
 pub(crate) fn d1_manifest_plan_mismatch_result(
