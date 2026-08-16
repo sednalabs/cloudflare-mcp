@@ -772,7 +772,7 @@ fn spawn_fake_bootstrap_api(
     ambiguous_initializer: bool,
     cloudflare_internal_present: bool,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind bootstrap D1 API");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind bootstrap D1 API"); // DevSkim: ignore DS162092 -- loopback-only MCP test fixture
     let addr = listener.local_addr().expect("bootstrap D1 address");
     let requests = Arc::new(Mutex::new(Vec::new()));
     let requests_for_thread = requests.clone();
@@ -841,7 +841,7 @@ fn spawn_fake_bootstrap_api(
                 .expect("write bootstrap response");
         }
     });
-    (format!("http://{addr}"), requests)
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
 }
 
 fn spawn_manifest_authority_rejection_api(
@@ -4899,7 +4899,7 @@ fn stdio_tool_calls_cover_context_and_body_normalization_edges() {
         "find_tools",
         json!({
             "query": "d1",
-            "limit": 10,
+            "limit": 20,
             "include_schema": false
         }),
     );
@@ -4913,6 +4913,10 @@ fn stdio_tool_calls_cover_context_and_body_normalization_edges() {
     assert!(
         result_names.contains(&"d1_query_read_only"),
         "find_tools should expose curated D1 tools: {tools_content}"
+    );
+    assert!(
+        result_names.contains(&"d1_bootstrap_migration_ledger"),
+        "find_tools should expose the guarded ledger bootstrap: {tools_content}"
     );
 }
 
