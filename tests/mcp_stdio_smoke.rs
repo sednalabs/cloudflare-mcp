@@ -4695,7 +4695,7 @@ fn create_static_pages_dir(name: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system clock")
         .as_nanos();
-    let root = std::env::temp_dir().join(format!(
+    let root = PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-pages-{name}-{}-{nonce}",
         std::process::id()
     ));
@@ -5516,7 +5516,7 @@ fn pages_deploy_directory_live_apply_uses_direct_upload_manifest_through_stdio_b
             "POST /accounts/acct-1/pages/projects/site/deployments",
         ]
     );
-    let _ = fs::remove_dir_all(directory); // codeql[rust/path-injection] -- test-owned temporary directory
+    let _ = fs::remove_dir_all(directory);
 }
 
 #[test]
@@ -5554,7 +5554,7 @@ fn pages_deploy_directory_live_apply_uploads_advanced_mode_worker_through_stdio_
             "POST /accounts/acct-1/pages/projects/site/deployments",
         ]
     );
-    let _ = fs::remove_dir_all(directory); // codeql[rust/path-injection] -- test-owned temporary directory
+    let _ = fs::remove_dir_all(directory);
 }
 
 #[test]
@@ -5863,7 +5863,7 @@ fn d1_validate_query_works_through_stdio_boundary_without_executing_user_query()
 #[test]
 fn d1_apply_migrations_retires_live_mutation_through_stdio_boundary() {
     let (base_url, requests) = spawn_fake_d1_migrations_api(3, false);
-    let dir = std::env::temp_dir().join(format!("cloudflare-mcp-d1-stdio-{}", std::process::id()));
+    let dir = PathBuf::from("/tmp").join(format!("cloudflare-mcp-d1-stdio-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("create migrations dir");
     fs::write(
@@ -5898,13 +5898,13 @@ fn d1_apply_migrations_retires_live_mutation_through_stdio_boundary() {
     assert_eq!(content["provider_mutations"], json!(0));
     let requests = requests.lock().expect("request log lock").clone();
     assert!(requests.is_empty(), "retired live path must not call D1");
-    let _ = fs::remove_dir_all(dir); // codeql[rust/path-injection] -- test-owned temporary directory
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
 fn d1_apply_migrations_retires_before_any_ledger_or_provider_access() {
     let (base_url, requests) = spawn_fake_d1_migrations_api(2, true);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-d1-ledger-fail-{}",
         std::process::id()
     ));
@@ -5937,7 +5937,7 @@ fn d1_apply_migrations_retires_before_any_ledger_or_provider_access() {
         0,
         "retired migration path must not probe or mutate the provider"
     );
-    let _ = fs::remove_dir_all(dir); // codeql[rust/path-injection] -- test-owned temporary directory
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
