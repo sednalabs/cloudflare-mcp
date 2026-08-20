@@ -3988,10 +3988,15 @@ fn classify_d1_migration_provider_error(
     let Value::Object(envelope) = decode_json_rejecting_duplicate_object_keys(body).ok()? else {
         return None;
     };
-    if envelope.len() != 4
+    let messages_are_absent_or_empty = match envelope.get("messages") {
+        None => true,
+        Some(Value::Array(messages)) => messages.is_empty(),
+        Some(_) => false,
+    };
+    if !(3..=4).contains(&envelope.len())
         || envelope.get("success") != Some(&Value::Bool(false))
         || envelope.get("result") != Some(&Value::Null)
-        || !matches!(envelope.get("messages"), Some(Value::Array(messages)) if messages.is_empty())
+        || !messages_are_absent_or_empty
     {
         return None;
     }
@@ -4950,16 +4955,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_manifest_write_http_error_surfaces_redacted_provider_location() {
-        let private_message =
-            "D1_ERROR: too many arguments on function private_function at offset 12: SQLITE_ERROR";
-        let response_body = json!({
+    async fn migration_manifest_write_http_error_without_messages_surfaces_redacted_provider_error()
+    {
+        let private_message = "private provider failure";
+        let mut envelope = json!({
             "success": false,
             "errors": [{"code": 7500, "message": private_message}],
             "messages": [],
             "result": null,
-        })
-        .to_string();
+        });
+        envelope
+            .as_object_mut()
+            .expect("synthetic error envelope")
+            .remove("messages");
+        let response_body = envelope.to_string();
         let expected_body_sha256 = format!("{:x}", Sha256::digest(response_body.as_bytes()));
         let expected_body_size_bytes = response_body.len();
         let router = Router::new().route(
@@ -4992,17 +5001,13 @@ mod tests {
             Some(D1MigrationProviderError {
                 code: 7_500,
                 category: "d1_error",
-                location: Some(D1MigrationProviderErrorLocation {
-                    kind: "sql_byte_offset",
-                    offset_bytes: 12,
-                }),
+                location: None,
             })
         );
         assert_eq!(error.error.code, "cloudflare.http_error");
         assert_eq!(error.error.status, Some(400));
         assert!(!error.error.retryable);
         assert!(!error.error.message.contains(private_message));
-        assert!(!error.error.message.contains("private_function"));
         assert_eq!(error.response_body_sha256, Some(expected_body_sha256));
         assert_eq!(
             error.response_body_size_bytes,
@@ -5635,24 +5640,32 @@ mod tests {
     #[test]
     fn reconciliation_provider_error_classifier_is_allowlisted_complete_and_message_blind() {
         for (code, category) in [(7_500, "d1_error"), (10_000, "authentication_error")] {
-            let body = json!({
-                "success": false,
-                "errors": [{
-                    "code": code,
-                    "message": "SQL SELECT * FROM private_table at /private/path"
-                }],
-                "messages": [],
-                "result": null,
-            })
-            .to_string();
-            assert_eq!(
-                classify_d1_migration_provider_error(&body, 1),
-                Some(D1MigrationProviderError {
-                    code,
-                    category,
-                    location: None,
-                })
-            );
+            for omit_messages in [false, true] {
+                let mut envelope = json!({
+                    "success": false,
+                    "errors": [{
+                        "code": code,
+                        "message": "SQL SELECT * FROM private_table at /private/path"
+                    }],
+                    "messages": [],
+                    "result": null,
+                });
+                if omit_messages {
+                    envelope
+                        .as_object_mut()
+                        .expect("synthetic provider error envelope")
+                        .remove("messages");
+                }
+                let body = envelope.to_string();
+                assert_eq!(
+                    classify_d1_migration_provider_error(&body, 1),
+                    Some(D1MigrationProviderError {
+                        code,
+                        category,
+                        location: None,
+                    })
+                );
+            }
         }
 
         for (message, offset_bytes) in [
@@ -5708,7 +5721,7 @@ mod tests {
             r#"{"success":false,"errors":[{"code":9999,"message":"private"}],"messages":[],"result":null}"#,
             r#"{"success":false,"errors":[{"code":7500}],"messages":[],"result":null}"#,
             r#"{"success":false,"errors":[{"code":"7500","message":"private"}],"messages":[],"result":null}"#,
-            r#"{"success":false,"errors":[{"code":7500,"message":"private"}],"result":null}"#,
+            r#"{"success":false,"errors":[{"code":7500,"message":"private"}],"messages":null,"result":null}"#,
             r#"{"success":false,"errors":[{"code":7500,"message":"private"}],"messages":[{}],"result":null}"#,
             r#"{"success":false,"errors":[{"code":7500,"message":"private"}],"messages":[],"result":null,"unexpected":true}"#,
             r#"{"success":false,"success":true,"errors":[{"code":7500,"message":"private"}],"messages":[],"result":null}"#,

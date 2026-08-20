@@ -1523,7 +1523,7 @@ fn spawn_fake_manifest_ambiguous_api(
 
 fn spawn_fake_manifest_http_error_api(
     ledger_names_commit_after_ambiguous_response: bool,
-    provider_error: Option<(u16, i64, String)>,
+    provider_error: Option<(u16, i64, String, bool)>,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ambiguous manifest D1 API");
     let addr = listener.local_addr().expect("ambiguous manifest D1 addr");
@@ -1553,14 +1553,21 @@ fn spawn_fake_manifest_http_error_api(
             }
             if sql.contains("INSERT INTO \"d1_migrations\"") {
                 apply_seen = ledger_names_commit_after_ambiguous_response;
-                if let Some((status, code, message)) = provider_error.as_ref() {
-                    let response = serde_json::to_vec(&json!({
+                if let Some((status, code, message, omit_messages)) = provider_error.as_ref() {
+                    let mut envelope = json!({
                         "success": false,
                         "errors": [{"code": code, "message": message}],
                         "messages": [],
                         "result": null,
-                    }))
-                    .expect("serialize migration provider error");
+                    });
+                    if *omit_messages {
+                        envelope
+                            .as_object_mut()
+                            .expect("synthetic migration provider error envelope")
+                            .remove("messages");
+                    }
+                    let response =
+                        serde_json::to_vec(&envelope).expect("serialize migration provider error");
                     write!(stream, "HTTP/1.1 {status} Synthetic\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write migration provider-error headers");
                     stream
                         .write_all(&response)
@@ -10051,12 +10058,19 @@ fn d1_apply_migration_manifest_response_loss_stops_without_retry_and_next_proces
     let _ = fs::remove_dir_all(lease_root);
 }
 
-fn assert_manifest_provider_error_location(offset_bytes: u64, expect_location: bool, label: &str) {
+fn assert_manifest_provider_error_location(
+    offset_bytes: u64,
+    expect_location: bool,
+    omit_messages: bool,
+    label: &str,
+) {
     let private_message = format!(
         "D1_ERROR: too many arguments on function private_function at offset {offset_bytes}: SQLITE_ERROR"
     );
-    let (base_url, requests) =
-        spawn_fake_manifest_http_error_api(false, Some((400, 7_500, private_message.clone())));
+    let (base_url, requests) = spawn_fake_manifest_http_error_api(
+        false,
+        Some((400, 7_500, private_message.clone(), omit_messages)),
+    );
     let lease_root = std::path::PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-provider-error-manifest-{}-{label}",
         std::process::id(),
@@ -10210,8 +10224,9 @@ fn assert_manifest_provider_error_location(offset_bytes: u64, expect_location: b
 
 #[test]
 fn d1_apply_migration_manifest_bounds_redacted_provider_location_without_replay() {
-    assert_manifest_provider_error_location(42, true, "valid");
-    assert_manifest_provider_error_location(761, false, "out-of-range");
+    assert_manifest_provider_error_location(42, true, false, "valid");
+    assert_manifest_provider_error_location(761, false, false, "out-of-range");
+    assert_manifest_provider_error_location(761, false, true, "omitted-messages");
 }
 
 #[test]
