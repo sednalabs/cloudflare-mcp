@@ -1574,6 +1574,52 @@ fn spawn_fake_manifest_oversized_write_api() -> (String, Arc<Mutex<Vec<Value>>>)
     (format!("http://{addr}"), requests)
 }
 
+fn spawn_fake_manifest_deep_write_api(private_message: &str) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind deep manifest D1 API");
+    let addr = listener.local_addr().expect("deep manifest D1 addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    let private_message = private_message.to_string();
+    thread::spawn(move || {
+        for stream in listener.incoming().take(10) {
+            let mut stream = stream.expect("deep manifest D1 stream");
+            let (headers, body) = read_http_request(&mut stream);
+            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            let body_json: Value =
+                serde_json::from_slice(&body).expect("deep manifest request JSON");
+            requests_for_thread
+                .lock()
+                .expect("deep manifest request log")
+                .push(body_json.clone());
+            let sql = body_json["sql"].as_str().unwrap_or_default();
+            let response = if is_manifest_ledger_authority_sql(sql) {
+                serde_json::to_vec(&manifest_ledger_authority_response("d1_migrations"))
+                    .expect("serialize deep fixture authority response")
+            } else if sql.contains("INSERT INTO \"d1_migrations\"") {
+                let nested = format!("{}0{}", "[".repeat(40), "]".repeat(40));
+                format!(
+                    r#"{{"success":true,"errors":[],"messages":[],"result":[{{"success":true,"errors":[],"results":[{{"ok":true,"message":{},"nested":{nested}}}],"meta":{{"served_by_primary":true,"changed_db":true,"changes":1,"rows_written":1}}}}]}}"#,
+                    serde_json::to_string(&private_message)
+                        .expect("serialize private deep acknowledgement message")
+                )
+                .into_bytes()
+            } else {
+                assert_eq!(sql, "SELECT * FROM \"d1_migrations\" ORDER BY id");
+                serde_json::to_vec(&manifest_ledger_response(vec![json!({
+                    "id": 1,
+                    "name": "0001_initial.sql"
+                })]))
+                .expect("serialize deep fixture ledger response")
+            };
+            write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write deep manifest response headers");
+            stream
+                .write_all(&response)
+                .expect("write deep manifest response");
+        }
+    });
+    (format!("http://{addr}"), requests)
+}
+
 /// Coordinate one response-loss boundary so the test can alter local custody
 /// only after the non-idempotent write has reached its provider boundary.
 fn spawn_blocked_ambiguous_manifest_api() -> (
@@ -9561,6 +9607,132 @@ fn d1_apply_migration_manifest_oversized_write_response_retains_custody_without_
         &requests,
         10,
         "oversized migration-write response",
+    );
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_apply_migration_manifest_over_depth_acknowledgement_is_ambiguous_and_retains_custody() {
+    let private_message = "SQL SELECT * FROM private_table at /private/path";
+    let (base_url, requests) = spawn_fake_manifest_deep_write_api(private_message);
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-deep-manifest-write-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create deep-write lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make deep-write lease root private");
+    }
+    let env = vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ];
+    let mut mcp = McpStdioProcess::start_with_env(env.clone());
+    let first_sql = "CREATE TABLE submissions(id TEXT);";
+    let second_sql = "ALTER TABLE submissions ADD COLUMN status TEXT;";
+    let manifest = json!([
+        {"name": "0001_initial.sql", "size_bytes": first_sql.len(), "sql_sha256": sha256_hex(first_sql), "sql": first_sql},
+        {"name": "0002_second.sql", "size_bytes": second_sql.len(), "sql_sha256": sha256_hex(second_sql), "sql": second_sql}
+    ]);
+    let dry = mcp.call_tool(
+        1765,
+        "d1_apply_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "dry_run": true,
+            "manifest": manifest.clone(),
+        }),
+    );
+    let plan = structured_content(&dry)["plan_sha256"]
+        .as_str()
+        .expect("deep-write plan")
+        .to_string();
+    let live = mcp.call_tool(
+        1766,
+        "d1_apply_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest.clone(),
+            "approved_plan_sha256": plan.clone(),
+        }),
+    );
+    let content = structured_content(&live);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["status"], json!("reconciliation_required"));
+    assert_eq!(content["outcome"], json!("unknown"));
+    assert_eq!(content["lease_retained"], json!(true));
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.migration_apply_outcome_unknown")
+    );
+    assert_eq!(
+        content["error"]["cause"]["code"],
+        json!("cloudflare.d1.migration_manifest_malformed_envelope")
+    );
+    assert_eq!(content["error"]["cause"]["status"], json!(200));
+    assert_eq!(content["error"]["cause"]["retryable"], json!(false));
+    assert_eq!(
+        content["error"]["cause"]["operator_guidance"],
+        json!("reconciliation_only")
+    );
+    assert_eq!(
+        content["error"]["cause"]["provider_write_lifecycle"],
+        json!({
+            "dispatch_stage": "attempted",
+            "response_stage": "received",
+            "body_stage": "completely_read",
+            "http_status": 200,
+        })
+    );
+    assert!(
+        content["error"]["cause"]["response_body_sha256"]
+            .as_str()
+            .is_some_and(|digest| digest.len() == 64),
+        "{content}"
+    );
+    assert!(
+        content["error"]["cause"]["response_body_size_bytes"]
+            .as_u64()
+            .is_some_and(|size| size > 0),
+        "{content}"
+    );
+    let serialized = serde_json::to_string(content).expect("serialize deep write result");
+    assert!(!serialized.contains(private_message));
+    assert!(!serialized.contains("private_table"));
+    assert!(!serialized.contains("/private/path"));
+    let observed = requests.lock().expect("deep-write request log").clone();
+    assert_eq!(observed.len(), 10, "one write plus bounded reconciliation");
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|request| request["sql"]
+                .as_str()
+                .is_some_and(|sql| sql.contains("INSERT INTO \"d1_migrations\"")))
+            .count(),
+        1,
+        "over-depth acknowledgement must not replay the non-idempotent write"
+    );
+    let active = assert_private_regular_active_lease(&lease_root);
+    let target = active.parent().expect("manifest custody target");
+    assert!(!target.join("retiring.lease.json").exists());
+    assert!(!target.join("retired.lease.json").exists());
+    mcp.terminate();
+    assert_fresh_process_blocked_without_provider_request(
+        env,
+        &manifest,
+        &plan,
+        &requests,
+        10,
+        "over-depth migration-write acknowledgement",
     );
     let _ = fs::remove_dir_all(lease_root);
 }

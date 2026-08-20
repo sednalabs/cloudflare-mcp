@@ -562,15 +562,15 @@ excerpts, or row data. Pre-query semantic failures return the field as null.
 This output receipt does not alter the fixed query, its SHA-256, predecessor
 plan reconstruction, or terminal receipt authority.
 
-Before any successful-status reconciliation response object is converted to
-`serde_json::Value`, the bounded raw body is decoded through a reconciliation-
-local recursive visitor that rejects duplicate keys in the outer envelope and
-every nested object, including result, metadata, error, and row objects. Either
-key order fails as contradictory evidence. The exact raw-body digest, byte
-count, HTTP status, and completed-read lifecycle are captured first; no key or
-value from the rejected body is returned. This stricter decoder is deliberately
-limited to reconciliation reads and does not change generic Cloudflare response
-paths or the migration-write decoder.
+Before any strict D1 migration response object is converted to
+`serde_json::Value`, the bounded raw body is decoded through the shared visitor
+that rejects duplicate keys and more than 32 nested object/array containers.
+The policy covers migration-write acknowledgements and reconciliation
+success/error envelopes without changing generic Cloudflare response paths.
+Rejected reconciliation evidence remains contradictory; a rejected
+post-dispatch write acknowledgement remains ambiguous and retains custody. The
+exact raw-body digest, byte count, HTTP status, and completed-read lifecycle are
+captured first, and no key or value from the rejected body is returned.
 
 The reconciliation HTTP client does not follow redirects. Interpret
 `provider_read_lifecycle` in order: `pre_dispatch` means no provider call;
