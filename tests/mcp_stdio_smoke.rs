@@ -14350,13 +14350,17 @@ fn d1_post_parse_custody_release_overrides_parse_failure_in_reconcile_and_termin
             .len(),
         1
     );
+    let observed = requests.lock().expect("post-parse reconcile requests");
+    assert_eq!(observed.len(), 1);
     assert_eq!(
-        requests
-            .lock()
-            .expect("post-parse reconcile requests")
-            .len(),
-        1
+        reconciliation_statement_markers(
+            observed[0]["sql"].as_str().expect("selection request SQL")
+        )
+        .len(),
+        2,
+        "custody release after selection parsing must stop before either complete read"
     );
+    drop(observed);
     assert!(!active.exists());
     assert!(retiring.exists());
     mcp.terminate();
@@ -14400,10 +14404,44 @@ fn d1_post_parse_custody_release_overrides_parse_failure_in_reconcile_and_termin
     );
     let reconciled = structured_content(&reconciliation).clone();
     assert_eq!(reconciled["ok"], true, "{reconciled}");
+    assert_eq!(reconciled["provider_calls"], 3);
     assert_eq!(
-        baseline_requests.lock().expect("baseline requests").len(),
-        2
+        reconciled["response_evidence"]
+            .as_array()
+            .expect("baseline response evidence")
+            .len(),
+        3
     );
+    assert_eq!(
+        reconciled["provider_read_lifecycle"]
+            .as_array()
+            .expect("baseline provider chronology")
+            .len(),
+        3
+    );
+    let observed = baseline_requests.lock().expect("baseline requests");
+    assert_eq!(
+        observed
+            .iter()
+            .map(|request| reconciliation_statement_markers(
+                request["sql"].as_str().expect("baseline request SQL")
+            )
+            .len())
+            .collect::<Vec<_>>(),
+        vec![2, 5, 5],
+        "fresh scoped chronology must be selection followed by two complete reads"
+    );
+    assert_ne!(observed[0]["sql"], observed[1]["sql"]);
+    assert_eq!(observed[1]["sql"], observed[2]["sql"]);
+    assert_eq!(
+        reconciled["selection_binding"]["selection_query_sha256"],
+        sha256_hex(observed[0]["sql"].as_str().expect("selection SQL"))
+    );
+    assert_eq!(
+        reconciled["query_sha256"],
+        sha256_hex(observed[1]["sql"].as_str().expect("complete SQL"))
+    );
+    drop(observed);
     baseline_mcp.terminate();
 
     let active = assert_private_regular_active_lease(&terminal_root);
@@ -14450,7 +14488,17 @@ fn d1_post_parse_custody_release_overrides_parse_failure_in_reconcile_and_termin
             .len(),
         1
     );
-    assert_eq!(release_requests.lock().expect("release requests").len(), 1);
+    let observed = release_requests.lock().expect("release requests");
+    assert_eq!(observed.len(), 1);
+    assert_eq!(
+        reconciliation_statement_markers(
+            observed[0]["sql"].as_str().expect("terminal selection SQL")
+        )
+        .len(),
+        2,
+        "terminal custody release after selection parsing must stop before either complete read"
+    );
+    drop(observed);
     assert!(!active.exists());
     assert!(retiring.exists());
     assert!(
