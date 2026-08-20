@@ -53,6 +53,9 @@ fn sql_word(byte: u8) -> bool {
 #[derive(Clone, Copy)]
 enum ForeignKeysPragmaScan {
     StatementStart,
+    ExplainStatement,
+    ExplainQuery,
+    ExplainQueryPlan,
     PragmaName,
     SchemaDot,
     SchemaPragmaName,
@@ -136,6 +139,9 @@ fn contains_foreign_keys_pragma(sql: &str) -> bool {
                     }
                     ForeignKeysPragmaScan::PragmaName => ForeignKeysPragmaScan::SchemaDot,
                     ForeignKeysPragmaScan::StatementStart
+                    | ForeignKeysPragmaScan::ExplainStatement
+                    | ForeignKeysPragmaScan::ExplainQuery
+                    | ForeignKeysPragmaScan::ExplainQueryPlan
                     | ForeignKeysPragmaScan::SchemaPragmaName => {
                         ForeignKeysPragmaScan::IgnoreStatement
                     }
@@ -154,6 +160,9 @@ fn contains_foreign_keys_pragma(sql: &str) -> bool {
                     }
                     ForeignKeysPragmaScan::PragmaName => ForeignKeysPragmaScan::SchemaDot,
                     ForeignKeysPragmaScan::StatementStart
+                    | ForeignKeysPragmaScan::ExplainStatement
+                    | ForeignKeysPragmaScan::ExplainQuery
+                    | ForeignKeysPragmaScan::ExplainQueryPlan
                     | ForeignKeysPragmaScan::SchemaPragmaName => {
                         ForeignKeysPragmaScan::IgnoreStatement
                     }
@@ -178,6 +187,31 @@ fn contains_foreign_keys_pragma(sql: &str) -> bool {
                 }
                 state = match state {
                     ForeignKeysPragmaScan::StatementStart
+                        if bytes[start..cursor].eq_ignore_ascii_case(b"pragma") =>
+                    {
+                        ForeignKeysPragmaScan::PragmaName
+                    }
+                    ForeignKeysPragmaScan::StatementStart
+                        if bytes[start..cursor].eq_ignore_ascii_case(b"explain") =>
+                    {
+                        ForeignKeysPragmaScan::ExplainStatement
+                    }
+                    ForeignKeysPragmaScan::ExplainStatement
+                        if bytes[start..cursor].eq_ignore_ascii_case(b"pragma") =>
+                    {
+                        ForeignKeysPragmaScan::PragmaName
+                    }
+                    ForeignKeysPragmaScan::ExplainStatement
+                        if bytes[start..cursor].eq_ignore_ascii_case(b"query") =>
+                    {
+                        ForeignKeysPragmaScan::ExplainQuery
+                    }
+                    ForeignKeysPragmaScan::ExplainQuery
+                        if bytes[start..cursor].eq_ignore_ascii_case(b"plan") =>
+                    {
+                        ForeignKeysPragmaScan::ExplainQueryPlan
+                    }
+                    ForeignKeysPragmaScan::ExplainQueryPlan
                         if bytes[start..cursor].eq_ignore_ascii_case(b"pragma") =>
                     {
                         ForeignKeysPragmaScan::PragmaName
@@ -208,6 +242,34 @@ fn contains_foreign_keys_pragma(sql: &str) -> bool {
     false
 }
 
+fn contains_non_trivia_sql(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        if bytes[cursor..].starts_with(UTF8_BOM) {
+            cursor += UTF8_BOM.len();
+        } else if bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        } else if bytes[cursor..].starts_with(b"--") {
+            cursor += 2;
+            while cursor < bytes.len() && !matches!(bytes[cursor], b'\n' | b'\r') {
+                cursor += 1;
+            }
+        } else if bytes[cursor..].starts_with(b"/*") {
+            cursor += 2;
+            while cursor < bytes.len()
+                && !(bytes[cursor] == b'*' && bytes.get(cursor + 1) == Some(&b'/'))
+            {
+                cursor += 1;
+            }
+            cursor = (cursor + 2).min(bytes.len());
+        } else {
+            return true;
+        }
+    }
+    false
+}
+
 pub(crate) fn derive_d1_manifest_execution_plan(
     manifest: &[D1MigrationManifestEntry],
 ) -> Result<D1ManifestExecutionPlan, CallToolResult> {
@@ -217,7 +279,7 @@ pub(crate) fn derive_d1_manifest_execution_plan(
         let (transform_id, transform_version, executed_sql) = if let Some(remainder) =
             migration.sql.strip_prefix(D1_FOREIGN_KEYS_ON_PREFIX_V1)
         {
-            if remainder.trim().is_empty() || contains_foreign_keys_pragma(remainder) {
+            if !contains_non_trivia_sql(remainder) || contains_foreign_keys_pragma(remainder) {
                 return Err(invalid_argument_result(
                     "d1.migration_execution_transform_ambiguous",
                     "the reviewed leading foreign_keys pragma was empty, repeated, embedded, or otherwise ambiguous",
@@ -1138,6 +1200,15 @@ mod tests {
             " \u{feff}PRAGMA foreign_keys = ON; CREATE TABLE items(id INTEGER);",
             "PRAGMA \u{feff}foreign_keys = ON; CREATE TABLE items(id INTEGER);",
             "PRAGMA optimize;\u{feff}PRAGMA foreign_keys = ON;",
+            "EXPLAIN PRAGMA foreign_keys = OFF;",
+            "EXPLAIN QUERY PLAN PRAGMA foreign_keys(OFF);",
+            "EXPLAIN PRAGMA main.\"foreign_keys\" = OFF;",
+            "EXPLAIN QUERY PLAN PRAGMA \"main\".[foreign_keys](OFF);",
+            "EXPLAIN/* prefix trivia */PRAGMA foreign_keys = OFF;",
+            "EXPLAIN QUERY -- prefix trivia\n PLAN \u{feff}PRAGMA foreign_keys = OFF;",
+            "PRAGMA foreign_keys = ON;\n\n\u{feff}",
+            "PRAGMA foreign_keys = ON;\n\n \t\u{feff}\r\n",
+            "PRAGMA foreign_keys = ON;\n\n\u{feff}/* trivia only */ -- end",
         ] {
             assert!(
                 derive_d1_manifest_execution_plan(&[manifest_entry(sql)]).is_err(),
@@ -1181,6 +1252,10 @@ mod tests {
             "/* PRAGMA foreign_keys = ON; */ CREATE TABLE notes(body TEXT);",
             "PRAGMA optimize; CREATE TABLE foreign_keys(id INTEGER);",
             "\u{feff}CREATE TABLE notes(body TEXT);",
+            "EXPLAIN SELECT 1;",
+            "EXPLAIN QUERY PLAN SELECT 1;",
+            "EXPLAIN PRAGMA optimize;",
+            "EXPLAIN QUERY PLAN PRAGMA optimize;",
         ] {
             assert!(
                 derive_d1_manifest_execution_plan(&[manifest_entry(sql)]).is_ok(),

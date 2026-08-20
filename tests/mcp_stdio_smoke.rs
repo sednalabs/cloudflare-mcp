@@ -8216,16 +8216,63 @@ fn d1_manifest_execution_transform_rejects_noncanonical_pragma_before_provider()
         "CLOUDFLARE_MCP_API_BASE_URL",
         "http://127.0.0.1:9".to_string(), // DevSkim: ignore DS137138 -- loopback-only zero-call fixture
     )]);
-    for (index, sql) in [
-        "pragma foreign_keys = on;\n\nCREATE TABLE items(id INTEGER);",
-        "PRAGMA foreign_keys = ON;\nCREATE TABLE items(id INTEGER);",
-        "CREATE TABLE items(id INTEGER); PRAGMA foreign_keys = ON;",
-        "PRAGMA foreign_keys = ON;\n\nPRAGMA foreign_keys = ON;\nCREATE TABLE items(id INTEGER);",
-        "PRAGMA/*;*/foreign_keys = ON; CREATE TABLE items(id INTEGER);",
-        "PRAGMA -- ;\n foreign_keys = ON; CREATE TABLE items(id INTEGER);",
-        "PRAGMA optimize; PRAGMA main.foreign_keys(ON);",
-        "\u{feff}PRAGMA foreign_keys = ON;\n\nCREATE TABLE items(id INTEGER);",
-        " \u{feff}PRAGMA foreign_keys = ON; CREATE TABLE items(id INTEGER);",
+    for (index, (sql, expected_code)) in [
+        (
+            "pragma foreign_keys = on;\n\nCREATE TABLE items(id INTEGER);",
+            "d1.migration_execution_transform_unsupported",
+        ),
+        (
+            "PRAGMA foreign_keys = ON;\nCREATE TABLE items(id INTEGER);",
+            "d1.migration_execution_transform_unsupported",
+        ),
+        (
+            "CREATE TABLE items(id INTEGER); PRAGMA foreign_keys = ON;",
+            "d1.migration_execution_transform_unsupported",
+        ),
+        (
+            "PRAGMA foreign_keys = ON;\n\nPRAGMA foreign_keys = ON;\nCREATE TABLE items(id INTEGER);",
+            "d1.migration_execution_transform_ambiguous",
+        ),
+        (
+            "PRAGMA/*;*/foreign_keys = ON; CREATE TABLE items(id INTEGER);",
+            "d1.migration_execution_transform_unsupported",
+        ),
+        (
+            "PRAGMA -- ;\n foreign_keys = ON; CREATE TABLE items(id INTEGER);",
+            "d1.migration_execution_transform_unsupported",
+        ),
+        (
+            "PRAGMA optimize; PRAGMA main.foreign_keys(ON);",
+            "d1.migration_execution_transform_unsupported",
+        ),
+        (
+            "\u{feff}PRAGMA foreign_keys = ON;\n\nCREATE TABLE items(id INTEGER);",
+            "d1.migration_execution_transform_unsupported",
+        ),
+        (
+            " \u{feff}PRAGMA foreign_keys = ON; CREATE TABLE items(id INTEGER);",
+            "d1.migration_execution_transform_unsupported",
+        ),
+        (
+            "EXPLAIN PRAGMA foreign_keys = OFF;",
+            "d1.migration_execution_transform_unsupported",
+        ),
+        (
+            "EXPLAIN QUERY PLAN PRAGMA main.\"foreign_keys\"(OFF);",
+            "d1.migration_execution_transform_unsupported",
+        ),
+        (
+            "EXPLAIN QUERY -- prefix trivia\n PLAN \u{feff}PRAGMA foreign_keys = OFF;",
+            "d1.migration_execution_transform_unsupported",
+        ),
+        (
+            "PRAGMA foreign_keys = ON;\n\n\u{feff}",
+            "d1.migration_execution_transform_ambiguous",
+        ),
+        (
+            "PRAGMA foreign_keys = ON;\n\n \t\u{feff}\r\n",
+            "d1.migration_execution_transform_ambiguous",
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -8262,11 +8309,7 @@ fn d1_manifest_execution_transform_rejects_noncanonical_pragma_before_provider()
         );
         assert_eq!(
             content["error"]["code"],
-            if index == 3 {
-                "d1.migration_execution_transform_ambiguous"
-            } else {
-                "d1.migration_execution_transform_unsupported"
-            },
+            expected_code,
             "{content}"
         );
     }
