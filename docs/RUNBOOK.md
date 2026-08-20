@@ -439,12 +439,28 @@ Select one explicit built-in effect assertion:
   no raw seed values in the response. Any ambiguity or mismatch remains
   reconciliation-required.
   The predecessor assertions do not accept top-level INSERT.
+- Use the distinct
+  `effect_assertion_id=schema_create_objects_additive_seed_rows_v2` only when a
+  reviewed manifest contains canonical SQL `NULL` seed literals. Version 1
+  remains closed to TEXT and INTEGER and retains its existing query, hash,
+  receipt, and replay bytes. Version 2 adds NULL as a third typed literal,
+  hashes `{"storage_class":"null","value":null}` inside a version-2 row-set
+  proof, and requires every NULL target column to be nullable in reviewed
+  `table_xinfo` and not an `INTEGER PRIMARY KEY` column in a rowid table, where
+  SQLite would replace NULL with a generated rowid. Reject a `null` storage
+  class with any non-null value, any
+  non-NULL storage class with a JSON null value, and NULL against a `NOT NULL`
+  column before terminal authority. Keep the v2 assertion ID unchanged through
+  reconciliation, terminal dry run, live finalization, durable receipt, and
+  completed replay. This assertion does not change provider migration-write or
+  PRAGMA transmission behavior; treat that as a separate execution boundary.
 
 The successful response identifies that same closed scope without flattening
 the broader assertions back to the legacy label: `effect_assertion.scope`
 reports `schema_create_only`, `schema_create_tables_indexes_views_triggers`, or
 `schema_create_objects_additive`, or
-`schema_create_objects_additive_seed_rows` respectively, alongside the complete
+`schema_create_objects_additive_seed_rows`, or
+`schema_create_objects_additive_seed_rows_with_nulls` respectively, alongside the complete
 allowed `schema_object_types` array.
 
 For every assertion, the configured `migrations_table` is a reserved schema

@@ -1918,7 +1918,12 @@ fn seed_rowset_sha256(table_name: &str, columns: &[&str], rows: &[&[&str]]) -> S
     )
 }
 
-fn typed_seed_rowset_sha256(
+fn typed_seed_rowset_sha256(table_name: &str, columns: &[&str], rows: Vec<Vec<Value>>) -> String {
+    typed_seed_rowset_sha256_version(1, table_name, columns, rows)
+}
+
+fn typed_seed_rowset_sha256_version(
+    version: u8,
     table_name: &str,
     columns: &[&str],
     mut rows: Vec<Vec<Value>>,
@@ -1930,7 +1935,7 @@ fn typed_seed_rowset_sha256(
     });
     sha256_hex(
         &serde_json::to_string(&json!({
-            "version": 1,
+            "version": version,
             "table_name": table_name,
             "columns": columns,
             "rows": rows,
@@ -2781,6 +2786,147 @@ fn spawn_fake_canonical_seed_reconciliation_api(
             stream
                 .write_all(&response)
                 .expect("write canonical seed response");
+        }
+    });
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
+}
+
+fn spawn_fake_null_seed_reconciliation_api(
+    call_count: usize,
+    table_sql: String,
+    ledger_rows: Vec<Value>,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind NULL seed reconciliation D1 API"); // DevSkim: ignore DS162092 -- loopback-only MCP test fixture
+    let addr = listener
+        .local_addr()
+        .expect("NULL seed reconciliation D1 address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().take(call_count) {
+            let mut stream = stream.expect("NULL seed reconciliation stream");
+            let (headers, body) = read_http_request(&mut stream);
+            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            let body_json: Value = serde_json::from_slice(&body).expect("NULL seed request JSON");
+            let sql = body_json["sql"]
+                .as_str()
+                .expect("NULL seed reconciliation SQL");
+            let markers = reconciliation_statement_markers(sql);
+            assert!(matches!(markers.len(), 2 | 6));
+            assert!(
+                sql.split(";\n")
+                    .all(|statement| statement.starts_with("SELECT "))
+            );
+            if markers.len() == 6 {
+                assert_eq!(sql.matches("WHEN 'null' THEN NULL").count(), 7);
+            }
+            requests_for_thread
+                .lock()
+                .expect("NULL seed request log lock")
+                .push(body_json);
+
+            let mut results = vec![
+                tagged_reconciliation_result(
+                    &markers[0],
+                    &["id", "name"],
+                    ledger_rows.clone(),
+                    Some(json!({"changed_db": false, "changes": 0, "rows_written": 0})),
+                ),
+                tagged_reconciliation_result(
+                    &markers[1],
+                    &["type", "name", "tbl_name", "sql"],
+                    if markers.len() == 2 {
+                        Vec::new()
+                    } else {
+                        vec![json!({
+                            "type": "table",
+                            "name": "bootstrap_state",
+                            "tbl_name": "bootstrap_state",
+                            "sql": table_sql.clone(),
+                        })]
+                    },
+                    None,
+                ),
+            ];
+            if markers.len() == 6 {
+                let xinfo_rows = (0..7)
+                    .map(|index| {
+                        json!({
+                            "cid": index,
+                            "name": format!("value_{index}"),
+                            "type": "TEXT",
+                            "notnull": 0,
+                            "dflt_value": null,
+                            "pk": 0,
+                            "hidden": 0,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                results.extend([
+                    tagged_reconciliation_result(
+                        &markers[2],
+                        &[
+                            "cid",
+                            "name",
+                            "type",
+                            "notnull",
+                            "dflt_value",
+                            "pk",
+                            "hidden",
+                        ],
+                        xinfo_rows,
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[3],
+                        &[
+                            "id",
+                            "seq",
+                            "table",
+                            "from",
+                            "to",
+                            "on_update",
+                            "on_delete",
+                            "match",
+                        ],
+                        Vec::new(),
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[4],
+                        &["table", "rowid", "parent", "fkid"],
+                        Vec::new(),
+                        None,
+                    ),
+                ]);
+                let mut null_row = serde_json::Map::new();
+                let mut fields = Vec::new();
+                for index in 0..7 {
+                    fields.push(format!("t{index}"));
+                    fields.push(format!("v{index}"));
+                    null_row.insert(format!("t{index}"), json!("null"));
+                    null_row.insert(format!("v{index}"), Value::Null);
+                }
+                let field_refs = fields.iter().map(String::as_str).collect::<Vec<_>>();
+                results.push(tagged_reconciliation_result(
+                    &markers[5],
+                    &field_refs,
+                    vec![Value::Object(null_row)],
+                    None,
+                ));
+            }
+            let response = serde_json::to_vec(&json!({
+                "success": true,
+                "errors": [],
+                "messages": [],
+                "result": results,
+            }))
+            .expect("serialize NULL seed response");
+            write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                .expect("write NULL seed response headers");
+            stream
+                .write_all(&response)
+                .expect("write NULL seed response");
         }
     });
     (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
@@ -10218,6 +10364,280 @@ fn d1_canonical_five_seed_rows_bind_reconciliation_terminal_receipt_and_replay()
         assert!(!sql.contains("example.com"));
     }
     drop(observed);
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_v2_seven_null_seed_literals_bind_reconciliation_terminal_receipt_and_replay() {
+    let columns = (0..7)
+        .map(|index| format!("value_{index} TEXT"))
+        .collect::<Vec<_>>();
+    let column_names = (0..7)
+        .map(|index| format!("value_{index}"))
+        .collect::<Vec<_>>();
+    let column_name_refs = column_names.iter().map(String::as_str).collect::<Vec<_>>();
+    let table_sql = format!("CREATE TABLE bootstrap_state({})", columns.join(", "));
+    let insert_sql = format!(
+        "INSERT INTO bootstrap_state ({}) VALUES ({})",
+        column_names.join(", "),
+        ["NULL"; 7].join(", ")
+    );
+    let migration_sql = format!("{table_sql};\n{insert_sql};");
+    let manifest = json!([{
+        "name": "0001_bootstrap_state.sql",
+        "size_bytes": migration_sql.len(),
+        "sql_sha256": sha256_hex(&migration_sql),
+        "sql": migration_sql,
+    }]);
+    let table_columns = (0..7)
+        .map(|index| {
+            json!({
+                "cid": index,
+                "name": format!("value_{index}"),
+                "declared_type": "TEXT",
+                "not_null": false,
+                "default_value": null,
+                "primary_key_position": 0,
+                "hidden": 0,
+            })
+        })
+        .collect::<Vec<_>>();
+    let null_row = (0..7)
+        .map(|_| json!({"storage_class": "null", "value": null}))
+        .collect::<Vec<_>>();
+    let state_expectations = json!([
+        {"manifest_prefix_length": 0, "schema_objects": [], "tables": []},
+        {
+            "manifest_prefix_length": 1,
+            "schema_objects": [{
+                "object_type": "table",
+                "name": "bootstrap_state",
+                "table_name": "bootstrap_state",
+                "sql_sha256": sha256_hex(&table_sql),
+            }],
+            "tables": [{
+                "name": "bootstrap_state",
+                "columns": table_columns,
+                "foreign_keys": [],
+            }],
+            "seed_tables": [{
+                "table_name": "bootstrap_state",
+                "columns": column_names,
+                "row_count": 1,
+                "rows_sha256": typed_seed_rowset_sha256_version(
+                    2,
+                    "bootstrap_state",
+                    &column_name_refs,
+                    vec![null_row],
+                ),
+            }],
+        },
+    ]);
+
+    let mut v1_mcp = McpStdioProcess::start();
+    let v1_rejection = v1_mcp.call_tool(
+        900,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest.clone(),
+            "approved_plan_sha256": "a".repeat(64),
+            "lease_nonce": "b".repeat(64),
+            "lease_payload_sha256": "c".repeat(64),
+            "effect_assertion_id": "schema_create_objects_additive_seed_rows_v1",
+            "state_expectations": state_expectations.clone(),
+        }),
+    );
+    let v1_content = structured_content(&v1_rejection);
+    assert_eq!(v1_content["ok"], json!(false));
+    assert_eq!(v1_content["provider_calls"], json!(0));
+    assert_eq!(
+        v1_content["error"]["code"],
+        "d1.migration_reconciliation_seed_insert_effect_unavailable"
+    );
+    v1_mcp.terminate();
+
+    let rowid_table_sql = "CREATE TABLE rowid_seed(id INTEGER PRIMARY KEY) STRICT";
+    let rowid_insert_sql = "INSERT INTO rowid_seed (id) VALUES (NULL)";
+    let rowid_migration_sql = format!("{rowid_table_sql};\n{rowid_insert_sql};");
+    let rowid_manifest = json!([{
+        "name": "0001_rowid_seed.sql",
+        "size_bytes": rowid_migration_sql.len(),
+        "sql_sha256": sha256_hex(&rowid_migration_sql),
+        "sql": rowid_migration_sql,
+    }]);
+    let rowid_state_expectations = json!([
+        {"manifest_prefix_length": 0, "schema_objects": [], "tables": []},
+        {
+            "manifest_prefix_length": 1,
+            "schema_objects": [{
+                "object_type": "table",
+                "name": "rowid_seed",
+                "table_name": "rowid_seed",
+                "sql_sha256": sha256_hex(rowid_table_sql),
+            }],
+            "tables": [{
+                "name": "rowid_seed",
+                "columns": [{
+                    "cid": 0,
+                    "name": "id",
+                    "declared_type": "INTEGER",
+                    "not_null": false,
+                    "default_value": null,
+                    "primary_key_position": 1,
+                    "hidden": 0,
+                }],
+                "foreign_keys": [],
+            }],
+            "seed_tables": [{
+                "table_name": "rowid_seed",
+                "columns": ["id"],
+                "row_count": 1,
+                "rows_sha256": typed_seed_rowset_sha256_version(
+                    2,
+                    "rowid_seed",
+                    &["id"],
+                    vec![vec![json!({"storage_class": "null", "value": null})]],
+                ),
+            }],
+        },
+    ]);
+    let mut rowid_mcp = McpStdioProcess::start_with_env(vec![(
+        "CLOUDFLARE_MCP_API_BASE_URL",
+        "http://127.0.0.1:9".to_string(), // DevSkim: ignore DS137138 -- loopback-only zero-call fixture
+    )]);
+    let rowid_rejection = rowid_mcp.call_tool(
+        905,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": rowid_manifest,
+            "approved_plan_sha256": "a".repeat(64),
+            "lease_nonce": "b".repeat(64),
+            "lease_payload_sha256": "c".repeat(64),
+            "effect_assertion_id": "schema_create_objects_additive_seed_rows_v2",
+            "state_expectations": rowid_state_expectations,
+        }),
+    );
+    let rowid_content = structured_content(&rowid_rejection);
+    assert_eq!(rowid_content["ok"], json!(false), "{rowid_content}");
+    assert_eq!(rowid_content["provider_calls"], json!(0), "{rowid_content}");
+    assert_eq!(
+        rowid_content["error"]["code"],
+        "d1.migration_reconciliation_seed_affinity_unstable"
+    );
+    rowid_mcp.terminate();
+
+    let (base_url, requests) = spawn_fake_null_seed_reconciliation_api(
+        11,
+        table_sql,
+        vec![json!({"id": 1, "name": "0001_bootstrap_state.sql"})],
+    );
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-reconcile-null-seeds-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create NULL seed reconciliation root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make NULL seed reconciliation root private");
+    }
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&lease_root, &manifest);
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let reconciliation_args = json!({
+        "database_id": "db-1",
+        "migration_family": "newsletter-core",
+        "manifest": manifest,
+        "approved_plan_sha256": approved_plan_sha256,
+        "lease_nonce": lease_nonce,
+        "lease_payload_sha256": lease_payload_sha256,
+        "effect_assertion_id": "schema_create_objects_additive_seed_rows_v2",
+        "state_expectations": state_expectations,
+    });
+    let reconciliation = mcp.call_tool(
+        901,
+        "d1_reconcile_migration_manifest",
+        reconciliation_args.clone(),
+    );
+    let reconciled = structured_content(&reconciliation).clone();
+    assert_eq!(reconciled["ok"], json!(true), "{reconciled}");
+    assert_eq!(reconciled["outcome"], json!("full_state_converged"));
+    assert_eq!(reconciled["provider_calls"], json!(3));
+    assert_eq!(reconciled["provider_mutations"], json!(0));
+    assert_eq!(
+        reconciled["effect_assertion"]["id"],
+        "schema_create_objects_additive_seed_rows_v2"
+    );
+    assert_eq!(
+        reconciled["effect_assertion"]["scope"]["statement_class"],
+        "schema_create_objects_additive_seed_rows_with_nulls"
+    );
+    assert_eq!(reconciled["seed_row_evidence"][0]["row_count"], 1);
+
+    let mut terminal_args = reconciliation_args;
+    terminal_args["expected_reconciliation_plan_sha256"] =
+        reconciled["reconciliation_plan_sha256"].clone();
+    terminal_args["expected_expectation_proof_sha256"] =
+        reconciled["expectation_proof_sha256"].clone();
+    terminal_args["expected_query_sha256"] = reconciled["query_sha256"].clone();
+    terminal_args["expected_canonical_snapshot_sha256"] =
+        reconciled["canonical_snapshot_sha256"].clone();
+    terminal_args["expected_outcome"] = reconciled["outcome"].clone();
+    terminal_args["expected_original_prefix_length"] =
+        reconciled["reconstructed_original_prefix_length"].clone();
+    terminal_args["expected_current_prefix_length"] =
+        reconciled["current_manifest_prefix_length"].clone();
+    terminal_args["terminal_request_sha256"] = json!("d".repeat(64));
+    terminal_args["terminal_attempt_sha256"] = json!("e".repeat(64));
+    terminal_args["dry_run"] = json!(true);
+    let dry = mcp.call_tool(
+        902,
+        "d1_finalize_migration_reconciliation",
+        terminal_args.clone(),
+    );
+    let dry_content = structured_content(&dry).clone();
+    assert_eq!(dry_content["ok"], json!(true), "{dry_content}");
+    assert_eq!(dry_content["provider_calls"], json!(3));
+
+    terminal_args["dry_run"] = json!(false);
+    terminal_args["approved_terminal_plan_sha256"] = dry_content["terminal_plan_sha256"].clone();
+    let live = mcp.call_tool(
+        903,
+        "d1_finalize_migration_reconciliation",
+        terminal_args.clone(),
+    );
+    let live_content = structured_content(&live);
+    assert_eq!(live_content["ok"], json!(true), "{live_content}");
+    assert_eq!(live_content["provider_calls"], json!(5));
+    assert_eq!(live_content["provider_mutations"], json!(0));
+    assert_eq!(live_content["lease_retained"], json!(false));
+    assert_eq!(
+        live_content["effect_assertion_id"],
+        "schema_create_objects_additive_seed_rows_v2"
+    );
+
+    let replay = mcp.call_tool(904, "d1_finalize_migration_reconciliation", terminal_args);
+    let replay_content = structured_content(&replay);
+    assert_eq!(replay_content["ok"], json!(true), "{replay_content}");
+    assert_eq!(
+        replay_content["status"],
+        "terminal_reconciliation_already_complete"
+    );
+    assert_eq!(replay_content["provider_calls"], json!(0));
+    assert_eq!(requests.lock().expect("NULL seed request log").len(), 11);
     mcp.terminate();
     let _ = fs::remove_dir_all(lease_root);
 }

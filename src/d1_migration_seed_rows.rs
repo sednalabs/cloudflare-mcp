@@ -16,6 +16,27 @@ use crate::tools::sha256_bytes_hex;
 
 pub(crate) const EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1: &str =
     "schema_create_objects_additive_seed_rows_v1";
+pub(crate) const EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V2: &str =
+    "schema_create_objects_additive_seed_rows_v2";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SeedAssertionVersion {
+    V1,
+    V2,
+}
+
+impl SeedAssertionVersion {
+    fn proof_version(self) -> u8 {
+        match self {
+            Self::V1 => 1,
+            Self::V2 => 2,
+        }
+    }
+
+    fn allows_null(self) -> bool {
+        self == Self::V2
+    }
+}
 
 pub(crate) const MAX_SEED_TABLES: usize = 16;
 pub(crate) const MAX_SEED_COLUMNS_PER_TABLE: usize = 16;
@@ -36,28 +57,53 @@ pub struct D1MigrationSeedTableExpectation {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(tag = "storage_class", content = "value", rename_all = "snake_case")]
 pub(crate) enum SeedLiteral {
+    Null,
     Text(String),
     Integer(i64),
 }
 
 impl SeedLiteral {
-    fn canonical_value(&self) -> String {
+    fn canonical_value(&self) -> Value {
         match self {
-            Self::Text(value) => hex_upper(value.as_bytes()),
-            Self::Integer(value) => value.to_string(),
+            Self::Null => Value::Null,
+            Self::Text(value) => Value::String(hex_upper(value.as_bytes())),
+            Self::Integer(value) => Value::String(value.to_string()),
+        }
+    }
+
+    fn canonical_value_bytes(&self) -> usize {
+        match self {
+            Self::Null => 0,
+            Self::Text(value) => value.len().saturating_mul(2),
+            Self::Integer(value) => signed_decimal_len(*value),
         }
     }
 
     fn storage_class(&self) -> &'static str {
         match self {
+            Self::Null => "null",
             Self::Text(_) => "text",
             Self::Integer(_) => "integer",
         }
     }
 }
 
+fn signed_decimal_len(value: i64) -> usize {
+    if value == 0 {
+        return 1;
+    }
+    let mut magnitude = value.unsigned_abs();
+    let mut digits = usize::from(value.is_negative());
+    while magnitude > 0 {
+        digits += 1;
+        magnitude /= 10;
+    }
+    digits
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SeedInsertEffect {
+    pub(crate) assertion_version: SeedAssertionVersion,
     pub(crate) table_name: String,
     pub(crate) columns: Vec<String>,
     pub(crate) rows: Vec<Vec<SeedLiteral>>,
@@ -65,6 +111,7 @@ pub(crate) struct SeedInsertEffect {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SeedTableState {
+    pub(crate) assertion_version: SeedAssertionVersion,
     pub(crate) table_name: String,
     pub(crate) columns: Vec<String>,
     pub(crate) rows: Vec<Vec<SeedLiteral>>,
@@ -77,6 +124,8 @@ pub(crate) struct SeedManifestPlan {
     pub(crate) states: Vec<Vec<SeedTableState>>,
     /// SQLite ASCII-normalized identities of manifest-created STRICT tables.
     pub(crate) strict_table_keys: BTreeSet<String>,
+    /// SQLite ASCII-normalized identities of manifest-created rowid tables.
+    pub(crate) rowid_table_keys: BTreeSet<String>,
     /// Full-manifest projection registry. A registered table exists in every
     /// state at or after `created_prefix`, with zero rows until `seeded_prefix`.
     pub(crate) registry: Vec<SeedTableRegistration>,
@@ -100,11 +149,18 @@ pub(crate) struct SeedContractError {
 }
 
 impl SeedContractError {
-    fn grammar() -> Self {
+    fn grammar(assertion_version: SeedAssertionVersion) -> Self {
         Self {
             capability_state: "capability_gap",
             code: "d1.migration_reconciliation_seed_insert_effect_unavailable",
-            message: "the seed-row assertion accepts only plain unqualified INSERT INTO a manifest-created table with explicit canonical columns and bounded TEXT or INTEGER literal VALUES tuples",
+            message: match assertion_version {
+                SeedAssertionVersion::V1 => {
+                    "the seed-row assertion accepts only plain unqualified INSERT INTO a manifest-created table with explicit canonical columns and bounded TEXT or INTEGER literal VALUES tuples"
+                }
+                SeedAssertionVersion::V2 => {
+                    "the seed-row v2 assertion accepts only plain unqualified INSERT INTO a manifest-created table with explicit canonical columns and bounded NULL, TEXT, or INTEGER literal VALUES tuples"
+                }
+            },
         }
     }
 
@@ -119,17 +175,18 @@ impl SeedContractError {
 
 pub(crate) fn classify_seed_insert(
     tokens: &[SqlToken],
+    assertion_version: SeedAssertionVersion,
 ) -> Result<Option<SeedInsertEffect>, SeedContractError> {
     if !token_is_word(tokens.first(), "insert") {
         return Ok(None);
     }
     if tokens.len() > MAX_SEED_STATEMENT_TOKENS || !token_is_word(tokens.get(1), "into") {
-        return Err(SeedContractError::grammar());
+        return Err(SeedContractError::grammar(assertion_version));
     }
-    let table_name =
-        canonical_plain_identifier(tokens.get(2)).ok_or_else(SeedContractError::grammar)?;
+    let table_name = canonical_plain_identifier(tokens.get(2))
+        .ok_or_else(|| SeedContractError::grammar(assertion_version))?;
     if tokens.get(3) != Some(&SqlToken::Symbol('(')) {
-        return Err(SeedContractError::grammar());
+        return Err(SeedContractError::grammar(assertion_version));
     }
 
     let mut cursor = 4usize;
@@ -137,11 +194,11 @@ pub(crate) fn classify_seed_insert(
     let mut column_names = BTreeSet::new();
     loop {
         let column = canonical_plain_identifier(tokens.get(cursor))
-            .ok_or_else(SeedContractError::grammar)?;
+            .ok_or_else(|| SeedContractError::grammar(assertion_version))?;
         if !column_names.insert(column.to_ascii_lowercase())
             || columns.len() >= MAX_SEED_COLUMNS_PER_TABLE
         {
-            return Err(SeedContractError::grammar());
+            return Err(SeedContractError::grammar(assertion_version));
         }
         columns.push(column);
         cursor += 1;
@@ -151,11 +208,11 @@ pub(crate) fn classify_seed_insert(
                 cursor += 1;
                 break;
             }
-            _ => return Err(SeedContractError::grammar()),
+            _ => return Err(SeedContractError::grammar(assertion_version)),
         }
     }
     if columns.is_empty() || !token_is_word(tokens.get(cursor), "values") {
-        return Err(SeedContractError::grammar());
+        return Err(SeedContractError::grammar(assertion_version));
     }
     cursor += 1;
 
@@ -165,38 +222,38 @@ pub(crate) fn classify_seed_insert(
         if tokens.get(cursor) != Some(&SqlToken::Symbol('('))
             || rows.len() >= MAX_SEED_ROWS_PER_TABLE
         {
-            return Err(SeedContractError::grammar());
+            return Err(SeedContractError::grammar(assertion_version));
         }
         cursor += 1;
         let mut row = Vec::with_capacity(columns.len());
         for column_index in 0..columns.len() {
-            let (literal, width) = parse_literal(tokens, cursor)?;
+            let (literal, width) = parse_literal(tokens, cursor, assertion_version)?;
             literal_bytes_total = literal_bytes_total
-                .checked_add(literal.canonical_value().len())
+                .checked_add(literal.canonical_value_bytes())
                 .filter(|bytes| *bytes <= MAX_SEED_LITERAL_BYTES_TOTAL)
-                .ok_or_else(SeedContractError::grammar)?;
+                .ok_or_else(|| SeedContractError::grammar(assertion_version))?;
             row.push(literal);
             cursor += width;
             if column_index + 1 < columns.len() {
                 if tokens.get(cursor) != Some(&SqlToken::Symbol(',')) {
-                    return Err(SeedContractError::grammar());
+                    return Err(SeedContractError::grammar(assertion_version));
                 }
                 cursor += 1;
             }
         }
         if tokens.get(cursor) != Some(&SqlToken::Symbol(')')) {
-            return Err(SeedContractError::grammar());
+            return Err(SeedContractError::grammar(assertion_version));
         }
         cursor += 1;
         rows.push(row);
         match tokens.get(cursor) {
             Some(SqlToken::Symbol(',')) => cursor += 1,
             None => break,
-            _ => return Err(SeedContractError::grammar()),
+            _ => return Err(SeedContractError::grammar(assertion_version)),
         }
     }
     if rows.is_empty() {
-        return Err(SeedContractError::grammar());
+        return Err(SeedContractError::grammar(assertion_version));
     }
     rows.sort();
     if rows.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -206,6 +263,7 @@ pub(crate) fn classify_seed_insert(
         ));
     }
     Ok(Some(SeedInsertEffect {
+        assertion_version,
         table_name,
         columns,
         rows,
@@ -215,8 +273,14 @@ pub(crate) fn classify_seed_insert(
 fn parse_literal(
     tokens: &[SqlToken],
     cursor: usize,
+    assertion_version: SeedAssertionVersion,
 ) -> Result<(SeedLiteral, usize), SeedContractError> {
     match tokens.get(cursor) {
+        Some(SqlToken::Word(value))
+            if assertion_version.allows_null() && value.eq_ignore_ascii_case("null") =>
+        {
+            Ok((SeedLiteral::Null, 1))
+        }
         Some(SqlToken::StringLiteral(value))
             if value.as_bytes().len() <= MAX_SEED_VALUE_BYTES && !value.contains('\0') =>
         {
@@ -224,7 +288,7 @@ fn parse_literal(
         }
         Some(SqlToken::Word(value)) => parse_integer(value)
             .map(|value| (SeedLiteral::Integer(value), 1))
-            .ok_or_else(SeedContractError::grammar),
+            .ok_or_else(|| SeedContractError::grammar(assertion_version)),
         Some(SqlToken::Symbol('-')) => tokens
             .get(cursor + 1)
             .and_then(|token| match token {
@@ -232,8 +296,8 @@ fn parse_literal(
                 _ => None,
             })
             .map(|value| (SeedLiteral::Integer(value), 2))
-            .ok_or_else(SeedContractError::grammar),
-        _ => Err(SeedContractError::grammar()),
+            .ok_or_else(|| SeedContractError::grammar(assertion_version)),
+        _ => Err(SeedContractError::grammar(assertion_version)),
     }
 }
 
@@ -274,7 +338,11 @@ pub(crate) fn seed_literal_is_identity_stable_for_declared_type(
     literal: &SeedLiteral,
     declared_type: &str,
     strict_table: bool,
+    not_null: bool,
 ) -> bool {
+    if matches!(literal, SeedLiteral::Null) {
+        return !not_null;
+    }
     let declared_type = declared_type.to_ascii_uppercase();
     if strict_table {
         return matches!(
@@ -306,6 +374,29 @@ pub(crate) fn seed_literal_is_identity_stable_for_declared_type(
     )
 }
 
+pub(crate) fn seed_literal_is_identity_stable_for_reviewed_column(
+    literal: &SeedLiteral,
+    declared_type: &str,
+    strict_table: bool,
+    not_null: bool,
+    primary_key_position: i64,
+    rowid_table: bool,
+) -> bool {
+    if matches!(literal, SeedLiteral::Null)
+        && rowid_table
+        && primary_key_position > 0
+        && declared_type.eq_ignore_ascii_case("INTEGER")
+    {
+        return false;
+    }
+    seed_literal_is_identity_stable_for_declared_type(
+        literal,
+        declared_type,
+        strict_table,
+        not_null,
+    )
+}
+
 pub(crate) fn insert_seed_effect(
     cumulative: &mut BTreeMap<String, SeedTableState>,
     effect: SeedInsertEffect,
@@ -333,6 +424,7 @@ pub(crate) fn insert_seed_effect(
     cumulative.insert(
         authority_key,
         SeedTableState {
+            assertion_version: effect.assertion_version,
             table_name: effect.table_name,
             columns: effect.columns,
             rows: effect.rows,
@@ -361,7 +453,12 @@ pub(crate) fn seed_table_summary(state: &SeedTableState) -> D1MigrationSeedTable
         })
         .collect::<Vec<_>>();
     sort_canonical_rows(&mut canonical_rows);
-    seed_summary_from_canonical_rows(&state.table_name, &state.columns, canonical_rows)
+    seed_summary_from_canonical_rows(
+        state.assertion_version,
+        &state.table_name,
+        &state.columns,
+        canonical_rows,
+    )
 }
 
 pub(crate) fn seed_data_fields(column_count: usize) -> Vec<String> {
@@ -383,11 +480,17 @@ pub(crate) fn seed_select_sql(state: &SeedTableState) -> String {
                 ];
             }
             let column = quote_identifier(column);
-            [
-                format!("typeof({column}) AS \"t{index}\""),
-                format!(
+            let value_projection = match state.assertion_version {
+                SeedAssertionVersion::V1 => format!(
                     "CASE typeof({column}) WHEN 'text' THEN hex(CAST({column} AS BLOB)) WHEN 'integer' THEN printf('%lld', {column}) ELSE NULL END AS \"v{index}\""
                 ),
+                SeedAssertionVersion::V2 => format!(
+                    "CASE typeof({column}) WHEN 'null' THEN NULL WHEN 'text' THEN hex(CAST({column} AS BLOB)) WHEN 'integer' THEN printf('%lld', {column}) ELSE NULL END AS \"v{index}\""
+                ),
+            };
+            [
+                format!("typeof({column}) AS \"t{index}\""),
+                value_projection,
             ]
         })
         .collect::<Vec<_>>();
@@ -427,16 +530,22 @@ pub(crate) fn observed_seed_summary(
         let mut canonical = Vec::with_capacity(state.columns.len());
         for index in 0..state.columns.len() {
             let storage_class = exact_string(object, &format!("t{index}"))?;
-            let value = exact_string(object, &format!("v{index}"))?;
+            let value = object
+                .get(&format!("v{index}"))
+                .ok_or_else(seed_row_malformed)?;
             let valid = match storage_class.as_str() {
+                "null" => state.assertion_version.allows_null() && value.is_null(),
                 "text" => {
+                    let Some(value) = value.as_str() else {
+                        return Err(seed_row_malformed());
+                    };
                     value.len() <= MAX_SEED_VALUE_BYTES * 2
                         && value.len() % 2 == 0
                         && value
                             .bytes()
                             .all(|byte| byte.is_ascii_digit() || (b'A'..=b'F').contains(&byte))
                 }
-                "integer" => canonical_signed_decimal(&value),
+                "integer" => value.as_str().is_some_and(canonical_signed_decimal),
                 _ => false,
             };
             if !valid {
@@ -448,6 +557,7 @@ pub(crate) fn observed_seed_summary(
     }
     sort_canonical_rows(&mut canonical_rows);
     Ok(seed_summary_from_canonical_rows(
+        state.assertion_version,
         &state.table_name,
         &state.columns,
         canonical_rows,
@@ -463,13 +573,14 @@ fn sort_canonical_rows(rows: &mut [Vec<Value>]) {
 }
 
 fn seed_summary_from_canonical_rows(
+    assertion_version: SeedAssertionVersion,
     table_name: &str,
     columns: &[String],
     rows: Vec<Vec<Value>>,
 ) -> D1MigrationSeedTableExpectation {
     let row_count = rows.len();
     let proof = json!({
-        "version": 1,
+        "version": assertion_version.proof_version(),
         "table_name": table_name,
         "columns": columns,
         "rows": rows,
@@ -577,7 +688,7 @@ mod tests {
             SqlToken::StringLiteral("Beta".into()),
             SqlToken::Symbol(')'),
         ];
-        let parsed = classify_seed_insert(&tokens)
+        let parsed = classify_seed_insert(&tokens, SeedAssertionVersion::V1)
             .expect("closed grammar")
             .expect("seed INSERT");
         assert_eq!(parsed.table_name, "publications");
@@ -600,17 +711,21 @@ mod tests {
             SqlToken::Word("9223372036854775808".into()),
             SqlToken::Symbol(')'),
         ];
-        let parsed = classify_seed_insert(&minimum)
+        let parsed = classify_seed_insert(&minimum, SeedAssertionVersion::V1)
             .expect("minimum i64 is canonical")
             .expect("seed INSERT");
         assert_eq!(parsed.rows, vec![vec![SeedLiteral::Integer(i64::MIN)]]);
         assert!(canonical_signed_decimal("-9223372036854775808"));
         assert!(!canonical_signed_decimal("-9223372036854775809"));
+        assert_eq!(signed_decimal_len(i64::MIN), 20);
+        assert_eq!(signed_decimal_len(i64::MAX), 19);
+        assert_eq!(signed_decimal_len(0), 1);
     }
 
     #[test]
     fn cumulative_seed_authority_rejects_ascii_case_aliases() {
         let effect = |table_name: &str| SeedInsertEffect {
+            assertion_version: SeedAssertionVersion::V1,
             table_name: table_name.to_string(),
             columns: vec!["id".into()],
             rows: vec![vec![SeedLiteral::Text("x".into())]],
@@ -626,6 +741,7 @@ mod tests {
     #[test]
     fn zero_row_projection_does_not_require_future_seed_columns() {
         let state = SeedTableState {
+            assertion_version: SeedAssertionVersion::V1,
             table_name: "channels".into(),
             columns: vec!["future_rank".into()],
             rows: Vec::new(),
@@ -648,12 +764,14 @@ mod tests {
                 &text,
                 declared_type,
                 false,
+                false,
             ));
         }
         for declared_type in ["INTEGER", "BIGINT", "BOOLEAN", "NUMERIC", "", "BLOB"] {
             assert!(seed_literal_is_identity_stable_for_declared_type(
                 &integer,
                 declared_type,
+                false,
                 false,
             ));
         }
@@ -662,6 +780,7 @@ mod tests {
                 &text,
                 declared_type,
                 false,
+                false,
             ));
         }
         for declared_type in ["TEXT", "VARCHAR(12)", "REAL", "DOUBLE"] {
@@ -669,17 +788,18 @@ mod tests {
                 &integer,
                 declared_type,
                 false,
+                false,
             ));
         }
 
         assert!(seed_literal_is_identity_stable_for_declared_type(
-            &text, "TEXT", true,
+            &text, "TEXT", true, false,
         ));
         assert!(seed_literal_is_identity_stable_for_declared_type(
-            &integer, "INT", true,
+            &integer, "INT", true, false,
         ));
         assert!(seed_literal_is_identity_stable_for_declared_type(
-            &integer, "INTEGER", true,
+            &integer, "INTEGER", true, false,
         ));
         for (literal, declared_type) in [
             (&text, "BLOB"),
@@ -692,16 +812,18 @@ mod tests {
                 literal,
                 declared_type,
                 true,
+                false,
             ));
         }
 
         let mixed_blob = SeedTableState {
+            assertion_version: SeedAssertionVersion::V1,
             table_name: "mixed".into(),
             columns: vec!["value".into()],
             rows: vec![vec![text], vec![integer]],
         };
         assert!(mixed_blob.rows.iter().flatten().all(|literal| {
-            seed_literal_is_identity_stable_for_declared_type(literal, "BLOB", false)
+            seed_literal_is_identity_stable_for_declared_type(literal, "BLOB", false, false)
         }));
     }
 
@@ -713,7 +835,7 @@ mod tests {
             words(&["INSERT", "INTO", "t", "SELECT", "x"]),
             words(&["INSERT", "INTO", "t", "VALUES"]),
         ] {
-            assert!(classify_seed_insert(&tokens).is_err());
+            assert!(classify_seed_insert(&tokens, SeedAssertionVersion::V1).is_err());
         }
     }
 
@@ -783,7 +905,7 @@ mod tests {
                 SqlToken::Symbol(')'),
             ],
         ] {
-            assert!(classify_seed_insert(&tokens).is_err());
+            assert!(classify_seed_insert(&tokens, SeedAssertionVersion::V1).is_err());
         }
 
         let duplicate = vec![
@@ -803,7 +925,7 @@ mod tests {
             SqlToken::Symbol(')'),
         ];
         assert_eq!(
-            classify_seed_insert(&duplicate)
+            classify_seed_insert(&duplicate, SeedAssertionVersion::V1)
                 .expect_err("duplicate tuple must conflict")
                 .code,
             "d1.migration_reconciliation_seed_rows_duplicate"
@@ -811,8 +933,137 @@ mod tests {
     }
 
     #[test]
+    fn v2_accepts_exactly_bounded_canonical_null_literals_without_broadening_v1() {
+        let mut tokens = vec![
+            SqlToken::Word("INSERT".into()),
+            SqlToken::Word("INTO".into()),
+            SqlToken::Word("bootstrap_state".into()),
+            SqlToken::Symbol('('),
+        ];
+        for index in 0..7 {
+            if index > 0 {
+                tokens.push(SqlToken::Symbol(','));
+            }
+            tokens.push(SqlToken::Word(format!("value_{index}")));
+        }
+        tokens.extend([
+            SqlToken::Symbol(')'),
+            SqlToken::Word("VALUES".into()),
+            SqlToken::Symbol('('),
+        ]);
+        for index in 0..7 {
+            if index > 0 {
+                tokens.push(SqlToken::Symbol(','));
+            }
+            tokens.push(SqlToken::Word("NULL".into()));
+        }
+        tokens.push(SqlToken::Symbol(')'));
+
+        let v1 = classify_seed_insert(&tokens, SeedAssertionVersion::V1)
+            .expect_err("v1 must retain its TEXT/INTEGER-only grammar");
+        assert_eq!(
+            v1.code,
+            "d1.migration_reconciliation_seed_insert_effect_unavailable"
+        );
+        let v2 = classify_seed_insert(&tokens, SeedAssertionVersion::V2)
+            .expect("v2 grammar")
+            .expect("seed INSERT");
+        assert_eq!(v2.assertion_version, SeedAssertionVersion::V2);
+        assert_eq!(v2.rows, vec![vec![SeedLiteral::Null; 7]]);
+    }
+
+    #[test]
+    fn v2_null_hash_and_provider_normalization_are_exact_and_type_sensitive() {
+        let state = SeedTableState {
+            assertion_version: SeedAssertionVersion::V2,
+            table_name: "bootstrap_state".into(),
+            columns: vec!["value".into()],
+            rows: vec![vec![SeedLiteral::Null]],
+        };
+        let expected = seed_table_summary(&state);
+        let observed = observed_seed_summary(&state, &[json!({"t0": "null", "v0": null})])
+            .expect("canonical NULL evidence");
+        assert_eq!(observed, expected);
+        assert!(seed_select_sql(&state).contains("WHEN 'null' THEN NULL"));
+
+        for malformed in [
+            json!({"t0": "null", "v0": ""}),
+            json!({"t0": "null", "v0": "NULL"}),
+            json!({"t0": "text", "v0": null}),
+            json!({"t0": "integer", "v0": null}),
+        ] {
+            assert_eq!(
+                observed_seed_summary(&state, &[malformed])
+                    .expect_err("contradictory NULL evidence must fail closed")
+                    .code,
+                "d1.migration_reconciliation_seed_row_malformed"
+            );
+        }
+
+        let v1_state = SeedTableState {
+            assertion_version: SeedAssertionVersion::V1,
+            ..state.clone()
+        };
+        assert_ne!(
+            seed_table_summary(&v1_state).rows_sha256,
+            expected.rows_sha256,
+            "the v2 row-set proof identity must not alias v1"
+        );
+        assert!(!seed_select_sql(&v1_state).contains("WHEN 'null' THEN NULL"));
+    }
+
+    #[test]
+    fn null_affinity_requires_a_nullable_reviewed_column() {
+        let null = SeedLiteral::Null;
+        for strict in [false, true] {
+            for declared_type in ["", "TEXT", "INTEGER", "REAL", "BLOB", "ANY"] {
+                assert!(seed_literal_is_identity_stable_for_declared_type(
+                    &null,
+                    declared_type,
+                    strict,
+                    false,
+                ));
+                assert!(!seed_literal_is_identity_stable_for_declared_type(
+                    &null,
+                    declared_type,
+                    strict,
+                    true,
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn null_rejects_a_reviewed_integer_primary_key_rowid_alias() {
+        let null = SeedLiteral::Null;
+        for strict in [false, true] {
+            assert!(!seed_literal_is_identity_stable_for_reviewed_column(
+                &null, "INTEGER", strict, false, 1, true,
+            ));
+            assert!(seed_literal_is_identity_stable_for_reviewed_column(
+                &null, "INTEGER", strict, false, 1, false,
+            ));
+            assert!(seed_literal_is_identity_stable_for_reviewed_column(
+                &null, "TEXT", strict, false, 1, true,
+            ));
+            assert!(seed_literal_is_identity_stable_for_reviewed_column(
+                &null, "INTEGER", strict, false, 0, true,
+            ));
+        }
+        assert!(seed_literal_is_identity_stable_for_reviewed_column(
+            &SeedLiteral::Integer(1),
+            "INTEGER",
+            true,
+            false,
+            1,
+            true,
+        ));
+    }
+
+    #[test]
     fn observed_summary_is_type_sensitive_and_aggregate_safe() {
         let state = SeedTableState {
+            assertion_version: SeedAssertionVersion::V1,
             table_name: "channels".into(),
             columns: vec!["id".into()],
             rows: vec![vec![SeedLiteral::Text("1".into())]],
@@ -830,6 +1081,7 @@ mod tests {
     #[test]
     fn observed_summary_rejects_extra_and_malformed_rows_and_distinguishes_absence() {
         let state = SeedTableState {
+            assertion_version: SeedAssertionVersion::V1,
             table_name: "channels".into(),
             columns: vec!["id".into()],
             rows: vec![vec![SeedLiteral::Text("a".into())]],
@@ -867,6 +1119,7 @@ mod tests {
     #[test]
     fn expected_and_observed_mixed_types_use_one_canonical_sort_order() {
         let state = SeedTableState {
+            assertion_version: SeedAssertionVersion::V1,
             table_name: "mixed".into(),
             columns: vec!["value".into()],
             rows: vec![

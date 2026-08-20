@@ -31,9 +31,10 @@ use crate::d1_migration_manifest::{
 };
 use crate::d1_migration_seed_rows::{
     D1MigrationSeedTableExpectation, EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1,
-    SeedContractError, SeedInsertEffect, SeedManifestPlan, SeedTableRegistration, SeedTableState,
+    EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V2, SeedAssertionVersion, SeedContractError,
+    SeedInsertEffect, SeedManifestPlan, SeedTableRegistration, SeedTableState,
     classify_seed_insert, insert_seed_effect, observed_seed_summary, seed_data_fields,
-    seed_literal_is_identity_stable_for_declared_type, seed_select_sql,
+    seed_literal_is_identity_stable_for_reviewed_column, seed_select_sql,
     sqlite_ascii_identifier_key, state_summaries,
 };
 use crate::server::CloudflareMcp;
@@ -437,8 +438,7 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
             ));
         }
     }
-    let seed_assertion =
-        selected_effect_assertion_id == EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1;
+    let seed_assertion = seed_assertion_version(selected_effect_assertion_id).is_some();
     let (selection_object_names, selection_table_names) = if seed_assertion {
         (&[][..], &[][..])
     } else {
@@ -854,7 +854,7 @@ pub(crate) async fn reconcile_d1_migration_manifest(
         "provider_mutations": 0,
         "local_namespace_mutations": 0,
     });
-    if proof.effect_assertion_id == EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1 {
+    if seed_assertion_version(&proof.effect_assertion_id).is_some() {
         content["scope_completeness"]["seed_rows"] =
             json!("complete_selected_prefix_manifest_derived_storage_class_and_value_row_set");
         content["seed_row_evidence"] = json!(proof.first.snapshot.seed_tables);
@@ -1039,6 +1039,7 @@ fn validate_expectations(
             &derived_seed_state,
             &state.tables,
             seed_plan.map(|plan| &plan.strict_table_keys),
+            seed_plan.map(|plan| &plan.rowid_table_keys),
         )?;
         let derived_seed_summaries = state_summaries(&derived_seed_state);
         if state.seed_tables != derived_seed_summaries {
@@ -1262,6 +1263,7 @@ fn validate_seed_storage_affinity(
     seed_tables: &[SeedTableState],
     tables: &[D1MigrationTableExpectation],
     strict_table_keys: Option<&BTreeSet<String>>,
+    rowid_table_keys: Option<&BTreeSet<String>>,
 ) -> Result<(), CallToolResult> {
     if seed_tables.is_empty() {
         return Ok(());
@@ -1311,10 +1313,13 @@ fn validate_seed_storage_affinity(
                     )
                 })?;
             if seed_table.rows.iter().any(|row| {
-                !seed_literal_is_identity_stable_for_declared_type(
+                !seed_literal_is_identity_stable_for_reviewed_column(
                     &row[column_index],
                     &column.declared_type,
                     strict_table_keys.is_some_and(|keys| keys.contains(&table_key)),
+                    column.not_null,
+                    column.primary_key_position,
+                    rowid_table_keys.is_some_and(|keys| keys.contains(&table_key)),
                 )
             }) {
                 return Err(reconciliation_error(
@@ -1469,10 +1474,13 @@ fn derive_effect_assertion_details(
             "the selected effect assertion cannot exactly prove this statement or any arbitrary top-level DML, ALTER, DROP, PRAGMA, virtual table, or data-producing CREATE effect",
         ),
         EFFECT_ASSERTION_SCHEMA_ADDITIVE_V1 => {
-            return derive_additive_effect_assertion(manifest, false);
+            return derive_additive_effect_assertion(manifest, None);
         }
         EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1 => {
-            return derive_additive_effect_assertion(manifest, true);
+            return derive_additive_effect_assertion(manifest, Some(SeedAssertionVersion::V1));
+        }
+        EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V2 => {
+            return derive_additive_effect_assertion(manifest, Some(SeedAssertionVersion::V2));
         }
         _ => unreachable!("canonical registry assertion"),
     };
@@ -1528,14 +1536,16 @@ fn derive_effect_assertion_details(
 
 fn derive_additive_effect_assertion(
     manifest: &[D1MigrationManifestEntry],
-    allow_seed_rows: bool,
+    seed_assertion_version: Option<SeedAssertionVersion>,
 ) -> Result<DerivedEffectAssertion, CallToolResult> {
+    let allow_seed_rows = seed_assertion_version.is_some();
     let mut migrations = Vec::with_capacity(manifest.len());
     let mut trigger_lexical_token_values = BTreeSet::new();
     let mut manifest_created_tables = BTreeMap::<String, String>::new();
     let mut trigger_seen = BTreeSet::new();
     let mut seeded_tables = BTreeSet::new();
     let mut strict_seed_table_keys = BTreeSet::new();
+    let mut rowid_seed_table_keys = BTreeSet::new();
     let mut table_identity_spellings = BTreeMap::<String, String>::new();
     for migration in manifest {
         let statements = tokenize_sql_statements(&migration.sql).ok_or_else(|| {
@@ -1579,6 +1589,9 @@ fn derive_additive_effect_assertion(
                     if schema_create_table_is_strict(&tokens) {
                         strict_seed_table_keys.insert(authority_key.clone());
                     }
+                    if !schema_create_table_is_without_rowid(&tokens) {
+                        rowid_seed_table_keys.insert(authority_key.clone());
+                    }
                     table_identity_spellings
                         .entry(authority_key)
                         .or_insert_with(|| object.name.clone());
@@ -1616,8 +1629,11 @@ fn derive_additive_effect_assertion(
                 }
                 None => {
                     if allow_seed_rows {
-                        if let Some(mut effect) =
-                            classify_seed_insert(&tokens).map_err(seed_contract_error)?
+                        if let Some(mut effect) = classify_seed_insert(
+                            &tokens,
+                            seed_assertion_version.expect("seed assertion version"),
+                        )
+                        .map_err(seed_contract_error)?
                         {
                             let authority_key = sqlite_ascii_identifier_key(&effect.table_name);
                             let reviewed_table_name = manifest_created_tables
@@ -1847,6 +1863,7 @@ fn derive_additive_effect_assertion(
         seed_plan: allow_seed_rows.then_some(SeedManifestPlan {
             states: seed_states,
             strict_table_keys: strict_seed_table_keys,
+            rowid_table_keys: rowid_seed_table_keys,
             registry: seed_registry,
             preexisting_table_spellings,
         }),
@@ -1913,6 +1930,9 @@ pub(crate) fn canonical_effect_assertion_id(
         Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_V1) => Ok(EFFECT_ASSERTION_SCHEMA_ADDITIVE_V1),
         Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1) => {
             Ok(EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1)
+        }
+        Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V2) => {
+            Ok(EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V2)
         }
         _ => Err(reconciliation_error(
             "capability_gap",
@@ -1989,6 +2009,16 @@ fn effect_assertion_scope(effect_assertion_id: &str) -> &'static [&'static str] 
             "pragma_foreign_keys_on",
             "insert_seed_values",
         ],
+        EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V2 => &[
+            "table",
+            "index",
+            "view",
+            "trigger",
+            "alter_table_add_column",
+            "pragma_foreign_keys_on",
+            "insert_seed_values",
+            "insert_seed_null_values",
+        ],
         _ => &[],
     }
 }
@@ -1999,7 +2029,18 @@ fn effect_assertion_statement_class(effect_assertion_id: &str) -> &'static str {
         EFFECT_ASSERTION_SCHEMA_CREATE_OBJECTS_V1 => "schema_create_tables_indexes_views_triggers",
         EFFECT_ASSERTION_SCHEMA_ADDITIVE_V1 => "schema_create_objects_additive",
         EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1 => "schema_create_objects_additive_seed_rows",
+        EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V2 => {
+            "schema_create_objects_additive_seed_rows_with_nulls"
+        }
         _ => "unsupported",
+    }
+}
+
+fn seed_assertion_version(effect_assertion_id: &str) -> Option<SeedAssertionVersion> {
+    match effect_assertion_id {
+        EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1 => Some(SeedAssertionVersion::V1),
+        EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V2 => Some(SeedAssertionVersion::V2),
+        _ => None,
     }
 }
 
@@ -2325,6 +2366,21 @@ fn schema_create_table_is_strict(tokens: &[SqlToken]) -> bool {
     tokens[after_definition..]
         .iter()
         .any(|token| token_is_word(Some(token), "strict"))
+}
+
+fn schema_create_table_is_without_rowid(tokens: &[SqlToken]) -> bool {
+    let Some(definition_start) = tokens
+        .iter()
+        .position(|token| token == &SqlToken::Symbol('('))
+    else {
+        return false;
+    };
+    let Some(after_definition) = balanced_parenthesized_end(tokens, definition_start) else {
+        return false;
+    };
+    tokens[after_definition..].windows(2).any(|window| {
+        token_is_word(window.first(), "without") && token_is_word(window.get(1), "rowid")
+    })
 }
 
 fn tokenize_sql_statements(sql: &str) -> Option<Vec<Vec<SqlToken>>> {
@@ -4289,6 +4345,7 @@ mod tests {
                 foreign_keys: Vec::new(),
             }],
             Some(&seed_plan.strict_table_keys),
+            Some(&seed_plan.rowid_table_keys),
         )
         .expect("the zero-row prefix need not expose a later seed column");
 
