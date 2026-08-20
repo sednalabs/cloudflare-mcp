@@ -250,6 +250,13 @@ pub(crate) struct D1MigrationReconciliationBatchError {
 pub(crate) struct D1MigrationProviderError {
     pub(crate) code: i64,
     pub(crate) category: &'static str,
+    pub(crate) location: Option<D1MigrationProviderErrorLocation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct D1MigrationProviderErrorLocation {
+    pub(crate) kind: &'static str,
+    pub(crate) offset_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -263,6 +270,7 @@ pub(crate) struct D1MigrationManifestWrite {
 #[derive(Debug, Clone)]
 pub(crate) struct D1MigrationManifestWriteError {
     pub(crate) error: AdapterErrorPayload,
+    pub(crate) provider_error: Option<D1MigrationProviderError>,
     pub(crate) response_body_sha256: Option<String>,
     pub(crate) response_body_size_bytes: Option<usize>,
     pub(crate) lifecycle: D1MigrationManifestWriteLifecycle,
@@ -434,6 +442,25 @@ pub(crate) fn d1_migration_manifest_write_reconciliation_cause(
         "response_body_size_bytes".to_string(),
         json!(failure.response_body_size_bytes),
     );
+    if let Some(provider_error) = failure.provider_error {
+        cause_fields.insert(
+            "provider_error_code".to_string(),
+            json!(provider_error.code),
+        );
+        cause_fields.insert(
+            "provider_error_category".to_string(),
+            json!(provider_error.category),
+        );
+        if let Some(location) = provider_error.location {
+            cause_fields.insert(
+                "provider_error_location".to_string(),
+                json!({
+                    "kind": location.kind,
+                    "offset_bytes": location.offset_bytes,
+                }),
+            );
+        }
+    }
     cause
 }
 
@@ -1010,7 +1037,7 @@ impl CloudflareClient {
         if !status.is_success() {
             return Err(evidence_error(
                 d1_migration_reconciliation_http_status_error(status),
-                classify_d1_migration_provider_error(body),
+                classify_d1_migration_provider_error(body, sql.len()),
             ));
         }
         let envelope = decode_strict_d1_migration_reconciliation_envelope(body)
@@ -1035,6 +1062,7 @@ impl CloudflareClient {
     ) -> Result<D1MigrationManifestWrite, D1MigrationManifestWriteError> {
         let pre_dispatch = |error: AdapterError| D1MigrationManifestWriteError {
             error: error.payload(),
+            provider_error: None,
             response_body_sha256: None,
             response_body_size_bytes: None,
             lifecycle: D1MigrationManifestWriteLifecycle::pre_dispatch(),
@@ -1086,6 +1114,7 @@ impl CloudflareClient {
                     )
                     .with_retryable(false)
                     .payload(),
+                    provider_error: None,
                     response_body_sha256: None,
                     response_body_size_bytes: None,
                     lifecycle: D1MigrationManifestWriteLifecycle::attempted_without_response(),
@@ -1113,6 +1142,7 @@ impl CloudflareClient {
                 )
                 .with_status(Some(status_code))
                 .payload(),
+                provider_error: None,
                 response_body_sha256: None,
                 response_body_size_bytes: None,
                 lifecycle: D1MigrationManifestWriteLifecycle::response_received(status_code),
@@ -1130,6 +1160,7 @@ impl CloudflareClient {
                 )
                 .with_status(Some(status_code))
                 .payload(),
+                provider_error: None,
                 response_body_sha256: None,
                 response_body_size_bytes: response.content_length().map(|length| length as usize),
                 lifecycle: D1MigrationManifestWriteLifecycle::response_received(status_code),
@@ -1152,6 +1183,7 @@ impl CloudflareClient {
                 .with_status(Some(status_code))
                 .with_retryable(false)
                 .payload(),
+                provider_error: None,
                 response_body_sha256: None,
                 response_body_size_bytes: Some(bytes.len()),
                 lifecycle: D1MigrationManifestWriteLifecycle::body_read_failed(
@@ -1169,6 +1201,7 @@ impl CloudflareClient {
                     )
                     .with_status(Some(status_code))
                     .payload(),
+                    provider_error: None,
                     response_body_sha256: None,
                     response_body_size_bytes: Some(observed_size),
                     lifecycle: D1MigrationManifestWriteLifecycle::body_partially_read(status_code),
@@ -1179,12 +1212,16 @@ impl CloudflareClient {
         }
         let response_body_size_bytes = bytes.len();
         let response_body_sha256 = format!("{:x}", hasher.finalize());
-        let evidence_error = |error: AdapterError| D1MigrationManifestWriteError {
-            error: error.with_retryable(false).payload(),
-            response_body_sha256: Some(response_body_sha256.clone()),
-            response_body_size_bytes: Some(response_body_size_bytes),
-            lifecycle: D1MigrationManifestWriteLifecycle::body_completely_read(status_code),
-        };
+        let evidence_error =
+            |error: AdapterError, provider_error: Option<D1MigrationProviderError>| {
+                D1MigrationManifestWriteError {
+                    error: error.with_retryable(false).payload(),
+                    provider_error,
+                    response_body_sha256: Some(response_body_sha256.clone()),
+                    response_body_size_bytes: Some(response_body_size_bytes),
+                    lifecycle: D1MigrationManifestWriteLifecycle::body_completely_read(status_code),
+                }
+            };
         let body = std::str::from_utf8(&bytes).map_err(|error| {
             evidence_error(
                 AdapterError::new(
@@ -1193,13 +1230,17 @@ impl CloudflareClient {
                     "Treat the provider outcome as ambiguous; retain custody and do not replay the migration write.",
                 )
                 .with_status(Some(status_code)),
+                None,
             )
         })?;
         if !status.is_success() {
-            return Err(evidence_error(http_status_error(status, body)));
+            return Err(evidence_error(
+                d1_migration_manifest_write_http_status_error(status),
+                classify_d1_migration_provider_error(body, sql.len()),
+            ));
         }
         let envelope = decode_strict_d1_migration_manifest_envelope(body)
-            .map_err(|error| evidence_error(error.with_status(Some(status_code))))?;
+            .map_err(|error| evidence_error(error.with_status(Some(status_code)), None))?;
         Ok(D1MigrationManifestWrite {
             result: envelope.result.unwrap_or(Value::Null),
             response_body_sha256,
@@ -3940,7 +3981,10 @@ fn decode_strict_d1_migration_reconciliation_envelope(
     validate_strict_d1_migration_manifest_envelope(envelope)
 }
 
-fn classify_d1_migration_provider_error(body: &str) -> Option<D1MigrationProviderError> {
+fn classify_d1_migration_provider_error(
+    body: &str,
+    dispatched_sql_size_bytes: usize,
+) -> Option<D1MigrationProviderError> {
     let Value::Object(envelope) = decode_json_rejecting_duplicate_object_keys(body).ok()? else {
         return None;
     };
@@ -3964,7 +4008,49 @@ fn classify_d1_migration_provider_error(body: &str) -> Option<D1MigrationProvide
         10_000 => "authentication_error",
         _ => return None,
     };
-    Some(D1MigrationProviderError { code, category })
+    let location = (code == 7_500)
+        .then(|| error.get("message").and_then(Value::as_str))
+        .flatten()
+        .and_then(|message| {
+            d1_migration_provider_error_location(message, dispatched_sql_size_bytes)
+        });
+    Some(D1MigrationProviderError {
+        code,
+        category,
+        location,
+    })
+}
+
+const D1_MIGRATION_PROVIDER_ERROR_MESSAGE_SCAN_MAX_BYTES: usize = 4 * 1024;
+
+fn d1_migration_provider_error_location(
+    message: &str,
+    dispatched_sql_size_bytes: usize,
+) -> Option<D1MigrationProviderErrorLocation> {
+    if message.len() > D1_MIGRATION_PROVIDER_ERROR_MESSAGE_SCAN_MAX_BYTES || !message.is_ascii() {
+        return None;
+    }
+    let lower = message.to_ascii_lowercase();
+    let marker = " at offset ";
+    let marker_start = lower.rfind(marker)?;
+    let location_start = marker_start.checked_add(marker.len())?;
+    let tail = &lower[location_start..];
+    let digits_len = tail.bytes().take_while(u8::is_ascii_digit).count();
+    if digits_len == 0 {
+        return None;
+    }
+    let suffix = tail[digits_len..].trim();
+    if !suffix.is_empty() && suffix != ": sqlite_error" {
+        return None;
+    }
+    let offset_bytes = tail[..digits_len].parse::<u64>().ok()?;
+    if offset_bytes >= u64::try_from(dispatched_sql_size_bytes).ok()? {
+        return None;
+    }
+    Some(D1MigrationProviderErrorLocation {
+        kind: "sql_byte_offset",
+        offset_bytes,
+    })
 }
 
 fn decode_json_rejecting_duplicate_object_keys(
@@ -4580,6 +4666,45 @@ fn http_status_error(status: StatusCode, body: &str) -> AdapterError {
     }
 }
 
+fn d1_migration_manifest_write_http_status_error(status: StatusCode) -> AdapterError {
+    let (code, hint) = match status {
+        StatusCode::UNAUTHORIZED => (
+            "cloudflare.http_unauthorized",
+            "Treat the provider outcome as ambiguous; verify the configured token before governed reconciliation.",
+        ),
+        StatusCode::FORBIDDEN => (
+            "cloudflare.http_forbidden",
+            "Treat the provider outcome as ambiguous; verify D1 write scope before governed reconciliation.",
+        ),
+        StatusCode::NOT_FOUND => (
+            "cloudflare.http_not_found",
+            "Treat the provider outcome as ambiguous; verify the retained target identity before governed reconciliation.",
+        ),
+        StatusCode::TOO_MANY_REQUESTS => (
+            "cloudflare.http_rate_limited",
+            "Treat the provider outcome as ambiguous; retain custody and reconcile instead of replaying the write.",
+        ),
+        _ if status.is_server_error() => (
+            "cloudflare.http_server_error",
+            "Treat the provider outcome as ambiguous; retain custody and reconcile instead of replaying the write.",
+        ),
+        _ => (
+            "cloudflare.http_error",
+            "Treat the provider outcome as ambiguous; retain custody and reconcile instead of replaying the write.",
+        ),
+    };
+    AdapterError::new(
+        code,
+        format!(
+            "Cloudflare D1 migration-manifest write returned HTTP status {}",
+            status.as_u16()
+        ),
+        hint,
+    )
+    .with_retryable(false)
+    .with_status(Some(status.as_u16()))
+}
+
 fn d1_migration_reconciliation_http_status_error(status: StatusCode) -> AdapterError {
     let (code, hint) = match status {
         StatusCode::UNAUTHORIZED => (
@@ -4664,7 +4789,8 @@ mod tests {
     use super::{
         AdapterError, CloudflareApiError, CloudflareClient, D1_MIGRATION_JSON_MAX_CONTAINER_DEPTH,
         D1_MIGRATION_RESPONSE_MAX_BYTES, D1MigrationManifestWriteLifecycle,
-        D1MigrationProviderError, D1MigrationReconciliationReadLifecycle, DuplicateSafeJsonError,
+        D1MigrationProviderError, D1MigrationProviderErrorLocation,
+        D1MigrationReconciliationReadLifecycle, DuplicateSafeJsonError,
         classify_d1_migration_provider_error, decode_json_rejecting_duplicate_object_keys,
         decode_strict_d1_migration_manifest_envelope,
         decode_strict_d1_migration_reconciliation_envelope, is_d1_sqlite_auth_error, path_segment,
@@ -4812,6 +4938,7 @@ mod tests {
             Some(D1MigrationProviderError {
                 code: 7_500,
                 category: "d1_error",
+                location: None,
             })
         );
         assert_eq!(error.error.code, "cloudflare.http_error");
@@ -4820,6 +4947,72 @@ mod tests {
         assert_eq!(error.error.status, Some(400));
         assert_eq!(error.lifecycle.body_stage, "completely_read");
         assert!(error.response_body_sha256.is_some());
+    }
+
+    #[tokio::test]
+    async fn migration_manifest_write_http_error_surfaces_redacted_provider_location() {
+        let private_message =
+            "D1_ERROR: too many arguments on function private_function at offset 12: SQLITE_ERROR";
+        let response_body = json!({
+            "success": false,
+            "errors": [{"code": 7500, "message": private_message}],
+            "messages": [],
+            "result": null,
+        })
+        .to_string();
+        let expected_body_sha256 = format!("{:x}", Sha256::digest(response_body.as_bytes()));
+        let expected_body_size_bytes = response_body.len();
+        let router = Router::new().route(
+            "/accounts/acct-1/d1/database/db-1/query",
+            post(move || {
+                let response_body = response_body.clone();
+                async move {
+                    Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .header("content-type", "application/json")
+                        .body(Body::from(response_body))
+                        .expect("migration-write provider error response")
+                }
+            }),
+        );
+        let base = spawn_router(router).await;
+        let client = CloudflareClient::new(test_config(base)).expect("client");
+        let error = client
+            .execute_d1_migration_manifest_write(
+                "acct-1",
+                "db-1",
+                "CREATE TABLE guarded(id INTEGER PRIMARY KEY)",
+                &[],
+            )
+            .await
+            .expect_err("HTTP error must remain ambiguous");
+
+        assert_eq!(
+            error.provider_error,
+            Some(D1MigrationProviderError {
+                code: 7_500,
+                category: "d1_error",
+                location: Some(D1MigrationProviderErrorLocation {
+                    kind: "sql_byte_offset",
+                    offset_bytes: 12,
+                }),
+            })
+        );
+        assert_eq!(error.error.code, "cloudflare.http_error");
+        assert_eq!(error.error.status, Some(400));
+        assert!(!error.error.retryable);
+        assert!(!error.error.message.contains(private_message));
+        assert!(!error.error.message.contains("private_function"));
+        assert_eq!(error.response_body_sha256, Some(expected_body_sha256));
+        assert_eq!(
+            error.response_body_size_bytes,
+            Some(expected_body_size_bytes)
+        );
+        assert_eq!(
+            error.lifecycle,
+            D1MigrationManifestWriteLifecycle::body_completely_read(400)
+        );
+        assert_eq!(error.lifecycle.provider_calls(), 1);
     }
 
     #[tokio::test]
@@ -5453,10 +5646,63 @@ mod tests {
             })
             .to_string();
             assert_eq!(
-                classify_d1_migration_provider_error(&body),
-                Some(D1MigrationProviderError { code, category })
+                classify_d1_migration_provider_error(&body, 1),
+                Some(D1MigrationProviderError {
+                    code,
+                    category,
+                    location: None,
+                })
             );
         }
+
+        for (message, offset_bytes) in [
+            (
+                "D1_ERROR: too many arguments on function private_function at offset 761: SQLITE_ERROR",
+                761,
+            ),
+            (
+                "near \"private_table\": syntax error AT OFFSET 42: SQLITE_ERROR",
+                42,
+            ),
+        ] {
+            let body = json!({
+                "success": false,
+                "errors": [{"code": 7500, "message": message}],
+                "messages": [],
+                "result": null,
+            })
+            .to_string();
+            assert_eq!(
+                classify_d1_migration_provider_error(&body, offset_bytes as usize + 1),
+                Some(D1MigrationProviderError {
+                    code: 7_500,
+                    category: "d1_error",
+                    location: Some(D1MigrationProviderErrorLocation {
+                        kind: "sql_byte_offset",
+                        offset_bytes,
+                    }),
+                })
+            );
+        }
+
+        let out_of_range_body = json!({
+            "success": false,
+            "errors": [{
+                "code": 7500,
+                "message": "D1_ERROR: private SQL at offset 42: SQLITE_ERROR"
+            }],
+            "messages": [],
+            "result": null,
+        })
+        .to_string();
+        assert_eq!(
+            classify_d1_migration_provider_error(&out_of_range_body, 42),
+            Some(D1MigrationProviderError {
+                code: 7_500,
+                category: "d1_error",
+                location: None,
+            })
+        );
 
         for body in [
             r#"{"success":false,"errors":[{"code":9999,"message":"private"}],"messages":[],"result":null}"#,
@@ -5468,7 +5714,11 @@ mod tests {
             r#"{"success":false,"success":true,"errors":[{"code":7500,"message":"private"}],"messages":[],"result":null}"#,
             "{",
         ] {
-            assert_eq!(classify_d1_migration_provider_error(body), None, "{body}");
+            assert_eq!(
+                classify_d1_migration_provider_error(body, 1_024),
+                None,
+                "{body}"
+            );
         }
     }
 
@@ -5550,7 +5800,7 @@ mod tests {
             r#"{{"success":false,"errors":[{{"code":7500,"message":"{private_message}","nested":{nested}}}],"messages":[],"result":null}}"#
         );
         assert_eq!(
-            classify_d1_migration_provider_error(&provider_error_body),
+            classify_d1_migration_provider_error(&provider_error_body, 1_024),
             None
         );
     }

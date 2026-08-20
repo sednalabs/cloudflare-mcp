@@ -853,6 +853,30 @@ fn spawn_fake_bootstrap_api_with_inner_result(
     cloudflare_internal_present: bool,
     initializer_inner_result: Option<Value>,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let initializer_http_error = ambiguous_initializer.then(|| {
+        (
+            503,
+            9_911,
+            "private-initializer-body-marker".to_string(),
+            false,
+        )
+    });
+    spawn_fake_bootstrap_api_with_initializer_http_error(
+        expected_requests,
+        conflict,
+        cloudflare_internal_present,
+        initializer_inner_result,
+        initializer_http_error,
+    )
+}
+
+fn spawn_fake_bootstrap_api_with_initializer_http_error(
+    expected_requests: usize,
+    conflict: bool,
+    cloudflare_internal_present: bool,
+    initializer_inner_result: Option<Value>,
+    initializer_http_error: Option<(u16, i64, String, bool)>,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind bootstrap D1 API"); // DevSkim: ignore DS162092 -- loopback-only MCP test fixture
     let addr = listener.local_addr().expect("bootstrap D1 address");
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -871,12 +895,28 @@ fn spawn_fake_bootstrap_api_with_inner_result(
             let sql = body_json["sql"].as_str().unwrap_or_default();
             if sql.starts_with("CREATE TABLE IF NOT EXISTS \"d1_migrations\"") {
                 initialized = true;
-                if ambiguous_initializer {
-                    let response = br#"{"success":false,"errors":[{"code":9911,"message":"private-initializer-body-marker"}],"result":null}"#;
-                    write!(stream, "HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
-                        .expect("write ambiguous initializer response");
+                if let Some((status, code, message, include_messages)) =
+                    initializer_http_error.as_ref()
+                {
+                    let response = if *include_messages {
+                        serde_json::to_vec(&json!({
+                            "success": false,
+                            "errors": [{"code": code, "message": message}],
+                            "messages": [],
+                            "result": null,
+                        }))
+                        .expect("serialize initializer HTTP error")
+                    } else {
+                        assert_eq!(
+                            (*status, *code, message.as_str()),
+                            (503, 9_911, "private-initializer-body-marker")
+                        );
+                        br#"{"success":false,"errors":[{"code":9911,"message":"private-initializer-body-marker"}],"result":null}"#.to_vec()
+                    };
+                    write!(stream, "HTTP/1.1 {status} Synthetic\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                        .expect("write ambiguous initializer response headers");
                     stream
-                        .write_all(response)
+                        .write_all(&response)
                         .expect("write private ambiguous initializer body");
                     continue;
                 }
@@ -1478,6 +1518,13 @@ fn spawn_fake_manifest_outer_error_api(
 fn spawn_fake_manifest_ambiguous_api(
     ledger_names_commit_after_ambiguous_response: bool,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
+    spawn_fake_manifest_http_error_api(ledger_names_commit_after_ambiguous_response, None)
+}
+
+fn spawn_fake_manifest_http_error_api(
+    ledger_names_commit_after_ambiguous_response: bool,
+    provider_error: Option<(u16, i64, String)>,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ambiguous manifest D1 API");
     let addr = listener.local_addr().expect("ambiguous manifest D1 addr");
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1506,7 +1553,21 @@ fn spawn_fake_manifest_ambiguous_api(
             }
             if sql.contains("INSERT INTO \"d1_migrations\"") {
                 apply_seen = ledger_names_commit_after_ambiguous_response;
-                write!(stream, "HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-length: 0\r\n\r\n").expect("write ambiguous response");
+                if let Some((status, code, message)) = provider_error.as_ref() {
+                    let response = serde_json::to_vec(&json!({
+                        "success": false,
+                        "errors": [{"code": code, "message": message}],
+                        "messages": [],
+                        "result": null,
+                    }))
+                    .expect("serialize migration provider error");
+                    write!(stream, "HTTP/1.1 {status} Synthetic\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write migration provider-error headers");
+                    stream
+                        .write_all(&response)
+                        .expect("write migration provider-error body");
+                } else {
+                    write!(stream, "HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-length: 0\r\n\r\n").expect("write ambiguous response");
+                }
                 continue;
             }
             assert_eq!(sql, "SELECT * FROM \"d1_migrations\" ORDER BY id");
@@ -7701,6 +7762,162 @@ fn d1_bootstrap_migration_ledger_response_loss_retains_custody_and_never_retries
     let _ = fs::remove_dir_all(lease_root);
 }
 
+fn assert_bootstrap_provider_error_location(offset_bytes: u64, expect_location: bool, label: &str) {
+    let private_message = format!(
+        "D1_ERROR: too many arguments on function private_initializer_function at offset {offset_bytes}: SQLITE_ERROR"
+    );
+    let (base_url, requests) = spawn_fake_bootstrap_api_with_initializer_http_error(
+        9,
+        false,
+        true,
+        None,
+        Some((400, 7_500, private_message.clone(), true)),
+    );
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-bootstrap-provider-error-{}-{label}",
+        std::process::id(),
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create provider-error bootstrap lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make provider-error bootstrap lease root private");
+    }
+    let env = vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ];
+    let mut mcp = McpStdioProcess::start_with_env(env.clone());
+    let dry = mcp.call_tool(
+        1772,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "dry_run": true}),
+    );
+    let plan = structured_content(&dry)["plan_sha256"]
+        .as_str()
+        .expect("provider-error bootstrap plan")
+        .to_string();
+    let live = mcp.call_tool(
+        1773,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "approved_plan_sha256": plan}),
+    );
+    let content = structured_content(&live);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["status"], json!("reconciliation_required"));
+    assert_eq!(content["provider_calls"], json!(7));
+    assert_eq!(content["provider_mutations"], json!(1));
+    assert_eq!(content["provider_outcome"], json!("unknown"));
+    assert_eq!(content["lease_retained"], json!(true));
+    assert_eq!(content["automatic_retry_permitted"], json!(false));
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.bootstrap_initializer_outcome_unknown")
+    );
+    assert_eq!(content["error"]["cause"]["kind"], json!("transport"));
+    let detail = &content["error"]["cause"]["detail"];
+    assert_eq!(detail["code"], json!("cloudflare.http_error"));
+    assert_eq!(detail["status"], json!(400));
+    assert_eq!(detail["provider_error_code"], json!(7_500));
+    assert_eq!(detail["provider_error_category"], json!("d1_error"));
+    let expected_location =
+        expect_location.then(|| json!({"kind": "sql_byte_offset", "offset_bytes": offset_bytes}));
+    assert_eq!(
+        detail.get("provider_error_location"),
+        expected_location.as_ref(),
+        "{label}: {content}"
+    );
+    assert_eq!(detail["retryable"], json!(false));
+    assert_eq!(detail["operator_guidance"], json!("reconciliation_only"));
+    assert_eq!(
+        detail["provider_write_lifecycle"],
+        json!({
+            "dispatch_stage": "attempted",
+            "response_stage": "received",
+            "body_stage": "completely_read",
+            "http_status": 400,
+        })
+    );
+    assert!(
+        detail["response_body_sha256"].as_str().is_some_and(
+            |digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        ),
+        "{content}"
+    );
+    assert!(
+        detail["response_body_size_bytes"]
+            .as_u64()
+            .is_some_and(|size| size > 0),
+        "{content}"
+    );
+    let serialized = serde_json::to_string(content).expect("serialize bootstrap provider error");
+    assert!(!serialized.contains(&private_message));
+    assert!(!serialized.contains("private_initializer_function"));
+    assert_private_regular_active_lease(&lease_root);
+
+    let observed = requests.lock().expect("provider-error request log").clone();
+    assert_eq!(
+        observed.len(),
+        9,
+        "{label}: one write plus bounded reconciliation"
+    );
+    let dispatched_sql = observed
+        .iter()
+        .find_map(|request| {
+            request["sql"]
+                .as_str()
+                .filter(|sql| sql.starts_with("CREATE TABLE IF NOT EXISTS"))
+        })
+        .expect("dispatched bootstrap initializer SQL");
+    assert_eq!(
+        offset_bytes < dispatched_sql.len() as u64,
+        expect_location,
+        "{label}: location evidence must be strictly inside the dispatched SQL bytes"
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|request| request["sql"]
+                .as_str()
+                .is_some_and(|sql| sql.starts_with("CREATE TABLE IF NOT EXISTS")))
+            .count(),
+        1,
+        "provider HTTP error must not replay the non-idempotent initializer"
+    );
+    mcp.terminate();
+
+    let mut fresh = McpStdioProcess::start_with_env(env);
+    let blocked = fresh.call_tool(
+        1774,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "approved_plan_sha256": "a".repeat(64)}),
+    );
+    let blocked = structured_content(&blocked);
+    assert_eq!(
+        blocked["error"]["code"],
+        json!("d1.migration_target_lease_held")
+    );
+    assert_eq!(blocked["provider_calls"], json!(0));
+    assert_eq!(
+        requests.lock().expect("provider-error request log").len(),
+        9,
+        "the blocked process must not replay or read provider state"
+    );
+    fresh.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_bootstrap_migration_ledger_bounds_redacted_provider_location_without_retry() {
+    assert_bootstrap_provider_error_location(42, true, "valid");
+    assert_bootstrap_provider_error_location(761, false, "out-of-range");
+}
+
 #[test]
 fn d1_bootstrap_response_loss_reconciles_and_retires_without_retrying_initializer() {
     let (base_url, requests) = spawn_fake_bootstrap_api(41, false, true, true);
@@ -9832,6 +10049,169 @@ fn d1_apply_migration_manifest_response_loss_stops_without_retry_and_next_proces
         "response loss",
     );
     let _ = fs::remove_dir_all(lease_root);
+}
+
+fn assert_manifest_provider_error_location(offset_bytes: u64, expect_location: bool, label: &str) {
+    let private_message = format!(
+        "D1_ERROR: too many arguments on function private_function at offset {offset_bytes}: SQLITE_ERROR"
+    );
+    let (base_url, requests) =
+        spawn_fake_manifest_http_error_api(false, Some((400, 7_500, private_message.clone())));
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-provider-error-manifest-{}-{label}",
+        std::process::id(),
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create provider-error lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make provider-error lease root private");
+    }
+    let env = vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ];
+    let mut mcp = McpStdioProcess::start_with_env(env.clone());
+    let first_sql = "CREATE TABLE submissions(id TEXT);";
+    let second_sql = "ALTER TABLE submissions ADD COLUMN status TEXT;";
+    let manifest = json!([
+        {"name": "0001_initial.sql", "size_bytes": first_sql.len(), "sql_sha256": sha256_hex(first_sql), "sql": first_sql},
+        {"name": "0002_second.sql", "size_bytes": second_sql.len(), "sql_sha256": sha256_hex(second_sql), "sql": second_sql}
+    ]);
+    let dry = mcp.call_tool(
+        1770,
+        "d1_apply_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "dry_run": true,
+            "manifest": manifest.clone(),
+        }),
+    );
+    let plan = structured_content(&dry)["plan_sha256"]
+        .as_str()
+        .expect("provider-error plan")
+        .to_string();
+    let live = mcp.call_tool(
+        1771,
+        "d1_apply_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest.clone(),
+            "approved_plan_sha256": plan.clone(),
+        }),
+    );
+    let content = structured_content(&live);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["status"], json!("reconciliation_required"));
+    assert_eq!(content["outcome"], json!("unknown"));
+    assert_eq!(content["lease_retained"], json!(true));
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.migration_apply_outcome_unknown")
+    );
+    assert_eq!(content["error"]["cause"]["kind"], json!("transport"));
+    assert_eq!(
+        content["error"]["cause"]["code"],
+        json!("cloudflare.http_error")
+    );
+    assert_eq!(content["error"]["cause"]["status"], json!(400));
+    assert_eq!(
+        content["error"]["cause"]["provider_error_code"],
+        json!(7_500)
+    );
+    assert_eq!(
+        content["error"]["cause"]["provider_error_category"],
+        json!("d1_error")
+    );
+    let expected_location =
+        expect_location.then(|| json!({"kind": "sql_byte_offset", "offset_bytes": offset_bytes}));
+    assert_eq!(
+        content["error"]["cause"].get("provider_error_location"),
+        expected_location.as_ref(),
+        "{label}: {content}"
+    );
+    assert_eq!(content["error"]["cause"]["retryable"], json!(false));
+    assert_eq!(
+        content["error"]["cause"]["operator_guidance"],
+        json!("reconciliation_only")
+    );
+    assert_eq!(
+        content["error"]["cause"]["provider_write_lifecycle"],
+        json!({
+            "dispatch_stage": "attempted",
+            "response_stage": "received",
+            "body_stage": "completely_read",
+            "http_status": 400,
+        })
+    );
+    assert!(
+        content["error"]["cause"]["response_body_sha256"]
+            .as_str()
+            .is_some_and(|digest| digest.len() == 64),
+        "{content}"
+    );
+    assert!(
+        content["error"]["cause"]["response_body_size_bytes"]
+            .as_u64()
+            .is_some_and(|size| size > 0),
+        "{content}"
+    );
+    let serialized = serde_json::to_string(content).expect("serialize provider error result");
+    assert!(!serialized.contains(&private_message));
+    assert!(!serialized.contains("private_function"));
+    let observed = requests.lock().expect("provider-error request log").clone();
+    assert_eq!(
+        observed.len(),
+        10,
+        "{label}: one write plus bounded reconciliation"
+    );
+    let dispatched_sql = observed
+        .iter()
+        .find_map(|request| {
+            request["sql"]
+                .as_str()
+                .filter(|sql| sql.contains("INSERT INTO \"d1_migrations\""))
+        })
+        .expect("dispatched manifest provider SQL");
+    assert_eq!(
+        offset_bytes < dispatched_sql.len() as u64,
+        expect_location,
+        "{label}: location evidence must be strictly inside the dispatched SQL bytes"
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|request| request["sql"]
+                .as_str()
+                .is_some_and(|sql| sql.contains("INSERT INTO \"d1_migrations\"")))
+            .count(),
+        1,
+        "provider HTTP error must not replay the non-idempotent write"
+    );
+    assert_private_regular_active_lease(&lease_root);
+    mcp.terminate();
+    assert_fresh_process_blocked_without_provider_request(
+        env,
+        &manifest,
+        &plan,
+        &requests,
+        10,
+        "provider HTTP error",
+    );
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_apply_migration_manifest_bounds_redacted_provider_location_without_replay() {
+    assert_manifest_provider_error_location(42, true, "valid");
+    assert_manifest_provider_error_location(761, false, "out-of-range");
 }
 
 #[test]
