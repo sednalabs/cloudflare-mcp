@@ -77,9 +77,141 @@ release artifact bundle so agents can compare:
 - schema snapshot hash versus `spec/tool_schema_snapshot.v1.json`,
 - `/proc/<pid>/exe` hash for any already-running stdio process.
 
+## First-ledger bootstrap for an empty D1 target
+
+Use `d1_bootstrap_migration_ledger` only for a separately selected database
+that is intended to be empty before its first migration. Do not use it to add a
+ledger to an existing application database, repair a partial initialization,
+or bypass `d1_apply_migration_manifest`.
+
+1. Configure `CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT` to the same trusted,
+   private Linux custody root used by manifest apply.
+2. Call the bootstrap with `dry_run=true` and the exact account, database, and
+   optional canonical ledger-table identifier. Confirm that the response
+   reports two provider reads, zero mutations, `target_inventory.state=empty`,
+   a lowercase `plan_sha256`, two chronological one-attempt
+   `provider_read_lifecycle` entries, and matching exact-body
+   `response_evidence`.
+3. Independently confirm that this is the intended empty target. Approval of a
+   manifest apply, an account default, or a similarly named database is not
+   bootstrap approval.
+4. Call the same tool live with the exact dry-run `plan_sha256`. The tool
+   repeats the stable primary empty preflight under the account/database target
+   lease and issues at most one non-idempotent canonical initializer.
+5. Treat success as proven only when the response reports one provider
+   mutation, the canonical ledger as the only non-internal schema object, an
+   empty filename ledger, and released custody. A DDL acknowledgement may
+   report zero changed rows, but it must report primary service,
+   `changed_db=true`, and typed non-negative counts before the stable post-state
+   can authorize success. Continue with a separate `d1_apply_migration_manifest`
+   dry-run; bootstrap approval never approves migration SQL.
+
+If the initializer response is lost or malformed, do not retry. The tool makes
+bounded read-only reconciliation calls with no redirects or adapter retries,
+retains custody when it can prove the local chain, and reports the single
+mutation attempt plus exact physical read accounting. HTTP/auth/rate-limit/5xx,
+transport, truncated, oversized, malformed, invalid-UTF-8, non-primary, and
+unstable evidence stays fail-closed. Builder/config failures remain
+pre-dispatch with zero calls. Confirm every lifecycle/response entry retains
+its exact lifecycle window, phase, and query digest, and every nested provider
+cause says `retryable=false` with reconciliation-only guidance while omitting
+provider response text. Escalate that exact evidence to
+the governed reconciliation path. A canonical empty ledger observed afterward
+does not prove whether this call created it, so it is not permission to replay.
+
+Every new bootstrap lease carries the
+`bootstrap-initializer-attempt-marker-v1` protocol. Immediately before the one
+initializer dispatch, the coordinator durably creates an exact attempt receipt
+under the held target guard. A failure before that receipt exists is therefore
+distinguishable from every attempted or ambiguous initializer outcome.
+
+### Retire bootstrap custody after a proven zero-dispatch failure
+
+Use `d1_abort_bootstrap_migration_ledger` only when a bootstrap result retained
+custody with `provider_outcome=not_dispatched` and zero provider mutations, such
+as a failed active-to-retiring release after the under-custody empty-target
+proof. Supply the exact target, ledger table, bootstrap plan, lease nonce and
+payload digest plus distinct terminal request and attempt SHA-256 identities.
+
+1. Call the abort tool with `dry_run=true`. It performs no provider access. It
+   accepts only marker-aware bootstrap lease bytes and proves the exact
+   initializer-attempt receipt is stably absent under the held guard. Legacy
+   custody, a present marker, malformed or contradictory marker evidence,
+   absent/conflicting lease evidence, or retiring/retired custody without the
+   exact terminal receipt fails closed.
+2. Independently approve the returned terminal-plan digest, then repeat with
+   `dry_run=false` and that exact digest. The tool creates a canonical
+   `not_committed` receipt, re-proves marker absence, and moves custody through
+   active -> retiring -> `retired.<nonce>.lease.json` with directory sync at
+   each boundary.
+3. Require `bootstrap_zero_dispatch_abort_complete`,
+   `provider_initializer_dispatches=0`, `provider_calls=0`,
+   `provider_mutations=0`, and verified retired custody. Exact replay returns
+   the same terminal receipt with zero mutations. Changed request/attempt or
+   plan authority conflicts with the incumbent receipt.
+
+Never use this path after an initializer attempt. A durable attempt marker is
+permanent no-retry evidence even when transport never returned a response. Use
+the read-only bootstrap reconciler and normal bootstrap finalizer for that
+state. After a successful zero-dispatch retirement, any later bootstrap is a
+new operation requiring a fresh empty-target dry run and approval.
+
+### Recover retained bootstrap custody
+
+This recovery is bootstrap-specific. Never substitute an empty migration
+manifest and never issue the initializer again.
+
+1. Preserve the exact `active.lease.json` or `retiring.lease.json` and record
+   the original bootstrap result's plan, nonce, payload digest, account,
+   database, and migrations-table identity.
+2. Call `d1_reconcile_bootstrap_migration_ledger` with those exact fields. It
+   locks and validates the existing `migration-ledger-bootstrap-v1` custody,
+   then makes two stable primary proof windows. Each window contains two schema
+   inventory reads and two empty-ledger reads. Every read is one HTTP attempt,
+   never follows a redirect, and records exact response-byte digest, size, and
+   lifecycle evidence. A successful response therefore reports eight actual
+   provider dispatches, zero provider mutations, zero local namespace mutations,
+   and four approval products: reconciliation plan, initializer
+   authority, query authority, and canonical snapshot digests.
+3. Stop on any nonterminal product. Physical ledger absence or any non-ledger
+   object is `conflicting`; a non-empty ledger is also conflicting. Malformed,
+   non-primary, unreadable, unstable, or custody-drifted evidence is `unknown`.
+   Every state keeps initializer retry forbidden and leaves custody in place.
+4. Record the four successful reconciliation digests and choose two distinct
+   operator-controlled lowercase SHA-256 request and attempt identities. Call
+   `d1_finalize_bootstrap_migration_ledger` with `dry_run=true`; independently
+   approve the returned terminal-plan digest.
+5. Repeat with `dry_run=false` and the exact approved terminal plan. The tool
+   repeats the eight-read proof, performs one additional four-read proof before
+   creating the canonical private receipt, performs another four-read proof
+   before retirement, and issues no provider write. Only then may it durably
+   move custody from active to retiring to `retired.<nonce>.lease.json`. If
+   custody changes during either refresh, require `lease_retained=null` and
+   `retained_evidence_unverified`; after receipt creation the response must also
+   report that receipt and its one local namespace mutation without retiring it.
+6. Require `bootstrap_terminal_complete`, verified retired custody, the exact
+   receipt digest, `provider_mutations=0`, and truthful local mutation counts.
+   Treat the final descriptor-bound readback as current receipt authority: a
+   failed readback must report its observed true/false/null receipt state, not
+   merely the earlier successful creation event.
+   An exact completed replay validates the receipt and retirement with zero
+   provider calls. A receipt without matching provider proof, or retirement
+   without the exact receipt, is a blocker rather than cleanup authority.
+
+The only terminal provider product is the exact schema produced by the
+approved canonical initializer, with that ledger as the sole application-owned
+object and zero ledger rows. This proves current convergence, not which caller
+created it. General manifest reconciliation remains a separate authority and
+cannot reconcile or retire bootstrap-family custody.
+
 ## Exact-byte D1 migration manifests
 
 Use `d1_apply_migration_manifest` for an approval-gated D1 migration family.
+Never pass the reserved exact family `migration-ledger-bootstrap-v1` to this
+generic tool or to generic reconciliation/finalization. Only the dedicated
+bootstrap lifecycle owns that family; generic boundaries reject it before
+provider access or local custody/receipt activity.
+
 First run it with `dry_run=true`; retain the returned `plan_sha256`, which is
 bound to the exact SQL bytes and current Wrangler ledger prefix. A live call
 must submit that exact lowercase value, without whitespace or case changes, as
@@ -109,6 +241,19 @@ The exact-byte manifest boundary accepts at most 16 MiB of aggregate SQL and
 moves the supplied manifest into validation without cloning its SQL strings.
 Split a larger migration family before review rather than increasing this
 operator-surface memory bound.
+
+Every manifest-owned provider write uses its own one-attempt HTTP client. It
+requests identity response encoding, never follows redirects, and consumes the
+response as a stream capped at 16 MiB before UTF-8 or strict-envelope decoding.
+A 307 or 308 is provider response evidence, never authority for a second POST.
+Declared or streamed oversize, unsupported content encoding, read failure,
+invalid UTF-8, malformed JSON, and contradictory envelopes after dispatch all
+retain the exact write lifecycle and bounded body digest/size evidence when
+available. Treat every such result as ambiguous: retain custody, reconcile,
+and never replay the migration write automatically. A decoded HTTP 200 outer
+envelope retains that same complete-body evidence through inner D1 result
+validation; malformed, missing, or failed inner results remain one attempted
+write with unknown outcome, not a replayable provider rejection.
 
 On a live manifest call, the MCP first performs a read-only inspection of any
 existing target custody. It never creates a target or guard during this step;

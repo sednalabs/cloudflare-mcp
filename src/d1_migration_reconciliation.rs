@@ -27,7 +27,7 @@ use crate::d1_migration_lease::{
 };
 use crate::d1_migration_manifest::{
     D1ManifestLedgerRow, classify_d1_manifest_ledger, d1_ledger_summaries, d1_manifest_plan_sha256,
-    d1_manifest_summaries,
+    d1_manifest_summaries, validate_generic_d1_migration_family,
 };
 use crate::d1_migration_seed_rows::{
     D1MigrationSeedTableExpectation, EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1,
@@ -401,6 +401,9 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
     effect_assertion_id: Option<&str>,
     state_expectations: Vec<D1MigrationStateExpectation>,
 ) -> Result<D1MigrationReconciliationProof, CallToolResult> {
+    if let Err(result) = validate_generic_d1_migration_family(family) {
+        return Err(prelease_error(result, "not_inspected", None));
+    }
     let selected_effect_assertion_id = match canonical_effect_assertion_id(effect_assertion_id) {
         Ok(id) => id,
         Err(result) => return Err(prelease_error(result, "not_inspected", None)),

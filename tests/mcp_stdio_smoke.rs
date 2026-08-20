@@ -533,7 +533,7 @@ fn spawn_fake_r2_api_with_requests(expected_requests: usize) -> (String, Arc<Mut
             }
         }
     });
-    (format!("http://{addr}"), requests)
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
 }
 
 fn spawn_fake_r2_binary_api() -> (String, Arc<Mutex<Vec<String>>>) {
@@ -713,6 +713,369 @@ fn manifest_ledger_response(rows: Vec<Value>) -> Value {
             "results": rows,
         }],
     })
+}
+
+fn bootstrap_inventory_response(
+    initialized: bool,
+    conflict: bool,
+    cloudflare_internal_visible: bool,
+) -> Value {
+    let mut results = if conflict {
+        vec![json!({
+            "type": "table",
+            "name": "application_rows",
+            "tbl_name": "application_rows",
+            "sql": "CREATE TABLE application_rows(id INTEGER)",
+        })]
+    } else if initialized {
+        manifest_ledger_authority_response("d1_migrations")["result"][0]["results"]
+            .as_array()
+            .expect("canonical authority rows")
+            .clone()
+    } else {
+        Vec::new()
+    };
+    if cloudflare_internal_visible {
+        results.insert(
+            0,
+            json!({
+                "type": "table",
+                "name": "_cf_KV",
+                "tbl_name": "_cf_KV",
+                "sql": "CREATE TABLE _cf_KV (key TEXT PRIMARY KEY, value BLOB) WITHOUT ROWID",
+            }),
+        );
+        results.truncate(2);
+    }
+    json!({
+        "success": true,
+        "errors": [],
+        "messages": [],
+        "result": [{
+            "success": true,
+            "errors": [],
+            "meta": {"served_by_primary": true},
+            "results": results,
+        }],
+    })
+}
+
+fn is_bootstrap_inventory_sql(sql: &str) -> bool {
+    sql.starts_with("SELECT type, name, tbl_name, sql FROM sqlite_master ")
+        && sql.contains("lower(name) NOT GLOB 'sqlite_*'")
+        && sql.ends_with("LIMIT 2")
+}
+
+fn spawn_fake_bootstrap_api(
+    expected_requests: usize,
+    conflict: bool,
+    ambiguous_initializer: bool,
+    cloudflare_internal_present: bool,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    spawn_fake_bootstrap_api_with_inner_result(
+        expected_requests,
+        conflict,
+        ambiguous_initializer,
+        cloudflare_internal_present,
+        None,
+    )
+}
+
+fn spawn_fake_bootstrap_api_with_inner_result(
+    expected_requests: usize,
+    conflict: bool,
+    ambiguous_initializer: bool,
+    cloudflare_internal_present: bool,
+    initializer_inner_result: Option<Value>,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind bootstrap D1 API"); // DevSkim: ignore DS162092 -- loopback-only MCP test fixture
+    let addr = listener.local_addr().expect("bootstrap D1 address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        let mut initialized = false;
+        for stream in listener.incoming().take(expected_requests) {
+            let mut stream = stream.expect("bootstrap D1 stream");
+            let (headers, body) = read_http_request(&mut stream);
+            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            let body_json: Value = serde_json::from_slice(&body).expect("bootstrap request JSON");
+            requests_for_thread
+                .lock()
+                .expect("bootstrap request log")
+                .push(body_json.clone());
+            let sql = body_json["sql"].as_str().unwrap_or_default();
+            if sql.starts_with("CREATE TABLE IF NOT EXISTS \"d1_migrations\"") {
+                initialized = true;
+                if ambiguous_initializer {
+                    let response = br#"{"success":false,"errors":[{"code":9911,"message":"private-initializer-body-marker"}],"result":null}"#;
+                    write!(stream, "HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                        .expect("write ambiguous initializer response");
+                    stream
+                        .write_all(response)
+                        .expect("write private ambiguous initializer body");
+                    continue;
+                }
+                let response = serde_json::to_vec(&json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": initializer_inner_result.clone().unwrap_or_else(|| json!([{
+                        "success": true,
+                        "errors": [],
+                        "results": [],
+                        "meta": {
+                            "served_by_primary": true,
+                            "changed_db": true,
+                            "changes": 0,
+                            "rows_written": 0,
+                        },
+                    }])),
+                }))
+                .expect("serialize initializer response");
+                write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                    .expect("write initializer headers");
+                stream
+                    .write_all(&response)
+                    .expect("write initializer response");
+                continue;
+            }
+            let response = if is_bootstrap_inventory_sql(sql) {
+                let filters_cloudflare_internal = sql.contains("lower(name) NOT GLOB '_cf_*'")
+                    && sql.contains("lower(tbl_name) NOT GLOB '_cf_*'");
+                bootstrap_inventory_response(
+                    initialized,
+                    conflict,
+                    cloudflare_internal_present && !filters_cloudflare_internal,
+                )
+            } else if sql == "SELECT * FROM \"d1_migrations\" ORDER BY id" {
+                assert!(initialized, "ledger reads follow initializer dispatch");
+                manifest_ledger_response(Vec::new())
+            } else {
+                panic!("unexpected bootstrap SQL: {sql}");
+            };
+            let response = serde_json::to_vec(&response).expect("serialize bootstrap response");
+            write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                .expect("write bootstrap headers");
+            stream
+                .write_all(&response)
+                .expect("write bootstrap response");
+        }
+    });
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
+}
+
+#[derive(Clone, Copy)]
+enum BootstrapReadFault {
+    HttpStatus(u16),
+    Redirect,
+    TransportLoss,
+    Truncated(bool),
+    Oversized,
+    MalformedJson,
+    InvalidUtf8,
+    PrimaryMarkerWrongType,
+    Unstable,
+}
+
+fn spawn_fake_bootstrap_read_fault_api(
+    fault: BootstrapReadFault,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind bootstrap read-fault API"); // DevSkim: ignore DS162092 -- loopback-only MCP test fixture
+    let addr = listener.local_addr().expect("bootstrap read-fault address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    let expected_calls = if matches!(fault, BootstrapReadFault::Unstable) {
+        2
+    } else {
+        1
+    };
+    thread::spawn(move || {
+        for (index, stream) in listener.incoming().take(expected_calls).enumerate() {
+            let mut stream = stream.expect("bootstrap read-fault stream");
+            let (headers, body) = read_http_request(&mut stream);
+            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            let request: Value =
+                serde_json::from_slice(&body).expect("bootstrap read-fault request JSON");
+            assert!(is_bootstrap_inventory_sql(
+                request["sql"].as_str().unwrap_or_default()
+            ));
+            requests_for_thread
+                .lock()
+                .expect("bootstrap read-fault request log")
+                .push(request);
+            match fault {
+                BootstrapReadFault::HttpStatus(status) => {
+                    let response = reconciliation_http_error_response(status);
+                    write!(stream, "HTTP/1.1 {status} Synthetic\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                        .expect("write bootstrap HTTP error headers");
+                    stream
+                        .write_all(&response)
+                        .expect("write bootstrap HTTP error body");
+                }
+                BootstrapReadFault::Redirect => {
+                    let response = b"redirect refused";
+                    write!(stream, "HTTP/1.1 302 Found\r\nconnection: close\r\nlocation: http://127.0.0.1:9/must-not-be-followed\r\ncontent-type: text/plain\r\ncontent-length: {}\r\n\r\n", response.len()) // DevSkim: ignore DS137138 -- loopback-only no-follow fixture
+                        .expect("write bootstrap redirect headers");
+                    stream
+                        .write_all(response)
+                        .expect("write bootstrap redirect body");
+                }
+                BootstrapReadFault::TransportLoss => {}
+                BootstrapReadFault::Truncated(partial) => {
+                    write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 64\r\n\r\n")
+                        .expect("write bootstrap truncated headers");
+                    if partial {
+                        stream
+                            .write_all(b"{")
+                            .expect("write bootstrap partial response body");
+                    }
+                }
+                BootstrapReadFault::Oversized => {
+                    write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", 16 * 1024 * 1024 + 1)
+                        .expect("write oversized bootstrap headers");
+                }
+                BootstrapReadFault::MalformedJson => {
+                    let response = b"{";
+                    write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                        .expect("write malformed bootstrap JSON headers");
+                    stream
+                        .write_all(response)
+                        .expect("write malformed bootstrap JSON");
+                }
+                BootstrapReadFault::InvalidUtf8 => {
+                    let response = [0xff, 0xfe];
+                    write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                        .expect("write invalid UTF-8 bootstrap headers");
+                    stream
+                        .write_all(&response)
+                        .expect("write invalid UTF-8 bootstrap body");
+                }
+                BootstrapReadFault::PrimaryMarkerWrongType => {
+                    let mut response = bootstrap_inventory_response(false, false, false);
+                    response["result"][0]["meta"]["served_by_primary"] = json!("true");
+                    let response =
+                        serde_json::to_vec(&response).expect("serialize primary-marker fault");
+                    write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                        .expect("write primary-marker fault headers");
+                    stream
+                        .write_all(&response)
+                        .expect("write primary-marker fault body");
+                }
+                BootstrapReadFault::Unstable => {
+                    let response = bootstrap_inventory_response(false, index == 1, false);
+                    let response =
+                        serde_json::to_vec(&response).expect("serialize unstable bootstrap read");
+                    write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                        .expect("write unstable bootstrap headers");
+                    stream
+                        .write_all(&response)
+                        .expect("write unstable bootstrap response");
+                }
+            }
+        }
+    });
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
+}
+
+enum BootstrapRecoveryFixtureFault {
+    CustodyDrift(PathBuf),
+    TargetReadOnly(PathBuf),
+}
+
+fn spawn_fake_initialized_bootstrap_recovery_api(
+    expected_requests: usize,
+    fault: Option<(usize, BootstrapRecoveryFixtureFault)>,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").expect("bind initialized bootstrap recovery API"); // DevSkim: ignore DS162092 -- loopback-only MCP test fixture
+    let addr = listener
+        .local_addr()
+        .expect("initialized bootstrap recovery address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        for (index, stream) in listener.incoming().take(expected_requests).enumerate() {
+            let mut stream = stream.expect("initialized bootstrap recovery stream");
+            let (headers, body) = read_http_request(&mut stream);
+            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            let body_json: Value =
+                serde_json::from_slice(&body).expect("bootstrap recovery request JSON");
+            requests_for_thread
+                .lock()
+                .expect("bootstrap recovery request log")
+                .push(body_json.clone());
+            let sql = body_json["sql"].as_str().unwrap_or_default();
+            let response = if is_bootstrap_inventory_sql(sql) {
+                bootstrap_inventory_response(true, false, false)
+            } else if sql == "SELECT * FROM \"d1_migrations\" ORDER BY id" {
+                manifest_ledger_response(Vec::new())
+            } else {
+                panic!("unexpected initialized bootstrap recovery SQL: {sql}");
+            };
+            let response =
+                serde_json::to_vec(&response).expect("serialize bootstrap recovery response");
+            if fault
+                .as_ref()
+                .is_some_and(|(request, _)| *request == index + 1)
+            {
+                match &fault.as_ref().expect("selected bootstrap fault").1 {
+                    BootstrapRecoveryFixtureFault::CustodyDrift(active) => {
+                        fs::rename(active, active.with_extension("custody-drifted"))
+                            .expect("displace active bootstrap custody before response completion");
+                    }
+                    BootstrapRecoveryFixtureFault::TargetReadOnly(target) => {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            fs::set_permissions(target, fs::Permissions::from_mode(0o500))
+                                .expect("make bootstrap target read-only before retirement");
+                        }
+                    }
+                }
+            }
+            write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                .expect("write initialized bootstrap recovery headers");
+            stream
+                .write_all(&response)
+                .expect("write initialized bootstrap recovery response");
+        }
+    });
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
+}
+
+fn spawn_fake_bootstrap_recovery_http_failure_api() -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind bootstrap recovery failure API"); // DevSkim: ignore DS162092 -- loopback-only MCP test fixture
+    let addr = listener
+        .local_addr()
+        .expect("bootstrap recovery failure address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        let (mut stream, _) = listener
+            .accept()
+            .expect("bootstrap recovery failure stream");
+        let (headers, body) = read_http_request(&mut stream);
+        assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+        let body_json: Value =
+            serde_json::from_slice(&body).expect("bootstrap recovery failure request JSON");
+        requests_for_thread
+            .lock()
+            .expect("bootstrap recovery failure request log")
+            .push(body_json);
+        let response = serde_json::to_vec(&json!({
+            "success": false,
+            "errors": [{"code": 7500, "message": "provider unavailable"}],
+            "messages": [],
+            "result": null,
+        }))
+        .expect("serialize bootstrap recovery failure response");
+        write!(stream, "HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+            .expect("write bootstrap recovery failure headers");
+        stream
+            .write_all(&response)
+            .expect("write bootstrap recovery failure response");
+    });
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
 }
 
 fn spawn_manifest_authority_rejection_api(
@@ -1094,6 +1457,53 @@ fn spawn_fake_manifest_ambiguous_api(
                 serde_json::to_vec(&manifest_ledger_response(ledger)).expect("serialize response");
             write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write headers");
             stream.write_all(&response).expect("write response");
+        }
+    });
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
+}
+
+fn spawn_fake_manifest_oversized_write_api() -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind oversized manifest D1 API"); // DevSkim: ignore DS162092 -- loopback-only MCP test fixture
+    let addr = listener.local_addr().expect("oversized manifest D1 addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().take(10) {
+            let mut stream = stream.expect("oversized manifest D1 stream");
+            let (headers, body) = read_http_request(&mut stream);
+            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            let body_json: Value =
+                serde_json::from_slice(&body).expect("oversized manifest request JSON");
+            requests_for_thread
+                .lock()
+                .expect("oversized manifest request log")
+                .push(body_json.clone());
+            let sql = body_json["sql"].as_str().unwrap_or_default();
+            if is_manifest_ledger_authority_sql(sql) {
+                let response =
+                    serde_json::to_vec(&manifest_ledger_authority_response("d1_migrations"))
+                        .expect("serialize oversized fixture authority response");
+                write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write oversized fixture authority headers");
+                stream
+                    .write_all(&response)
+                    .expect("write oversized fixture authority response");
+                continue;
+            }
+            if sql.contains("INSERT INTO \"d1_migrations\"") {
+                write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", 16 * 1024 * 1024 + 1)
+                    .expect("write oversized migration response headers");
+                continue;
+            }
+            assert_eq!(sql, "SELECT * FROM \"d1_migrations\" ORDER BY id");
+            let response = serde_json::to_vec(&manifest_ledger_response(vec![json!({
+                "id": 1,
+                "name": "0001_initial.sql"
+            })]))
+            .expect("serialize oversized fixture ledger response");
+            write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write oversized fixture ledger headers");
+            stream
+                .write_all(&response)
+                .expect("write oversized fixture ledger response");
         }
     });
     (format!("http://{addr}"), requests)
@@ -4285,7 +4695,7 @@ fn create_static_pages_dir(name: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system clock")
         .as_nanos();
-    let root = std::env::temp_dir().join(format!(
+    let root = PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-pages-{name}-{}-{nonce}",
         std::process::id()
     ));
@@ -4655,10 +5065,9 @@ fn stdio_tool_calls_cover_context_and_body_normalization_edges() {
         3,
         "api_mutate",
         json!({
-            "operation_id": "d1-query-database",
+            "operation_id": "d1-create-database",
             "path_params": {
-                "account_id": "acct-1",
-                "database_id": "db-1"
+                "account_id": "acct-1"
             },
             "body": "{\"sql\":\"UPDATE submissions SET status = ? WHERE id = ?\",\"params\":[\"in_progress\",\"sub-1\"]}",
             "dry_run": true,
@@ -4770,7 +5179,7 @@ fn stdio_tool_calls_cover_context_and_body_normalization_edges() {
         "find_tools",
         json!({
             "query": "d1",
-            "limit": 10,
+            "limit": 30,
             "include_schema": false
         }),
     );
@@ -4784,6 +5193,16 @@ fn stdio_tool_calls_cover_context_and_body_normalization_edges() {
     assert!(
         result_names.contains(&"d1_query_read_only"),
         "find_tools should expose curated D1 tools: {tools_content}"
+    );
+    assert!(
+        result_names.contains(&"d1_bootstrap_migration_ledger"),
+        "find_tools should expose the guarded ledger bootstrap: {tools_content}"
+    );
+    assert!(
+        result_names.contains(&"d1_reconcile_bootstrap_migration_ledger")
+            && result_names.contains(&"d1_finalize_bootstrap_migration_ledger")
+            && result_names.contains(&"d1_abort_bootstrap_migration_ledger"),
+        "find_tools should expose the bootstrap-specific recovery boundary: {tools_content}"
     );
 }
 
@@ -5444,7 +5863,7 @@ fn d1_validate_query_works_through_stdio_boundary_without_executing_user_query()
 #[test]
 fn d1_apply_migrations_retires_live_mutation_through_stdio_boundary() {
     let (base_url, requests) = spawn_fake_d1_migrations_api(3, false);
-    let dir = std::env::temp_dir().join(format!("cloudflare-mcp-d1-stdio-{}", std::process::id()));
+    let dir = PathBuf::from("/tmp").join(format!("cloudflare-mcp-d1-stdio-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("create migrations dir");
     fs::write(
@@ -5485,7 +5904,7 @@ fn d1_apply_migrations_retires_live_mutation_through_stdio_boundary() {
 #[test]
 fn d1_apply_migrations_retires_before_any_ledger_or_provider_access() {
     let (base_url, requests) = spawn_fake_d1_migrations_api(2, true);
-    let dir = std::env::temp_dir().join(format!(
+    let dir = PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-d1-ledger-fail-{}",
         std::process::id()
     ));
@@ -5519,6 +5938,2022 @@ fn d1_apply_migrations_retires_before_any_ledger_or_provider_access() {
         "retired migration path must not probe or mutate the provider"
     );
     let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn d1_bootstrap_migration_ledger_dry_run_and_live_prove_one_initializer_only() {
+    let (base_url, requests) = spawn_fake_bootstrap_api(9, false, false, true);
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-bootstrap-ledger-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create bootstrap lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make bootstrap lease root private");
+    }
+    let env = vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ];
+    let mut mcp = McpStdioProcess::start_with_env(env);
+
+    let invalid = mcp.call_tool(
+        30,
+        "d1_bootstrap_migration_ledger",
+        json!({
+            "database_id": "db-1",
+            "migrations_table": " d1_migrations",
+            "dry_run": true,
+        }),
+    );
+    let invalid = structured_content(&invalid);
+    assert_eq!(invalid["ok"], json!(false), "{invalid}");
+    assert_eq!(invalid["provider_calls"], json!(0));
+    assert_eq!(invalid["provider_mutations"], json!(0));
+    assert!(requests.lock().expect("request log").is_empty());
+
+    for (id, migrations_table) in [(31, "_cf_ledger"), (32, "SQLITE_ledger")] {
+        let reserved = mcp.call_tool(
+            id,
+            "d1_bootstrap_migration_ledger",
+            json!({
+                "database_id": "db-1",
+                "migrations_table": migrations_table,
+                "dry_run": true,
+            }),
+        );
+        let reserved = structured_content(&reserved);
+        assert_eq!(reserved["ok"], json!(false), "{reserved}");
+        assert_eq!(
+            reserved["error"]["code"],
+            json!("d1.bootstrap_reserved_migrations_table")
+        );
+        assert_eq!(reserved["provider_calls"], json!(0));
+        assert_eq!(reserved["provider_mutations"], json!(0));
+    }
+    assert!(requests.lock().expect("request log").is_empty());
+
+    let dry = mcp.call_tool(
+        33,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "dry_run": true}),
+    );
+    let dry = structured_content(&dry);
+    assert_eq!(dry["ok"], json!(true), "{dry}");
+    assert_eq!(dry["status"], json!("previewed"));
+    assert_eq!(dry["target_inventory"]["state"], json!("empty"));
+    assert_eq!(dry["provider_calls"], json!(2));
+    assert_eq!(dry["provider_mutations"], json!(0));
+    assert_eq!(
+        dry["provider_read_lifecycle"].as_array().map(Vec::len),
+        Some(2),
+        "{dry}"
+    );
+    assert!(
+        dry["provider_read_lifecycle"]
+            .as_array()
+            .is_some_and(|reads| {
+                reads.iter().enumerate().all(|(index, read)| {
+                    read["phase"]
+                        == json!(format!(
+                            "dry_run_preflight.inventory.{}",
+                            if index == 0 { "first" } else { "second" }
+                        ))
+                        && read["query_sha256"]
+                            .as_str()
+                            .is_some_and(|value| value.len() == 64)
+                        && read["lifecycle"]["dispatch_stage"] == json!("attempted")
+                        && read["lifecycle"]["response_stage"] == json!("received")
+                        && read["lifecycle"]["body_stage"] == json!("completely_read")
+                        && read["lifecycle"]["http_status"] == json!(200)
+                })
+            })
+    );
+    assert_eq!(dry["response_evidence"].as_array().map(Vec::len), Some(2));
+    let plan = dry["plan_sha256"].as_str().expect("bootstrap plan");
+
+    let live = mcp.call_tool(
+        34,
+        "d1_bootstrap_migration_ledger",
+        json!({
+            "database_id": "db-1",
+            "approved_plan_sha256": plan,
+        }),
+    );
+    let live = structured_content(&live);
+    assert_eq!(live["ok"], json!(true), "{live}");
+    assert_eq!(live["status"], json!("applied_proven"));
+    assert_eq!(live["provider_calls"], json!(7));
+    assert_eq!(live["provider_mutations"], json!(1));
+    assert_eq!(
+        live["provider_read_lifecycle"].as_array().map(Vec::len),
+        Some(6),
+        "{live}"
+    );
+    assert_eq!(
+        live["response_evidence"].as_array().map(Vec::len),
+        Some(6),
+        "{live}"
+    );
+    assert_eq!(
+        live["provider_read_lifecycle"]
+            .as_array()
+            .expect("live lifecycle")
+            .iter()
+            .map(|entry| entry["phase"].as_str().expect("bounded phase"))
+            .collect::<Vec<_>>(),
+        vec![
+            "live_predispatch.inventory.first",
+            "live_predispatch.inventory.second",
+            "post_write_proof.inventory.first",
+            "post_write_proof.inventory.second",
+            "post_write_proof.ledger.first",
+            "post_write_proof.ledger.second",
+        ],
+        "{live}"
+    );
+    assert_eq!(live["migration_sql_executed"], json!(false));
+    assert_eq!(live["post_write"]["ledger_row_count"], json!(0));
+    assert_eq!(
+        live["post_write"]["target_inventory"]["state"],
+        json!("canonical_ledger_only")
+    );
+    assert_released_manifest_target_custody(&lease_root);
+
+    let requests = requests.lock().expect("request log").clone();
+    assert_eq!(requests.len(), 9);
+    let initializer_requests = requests
+        .iter()
+        .filter(|request| {
+            request["sql"]
+                .as_str()
+                .is_some_and(|sql| sql.starts_with("CREATE TABLE IF NOT EXISTS \"d1_migrations\""))
+        })
+        .count();
+    assert_eq!(initializer_requests, 1, "exactly one initializer dispatch");
+    assert!(requests.iter().all(|request| {
+        request["sql"]
+            .as_str()
+            .is_some_and(|sql| !sql.contains("INSERT INTO") && !sql.contains("ALTER TABLE"))
+    }));
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_bootstrap_reads_are_one_attempt_bounded_and_report_exact_lifecycle() {
+    for (index, (fault, status, body_stage, expected_code, expected_calls)) in [
+        (
+            BootstrapReadFault::HttpStatus(400),
+            Some(400),
+            "completely_read",
+            "d1.bootstrap_inventory_unreadable",
+            1,
+        ),
+        (
+            BootstrapReadFault::HttpStatus(401),
+            Some(401),
+            "completely_read",
+            "d1.bootstrap_inventory_unreadable",
+            1,
+        ),
+        (
+            BootstrapReadFault::HttpStatus(403),
+            Some(403),
+            "completely_read",
+            "d1.bootstrap_inventory_unreadable",
+            1,
+        ),
+        (
+            BootstrapReadFault::HttpStatus(429),
+            Some(429),
+            "completely_read",
+            "d1.bootstrap_inventory_unreadable",
+            1,
+        ),
+        (
+            BootstrapReadFault::HttpStatus(503),
+            Some(503),
+            "completely_read",
+            "d1.bootstrap_inventory_unreadable",
+            1,
+        ),
+        (
+            BootstrapReadFault::Redirect,
+            Some(302),
+            "completely_read",
+            "d1.bootstrap_inventory_unreadable",
+            1,
+        ),
+        (
+            BootstrapReadFault::TransportLoss,
+            None,
+            "not_read",
+            "d1.bootstrap_inventory_unreadable",
+            1,
+        ),
+        (
+            BootstrapReadFault::Truncated(false),
+            Some(200),
+            "not_read",
+            "d1.bootstrap_inventory_unreadable",
+            1,
+        ),
+        (
+            BootstrapReadFault::Truncated(true),
+            Some(200),
+            "partially_read",
+            "d1.bootstrap_inventory_unreadable",
+            1,
+        ),
+        (
+            BootstrapReadFault::Oversized,
+            Some(200),
+            "not_read",
+            "d1.bootstrap_inventory_unreadable",
+            1,
+        ),
+        (
+            BootstrapReadFault::MalformedJson,
+            Some(200),
+            "completely_read",
+            "d1.bootstrap_inventory_unreadable",
+            1,
+        ),
+        (
+            BootstrapReadFault::InvalidUtf8,
+            Some(200),
+            "completely_read",
+            "d1.bootstrap_inventory_unreadable",
+            1,
+        ),
+        (
+            BootstrapReadFault::PrimaryMarkerWrongType,
+            Some(200),
+            "completely_read",
+            "d1.bootstrap_inventory_malformed",
+            1,
+        ),
+        (
+            BootstrapReadFault::Unstable,
+            Some(200),
+            "completely_read",
+            "d1.bootstrap_inventory_unstable",
+            2,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (base_url, requests) = spawn_fake_bootstrap_read_fault_api(fault);
+        let mut mcp =
+            McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+        let content = structured_content(&mcp.call_tool(
+            500 + index as u64,
+            "d1_bootstrap_migration_ledger",
+            json!({"database_id": "db-1", "dry_run": true}),
+        ))
+        .clone();
+        assert_eq!(content["ok"], json!(false), "case {index}: {content}");
+        assert_eq!(
+            content["error"]["code"],
+            json!(expected_code),
+            "case {index}: {content}"
+        );
+        assert_eq!(
+            content["provider_calls"],
+            json!(expected_calls),
+            "case {index}: {content}"
+        );
+        assert_eq!(content["provider_mutations"], json!(0), "{content}");
+        assert_eq!(
+            content["automatic_retry_permitted"],
+            json!(false),
+            "case {index}: {content}"
+        );
+        assert_eq!(
+            content["provider_read_lifecycle"].as_array().map(Vec::len),
+            Some(expected_calls),
+            "case {index}: {content}"
+        );
+        assert_eq!(
+            content["provider_read_lifecycle"][expected_calls - 1]["lifecycle"]["http_status"],
+            status.map_or(Value::Null, Value::from),
+            "case {index}: {content}"
+        );
+        assert_eq!(
+            content["provider_read_lifecycle"][expected_calls - 1]["lifecycle"]["body_stage"],
+            json!(body_stage),
+            "case {index}: {content}"
+        );
+        for (read_index, entry) in content["provider_read_lifecycle"]
+            .as_array()
+            .expect("provider lifecycle array")
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(
+                entry["phase"],
+                json!(format!(
+                    "dry_run_preflight.inventory.{}",
+                    if read_index == 0 { "first" } else { "second" }
+                )),
+                "case {index}: {content}"
+            );
+            assert!(
+                entry["query_sha256"]
+                    .as_str()
+                    .is_some_and(|value| value.len() == 64),
+                "case {index}: {content}"
+            );
+        }
+        let evidence = content["response_evidence"]
+            .as_array()
+            .expect("response evidence array");
+        assert_eq!(evidence.len(), expected_calls, "case {index}: {content}");
+        let last = &evidence[expected_calls - 1];
+        assert_eq!(
+            last["phase"],
+            json!(if expected_calls == 1 {
+                "dry_run_preflight.inventory.first"
+            } else {
+                "dry_run_preflight.inventory.second"
+            })
+        );
+        if body_stage == "completely_read" {
+            assert!(
+                last["response"]["body_sha256"]
+                    .as_str()
+                    .is_some_and(|value| value.len() == 64),
+                "case {index}: {content}"
+            );
+            assert_eq!(
+                last["response"]["complete_body_digest"],
+                json!(true),
+                "{content}"
+            );
+        } else {
+            assert!(
+                last["response"]["body_sha256"].is_null(),
+                "case {index}: {content}"
+            );
+            assert_eq!(
+                last["response"]["complete_body_digest"],
+                json!(false),
+                "{content}"
+            );
+            if status.is_some() {
+                assert!(
+                    last["response"]["body_size_bytes"].as_u64().is_some(),
+                    "case {index}: {content}"
+                );
+            } else {
+                assert!(last["response"]["body_size_bytes"].is_null(), "{content}");
+            }
+        }
+        if expected_code == "d1.bootstrap_inventory_unreadable" {
+            assert_eq!(
+                content["error"]["cause"]["retryable"],
+                json!(false),
+                "{content}"
+            );
+            assert_eq!(
+                content["error"]["cause"]["operator_guidance"],
+                json!("reconciliation_only"),
+                "{content}"
+            );
+            assert!(content["error"]["cause"].get("hint").is_none(), "{content}");
+            assert!(
+                content["error"]["cause"].get("message").is_none(),
+                "{content}"
+            );
+            assert!(!content.to_string().contains("synthetic HTTP"), "{content}");
+        }
+        assert_eq!(
+            requests
+                .lock()
+                .expect("bootstrap read-fault requests")
+                .len(),
+            expected_calls,
+            "case {index}: no hidden retry is permitted"
+        );
+        mcp.terminate();
+    }
+
+    let mut pre_dispatch = McpStdioProcess::start_with_env(vec![
+        (
+            "CLOUDFLARE_MCP_API_BASE_URL",
+            "http://127.0.0.1:9".to_string(),
+        ),
+        ("CLOUDFLARE_API_TOKEN", String::new()),
+        ("CLOUDFLARE_MCP_API_TOKEN", String::new()),
+    ]);
+    let content = structured_content(&pre_dispatch.call_tool(
+        599,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "dry_run": true}),
+    ))
+    .clone();
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["provider_calls"], json!(0), "{content}");
+    assert_eq!(
+        content["automatic_retry_permitted"],
+        json!(false),
+        "{content}"
+    );
+    assert_eq!(
+        content["provider_read_lifecycle"][0]["lifecycle"],
+        json!({
+            "dispatch_stage": "pre_dispatch",
+            "response_stage": "not_received",
+            "body_stage": "not_read",
+            "http_status": null,
+        }),
+        "{content}"
+    );
+    assert_eq!(
+        content["provider_read_lifecycle"][0]["phase"],
+        json!("dry_run_preflight.inventory.first")
+    );
+    assert!(
+        content["provider_read_lifecycle"][0]["query_sha256"]
+            .as_str()
+            .is_some_and(|value| value.len() == 64)
+    );
+    assert_eq!(
+        content["response_evidence"].as_array().map(Vec::len),
+        Some(1),
+        "{content}"
+    );
+    assert!(content["response_evidence"][0]["response"]["body_sha256"].is_null());
+    pre_dispatch.terminate();
+
+    let mut builder_failure = McpStdioProcess::start_with_env(vec![
+        (
+            "CLOUDFLARE_MCP_API_BASE_URL",
+            "http://127.0.0.1:9".to_string(),
+        ),
+        ("CLOUDFLARE_API_TOKEN", "invalid\nheader".to_string()),
+        ("CLOUDFLARE_MCP_API_TOKEN", "invalid\nheader".to_string()),
+    ]);
+    let content = structured_content(&builder_failure.call_tool(
+        600,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "dry_run": true}),
+    ))
+    .clone();
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["provider_calls"], json!(0), "{content}");
+    assert_eq!(
+        content["error"]["cause"]["code"],
+        json!("cloudflare.request_build_failed"),
+        "{content}"
+    );
+    assert_eq!(
+        content["error"]["cause"]["retryable"],
+        json!(false),
+        "{content}"
+    );
+    assert_eq!(
+        content["error"]["cause"]["operator_guidance"],
+        json!("reconciliation_only"),
+        "{content}"
+    );
+    assert_eq!(
+        content["provider_read_lifecycle"][0]["phase"],
+        json!("dry_run_preflight.inventory.first"),
+        "{content}"
+    );
+    assert_eq!(
+        content["provider_read_lifecycle"][0]["lifecycle"]["dispatch_stage"],
+        json!("pre_dispatch"),
+        "{content}"
+    );
+    assert_eq!(
+        content["response_evidence"].as_array().map(Vec::len),
+        Some(1),
+        "{content}"
+    );
+    builder_failure.terminate();
+}
+
+#[test]
+fn d1_bootstrap_migration_ledger_rejects_application_objects_without_write() {
+    let (base_url, requests) = spawn_fake_bootstrap_api(2, true, false, true);
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let response = mcp.call_tool(
+        33,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "dry_run": true}),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.bootstrap_target_not_empty")
+    );
+    assert_eq!(content["provider_calls"], json!(2));
+    assert_eq!(content["provider_mutations"], json!(0));
+    let requests = requests.lock().expect("request log").clone();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| is_bootstrap_inventory_sql(request["sql"].as_str().unwrap_or_default()))
+    );
+}
+
+#[test]
+fn d1_bootstrap_migration_ledger_rejects_stale_plan_after_fresh_empty_preflight() {
+    let (base_url, requests) = spawn_fake_bootstrap_api(2, false, false, true);
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-bootstrap-stale-plan-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create stale-plan bootstrap lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make stale-plan lease root private");
+    }
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let response = mcp.call_tool(
+        34,
+        "d1_bootstrap_migration_ledger",
+        json!({
+            "database_id": "db-1",
+            "approved_plan_sha256": "a".repeat(64),
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.bootstrap_plan_digest_mismatch")
+    );
+    assert_eq!(content["provider_calls"], json!(2));
+    assert_eq!(content["provider_mutations"], json!(0));
+    assert_eq!(content["automatic_retry_permitted"], json!(false));
+    assert_released_manifest_target_custody(&lease_root);
+    let requests = requests.lock().expect("request log").clone();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|request| {
+        is_bootstrap_inventory_sql(request["sql"].as_str().unwrap_or_default())
+    }));
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_bootstrap_zero_dispatch_abort_retires_only_exact_marker_aware_custody() {
+    let (dry_url, _) = spawn_fake_bootstrap_api(2, false, false, true);
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-bootstrap-zero-dispatch-abort-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create zero-dispatch bootstrap lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make zero-dispatch lease root private");
+    }
+    let mut dry = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", dry_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let preview = dry.call_tool(
+        340,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "dry_run": true}),
+    );
+    let plan = structured_content(&preview)["plan_sha256"]
+        .as_str()
+        .expect("zero-dispatch bootstrap plan")
+        .to_string();
+    dry.terminate();
+
+    // Force a pre-dispatch provider conflict, then put the exact terminally
+    // released bytes back in active to model the reviewed release-failure seam.
+    let (conflict_url, conflict_requests) = spawn_fake_bootstrap_api(2, true, false, true);
+    let env = vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", conflict_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ];
+    let mut bootstrap = McpStdioProcess::start_with_env(env.clone());
+    let blocked = bootstrap.call_tool(
+        341,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "approved_plan_sha256": plan}),
+    );
+    let blocked = structured_content(&blocked);
+    assert_eq!(blocked["ok"], json!(false), "{blocked}");
+    assert_eq!(blocked["provider_mutations"], json!(0), "{blocked}");
+    assert_eq!(blocked["provider_outcome"], json!("not_dispatched"));
+    let nonce = blocked["lease"]["nonce"]
+        .as_str()
+        .unwrap_or_else(|| panic!("zero-dispatch lease nonce: {blocked}"))
+        .to_string();
+    let payload = blocked["lease"]["payload_sha256"]
+        .as_str()
+        .unwrap_or_else(|| panic!("zero-dispatch lease payload: {blocked}"))
+        .to_string();
+    bootstrap.terminate();
+    assert_eq!(
+        conflict_requests.lock().expect("conflict requests").len(),
+        2
+    );
+    let target = manifest_target_path(&lease_root);
+    let retired = target.join(format!("retired.{nonce}.lease.json"));
+    let active = target.join("active.lease.json");
+    fs::rename(&retired, &active).expect("model zero-dispatch release failure");
+
+    let terminal_request = "7".repeat(64);
+    let terminal_attempt = "8".repeat(64);
+    let abort_args = |attempt: &str, dry_run: bool, approved: Option<&str>| {
+        let mut args = json!({
+            "database_id": "db-1",
+            "approved_bootstrap_plan_sha256": plan,
+            "lease_nonce": nonce,
+            "lease_payload_sha256": payload,
+            "terminal_request_sha256": terminal_request,
+            "terminal_attempt_sha256": attempt,
+            "dry_run": dry_run,
+        });
+        if let Some(approved) = approved {
+            args["approved_terminal_plan_sha256"] = json!(approved);
+        }
+        args
+    };
+    let mut abort = McpStdioProcess::start_with_env(env);
+
+    let displaced = target.join("displaced.active.lease.json");
+    fs::rename(&active, &displaced).expect("temporarily remove active evidence");
+    let absent = structured_content(&abort.call_tool(
+        342,
+        "d1_abort_bootstrap_migration_ledger",
+        abort_args(&terminal_attempt, true, None),
+    ))
+    .clone();
+    assert_eq!(absent["ok"], json!(false), "{absent}");
+    assert_eq!(absent["custody_status"], json!("inspection_failed"));
+    assert_eq!(absent["provider_calls"], json!(0));
+    fs::rename(&displaced, &active).expect("restore active evidence");
+
+    let retiring = target.join("retiring.lease.json");
+    fs::rename(&active, &retiring).expect("install retiring evidence");
+    let retiring_result = structured_content(&abort.call_tool(
+        343,
+        "d1_abort_bootstrap_migration_ledger",
+        abort_args(&terminal_attempt, true, None),
+    ))
+    .clone();
+    assert_eq!(retiring_result["ok"], json!(false), "{retiring_result}");
+    assert_eq!(
+        retiring_result["error"]["code"],
+        json!("d1.bootstrap_abort_terminal_receipt_absent")
+    );
+    fs::rename(&retiring, &active).expect("restore active from retiring fixture");
+
+    let marker = target.join(format!(
+        "bootstrap-initializer-attempt.{nonce}.receipt.json"
+    ));
+    fs::write(&marker, b"{malformed").expect("install malformed attempt evidence");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o600))
+            .expect("make malformed marker private");
+    }
+    let malformed = structured_content(&abort.call_tool(
+        344,
+        "d1_abort_bootstrap_migration_ledger",
+        abort_args(&terminal_attempt, true, None),
+    ))
+    .clone();
+    assert_eq!(malformed["ok"], json!(false), "{malformed}");
+    assert_eq!(
+        malformed["error"]["code"],
+        json!("d1.bootstrap_abort_dispatch_not_absent")
+    );
+    fs::remove_file(&marker).expect("remove malformed test fixture");
+
+    let preview = structured_content(&abort.call_tool(
+        345,
+        "d1_abort_bootstrap_migration_ledger",
+        abort_args(&terminal_attempt, true, None),
+    ))
+    .clone();
+    assert_eq!(preview["ok"], json!(true), "{preview}");
+    assert_eq!(
+        preview["status"],
+        json!("bootstrap_zero_dispatch_abort_plan_ready")
+    );
+    assert_eq!(preview["provider_initializer_dispatches"], json!(0));
+    assert_eq!(preview["provider_calls"], json!(0));
+    let terminal_plan = preview["terminal_plan_sha256"]
+        .as_str()
+        .expect("zero-dispatch terminal plan")
+        .to_string();
+
+    let completed = structured_content(&abort.call_tool(
+        346,
+        "d1_abort_bootstrap_migration_ledger",
+        abort_args(&terminal_attempt, false, Some(&terminal_plan)),
+    ))
+    .clone();
+    assert_eq!(completed["ok"], json!(true), "{completed}");
+    assert_eq!(
+        completed["status"],
+        json!("bootstrap_zero_dispatch_abort_complete")
+    );
+    assert_eq!(
+        completed["custody_status"],
+        json!("retired_evidence_verified")
+    );
+    assert_eq!(completed["local_namespace_mutations"], json!(3));
+    assert_eq!(completed["provider_calls"], json!(0));
+
+    let replay = structured_content(&abort.call_tool(
+        347,
+        "d1_abort_bootstrap_migration_ledger",
+        abort_args(&terminal_attempt, false, Some(&terminal_plan)),
+    ))
+    .clone();
+    assert_eq!(replay["ok"], json!(true), "{replay}");
+    assert_eq!(replay["replayed"], json!(true));
+    assert_eq!(replay["local_namespace_mutations"], json!(0));
+    assert_eq!(replay["provider_calls"], json!(0));
+
+    let conflict = structured_content(&abort.call_tool(
+        348,
+        "d1_abort_bootstrap_migration_ledger",
+        abort_args(&"9".repeat(64), true, None),
+    ))
+    .clone();
+    assert_eq!(conflict["ok"], json!(false), "{conflict}");
+    assert_eq!(conflict["capability_state"], json!("contradictory"));
+    assert_eq!(conflict["provider_calls"], json!(0));
+    abort.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_bootstrap_migration_ledger_ambiguous_inner_results_preserve_write_evidence_without_retry() {
+    for (index, (label, inner_result, classification)) in [
+        (
+            "malformed inner result",
+            Value::Null,
+            "missing_or_non_array_result",
+        ),
+        (
+            "failed inner result",
+            json!([{
+                "success": false,
+                "errors": [],
+                "results": [],
+                "meta": {
+                    "served_by_primary": true,
+                    "changed_db": true,
+                    "changes": 0,
+                    "rows_written": 0,
+                },
+            }]),
+            "inner_statement_failure_or_missing_success",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let expected_write_response = serde_json::to_vec(&json!({
+            "success": true,
+            "errors": [],
+            "messages": [],
+            "result": inner_result.clone(),
+        }))
+        .expect("serialize expected ambiguous initializer response");
+        let expected_write_response_sha256 = sha256_hex(
+            &String::from_utf8(expected_write_response.clone())
+                .expect("expected ambiguous initializer response is UTF-8"),
+        );
+        let (base_url, requests) =
+            spawn_fake_bootstrap_api_with_inner_result(9, false, false, true, Some(inner_result));
+        let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+            "cloudflare-mcp-bootstrap-inner-result-{index}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&lease_root);
+        fs::create_dir_all(&lease_root).expect("create ambiguous bootstrap lease root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+                .expect("make ambiguous bootstrap lease root private");
+        }
+        let env = vec![
+            ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+            (
+                "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+                lease_root.to_string_lossy().to_string(),
+            ),
+        ];
+        let mut mcp = McpStdioProcess::start_with_env(env.clone());
+        let dry = mcp.call_tool(
+            380 + index as u64 * 3,
+            "d1_bootstrap_migration_ledger",
+            json!({"database_id": "db-1", "dry_run": true}),
+        );
+        let plan = structured_content(&dry)["plan_sha256"]
+            .as_str()
+            .expect("ambiguous inner-result bootstrap plan")
+            .to_string();
+        let live = mcp.call_tool(
+            381 + index as u64 * 3,
+            "d1_bootstrap_migration_ledger",
+            json!({"database_id": "db-1", "approved_plan_sha256": plan}),
+        );
+        let content = structured_content(&live);
+        assert_eq!(content["ok"], json!(false), "{label}: {content}");
+        assert_eq!(
+            content["status"],
+            json!("reconciliation_required"),
+            "{label}"
+        );
+        assert_eq!(content["provider_calls"], json!(7), "{label}");
+        assert_eq!(content["provider_mutations"], json!(1), "{label}");
+        assert_eq!(content["provider_outcome"], json!("unknown"), "{label}");
+        assert_eq!(content["lease_retained"], json!(true), "{label}");
+        assert_eq!(
+            content["error"]["cause"]["kind"],
+            json!("provider_result"),
+            "{label}"
+        );
+        assert_eq!(
+            content["error"]["cause"]["detail"]["classification"],
+            json!(classification),
+            "{label}"
+        );
+        assert_eq!(
+            content["error"]["cause"]["detail"]["provider_write_lifecycle"],
+            json!({
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 200,
+            }),
+            "{label}"
+        );
+        assert_eq!(
+            content["error"]["cause"]["detail"]["response_body_sha256"],
+            json!(expected_write_response_sha256),
+            "{label}"
+        );
+        assert_eq!(
+            content["error"]["cause"]["detail"]["response_body_size_bytes"],
+            json!(expected_write_response.len()),
+            "{label}"
+        );
+        assert_eq!(
+            content["error"]["cause"]["detail"]["retryable"],
+            json!(false),
+            "{label}"
+        );
+        assert_private_regular_active_lease(&lease_root);
+
+        let observed_before_blocked = requests.lock().expect("request log").clone();
+        assert_eq!(observed_before_blocked.len(), 9, "{label}");
+        assert_eq!(
+            observed_before_blocked
+                .iter()
+                .filter(|request| request["sql"]
+                    .as_str()
+                    .is_some_and(|sql| sql.starts_with("CREATE TABLE IF NOT EXISTS")))
+                .count(),
+            1,
+            "{label} must dispatch the initializer exactly once"
+        );
+        mcp.terminate();
+
+        let mut fresh = McpStdioProcess::start_with_env(env);
+        let blocked = fresh.call_tool(
+            382 + index as u64 * 3,
+            "d1_bootstrap_migration_ledger",
+            json!({"database_id": "db-1", "approved_plan_sha256": "a".repeat(64)}),
+        );
+        let blocked = structured_content(&blocked);
+        assert_eq!(
+            blocked["error"]["code"],
+            json!("d1.migration_target_lease_held")
+        );
+        assert_eq!(blocked["provider_calls"], json!(0), "{label}");
+        assert_eq!(
+            requests.lock().expect("request log").len(),
+            9,
+            "{label} must not replay or read provider state from the blocked process"
+        );
+        fresh.terminate();
+        let _ = fs::remove_dir_all(lease_root);
+    }
+}
+
+#[test]
+fn d1_bootstrap_migration_ledger_response_loss_retains_custody_and_never_retries() {
+    let (base_url, requests) = spawn_fake_bootstrap_api(9, false, true, true);
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-bootstrap-ambiguous-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create ambiguous bootstrap lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make ambiguous lease root private");
+    }
+    let env = vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ];
+    let mut mcp = McpStdioProcess::start_with_env(env.clone());
+    let dry = mcp.call_tool(
+        34,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "dry_run": true}),
+    );
+    let plan = structured_content(&dry)["plan_sha256"]
+        .as_str()
+        .expect("ambiguous bootstrap plan")
+        .to_string();
+    let live = mcp.call_tool(
+        35,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "approved_plan_sha256": plan}),
+    );
+    let content = structured_content(&live);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["status"], json!("reconciliation_required"));
+    assert_eq!(content["provider_calls"], json!(7));
+    assert_eq!(content["provider_mutations"], json!(1));
+    assert_eq!(content["provider_outcome"], json!("unknown"));
+    assert_eq!(content["lease_retained"], json!(true));
+    assert_eq!(content["automatic_retry_permitted"], json!(false));
+    assert_eq!(
+        content["provider_read_lifecycle"].as_array().map(Vec::len),
+        Some(6),
+        "two pre-dispatch proof reads plus four ambiguity readbacks: {content}"
+    );
+    assert_eq!(
+        content["response_evidence"].as_array().map(Vec::len),
+        Some(6),
+        "{content}"
+    );
+    let phases = content["provider_read_lifecycle"]
+        .as_array()
+        .expect("ambiguous lifecycle")
+        .iter()
+        .map(|entry| entry["phase"].as_str().expect("bounded phase"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        phases,
+        vec![
+            "live_predispatch.inventory.first",
+            "live_predispatch.inventory.second",
+            "ambiguous_write_reconciliation.inventory.first",
+            "ambiguous_write_reconciliation.inventory.second",
+            "ambiguous_write_reconciliation.ledger.first",
+            "ambiguous_write_reconciliation.ledger.second",
+        ],
+        "{content}"
+    );
+    assert_eq!(
+        content["error"]["cause"],
+        json!({
+            "kind": "transport",
+            "detail": {
+                "code": "cloudflare.http_server_error",
+                "status": 503,
+                "retryable": false,
+                "operator_guidance": "reconciliation_only",
+                "provider_write_lifecycle": {
+                    "dispatch_stage": "attempted",
+                    "response_stage": "received",
+                    "body_stage": "completely_read",
+                    "http_status": 503,
+                },
+                "response_body_sha256": "50ab9a4d22f15c104d768ad5449f5fd7ca69f12290133c7af485f289793cfc4b",
+                "response_body_size_bytes": 100,
+            },
+        }),
+        "{content}"
+    );
+    assert!(
+        !content
+            .to_string()
+            .contains("private-initializer-body-marker"),
+        "provider body excerpt leaked: {content}"
+    );
+    assert_eq!(
+        content["reconciliation_evidence"]["state"],
+        json!("canonical_empty_ledger_observed")
+    );
+    assert_eq!(
+        content["reconciliation_evidence"]["effect_attribution"],
+        json!("unknown")
+    );
+    assert_eq!(
+        content["reconciliation_evidence"]["provider_read_lifecycle"]
+            .as_array()
+            .map(Vec::len),
+        Some(4),
+        "{content}"
+    );
+    assert_eq!(
+        content["reconciliation_evidence"]["response_evidence"]
+            .as_array()
+            .map(Vec::len),
+        Some(4),
+        "{content}"
+    );
+    assert_eq!(
+        content["reconciliation_evidence"]["provider_read_lifecycle"]
+            .as_array()
+            .expect("reconciliation lifecycle")
+            .iter()
+            .map(|entry| entry["phase"].as_str().expect("bounded phase"))
+            .collect::<Vec<_>>(),
+        phases[2..],
+        "{content}"
+    );
+    assert_private_regular_active_lease(&lease_root);
+
+    let mut fresh = McpStdioProcess::start_with_env(env);
+    let blocked = fresh.call_tool(
+        36,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "approved_plan_sha256": "a".repeat(64)}),
+    );
+    let blocked = structured_content(&blocked);
+    assert_eq!(blocked["ok"], json!(false), "{blocked}");
+    assert_eq!(
+        blocked["error"]["code"],
+        json!("d1.migration_target_lease_held")
+    );
+    assert_eq!(blocked["provider_calls"], json!(0));
+
+    let abort_after_attempt = fresh.call_tool(
+        37,
+        "d1_abort_bootstrap_migration_ledger",
+        json!({
+            "database_id": "db-1",
+            "approved_bootstrap_plan_sha256": plan,
+            "lease_nonce": content["lease"]["nonce"],
+            "lease_payload_sha256": content["lease"]["payload_sha256"],
+            "terminal_request_sha256": "7".repeat(64),
+            "terminal_attempt_sha256": "8".repeat(64),
+            "dry_run": true,
+        }),
+    );
+    let abort_after_attempt = structured_content(&abort_after_attempt);
+    assert_eq!(
+        abort_after_attempt["ok"],
+        json!(false),
+        "{abort_after_attempt}"
+    );
+    assert_eq!(abort_after_attempt["provider_calls"], json!(0));
+    assert_eq!(
+        abort_after_attempt["error"]["code"],
+        json!("d1.bootstrap_abort_dispatch_not_absent")
+    );
+    assert_private_regular_active_lease(&lease_root);
+
+    let requests = requests.lock().expect("request log").clone();
+    assert_eq!(requests.len(), 9);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request["sql"]
+                .as_str()
+                .is_some_and(|sql| sql.starts_with("CREATE TABLE IF NOT EXISTS")))
+            .count(),
+        1,
+        "ambiguous initializer is dispatched once and never retried"
+    );
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_bootstrap_response_loss_reconciles_and_retires_without_retrying_initializer() {
+    let (base_url, requests) = spawn_fake_bootstrap_api(41, false, true, true);
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-bootstrap-terminal-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create bootstrap terminal lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make bootstrap terminal lease root private");
+    }
+    let env = vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ];
+    let mut mcp = McpStdioProcess::start_with_env(env.clone());
+    let dry = mcp.call_tool(
+        200,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "dry_run": true}),
+    );
+    let bootstrap_plan = structured_content(&dry)["plan_sha256"]
+        .as_str()
+        .expect("bootstrap plan")
+        .to_string();
+    let ambiguous = mcp.call_tool(
+        201,
+        "d1_bootstrap_migration_ledger",
+        json!({
+            "database_id": "db-1",
+            "approved_plan_sha256": bootstrap_plan,
+        }),
+    );
+    let ambiguous = structured_content(&ambiguous);
+    assert_eq!(ambiguous["status"], json!("reconciliation_required"));
+    assert_eq!(ambiguous["lease_retained"], json!(true));
+    let lease_nonce = ambiguous["lease"]["nonce"]
+        .as_str()
+        .expect("retained bootstrap nonce")
+        .to_string();
+    let lease_payload_sha256 = ambiguous["lease"]["payload_sha256"]
+        .as_str()
+        .expect("retained bootstrap payload digest")
+        .to_string();
+
+    let reconcile = mcp.call_tool(
+        202,
+        "d1_reconcile_bootstrap_migration_ledger",
+        json!({
+            "database_id": "db-1",
+            "approved_bootstrap_plan_sha256": bootstrap_plan,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+        }),
+    );
+    let reconcile = structured_content(&reconcile);
+    assert_eq!(reconcile["ok"], json!(true), "{reconcile}");
+    assert_eq!(reconcile["status"], json!("bootstrap_reconciled"));
+    assert_eq!(reconcile["capability_state"], json!("terminal_proof_ready"));
+    assert_eq!(reconcile["outcome"], json!("canonical_empty_ledger"));
+    assert_eq!(reconcile["provider_calls"], json!(8));
+    assert_eq!(reconcile["provider_mutations"], json!(0));
+    assert_eq!(reconcile["local_namespace_mutations"], json!(0));
+    let reconcile_lifecycle = reconcile["provider_read_lifecycle"]
+        .as_array()
+        .expect("bootstrap reconciliation lifecycle");
+    assert_eq!(reconcile_lifecycle.len(), 8);
+    assert!(reconcile_lifecycle.iter().all(|entry| {
+        entry["provider_call_attempted"] == json!(true)
+            && entry["lifecycle"]["dispatch_stage"] == json!("attempted")
+            && entry["lifecycle"]["response_stage"] == json!("received")
+            && entry["lifecycle"]["body_stage"] == json!("completely_read")
+            && entry["response"]["body_sha256"]
+                .as_str()
+                .is_some_and(|value| value.len() == 64)
+            && entry["response"]["body_size_bytes"].as_u64().is_some()
+    }));
+    assert_eq!(
+        reconcile["response_evidence"]
+            .as_array()
+            .expect("bootstrap reconciliation response evidence")
+            .len(),
+        9,
+        "eight exact response-byte products plus the stable before/after snapshot"
+    );
+    assert_eq!(reconcile["lease_retained"], json!(true));
+    assert_eq!(
+        reconcile["retry_decision"],
+        json!("do_not_retry_initializer")
+    );
+    let reconciliation_plan = reconcile["reconciliation_plan_sha256"]
+        .as_str()
+        .expect("bootstrap reconciliation plan")
+        .to_string();
+    let initializer_authority = reconcile["initializer_authority_sha256"]
+        .as_str()
+        .expect("initializer authority")
+        .to_string();
+    let query_authority = reconcile["query_authority_sha256"]
+        .as_str()
+        .expect("query authority")
+        .to_string();
+    let canonical_snapshot = reconcile["canonical_snapshot_sha256"]
+        .as_str()
+        .expect("canonical bootstrap snapshot")
+        .to_string();
+    let terminal_request = "7".repeat(64);
+    let terminal_attempt = "8".repeat(64);
+    let terminal_args = |snapshot: &str, dry_run: bool, approved: Option<&str>| {
+        let mut args = json!({
+            "database_id": "db-1",
+            "approved_bootstrap_plan_sha256": bootstrap_plan,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "expected_reconciliation_plan_sha256": reconciliation_plan,
+            "expected_initializer_authority_sha256": initializer_authority,
+            "expected_query_authority_sha256": query_authority,
+            "expected_canonical_snapshot_sha256": snapshot,
+            "terminal_request_sha256": terminal_request,
+            "terminal_attempt_sha256": terminal_attempt,
+            "dry_run": dry_run,
+        });
+        if let Some(approved) = approved {
+            args["approved_terminal_plan_sha256"] = json!(approved);
+        }
+        args
+    };
+
+    let contradictory = mcp.call_tool(
+        203,
+        "d1_finalize_bootstrap_migration_ledger",
+        terminal_args(&"9".repeat(64), true, None),
+    );
+    let contradictory = structured_content(&contradictory);
+    assert_eq!(contradictory["ok"], json!(false), "{contradictory}");
+    assert_eq!(
+        contradictory["error"]["code"],
+        json!("d1.bootstrap_terminal_reconciliation_plan_mismatch")
+    );
+    assert_eq!(contradictory["provider_calls"], json!(0));
+    assert_eq!(contradictory["provider_mutations"], json!(0));
+    assert_eq!(contradictory["local_namespace_mutations"], json!(0));
+    assert_private_regular_active_lease(&lease_root);
+
+    let terminal_dry = mcp.call_tool(
+        204,
+        "d1_finalize_bootstrap_migration_ledger",
+        terminal_args(&canonical_snapshot, true, None),
+    );
+    let terminal_dry = structured_content(&terminal_dry);
+    assert_eq!(terminal_dry["ok"], json!(true), "{terminal_dry}");
+    assert_eq!(
+        terminal_dry["status"],
+        json!("bootstrap_terminal_plan_ready")
+    );
+    assert_eq!(terminal_dry["provider_calls"], json!(8));
+    assert_eq!(terminal_dry["provider_mutations"], json!(0));
+    assert_eq!(terminal_dry["local_namespace_mutations"], json!(0));
+    let terminal_plan = terminal_dry["terminal_plan_sha256"]
+        .as_str()
+        .expect("bootstrap terminal plan")
+        .to_string();
+
+    let terminal_live = mcp.call_tool(
+        205,
+        "d1_finalize_bootstrap_migration_ledger",
+        terminal_args(&canonical_snapshot, false, Some(&terminal_plan)),
+    );
+    let terminal_live = structured_content(&terminal_live);
+    assert_eq!(terminal_live["ok"], json!(true), "{terminal_live}");
+    assert_eq!(
+        terminal_live["status"],
+        json!("bootstrap_terminal_complete")
+    );
+    assert_eq!(terminal_live["provider_calls"], json!(16));
+    assert_eq!(terminal_live["provider_mutations"], json!(0));
+    assert_eq!(terminal_live["local_namespace_mutations"], json!(3));
+    assert_eq!(terminal_live["lease_retained"], json!(false));
+    assert_eq!(
+        terminal_live["provider_read_lifecycle"]
+            .as_array()
+            .expect("bootstrap terminal lifecycle")
+            .len(),
+        16
+    );
+    assert_eq!(
+        terminal_live["response_evidence"]
+            .as_array()
+            .expect("bootstrap terminal response evidence")
+            .len(),
+        19,
+        "sixteen exact response-byte products plus three canonical snapshot products"
+    );
+    assert_eq!(
+        terminal_live["custody_status"],
+        json!("retired_evidence_verified")
+    );
+
+    let target = manifest_target_path(&lease_root);
+    assert!(!target.join("active.lease.json").exists());
+    assert!(!target.join("retiring.lease.json").exists());
+    assert!(
+        target
+            .join(format!("retired.{lease_nonce}.lease.json"))
+            .is_file()
+    );
+    assert!(
+        target
+            .join(format!(
+                "terminal-reconciliation.{lease_nonce}.receipt.json"
+            ))
+            .is_file()
+    );
+
+    let mut replay = McpStdioProcess::start_with_env(env);
+    let replay_result = replay.call_tool(
+        206,
+        "d1_finalize_bootstrap_migration_ledger",
+        terminal_args(&canonical_snapshot, false, Some(&terminal_plan)),
+    );
+    let replay_result = structured_content(&replay_result);
+    assert_eq!(replay_result["ok"], json!(true), "{replay_result}");
+    assert_eq!(
+        replay_result["status"],
+        json!("bootstrap_terminal_already_complete")
+    );
+    assert_eq!(replay_result["provider_calls"], json!(0));
+    assert_eq!(replay_result["provider_mutations"], json!(0));
+    assert_eq!(replay_result["local_namespace_mutations"], json!(0));
+
+    let requests = requests
+        .lock()
+        .expect("bootstrap recovery requests")
+        .clone();
+    assert_eq!(requests.len(), 41);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request["sql"]
+                .as_str()
+                .is_some_and(|sql| sql.starts_with("CREATE TABLE IF NOT EXISTS")))
+            .count(),
+        1,
+        "bootstrap recovery never retries the initializer"
+    );
+    assert!(requests.iter().all(|request| {
+        request["sql"]
+            .as_str()
+            .is_some_and(|sql| !sql.contains("INSERT INTO") && !sql.contains("ALTER TABLE"))
+    }));
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_bootstrap_terminal_custody_drift_never_claims_stale_retention() {
+    for (label, drift_after_request, expected_receipt, expected_local_mutations) in [
+        ("before-receipt", 12usize, false, 0usize),
+        ("before-retirement", 16usize, true, 1usize),
+    ] {
+        let (bootstrap_url, bootstrap_requests) = spawn_fake_bootstrap_api(9, false, true, true);
+        let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+            "cloudflare-mcp-bootstrap-terminal-drift-{label}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&lease_root);
+        fs::create_dir_all(&lease_root).expect("create bootstrap drift lease root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+                .expect("make bootstrap drift lease root private");
+        }
+        let bootstrap_env = vec![
+            ("CLOUDFLARE_MCP_API_BASE_URL", bootstrap_url),
+            (
+                "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+                lease_root.to_string_lossy().to_string(),
+            ),
+        ];
+        let mut bootstrap = McpStdioProcess::start_with_env(bootstrap_env);
+        let dry = bootstrap.call_tool(
+            220,
+            "d1_bootstrap_migration_ledger",
+            json!({"database_id": "db-1", "dry_run": true}),
+        );
+        let bootstrap_plan = structured_content(&dry)["plan_sha256"]
+            .as_str()
+            .expect("bootstrap drift plan")
+            .to_string();
+        let ambiguous = bootstrap.call_tool(
+            221,
+            "d1_bootstrap_migration_ledger",
+            json!({
+                "database_id": "db-1",
+                "approved_plan_sha256": bootstrap_plan,
+            }),
+        );
+        let ambiguous = structured_content(&ambiguous);
+        let lease_nonce = ambiguous["lease"]["nonce"]
+            .as_str()
+            .expect("bootstrap drift nonce")
+            .to_string();
+        let lease_payload_sha256 = ambiguous["lease"]["payload_sha256"]
+            .as_str()
+            .expect("bootstrap drift payload")
+            .to_string();
+        assert_eq!(bootstrap_requests.lock().expect("request log").len(), 9);
+        bootstrap.terminate();
+
+        let (proof_url, proof_requests) = spawn_fake_initialized_bootstrap_recovery_api(16, None);
+        let proof_env = vec![
+            ("CLOUDFLARE_MCP_API_BASE_URL", proof_url),
+            (
+                "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+                lease_root.to_string_lossy().to_string(),
+            ),
+        ];
+        let mut proof_process = McpStdioProcess::start_with_env(proof_env);
+        let reconcile = proof_process.call_tool(
+            222,
+            "d1_reconcile_bootstrap_migration_ledger",
+            json!({
+                "database_id": "db-1",
+                "approved_bootstrap_plan_sha256": bootstrap_plan,
+                "lease_nonce": lease_nonce,
+                "lease_payload_sha256": lease_payload_sha256,
+            }),
+        );
+        let reconcile = structured_content(&reconcile);
+        assert_eq!(reconcile["ok"], json!(true), "{label}: {reconcile}");
+        let reconciliation_plan = reconcile["reconciliation_plan_sha256"]
+            .as_str()
+            .expect("bootstrap drift reconciliation plan")
+            .to_string();
+        let initializer_authority = reconcile["initializer_authority_sha256"]
+            .as_str()
+            .expect("bootstrap drift initializer authority")
+            .to_string();
+        let query_authority = reconcile["query_authority_sha256"]
+            .as_str()
+            .expect("bootstrap drift query authority")
+            .to_string();
+        let canonical_snapshot = reconcile["canonical_snapshot_sha256"]
+            .as_str()
+            .expect("bootstrap drift snapshot")
+            .to_string();
+        let terminal_request = "7".repeat(64);
+        let terminal_attempt = "8".repeat(64);
+        let terminal_arguments = |dry_run: bool, approved: Option<&str>| {
+            let mut args = json!({
+                "database_id": "db-1",
+                "approved_bootstrap_plan_sha256": bootstrap_plan,
+                "lease_nonce": lease_nonce,
+                "lease_payload_sha256": lease_payload_sha256,
+                "expected_reconciliation_plan_sha256": reconciliation_plan,
+                "expected_initializer_authority_sha256": initializer_authority,
+                "expected_query_authority_sha256": query_authority,
+                "expected_canonical_snapshot_sha256": canonical_snapshot,
+                "terminal_request_sha256": terminal_request,
+                "terminal_attempt_sha256": terminal_attempt,
+                "dry_run": dry_run,
+            });
+            if let Some(approved) = approved {
+                args["approved_terminal_plan_sha256"] = json!(approved);
+            }
+            args
+        };
+        let terminal_dry = proof_process.call_tool(
+            223,
+            "d1_finalize_bootstrap_migration_ledger",
+            terminal_arguments(true, None),
+        );
+        let terminal_dry = structured_content(&terminal_dry);
+        assert_eq!(terminal_dry["ok"], json!(true), "{label}: {terminal_dry}");
+        let terminal_plan = terminal_dry["terminal_plan_sha256"]
+            .as_str()
+            .expect("bootstrap drift terminal plan")
+            .to_string();
+        assert_eq!(proof_requests.lock().expect("proof requests").len(), 16);
+        proof_process.terminate();
+
+        let active = assert_private_regular_active_lease(&lease_root);
+        let (drift_url, drift_requests) = spawn_fake_initialized_bootstrap_recovery_api(
+            drift_after_request,
+            Some((
+                drift_after_request,
+                BootstrapRecoveryFixtureFault::CustodyDrift(active.clone()),
+            )),
+        );
+        let mut terminal = McpStdioProcess::start_with_env(vec![
+            ("CLOUDFLARE_MCP_API_BASE_URL", drift_url),
+            (
+                "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+                lease_root.to_string_lossy().to_string(),
+            ),
+        ]);
+        let result = terminal.call_tool(
+            224,
+            "d1_finalize_bootstrap_migration_ledger",
+            terminal_arguments(false, Some(&terminal_plan)),
+        );
+        let content = structured_content(&result);
+        assert_eq!(content["ok"], json!(false), "{label}: {content}");
+        assert_eq!(
+            content["status"],
+            json!("reconciliation_required"),
+            "{label}: {content}"
+        );
+        assert_eq!(
+            content["custody_status"],
+            json!("retained_evidence_unverified"),
+            "{label}: {content}"
+        );
+        assert_eq!(content["lease_retained"], Value::Null, "{label}: {content}");
+        assert_eq!(content["lease_decision"], Value::Null, "{label}: {content}");
+        assert_eq!(
+            content["provider_calls"],
+            json!(drift_after_request),
+            "{label}: {content}"
+        );
+        assert_eq!(content["provider_mutations"], json!(0), "{label}");
+        assert_eq!(
+            content["local_namespace_mutations"],
+            json!(expected_local_mutations),
+            "{label}: {content}"
+        );
+        assert_eq!(
+            content["receipt_persisted"],
+            json!(expected_receipt),
+            "{label}: {content}"
+        );
+        assert_eq!(
+            content["response_evidence"]
+                .as_array()
+                .expect("bootstrap drift response evidence")
+                .len(),
+            drift_after_request,
+            "{label}: every attempted read retains exact response-byte evidence"
+        );
+        let observed = drift_requests.lock().expect("drift requests").clone();
+        assert_eq!(observed.len(), drift_after_request, "{label}");
+        assert!(observed.iter().all(|request| {
+            request["sql"].as_str().is_some_and(|sql| {
+                is_bootstrap_inventory_sql(sql)
+                    || sql == "SELECT * FROM \"d1_migrations\" ORDER BY id"
+            })
+        }));
+        assert!(
+            active.with_extension("custody-drifted").is_file(),
+            "{label}"
+        );
+        let receipt = manifest_target_path(&lease_root).join(format!(
+            "terminal-reconciliation.{lease_nonce}.receipt.json"
+        ));
+        assert_eq!(receipt.is_file(), expected_receipt, "{label}");
+        terminal.terminate();
+        let _ = fs::remove_dir_all(lease_root);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn d1_bootstrap_retirement_failure_preserves_persisted_receipt_accounting() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (bootstrap_url, bootstrap_requests) = spawn_fake_bootstrap_api(9, false, true, true);
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-bootstrap-retirement-failure-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create bootstrap retirement-failure lease root");
+    fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+        .expect("make bootstrap retirement-failure lease root private");
+    let mut bootstrap = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", bootstrap_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let dry = bootstrap.call_tool(
+        240,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "dry_run": true}),
+    );
+    let bootstrap_plan = structured_content(&dry)["plan_sha256"]
+        .as_str()
+        .expect("bootstrap retirement-failure plan")
+        .to_string();
+    let ambiguous = bootstrap.call_tool(
+        241,
+        "d1_bootstrap_migration_ledger",
+        json!({
+            "database_id": "db-1",
+            "approved_plan_sha256": bootstrap_plan,
+        }),
+    );
+    let ambiguous = structured_content(&ambiguous);
+    let lease_nonce = ambiguous["lease"]["nonce"]
+        .as_str()
+        .expect("bootstrap retirement-failure nonce")
+        .to_string();
+    let lease_payload_sha256 = ambiguous["lease"]["payload_sha256"]
+        .as_str()
+        .expect("bootstrap retirement-failure payload")
+        .to_string();
+    assert_eq!(bootstrap_requests.lock().expect("request log").len(), 9);
+    bootstrap.terminate();
+
+    let (proof_url, proof_requests) = spawn_fake_initialized_bootstrap_recovery_api(16, None);
+    let mut proof_process = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", proof_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let reconcile = proof_process.call_tool(
+        242,
+        "d1_reconcile_bootstrap_migration_ledger",
+        json!({
+            "database_id": "db-1",
+            "approved_bootstrap_plan_sha256": bootstrap_plan,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+        }),
+    );
+    let reconcile = structured_content(&reconcile);
+    assert_eq!(reconcile["ok"], json!(true), "{reconcile}");
+    let reconciliation_plan = reconcile["reconciliation_plan_sha256"]
+        .as_str()
+        .expect("bootstrap retirement-failure reconciliation plan")
+        .to_string();
+    let initializer_authority = reconcile["initializer_authority_sha256"]
+        .as_str()
+        .expect("bootstrap retirement-failure initializer authority")
+        .to_string();
+    let query_authority = reconcile["query_authority_sha256"]
+        .as_str()
+        .expect("bootstrap retirement-failure query authority")
+        .to_string();
+    let canonical_snapshot = reconcile["canonical_snapshot_sha256"]
+        .as_str()
+        .expect("bootstrap retirement-failure snapshot")
+        .to_string();
+    let terminal_request = "7".repeat(64);
+    let terminal_attempt = "8".repeat(64);
+    let terminal_arguments = |dry_run: bool, approved: Option<&str>| {
+        let mut args = json!({
+            "database_id": "db-1",
+            "approved_bootstrap_plan_sha256": bootstrap_plan,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "expected_reconciliation_plan_sha256": reconciliation_plan,
+            "expected_initializer_authority_sha256": initializer_authority,
+            "expected_query_authority_sha256": query_authority,
+            "expected_canonical_snapshot_sha256": canonical_snapshot,
+            "terminal_request_sha256": terminal_request,
+            "terminal_attempt_sha256": terminal_attempt,
+            "dry_run": dry_run,
+        });
+        if let Some(approved) = approved {
+            args["approved_terminal_plan_sha256"] = json!(approved);
+        }
+        args
+    };
+    let terminal_dry = proof_process.call_tool(
+        243,
+        "d1_finalize_bootstrap_migration_ledger",
+        terminal_arguments(true, None),
+    );
+    let terminal_plan = structured_content(&terminal_dry)["terminal_plan_sha256"]
+        .as_str()
+        .expect("bootstrap retirement-failure terminal plan")
+        .to_string();
+    assert_eq!(proof_requests.lock().expect("proof requests").len(), 16);
+    proof_process.terminate();
+
+    let target = manifest_target_path(&lease_root);
+    let (failure_url, failure_requests) = spawn_fake_initialized_bootstrap_recovery_api(
+        16,
+        Some((
+            16,
+            BootstrapRecoveryFixtureFault::TargetReadOnly(target.clone()),
+        )),
+    );
+    let mut terminal = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", failure_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let result = terminal.call_tool(
+        244,
+        "d1_finalize_bootstrap_migration_ledger",
+        terminal_arguments(false, Some(&terminal_plan)),
+    );
+    let content = structured_content(&result);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["status"], json!("reconciliation_required"));
+    assert_eq!(content["provider_calls"], json!(16), "{content}");
+    assert_eq!(content["provider_mutations"], json!(0), "{content}");
+    assert_eq!(content["receipt_persisted"], json!(true), "{content}");
+    assert_eq!(content["local_namespace_mutations"], json!(1), "{content}");
+    assert_eq!(failure_requests.lock().expect("failure requests").len(), 16);
+    assert!(target.join("active.lease.json").is_file());
+    assert!(!target.join("retiring.lease.json").exists());
+    assert!(
+        target
+            .join(format!(
+                "terminal-reconciliation.{lease_nonce}.receipt.json"
+            ))
+            .is_file()
+    );
+    terminal.terminate();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
+        .expect("restore bootstrap target permissions for cleanup");
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_bootstrap_reconciliation_reports_provider_conflict_and_keeps_custody() {
+    let (bootstrap_url, bootstrap_requests) = spawn_fake_bootstrap_api(9, false, true, true);
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-bootstrap-conflict-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create bootstrap conflict lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make bootstrap conflict lease root private");
+    }
+    let mut bootstrap = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", bootstrap_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let dry = bootstrap.call_tool(
+        210,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "dry_run": true}),
+    );
+    let plan = structured_content(&dry)["plan_sha256"]
+        .as_str()
+        .expect("bootstrap conflict plan")
+        .to_string();
+    let ambiguous = bootstrap.call_tool(
+        211,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "approved_plan_sha256": plan}),
+    );
+    let ambiguous = structured_content(&ambiguous);
+    let nonce = ambiguous["lease"]["nonce"]
+        .as_str()
+        .expect("bootstrap conflict nonce")
+        .to_string();
+    let payload = ambiguous["lease"]["payload_sha256"]
+        .as_str()
+        .expect("bootstrap conflict payload")
+        .to_string();
+    assert_eq!(bootstrap_requests.lock().expect("request log").len(), 9);
+
+    let (conflict_url, conflict_requests) = spawn_fake_bootstrap_api(2, true, false, true);
+    let mut reconcile = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", conflict_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let result = reconcile.call_tool(
+        212,
+        "d1_reconcile_bootstrap_migration_ledger",
+        json!({
+            "database_id": "db-1",
+            "approved_bootstrap_plan_sha256": plan,
+            "lease_nonce": nonce,
+            "lease_payload_sha256": payload,
+        }),
+    );
+    let content = structured_content(&result);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["capability_state"], json!("conflicting"));
+    assert_eq!(content["outcome"], json!("conflict"));
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.bootstrap_recovery_schema_conflict")
+    );
+    assert_eq!(content["provider_calls"], json!(2));
+    assert_eq!(content["provider_mutations"], json!(0));
+    assert_eq!(content["local_namespace_mutations"], json!(0));
+    assert_eq!(content["lease_retained"], json!(true));
+    assert_private_regular_active_lease(&lease_root);
+    assert_eq!(
+        conflict_requests.lock().expect("conflict requests").len(),
+        2
+    );
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_bootstrap_reconciliation_provider_failure_is_one_attempt_and_nonterminal() {
+    let (bootstrap_url, bootstrap_requests) = spawn_fake_bootstrap_api(9, false, true, true);
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-bootstrap-provider-failure-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create bootstrap provider-failure lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make bootstrap provider-failure lease root private");
+    }
+    let mut bootstrap = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", bootstrap_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let dry = bootstrap.call_tool(
+        230,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "dry_run": true}),
+    );
+    let plan = structured_content(&dry)["plan_sha256"]
+        .as_str()
+        .expect("bootstrap provider-failure plan")
+        .to_string();
+    let ambiguous = bootstrap.call_tool(
+        231,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "approved_plan_sha256": plan}),
+    );
+    let ambiguous = structured_content(&ambiguous);
+    let nonce = ambiguous["lease"]["nonce"]
+        .as_str()
+        .expect("bootstrap provider-failure nonce")
+        .to_string();
+    let payload = ambiguous["lease"]["payload_sha256"]
+        .as_str()
+        .expect("bootstrap provider-failure payload")
+        .to_string();
+    assert_eq!(bootstrap_requests.lock().expect("request log").len(), 9);
+    bootstrap.terminate();
+
+    let (failure_url, failure_requests) = spawn_fake_bootstrap_recovery_http_failure_api();
+    let mut reconcile = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", failure_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let result = reconcile.call_tool(
+        232,
+        "d1_reconcile_bootstrap_migration_ledger",
+        json!({
+            "database_id": "db-1",
+            "approved_bootstrap_plan_sha256": plan,
+            "lease_nonce": nonce,
+            "lease_payload_sha256": payload,
+        }),
+    );
+    let content = structured_content(&result);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["capability_state"], json!("unknown"), "{content}");
+    assert_eq!(content["outcome"], json!("unknown"), "{content}");
+    assert_eq!(content["provider_calls"], json!(1), "{content}");
+    assert_eq!(content["provider_mutations"], json!(0), "{content}");
+    assert_eq!(content["local_namespace_mutations"], json!(0), "{content}");
+    assert_eq!(content["lease_retained"], json!(true), "{content}");
+    assert_eq!(
+        content["error"]["cause"]["retryable"],
+        json!(false),
+        "{content}"
+    );
+    assert_eq!(
+        content["error"]["cause"]["operator_guidance"],
+        json!("reconciliation_only"),
+        "{content}"
+    );
+    assert_eq!(
+        content["provider_read_lifecycle"][0]["lifecycle"]["http_status"],
+        json!(503),
+        "{content}"
+    );
+    assert_eq!(
+        content["provider_read_lifecycle"][0]["lifecycle"]["body_stage"],
+        json!("completely_read"),
+        "{content}"
+    );
+    assert!(
+        content["response_evidence"][0]["response"]["body_sha256"]
+            .as_str()
+            .is_some_and(|value| value.len() == 64),
+        "{content}"
+    );
+    assert_eq!(failure_requests.lock().expect("failure requests").len(), 1);
+    assert_private_regular_active_lease(&lease_root);
+    reconcile.terminate();
+
+    let mut pre_dispatch = McpStdioProcess::start_with_env(vec![
+        (
+            "CLOUDFLARE_MCP_API_BASE_URL",
+            "http://127.0.0.1:9".to_string(),
+        ),
+        ("CLOUDFLARE_API_TOKEN", String::new()),
+        ("CLOUDFLARE_MCP_API_TOKEN", String::new()),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let result = pre_dispatch.call_tool(
+        233,
+        "d1_reconcile_bootstrap_migration_ledger",
+        json!({
+            "database_id": "db-1",
+            "approved_bootstrap_plan_sha256": plan,
+            "lease_nonce": nonce,
+            "lease_payload_sha256": payload,
+        }),
+    );
+    let content = structured_content(&result);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["provider_calls"], json!(0), "{content}");
+    assert_eq!(
+        content["provider_read_lifecycle"][0]["lifecycle"]["dispatch_stage"],
+        json!("pre_dispatch"),
+        "{content}"
+    );
+    assert_eq!(content["response_evidence"], json!([]), "{content}");
+    assert_eq!(content["lease_retained"], json!(true), "{content}");
+    assert_private_regular_active_lease(&lease_root);
+    pre_dispatch.terminate();
+
+    let active = assert_private_regular_active_lease(&lease_root);
+    let retiring = active.with_file_name("retiring.lease.json");
+    fs::rename(&active, &retiring).expect("move bootstrap fixture into retiring custody");
+    let (retiring_url, retiring_requests) = spawn_fake_initialized_bootstrap_recovery_api(8, None);
+    let mut retiring_reconcile = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", retiring_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let result = retiring_reconcile.call_tool(
+        234,
+        "d1_reconcile_bootstrap_migration_ledger",
+        json!({
+            "database_id": "db-1",
+            "approved_bootstrap_plan_sha256": plan,
+            "lease_nonce": nonce,
+            "lease_payload_sha256": payload,
+        }),
+    );
+    let content = structured_content(&result);
+    assert_eq!(content["ok"], json!(true), "{content}");
+    assert_eq!(
+        content["custody_status"],
+        json!("retiring_evidence_verified"),
+        "{content}"
+    );
+    assert_eq!(content["lease_retained"], Value::Null, "{content}");
+    assert_eq!(content["lease_decision"], Value::Null, "{content}");
+    assert_eq!(
+        retiring_requests.lock().expect("retiring requests").len(),
+        8
+    );
+    retiring_reconcile.terminate();
+    let _ = fs::remove_dir_all(lease_root);
 }
 
 #[test]
@@ -5948,6 +8383,33 @@ fn d1_apply_migration_manifest_outer_write_errors_remain_unknown_and_retain_leas
         assert_eq!(
             content["error"]["code"],
             json!("d1.migration_apply_outcome_unknown"),
+            "{label}"
+        );
+        assert_eq!(
+            content["error"]["cause"]["provider_write_lifecycle"],
+            json!({
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 200,
+            }),
+            "{label}"
+        );
+        assert!(
+            content["error"]["cause"]["response_body_sha256"]
+                .as_str()
+                .is_some_and(|digest| digest.len() == 64),
+            "{label}: {content}"
+        );
+        assert!(
+            content["error"]["cause"]["response_body_size_bytes"]
+                .as_u64()
+                .is_some_and(|size| size > 0),
+            "{label}: {content}"
+        );
+        assert_eq!(
+            content["error"]["cause"]["retryable"],
+            json!(false),
             "{label}"
         );
         let observed = requests.lock().expect("requests lock").clone();
@@ -6597,6 +9059,124 @@ fn d1_apply_migration_manifest_response_loss_stops_without_retry_and_next_proces
     let _ = fs::remove_dir_all(lease_root);
 }
 
+#[test]
+fn d1_apply_migration_manifest_oversized_write_response_retains_custody_without_replay() {
+    let (base_url, requests) = spawn_fake_manifest_oversized_write_api();
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-oversized-manifest-write-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create oversized-write lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make oversized-write lease root private");
+    }
+    let env = vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ];
+    let mut mcp = McpStdioProcess::start_with_env(env.clone());
+    let first_sql = "CREATE TABLE submissions(id TEXT);";
+    let second_sql = "ALTER TABLE submissions ADD COLUMN status TEXT;";
+    let manifest = json!([
+        {"name": "0001_initial.sql", "size_bytes": first_sql.len(), "sql_sha256": sha256_hex(first_sql), "sql": first_sql},
+        {"name": "0002_second.sql", "size_bytes": second_sql.len(), "sql_sha256": sha256_hex(second_sql), "sql": second_sql}
+    ]);
+    let dry = mcp.call_tool(
+        74,
+        "d1_apply_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "dry_run": true,
+            "manifest": manifest.clone(),
+        }),
+    );
+    let plan = structured_content(&dry)["plan_sha256"]
+        .as_str()
+        .expect("oversized-write plan")
+        .to_string();
+    let live = mcp.call_tool(
+        75,
+        "d1_apply_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest.clone(),
+            "approved_plan_sha256": plan.clone(),
+        }),
+    );
+    let content = structured_content(&live);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["status"], json!("reconciliation_required"));
+    assert_eq!(content["outcome"], json!("unknown"));
+    assert_eq!(content["lease_retained"], json!(true));
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.migration_apply_outcome_unknown")
+    );
+    assert_eq!(content["error"]["cause"]["kind"], json!("transport"));
+    assert_eq!(
+        content["error"]["cause"]["code"],
+        json!("cloudflare.d1.migration_manifest_response_too_large")
+    );
+    assert_eq!(content["error"]["cause"]["status"], json!(200));
+    assert_eq!(content["error"]["cause"]["retryable"], json!(false));
+    assert_eq!(
+        content["error"]["cause"]["operator_guidance"],
+        json!("reconciliation_only")
+    );
+    assert_eq!(
+        content["error"]["cause"]["provider_write_lifecycle"],
+        json!({
+            "dispatch_stage": "attempted",
+            "response_stage": "received",
+            "body_stage": "not_read",
+            "http_status": 200,
+        })
+    );
+    assert_eq!(
+        content["error"]["cause"]["response_body_sha256"],
+        Value::Null
+    );
+    assert_eq!(
+        content["error"]["cause"]["response_body_size_bytes"],
+        json!(16 * 1024 * 1024 + 1)
+    );
+    let observed = requests
+        .lock()
+        .expect("oversized-write request log")
+        .clone();
+    assert_eq!(observed.len(), 10, "one write plus bounded reconciliation");
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|request| request["sql"]
+                .as_str()
+                .is_some_and(|sql| sql.contains("INSERT INTO \"d1_migrations\"")))
+            .count(),
+        1,
+        "oversized response must not replay the non-idempotent write"
+    );
+    assert_private_regular_active_lease(&lease_root);
+    mcp.terminate();
+    assert_fresh_process_blocked_without_provider_request(
+        env,
+        &manifest,
+        &plan,
+        &requests,
+        10,
+        "oversized migration-write response",
+    );
+    let _ = fs::remove_dir_all(lease_root);
+}
+
 #[cfg(unix)]
 #[test]
 fn d1_apply_migration_manifest_ambiguous_apply_never_claims_retained_custody_after_drift() {
@@ -6866,6 +9446,116 @@ fn d1_reconcile_migration_manifest_stdio_wraps_semantic_validation_in_fixed_orde
         ),
     );
     missing_account_mcp.terminate();
+}
+
+#[test]
+fn generic_manifest_tools_reject_the_reserved_bootstrap_family_before_any_effect() {
+    let provider = TcpListener::bind("127.0.0.1:0").expect("bind no-call provider witness");
+    provider
+        .set_nonblocking(true)
+        .expect("make provider witness nonblocking");
+    let provider_url = format!(
+        "http://{}",
+        provider.local_addr().expect("provider witness address")
+    );
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-reserved-bootstrap-family-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create private lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make lease root private");
+    }
+
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", provider_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let (manifest, state_expectations) = one_table_reconciliation_case();
+    let reserved_family = "migration-ledger-bootstrap-v1";
+    let apply = mcp.call_tool(
+        737,
+        "d1_apply_migration_manifest",
+        json!({
+            "account_id": "acct-1",
+            "database_id": "db-1",
+            "migration_family": reserved_family,
+            "manifest": manifest.clone(),
+            "approved_plan_sha256": "a".repeat(64),
+            "dry_run": false,
+        }),
+    );
+    let reconcile = mcp.call_tool(
+        738,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "account_id": "acct-1",
+            "database_id": "db-1",
+            "migration_family": reserved_family,
+            "manifest": manifest.clone(),
+            "approved_plan_sha256": "a".repeat(64),
+            "lease_nonce": "b".repeat(64),
+            "lease_payload_sha256": "c".repeat(64),
+            "effect_assertion_id": "schema_create_only_v1",
+            "state_expectations": state_expectations.clone(),
+        }),
+    );
+    let mut terminal_args = terminal_request_args(
+        &manifest,
+        &state_expectations,
+        &"a".repeat(64),
+        &"b".repeat(64),
+        &"c".repeat(64),
+    );
+    terminal_args["account_id"] = json!("acct-1");
+    terminal_args["migration_family"] = json!(reserved_family);
+    let finalize = mcp.call_tool(739, "d1_finalize_migration_reconciliation", terminal_args);
+
+    for (operation, response) in [
+        ("d1_apply_migration_manifest", apply),
+        ("d1_reconcile_migration_manifest", reconcile),
+        ("d1_finalize_migration_reconciliation", finalize),
+    ] {
+        let content = structured_content(&response);
+        assert_eq!(content["ok"], json!(false), "{operation}: {content}");
+        assert_eq!(content["operation"], json!(operation), "{content}");
+        assert_eq!(
+            content["error"]["code"],
+            json!("d1.reserved_migration_family"),
+            "{operation}: {content}"
+        );
+        assert_eq!(content["provider_calls"], json!(0), "{content}");
+        assert_eq!(content["provider_mutations"], json!(0), "{content}");
+        assert_eq!(content["local_namespace_mutations"], json!(0), "{content}");
+        assert_eq!(content["lease_retained"], Value::Null, "{content}");
+        assert_eq!(content["custody_status"], "not_inspected", "{content}");
+    }
+
+    assert!(
+        matches!(provider.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "reserved-family rejection must not connect to the provider"
+    );
+    assert!(
+        !manifest_target_path(&lease_root).exists(),
+        "reserved-family rejection must not create or retire target custody"
+    );
+    assert_eq!(
+        fs::read_dir(&lease_root)
+            .expect("read empty lease root")
+            .count(),
+        0,
+        "reserved-family rejection leaves no local custody or receipt artifact"
+    );
+
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
 }
 
 #[test]
@@ -12187,6 +14877,17 @@ fn d1_apply_migration_manifest_ambiguous_inner_result_shapes_retain_lease_withou
     .into_iter()
     .enumerate()
     {
+        let expected_write_response = serde_json::to_vec(&json!({
+            "success": true,
+            "errors": [],
+            "messages": [],
+            "result": write_result.clone(),
+        }))
+        .expect("serialize expected ambiguous write response");
+        let expected_write_response_sha256 = sha256_hex(&String::from_utf8(
+            expected_write_response.clone(),
+        )
+        .expect("expected ambiguous write response is UTF-8"));
         let (base_url, requests) = spawn_fake_manifest_ambiguous_result_api(write_result);
         let lease_root = std::path::PathBuf::from("/tmp").join(format!(
             "cloudflare-mcp-ambiguous-manifest-result-{index}-{}",
@@ -12244,6 +14945,31 @@ fn d1_apply_migration_manifest_ambiguous_inner_result_shapes_retain_lease_withou
         assert_eq!(
             content["error"]["cause"]["classification"],
             json!(classification),
+            "{label}"
+        );
+        assert_eq!(
+            content["error"]["cause"]["provider_write_lifecycle"],
+            json!({
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 200,
+            }),
+            "{label}"
+        );
+        assert_eq!(
+            content["error"]["cause"]["response_body_sha256"],
+            json!(expected_write_response_sha256),
+            "{label}"
+        );
+        assert_eq!(
+            content["error"]["cause"]["response_body_size_bytes"],
+            json!(expected_write_response.len()),
+            "{label}"
+        );
+        assert_eq!(
+            content["error"]["cause"]["retryable"],
+            json!(false),
             "{label}"
         );
         assert!(
@@ -13682,10 +16408,9 @@ fn api_mutate_keeps_invalid_json_strings_as_strings_in_dry_run_plan() {
         2,
         "api_mutate",
         json!({
-            "operation_id": "d1-query-database",
+            "operation_id": "d1-create-database",
             "path_params": {
-                "account_id": "acct-1",
-                "database_id": "db-1"
+                "account_id": "acct-1"
             },
             "body": "{\"sql\":",
             "dry_run": true
@@ -13769,6 +16494,152 @@ fn api_mutate_denies_generic_worker_script_upload_and_names_curated_path() {
 }
 
 #[test]
+fn api_mutate_denies_existing_target_d1_schema_mutations_before_request_construction() {
+    let provider = TcpListener::bind("127.0.0.1:0").expect("bind no-call D1 provider witness");
+    provider
+        .set_nonblocking(true)
+        .expect("make D1 provider witness nonblocking");
+    let provider_url = format!(
+        "http://{}",
+        provider.local_addr().expect("D1 provider witness address")
+    );
+    let mut mcp =
+        McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", provider_url)]);
+
+    for (index, operation_id) in [
+        "d1-query-database",
+        "d1-raw-database-query",
+        "d1-import-database",
+        "d1-time-travel-restore",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mutation_payload_marker =
+            format!("CREATE TABLE forbidden_{index}(id INTEGER PRIMARY KEY)");
+        let response = mcp.call_tool(
+            20 + index as u64,
+            "api_mutate",
+            json!({
+                "operation_id": operation_id,
+                "path_params": {
+                    "account_id": "acct-1",
+                    "database_id": "db-1"
+                },
+                "body": {"sql": mutation_payload_marker},
+                "dry_run": false,
+                "confirmation_token": "untrusted-raw-d1-confirmation",
+                "reason": "negative policy proof"
+            }),
+        );
+        let content = structured_content(&response);
+        assert_eq!(content["ok"], json!(false), "{operation_id}: {content}");
+        assert_eq!(
+            content["error"]["code"],
+            json!("api_catalog.denied_by_default"),
+            "{operation_id}: {content}"
+        );
+        assert_eq!(
+            content["api_operation"]["operation_id"],
+            json!(operation_id)
+        );
+        assert_eq!(content["api_operation"]["risk"], json!("denied_by_default"));
+        let expected_preferred_tool = match operation_id {
+            "d1-query-database" | "d1-raw-database-query" => Some("d1_query_read_only"),
+            "d1-import-database" | "d1-time-travel-restore" => None,
+            _ => unreachable!(),
+        };
+        assert_eq!(content["preferred_tool"], json!(expected_preferred_tool));
+        if expected_preferred_tool.is_none() {
+            assert_eq!(
+                content["error"]["hint"],
+                json!(
+                    "Use a governed curated lifecycle for this operation; generic api_mutate remains denied."
+                )
+            );
+        }
+        assert_eq!(content["request_constructed"], json!(false));
+        assert_eq!(content["raw_body_dispatched"], json!(false));
+        assert_eq!(content["provider_calls"], json!(0));
+        assert_eq!(content["provider_mutations"], json!(0));
+        assert!(content.get("request_plan").is_none(), "{content}");
+        assert!(
+            !content.to_string().contains(&mutation_payload_marker),
+            "the denied mutation body must not be reflected or dispatched: {content}"
+        );
+    }
+
+    let discovery = mcp.call_tool(
+        24,
+        "find_tools",
+        json!({"group": "d1", "limit": 100, "include_schema": true}),
+    );
+    let discovery = structured_content(&discovery);
+    let curated_names = discovery["results"]
+        .as_array()
+        .expect("curated D1 discovery results")
+        .iter()
+        .filter_map(|result| result["name"].as_str())
+        .collect::<Vec<_>>();
+    for expected in [
+        "d1_query_read_only",
+        "d1_execute_write",
+        "d1_bootstrap_migration_ledger",
+        "d1_apply_migration_manifest",
+        "d1_reconcile_migration_manifest",
+        "d1_finalize_migration_reconciliation",
+        "d1_reconcile_bootstrap_migration_ledger",
+        "d1_finalize_bootstrap_migration_ledger",
+        "d1_abort_bootstrap_migration_ledger",
+    ] {
+        assert!(
+            curated_names.contains(&expected),
+            "curated D1 tool {expected} remains discoverable: {discovery}"
+        );
+        assert!(
+            discovery["schemas"][expected].is_object(),
+            "curated D1 tool {expected} remains loadable: {discovery}"
+        );
+    }
+
+    let curated_read = mcp.call_tool(
+        25,
+        "d1_query_read_only",
+        json!({
+            "account_id": "acct-1",
+            "database_id": "db-1",
+            "sql": "CREATE TABLE curated_read_guard(id INTEGER PRIMARY KEY)"
+        }),
+    );
+    assert_eq!(
+        structured_content(&curated_read)["error"]["code"],
+        json!("d1.sql_policy_denied"),
+        "curated read tool remains callable and guarded"
+    );
+    let curated_write = mcp.call_tool(
+        26,
+        "d1_execute_write",
+        json!({
+            "account_id": "acct-1",
+            "database_id": "db-1",
+            "sql": "CREATE TABLE curated_write_guard(id INTEGER PRIMARY KEY)",
+            "dry_run": true
+        }),
+    );
+    assert_eq!(
+        structured_content(&curated_write)["error"]["code"],
+        json!("d1.write_policy_denied"),
+        "curated write tool remains callable and guarded"
+    );
+
+    assert!(
+        matches!(provider.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "denied existing-target D1 operations and curated policy checks make zero provider connections"
+    );
+    mcp.terminate();
+}
+
+#[test]
 fn api_mutate_preserves_non_string_body_shapes_in_dry_run_plan() {
     let mut mcp = McpStdioProcess::start();
     let shapes = BTreeMap::from([
@@ -13782,10 +16653,9 @@ fn api_mutate_preserves_non_string_body_shapes_in_dry_run_plan() {
             10 + index as u64,
             "api_mutate",
             json!({
-                "operation_id": "d1-query-database",
+                "operation_id": "d1-create-database",
                 "path_params": {
-                    "account_id": "acct-1",
-                    "database_id": "db-1"
+                    "account_id": "acct-1"
                 },
                 "body": body,
                 "dry_run": true

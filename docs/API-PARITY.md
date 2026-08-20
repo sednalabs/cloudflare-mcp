@@ -20,7 +20,10 @@ preferred path for safety-sensitive operations.
 - Product workflows with curated safety policy remain specialized tools. D1
   workflows use `d1_list_databases`, `d1_get_database`, `d1_inspect_schema`,
   `d1_query_read_only`, `d1_validate_query`, `d1_execute_write`,
-  `d1_apply_migrations`, `d1_apply_migration_manifest`,
+  `d1_apply_migrations`, `d1_bootstrap_migration_ledger`,
+  `d1_reconcile_bootstrap_migration_ledger`,
+  `d1_finalize_bootstrap_migration_ledger`,
+  `d1_apply_migration_manifest`,
   `d1_reconcile_migration_manifest`, `d1_finalize_migration_reconciliation`,
   `d1_rename_database`, and `d1_delete_database`;
   Workers Analytics Engine workflows use
@@ -87,6 +90,16 @@ The generic `worker-script-put-content` operation is also denied: use the
 curated `workers_upload_script` flow, which binds its upload digest to dry-run
 confirmation and post-upload readback instead of treating executable code
 upload as a raw REST body.
+The generic `d1-query-database`, `d1-raw-database-query`,
+`d1-import-database`, and `d1-time-travel-restore` operations are likewise
+denied before request construction or provider access. Query and raw bodies can
+mutate schema outside the curated policy boundary; import and restore can
+replace existing-target schema and data wholesale. Use the curated D1 read,
+row-write, bootstrap, and migration-manifest tools where they cover the task.
+Import and time-travel restore require a separately governed curated lifecycle;
+they are not redirected to a nonexistent preferred tool. Create, get, list,
+export, and metadata updates retain their existing catalog policy, while delete
+retains its separate curated high-risk lifecycle.
 
 ## Catalog refresh
 

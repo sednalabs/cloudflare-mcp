@@ -117,6 +117,7 @@ pub struct CloudflareClient {
     pub(crate) cfg: CloudflareApiConfig,
     pub(crate) http: reqwest::Client,
     reconciliation_http: reqwest::Client,
+    migration_write_http: reqwest::Client,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -177,6 +178,7 @@ type HmacSha256 = Hmac<Sha256>;
 const WORKER_VERSION_PAGE_SIZE: u32 = 100;
 const WORKER_VERSION_MAX_PAGES: u32 = 32;
 const WORKER_VERSION_MAX_ITEMS: usize = 1024;
+const D1_MIGRATION_RESPONSE_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct WorkerVersionInventory {
@@ -241,6 +243,31 @@ pub(crate) struct D1MigrationReconciliationBatchError {
     pub(crate) response_body_sha256: Option<String>,
     pub(crate) response_body_size_bytes: Option<usize>,
     pub(crate) lifecycle: D1MigrationReconciliationReadLifecycle,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct D1MigrationManifestWrite {
+    pub(crate) result: Value,
+    pub(crate) response_body_sha256: String,
+    pub(crate) response_body_size_bytes: usize,
+    pub(crate) lifecycle: D1MigrationManifestWriteLifecycle,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct D1MigrationManifestWriteError {
+    pub(crate) error: AdapterErrorPayload,
+    pub(crate) response_body_sha256: Option<String>,
+    pub(crate) response_body_size_bytes: Option<usize>,
+    pub(crate) lifecycle: D1MigrationManifestWriteLifecycle,
+}
+
+pub(crate) fn d1_migration_reconciliation_only_cause(error: &AdapterErrorPayload) -> Value {
+    json!({
+        "code": error.code,
+        "status": error.status,
+        "retryable": false,
+        "operator_guidance": "reconciliation_only",
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -314,6 +341,114 @@ impl D1MigrationReconciliationReadLifecycle {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct D1MigrationManifestWriteLifecycle {
+    pub(crate) dispatch_stage: &'static str,
+    pub(crate) response_stage: &'static str,
+    pub(crate) body_stage: &'static str,
+    pub(crate) http_status: Option<u16>,
+}
+
+impl D1MigrationManifestWriteLifecycle {
+    const fn pre_dispatch() -> Self {
+        Self {
+            dispatch_stage: "pre_dispatch",
+            response_stage: "not_received",
+            body_stage: "not_read",
+            http_status: None,
+        }
+    }
+
+    const fn attempted_without_response() -> Self {
+        Self {
+            dispatch_stage: "attempted",
+            response_stage: "not_received",
+            body_stage: "not_read",
+            http_status: None,
+        }
+    }
+
+    const fn response_received(http_status: u16) -> Self {
+        Self {
+            dispatch_stage: "attempted",
+            response_stage: "received",
+            body_stage: "not_read",
+            http_status: Some(http_status),
+        }
+    }
+
+    const fn body_partially_read(http_status: u16) -> Self {
+        Self {
+            dispatch_stage: "attempted",
+            response_stage: "received",
+            body_stage: "partially_read",
+            http_status: Some(http_status),
+        }
+    }
+
+    fn body_read_failed(http_status: u16, bytes_read: usize) -> Self {
+        if bytes_read == 0 {
+            Self::response_received(http_status)
+        } else {
+            Self::body_partially_read(http_status)
+        }
+    }
+
+    const fn body_completely_read(http_status: u16) -> Self {
+        Self {
+            dispatch_stage: "attempted",
+            response_stage: "received",
+            body_stage: "completely_read",
+            http_status: Some(http_status),
+        }
+    }
+
+    pub(crate) fn provider_calls(self) -> usize {
+        usize::from(self.dispatch_stage == "attempted")
+    }
+}
+
+pub(crate) fn d1_migration_manifest_write_reconciliation_cause(
+    failure: &D1MigrationManifestWriteError,
+) -> Value {
+    let mut cause = d1_migration_reconciliation_only_cause(&failure.error);
+    let cause_fields = cause
+        .as_object_mut()
+        .expect("reconciliation-only cause is always an object");
+    cause_fields.insert(
+        "provider_write_lifecycle".to_string(),
+        json!(failure.lifecycle),
+    );
+    cause_fields.insert(
+        "response_body_sha256".to_string(),
+        json!(failure.response_body_sha256),
+    );
+    cause_fields.insert(
+        "response_body_size_bytes".to_string(),
+        json!(failure.response_body_size_bytes),
+    );
+    cause
+}
+
+pub(crate) fn d1_migration_manifest_write_provider_result_cause(
+    write: &D1MigrationManifestWrite,
+    detail: &Value,
+) -> Value {
+    json!({
+        "kind": "provider_result",
+        "detail": {
+            "code": detail.get("code"),
+            "classification": detail.get("classification"),
+            "message": detail.get("message"),
+            "retryable": false,
+            "operator_guidance": "reconciliation_only",
+            "provider_write_lifecycle": write.lifecycle,
+            "response_body_sha256": write.response_body_sha256,
+            "response_body_size_bytes": write.response_body_size_bytes,
+        },
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum D1EnvelopePolicy {
     Generic,
@@ -381,10 +516,22 @@ impl CloudflareClient {
                     "Verify TLS/runtime dependencies and CLOUDFLARE_MCP_API_TIMEOUT_MS settings.",
                 )
             })?;
+        let migration_write_http = reqwest::Client::builder()
+            .timeout(cfg.request_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|err| {
+                AdapterError::new(
+                    "cloudflare.client_init_failed",
+                    format!("failed to create migration-write HTTP client: {err}"),
+                    "Verify TLS/runtime dependencies and CLOUDFLARE_MCP_API_TIMEOUT_MS settings.",
+                )
+            })?;
         Ok(Self {
             cfg,
             http,
             reconciliation_http,
+            migration_write_http,
         })
     }
 
@@ -683,8 +830,6 @@ impl CloudflareClient {
         database_id: &str,
         sql: &str,
     ) -> Result<D1MigrationReconciliationBatch, D1MigrationReconciliationBatchError> {
-        const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
-
         let account_id = require_non_empty("account_id", account_id).map_err(|error| {
             D1MigrationReconciliationBatchError {
                 error: error.payload(),
@@ -730,8 +875,12 @@ impl CloudflareClient {
             .send()
             .await
             .map_err(|error| {
-                let retryable = error.is_timeout() || error.is_connect() || error.is_request();
-                let code = if error.is_timeout() {
+                let pre_dispatch = error.is_builder();
+                let retryable = !pre_dispatch
+                    && (error.is_timeout() || error.is_connect() || error.is_request());
+                let code = if pre_dispatch {
+                    "cloudflare.request_build_failed"
+                } else if error.is_timeout() {
                     "cloudflare.timeout"
                 } else {
                     "cloudflare.transport_error"
@@ -748,15 +897,18 @@ impl CloudflareClient {
                     .payload(),
                     response_body_sha256: None,
                     response_body_size_bytes: None,
-                    lifecycle:
-                        D1MigrationReconciliationReadLifecycle::attempted_without_response(),
+                    lifecycle: if pre_dispatch {
+                        D1MigrationReconciliationReadLifecycle::pre_dispatch()
+                    } else {
+                        D1MigrationReconciliationReadLifecycle::attempted_without_response()
+                    },
                 }
             })?;
         let status = response.status();
         let status_code = status.as_u16();
         if response
             .content_length()
-            .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+            .is_some_and(|length| length > D1_MIGRATION_RESPONSE_MAX_BYTES as u64)
         {
             return Err(D1MigrationReconciliationBatchError {
                 error: AdapterError::new(
@@ -767,13 +919,15 @@ impl CloudflareClient {
                 .with_status(Some(status.as_u16()))
                 .payload(),
                 response_body_sha256: None,
-                response_body_size_bytes: response.content_length().map(|length| length as usize),
+                response_body_size_bytes: response
+                    .content_length()
+                    .map(|length| usize::try_from(length).unwrap_or(usize::MAX)),
                 lifecycle: D1MigrationReconciliationReadLifecycle::response_received(status_code),
             });
         }
         let initial_capacity = response
             .content_length()
-            .map(|length| cmp::min(length as usize, MAX_RESPONSE_BYTES))
+            .map(|length| cmp::min(length as usize, D1_MIGRATION_RESPONSE_MAX_BYTES))
             .unwrap_or(0);
         let mut bytes = Vec::with_capacity(initial_capacity);
         let mut hasher = Sha256::new();
@@ -795,7 +949,7 @@ impl CloudflareClient {
                 ),
             })?;
             let observed_size = bytes.len().saturating_add(chunk.len());
-            if observed_size > MAX_RESPONSE_BYTES {
+            if observed_size > D1_MIGRATION_RESPONSE_MAX_BYTES {
                 return Err(D1MigrationReconciliationBatchError {
                     error: AdapterError::new(
                         "cloudflare.d1.migration_reconciliation_response_too_large",
@@ -847,23 +1001,186 @@ impl CloudflareClient {
     /// Submit one manifest-owned migration statement. The non-idempotent
     /// transport policy and strict outer-envelope evidence are both required:
     /// callers must reconcile rather than retry an ambiguous result.
-    pub async fn execute_d1_migration_manifest_write(
+    pub(crate) async fn execute_d1_migration_manifest_write(
         &self,
         account_id: &str,
         database_id: &str,
         sql: &str,
         params: &[Value],
-    ) -> Result<Value, AdapterError> {
-        self.execute_d1_query(
-            "cloudflare.d1.migration_manifest.write",
-            RetryPolicy::NonIdempotent,
-            D1EnvelopePolicy::RequireEmptyErrors,
-            account_id,
-            database_id,
-            sql,
-            params,
-        )
-        .await
+    ) -> Result<D1MigrationManifestWrite, D1MigrationManifestWriteError> {
+        let pre_dispatch = |error: AdapterError| D1MigrationManifestWriteError {
+            error: error.payload(),
+            response_body_sha256: None,
+            response_body_size_bytes: None,
+            lifecycle: D1MigrationManifestWriteLifecycle::pre_dispatch(),
+        };
+        let account_id = require_non_empty("account_id", account_id).map_err(pre_dispatch)?;
+        let database_id = require_non_empty("database_id", database_id).map_err(pre_dispatch)?;
+        let sql = require_non_empty("sql", sql).map_err(pre_dispatch)?;
+        let token = self.bearer_token().map_err(pre_dispatch)?;
+        let url = self.endpoint(&format!(
+            "/accounts/{}/d1/database/{}/query",
+            path_segment(account_id),
+            path_segment(database_id),
+        ));
+        let mut body = Map::new();
+        body.insert("sql".to_string(), Value::String(sql.to_string()));
+        if !params.is_empty() {
+            body.insert("params".to_string(), Value::Array(params.to_vec()));
+        }
+        let request = self
+            .migration_write_http
+            .post(url)
+            .bearer_auth(&token)
+            .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone())
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .json(&Value::Object(body))
+            .build()
+            .map_err(|error| {
+                pre_dispatch(AdapterError::new(
+                    "cloudflare.request_build_failed",
+                    format!("cloudflare.d1.migration_manifest.write request build failed: {error}"),
+                    "Correct the request configuration; no provider request was dispatched.",
+                ))
+            })?;
+        let response = self
+            .migration_write_http
+            .execute(request)
+            .await
+            .map_err(|error| {
+                let code = if error.is_timeout() {
+                    "cloudflare.timeout"
+                } else {
+                    "cloudflare.transport_error"
+                };
+                D1MigrationManifestWriteError {
+                    error: AdapterError::new(
+                        code,
+                        format!("cloudflare.d1.migration_manifest.write request failed: {error}"),
+                        "Treat the provider outcome as ambiguous; retain custody and do not replay the migration write.",
+                    )
+                    .with_retryable(false)
+                    .payload(),
+                    response_body_sha256: None,
+                    response_body_size_bytes: None,
+                    lifecycle: D1MigrationManifestWriteLifecycle::attempted_without_response(),
+                }
+            })?;
+        let status = response.status();
+        let status_code = status.as_u16();
+        let identity_encoded = response
+            .headers()
+            .get_all(reqwest::header::CONTENT_ENCODING)
+            .iter()
+            .all(|value| {
+                value.to_str().ok().is_some_and(|value| {
+                    value
+                        .split(',')
+                        .all(|encoding| encoding.trim().eq_ignore_ascii_case("identity"))
+                })
+            });
+        if !identity_encoded {
+            return Err(D1MigrationManifestWriteError {
+                error: AdapterError::new(
+                    "cloudflare.d1.migration_manifest_unsupported_content_encoding",
+                    "Cloudflare migration-write response used a non-identity content encoding",
+                    "Treat the provider outcome as ambiguous; retain custody and do not replay the migration write.",
+                )
+                .with_status(Some(status_code))
+                .payload(),
+                response_body_sha256: None,
+                response_body_size_bytes: None,
+                lifecycle: D1MigrationManifestWriteLifecycle::response_received(status_code),
+            });
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > D1_MIGRATION_RESPONSE_MAX_BYTES as u64)
+        {
+            return Err(D1MigrationManifestWriteError {
+                error: AdapterError::new(
+                    "cloudflare.d1.migration_manifest_response_too_large",
+                    "Cloudflare migration-write response exceeded the exact-evidence byte limit",
+                    "Treat the provider outcome as ambiguous; retain custody and do not replay the migration write.",
+                )
+                .with_status(Some(status_code))
+                .payload(),
+                response_body_sha256: None,
+                response_body_size_bytes: response.content_length().map(|length| length as usize),
+                lifecycle: D1MigrationManifestWriteLifecycle::response_received(status_code),
+            });
+        }
+        let initial_capacity = response
+            .content_length()
+            .map(|length| cmp::min(length as usize, D1_MIGRATION_RESPONSE_MAX_BYTES))
+            .unwrap_or(0);
+        let mut bytes = Vec::with_capacity(initial_capacity);
+        let mut hasher = Sha256::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| D1MigrationManifestWriteError {
+                error: AdapterError::new(
+                    "cloudflare.response_read_failed",
+                    format!("failed reading Cloudflare migration-write response body: {error}"),
+                    "Treat the provider outcome as ambiguous; retain custody and do not replay the migration write.",
+                )
+                .with_status(Some(status_code))
+                .with_retryable(false)
+                .payload(),
+                response_body_sha256: None,
+                response_body_size_bytes: Some(bytes.len()),
+                lifecycle: D1MigrationManifestWriteLifecycle::body_read_failed(
+                    status_code,
+                    bytes.len(),
+                ),
+            })?;
+            let observed_size = bytes.len().saturating_add(chunk.len());
+            if observed_size > D1_MIGRATION_RESPONSE_MAX_BYTES {
+                return Err(D1MigrationManifestWriteError {
+                    error: AdapterError::new(
+                        "cloudflare.d1.migration_manifest_response_too_large",
+                        "Cloudflare migration-write response exceeded the exact-evidence byte limit",
+                        "Treat the provider outcome as ambiguous; retain custody and do not replay the migration write.",
+                    )
+                    .with_status(Some(status_code))
+                    .payload(),
+                    response_body_sha256: None,
+                    response_body_size_bytes: Some(observed_size),
+                    lifecycle: D1MigrationManifestWriteLifecycle::body_partially_read(status_code),
+                });
+            }
+            hasher.update(&chunk);
+            bytes.extend_from_slice(&chunk);
+        }
+        let response_body_size_bytes = bytes.len();
+        let response_body_sha256 = format!("{:x}", hasher.finalize());
+        let evidence_error = |error: AdapterError| D1MigrationManifestWriteError {
+            error: error.with_retryable(false).payload(),
+            response_body_sha256: Some(response_body_sha256.clone()),
+            response_body_size_bytes: Some(response_body_size_bytes),
+            lifecycle: D1MigrationManifestWriteLifecycle::body_completely_read(status_code),
+        };
+        let body = std::str::from_utf8(&bytes).map_err(|error| {
+            evidence_error(
+                AdapterError::new(
+                    "cloudflare.d1.migration_manifest_malformed_utf8",
+                    format!("Cloudflare migration-write response was not valid UTF-8: {error}"),
+                    "Treat the provider outcome as ambiguous; retain custody and do not replay the migration write.",
+                )
+                .with_status(Some(status_code)),
+            )
+        })?;
+        if !status.is_success() {
+            return Err(evidence_error(http_status_error(status, body)));
+        }
+        let envelope = decode_strict_d1_migration_manifest_envelope(body)
+            .map_err(|error| evidence_error(error.with_status(Some(status_code))))?;
+        Ok(D1MigrationManifestWrite {
+            result: envelope.result.unwrap_or(Value::Null),
+            response_body_sha256,
+            response_body_size_bytes,
+            lifecycle: D1MigrationManifestWriteLifecycle::body_completely_read(status_code),
+        })
     }
 
     async fn execute_d1_query(
@@ -4180,6 +4497,7 @@ fn cloudflare_api_error_detail(error: &CloudflareApiError) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::convert::Infallible;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -4191,11 +4509,13 @@ mod tests {
     use axum::routing::{get, post, put};
     use axum::{Json, Router};
     use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     use super::{
-        AdapterError, CloudflareApiError, CloudflareClient, D1MigrationReconciliationReadLifecycle,
+        AdapterError, CloudflareApiError, CloudflareClient, D1_MIGRATION_RESPONSE_MAX_BYTES,
+        D1MigrationManifestWriteLifecycle, D1MigrationReconciliationReadLifecycle,
         decode_strict_d1_migration_manifest_envelope,
         decode_strict_d1_migration_reconciliation_envelope, is_d1_sqlite_auth_error, path_segment,
         with_request_api_token_override, worker_listing_identity, worker_version_id,
@@ -4333,6 +4653,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconciliation_request_builder_failure_remains_pre_dispatch() {
+        let mut cfg = test_config(refused_loopback_url("builder-must-not-dispatch"));
+        cfg.api_token = Some("invalid\nheader".to_string());
+        let client = CloudflareClient::new(cfg).expect("client");
+        let error = client
+            .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+            .await
+            .expect_err("invalid authorization header must fail before dispatch");
+        assert_eq!(error.error.code, "cloudflare.request_build_failed");
+        assert!(!error.error.retryable);
+        assert_eq!(error.lifecycle.provider_calls(), 0);
+        assert_eq!(
+            error.lifecycle,
+            D1MigrationReconciliationReadLifecycle::pre_dispatch()
+        );
+        assert_eq!(error.response_body_sha256, None);
+        assert_eq!(error.response_body_size_bytes, None);
+    }
+
+    #[tokio::test]
     async fn reconciliation_transport_failure_records_attempt_without_response() {
         let client =
             CloudflareClient::new(test_config(refused_loopback_url("attempted"))).expect("client");
@@ -4460,6 +4800,325 @@ mod tests {
             error.lifecycle,
             D1MigrationReconciliationReadLifecycle::body_completely_read(302)
         );
+    }
+
+    #[tokio::test]
+    async fn migration_manifest_write_does_not_follow_same_origin_307_or_308() {
+        for status in [
+            StatusCode::TEMPORARY_REDIRECT,
+            StatusCode::PERMANENT_REDIRECT,
+        ] {
+            let source_calls = Arc::new(AtomicUsize::new(0));
+            let target_calls = Arc::new(AtomicUsize::new(0));
+            let source_calls_for_route = source_calls.clone();
+            let target_calls_for_route = target_calls.clone();
+            let router = Router::new()
+                .route(
+                    "/accounts/acct-1/d1/database/db-1/query",
+                    post(move |headers: HeaderMap| {
+                        let source_calls = source_calls_for_route.clone();
+                        async move {
+                            source_calls.fetch_add(1, Ordering::SeqCst);
+                            assert_eq!(
+                                headers
+                                    .get(reqwest::header::ACCEPT_ENCODING)
+                                    .and_then(|value| value.to_str().ok()),
+                                Some("identity")
+                            );
+                            Response::builder()
+                                .status(status)
+                                .header("location", "/redirect-target")
+                                .body(Body::empty())
+                                .expect("migration-write redirect response")
+                        }
+                    }),
+                )
+                .route(
+                    "/redirect-target",
+                    post(move || {
+                        let target_calls = target_calls_for_route.clone();
+                        async move {
+                            target_calls.fetch_add(1, Ordering::SeqCst);
+                            Json(json!({
+                                "success": true,
+                                "errors": [],
+                                "result": [],
+                            }))
+                        }
+                    }),
+                );
+            let base = spawn_router(router).await;
+            let client = CloudflareClient::new(test_config(base)).expect("client");
+            let error = client
+                .execute_d1_migration_manifest_write(
+                    "acct-1",
+                    "db-1",
+                    "CREATE TABLE guarded(id INTEGER PRIMARY KEY)",
+                    &[],
+                )
+                .await
+                .expect_err("redirected migration write must remain ambiguous");
+
+            assert_eq!(source_calls.load(Ordering::SeqCst), 1, "{status}");
+            assert_eq!(target_calls.load(Ordering::SeqCst), 0, "{status}");
+            assert_eq!(error.error.status, Some(status.as_u16()), "{status}");
+            assert!(!error.error.retryable, "{status}");
+            assert_eq!(error.response_body_size_bytes, Some(0), "{status}");
+            assert_eq!(
+                error.lifecycle,
+                D1MigrationManifestWriteLifecycle::body_completely_read(status.as_u16()),
+                "{status}"
+            );
+            assert_eq!(error.lifecycle.provider_calls(), 1, "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_manifest_write_stream_cap_stops_without_replay() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_route = calls.clone();
+        let router = Router::new().route(
+            "/accounts/acct-1/d1/database/db-1/query",
+            post(move |headers: HeaderMap| {
+                let calls = calls_for_route.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(
+                        headers
+                            .get(reqwest::header::ACCEPT_ENCODING)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("identity")
+                    );
+                    let body = Body::from_stream(futures::stream::iter([
+                        Ok::<Bytes, Infallible>(Bytes::from(vec![
+                            b'x';
+                            D1_MIGRATION_RESPONSE_MAX_BYTES
+                        ])),
+                        Ok::<Bytes, Infallible>(Bytes::from_static(b"x")),
+                    ]));
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .body(body)
+                        .expect("oversized streamed migration-write response")
+                }
+            }),
+        );
+        let base = spawn_router(router).await;
+        let client = CloudflareClient::new(test_config(base)).expect("client");
+        let error = client
+            .execute_d1_migration_manifest_write(
+                "acct-1",
+                "db-1",
+                "CREATE TABLE guarded(id INTEGER PRIMARY KEY)",
+                &[],
+            )
+            .await
+            .expect_err("oversized streamed response must remain ambiguous");
+
+        assert_eq!(
+            error.error.code,
+            "cloudflare.d1.migration_manifest_response_too_large"
+        );
+        assert_eq!(error.error.status, Some(200));
+        assert!(!error.error.retryable);
+        assert_eq!(error.response_body_sha256, None);
+        assert!(
+            error
+                .response_body_size_bytes
+                .is_some_and(|size| size > D1_MIGRATION_RESPONSE_MAX_BYTES)
+        );
+        assert_eq!(
+            error.lifecycle,
+            D1MigrationManifestWriteLifecycle::body_partially_read(200)
+        );
+        assert_eq!(error.lifecycle.provider_calls(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn migration_manifest_write_stream_failure_is_ambiguous_without_replay() {
+        let listener = TcpListener::bind("127.0.0.1:0") // DevSkim: ignore DS162092 -- loopback-only migration-write fixture
+            .await
+            .expect("bind truncated migration-write fixture");
+        let addr = listener
+            .local_addr()
+            .expect("truncated migration-write fixture address");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_server = calls.clone();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept migration write");
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 1024];
+                let count = stream.read(&mut chunk).await.expect("read migration write");
+                assert!(count > 0, "request closed before complete body");
+                request.extend_from_slice(&chunk[..count]);
+                let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let header_end = header_end + 4;
+                let headers = std::str::from_utf8(&request[..header_end])
+                    .expect("migration-write headers are UTF-8");
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().expect("content length"))
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + content_length {
+                    break;
+                }
+            }
+            calls_for_server.fetch_add(1, Ordering::SeqCst);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 64\r\n\r\n{")
+                .await
+                .expect("write truncated migration response");
+        });
+        let client = CloudflareClient::new(test_config(format!("http://{addr}"))) // DevSkim: ignore DS137138 -- loopback-only migration-write fixture
+            .expect("migration-write client");
+        let error = client
+            .execute_d1_migration_manifest_write(
+                "acct-1",
+                "db-1",
+                "CREATE TABLE guarded(id INTEGER PRIMARY KEY)",
+                &[],
+            )
+            .await
+            .expect_err("truncated stream must remain ambiguous");
+
+        assert_eq!(error.error.code, "cloudflare.response_read_failed");
+        assert_eq!(error.error.status, Some(200));
+        assert!(!error.error.retryable);
+        assert_eq!(error.response_body_sha256, None);
+        assert_eq!(error.response_body_size_bytes, Some(1));
+        assert_eq!(
+            error.lifecycle,
+            D1MigrationManifestWriteLifecycle::body_partially_read(200)
+        );
+        assert_eq!(error.lifecycle.provider_calls(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn migration_manifest_write_rejects_encoded_and_malformed_bodies_without_replay() {
+        enum FailureBody {
+            Encoded,
+            InvalidUtf8,
+            DuplicateJsonKey,
+        }
+
+        for (case, expected_code) in [
+            (
+                FailureBody::Encoded,
+                "cloudflare.d1.migration_manifest_unsupported_content_encoding",
+            ),
+            (
+                FailureBody::InvalidUtf8,
+                "cloudflare.d1.migration_manifest_malformed_utf8",
+            ),
+            (
+                FailureBody::DuplicateJsonKey,
+                "cloudflare.d1.migration_manifest_duplicate_object_key",
+            ),
+        ] {
+            let (body, content_encoding) = match case {
+                FailureBody::Encoded => (
+                    br#"{"success":true,"errors":[],"result":[]}"#.to_vec(),
+                    Some("gzip"),
+                ),
+                FailureBody::InvalidUtf8 => (vec![0xff, 0xfe], None),
+                FailureBody::DuplicateJsonKey => (
+                    br#"{"success":true,"success":true,"errors":[],"result":[]}"#.to_vec(),
+                    None,
+                ),
+            };
+            let expected_body_size = body.len();
+            let expected_body_sha256 = format!("{:x}", Sha256::digest(&body));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let calls_for_route = calls.clone();
+            let router = Router::new().route(
+                "/accounts/acct-1/d1/database/db-1/query",
+                post(move || {
+                    let calls = calls_for_route.clone();
+                    let body = body.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let mut response = Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "application/json");
+                        if let Some(content_encoding) = content_encoding {
+                            response = response.header("content-encoding", content_encoding);
+                        }
+                        response
+                            .body(Body::from(body))
+                            .expect("malformed migration-write response")
+                    }
+                }),
+            );
+            let base = spawn_router(router).await;
+            let client = CloudflareClient::new(test_config(base)).expect("client");
+            let error = client
+                .execute_d1_migration_manifest_write(
+                    "acct-1",
+                    "db-1",
+                    "CREATE TABLE guarded(id INTEGER PRIMARY KEY)",
+                    &[],
+                )
+                .await
+                .expect_err("post-dispatch response defect must remain ambiguous");
+
+            assert_eq!(error.error.code, expected_code);
+            assert_eq!(error.error.status, Some(200));
+            assert!(!error.error.retryable);
+            assert_eq!(error.lifecycle.provider_calls(), 1);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            if content_encoding.is_some() {
+                assert_eq!(error.response_body_sha256, None);
+                assert_eq!(error.response_body_size_bytes, None);
+                assert_eq!(
+                    error.lifecycle,
+                    D1MigrationManifestWriteLifecycle::response_received(200)
+                );
+            } else {
+                assert_eq!(error.response_body_sha256, Some(expected_body_sha256));
+                assert_eq!(error.response_body_size_bytes, Some(expected_body_size));
+                assert_eq!(
+                    error.lifecycle,
+                    D1MigrationManifestWriteLifecycle::body_completely_read(200)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn migration_manifest_write_builder_failure_is_zero_call_predispatch() {
+        let mut cfg = test_config(refused_loopback_url("write-builder-must-not-dispatch"));
+        cfg.api_token = Some("invalid\nheader".to_string());
+        let client = CloudflareClient::new(cfg).expect("client");
+        let error = client
+            .execute_d1_migration_manifest_write(
+                "acct-1",
+                "db-1",
+                "CREATE TABLE guarded(id INTEGER PRIMARY KEY)",
+                &[],
+            )
+            .await
+            .expect_err("invalid authorization header must fail before dispatch");
+
+        assert_eq!(error.error.code, "cloudflare.request_build_failed");
+        assert_eq!(error.error.status, None);
+        assert_eq!(error.response_body_sha256, None);
+        assert_eq!(error.response_body_size_bytes, None);
+        assert_eq!(
+            error.lifecycle,
+            D1MigrationManifestWriteLifecycle::pre_dispatch()
+        );
+        assert_eq!(error.lifecycle.provider_calls(), 0);
     }
 
     #[tokio::test]

@@ -38,19 +38,32 @@ use crate::cloudflare::{
     AccessAppUpsertRequest, AccessPolicyWrite, BulkRedirectItemWrite, CacheRule, CacheRuleset,
     DnsRecordUpsertRequest, PagesDeploymentTriggerRequest, with_request_api_token_override,
 };
+use crate::d1_migration_bootstrap::{
+    D1_BOOTSTRAP_LEASE_FAMILY, D1_BOOTSTRAP_OPERATION, D1BootstrapExecutionInput,
+    d1_bootstrap_mutation_plan, d1_bootstrap_mutation_target,
+    execute_d1_bootstrap_migration_ledger,
+};
+use crate::d1_migration_bootstrap_recovery::{
+    D1_BOOTSTRAP_ABORT_OPERATION, D1_BOOTSTRAP_FINALIZE_OPERATION,
+    D1_BOOTSTRAP_RECONCILE_OPERATION, D1AbortBootstrapMigrationLedgerArgs,
+    D1FinalizeBootstrapMigrationLedgerArgs, D1ReconcileBootstrapMigrationLedgerArgs,
+    abort_bootstrap_migration_ledger, finalize_bootstrap_migration_ledger,
+    reconcile_bootstrap_migration_ledger,
+};
 use crate::d1_migration_lease::{
     acquire_d1_migration_lease, d1_migration_lease_requirements,
     preflight_d1_migration_target_custody,
 };
 use crate::d1_migration_manifest::{
     D1ManifestReconciliationEvidence, approved_d1_plan_digest_matches, classify_d1_manifest_ledger,
-    d1_ledger_summaries, d1_manifest_contextualize_failure, d1_manifest_plan_mismatch_result,
-    d1_manifest_plan_sha256, d1_manifest_reconciliation_custody_lost_result,
-    d1_manifest_reconciliation_required_result, d1_manifest_summaries,
-    d1_manifest_unknown_ledger_result, d1_migrations_table_init_sql, normalize_d1_manifest_target,
-    normalize_d1_migration_family, parse_d1_migration_ledger, read_stable_d1_migration_ledger,
-    read_stable_d1_migration_ledger_authority, validate_d1_manifest_write_result,
-    validate_d1_migration_manifest,
+    contextualize_d1_manifest_semantic_error, d1_ledger_summaries,
+    d1_manifest_contextualize_failure, d1_manifest_plan_mismatch_result, d1_manifest_plan_sha256,
+    d1_manifest_reconciliation_custody_lost_result, d1_manifest_reconciliation_required_result,
+    d1_manifest_summaries, d1_manifest_unknown_ledger_result, d1_migrations_table_init_sql,
+    normalize_d1_manifest_target, normalize_d1_migration_family, parse_d1_migration_ledger,
+    read_stable_d1_migration_ledger, read_stable_d1_migration_ledger_authority,
+    validate_d1_manifest_write_result, validate_d1_migration_manifest,
+    validate_generic_d1_migration_family,
 };
 use crate::d1_migration_reconciliation::{
     D1ReconcileMigrationManifestArgs, contextualize_d1_reconciliation_semantic_error,
@@ -946,6 +959,21 @@ pub struct D1ApplyMigrationManifestArgs {
     pub approved_plan_sha256: Option<String>,
     #[serde(default)]
     pub max_rows: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct D1BootstrapMigrationLedgerArgs {
+    #[serde(default)]
+    pub account_id: Option<String>,
+    pub database_id: String,
+    #[serde(default)]
+    pub migrations_table: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    /// Exact lowercase `plan_sha256` returned by the dry run. Live bootstrap
+    /// rejects case changes, whitespace, stale targets, and stale preflight.
+    pub approved_plan_sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -2768,27 +2796,33 @@ impl CloudflareMcp {
             }));
         }
         if !operation_allowed_by_default(operation) {
-            if let Some(preferred_tool) = operation.preferred_tool.as_deref() {
-                return Ok(CallToolResult::structured_error(json!({
-                    "ok": false,
-                    "operation": "api_mutate",
-                    "api_operation": operation_detail(operation),
-                    "error": {
-                        "code": "api_catalog.denied_by_default",
-                        "message": format!(
-                            "operation '{}' is denied by default by the generic API executor",
-                            operation.operation_id,
-                        ),
-                        "hint": format!(
-                            "Use the curated {preferred_tool} tool for this operation; generic api_mutate remains denied.",
-                        ),
-                    },
-                    "preferred_tool": preferred_tool,
-                })));
-            }
-            return Ok(api_catalog_error_result(ApiCatalogError::DeniedByDefault(
-                operation.operation_id.clone(),
-            )));
+            let preferred_tool = operation.preferred_tool.as_deref();
+            let hint = match preferred_tool {
+                Some(preferred_tool) => format!(
+                    "Use the curated {preferred_tool} tool for this operation; generic api_mutate remains denied.",
+                ),
+                None => ApiCatalogError::DeniedByDefault(operation.operation_id.clone())
+                    .hint()
+                    .to_string(),
+            };
+            return Ok(CallToolResult::structured_error(json!({
+                "ok": false,
+                "operation": "api_mutate",
+                "api_operation": operation_detail(operation),
+                "error": {
+                    "code": "api_catalog.denied_by_default",
+                    "message": format!(
+                        "operation '{}' is denied by default by the generic API executor",
+                        operation.operation_id,
+                    ),
+                    "hint": hint,
+                },
+                "preferred_tool": preferred_tool,
+                "request_constructed": false,
+                "raw_body_dispatched": false,
+                "provider_calls": 0,
+                "provider_mutations": 0,
+            })));
         }
         let path = match render_path(
             operation,
@@ -4541,6 +4575,388 @@ impl CloudflareMcp {
     }
 
     #[tool(
+        name = "d1_bootstrap_migration_ledger",
+        description = "Bootstrap only the canonical empty Wrangler-compatible migration ledger on an independently selected empty D1 target under an approved dry-run plan."
+    )]
+    async fn cloudflare_d1_bootstrap_migration_ledger(
+        &self,
+        Parameters(args): Parameters<D1BootstrapMigrationLedgerArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let D1BootstrapMigrationLedgerArgs {
+            account_id: requested_account_id,
+            database_id: requested_database_id,
+            migrations_table: requested_migrations_table,
+            dry_run,
+            approved_plan_sha256,
+        } = args;
+        let zero_call_error = |result: CallToolResult| {
+            CallToolResult::structured_error(json!({
+                "ok": false,
+                "operation": D1_BOOTSTRAP_OPERATION,
+                "status": "blocked",
+                "provider_calls": 0,
+                "provider_mutations": 0,
+                "automatic_retry_permitted": false,
+                "error": d1_call_tool_error_value(result),
+            }))
+        };
+
+        if let Some(account_id) = requested_account_id.as_deref() {
+            if let Err(result) = normalize_d1_manifest_target(account_id, &requested_database_id) {
+                return Ok(zero_call_error(result));
+            }
+        }
+        let resolved_account_id = resolve_account_id(self, requested_account_id.as_deref())?;
+        let target = match normalize_d1_manifest_target(resolved_account_id, &requested_database_id)
+        {
+            Ok(target) => target,
+            Err(result) => return Ok(zero_call_error(result)),
+        };
+        let migrations_table =
+            match normalize_d1_bootstrap_migrations_table(requested_migrations_table.as_deref()) {
+                Ok(table) => table,
+                Err(result) => return Ok(zero_call_error(result)),
+            };
+        let input = D1BootstrapExecutionInput {
+            account_id: target.account_id,
+            database_id: target.database_id,
+            migrations_table,
+            dry_run,
+            approved_plan_sha256,
+        };
+        let mutation_target = d1_bootstrap_mutation_target(&input);
+        let mutation_plan = d1_bootstrap_mutation_plan(&input);
+        let mut audit = MutationAuditSession::start(
+            Some(&parts),
+            D1_BOOTSTRAP_OPERATION,
+            mutation_target,
+            dry_run,
+        );
+        let result = execute_d1_bootstrap_migration_ledger(self, input, &mut audit).await;
+        Ok(finalize_mutation_result(
+            result,
+            &mutation_plan,
+            audit,
+            dry_run,
+        ))
+    }
+
+    #[tool(
+        name = "d1_reconcile_bootstrap_migration_ledger",
+        description = "Read-only reconciliation of one exact retained migration-ledger bootstrap against two stable primary canonical empty-ledger proof windows."
+    )]
+    async fn cloudflare_d1_reconcile_bootstrap_migration_ledger(
+        &self,
+        Parameters(args): Parameters<D1ReconcileBootstrapMigrationLedgerArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let D1ReconcileBootstrapMigrationLedgerArgs {
+            account_id: requested_account_id,
+            database_id: requested_database_id,
+            migrations_table: requested_migrations_table,
+            approved_bootstrap_plan_sha256,
+            lease_nonce,
+            lease_payload_sha256,
+        } = args;
+        let zero_call_error = |result: CallToolResult| {
+            CallToolResult::structured_error(json!({
+                "ok": false,
+                "operation": D1_BOOTSTRAP_RECONCILE_OPERATION,
+                "read_only": true,
+                "status": "reconciliation_required",
+                "capability_state": "contradictory",
+                "retry_decision": "do_not_retry_initializer",
+                "lease_retained": null,
+                "custody_status": "not_inspected",
+                "provider_calls": 0,
+                "provider_read_lifecycle": [],
+                "response_evidence": [],
+                "provider_mutations": 0,
+                "local_namespace_mutations": 0,
+                "error": d1_call_tool_error_value(result),
+            }))
+        };
+        if let Some(account_id) = requested_account_id.as_deref() {
+            if let Err(result) = normalize_d1_manifest_target(account_id, &requested_database_id) {
+                return Ok(zero_call_error(result));
+            }
+        }
+        let resolved_account_id = match resolve_account_id(self, requested_account_id.as_deref()) {
+            Ok(account_id) => account_id,
+            Err(_) => {
+                return Ok(zero_call_error(invalid_argument_result(
+                    "d1.invalid_manifest_target_identity",
+                    "account_id must be supplied or configured as a canonical identifier",
+                    "Use the exact account_id read from the intended Cloudflare resource.",
+                )));
+            }
+        };
+        let target = match normalize_d1_manifest_target(resolved_account_id, &requested_database_id)
+        {
+            Ok(target) => target,
+            Err(result) => return Ok(zero_call_error(result)),
+        };
+        let migrations_table =
+            match normalize_d1_bootstrap_migrations_table(requested_migrations_table.as_deref()) {
+                Ok(table) => table,
+                Err(result) => return Ok(zero_call_error(result)),
+            };
+        Ok(reconcile_bootstrap_migration_ledger(
+            self,
+            &target.account_id,
+            &target.database_id,
+            &migrations_table,
+            &approved_bootstrap_plan_sha256,
+            &lease_nonce,
+            &lease_payload_sha256,
+        )
+        .await)
+    }
+
+    #[tool(
+        name = "d1_finalize_bootstrap_migration_ledger",
+        description = "Persist an approval-bound terminal receipt and retire one exactly re-proven retained migration-ledger bootstrap without any provider write."
+    )]
+    async fn cloudflare_d1_finalize_bootstrap_migration_ledger(
+        &self,
+        Parameters(args): Parameters<D1FinalizeBootstrapMigrationLedgerArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let D1FinalizeBootstrapMigrationLedgerArgs {
+            account_id: requested_account_id,
+            database_id: requested_database_id,
+            migrations_table: requested_migrations_table,
+            approved_bootstrap_plan_sha256,
+            lease_nonce,
+            lease_payload_sha256,
+            expected_reconciliation_plan_sha256,
+            expected_initializer_authority_sha256,
+            expected_query_authority_sha256,
+            expected_canonical_snapshot_sha256,
+            terminal_request_sha256,
+            terminal_attempt_sha256,
+            dry_run,
+            approved_terminal_plan_sha256,
+        } = args;
+        let zero_call_error = |result: CallToolResult| {
+            CallToolResult::structured_error(json!({
+                "ok": false,
+                "operation": D1_BOOTSTRAP_FINALIZE_OPERATION,
+                "status": "reconciliation_required",
+                "capability_state": "contradictory",
+                "retry_decision": "do_not_retry_initializer",
+                "lease_retained": null,
+                "custody_status": "not_inspected",
+                "provider_calls": 0,
+                "provider_mutations": 0,
+                "local_namespace_mutations": 0,
+                "error": d1_call_tool_error_value(result),
+            }))
+        };
+        if let Some(account_id) = requested_account_id.as_deref() {
+            if let Err(result) = normalize_d1_manifest_target(account_id, &requested_database_id) {
+                return Ok(zero_call_error(result));
+            }
+        }
+        let resolved_account_id = match resolve_account_id(self, requested_account_id.as_deref()) {
+            Ok(account_id) => account_id,
+            Err(_) => {
+                return Ok(zero_call_error(invalid_argument_result(
+                    "d1.invalid_manifest_target_identity",
+                    "account_id must be supplied or configured as a canonical identifier",
+                    "Use the exact account_id read from the intended Cloudflare resource.",
+                )));
+            }
+        };
+        let target = match normalize_d1_manifest_target(resolved_account_id, &requested_database_id)
+        {
+            Ok(target) => target,
+            Err(result) => return Ok(zero_call_error(result)),
+        };
+        let migrations_table =
+            match normalize_d1_bootstrap_migrations_table(requested_migrations_table.as_deref()) {
+                Ok(table) => table,
+                Err(result) => return Ok(zero_call_error(result)),
+            };
+        let mutation_target = json!({
+            "target_key_sha256": sha256_bytes_hex(
+                format!("{}\0{}", target.account_id, target.database_id).as_bytes()
+            ),
+            "migration_family": D1_BOOTSTRAP_LEASE_FAMILY,
+            "migrations_table": migrations_table,
+            "approved_bootstrap_plan_sha256": approved_bootstrap_plan_sha256,
+            "expected_reconciliation_plan_sha256": expected_reconciliation_plan_sha256,
+            "expected_initializer_authority_sha256": expected_initializer_authority_sha256,
+            "expected_query_authority_sha256": expected_query_authority_sha256,
+            "expected_canonical_snapshot_sha256": expected_canonical_snapshot_sha256,
+            "terminal_request_sha256": terminal_request_sha256,
+            "terminal_attempt_sha256": terminal_attempt_sha256,
+        });
+        let mutation_plan = MutationPlan::new(D1_BOOTSTRAP_FINALIZE_OPERATION)
+            .step(
+                "reprove_exact_bootstrap_authority",
+                false,
+                mutation_target.clone(),
+            )
+            .step("persist_terminal_receipt", true, mutation_target.clone())
+            .step(
+                "reprove_before_custody_retirement",
+                false,
+                mutation_target.clone(),
+            )
+            .step("retire_bootstrap_custody", true, mutation_target.clone());
+        let audit = MutationAuditSession::start(
+            Some(&parts),
+            D1_BOOTSTRAP_FINALIZE_OPERATION,
+            mutation_target,
+            dry_run,
+        );
+        let result = finalize_bootstrap_migration_ledger(
+            self,
+            &target.account_id,
+            &target.database_id,
+            &migrations_table,
+            &approved_bootstrap_plan_sha256,
+            &lease_nonce,
+            &lease_payload_sha256,
+            &expected_reconciliation_plan_sha256,
+            &expected_initializer_authority_sha256,
+            &expected_query_authority_sha256,
+            &expected_canonical_snapshot_sha256,
+            &terminal_request_sha256,
+            &terminal_attempt_sha256,
+            dry_run,
+            approved_terminal_plan_sha256.as_deref(),
+        )
+        .await;
+        Ok(finalize_mutation_result(
+            result,
+            &mutation_plan,
+            audit,
+            dry_run,
+        ))
+    }
+
+    #[tool(
+        name = "d1_abort_bootstrap_migration_ledger",
+        description = "Persist an approval-bound zero-initializer-dispatch receipt and terminally retire exact bootstrap custody without provider access."
+    )]
+    async fn cloudflare_d1_abort_bootstrap_migration_ledger(
+        &self,
+        Parameters(args): Parameters<D1AbortBootstrapMigrationLedgerArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let D1AbortBootstrapMigrationLedgerArgs {
+            account_id: requested_account_id,
+            database_id: requested_database_id,
+            migrations_table: requested_migrations_table,
+            approved_bootstrap_plan_sha256,
+            lease_nonce,
+            lease_payload_sha256,
+            terminal_request_sha256,
+            terminal_attempt_sha256,
+            dry_run,
+            approved_terminal_plan_sha256,
+        } = args;
+        let zero_call_error = |result: CallToolResult| {
+            CallToolResult::structured_error(json!({
+                "ok": false,
+                "operation": D1_BOOTSTRAP_ABORT_OPERATION,
+                "status": "reconciliation_required",
+                "capability_state": "contradictory",
+                "initializer_dispatch_state": "unproven",
+                "provider_initializer_dispatches": null,
+                "lease_retained": null,
+                "custody_status": "not_inspected",
+                "provider_calls": 0,
+                "provider_read_lifecycle": [],
+                "response_evidence": [],
+                "provider_mutations": 0,
+                "local_namespace_mutations": 0,
+                "error": d1_call_tool_error_value(result),
+            }))
+        };
+        if let Some(account_id) = requested_account_id.as_deref() {
+            if let Err(result) = normalize_d1_manifest_target(account_id, &requested_database_id) {
+                return Ok(zero_call_error(result));
+            }
+        }
+        let resolved_account_id = match resolve_account_id(self, requested_account_id.as_deref()) {
+            Ok(account_id) => account_id,
+            Err(_) => {
+                return Ok(zero_call_error(invalid_argument_result(
+                    "d1.invalid_manifest_target_identity",
+                    "account_id must be supplied or configured as a canonical identifier",
+                    "Use the exact account_id read from the intended Cloudflare resource.",
+                )));
+            }
+        };
+        let target = match normalize_d1_manifest_target(resolved_account_id, &requested_database_id)
+        {
+            Ok(target) => target,
+            Err(result) => return Ok(zero_call_error(result)),
+        };
+        let migrations_table =
+            match normalize_d1_bootstrap_migrations_table(requested_migrations_table.as_deref()) {
+                Ok(table) => table,
+                Err(result) => return Ok(zero_call_error(result)),
+            };
+        let mutation_target = json!({
+            "target_key_sha256": sha256_bytes_hex(
+                format!("{}\0{}", target.account_id, target.database_id).as_bytes()
+            ),
+            "migration_family": D1_BOOTSTRAP_LEASE_FAMILY,
+            "migrations_table": migrations_table,
+            "approved_bootstrap_plan_sha256": approved_bootstrap_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "terminal_request_sha256": terminal_request_sha256,
+            "terminal_attempt_sha256": terminal_attempt_sha256,
+        });
+        let mutation_plan = MutationPlan::new(D1_BOOTSTRAP_ABORT_OPERATION)
+            .step(
+                "prove_initializer_attempt_marker_absent",
+                false,
+                mutation_target.clone(),
+            )
+            .step(
+                "persist_zero_dispatch_terminal_receipt",
+                true,
+                mutation_target.clone(),
+            )
+            .step(
+                "reprove_initializer_attempt_marker_absent",
+                false,
+                mutation_target.clone(),
+            )
+            .step("retire_bootstrap_custody", true, mutation_target.clone());
+        let audit = MutationAuditSession::start(
+            Some(&parts),
+            D1_BOOTSTRAP_ABORT_OPERATION,
+            mutation_target,
+            dry_run,
+        );
+        let result = abort_bootstrap_migration_ledger(
+            &target.account_id,
+            &target.database_id,
+            &migrations_table,
+            &approved_bootstrap_plan_sha256,
+            &lease_nonce,
+            &lease_payload_sha256,
+            &terminal_request_sha256,
+            &terminal_attempt_sha256,
+            dry_run,
+            approved_terminal_plan_sha256.as_deref(),
+        );
+        Ok(finalize_mutation_result(
+            result,
+            &mutation_plan,
+            audit,
+            dry_run,
+        ))
+    }
+
+    #[tool(
         name = "d1_apply_migration_manifest",
         description = "Apply a caller-supplied exact-byte D1 migration manifest under a target lease and approved dry-run plan."
     )]
@@ -4605,6 +5021,9 @@ impl CloudflareMcp {
             Ok(family) => family,
             Err(result) => return Ok(result),
         };
+        if let Err(result) = validate_generic_d1_migration_family(&family) {
+            return Ok(contextualize_d1_manifest_semantic_error(result, dry_run));
+        }
         let max_rows = max_rows.unwrap_or(100).clamp(1, 1000);
         let mutation_target = json!({
             "target_key_sha256": sha256_bytes_hex(
@@ -4992,11 +5411,21 @@ impl CloudflareMcp {
                 .cloudflare
                 .execute_d1_migration_manifest_write(account_id, &args.database_id, &statement, &[])
                 .await
-                .map_err(|error| json!({"kind": "transport", "detail": error.payload()}))
-                .and_then(|result| {
-                    validate_d1_manifest_write_result(&result)
-                        .map_err(|detail| json!({"kind": "provider_result", "detail": detail}))?;
-                    Ok(result)
+                .map_err(|failure| {
+                    json!({
+                        "kind": "transport",
+                        "detail": crate::cloudflare::client::d1_migration_manifest_write_reconciliation_cause(&failure),
+                    })
+                })
+                .and_then(|write| {
+                    validate_d1_manifest_write_result(&write.result)
+                        .map_err(|detail| {
+                            crate::cloudflare::client::d1_migration_manifest_write_provider_result_cause(
+                                &write,
+                                &detail,
+                            )
+                        })?;
+                    Ok(write.result)
                 });
             match write_result {
                 Ok(result) => {
@@ -5289,6 +5718,9 @@ impl CloudflareMcp {
                 return Ok(contextualize_d1_reconciliation_semantic_error(result));
             }
         };
+        if let Err(result) = validate_generic_d1_migration_family(&family) {
+            return Ok(contextualize_d1_reconciliation_semantic_error(result));
+        }
         Ok(reconcile_d1_migration_manifest(
             self,
             &target.account_id,
@@ -5373,6 +5805,9 @@ impl CloudflareMcp {
             Ok(family) => family,
             Err(result) => return Ok(contextualize_terminal_semantic_error(result)),
         };
+        if let Err(result) = validate_generic_d1_migration_family(&family) {
+            return Ok(contextualize_terminal_semantic_error(result));
+        }
         let mutation_target = json!({
             "target_key_sha256": sha256_bytes_hex(
                 format!("{}\0{}", target.account_id, target.database_id).as_bytes()
@@ -12833,6 +13268,26 @@ pub(crate) fn normalize_d1_migrations_table(value: Option<&str>) -> Result<Strin
     }
 }
 
+fn normalize_d1_bootstrap_migrations_table(value: Option<&str>) -> Result<String, CallToolResult> {
+    if value.is_some_and(|table| table.is_empty() || table.trim() != table) {
+        return Err(invalid_argument_result(
+            "d1.invalid_migrations_table",
+            "an explicit migrations_table must already be one exact canonical ASCII SQL identifier",
+            "Omit migrations_table for d1_migrations or provide the exact unpadded canonical identifier.",
+        ));
+    }
+    let table = normalize_d1_migrations_table(value)?;
+    let lower = table.to_ascii_lowercase();
+    if lower.starts_with("sqlite_") || lower.starts_with("_cf_") {
+        return Err(invalid_argument_result(
+            "d1.bootstrap_reserved_migrations_table",
+            "bootstrap migrations_table must not use a SQLite or Cloudflare-reserved identifier family",
+            "Use d1_migrations or another application-owned ASCII identifier.",
+        ));
+    }
+    Ok(table)
+}
+
 fn inspect_d1_migration_files(directory: &str) -> Result<Vec<D1MigrationFile>, CallToolResult> {
     let directory = directory.trim();
     if directory.is_empty() {
@@ -19355,7 +19810,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -19367,11 +19822,8 @@ mod tests {
 
         let dry_run = server
             .cloudflare_api_mutate(Parameters(ApiMutateArgs {
-                operation_id: "d1-query-database".to_string(),
-                path_params: BTreeMap::from([
-                    ("account_id".to_string(), "acct-1".to_string()),
-                    ("database_id".to_string(), "db-1".to_string()),
-                ]),
+                operation_id: "d1-create-database".to_string(),
+                path_params: BTreeMap::from([("account_id".to_string(), "acct-1".to_string())]),
                 query: BTreeMap::new(),
                 body: Some(body.clone()),
                 dry_run: true,
@@ -19397,11 +19849,8 @@ mod tests {
 
         let result = server
             .cloudflare_api_mutate(Parameters(ApiMutateArgs {
-                operation_id: "d1-query-database".to_string(),
-                path_params: BTreeMap::from([
-                    ("account_id".to_string(), "acct-1".to_string()),
-                    ("database_id".to_string(), "db-1".to_string()),
-                ]),
+                operation_id: "d1-create-database".to_string(),
+                path_params: BTreeMap::from([("account_id".to_string(), "acct-1".to_string())]),
                 query: BTreeMap::new(),
                 body: Some(body),
                 dry_run: false,

@@ -88,6 +88,14 @@ Note on elicitation mode:
   and `Zone Settings Write` before the dry-run exposes a confirmation token.
   Missing or unverified permissions return guarded token inspection and repair
   calls instead of an interactive-login recommendation.
+- Generic `api_mutate` denies the exact `d1-query-database`,
+  `d1-raw-database-query`, `d1-import-database`, and
+  `d1-time-travel-restore` operations before request construction or provider
+  access. Query/raw SQL must use curated D1 policy surfaces; import and restore
+  require a separately governed curated lifecycle because they can replace
+  existing-target schema and data and have no preferred tool. Create, get,
+  list, export, and metadata operations retain their existing policy, while
+  delete retains its separate curated high-risk lifecycle.
 - Apart from the explicit `api_mutate.token_permissions` field above,
   elicitation does not alter tool argument schemas; it changes pre-execution
   policy behavior.
@@ -97,6 +105,49 @@ Preserved curated tool families:
   `d1_inspect_schema` supports targeted `include_tables`/`include_table_pattern`
   filtering and must keep Cloudflare internal `_cf_*` objects out of
   application `column_errors`.
+- The first-ledger bootstrap (`d1_bootstrap_migration_ledger`) is a distinct
+  mutating contract from manifest apply. Keep its exact empty-target dry-run
+  digest, shared target custody, one-initializer maximum, no-retry ambiguity,
+  stable canonical-schema/empty-ledger readback, one-attempt/no-redirect bounded
+  read client, a separate one-attempt/no-redirect migration-write client with a
+  16 MiB identity-response stream cap, window/phase/query-bound
+  response/lifecycle evidence including
+  no-body events, privacy-safe reconciliation-only nested causes for reads and
+  initializer failure, physical provider-call and
+  mutation accounting, and MCP stdio negative-path coverage aligned with the
+  snapshot. It must never become
+  a compatibility path for application-bearing or partially initialized D1
+  databases.
+- Manifest-owned provider writes use that same dedicated write boundary: no
+  redirects or adapter retry, identity response encoding, a 16 MiB streamed
+  response cap before UTF-8/strict-envelope decoding, truthful pre-dispatch
+  versus attempted lifecycle evidence, and permanent reconciliation-only
+  handling after any dispatched oversize/read/decode failure. A valid HTTP 200
+  outer envelope with missing, malformed, or failed inner D1 results preserves
+  the complete response digest, size, and attempted lifecycle while remaining
+  ambiguous and non-retryable.
+- Bootstrap recovery (`d1_reconcile_bootstrap_migration_ledger`,
+  `d1_finalize_bootstrap_migration_ledger`, and
+  `d1_abort_bootstrap_migration_ledger`) is its own retained-custody
+  contract. Keep the fixed bootstrap family, exact bootstrap-plan/initializer/
+  installed-schema authority, two stable primary before/after proof windows made
+  from exact one-attempt/no-redirect reads with response-byte evidence,
+  canonical empty-ledger-only success, explicit conflict/unknown products,
+  create-only terminal receipt, fresh proof before guarded retirement, zero
+  provider writes, exact provider-dispatch and local mutation accounting, no
+  initializer retry, and zero-call completed replay aligned across schema, stdio
+  tests, and runbook. Custody drift must erase stale retention claims while
+  preserving known receipt state. An empty manifest must never substitute for
+  this authority. The abort path is separately limited to marker-aware custody
+  with stable physical absence of the mandatory pre-dispatch initializer
+  attempt receipt; it must reject legacy, malformed, contradictory, present,
+  or unstable marker evidence and preserve permanent no-retry semantics after
+  any attempted or ambiguous initializer.
+- The exact `migration-ledger-bootstrap-v1` family is reserved to that
+  dedicated bootstrap lifecycle. Generic manifest apply, reconciliation, and
+  terminal finalization/replay must reject it before provider, custody,
+  receipt, or local namespace activity; the reservation is exact rather than
+  prefix-based.
 - Retained-manifest reconciliation (`d1_reconcile_migration_manifest`) is a
   first-class read-only D1 recovery contract. Keep its exact structured
   expectation schema, manifest-derived complete prefix inventory, query-bound

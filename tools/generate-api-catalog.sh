@@ -42,9 +42,13 @@ jq \
     elif ($tag|ascii_downcase|test("cache|zone settings|zone rulesets")) then "cache_zone_setting"
     else null end;
 
-  def risk_for($path; $method; $tag; $summary):
+  def risk_for($id; $path; $method; $tag; $summary):
     ($path + " " + $tag + " " + ($summary // "") | ascii_downcase) as $text |
     if $method == "get" then "read"
+    elif ($id == "d1-query-database"
+      or $id == "d1-raw-database-query"
+      or $id == "d1-import-database"
+      or $id == "d1-time-travel-restore") then "denied_by_default"
     elif ($text|test("account deletion|delete account|billing|payment|subscription|registrar|domain transfer|api token|api key|user service key|membership|members|role|permission|delete zone|zone deletion")) then "denied_by_default"
     elif $method == "delete" then "high_risk"
     else "mutating" end;
@@ -63,7 +67,7 @@ jq \
       summary: ($op.summary // null),
       deprecated: ($op.deprecated // false),
       scope: scope_for($p.key),
-      risk: risk_for($p.key; $method; (($op.tags[0]) // "untagged"); ($op.summary // "")),
+      risk: risk_for($id; $p.key; $method; (($op.tags[0]) // "untagged"); ($op.summary // "")),
       path_params: ([($op.parameters // [])[] | select(.in == "path") | .name] | unique),
       query_params: ([($op.parameters // [])[] | select(.in == "query") | .name] | unique),
       required_query_params: ([($op.parameters // [])[] | select(.in == "query" and .required == true) | .name] | unique),
