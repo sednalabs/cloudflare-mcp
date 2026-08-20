@@ -75,7 +75,7 @@ impl SeedLiteral {
         match self {
             Self::Null => 0,
             Self::Text(value) => value.len().saturating_mul(2),
-            Self::Integer(value) => value.to_string().len(),
+            Self::Integer(value) => signed_decimal_len(*value),
         }
     }
 
@@ -86,6 +86,19 @@ impl SeedLiteral {
             Self::Integer(_) => "integer",
         }
     }
+}
+
+fn signed_decimal_len(value: i64) -> usize {
+    if value == 0 {
+        return 1;
+    }
+    let mut magnitude = value.unsigned_abs();
+    let mut digits = usize::from(value.is_negative());
+    while magnitude > 0 {
+        digits += 1;
+        magnitude /= 10;
+    }
+    digits
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -679,6 +692,9 @@ mod tests {
         assert_eq!(parsed.rows, vec![vec![SeedLiteral::Integer(i64::MIN)]]);
         assert!(canonical_signed_decimal("-9223372036854775808"));
         assert!(!canonical_signed_decimal("-9223372036854775809"));
+        assert_eq!(signed_decimal_len(i64::MIN), 20);
+        assert_eq!(signed_decimal_len(i64::MAX), 19);
+        assert_eq!(signed_decimal_len(0), 1);
     }
 
     #[test]
