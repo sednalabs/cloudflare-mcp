@@ -446,7 +446,9 @@ Select one explicit built-in effect assertion:
   receipt, and replay bytes. Version 2 adds NULL as a third typed literal,
   hashes `{"storage_class":"null","value":null}` inside a version-2 row-set
   proof, and requires every NULL target column to be nullable in reviewed
-  `table_xinfo`. Reject a `null` storage class with any non-null value, any
+  `table_xinfo` and not an `INTEGER PRIMARY KEY` column in a rowid table, where
+  SQLite would replace NULL with a generated rowid. Reject a `null` storage
+  class with any non-null value, any
   non-NULL storage class with a JSON null value, and NULL against a `NOT NULL`
   column before terminal authority. Keep the v2 assertion ID unchanged through
   reconciliation, terminal dry run, live finalization, durable receipt, and

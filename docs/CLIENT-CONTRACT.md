@@ -275,6 +275,9 @@ Successful `d1_reconcile_migration_manifest` evidence enumerates five closed
 `schema_create_objects_additive_seed_rows`, and
 `schema_create_objects_additive_seed_rows_with_nulls`. The adjacent
 `schema_object_types` array is the complete scope for the selected class.
+The NULL-capable class still rejects `NULL` for an `INTEGER PRIMARY KEY` in a
+rowid table because SQLite would generate an integer rowid instead of
+preserving the asserted NULL.
 
 ## Structured payload details for complex tools
 
@@ -301,8 +304,10 @@ INTEGER literals. Version 2 additionally admits the canonical SQL keyword
 `{"storage_class":"null","value":null}` and version-2 row-set proof domain,
 so its `rows_sha256`, reconciliation plan, terminal plan, durable receipt, and
 replay identity cannot alias version 1. A NULL literal is admitted only for a
-reviewed nullable column; declared affinity and STRICT mode do not make a
-`NOT NULL` column safe. Every classified CREATE must be unconditional;
+reviewed nullable column that is not an `INTEGER PRIMARY KEY` column in a rowid
+table; SQLite would replace such a NULL with a generated rowid. Declared
+affinity and STRICT mode do not make a `NOT NULL` column safe. Every classified
+CREATE must be unconditional;
 `CREATE ... IF NOT EXISTS` is rejected because an incumbent schema object could
 turn it into a no-op. CREATE must precede the seed, and every trigger on the
 target must follow it across the whole manifest. SQLite ASCII case-insensitive
