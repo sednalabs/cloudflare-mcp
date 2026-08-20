@@ -268,8 +268,16 @@ every seed target. The selected proof omits a not-yet-created target, requires
 an exact empty table projection after CREATE and before INSERT without
 referencing columns introduced by a later prefix, and requires the
 exact row set at and after INSERT. An unexpected intermediate row stops after
-the first complete proof with zero mutations. Terminal reconciliation rederives
-and repeats the same selected-prefix proof. Both complete proof ledgers must
+the first complete proof with zero mutations. Fresh reconciliation evidence
+causes terminal reconciliation to rederive and repeat the same selected-prefix
+proof. Exact historical active or retiring evidence instead uses the approved
+`expected_query_sha256` plus expected current prefix to select the predecessor
+full-table-union constructor deterministically before provider access. An
+unrecognized query digest fails with zero provider calls. Historical non-seed
+proofs retain their two full-union reads without a selection call; historical
+seed proofs retain their selection read before the two full-union reads. The
+ordinary read-only reconciliation tool never emits this compatibility shape.
+Both complete proof ledgers must
 equal the exact initial selected ledger, and the two complete snapshots must
 also remain canonically equal; two mutually consistent responses at another
 prefix are contradictory. Inspect aggregate-safe `selection_binding` for the

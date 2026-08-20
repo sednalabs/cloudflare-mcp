@@ -18,7 +18,7 @@ use crate::d1_migration_lease::{
 use crate::d1_migration_manifest::validate_generic_d1_migration_family;
 use crate::d1_migration_reconciliation::{
     D1MigrationStateExpectation, canonical_effect_assertion_id,
-    prepare_d1_migration_reconciliation, refresh_d1_migration_reconciliation,
+    prepare_d1_migration_reconciliation_for_expected_query, refresh_d1_migration_reconciliation,
     replay_reconciliation_plan_sha256, validate_replay_manifest_expectations,
 };
 use crate::d1_migration_terminal_semantics::valid_manifest_outcome_prefixes;
@@ -402,7 +402,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
     let recovering_exact_receipt = initial_receipt_evidence.is_some();
     drop(initial_lease);
 
-    let mut proof = match prepare_d1_migration_reconciliation(
+    let mut proof = match prepare_d1_migration_reconciliation_for_expected_query(
         server,
         account_id,
         database_id,
@@ -414,6 +414,8 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
         lease_payload_sha256,
         effect_assertion_id,
         state_expectations,
+        expected_query_sha256,
+        expected_current_prefix_length,
     )
     .await
     {

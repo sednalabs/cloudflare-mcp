@@ -516,6 +516,16 @@ extended assertion. Unknown fields, duplicate keys, malformed/noncanonical
 bytes, or an attempt to pair version 1 with the extended assertion fail closed
 before provider access.
 
+Terminal query compatibility is independently evidence-bound. Before provider
+access, the finalizer combines the exact approved `expected_query_sha256` with
+the exact expected current prefix and accepts only the current selected-prefix
+constructor or the predecessor full-table-union constructor. Any other digest
+fails with zero provider calls. The predecessor non-seed form preserves its
+historical two complete reads without a selection call; the predecessor seed
+form preserves its historical selection plus two complete reads. This path is
+only for reproducing already-approved active/retiring evidence and durable
+receipts. New read-only reconciliation always emits the selected-prefix form.
+
 Completed-retirement replay is not receipt-only lookup. Before returning the
 zero-provider success, the terminal boundary reclassifies the supplied manifest,
 validates the complete typed expectations, and locally recomputes the applicable

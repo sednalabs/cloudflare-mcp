@@ -1784,6 +1784,94 @@ fn reconciliation_statement_markers(sql: &str) -> Vec<String> {
         .collect()
 }
 
+fn predecessor_two_table_full_union_query(proof_sha256: &str) -> String {
+    fn marker(proof_sha256: &str, logical_identity: &str) -> String {
+        sha256_hex(&format!(
+            "d1-reconciliation-statement-v1\0{proof_sha256}\0{logical_identity}"
+        ))
+    }
+
+    fn tagged(
+        marker: &str,
+        fields: &[&str],
+        data_sql: &str,
+        data_order_positions: &[usize],
+    ) -> String {
+        let null_fields = fields
+            .iter()
+            .map(|field| format!("NULL AS \"{field}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut order = vec!["2".to_string()];
+        order.extend(data_order_positions.iter().map(ToString::to_string));
+        format!(
+            "SELECT '{marker}' AS \"__cf_mcp_statement_id\", 0 AS \"__cf_mcp_row_kind\", {null_fields} UNION ALL SELECT '{marker}', 1, * FROM ({data_sql}) ORDER BY {}",
+            order.join(", ")
+        )
+    }
+
+    let mut statements = vec![
+        tagged(
+            &marker(proof_sha256, "ledger"),
+            &["id", "name"],
+            "SELECT id, name FROM \"d1_migrations\" ORDER BY id LIMIT 3",
+            &[3],
+        ),
+        tagged(
+            &marker(proof_sha256, "sqlite_master"),
+            &["type", "name", "tbl_name", "sql"],
+            "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name COLLATE NOCASE IN ('Current', 'Future') ORDER BY type, name LIMIT 3",
+            &[3, 4],
+        ),
+    ];
+    for table in ["Current", "Future"] {
+        statements.extend([
+            tagged(
+                &marker(proof_sha256, &format!("table_xinfo\0{table}")),
+                &[
+                    "cid",
+                    "name",
+                    "type",
+                    "notnull",
+                    "dflt_value",
+                    "pk",
+                    "hidden",
+                ],
+                &format!(
+                    "SELECT cid, name, type, \"notnull\", dflt_value, pk, hidden FROM pragma_table_xinfo('{table}') ORDER BY cid LIMIT 257"
+                ),
+                &[3],
+            ),
+            tagged(
+                &marker(proof_sha256, &format!("foreign_key_list\0{table}")),
+                &[
+                    "id",
+                    "seq",
+                    "table",
+                    "from",
+                    "to",
+                    "on_update",
+                    "on_delete",
+                    "match",
+                ],
+                &format!(
+                    "SELECT id, seq, \"table\", \"from\", \"to\", on_update, on_delete, \"match\" FROM pragma_foreign_key_list('{table}') ORDER BY id, seq LIMIT 257"
+                ),
+                &[3, 4],
+            ),
+            tagged(
+                &marker(proof_sha256, &format!("foreign_key_check\0{table}")),
+                &["table", "rowid", "parent", "fkid"],
+                &format!(
+                    "SELECT \"table\", rowid, parent, fkid FROM pragma_foreign_key_check('{table}') LIMIT 1"
+                ),
+                &[],
+            ),
+        ]);
+    }
+    statements.join(";\n")
+}
+
 fn tagged_reconciliation_result(
     marker: &str,
     fields: &[&str],
@@ -1849,6 +1937,75 @@ fn one_table_reconciliation_case() -> (Value, Value) {
                 "foreign_keys": [],
             }],
         }
+    ]);
+    (manifest, expectations)
+}
+
+fn two_table_partial_reconciliation_case() -> (Value, Value) {
+    let current_sql = "CREATE TABLE Current(id TEXT PRIMARY KEY)";
+    let future_sql = "CREATE TABLE Future(id TEXT PRIMARY KEY)";
+    let first_sql = format!("{current_sql};");
+    let second_sql = format!("{future_sql};");
+    let manifest = json!([
+        {
+            "name": "0001_current.sql",
+            "size_bytes": first_sql.len(),
+            "sql_sha256": sha256_hex(&first_sql),
+            "sql": first_sql,
+        },
+        {
+            "name": "0002_future.sql",
+            "size_bytes": second_sql.len(),
+            "sql_sha256": sha256_hex(&second_sql),
+            "sql": second_sql,
+        },
+    ]);
+    let column = json!({
+        "cid": 0,
+        "name": "id",
+        "declared_type": "TEXT",
+        "not_null": false,
+        "default_value": null,
+        "primary_key_position": 1,
+        "hidden": 0,
+    });
+    let expectations = json!([
+        {"manifest_prefix_length": 0, "schema_objects": [], "tables": []},
+        {
+            "manifest_prefix_length": 1,
+            "schema_objects": [{
+                "object_type": "table",
+                "name": "Current",
+                "table_name": "Current",
+                "sql_sha256": sha256_hex(current_sql),
+            }],
+            "tables": [{
+                "name": "Current",
+                "columns": [column.clone()],
+                "foreign_keys": [],
+            }],
+        },
+        {
+            "manifest_prefix_length": 2,
+            "schema_objects": [
+                {
+                    "object_type": "table",
+                    "name": "Current",
+                    "table_name": "Current",
+                    "sql_sha256": sha256_hex(current_sql),
+                },
+                {
+                    "object_type": "table",
+                    "name": "Future",
+                    "table_name": "Future",
+                    "sql_sha256": sha256_hex(future_sql),
+                },
+            ],
+            "tables": [
+                {"name": "Current", "columns": [column.clone()], "foreign_keys": []},
+                {"name": "Future", "columns": [column], "foreign_keys": []},
+            ],
+        },
     ]);
     (manifest, expectations)
 }
@@ -2424,6 +2581,84 @@ fn terminal_args_from_reconciliation(
     args
 }
 
+fn predecessor_two_table_reconciliation_evidence(
+    manifest: &Value,
+    reconciled: &Value,
+) -> (String, String, String) {
+    let proof_sha256 = reconciled["expectation_proof_sha256"]
+        .as_str()
+        .expect("expectation proof digest");
+    let predecessor_query = predecessor_two_table_full_union_query(proof_sha256);
+    let query_sha256 = sha256_hex(&predecessor_query);
+    let scoped_query_sha256 = reconciled["query_sha256"]
+        .as_str()
+        .expect("scoped query digest");
+    assert_ne!(
+        query_sha256, scoped_query_sha256,
+        "the partial-prefix predecessor query must retain a distinct full-table-union identity"
+    );
+    let current_sql_sha256 = sha256_hex("CREATE TABLE Current(id TEXT PRIMARY KEY)");
+    let snapshot = format!(
+        r#"{{"ledger":[{{"id":1,"name":"0001_current.sql"}}],"schema_objects":[{{"object_type":"table","name":"Current","table_name":"Current","sql_sha256":"{current_sql_sha256}"}}],"tables":[{{"name":"Current","columns":[{{"cid":0,"name":"id","declared_type":"TEXT","not_null":false,"default_value":null,"primary_key_position":1,"hidden":0}}],"foreign_keys":[]}},{{"name":"Future","columns":[],"foreign_keys":[]}}]}}"#
+    );
+    let canonical_snapshot_sha256 = sha256_hex(&snapshot);
+    let reconciliation_plan_sha256 = two_table_reconciliation_plan_sha256(
+        manifest,
+        reconciled,
+        &query_sha256,
+        &canonical_snapshot_sha256,
+    );
+    (
+        query_sha256,
+        canonical_snapshot_sha256,
+        reconciliation_plan_sha256,
+    )
+}
+
+fn two_table_reconciliation_plan_sha256(
+    manifest: &Value,
+    reconciled: &Value,
+    query_sha256: &str,
+    canonical_snapshot_sha256: &str,
+) -> String {
+    let manifest_summary = Value::Array(
+        manifest
+            .as_array()
+            .expect("manifest array")
+            .iter()
+            .map(|entry| {
+                json!({
+                    "name": entry["name"],
+                    "size_bytes": entry["size_bytes"],
+                    "sql_sha256": entry["sql_sha256"],
+                })
+            })
+            .collect(),
+    );
+    let plan = json!({
+        "version": 1,
+        "operation": "d1_reconcile_migration_manifest",
+        "target_key_sha256": sha256_hex("acct-1\0db-1"),
+        "database_id": "db-1",
+        "migration_family": "newsletter-core",
+        "migrations_table": "d1_migrations",
+        "manifest": manifest_summary,
+        "lease": reconciled["lease"],
+        "original_prefix_length": 0,
+        "current_prefix_length": 1,
+        "outcome": "partial_state_converged",
+        "query_sha256": query_sha256,
+        "canonical_snapshot_sha256": canonical_snapshot_sha256,
+        "effect_assertion_id": "schema_create_only_v1",
+        "retry_decision": "do_not_retry_same_attempt",
+        "lease_decision": "retain",
+        "next_slice": "persist_terminal_reconciliation_receipt_then_guarded_retirement",
+    });
+    let reconciliation_plan_sha256 =
+        sha256_hex(&serde_json::to_string(&plan).expect("serialize predecessor plan"));
+    reconciliation_plan_sha256
+}
+
 fn assert_terminal_negative_whole_response(content: &Value, mut expected: Value) {
     let plan = content["plan"].clone();
     let audit = content["audit"].clone();
@@ -2760,6 +2995,145 @@ fn spawn_fake_reconciliation_api_with_fault_and_calls(
             stream
                 .write_all(&response)
                 .expect("write reconciliation response");
+        }
+    });
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
+}
+
+fn spawn_fake_predecessor_query_compatibility_api(
+    call_count: usize,
+    fail_request_index: Option<usize>,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").expect("bind predecessor-query compatibility D1 API"); // DevSkim: ignore DS162092 -- loopback-only MCP test fixture
+    let addr = listener
+        .local_addr()
+        .expect("predecessor-query compatibility D1 address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        for (request_index, stream) in listener.incoming().take(call_count).enumerate() {
+            let mut stream = stream.expect("predecessor-query compatibility stream");
+            let (headers, body) = read_http_request(&mut stream);
+            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            let body_json: Value =
+                serde_json::from_slice(&body).expect("predecessor-query request JSON");
+            let sql = body_json["sql"].as_str().expect("predecessor-query SQL");
+            let markers = reconciliation_statement_markers(sql);
+            assert!(
+                matches!(markers.len(), 2 | 5 | 8),
+                "only selection, selected-prefix, or predecessor full-union shapes are valid: {sql}"
+            );
+            if markers.len() == 2 {
+                assert!(!sql.contains("pragma_table_xinfo"));
+            } else {
+                assert!(sql.contains("'Current', 'Future'"));
+                assert!(sql.contains("pragma_table_xinfo('Current')"));
+                assert_eq!(
+                    sql.contains("pragma_table_xinfo('Future')"),
+                    markers.len() == 8,
+                    "only the predecessor query probes the future table"
+                );
+            }
+            requests_for_thread
+                .lock()
+                .expect("predecessor-query request log")
+                .push(body_json);
+            if fail_request_index == Some(request_index) {
+                continue;
+            }
+
+            let mut results = vec![
+                tagged_reconciliation_result(
+                    &markers[0],
+                    &["id", "name"],
+                    vec![json!({"id": 1, "name": "0001_current.sql"})],
+                    Some(json!({"changed_db": false, "changes": 0, "rows_written": 0})),
+                ),
+                tagged_reconciliation_result(
+                    &markers[1],
+                    &["type", "name", "tbl_name", "sql"],
+                    if markers.len() == 2 {
+                        Vec::new()
+                    } else {
+                        vec![json!({
+                            "type": "table",
+                            "name": "Current",
+                            "tbl_name": "Current",
+                            "sql": "CREATE TABLE Current(id TEXT PRIMARY KEY)",
+                        })]
+                    },
+                    None,
+                ),
+            ];
+            for (offset, table) in ["Current", "Future"]
+                .into_iter()
+                .take((markers.len().saturating_sub(2)) / 3)
+                .enumerate()
+            {
+                let marker_offset = 2 + offset * 3;
+                results.extend([
+                    tagged_reconciliation_result(
+                        &markers[marker_offset],
+                        &[
+                            "cid",
+                            "name",
+                            "type",
+                            "notnull",
+                            "dflt_value",
+                            "pk",
+                            "hidden",
+                        ],
+                        if table == "Current" {
+                            vec![json!({
+                                "cid": 0,
+                                "name": "id",
+                                "type": "TEXT",
+                                "notnull": 0,
+                                "dflt_value": null,
+                                "pk": 1,
+                                "hidden": 0,
+                            })]
+                        } else {
+                            Vec::new()
+                        },
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[marker_offset + 1],
+                        &[
+                            "id",
+                            "seq",
+                            "table",
+                            "from",
+                            "to",
+                            "on_update",
+                            "on_delete",
+                            "match",
+                        ],
+                        Vec::new(),
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[marker_offset + 2],
+                        &["table", "rowid", "parent", "fkid"],
+                        Vec::new(),
+                        None,
+                    ),
+                ]);
+            }
+            let response = serde_json::to_vec(&json!({
+                "success": true,
+                "errors": [],
+                "messages": [],
+                "result": results,
+            }))
+            .expect("serialize predecessor-query response");
+            write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                .expect("write predecessor-query response headers");
+            stream
+                .write_all(&response)
+                .expect("write predecessor-query response");
         }
     });
     (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
@@ -11974,6 +12348,298 @@ fn d1_terminal_plan_rejects_effect_assertion_change_after_approval_for_identical
     assert_private_regular_active_lease(&lease_root);
     assert_eq!(requests.lock().expect("request log").len(), 9);
     mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_terminal_finalizes_and_replays_genuine_predecessor_full_union_evidence_from_active_custody() {
+    let (base_url, requests) = spawn_fake_predecessor_query_compatibility_api(9, None);
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-terminal-predecessor-active-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create predecessor active root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make predecessor active root private");
+    }
+    let (manifest, state_expectations) = two_table_partial_reconciliation_case();
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&lease_root, &manifest);
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let reconciliation = mcp.call_tool(
+        940,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest,
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_only_v1",
+            "state_expectations": state_expectations,
+        }),
+    );
+    let reconciled = structured_content(&reconciliation).clone();
+    assert_eq!(reconciled["ok"], true, "{reconciled}");
+    assert_eq!(reconciled["current_manifest_prefix_length"], 1);
+    assert_eq!(reconciled["provider_calls"], 3);
+    let (legacy_query_sha256, legacy_snapshot_sha256, legacy_plan_sha256) =
+        predecessor_two_table_reconciliation_evidence(&manifest, &reconciled);
+
+    let mut terminal_args = terminal_args_from_reconciliation(
+        &manifest,
+        &state_expectations,
+        &approved_plan_sha256,
+        &lease_nonce,
+        &lease_payload_sha256,
+        &reconciled,
+    );
+    terminal_args["expected_query_sha256"] = json!(legacy_query_sha256);
+    terminal_args["expected_canonical_snapshot_sha256"] = json!(legacy_snapshot_sha256);
+    terminal_args["expected_reconciliation_plan_sha256"] = json!(legacy_plan_sha256);
+
+    let mut unknown_query_args = terminal_args.clone();
+    let unknown_query_sha256 = "f".repeat(64);
+    unknown_query_args["expected_query_sha256"] = json!(unknown_query_sha256);
+    unknown_query_args["expected_reconciliation_plan_sha256"] =
+        json!(two_table_reconciliation_plan_sha256(
+            &manifest,
+            &reconciled,
+            &unknown_query_sha256,
+            terminal_args["expected_canonical_snapshot_sha256"]
+                .as_str()
+                .expect("predecessor snapshot digest"),
+        ));
+    let unknown = mcp.call_tool(
+        941,
+        "d1_finalize_migration_reconciliation",
+        unknown_query_args,
+    );
+    let unknown_content = structured_content(&unknown);
+    assert_eq!(unknown_content["ok"], false, "{unknown_content}");
+    assert_eq!(unknown_content["provider_calls"], 0);
+    assert_eq!(
+        unknown_content["error"]["code"],
+        "d1.migration_reconciliation_expected_query_unrecognized"
+    );
+    assert_eq!(requests.lock().expect("unknown-query requests").len(), 3);
+
+    let dry = mcp.call_tool(
+        942,
+        "d1_finalize_migration_reconciliation",
+        terminal_args.clone(),
+    );
+    let dry_content = structured_content(&dry).clone();
+    assert_eq!(dry_content["ok"], true, "{dry_content}");
+    assert_eq!(dry_content["provider_calls"], 2);
+
+    terminal_args["dry_run"] = json!(false);
+    terminal_args["approved_terminal_plan_sha256"] = dry_content["terminal_plan_sha256"].clone();
+    let live = mcp.call_tool(
+        943,
+        "d1_finalize_migration_reconciliation",
+        terminal_args.clone(),
+    );
+    let live_content = structured_content(&live);
+    assert_eq!(live_content["ok"], true, "{live_content}");
+    assert_eq!(live_content["provider_calls"], 4);
+    assert_eq!(live_content["provider_mutations"], 0);
+    assert_eq!(live_content["local_namespace_mutations"], 3);
+    assert_eq!(live_content["lease_retained"], false);
+    let receipt_path = manifest_target_path(&lease_root).join(format!(
+        "terminal-reconciliation.{lease_nonce}.receipt.json"
+    ));
+    let durable_receipt: Value = serde_json::from_slice(
+        &fs::read(&receipt_path).expect("read predecessor terminal receipt"),
+    )
+    .expect("decode predecessor terminal receipt");
+    assert_eq!(
+        durable_receipt["query_sha256"], terminal_args["expected_query_sha256"],
+        "the durable receipt must retain the exact predecessor query authority"
+    );
+
+    let replay = mcp.call_tool(944, "d1_finalize_migration_reconciliation", terminal_args);
+    let replay_content = structured_content(&replay);
+    assert_eq!(replay_content["ok"], true, "{replay_content}");
+    assert_eq!(
+        replay_content["status"],
+        "terminal_reconciliation_already_complete"
+    );
+    assert_eq!(replay_content["provider_calls"], 0);
+
+    let observed = requests.lock().expect("predecessor active requests");
+    assert_eq!(observed.len(), 9);
+    let statement_counts = observed
+        .iter()
+        .map(|request| {
+            reconciliation_statement_markers(request["sql"].as_str().expect("request SQL")).len()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(statement_counts, vec![2, 5, 5, 8, 8, 8, 8, 8, 8]);
+    let predecessor_query = predecessor_two_table_full_union_query(
+        reconciled["expectation_proof_sha256"]
+            .as_str()
+            .expect("expectation proof digest"),
+    );
+    assert!(
+        observed[3..]
+            .iter()
+            .all(|request| request["sql"] == predecessor_query),
+        "terminal proof and both refreshes must reuse the exact predecessor query"
+    );
+    drop(observed);
+    assert_released_manifest_target_custody(&lease_root);
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_terminal_resumes_genuine_predecessor_full_union_receipt_from_retiring_custody() {
+    let (base_url, first_requests) = spawn_fake_predecessor_query_compatibility_api(9, Some(8));
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-terminal-predecessor-retiring-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create predecessor retiring root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make predecessor retiring root private");
+    }
+    let (manifest, state_expectations) = two_table_partial_reconciliation_case();
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&lease_root, &manifest);
+    let mut first_mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let reconciliation = first_mcp.call_tool(
+        945,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest,
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_only_v1",
+            "state_expectations": state_expectations,
+        }),
+    );
+    let reconciled = structured_content(&reconciliation).clone();
+    assert_eq!(reconciled["ok"], true, "{reconciled}");
+    let (legacy_query_sha256, legacy_snapshot_sha256, legacy_plan_sha256) =
+        predecessor_two_table_reconciliation_evidence(&manifest, &reconciled);
+    let mut terminal_args = terminal_args_from_reconciliation(
+        &manifest,
+        &state_expectations,
+        &approved_plan_sha256,
+        &lease_nonce,
+        &lease_payload_sha256,
+        &reconciled,
+    );
+    terminal_args["expected_query_sha256"] = json!(legacy_query_sha256);
+    terminal_args["expected_canonical_snapshot_sha256"] = json!(legacy_snapshot_sha256);
+    terminal_args["expected_reconciliation_plan_sha256"] = json!(legacy_plan_sha256);
+    let dry = first_mcp.call_tool(
+        946,
+        "d1_finalize_migration_reconciliation",
+        terminal_args.clone(),
+    );
+    let dry_content = structured_content(&dry).clone();
+    assert_eq!(dry_content["ok"], true, "{dry_content}");
+    assert_eq!(dry_content["provider_calls"], 2);
+    terminal_args["dry_run"] = json!(false);
+    terminal_args["approved_terminal_plan_sha256"] = dry_content["terminal_plan_sha256"].clone();
+
+    let interrupted = first_mcp.call_tool(
+        947,
+        "d1_finalize_migration_reconciliation",
+        terminal_args.clone(),
+    );
+    let interrupted_content = structured_content(&interrupted);
+    assert_eq!(interrupted_content["ok"], false, "{interrupted_content}");
+    assert_eq!(interrupted_content["provider_calls"], 4);
+    assert_eq!(interrupted_content["local_namespace_mutations"], 1);
+    assert_eq!(interrupted_content["receipt_persisted"], true);
+    assert_eq!(
+        first_requests
+            .lock()
+            .expect("first predecessor requests")
+            .len(),
+        9
+    );
+    first_mcp.terminate();
+
+    let target = manifest_target_path(&lease_root);
+    fs::rename(
+        target.join("active.lease.json"),
+        target.join("retiring.lease.json"),
+    )
+    .expect("model predecessor interruption in retiring namespace");
+    fs::File::open(&target)
+        .expect("open predecessor target")
+        .sync_all()
+        .expect("sync predecessor retiring namespace");
+
+    let (resume_url, resume_requests) = spawn_fake_predecessor_query_compatibility_api(4, None);
+    let mut resume_mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", resume_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let resumed = resume_mcp.call_tool(
+        948,
+        "d1_finalize_migration_reconciliation",
+        terminal_args.clone(),
+    );
+    let resumed_content = structured_content(&resumed);
+    assert_eq!(resumed_content["ok"], true, "{resumed_content}");
+    assert_eq!(
+        resumed_content["status"],
+        "terminal_reconciliation_complete"
+    );
+    assert_eq!(resumed_content["provider_calls"], 4);
+    assert_eq!(resumed_content["provider_mutations"], 0);
+    assert_eq!(resumed_content["local_namespace_mutations"], 1);
+    assert_eq!(resumed_content["lease_retained"], false);
+    assert_eq!(
+        resume_requests
+            .lock()
+            .expect("resume predecessor requests")
+            .len(),
+        4
+    );
+
+    let replay = resume_mcp.call_tool(949, "d1_finalize_migration_reconciliation", terminal_args);
+    let replay_content = structured_content(&replay);
+    assert_eq!(replay_content["ok"], true, "{replay_content}");
+    assert_eq!(
+        replay_content["status"],
+        "terminal_reconciliation_already_complete"
+    );
+    assert_eq!(replay_content["provider_calls"], 0);
+    assert_released_manifest_target_custody(&lease_root);
+    resume_mcp.terminate();
     let _ = fs::remove_dir_all(lease_root);
 }
 

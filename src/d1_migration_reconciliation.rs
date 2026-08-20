@@ -482,6 +482,81 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
     effect_assertion_id: Option<&str>,
     state_expectations: Vec<D1MigrationStateExpectation>,
 ) -> Result<D1MigrationReconciliationProof, CallToolResult> {
+    prepare_d1_migration_reconciliation_with_query_authority(
+        server,
+        account_id,
+        database_id,
+        family,
+        migrations_table,
+        manifest,
+        approved_plan_sha256,
+        lease_nonce,
+        lease_payload_sha256,
+        effect_assertion_id,
+        state_expectations,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn prepare_d1_migration_reconciliation_for_expected_query(
+    server: &CloudflareMcp,
+    account_id: &str,
+    database_id: &str,
+    family: &str,
+    migrations_table: &str,
+    manifest: &[D1MigrationManifestEntry],
+    approved_plan_sha256: &str,
+    lease_nonce: &str,
+    lease_payload_sha256: &str,
+    effect_assertion_id: Option<&str>,
+    state_expectations: Vec<D1MigrationStateExpectation>,
+    expected_query_sha256: &str,
+    expected_current_prefix_length: usize,
+) -> Result<D1MigrationReconciliationProof, CallToolResult> {
+    prepare_d1_migration_reconciliation_with_query_authority(
+        server,
+        account_id,
+        database_id,
+        family,
+        migrations_table,
+        manifest,
+        approved_plan_sha256,
+        lease_nonce,
+        lease_payload_sha256,
+        effect_assertion_id,
+        state_expectations,
+        Some((expected_query_sha256, expected_current_prefix_length)),
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconciliationQueryMode {
+    // Ordinary read-only reconciliation always uses this mode. The legacy
+    // modes are reachable only through terminal evidence that reproduces an
+    // exact approved query digest at its independently expected prefix.
+    ScopedSelectedPrefix,
+    LegacyFullUnionWithSelection,
+    LegacyFullUnionWithoutSelection,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_d1_migration_reconciliation_with_query_authority(
+    server: &CloudflareMcp,
+    account_id: &str,
+    database_id: &str,
+    family: &str,
+    migrations_table: &str,
+    manifest: &[D1MigrationManifestEntry],
+    approved_plan_sha256: &str,
+    lease_nonce: &str,
+    lease_payload_sha256: &str,
+    effect_assertion_id: Option<&str>,
+    state_expectations: Vec<D1MigrationStateExpectation>,
+    expected_query_authority: Option<(&str, usize)>,
+) -> Result<D1MigrationReconciliationProof, CallToolResult> {
     if let Err(result) = validate_generic_d1_migration_family(family) {
         return Err(prelease_error(result, "not_inspected", None));
     }
@@ -534,6 +609,84 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
         &validated.proof_sha256,
         seed_assertion,
     );
+    let query_mode = match expected_query_authority {
+        None => ReconciliationQueryMode::ScopedSelectedPrefix,
+        Some((expected_query_sha256, expected_prefix)) => {
+            let Some(expected_state) = validated.states.get(expected_prefix) else {
+                return Err(prelease_error(
+                    reconciliation_error(
+                        "contradictory",
+                        "d1.migration_reconciliation_expected_query_unrecognized",
+                        "approved query evidence does not identify a supported scoped or predecessor reconciliation query",
+                    ),
+                    "not_inspected",
+                    None,
+                ));
+            };
+            let expected_seed_state = validated
+                .seed_states
+                .get(expected_prefix)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let scoped_table_names = expected_state
+                .tables
+                .iter()
+                .map(|table| table.name.clone())
+                .collect::<Vec<_>>();
+            let scoped_query = build_fixed_query(
+                migrations_table,
+                manifest.len(),
+                &validated.object_names,
+                &scoped_table_names,
+                expected_seed_state,
+                &validated.proof_sha256,
+                seed_assertion,
+            );
+            let legacy_query = build_fixed_query(
+                migrations_table,
+                manifest.len(),
+                &validated.object_names,
+                &validated.table_names,
+                expected_seed_state,
+                &validated.proof_sha256,
+                seed_assertion,
+            );
+            if expected_query_sha256 == scoped_query.sha256 {
+                ReconciliationQueryMode::ScopedSelectedPrefix
+            } else if expected_query_sha256 == legacy_query.sha256 {
+                if seed_assertion {
+                    ReconciliationQueryMode::LegacyFullUnionWithSelection
+                } else {
+                    ReconciliationQueryMode::LegacyFullUnionWithoutSelection
+                }
+            } else {
+                return Err(prelease_error(
+                    reconciliation_error(
+                        "contradictory",
+                        "d1.migration_reconciliation_expected_query_unrecognized",
+                        "approved query evidence does not identify a supported scoped or predecessor reconciliation query",
+                    ),
+                    "not_inspected",
+                    None,
+                ));
+            }
+        }
+    };
+    let legacy_query_without_selection =
+        (query_mode == ReconciliationQueryMode::LegacyFullUnionWithoutSelection).then(|| {
+            build_fixed_query(
+                migrations_table,
+                manifest.len(),
+                &validated.object_names,
+                &validated.table_names,
+                &[],
+                &validated.proof_sha256,
+                seed_assertion,
+            )
+        });
+    let initial_query = legacy_query_without_selection
+        .as_ref()
+        .unwrap_or(&selection_query);
     let lease = match inspect_retained_d1_migration_lease(
         account_id,
         database_id,
@@ -545,76 +698,143 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
         Ok(lease) => lease,
         Err(result) => {
             return Err(with_query_shape_receipt(
-                prelease_error(result, "inspection_failed", Some(&selection_query.sha256)),
-                &selection_query,
+                prelease_error(result, "inspection_failed", Some(&initial_query.sha256)),
+                initial_query,
             ));
         }
     };
 
-    let selection = match read_complete_batch(
-        server,
-        &lease,
-        account_id,
-        database_id,
-        &selection_query,
-        manifest,
-    )
-    .await
-    {
-        Ok(batch) => batch,
-        Err(result) => return Err(result),
+    let selection = if query_mode == ReconciliationQueryMode::LegacyFullUnionWithoutSelection {
+        None
+    } else {
+        let batch = match read_complete_batch(
+            server,
+            &lease,
+            account_id,
+            database_id,
+            &selection_query,
+            manifest,
+        )
+        .await
+        {
+            Ok(batch) => batch,
+            Err(result) => return Err(result),
+        };
+        if classify_d1_manifest_ledger(manifest, &batch.snapshot.ledger).is_err() {
+            return Err(with_query_shape_receipt(
+                contextualize_error(
+                    reconciliation_error_with_evidence(
+                        "contradictory",
+                        "d1.migration_reconciliation_ledger_not_manifest_prefix",
+                        "selection evidence did not contain an exact manifest ledger prefix",
+                        Some(&selection_query.sha256),
+                        &[response_digest_summary(&batch)],
+                    ),
+                    Some(&selection_query.sha256),
+                    &[],
+                    1,
+                ),
+                &selection_query,
+            ));
+        }
+        if expected_query_authority
+            .is_some_and(|(_, expected_prefix)| batch.snapshot.ledger.len() != expected_prefix)
+        {
+            return Err(with_query_shape_receipt(
+                contextualize_error(
+                    reconciliation_error_with_evidence(
+                        "contradictory",
+                        "d1.migration_reconciliation_selected_ledger_changed",
+                        "primary-current selection did not equal the approved query prefix",
+                        Some(&selection_query.sha256),
+                        &[response_digest_summary(&batch)],
+                    ),
+                    Some(&selection_query.sha256),
+                    &[],
+                    1,
+                ),
+                &selection_query,
+            ));
+        }
+        Some(batch)
     };
-    if classify_d1_manifest_ledger(manifest, &selection.snapshot.ledger).is_err() {
+    let selected_prefix = selection
+        .as_ref()
+        .map(|batch| batch.snapshot.ledger.len())
+        .or_else(|| expected_query_authority.map(|(_, prefix)| prefix));
+    let selected_seed_state = selected_prefix
+        .and_then(|prefix| validated.seed_states.get(prefix))
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let selection_query_sha256 = selection.as_ref().map(|_| selection_query.sha256.clone());
+    let query = match query_mode {
+        ReconciliationQueryMode::ScopedSelectedPrefix => {
+            let prefix = selected_prefix.expect("scoped query always has a selected prefix");
+            let selected_table_names = validated.states[prefix]
+                .tables
+                .iter()
+                .map(|table| table.name.clone())
+                .collect::<Vec<_>>();
+            build_fixed_query(
+                migrations_table,
+                manifest.len(),
+                &validated.object_names,
+                &selected_table_names,
+                selected_seed_state,
+                &validated.proof_sha256,
+                seed_assertion,
+            )
+        }
+        ReconciliationQueryMode::LegacyFullUnionWithSelection => build_fixed_query(
+            migrations_table,
+            manifest.len(),
+            &validated.object_names,
+            &validated.table_names,
+            selected_seed_state,
+            &validated.proof_sha256,
+            seed_assertion,
+        ),
+        ReconciliationQueryMode::LegacyFullUnionWithoutSelection => {
+            legacy_query_without_selection.expect("legacy query without selection was precomputed")
+        }
+    };
+    if expected_query_authority
+        .is_some_and(|(expected_query_sha256, _)| query.sha256 != expected_query_sha256)
+    {
         return Err(with_query_shape_receipt(
             contextualize_error(
                 reconciliation_error_with_evidence(
                     "contradictory",
-                    "d1.migration_reconciliation_ledger_not_manifest_prefix",
-                    "selection evidence did not contain an exact manifest ledger prefix",
-                    Some(&selection_query.sha256),
-                    &[response_digest_summary(&selection)],
+                    "d1.migration_reconciliation_expected_query_unrecognized",
+                    "selected ledger did not reproduce the exact approved reconciliation query",
+                    Some(&query.sha256),
+                    &selection
+                        .iter()
+                        .map(response_digest_summary)
+                        .collect::<Vec<_>>(),
                 ),
-                Some(&selection_query.sha256),
+                Some(&query.sha256),
                 &[],
-                1,
+                usize::from(selection.is_some()),
             ),
-            &selection_query,
+            &query,
         ));
     }
-    let selected_prefix = selection.snapshot.ledger.len();
-    let selected_state = &validated.states[selected_prefix];
-    let selected_table_names = selected_state
-        .tables
-        .iter()
-        .map(|table| table.name.clone())
-        .collect::<Vec<_>>();
-    let selected_seed_state = validated
-        .seed_states
-        .get(selected_prefix)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-    let selection_query_sha256 = selection_query.sha256.clone();
-    let query = build_fixed_query(
-        migrations_table,
-        manifest.len(),
-        &validated.object_names,
-        &selected_table_names,
-        selected_seed_state,
-        &validated.proof_sha256,
-        seed_assertion,
-    );
 
     let first = match read_complete_batch(server, &lease, account_id, database_id, &query, manifest)
         .await
     {
         Ok(batch) => batch,
         Err(result) => {
-            return Err(contextualize_error(
-                result,
-                Some(&query.sha256),
-                &[response_digest_summary(&selection)],
-                1,
-            ));
+            if let Some(selection) = selection.as_ref() {
+                return Err(contextualize_error(
+                    result,
+                    Some(&query.sha256),
+                    &[response_digest_summary(selection)],
+                    1,
+                ));
+            }
+            return Err(result);
         }
     };
     let first_digest = batch_digest(&first);
@@ -630,7 +850,10 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
     {
         Ok(batch) => batch,
         Err(result) => {
-            let mut prior = vec![response_digest_summary(&selection)];
+            let mut prior = selection
+                .iter()
+                .map(response_digest_summary)
+                .collect::<Vec<_>>();
             prior.push(response_digest_summary(&first));
             return Err(contextualize_error(
                 result,
@@ -640,7 +863,10 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
             ));
         }
     };
-    let mut stable_evidence = vec![response_digest_summary(&selection)];
+    let mut stable_evidence = selection
+        .iter()
+        .map(response_digest_summary)
+        .collect::<Vec<_>>();
     stable_evidence.push(response_digest_summary(&first));
     stable_evidence.push(response_digest_summary(&second));
     let stable_provider_calls = stable_evidence.len();
@@ -664,20 +890,25 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
             Some(&query.sha256),
             &stable_evidence,
         );
-        add_selection_binding_evidence(
-            &mut result,
-            &selection,
-            &selection_query_sha256,
-            &[&first, &second],
-        );
+        if let (Some(selection), Some(selection_query_sha256)) =
+            (selection.as_ref(), selection_query_sha256.as_deref())
+        {
+            add_selection_binding_evidence(
+                &mut result,
+                selection,
+                selection_query_sha256,
+                &[&first, &second],
+            );
+        }
         return Err(with_query_shape_receipt(
             contextualize_error(result, Some(&query.sha256), &[], stable_provider_calls),
             &query,
         ));
     }
-    if first.snapshot.ledger != selection.snapshot.ledger
-        || second.snapshot.ledger != selection.snapshot.ledger
-    {
+    if selection.as_ref().is_some_and(|selection| {
+        first.snapshot.ledger != selection.snapshot.ledger
+            || second.snapshot.ledger != selection.snapshot.ledger
+    }) {
         let mut result = reconciliation_error_with_evidence(
             "contradictory",
             "d1.migration_reconciliation_selected_ledger_changed",
@@ -687,8 +918,10 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
         );
         add_selection_binding_evidence(
             &mut result,
-            &selection,
-            &selection_query_sha256,
+            selection.as_ref().expect("selection was checked above"),
+            selection_query_sha256
+                .as_deref()
+                .expect("selection query identity accompanies selection"),
             &[&first, &second],
         );
         return Err(with_query_shape_receipt(
@@ -830,8 +1063,8 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
     );
     Ok(D1MigrationReconciliationProof {
         lease,
-        selection: Some(selection),
-        selection_query_sha256: Some(selection_query_sha256),
+        selection,
+        selection_query_sha256,
         query,
         first,
         second,
