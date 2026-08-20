@@ -28,6 +28,7 @@ pub(crate) const D1_BOOTSTRAP_RESERVED_MIGRATION_FAMILY: &str = "migration-ledge
 pub(crate) const D1_FOREIGN_KEYS_ON_EXECUTION_TRANSFORM_V1: &str =
     "drop-leading-pragma-foreign-keys-on-v1";
 const D1_FOREIGN_KEYS_ON_PREFIX_V1: &str = "PRAGMA foreign_keys = ON;\n\n";
+const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct D1MigrationExecution {
@@ -96,6 +97,13 @@ fn contains_foreign_keys_pragma(sql: &str) -> bool {
     let mut cursor = 0usize;
     let mut state = ForeignKeysPragmaScan::StatementStart;
     while cursor < bytes.len() {
+        // SQLite treats U+FEFF as lexical whitespace, including before and
+        // within PRAGMA statements. Preserve the source bytes, but skip the
+        // exact UTF-8 sequence here so it cannot conceal a real pragma.
+        if bytes[cursor..].starts_with(UTF8_BOM) {
+            cursor += UTF8_BOM.len();
+            continue;
+        }
         match bytes[cursor] {
             b';' => {
                 state = ForeignKeysPragmaScan::StatementStart;
@@ -1126,6 +1134,10 @@ mod tests {
             "PRAGMA [foreign_keys] = ON; CREATE TABLE items(id INTEGER);",
             "PRAGMA \"main\".foreign_keys = ON; CREATE TABLE items(id INTEGER);",
             "PRAGMA main.\"foreign_keys\" = ON; CREATE TABLE items(id INTEGER);",
+            "\u{feff}PRAGMA foreign_keys = ON;\n\nCREATE TABLE items(id INTEGER);",
+            " \u{feff}PRAGMA foreign_keys = ON; CREATE TABLE items(id INTEGER);",
+            "PRAGMA \u{feff}foreign_keys = ON; CREATE TABLE items(id INTEGER);",
+            "PRAGMA optimize;\u{feff}PRAGMA foreign_keys = ON;",
         ] {
             assert!(
                 derive_d1_manifest_execution_plan(&[manifest_entry(sql)]).is_err(),
@@ -1168,6 +1180,7 @@ mod tests {
             "-- PRAGMA foreign_keys = ON;\nCREATE TABLE notes(body TEXT);",
             "/* PRAGMA foreign_keys = ON; */ CREATE TABLE notes(body TEXT);",
             "PRAGMA optimize; CREATE TABLE foreign_keys(id INTEGER);",
+            "\u{feff}CREATE TABLE notes(body TEXT);",
         ] {
             assert!(
                 derive_d1_manifest_execution_plan(&[manifest_entry(sql)]).is_ok(),

@@ -8224,6 +8224,8 @@ fn d1_manifest_execution_transform_rejects_noncanonical_pragma_before_provider()
         "PRAGMA/*;*/foreign_keys = ON; CREATE TABLE items(id INTEGER);",
         "PRAGMA -- ;\n foreign_keys = ON; CREATE TABLE items(id INTEGER);",
         "PRAGMA optimize; PRAGMA main.foreign_keys(ON);",
+        "\u{feff}PRAGMA foreign_keys = ON;\n\nCREATE TABLE items(id INTEGER);",
+        " \u{feff}PRAGMA foreign_keys = ON; CREATE TABLE items(id INTEGER);",
     ]
     .into_iter()
     .enumerate()
@@ -8246,7 +8248,18 @@ fn d1_manifest_execution_transform_rejects_noncanonical_pragma_before_provider()
         let content = structured_content(&response);
         assert_eq!(content["ok"], json!(false), "{content}");
         assert_eq!(content["provider_calls"], json!(0), "{content}");
+        assert_eq!(content["provider_mutations"], json!(0), "{content}");
         assert_eq!(content["local_namespace_mutations"], json!(0), "{content}");
+        assert_eq!(
+            content["lease_decision"],
+            json!("not_acquired"),
+            "{content}"
+        );
+        assert_eq!(
+            content["custody_status"],
+            json!("not_inspected"),
+            "{content}"
+        );
         assert_eq!(
             content["error"]["code"],
             if index == 3 {
