@@ -142,6 +142,24 @@ For `d1_bootstrap_migration_ledger` and `d1_apply_migration_manifest`, a live `a
 
 The exact family `migration-ledger-bootstrap-v1` is reserved to `d1_bootstrap_migration_ledger` and its dedicated reconcile, finalize, and abort tools. Generic manifest apply, read-only reconciliation, and terminal finalization reject that family before provider access, custody inspection or creation, receipt access, or local namespace mutation; similarly prefixed family labels are not reserved.
 
+Cloudflare D1 already enforces foreign keys and runs each query or migration in
+an implicit transaction, so a migration cannot enable enforcement with
+`PRAGMA foreign_keys = ON`. The manifest tool preserves that exact reviewed
+source text, size, and SHA-256, but execution transform
+`drop-leading-pragma-foreign-keys-on-v1` removes the pragma only when it is the
+byte-exact first statement `PRAGMA foreign_keys = ON;` followed by two LF
+bytes and non-empty migration SQL. Dry-run and apply responses expose the
+transform ID/version, executed byte count and SHA-256, and complete provider
+statement SHA-256. A transformed version-2 plan binds those fields; its digest
+then binds lease custody, retained reconciliation, terminal receipt,
+finalization, and exact replay. Case, whitespace, comment, duplicate, embedded,
+empty-remainder, or otherwise ambiguous `foreign_keys` forms cannot produce a
+new plan and fail before provider or local custody mutation. Read-only retained
+reconciliation continues to recognize an exact predecessor version-1 plan so
+its existing assertion grammars and terminal recovery remain compatible; that
+compatibility never authorizes a fresh apply. Manifests without this exact
+prefix retain the existing version-1 plan digest.
+
 | Tool | Required arguments | Optional arguments | Notes |
 | --- | --- | --- | --- |
 | `health` | none | none | Runtime status summary. |

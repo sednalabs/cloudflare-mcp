@@ -25,6 +25,296 @@ pub(crate) struct D1ManifestTarget {
 }
 
 pub(crate) const D1_BOOTSTRAP_RESERVED_MIGRATION_FAMILY: &str = "migration-ledger-bootstrap-v1";
+pub(crate) const D1_FOREIGN_KEYS_ON_EXECUTION_TRANSFORM_V1: &str =
+    "drop-leading-pragma-foreign-keys-on-v1";
+const D1_FOREIGN_KEYS_ON_PREFIX_V1: &str = "PRAGMA foreign_keys = ON;\n\n";
+const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct D1MigrationExecution {
+    pub(crate) source_name: String,
+    pub(crate) source_sql_sha256: String,
+    pub(crate) transform_id: String,
+    pub(crate) transform_version: u8,
+    pub(crate) executed_sql: String,
+    pub(crate) executed_sql_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct D1ManifestExecutionPlan {
+    pub(crate) migrations: Vec<D1MigrationExecution>,
+    pub(crate) transformed: bool,
+}
+
+fn sql_word(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+#[derive(Clone, Copy)]
+enum ForeignKeysPragmaScan {
+    StatementStart,
+    ExplainStatement,
+    ExplainQuery,
+    ExplainQueryPlan,
+    PragmaName,
+    SchemaDot,
+    SchemaPragmaName,
+    IgnoreStatement,
+}
+
+fn consume_quoted_sql_token(
+    bytes: &[u8],
+    mut cursor: usize,
+    closing: u8,
+    expected: &[u8],
+) -> (usize, bool) {
+    cursor += 1;
+    let mut expected_cursor = 0usize;
+    let mut matches = true;
+    let mut closed = false;
+    while cursor < bytes.len() {
+        if bytes[cursor] == closing {
+            if bytes.get(cursor + 1) == Some(&closing) {
+                matches = false;
+                cursor += 2;
+                continue;
+            }
+            cursor += 1;
+            closed = true;
+            break;
+        }
+        matches &= expected
+            .get(expected_cursor)
+            .is_some_and(|expected| bytes[cursor].eq_ignore_ascii_case(expected));
+        expected_cursor += 1;
+        cursor += 1;
+    }
+    (
+        cursor,
+        closed && matches && expected_cursor == expected.len(),
+    )
+}
+
+fn contains_foreign_keys_pragma(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut cursor = 0usize;
+    let mut state = ForeignKeysPragmaScan::StatementStart;
+    while cursor < bytes.len() {
+        // SQLite treats U+FEFF as lexical whitespace, including before and
+        // within PRAGMA statements. Preserve the source bytes, but skip the
+        // exact UTF-8 sequence here so it cannot conceal a real pragma.
+        if bytes[cursor..].starts_with(UTF8_BOM) {
+            cursor += UTF8_BOM.len();
+            continue;
+        }
+        match bytes[cursor] {
+            b';' => {
+                state = ForeignKeysPragmaScan::StatementStart;
+                cursor += 1;
+            }
+            b'-' if bytes.get(cursor + 1) == Some(&b'-') => {
+                cursor += 2;
+                while cursor < bytes.len() && !matches!(bytes[cursor], b'\n' | b'\r') {
+                    cursor += 1;
+                }
+            }
+            b'/' if bytes.get(cursor + 1) == Some(&b'*') => {
+                cursor += 2;
+                while cursor < bytes.len()
+                    && !(bytes[cursor] == b'*' && bytes.get(cursor + 1) == Some(&b'/'))
+                {
+                    cursor += 1;
+                }
+                cursor = (cursor + 2).min(bytes.len());
+            }
+            quote @ (b'\'' | b'"' | b'`') => {
+                let (next, is_foreign_keys) =
+                    consume_quoted_sql_token(bytes, cursor, quote, b"foreign_keys");
+                cursor = next;
+                state = match state {
+                    ForeignKeysPragmaScan::PragmaName | ForeignKeysPragmaScan::SchemaPragmaName
+                        if is_foreign_keys =>
+                    {
+                        return true;
+                    }
+                    ForeignKeysPragmaScan::PragmaName => ForeignKeysPragmaScan::SchemaDot,
+                    ForeignKeysPragmaScan::StatementStart
+                    | ForeignKeysPragmaScan::ExplainStatement
+                    | ForeignKeysPragmaScan::ExplainQuery
+                    | ForeignKeysPragmaScan::ExplainQueryPlan
+                    | ForeignKeysPragmaScan::SchemaPragmaName => {
+                        ForeignKeysPragmaScan::IgnoreStatement
+                    }
+                    state => state,
+                };
+            }
+            b'[' => {
+                let (next, is_foreign_keys) =
+                    consume_quoted_sql_token(bytes, cursor, b']', b"foreign_keys");
+                cursor = next;
+                state = match state {
+                    ForeignKeysPragmaScan::PragmaName | ForeignKeysPragmaScan::SchemaPragmaName
+                        if is_foreign_keys =>
+                    {
+                        return true;
+                    }
+                    ForeignKeysPragmaScan::PragmaName => ForeignKeysPragmaScan::SchemaDot,
+                    ForeignKeysPragmaScan::StatementStart
+                    | ForeignKeysPragmaScan::ExplainStatement
+                    | ForeignKeysPragmaScan::ExplainQuery
+                    | ForeignKeysPragmaScan::ExplainQueryPlan
+                    | ForeignKeysPragmaScan::SchemaPragmaName => {
+                        ForeignKeysPragmaScan::IgnoreStatement
+                    }
+                    state => state,
+                };
+            }
+            b'.' => {
+                state = match state {
+                    ForeignKeysPragmaScan::SchemaDot => ForeignKeysPragmaScan::SchemaPragmaName,
+                    ForeignKeysPragmaScan::IgnoreStatement => {
+                        ForeignKeysPragmaScan::IgnoreStatement
+                    }
+                    _ => ForeignKeysPragmaScan::IgnoreStatement,
+                };
+                cursor += 1;
+            }
+            byte if byte.is_ascii_whitespace() => cursor += 1,
+            byte if sql_word(byte) => {
+                let start = cursor;
+                while cursor < bytes.len() && sql_word(bytes[cursor]) {
+                    cursor += 1;
+                }
+                state = match state {
+                    ForeignKeysPragmaScan::StatementStart
+                        if bytes[start..cursor].eq_ignore_ascii_case(b"pragma") =>
+                    {
+                        ForeignKeysPragmaScan::PragmaName
+                    }
+                    ForeignKeysPragmaScan::StatementStart
+                        if bytes[start..cursor].eq_ignore_ascii_case(b"explain") =>
+                    {
+                        ForeignKeysPragmaScan::ExplainStatement
+                    }
+                    ForeignKeysPragmaScan::ExplainStatement
+                        if bytes[start..cursor].eq_ignore_ascii_case(b"pragma") =>
+                    {
+                        ForeignKeysPragmaScan::PragmaName
+                    }
+                    ForeignKeysPragmaScan::ExplainStatement
+                        if bytes[start..cursor].eq_ignore_ascii_case(b"query") =>
+                    {
+                        ForeignKeysPragmaScan::ExplainQuery
+                    }
+                    ForeignKeysPragmaScan::ExplainQuery
+                        if bytes[start..cursor].eq_ignore_ascii_case(b"plan") =>
+                    {
+                        ForeignKeysPragmaScan::ExplainQueryPlan
+                    }
+                    ForeignKeysPragmaScan::ExplainQueryPlan
+                        if bytes[start..cursor].eq_ignore_ascii_case(b"pragma") =>
+                    {
+                        ForeignKeysPragmaScan::PragmaName
+                    }
+                    ForeignKeysPragmaScan::PragmaName
+                        if bytes[start..cursor].eq_ignore_ascii_case(b"foreign_keys") =>
+                    {
+                        return true;
+                    }
+                    ForeignKeysPragmaScan::SchemaPragmaName
+                        if bytes[start..cursor].eq_ignore_ascii_case(b"foreign_keys") =>
+                    {
+                        return true;
+                    }
+                    ForeignKeysPragmaScan::PragmaName => ForeignKeysPragmaScan::SchemaDot,
+                    ForeignKeysPragmaScan::IgnoreStatement => {
+                        ForeignKeysPragmaScan::IgnoreStatement
+                    }
+                    _ => ForeignKeysPragmaScan::IgnoreStatement,
+                };
+            }
+            _ => {
+                state = ForeignKeysPragmaScan::IgnoreStatement;
+                cursor += 1;
+            }
+        }
+    }
+    false
+}
+
+fn contains_non_trivia_sql(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        if bytes[cursor..].starts_with(UTF8_BOM) {
+            cursor += UTF8_BOM.len();
+        } else if bytes[cursor].is_ascii_whitespace() || bytes[cursor] == b';' {
+            cursor += 1;
+        } else if bytes[cursor..].starts_with(b"--") {
+            cursor += 2;
+            while cursor < bytes.len() && !matches!(bytes[cursor], b'\n' | b'\r') {
+                cursor += 1;
+            }
+        } else if bytes[cursor..].starts_with(b"/*") {
+            cursor += 2;
+            while cursor < bytes.len()
+                && !(bytes[cursor] == b'*' && bytes.get(cursor + 1) == Some(&b'/'))
+            {
+                cursor += 1;
+            }
+            cursor = (cursor + 2).min(bytes.len());
+        } else {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn derive_d1_manifest_execution_plan(
+    manifest: &[D1MigrationManifestEntry],
+) -> Result<D1ManifestExecutionPlan, CallToolResult> {
+    let mut transformed = false;
+    let mut migrations = Vec::with_capacity(manifest.len());
+    for migration in manifest {
+        let (transform_id, transform_version, executed_sql) = if let Some(remainder) =
+            migration.sql.strip_prefix(D1_FOREIGN_KEYS_ON_PREFIX_V1)
+        {
+            if !contains_non_trivia_sql(remainder) || contains_foreign_keys_pragma(remainder) {
+                return Err(invalid_argument_result(
+                    "d1.migration_execution_transform_ambiguous",
+                    "the reviewed leading foreign_keys pragma was empty, repeated, embedded, or otherwise ambiguous",
+                    "Keep exactly one byte-exact leading `PRAGMA foreign_keys = ON;` followed by one blank LF line and executable migration SQL; remove every other foreign_keys pragma.",
+                ));
+            }
+            transformed = true;
+            (
+                D1_FOREIGN_KEYS_ON_EXECUTION_TRANSFORM_V1,
+                1,
+                remainder.to_string(),
+            )
+        } else if contains_foreign_keys_pragma(&migration.sql) {
+            return Err(invalid_argument_result(
+                "d1.migration_execution_transform_unsupported",
+                "the migration contains a foreign_keys pragma outside the one exact reviewed leading no-op form",
+                "Use exactly `PRAGMA foreign_keys = ON;` at byte zero followed by two LF bytes, or remove the pragma from the reviewed source migration.",
+            ));
+        } else {
+            ("identity-v1", 1, migration.sql.clone())
+        };
+        migrations.push(D1MigrationExecution {
+            source_name: migration.name.clone(),
+            source_sql_sha256: migration.sql_sha256.to_ascii_lowercase(),
+            transform_id: transform_id.to_string(),
+            transform_version,
+            executed_sql_sha256: sha256_hex(&executed_sql),
+            executed_sql,
+        });
+    }
+    Ok(D1ManifestExecutionPlan {
+        migrations,
+        transformed,
+    })
+}
 
 pub(crate) fn validate_generic_d1_migration_family(family: &str) -> Result<(), CallToolResult> {
     if family == D1_BOOTSTRAP_RESERVED_MIGRATION_FAMILY {
@@ -777,8 +1067,11 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        approved_d1_plan_digest_matches, current_wrangler_d1_migration_ledger_table_sql,
-        d1_manifest_write_result_classification, d1_migrations_table_init_sql,
+        D1_FOREIGN_KEYS_ON_PREFIX_V1, approved_d1_plan_digest_matches,
+        current_wrangler_d1_migration_ledger_table_sql, d1_manifest_execution_summaries,
+        d1_manifest_legacy_plan_sha256, d1_manifest_plan_sha256,
+        d1_manifest_write_result_classification, d1_migration_execution_provider_sql,
+        d1_migrations_table_init_sql, derive_d1_manifest_execution_plan,
         expected_d1_migration_ledger_table_sql, legacy_wrangler_d1_migration_ledger_table_sql,
         parse_d1_migration_ledger, parse_d1_migration_ledger_authority,
         validate_d1_manifest_write_result, validate_d1_migration_manifest,
@@ -798,6 +1091,189 @@ mod tests {
                 "sql": expected_d1_migration_ledger_table_sql(table),
             }],
         }])
+    }
+
+    fn manifest_entry(sql: &str) -> D1MigrationManifestEntry {
+        D1MigrationManifestEntry {
+            name: "0001_core.sql".to_string(),
+            size_bytes: sql.len() as u64,
+            sql_sha256: sha256_hex(sql),
+            sql: sql.to_string(),
+        }
+    }
+
+    #[test]
+    fn execution_transform_is_exact_versioned_and_provider_bound() {
+        let source = "PRAGMA foreign_keys = ON;\n\nCREATE TABLE items(id INTEGER PRIMARY KEY);";
+        let manifest = vec![manifest_entry(source)];
+        let execution = derive_d1_manifest_execution_plan(&manifest).expect("exact transform");
+        assert!(execution.transformed);
+        assert_eq!(
+            execution.migrations[0].source_sql_sha256,
+            sha256_hex(source)
+        );
+        assert_eq!(
+            execution.migrations[0].executed_sql,
+            "CREATE TABLE items(id INTEGER PRIMARY KEY);"
+        );
+        assert_eq!(
+            execution.migrations[0].transform_id,
+            "drop-leading-pragma-foreign-keys-on-v1"
+        );
+        assert_eq!(execution.migrations[0].transform_version, 1);
+        let provider = d1_migration_execution_provider_sql(
+            &execution.migrations[0],
+            "d1_migrations",
+            "0001_core.sql",
+        );
+        assert_eq!(
+            provider,
+            "CREATE TABLE items(id INTEGER PRIMARY KEY);\n\nINSERT INTO \"d1_migrations\" (name) VALUES ('0001_core.sql');"
+        );
+        let summaries = d1_manifest_execution_summaries(&execution, "d1_migrations");
+        assert_eq!(
+            summaries[0]["executed_sql_sha256"],
+            sha256_hex(&execution.migrations[0].executed_sql)
+        );
+        assert_eq!(
+            summaries[0]["provider_statement_sha256"],
+            sha256_hex(&provider)
+        );
+
+        let ledger = Vec::new();
+        let plan = d1_manifest_plan_sha256(
+            "account",
+            "database",
+            "newsletter-core",
+            "d1_migrations",
+            &manifest,
+            &ledger,
+            &execution,
+        );
+        assert_ne!(
+            plan,
+            d1_manifest_legacy_plan_sha256(
+                "account",
+                "database",
+                "newsletter-core",
+                "d1_migrations",
+                &manifest,
+                &ledger,
+            )
+        );
+        let mut drifted = execution.clone();
+        drifted.migrations[0].executed_sql.push('\n');
+        drifted.migrations[0].executed_sql_sha256 = sha256_hex(&drifted.migrations[0].executed_sql);
+        assert_ne!(
+            plan,
+            d1_manifest_plan_sha256(
+                "account",
+                "database",
+                "newsletter-core",
+                "d1_migrations",
+                &manifest,
+                &ledger,
+                &drifted,
+            ),
+            "executed-byte drift must change plan, lease, receipt, and replay authority"
+        );
+    }
+
+    #[test]
+    fn execution_transform_rejects_variants_duplicates_and_embedded_pragmas() {
+        for sql in [
+            "pragma foreign_keys = on;\n\nCREATE TABLE items(id INTEGER);",
+            "PRAGMA foreign_keys = ON;\nCREATE TABLE items(id INTEGER);",
+            "-- leading\nPRAGMA foreign_keys = ON;\n\nCREATE TABLE items(id INTEGER);",
+            "PRAGMA foreign_keys = ON;\n\nPRAGMA foreign_keys = ON;\nCREATE TABLE items(id INTEGER);",
+            "CREATE TABLE items(id INTEGER); PRAGMA foreign_keys = ON;",
+            "PRAGMA main.foreign_keys = ON; CREATE TABLE items(id INTEGER);",
+            "PRAGMA/*;*/foreign_keys = ON; CREATE TABLE items(id INTEGER);",
+            "PRAGMA -- ;\n foreign_keys = ON; CREATE TABLE items(id INTEGER);",
+            "PRAGMA optimize; PRAGMA foreign_keys(ON);",
+            "PRAGMA 'foreign_keys' = ON; CREATE TABLE items(id INTEGER);",
+            "PRAGMA \"foreign_keys\" = ON; CREATE TABLE items(id INTEGER);",
+            "PRAGMA `foreign_keys` = ON; CREATE TABLE items(id INTEGER);",
+            "PRAGMA [foreign_keys] = ON; CREATE TABLE items(id INTEGER);",
+            "PRAGMA \"main\".foreign_keys = ON; CREATE TABLE items(id INTEGER);",
+            "PRAGMA main.\"foreign_keys\" = ON; CREATE TABLE items(id INTEGER);",
+            "\u{feff}PRAGMA foreign_keys = ON;\n\nCREATE TABLE items(id INTEGER);",
+            " \u{feff}PRAGMA foreign_keys = ON; CREATE TABLE items(id INTEGER);",
+            "PRAGMA \u{feff}foreign_keys = ON; CREATE TABLE items(id INTEGER);",
+            "PRAGMA optimize;\u{feff}PRAGMA foreign_keys = ON;",
+            "EXPLAIN PRAGMA foreign_keys = OFF;",
+            "EXPLAIN QUERY PLAN PRAGMA foreign_keys(OFF);",
+            "EXPLAIN PRAGMA main.\"foreign_keys\" = OFF;",
+            "EXPLAIN QUERY PLAN PRAGMA \"main\".[foreign_keys](OFF);",
+            "EXPLAIN/* prefix trivia */PRAGMA foreign_keys = OFF;",
+            "EXPLAIN QUERY -- prefix trivia\n PLAN \u{feff}PRAGMA foreign_keys = OFF;",
+            "PRAGMA foreign_keys = ON;\n\n\u{feff}",
+            "PRAGMA foreign_keys = ON;\n\n \t\u{feff}\r\n",
+            "PRAGMA foreign_keys = ON;\n\n\u{feff}/* trivia only */ -- end",
+            "PRAGMA foreign_keys = ON;\n\n;",
+            "PRAGMA foreign_keys = ON;\n\n;;;",
+            "PRAGMA foreign_keys = ON;\n\n; \u{feff}\t/* empty */;-- empty\n;;",
+        ] {
+            assert!(
+                derive_d1_manifest_execution_plan(&[manifest_entry(sql)]).is_err(),
+                "unsupported form must fail closed: {sql:?}"
+            );
+        }
+
+        let separated_remainder =
+            ";; \u{feff}/* leading empty commands */;\nCREATE TABLE kept(id INTEGER);;;";
+        let separated_source = format!("{D1_FOREIGN_KEYS_ON_PREFIX_V1}{separated_remainder}");
+        let separated = derive_d1_manifest_execution_plan(&[manifest_entry(&separated_source)])
+            .expect("empty commands around real SQL remain executable content");
+        assert!(separated.transformed);
+        assert_eq!(separated.migrations[0].executed_sql, separated_remainder);
+
+        let identity_sql = "CREATE TABLE items(id INTEGER PRIMARY KEY);";
+        let identity_manifest = vec![manifest_entry(identity_sql)];
+        let identity = derive_d1_manifest_execution_plan(&identity_manifest).expect("identity");
+        assert!(!identity.transformed);
+        assert_eq!(identity.migrations[0].executed_sql, identity_sql);
+        assert_eq!(
+            d1_manifest_plan_sha256(
+                "account",
+                "database",
+                "newsletter-core",
+                "d1_migrations",
+                &identity_manifest,
+                &[],
+                &identity,
+            ),
+            d1_manifest_legacy_plan_sha256(
+                "account",
+                "database",
+                "newsletter-core",
+                "d1_migrations",
+                &identity_manifest,
+                &[],
+            ),
+            "untransformed manifests preserve existing plan identity"
+        );
+
+        for sql in [
+            "CREATE TABLE items(id INTEGER PRIMARY KEY, foreign_keys TEXT);",
+            "CREATE TABLE notes(body TEXT DEFAULT 'PRAGMA foreign_keys');",
+            "CREATE TABLE \"PRAGMA foreign_keys\"(id INTEGER);",
+            "CREATE TABLE `PRAGMA foreign_keys`(id INTEGER);",
+            "CREATE TABLE [PRAGMA foreign_keys](id INTEGER);",
+            "-- PRAGMA foreign_keys = ON;\nCREATE TABLE notes(body TEXT);",
+            "/* PRAGMA foreign_keys = ON; */ CREATE TABLE notes(body TEXT);",
+            "PRAGMA optimize; CREATE TABLE foreign_keys(id INTEGER);",
+            "\u{feff}CREATE TABLE notes(body TEXT);",
+            "EXPLAIN SELECT 1;",
+            "EXPLAIN QUERY PLAN SELECT 1;",
+            "EXPLAIN PRAGMA optimize;",
+            "EXPLAIN QUERY PLAN PRAGMA optimize;",
+        ] {
+            assert!(
+                derive_d1_manifest_execution_plan(&[manifest_entry(sql)]).is_ok(),
+                "quoted, commented, cross-statement, and ordinary identifiers are not foreign_keys pragmas: {sql:?}"
+            );
+        }
     }
 
     fn current_wrangler_authority(table: &str) -> serde_json::Value {
@@ -1335,6 +1811,45 @@ pub(crate) fn d1_manifest_summaries(manifest: &[D1MigrationManifestEntry]) -> Ve
         .collect()
 }
 
+pub(crate) fn d1_migration_execution_provider_sql(
+    execution: &D1MigrationExecution,
+    migrations_table: &str,
+    migration_name: &str,
+) -> String {
+    let table = quote_sql_identifier(migrations_table);
+    let migration_name = quote_sql_string(migration_name);
+    format!(
+        "{}\n\nINSERT INTO {table} (name) VALUES ({migration_name});",
+        execution.executed_sql
+    )
+}
+
+pub(crate) fn d1_manifest_execution_summaries(
+    execution_plan: &D1ManifestExecutionPlan,
+    migrations_table: &str,
+) -> Vec<Value> {
+    execution_plan
+        .migrations
+        .iter()
+        .map(|execution| {
+            let provider_sql = d1_migration_execution_provider_sql(
+                execution,
+                migrations_table,
+                &execution.source_name,
+            );
+            json!({
+                "source_name": execution.source_name,
+                "source_sql_sha256": execution.source_sql_sha256,
+                "transform_id": execution.transform_id,
+                "transform_version": execution.transform_version,
+                "executed_size_bytes": execution.executed_sql.len(),
+                "executed_sql_sha256": execution.executed_sql_sha256,
+                "provider_statement_sha256": sha256_hex(&provider_sql),
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn d1_ledger_summaries(ledger: &[D1ManifestLedgerRow]) -> Vec<Value> {
     ledger
         .iter()
@@ -1343,6 +1858,52 @@ pub(crate) fn d1_ledger_summaries(ledger: &[D1ManifestLedgerRow]) -> Vec<Value> 
 }
 
 pub(crate) fn d1_manifest_plan_sha256(
+    account_id: &str,
+    database_id: &str,
+    family: &str,
+    migrations_table: &str,
+    manifest: &[D1MigrationManifestEntry],
+    ledger: &[D1ManifestLedgerRow],
+    execution_plan: &D1ManifestExecutionPlan,
+) -> String {
+    if !execution_plan.transformed {
+        return d1_manifest_legacy_plan_sha256(
+            account_id,
+            database_id,
+            family,
+            migrations_table,
+            manifest,
+            ledger,
+        );
+    }
+    #[derive(Serialize)]
+    struct Plan<'a> {
+        version: u8,
+        operation: &'static str,
+        account_id: &'a str,
+        database_id: &'a str,
+        migration_family: &'a str,
+        migrations_table: &'a str,
+        manifest: Vec<Value>,
+        execution_manifest: Vec<Value>,
+        ledger: Vec<Value>,
+    }
+    let bytes = serde_json::to_vec(&Plan {
+        version: 2,
+        operation: "d1_apply_migration_manifest",
+        account_id,
+        database_id,
+        migration_family: family,
+        migrations_table,
+        manifest: d1_manifest_summaries(manifest),
+        execution_manifest: d1_manifest_execution_summaries(execution_plan, migrations_table),
+        ledger: d1_ledger_summaries(ledger),
+    })
+    .expect("serializing D1 manifest plan is infallible");
+    sha256_bytes_hex(&bytes)
+}
+
+pub(crate) fn d1_manifest_legacy_plan_sha256(
     account_id: &str,
     database_id: &str,
     family: &str,
@@ -1371,7 +1932,7 @@ pub(crate) fn d1_manifest_plan_sha256(
         manifest: d1_manifest_summaries(manifest),
         ledger: d1_ledger_summaries(ledger),
     })
-    .expect("serializing D1 manifest plan is infallible");
+    .expect("serializing legacy D1 manifest plan is infallible");
     sha256_bytes_hex(&bytes)
 }
 

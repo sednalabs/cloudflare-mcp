@@ -57,13 +57,14 @@ use crate::d1_migration_lease::{
 use crate::d1_migration_manifest::{
     D1ManifestReconciliationEvidence, approved_d1_plan_digest_matches, classify_d1_manifest_ledger,
     contextualize_d1_manifest_semantic_error, d1_ledger_summaries,
-    d1_manifest_contextualize_failure, d1_manifest_plan_mismatch_result, d1_manifest_plan_sha256,
+    d1_manifest_contextualize_failure, d1_manifest_execution_summaries,
+    d1_manifest_plan_mismatch_result, d1_manifest_plan_sha256,
     d1_manifest_reconciliation_custody_lost_result, d1_manifest_reconciliation_required_result,
-    d1_manifest_summaries, d1_manifest_unknown_ledger_result, d1_migrations_table_init_sql,
-    normalize_d1_manifest_target, normalize_d1_migration_family, parse_d1_migration_ledger,
-    read_stable_d1_migration_ledger, read_stable_d1_migration_ledger_authority,
-    validate_d1_manifest_write_result, validate_d1_migration_manifest,
-    validate_generic_d1_migration_family,
+    d1_manifest_summaries, d1_manifest_unknown_ledger_result, d1_migration_execution_provider_sql,
+    d1_migrations_table_init_sql, derive_d1_manifest_execution_plan, normalize_d1_manifest_target,
+    normalize_d1_migration_family, parse_d1_migration_ledger, read_stable_d1_migration_ledger,
+    read_stable_d1_migration_ledger_authority, validate_d1_manifest_write_result,
+    validate_d1_migration_manifest, validate_generic_d1_migration_family,
 };
 use crate::d1_migration_reconciliation::{
     D1ReconcileMigrationManifestArgs, contextualize_d1_reconciliation_semantic_error,
@@ -5017,6 +5018,10 @@ impl CloudflareMcp {
             Ok(manifest) => manifest,
             Err(result) => return Ok(result),
         };
+        let execution_plan = match derive_d1_manifest_execution_plan(&manifest) {
+            Ok(plan) => plan,
+            Err(result) => return Ok(contextualize_d1_manifest_semantic_error(result, dry_run)),
+        };
         let family = match normalize_d1_migration_family(&migration_family) {
             Ok(family) => family,
             Err(result) => return Ok(result),
@@ -5032,6 +5037,7 @@ impl CloudflareMcp {
             "migration_family": family,
             "migrations_table": migrations_table,
             "manifest": d1_manifest_summaries(&manifest),
+            "execution_manifest": d1_manifest_execution_summaries(&execution_plan, &migrations_table),
             "supplied_plan_sha256": args.approved_plan_sha256,
             "computed_plan_sha256": Value::Null,
         });
@@ -5096,6 +5102,7 @@ impl CloudflareMcp {
                 &migrations_table,
                 &manifest,
                 &ledger,
+                &execution_plan,
             );
             audit.set_target(json!({
                 "target_key_sha256": sha256_bytes_hex(
@@ -5104,6 +5111,7 @@ impl CloudflareMcp {
                 "migration_family": family,
                 "migrations_table": migrations_table,
                 "manifest": d1_manifest_summaries(&manifest),
+                "execution_manifest": d1_manifest_execution_summaries(&execution_plan, &migrations_table),
                 "supplied_plan_sha256": args.approved_plan_sha256,
                 "computed_plan_sha256": plan_sha256,
             }));
@@ -5119,6 +5127,7 @@ impl CloudflareMcp {
                 "ledger": d1_ledger_summaries(&ledger),
                 "already_applied": classification.applied_names,
                 "pending_migrations": d1_manifest_summaries(&classification.pending),
+                "execution_manifest": d1_manifest_execution_summaries(&execution_plan, &migrations_table),
                 "plan_sha256": plan_sha256,
                 "lease": d1_migration_lease_requirements(account_id, &args.database_id, &family),
                 "max_rows": max_rows,
@@ -5265,6 +5274,7 @@ impl CloudflareMcp {
             &migrations_table,
             &manifest,
             &ledger,
+            &execution_plan,
         );
         audit.set_target(json!({
             "target_key_sha256": sha256_bytes_hex(
@@ -5273,6 +5283,7 @@ impl CloudflareMcp {
             "migration_family": family,
             "migrations_table": migrations_table,
             "manifest": d1_manifest_summaries(&manifest),
+            "execution_manifest": d1_manifest_execution_summaries(&execution_plan, &migrations_table),
             "supplied_plan_sha256": args.approved_plan_sha256,
             "computed_plan_sha256": plan_sha256,
         }));
@@ -5351,9 +5362,11 @@ impl CloudflareMcp {
         }
 
         let mut applied = Vec::new();
-        for migration in &classification.pending {
+        let pending_start = manifest.len() - classification.pending.len();
+        for (pending_index, migration) in classification.pending.iter().enumerate() {
+            let execution = &execution_plan.migrations[pending_start + pending_index];
             let statement =
-                d1_migration_apply_sql(&migration.sql, &migrations_table, &migration.name);
+                d1_migration_execution_provider_sql(execution, &migrations_table, &migration.name);
             if let Err(result) = read_stable_d1_migration_ledger_authority(
                 self,
                 account_id,
@@ -5434,6 +5447,13 @@ impl CloudflareMcp {
                         "name": &migration.name,
                         "size_bytes": migration.size_bytes,
                         "sql_sha256": &migration.sql_sha256,
+                        "execution": d1_manifest_execution_summaries(
+                            &crate::d1_migration_manifest::D1ManifestExecutionPlan {
+                                migrations: vec![execution.clone()],
+                                transformed: execution.transform_id != "identity-v1",
+                            },
+                            &migrations_table,
+                        )[0].clone(),
                         "result": result,
                         "truncated": truncated,
                         "outcome": "applied",
@@ -5642,6 +5662,10 @@ impl CloudflareMcp {
                 "supplied_plan_sha256": args.approved_plan_sha256,
                 "computed_plan_sha256": plan_sha256,
                 "manifest": d1_manifest_summaries(&manifest),
+                "execution_manifest": d1_manifest_execution_summaries(
+                    &execution_plan,
+                    &migrations_table,
+                ),
                 "ledger": d1_ledger_summaries(&final_ledger),
                 "applied_migrations": applied,
                 "lease": d1_migration_lease_requirements(account_id, &args.database_id, &family),
