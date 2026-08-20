@@ -2269,6 +2269,24 @@ fn d1_manifest_nonretryable_cause(error: Value) -> Value {
             Value::String(correlation_id.to_string()),
         );
     }
+    if let Some((provider_error_code, provider_error_category)) =
+        detail.and_then(d1_manifest_provider_error_classification)
+    {
+        cause.insert(
+            "provider_error_code".to_string(),
+            json!(provider_error_code),
+        );
+        cause.insert(
+            "provider_error_category".to_string(),
+            Value::String(provider_error_category.to_string()),
+        );
+        if let Some(location) = detail
+            .and_then(|detail| detail.get("provider_error_location"))
+            .and_then(d1_manifest_provider_error_location)
+        {
+            cause.insert("provider_error_location".to_string(), location);
+        }
+    }
     if kind == Some("provider_result") {
         if let Some(classification) = detail
             .and_then(|detail| detail.get("classification"))
@@ -2319,6 +2337,35 @@ fn d1_manifest_nonretryable_cause(error: Value) -> Value {
         Value::String("reconciliation_only".to_string()),
     );
     Value::Object(cause)
+}
+
+fn d1_manifest_provider_error_classification(
+    detail: &Map<String, Value>,
+) -> Option<(i64, &'static str)> {
+    let code = detail.get("provider_error_code")?.as_i64()?;
+    let category = detail.get("provider_error_category")?.as_str()?;
+    match (code, category) {
+        (7_500, "d1_error") => Some((7_500, "d1_error")),
+        (10_000, "authentication_error") => Some((10_000, "authentication_error")),
+        _ => None,
+    }
+}
+
+fn d1_manifest_provider_error_location(value: &Value) -> Option<Value> {
+    let location = value.as_object()?;
+    if location.len() != 2
+        || location.get("kind").and_then(Value::as_str) != Some("sql_byte_offset")
+    {
+        return None;
+    }
+    let offset_bytes = location.get("offset_bytes")?.as_u64()?;
+    if offset_bytes > MAX_D1_MIGRATION_MANIFEST_BYTES as u64 {
+        return None;
+    }
+    Some(json!({
+        "kind": "sql_byte_offset",
+        "offset_bytes": offset_bytes,
+    }))
 }
 
 fn d1_manifest_write_lifecycle_evidence(value: &Value) -> Option<Value> {

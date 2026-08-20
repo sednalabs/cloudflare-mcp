@@ -1478,6 +1478,13 @@ fn spawn_fake_manifest_outer_error_api(
 fn spawn_fake_manifest_ambiguous_api(
     ledger_names_commit_after_ambiguous_response: bool,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
+    spawn_fake_manifest_http_error_api(ledger_names_commit_after_ambiguous_response, None)
+}
+
+fn spawn_fake_manifest_http_error_api(
+    ledger_names_commit_after_ambiguous_response: bool,
+    provider_error: Option<(u16, i64, String)>,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ambiguous manifest D1 API");
     let addr = listener.local_addr().expect("ambiguous manifest D1 addr");
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1506,7 +1513,21 @@ fn spawn_fake_manifest_ambiguous_api(
             }
             if sql.contains("INSERT INTO \"d1_migrations\"") {
                 apply_seen = ledger_names_commit_after_ambiguous_response;
-                write!(stream, "HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-length: 0\r\n\r\n").expect("write ambiguous response");
+                if let Some((status, code, message)) = provider_error.as_ref() {
+                    let response = serde_json::to_vec(&json!({
+                        "success": false,
+                        "errors": [{"code": code, "message": message}],
+                        "messages": [],
+                        "result": null,
+                    }))
+                    .expect("serialize migration provider error");
+                    write!(stream, "HTTP/1.1 {status} Synthetic\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write migration provider-error headers");
+                    stream
+                        .write_all(&response)
+                        .expect("write migration provider-error body");
+                } else {
+                    write!(stream, "HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-length: 0\r\n\r\n").expect("write ambiguous response");
+                }
                 continue;
             }
             assert_eq!(sql, "SELECT * FROM \"d1_migrations\" ORDER BY id");
@@ -9830,6 +9851,143 @@ fn d1_apply_migration_manifest_response_loss_stops_without_retry_and_next_proces
         &requests,
         10,
         "response loss",
+    );
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_apply_migration_manifest_http_error_reports_redacted_provider_location_without_replay() {
+    let private_message =
+        "D1_ERROR: too many arguments on function private_function at offset 761: SQLITE_ERROR";
+    let (base_url, requests) =
+        spawn_fake_manifest_http_error_api(false, Some((400, 7_500, private_message.to_string())));
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-provider-error-manifest-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create provider-error lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make provider-error lease root private");
+    }
+    let env = vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ];
+    let mut mcp = McpStdioProcess::start_with_env(env.clone());
+    let first_sql = "CREATE TABLE submissions(id TEXT);";
+    let second_sql = "ALTER TABLE submissions ADD COLUMN status TEXT;";
+    let manifest = json!([
+        {"name": "0001_initial.sql", "size_bytes": first_sql.len(), "sql_sha256": sha256_hex(first_sql), "sql": first_sql},
+        {"name": "0002_second.sql", "size_bytes": second_sql.len(), "sql_sha256": sha256_hex(second_sql), "sql": second_sql}
+    ]);
+    let dry = mcp.call_tool(
+        1770,
+        "d1_apply_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "dry_run": true,
+            "manifest": manifest.clone(),
+        }),
+    );
+    let plan = structured_content(&dry)["plan_sha256"]
+        .as_str()
+        .expect("provider-error plan")
+        .to_string();
+    let live = mcp.call_tool(
+        1771,
+        "d1_apply_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest.clone(),
+            "approved_plan_sha256": plan.clone(),
+        }),
+    );
+    let content = structured_content(&live);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["status"], json!("reconciliation_required"));
+    assert_eq!(content["outcome"], json!("unknown"));
+    assert_eq!(content["lease_retained"], json!(true));
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.migration_apply_outcome_unknown")
+    );
+    assert_eq!(content["error"]["cause"]["kind"], json!("transport"));
+    assert_eq!(
+        content["error"]["cause"]["code"],
+        json!("cloudflare.http_error")
+    );
+    assert_eq!(content["error"]["cause"]["status"], json!(400));
+    assert_eq!(
+        content["error"]["cause"]["provider_error_code"],
+        json!(7_500)
+    );
+    assert_eq!(
+        content["error"]["cause"]["provider_error_category"],
+        json!("d1_error")
+    );
+    assert_eq!(
+        content["error"]["cause"]["provider_error_location"],
+        json!({"kind": "sql_byte_offset", "offset_bytes": 761})
+    );
+    assert_eq!(content["error"]["cause"]["retryable"], json!(false));
+    assert_eq!(
+        content["error"]["cause"]["operator_guidance"],
+        json!("reconciliation_only")
+    );
+    assert_eq!(
+        content["error"]["cause"]["provider_write_lifecycle"],
+        json!({
+            "dispatch_stage": "attempted",
+            "response_stage": "received",
+            "body_stage": "completely_read",
+            "http_status": 400,
+        })
+    );
+    assert!(
+        content["error"]["cause"]["response_body_sha256"]
+            .as_str()
+            .is_some_and(|digest| digest.len() == 64),
+        "{content}"
+    );
+    assert!(
+        content["error"]["cause"]["response_body_size_bytes"]
+            .as_u64()
+            .is_some_and(|size| size > 0),
+        "{content}"
+    );
+    let serialized = serde_json::to_string(content).expect("serialize provider error result");
+    assert!(!serialized.contains(private_message));
+    assert!(!serialized.contains("private_function"));
+    let observed = requests.lock().expect("provider-error request log").clone();
+    assert_eq!(observed.len(), 10, "one write plus bounded reconciliation");
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|request| request["sql"]
+                .as_str()
+                .is_some_and(|sql| sql.contains("INSERT INTO \"d1_migrations\"")))
+            .count(),
+        1,
+        "provider HTTP error must not replay the non-idempotent write"
+    );
+    assert_private_regular_active_lease(&lease_root);
+    mcp.terminate();
+    assert_fresh_process_blocked_without_provider_request(
+        env,
+        &manifest,
+        &plan,
+        &requests,
+        10,
+        "provider HTTP error",
     );
     let _ = fs::remove_dir_all(lease_root);
 }
