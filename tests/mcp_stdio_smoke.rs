@@ -1664,6 +1664,7 @@ enum ReconciliationFault {
     SecondBatchPrimaryFalse,
     SecondBatchHttpStatus(u16),
     SecondBatchAllowlistedHttpError(u16, i64, String),
+    SecondBatchDeepHttpError(u16, String),
     SecondBatchTransportFailure(Option<PathBuf>),
     RequestTransportFailure(usize),
     DuplicateOuterSuccess(bool, Arc<Mutex<Vec<u8>>>),
@@ -2521,6 +2522,22 @@ fn spawn_fake_reconciliation_api_with_fault_and_calls(
                     continue;
                 }
             }
+            if let ReconciliationFault::SecondBatchDeepHttpError(status, message) = &fault {
+                if request_index == 1 {
+                    let nested = format!("{}0{}", "[".repeat(40), "]".repeat(40));
+                    let response = format!(
+                        r#"{{"success":false,"errors":[{{"code":7500,"message":{},"nested":{nested}}}],"messages":[],"result":null}}"#,
+                        serde_json::to_string(message)
+                            .expect("serialize deep reconciliation error message")
+                    )
+                    .into_bytes();
+                    write!(stream, "HTTP/1.1 {status} Synthetic\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write deep second reconciliation HTTP error headers");
+                    stream
+                        .write_all(&response)
+                        .expect("write deep second reconciliation HTTP error");
+                    continue;
+                }
+            }
             if let ReconciliationFault::OversizedHttpStatus(status) = &fault {
                 write!(stream, "HTTP/1.1 {status} Synthetic\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", 16 * 1024 * 1024 + 1).expect("write oversized reconciliation HTTP error headers");
                 continue;
@@ -2668,6 +2685,7 @@ fn spawn_fake_reconciliation_api_with_fault_and_calls(
                 | ReconciliationFault::SecondBatchPrimaryFalse
                 | ReconciliationFault::SecondBatchHttpStatus(_)
                 | ReconciliationFault::SecondBatchAllowlistedHttpError(_, _, _)
+                | ReconciliationFault::SecondBatchDeepHttpError(_, _)
                 | ReconciliationFault::SecondBatchTransportFailure(_)
                 | ReconciliationFault::RequestTransportFailure(_)
                 | ReconciliationFault::DuplicateOuterSuccess(_, _)
@@ -15151,6 +15169,104 @@ fn d1_reconcile_migration_manifest_stdio_reports_safe_allowlisted_second_error()
     );
     assert_eq!(receipt["receipt_sha256"].as_str().map(str::len), Some(64));
     let serialized = serde_json::to_string(content).expect("serialize safe provider error");
+    assert!(!serialized.contains(private_message));
+    assert!(!serialized.contains("private_table"));
+    assert!(!serialized.contains("/private/path"));
+    assert_eq!(requests.lock().expect("request log").len(), 2);
+    assert_private_regular_active_lease(&lease_root);
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_reconcile_migration_manifest_stdio_deep_error_is_generic_with_custody_retained() {
+    let (manifest, expectations) = one_table_reconciliation_case();
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-reconcile-deep-provider-error-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create deep-provider-error reconciliation root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make deep-provider-error reconciliation root private");
+    }
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&lease_root, &manifest);
+    let private_message = "SQL SELECT * FROM private_table at /private/path";
+    let (base_url, requests) = spawn_fake_reconciliation_api_with_fault(
+        ReconciliationFault::SecondBatchDeepHttpError(400, private_message.to_string()),
+    );
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let response = mcp.call_tool(
+        1764,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest,
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_only_v1",
+            "state_expectations": expectations,
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["provider_calls"], json!(2), "{content}");
+    assert_eq!(content["provider_mutations"], json!(0), "{content}");
+    assert_eq!(content["lease_retained"], json!(true), "{content}");
+    assert_eq!(
+        content["custody_status"],
+        json!("retained_evidence_verified"),
+        "{content}"
+    );
+    assert_eq!(
+        content["provider_read_lifecycle"],
+        json!([
+            {
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 200,
+            },
+            {
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 400,
+            }
+        ]),
+        "{content}"
+    );
+    assert_eq!(
+        content["response_evidence"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        content["provider_cause"],
+        json!({
+            "code": "cloudflare.http_error",
+            "operator_guidance": "reconciliation_only",
+            "retryable": false,
+            "status": 400,
+        }),
+        "{content}"
+    );
+    assert_eq!(
+        content["query_shape_receipt"]["query_sha256"],
+        content["query_sha256"]
+    );
+    let serialized = serde_json::to_string(content).expect("serialize deep provider error");
     assert!(!serialized.contains(private_message));
     assert!(!serialized.contains("private_table"));
     assert!(!serialized.contains("/private/path"));

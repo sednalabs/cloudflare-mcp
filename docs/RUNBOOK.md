@@ -586,8 +586,10 @@ free Cloudflare error envelope, `provider_cause` may additionally expose only
 an allowlisted numeric code and stable category: 7500 as `d1_error` or 10000 as
 `authentication_error`. Provider messages are always discarded because they
 may echo SQL or identifiers. Partial, malformed, oversized, duplicate-key,
-multi-error, non-allowlisted, or otherwise unexpected envelopes retain generic
-HTTP classification and never expose provider body content.
+over-depth, multi-error, non-allowlisted, or otherwise unexpected envelopes
+retain generic HTTP classification and never expose provider body content. The
+shared migration-envelope decoder applies its 32-container limit while parsing
+both reconciliation and migration-write responses.
 
 Interpret custody fields literally. Validation failures before custody lookup
 return `lease_retained=null` and `custody_status=not_inspected`. Inspection

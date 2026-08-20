@@ -314,14 +314,15 @@ reconciliation. It performs two bounded read-only batches and never retires
 custody evidence or authorizes an apply retry. The boundary does not follow
 HTTP redirects and returns one chronological `provider_read_lifecycle` entry
 per invocation, distinguishing pre-dispatch, attempted-without-response,
-response received, partial/complete body read, and captured HTTP status. A
-reconciliation-local recursive decoder rejects duplicate object keys in a
-successful-status body before
+response received, partial/complete body read, and captured HTTP status. A D1
+migration-envelope decoder rejects duplicate object keys and enforces a
+32-container JSON nesting limit while parsing, before
 the raw provider JSON can collapse into a value, across the outer envelope and
 nested result, metadata, error, and row objects in either order. Rejection keeps
 the exact raw digest, size, status, lifecycle, and retained-custody evidence but
 never exposes the duplicate key or body content. This does not broaden generic
-Cloudflare response paths or the migration-write JSON policy.
+Cloudflare response paths; the same bound and duplicate-key policy protect
+migration-write acknowledgements and reconciliation success/error envelopes. A
 versioned `query_shape_receipt` accompanies every success or failure after a
 fixed query exists. It binds the exact query digest to aggregate counts and
 presence booleans for ledger, schema-catalog, xinfo, foreign-key definition,
