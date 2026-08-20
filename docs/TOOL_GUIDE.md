@@ -172,6 +172,11 @@ Use `d1_reconcile_migration_manifest` only for exact retained
 `active.lease.json` or `retiring.lease.json` evidence after an ambiguous
 manifest apply. Supply the complete exact-byte manifest and one complete
 expected schema state for every prefix from zero through the full manifest.
+For every assertion, the tool first selects the exact primary-current ledger
+prefix, then runs two identical complete reads. The complete reads retain the
+full-manifest `sqlite_master` object-name union to detect premature future
+objects, but issue table xinfo, foreign-key definition/check, and seed reads
+only for tables in the selected state. An absent future table is never probed.
 
 For `d1_apply_migration_manifest`, every plan, live, post-apply, and ambiguous
 outcome filename-ledger read requires exactly one successful result set with
@@ -307,10 +312,12 @@ The bounded evidence retains every word, quoted identifier, and string-literal
 value across the complete post-parent trigger header (including `WHEN`) and
 body. An exact string-literal collision is deliberately rejected; longer
 unrelated token values and unrelated triggers remain supported.
-The boundary also requires every fixed result set in both batches to carry exact
+The boundary also requires every fixed result set in the selection read and
+both complete batches to carry exact
 `meta.served_by_primary=true` evidence; absent, false, null, non-boolean, or
 mixed primary markers are contradictory and cannot support positive
-reconciliation. It performs two bounded read-only batches and never retires
+reconciliation. It performs one bounded prefix-selection read plus two bounded
+complete read-only batches and never retires
 custody evidence or authorizes an apply retry. The boundary does not follow
 HTTP redirects and returns one chronological `provider_read_lifecycle` entry
 per invocation, distinguishing pre-dispatch, attempted-without-response,

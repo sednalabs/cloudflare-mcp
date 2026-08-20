@@ -435,12 +435,14 @@ Select one explicit built-in effect assertion:
   TEXT/BLOB columns and INTEGER literals on INTEGER/NUMERIC/BLOB columns; for
   STRICT tables, TEXT literals on exact TEXT columns and INTEGER literals on
   exact INT/INTEGER columns. Reject STRICT BLOB seeds before custody/provider
-  access. This assertion performs one
-  primary-current prefix-selection read followed by two identical complete
-  primary-current reads. Each complete read covers the bounded full-manifest
-  `sqlite_master` object union and safe table-valued PRAGMAs for the bounded
-  full-manifest physical-table union; every prefix therefore proves future
-  objects and future table structure absent as well as current facts present.
+  access.
+  Every assertion performs one primary-current prefix-selection read followed
+  by two identical complete primary-current reads. Each complete read covers
+  the bounded full-manifest `sqlite_master` object union, so premature future
+  objects remain visible and contradictory, while table-valued `table_xinfo`,
+  `foreign_key_list`, and `foreign_key_check` statements cover only the exact
+  physical tables in the selected prefix. A prefix before a future table is
+  created therefore never probes that absent table.
   Match schema-object membership under SQLite ASCII `NOCASE`, retain exact
   observed spelling and canonical type/name ordering, and reject aliases or
   conflicting spellings.
@@ -536,7 +538,8 @@ a purpose-built registry assertion/readback contract before continuing.
 
 The tool opens the existing target and guard without creating entries, requires
 exactly one active or retiring regular private evidence file, and holds the
-guard across two complete internally generated read-only batches. It returns
+guard across one prefix-selection read and two complete internally generated
+read-only batches. It returns
 `not_committed`, `partial_state_converged`, or `full_state_converged` only when
 the current ledger is an exact manifest prefix, the retained approved plan
 reconstructs uniquely from that prefix relationship, both canonical snapshots

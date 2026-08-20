@@ -2444,7 +2444,7 @@ fn assert_terminal_negative_whole_response(content: &Value, mut expected: Value)
 }
 
 fn spawn_fake_reconciliation_api() -> (String, Arc<Mutex<Vec<Value>>>) {
-    spawn_fake_reconciliation_api_with_fault_and_calls(ReconciliationFault::None, 2)
+    spawn_fake_reconciliation_api_with_fault_and_calls(ReconciliationFault::None, 3)
 }
 
 fn spawn_fake_reconciliation_api_for_calls(call_count: usize) -> (String, Arc<Mutex<Vec<Value>>>) {
@@ -2454,7 +2454,7 @@ fn spawn_fake_reconciliation_api_for_calls(call_count: usize) -> (String, Arc<Mu
 fn spawn_fake_reconciliation_api_with_fault(
     fault: ReconciliationFault,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
-    spawn_fake_reconciliation_api_with_fault_and_calls(fault, 2)
+    spawn_fake_reconciliation_api_with_fault_and_calls(fault, 3)
 }
 
 fn spawn_fake_reconciliation_api_with_fault_and_calls(
@@ -2480,7 +2480,7 @@ fn spawn_fake_reconciliation_api_with_fault_and_calls(
                 .expect("request log lock")
                 .push(body_json);
             if let ReconciliationFault::SecondBatchTransportFailure(custody_path) = &fault {
-                if request_index == 1 {
+                if request_index == 2 {
                     if let Some(path) = custody_path {
                         fs::write(path, b"tampered retained evidence")
                             .expect("tamper retained evidence before transport failure");
@@ -2541,7 +2541,7 @@ fn spawn_fake_reconciliation_api_with_fault_and_calls(
                 continue;
             }
             if let ReconciliationFault::SecondBatchHttpStatus(status) = &fault {
-                if request_index == 1 {
+                if request_index == 2 {
                     let response = reconciliation_http_error_response(*status);
                     write!(stream, "HTTP/1.1 {status} Synthetic\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write second reconciliation HTTP error headers");
                     stream
@@ -2553,7 +2553,7 @@ fn spawn_fake_reconciliation_api_with_fault_and_calls(
             if let ReconciliationFault::SecondBatchAllowlistedHttpError(status, code, message) =
                 &fault
             {
-                if request_index == 1 {
+                if request_index == 2 {
                     let response = serde_json::to_vec(&json!({
                         "success": false,
                         "errors": [{"code": code, "message": message}],
@@ -2569,7 +2569,7 @@ fn spawn_fake_reconciliation_api_with_fault_and_calls(
                 }
             }
             if let ReconciliationFault::SecondBatchDeepHttpError(status, message) = &fault {
-                if request_index == 1 {
+                if request_index == 2 {
                     let nested = format!("{}0{}", "[".repeat(40), "]".repeat(40));
                     let response = format!(
                         r#"{{"success":false,"errors":[{{"code":7500,"message":{},"nested":{nested}}}],"messages":[],"result":null}}"#,
@@ -2602,6 +2602,7 @@ fn spawn_fake_reconciliation_api_with_fault_and_calls(
                     .expect("write reconciliation HTTP error");
                 continue;
             }
+            let selection = markers.len() == 2;
             let mut results = vec![
                 tagged_reconciliation_result(
                     &markers[0],
@@ -2612,12 +2613,18 @@ fn spawn_fake_reconciliation_api_with_fault_and_calls(
                 tagged_reconciliation_result(
                     &markers[1],
                     &["type", "name", "tbl_name", "sql"],
-                    vec![
-                        json!({"type": "table", "name": "items", "tbl_name": "items", "sql": "CREATE TABLE items(id INTEGER PRIMARY KEY)"}),
-                    ],
+                    if selection {
+                        Vec::new()
+                    } else {
+                        vec![
+                            json!({"type": "table", "name": "items", "tbl_name": "items", "sql": "CREATE TABLE items(id INTEGER PRIMARY KEY)"}),
+                        ]
+                    },
                     None,
                 ),
-                tagged_reconciliation_result(
+            ];
+            if !selection {
+                results.extend([tagged_reconciliation_result(
                     &markers[2],
                     &[
                         "cid",
@@ -2632,8 +2639,7 @@ fn spawn_fake_reconciliation_api_with_fault_and_calls(
                         json!({"cid": 0, "name": "id", "type": "INTEGER", "notnull": 0, "dflt_value": null, "pk": 1, "hidden": 0}),
                     ],
                     None,
-                ),
-                tagged_reconciliation_result(
+                ), tagged_reconciliation_result(
                     &markers[3],
                     &[
                         "id",
@@ -2647,14 +2653,13 @@ fn spawn_fake_reconciliation_api_with_fault_and_calls(
                     ],
                     Vec::new(),
                     None,
-                ),
-                tagged_reconciliation_result(
+                ), tagged_reconciliation_result(
                     &markers[4],
                     &["table", "rowid", "parent", "fkid"],
                     Vec::new(),
                     None,
-                ),
-            ];
+                )]);
+            }
             match &fault {
                 ReconciliationFault::WrongStatementMarker => {
                     results[0]["results"][0]["__cf_mcp_statement_id"] = json!("f".repeat(64));
@@ -2679,7 +2684,7 @@ fn spawn_fake_reconciliation_api_with_fault_and_calls(
                     .sync_all()
                     .expect("sync retained evidence move");
                 }
-                ReconciliationFault::SecondBatchCustodyDrift(path) if request_index == 1 => {
+                ReconciliationFault::SecondBatchCustodyDrift(path) if request_index == 2 => {
                     fs::write(path, b"tampered retained evidence")
                         .expect("tamper retained evidence after second provider read");
                 }
@@ -2705,15 +2710,17 @@ fn spawn_fake_reconciliation_api_with_fault_and_calls(
                     results[0]["meta"]["served_by_primary"] = json!("true");
                 }
                 ReconciliationFault::MixedPrimaryMarkers => {
-                    results[2]["meta"]["served_by_primary"] = json!(false);
+                    let last = results.len() - 1;
+                    results[last]["meta"]["served_by_primary"] = json!(false);
                 }
-                ReconciliationFault::SecondBatchPrimaryFalse if request_index == 1 => {
-                    results[3]["meta"]["served_by_primary"] = json!(false);
+                ReconciliationFault::SecondBatchPrimaryFalse if request_index == 2 => {
+                    let last = results.len() - 1;
+                    results[last]["meta"]["served_by_primary"] = json!(false);
                 }
-                ReconciliationFault::LedgerNotManifestPrefix => {
+                ReconciliationFault::LedgerNotManifestPrefix if !selection => {
                     results[0]["results"][1]["name"] = json!("0099_unknown.sql");
                 }
-                ReconciliationFault::UnstableSecondBatch if request_index == 1 => {
+                ReconciliationFault::UnstableSecondBatch if request_index == 2 => {
                     results[1]["results"][1]["sql"] =
                         json!("CREATE TABLE items(id INTEGER PRIMARY KEY, changed TEXT)");
                 }
@@ -2736,6 +2743,7 @@ fn spawn_fake_reconciliation_api_with_fault_and_calls(
                 | ReconciliationFault::RequestTransportFailure(_)
                 | ReconciliationFault::DuplicateOuterSuccess(_, _)
                 | ReconciliationFault::DuplicateNestedRowId(_, _)
+                | ReconciliationFault::LedgerNotManifestPrefix
                 | ReconciliationFault::UnstableSecondBatch => {}
             }
             let response =
@@ -3224,21 +3232,24 @@ fn spawn_fake_seed_prefix_reconciliation_api(
     let requests = Arc::new(Mutex::new(Vec::new()));
     let requests_for_thread = requests.clone();
     thread::spawn(move || {
-        for stream in listener.incoming().take(6) {
+        for (request_index, stream) in listener.incoming().take(6).enumerate() {
             let mut stream = stream.expect("seed-prefix stream");
             let (headers, body) = read_http_request(&mut stream);
             assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
             let body_json: Value = serde_json::from_slice(&body).expect("seed-prefix request JSON");
             let sql = body_json["sql"].as_str().expect("seed-prefix SQL");
             let markers = reconciliation_statement_markers(sql);
-            let selection = markers.len() == 2;
+            let selection = request_index % 3 == 0;
             if selection {
                 assert_eq!(markers.len(), 2);
                 assert!(!sql.contains("pragma_table_xinfo"));
                 assert!(!sql.contains("FROM \"Channels\""));
             } else {
-                assert_eq!(markers.len(), if current_prefix == 0 { 5 } else { 6 });
-                assert!(sql.contains("pragma_table_xinfo('Channels')"));
+                assert_eq!(markers.len(), if current_prefix == 0 { 2 } else { 6 });
+                assert_eq!(
+                    sql.contains("pragma_table_xinfo('Channels')"),
+                    current_prefix > 0
+                );
                 assert_eq!(sql.contains("FROM \"Channels\""), current_prefix > 0);
             }
             requests_for_thread
@@ -3276,16 +3287,12 @@ fn spawn_fake_seed_prefix_reconciliation_api(
                     None,
                 ),
             ];
-            if !selection {
+            if !selection && current_prefix > 0 {
                 results.extend([
                     tagged_reconciliation_result(
                         &markers[2],
                         &["cid", "name", "type", "notnull", "dflt_value", "pk", "hidden"],
-                        if current_prefix == 0 {
-                            Vec::new()
-                        } else {
-                            vec![json!({"cid": 0, "name": "id", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 1, "hidden": 0})]
-                        },
+                        vec![json!({"cid": 0, "name": "id", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 1, "hidden": 0})],
                         None,
                     ),
                     tagged_reconciliation_result(
@@ -3301,18 +3308,16 @@ fn spawn_fake_seed_prefix_reconciliation_api(
                         None,
                     ),
                 ]);
-                if current_prefix > 0 {
-                    results.push(tagged_reconciliation_result(
-                        &markers[5],
-                        &["t0", "v0"],
-                        if current_prefix == 2 || unexpected_intermediate_row {
-                            vec![json!({"t0": "text", "v0": uppercase_hex("daily")})]
-                        } else {
-                            Vec::new()
-                        },
-                        None,
-                    ));
-                }
+                results.push(tagged_reconciliation_result(
+                    &markers[5],
+                    &["t0", "v0"],
+                    if current_prefix == 2 || unexpected_intermediate_row {
+                        vec![json!({"t0": "text", "v0": uppercase_hex("daily")})]
+                    } else {
+                        Vec::new()
+                    },
+                    None,
+                ));
             }
             let response = serde_json::to_vec(&json!({
                 "success": true,
@@ -3580,13 +3585,14 @@ fn spawn_fake_premature_manifest_fact_api(
                 .as_str()
                 .expect("premature-manifest-fact SQL");
             let markers = reconciliation_statement_markers(sql);
-            let selection = markers.len() == 2;
+            let selection = call_index % 3 == 0;
             if selection {
+                assert_eq!(markers.len(), 2);
                 assert!(!sql.contains("pragma_table_xinfo"));
                 assert!(!sql.contains("FROM \"Current\""));
                 assert!(!sql.contains("FROM \"Future\""));
             } else {
-                assert_eq!(markers.len(), if selected_prefix == 0 { 8 } else { 9 });
+                assert_eq!(markers.len(), if selected_prefix == 0 { 2 } else { 6 });
                 assert!(sql.contains("WHERE name COLLATE NOCASE IN"));
                 for object in [
                     "Current",
@@ -3600,8 +3606,11 @@ fn spawn_fake_premature_manifest_fact_api(
                         "full object union omitted {object}: {sql}"
                     );
                 }
-                assert!(sql.contains("pragma_table_xinfo('Current')"));
-                assert!(sql.contains("pragma_table_xinfo('Future')"));
+                assert_eq!(
+                    sql.contains("pragma_table_xinfo('Current')"),
+                    selected_prefix == 1
+                );
+                assert!(!sql.contains("pragma_table_xinfo('Future')"));
                 assert_eq!(sql.contains("FROM \"Current\""), selected_prefix == 1);
                 assert!(!sql.contains("FROM \"Future\""));
             }
@@ -3677,12 +3686,6 @@ fn spawn_fake_premature_manifest_fact_api(
             let current_altered = flawed
                 && selected_prefix == 1
                 && matches!(fact, PrematureManifestFact::AlteredTableStructure);
-            let future_exists = flawed
-                && selected_prefix == 1
-                && matches!(
-                    fact,
-                    PrematureManifestFact::Table | PrematureManifestFact::CaseVariantTable
-                );
             let mut current_columns = if current_exists {
                 vec![
                     json!({"cid": 0, "name": "id", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 1, "hidden": 0}),
@@ -3693,13 +3696,6 @@ fn spawn_fake_premature_manifest_fact_api(
             if current_altered {
                 current_columns.push(json!({"cid": 1, "name": "rank", "type": "INTEGER", "notnull": 0, "dflt_value": null, "pk": 0, "hidden": 0}));
             }
-            let future_columns = if future_exists {
-                vec![
-                    json!({"cid": 0, "name": "id", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 1, "hidden": 0}),
-                ]
-            } else {
-                Vec::new()
-            };
             let mut results = vec![
                 tagged_reconciliation_result(
                     &markers[0],
@@ -3714,7 +3710,7 @@ fn spawn_fake_premature_manifest_fact_api(
                     None,
                 ),
             ];
-            if !selection {
+            if !selection && selected_prefix == 1 {
                 results.extend([
                     tagged_reconciliation_result(
                         &markers[2],
@@ -3751,50 +3747,13 @@ fn spawn_fake_premature_manifest_fact_api(
                         Vec::new(),
                         None,
                     ),
-                    tagged_reconciliation_result(
-                        &markers[5],
-                        &[
-                            "cid",
-                            "name",
-                            "type",
-                            "notnull",
-                            "dflt_value",
-                            "pk",
-                            "hidden",
-                        ],
-                        future_columns,
-                        None,
-                    ),
-                    tagged_reconciliation_result(
-                        &markers[6],
-                        &[
-                            "id",
-                            "seq",
-                            "table",
-                            "from",
-                            "to",
-                            "on_update",
-                            "on_delete",
-                            "match",
-                        ],
-                        Vec::new(),
-                        None,
-                    ),
-                    tagged_reconciliation_result(
-                        &markers[7],
-                        &["table", "rowid", "parent", "fkid"],
-                        Vec::new(),
-                        None,
-                    ),
                 ]);
-                if selected_prefix == 1 {
-                    results.push(tagged_reconciliation_result(
-                        &markers[8],
-                        &["t0", "v0"],
-                        vec![json!({"t0": "text", "v0": uppercase_hex("base")})],
-                        None,
-                    ));
-                }
+                results.push(tagged_reconciliation_result(
+                    &markers[5],
+                    &["t0", "v0"],
+                    vec![json!({"t0": "text", "v0": uppercase_hex("base")})],
+                    None,
+                ));
             }
             let response = serde_json::to_vec(&json!({
                 "success": true,
@@ -3838,16 +3797,16 @@ fn spawn_fake_custom_schema_reconciliation_api(
                     .as_str()
                     .expect("schema-object reconciliation SQL"),
             );
-            assert_eq!(
-                markers.len(),
-                5,
-                "only the one physical table receives xinfo/FK proof statements",
+            let selection = markers.len() == 2;
+            assert!(
+                matches!(markers.len(), 2 | 5),
+                "selection has only ledger/catalog; the full proof adds one physical table's xinfo/FK statements",
             );
             requests_for_thread
                 .lock()
                 .expect("schema-object request log lock")
                 .push(body_json);
-            let results = vec![
+            let mut results = vec![
                 tagged_reconciliation_result(
                     &markers[0],
                     &["id", "name"],
@@ -3857,45 +3816,53 @@ fn spawn_fake_custom_schema_reconciliation_api(
                 tagged_reconciliation_result(
                     &markers[1],
                     &["type", "name", "tbl_name", "sql"],
-                    schema_rows.clone(),
-                    None,
-                ),
-                tagged_reconciliation_result(
-                    &markers[2],
-                    &[
-                        "cid",
-                        "name",
-                        "type",
-                        "notnull",
-                        "dflt_value",
-                        "pk",
-                        "hidden",
-                    ],
-                    xinfo_rows.clone(),
-                    None,
-                ),
-                tagged_reconciliation_result(
-                    &markers[3],
-                    &[
-                        "id",
-                        "seq",
-                        "table",
-                        "from",
-                        "to",
-                        "on_update",
-                        "on_delete",
-                        "match",
-                    ],
-                    Vec::new(),
-                    None,
-                ),
-                tagged_reconciliation_result(
-                    &markers[4],
-                    &["table", "rowid", "parent", "fkid"],
-                    Vec::new(),
+                    if selection {
+                        Vec::new()
+                    } else {
+                        schema_rows.clone()
+                    },
                     None,
                 ),
             ];
+            if !selection {
+                results.extend([
+                    tagged_reconciliation_result(
+                        &markers[2],
+                        &[
+                            "cid",
+                            "name",
+                            "type",
+                            "notnull",
+                            "dflt_value",
+                            "pk",
+                            "hidden",
+                        ],
+                        xinfo_rows.clone(),
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[3],
+                        &[
+                            "id",
+                            "seq",
+                            "table",
+                            "from",
+                            "to",
+                            "on_update",
+                            "on_delete",
+                            "match",
+                        ],
+                        Vec::new(),
+                        None,
+                    ),
+                    tagged_reconciliation_result(
+                        &markers[4],
+                        &["table", "rowid", "parent", "fkid"],
+                        Vec::new(),
+                        None,
+                    ),
+                ]);
+            }
             let response = serde_json::to_vec(&json!({
                 "success": true,
                 "errors": [],
@@ -10197,10 +10164,16 @@ fn d1_reconcile_migration_manifest_proves_stable_full_state_without_retry_or_mut
         json!("do_not_retry_same_attempt")
     );
     assert_eq!(content["lease_decision"], json!("retain"));
-    assert_eq!(content["provider_calls"], json!(2));
+    assert_eq!(content["provider_calls"], json!(3));
     assert_eq!(
         content["provider_read_lifecycle"],
         json!([
+            {
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 200,
+            },
             {
                 "dispatch_stage": "attempted",
                 "response_stage": "received",
@@ -10248,10 +10221,14 @@ fn d1_reconcile_migration_manifest_proves_stable_full_state_without_retry_or_mut
     assert!(content["reconciliation_plan_sha256"].as_str().is_some());
     assert_eq!(
         content["response_evidence"].as_array().map(Vec::len),
-        Some(2)
+        Some(3)
     );
     let observed = requests.lock().expect("request log");
-    assert_eq!(observed.len(), 2, "exactly two complete batches");
+    assert_eq!(
+        observed.len(),
+        3,
+        "one prefix selection precedes exactly two complete batches"
+    );
     for request in observed.iter() {
         let sql = request["sql"].as_str().expect("fixed reconciliation SQL");
         assert!(sql.split(';').all(|statement| {
@@ -10277,7 +10254,7 @@ fn d1_reconcile_migration_manifest_proves_stable_full_state_without_retry_or_mut
 fn d1_reconciliation_and_terminal_finalize_share_view_trigger_effect_proof() {
     let (manifest, state_expectations, schema_rows) =
         table_index_view_trigger_reconciliation_case();
-    let (base_url, requests) = spawn_fake_schema_object_reconciliation_api(8, schema_rows);
+    let (base_url, requests) = spawn_fake_schema_object_reconciliation_api(11, schema_rows);
     let lease_root = PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-reconcile-schema-objects-{}",
         std::process::id()
@@ -10317,7 +10294,7 @@ fn d1_reconciliation_and_terminal_finalize_share_view_trigger_effect_proof() {
     let reconciled = structured_content(&reconciliation).clone();
     assert_eq!(reconciled["ok"], json!(true), "{reconciled}");
     assert_eq!(reconciled["outcome"], json!("full_state_converged"));
-    assert_eq!(reconciled["provider_calls"], json!(2));
+    assert_eq!(reconciled["provider_calls"], json!(3));
     assert_eq!(reconciled["provider_mutations"], json!(0));
     assert_eq!(
         reconciled["effect_assertion"]["id"],
@@ -10358,7 +10335,7 @@ fn d1_reconciliation_and_terminal_finalize_share_view_trigger_effect_proof() {
         dry_content["status"],
         json!("terminal_reconciliation_plan_ready")
     );
-    assert_eq!(dry_content["provider_calls"], json!(2));
+    assert_eq!(dry_content["provider_calls"], json!(3));
 
     terminal_args["dry_run"] = json!(false);
     terminal_args["approved_terminal_plan_sha256"] = dry_content["terminal_plan_sha256"].clone();
@@ -10373,7 +10350,7 @@ fn d1_reconciliation_and_terminal_finalize_share_view_trigger_effect_proof() {
         live_content["status"],
         json!("terminal_reconciliation_complete")
     );
-    assert_eq!(live_content["provider_calls"], json!(4));
+    assert_eq!(live_content["provider_calls"], json!(5));
     assert_eq!(live_content["provider_mutations"], json!(0));
     assert_eq!(live_content["local_namespace_mutations"], json!(3));
     assert_eq!(live_content["lease_retained"], json!(false));
@@ -10418,14 +10395,24 @@ fn d1_reconciliation_and_terminal_finalize_share_view_trigger_effect_proof() {
     assert_eq!(replay_content["provider_calls"], json!(0));
 
     let observed = requests.lock().expect("schema-object request log");
-    assert_eq!(observed.len(), 8);
+    assert_eq!(observed.len(), 11);
     for request in observed.iter() {
         let sql = request["sql"].as_str().expect("fixed reconciliation SQL");
-        assert_eq!(sql.matches("pragma_table_xinfo").count(), 1);
-        assert_eq!(sql.matches("pragma_foreign_key_list").count(), 1);
-        assert_eq!(sql.matches("pragma_foreign_key_check").count(), 1);
-        assert!(sql.contains("'item_names'"));
-        assert!(sql.contains("'items_after_update'"));
+        let selection = reconciliation_statement_markers(sql).len() == 2;
+        assert_eq!(
+            sql.matches("pragma_table_xinfo").count(),
+            usize::from(!selection)
+        );
+        assert_eq!(
+            sql.matches("pragma_foreign_key_list").count(),
+            usize::from(!selection)
+        );
+        assert_eq!(
+            sql.matches("pragma_foreign_key_check").count(),
+            usize::from(!selection)
+        );
+        assert_eq!(sql.contains("'item_names'"), !selection);
+        assert_eq!(sql.contains("'items_after_update'"), !selection);
     }
     drop(observed);
     mcp.terminate();
@@ -10435,7 +10422,7 @@ fn d1_reconciliation_and_terminal_finalize_share_view_trigger_effect_proof() {
 #[test]
 fn d1_reconciliation_and_terminal_finalize_share_additive_effect_proof() {
     let (manifest, state_expectations, schema_rows) = additive_reconciliation_case();
-    let (base_url, requests) = spawn_fake_schema_object_reconciliation_api(8, schema_rows);
+    let (base_url, requests) = spawn_fake_schema_object_reconciliation_api(11, schema_rows);
     let lease_root = PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-reconcile-additive-{}",
         std::process::id()
@@ -10475,7 +10462,7 @@ fn d1_reconciliation_and_terminal_finalize_share_additive_effect_proof() {
     let reconciled = structured_content(&reconciliation).clone();
     assert_eq!(reconciled["ok"], json!(true), "{reconciled}");
     assert_eq!(reconciled["outcome"], json!("full_state_converged"));
-    assert_eq!(reconciled["provider_calls"], json!(2));
+    assert_eq!(reconciled["provider_calls"], json!(3));
     assert_eq!(reconciled["provider_mutations"], json!(0));
     assert_eq!(
         reconciled["effect_assertion"]["id"],
@@ -10523,7 +10510,7 @@ fn d1_reconciliation_and_terminal_finalize_share_additive_effect_proof() {
         dry_content["status"],
         json!("terminal_reconciliation_plan_ready")
     );
-    assert_eq!(dry_content["provider_calls"], json!(2));
+    assert_eq!(dry_content["provider_calls"], json!(3));
 
     terminal_args["dry_run"] = json!(false);
     terminal_args["approved_terminal_plan_sha256"] = dry_content["terminal_plan_sha256"].clone();
@@ -10538,7 +10525,7 @@ fn d1_reconciliation_and_terminal_finalize_share_additive_effect_proof() {
         live_content["status"],
         json!("terminal_reconciliation_complete")
     );
-    assert_eq!(live_content["provider_calls"], json!(4));
+    assert_eq!(live_content["provider_calls"], json!(5));
     assert_eq!(live_content["provider_mutations"], json!(0));
     assert_eq!(live_content["local_namespace_mutations"], json!(3));
     assert_eq!(live_content["lease_retained"], json!(false));
@@ -10600,10 +10587,14 @@ fn d1_reconciliation_and_terminal_finalize_share_additive_effect_proof() {
     );
 
     let observed = requests.lock().expect("additive request log");
-    assert_eq!(observed.len(), 8);
+    assert_eq!(observed.len(), 11);
     for request in observed.iter() {
         let sql = request["sql"].as_str().expect("fixed reconciliation SQL");
-        assert_eq!(sql.matches("pragma_table_xinfo").count(), 1);
+        let selection = reconciliation_statement_markers(sql).len() == 2;
+        assert_eq!(
+            sql.matches("pragma_table_xinfo").count(),
+            usize::from(!selection)
+        );
         assert!(!sql.contains("ALTER TABLE"));
         assert!(!sql.contains("PRAGMA foreign_keys = ON"));
     }
@@ -11170,7 +11161,7 @@ fn d1_seed_projection_registry_proves_zero_create_only_and_full_prefixes() {
             );
             assert_eq!(
                 content["scope_completeness"]["table_xinfo"],
-                "complete_exact_declared_table_union"
+                "complete_exact_selected_prefix_table_set"
             );
             assert_eq!(
                 content["scope_completeness"]["seed_rows"],
@@ -11602,6 +11593,14 @@ fn d1_seed_complete_proofs_reject_every_premature_manifest_fact_in_reconcile_and
         assert_eq!(content["provider_calls"], 3);
         assert_eq!(content["provider_mutations"], 0);
         assert_eq!(content["local_namespace_mutations"], 0);
+        assert_eq!(
+            content["query_sha256"], reconciled["query_sha256"],
+            "terminal proof must rederive the prefix-scoped query identity: {fact:?}"
+        );
+        assert_eq!(
+            content["query_shape_receipt"], reconciled["query_shape_receipt"],
+            "terminal proof must rederive the prefix-scoped query receipt: {fact:?}"
+        );
         assert_eq!(content["retry_decision"], "do_not_retry_same_attempt");
         assert_eq!(content["lease_retained"], true);
         assert_eq!(content["custody_status"], "retained_evidence_verified");
@@ -11826,7 +11825,7 @@ fn d1_additive_reconciliation_proves_five_prefixes_with_bounded_checks() {
                 .is_some_and(|sql| sql.matches("PRAGMA foreign_keys = ON").count() == 1)))
     );
     let (base_url, requests) =
-        spawn_fake_custom_schema_reconciliation_api(2, ledger_rows, schema_rows, xinfo_rows);
+        spawn_fake_custom_schema_reconciliation_api(3, ledger_rows, schema_rows, xinfo_rows);
     let lease_root = PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-reconcile-additive-checks-{}",
         std::process::id()
@@ -11866,12 +11865,12 @@ fn d1_additive_reconciliation_proves_five_prefixes_with_bounded_checks() {
     assert_eq!(content["ok"], json!(true), "{content}");
     assert_eq!(content["outcome"], json!("full_state_converged"));
     assert_eq!(content["current_manifest_prefix_length"], json!(5));
-    assert_eq!(content["provider_calls"], json!(2));
+    assert_eq!(content["provider_calls"], json!(3));
     assert_eq!(content["provider_mutations"], json!(0));
     assert_eq!(content["lease_retained"], json!(true));
 
     let observed = requests.lock().expect("additive CHECK request log");
-    assert_eq!(observed.len(), 2);
+    assert_eq!(observed.len(), 3);
     for request in observed.iter() {
         let sql = request["sql"].as_str().expect("fixed reconciliation SQL");
         assert!(!sql.contains("ALTER TABLE"));
@@ -11885,7 +11884,7 @@ fn d1_additive_reconciliation_proves_five_prefixes_with_bounded_checks() {
 
 #[test]
 fn d1_terminal_plan_rejects_effect_assertion_change_after_approval_for_identical_table_state() {
-    let (base_url, requests) = spawn_fake_reconciliation_api_for_calls(6);
+    let (base_url, requests) = spawn_fake_reconciliation_api_for_calls(9);
     let lease_root = PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-terminal-assertion-binding-{}",
         std::process::id()
@@ -11973,7 +11972,7 @@ fn d1_terminal_plan_rejects_effect_assertion_change_after_approval_for_identical
     );
     assert_eq!(rejected_content["provider_calls"], json!(0));
     assert_private_regular_active_lease(&lease_root);
-    assert_eq!(requests.lock().expect("request log").len(), 6);
+    assert_eq!(requests.lock().expect("request log").len(), 9);
     mcp.terminate();
     let _ = fs::remove_dir_all(lease_root);
 }
@@ -12301,7 +12300,7 @@ fn d1_terminal_resumes_canonical_v1_receipt_from_retiring_namespace() {
         current_prefix_length: usize,
     }
 
-    let (base_url, requests) = spawn_fake_reconciliation_api_for_calls(6);
+    let (base_url, requests) = spawn_fake_reconciliation_api_for_calls(8);
     let lease_root = PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-terminal-v1-retiring-{}",
         std::process::id()
@@ -12458,10 +12457,10 @@ fn d1_terminal_resumes_canonical_v1_receipt_from_retiring_namespace() {
         json!("terminal_reconciliation_complete")
     );
     assert_eq!(resumed_content["terminal_receipt_version"], json!(1));
-    assert_eq!(resumed_content["provider_calls"], json!(4));
+    assert_eq!(resumed_content["provider_calls"], json!(5));
     assert_eq!(resumed_content["provider_mutations"], json!(0));
     assert_eq!(resumed_content["local_namespace_mutations"], json!(1));
-    assert_eq!(requests.lock().expect("request log").len(), 6);
+    assert_eq!(requests.lock().expect("request log").len(), 8);
     assert_released_manifest_target_custody(&lease_root);
     mcp.terminate();
     let _ = fs::remove_dir_all(lease_root);
@@ -12517,7 +12516,7 @@ fn d1_reconciliation_stdio_rejects_view_trigger_effects_outside_the_explicit_reg
 #[test]
 fn d1_finalize_migration_reconciliation_stdio_requires_preapproval_and_retires_after_two_fresh_reads()
  {
-    let (base_url, requests) = spawn_fake_reconciliation_api_for_calls(8);
+    let (base_url, requests) = spawn_fake_reconciliation_api_for_calls(11);
     let lease_root = PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-finalize-manifest-{}",
         std::process::id()
@@ -12588,7 +12587,7 @@ fn d1_finalize_migration_reconciliation_stdio_requires_preapproval_and_retires_a
         dry_content["status"],
         json!("terminal_reconciliation_plan_ready")
     );
-    assert_eq!(dry_content["provider_calls"], json!(2));
+    assert_eq!(dry_content["provider_calls"], json!(3));
     assert_eq!(dry_content["lease_retained"], json!(true));
     assert_eq!(
         dry_content["custody_status"],
@@ -12611,7 +12610,7 @@ fn d1_finalize_migration_reconciliation_stdio_requires_preapproval_and_retires_a
         live_content["status"],
         json!("terminal_reconciliation_complete")
     );
-    assert_eq!(live_content["provider_calls"], json!(4));
+    assert_eq!(live_content["provider_calls"], json!(5));
     assert_eq!(live_content["provider_mutations"], json!(0));
     assert_eq!(live_content["local_namespace_mutations"], json!(3));
     assert_eq!(live_content["lease_retained"], json!(false));
@@ -12624,7 +12623,7 @@ fn d1_finalize_migration_reconciliation_stdio_requires_preapproval_and_retires_a
         live_content["provider_read_lifecycle"]
             .as_array()
             .map(Vec::len),
-        Some(4)
+        Some(5)
     );
     assert_released_manifest_target_custody(&lease_root);
     let target = manifest_target_path(&lease_root);
@@ -12676,7 +12675,7 @@ fn d1_finalize_migration_reconciliation_stdio_requires_preapproval_and_retires_a
         changed_manifest_content["error"]["code"],
         json!("d1.migration_terminal_approved_evidence_mismatch")
     );
-    assert_eq!(requests.lock().expect("request log").len(), 8);
+    assert_eq!(requests.lock().expect("request log").len(), 11);
     mcp.terminate();
     let _ = fs::remove_dir_all(lease_root);
 }
@@ -12684,8 +12683,8 @@ fn d1_finalize_migration_reconciliation_stdio_requires_preapproval_and_retires_a
 #[test]
 fn d1_finalize_migration_reconciliation_resumes_exact_receipt_from_retiring_namespace() {
     let (base_url, first_requests) = spawn_fake_reconciliation_api_with_fault_and_calls(
-        ReconciliationFault::RequestTransportFailure(7),
-        8,
+        ReconciliationFault::RequestTransportFailure(10),
+        11,
     );
     let lease_root = PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-finalize-resume-{}",
@@ -12766,7 +12765,7 @@ fn d1_finalize_migration_reconciliation_resumes_exact_receipt_from_retiring_name
         json!(false),
         "{interrupted_content}"
     );
-    assert_eq!(interrupted_content["provider_calls"], json!(4));
+    assert_eq!(interrupted_content["provider_calls"], json!(5));
     assert_eq!(interrupted_content["provider_mutations"], json!(0));
     assert_eq!(interrupted_content["local_namespace_mutations"], json!(1));
     assert_eq!(interrupted_content["lease_retained"], json!(true));
@@ -12775,7 +12774,7 @@ fn d1_finalize_migration_reconciliation_resumes_exact_receipt_from_retiring_name
         json!("retained_evidence_verified")
     );
     assert_eq!(interrupted_content["lease_decision"], json!("retain"));
-    assert_eq!(first_requests.lock().expect("first request log").len(), 8);
+    assert_eq!(first_requests.lock().expect("first request log").len(), 11);
     first_mcp.terminate();
 
     let target = manifest_target_path(&lease_root);
@@ -12803,7 +12802,7 @@ fn d1_finalize_migration_reconciliation_resumes_exact_receipt_from_retiring_name
         .sync_all()
         .expect("sync modeled retiring namespace");
 
-    let (resume_url, resume_requests) = spawn_fake_reconciliation_api_for_calls(4);
+    let (resume_url, resume_requests) = spawn_fake_reconciliation_api_for_calls(5);
     let mut resume_mcp = McpStdioProcess::start_with_env(vec![
         ("CLOUDFLARE_MCP_API_BASE_URL", resume_url),
         (
@@ -12818,7 +12817,7 @@ fn d1_finalize_migration_reconciliation_resumes_exact_receipt_from_retiring_name
         resumed_content["status"],
         json!("terminal_reconciliation_complete")
     );
-    assert_eq!(resumed_content["provider_calls"], json!(4));
+    assert_eq!(resumed_content["provider_calls"], json!(5));
     assert_eq!(resumed_content["provider_mutations"], json!(0));
     assert_eq!(resumed_content["local_namespace_mutations"], json!(1));
     assert_eq!(resumed_content["lease_retained"], json!(false));
@@ -12827,7 +12826,7 @@ fn d1_finalize_migration_reconciliation_resumes_exact_receipt_from_retiring_name
         json!("retired_evidence_verified")
     );
     assert_eq!(resumed_content["lease_decision"], json!("retired"));
-    assert_eq!(resume_requests.lock().expect("resume request log").len(), 4);
+    assert_eq!(resume_requests.lock().expect("resume request log").len(), 5);
     assert_released_manifest_target_custody(&lease_root);
     resume_mcp.terminate();
     let _ = fs::remove_dir_all(lease_root);
@@ -13333,7 +13332,7 @@ fn d1_finalize_migration_reconciliation_stdio_does_not_claim_retention_after_cus
             .lock()
             .expect("baseline request log")
             .len(),
-        2
+        3
     );
     baseline_mcp.terminate();
 
@@ -14481,7 +14480,7 @@ fn d1_reconcile_migration_manifest_stdio_requires_primary_current_evidence_for_e
         (ReconciliationFault::PrimaryMarkerNull, 1),
         (ReconciliationFault::PrimaryMarkerWrongType, 1),
         (ReconciliationFault::MixedPrimaryMarkers, 1),
-        (ReconciliationFault::SecondBatchPrimaryFalse, 2),
+        (ReconciliationFault::SecondBatchPrimaryFalse, 3),
     ]
     .into_iter()
     .enumerate()
@@ -14922,10 +14921,12 @@ fn d1_reconcile_migration_manifest_stdio_preserves_identical_reads_after_second_
     let query_shape_receipt = content["query_shape_receipt"].clone();
     let evidence = content["response_evidence"]
         .as_array()
-        .expect("two chronological response summaries");
-    assert_eq!(evidence.len(), 2, "{content}");
-    assert_eq!(evidence[0], evidence[1], "{content}");
-    let response_summary = evidence[0].clone();
+        .expect("selection and two chronological response summaries");
+    assert_eq!(evidence.len(), 3, "{content}");
+    assert_eq!(evidence[1], evidence[2], "{content}");
+    let selection_summary = evidence[0].clone();
+    let response_summary = evidence[1].clone();
+    let selection_lifecycle = selection_summary["lifecycle"].clone();
     let lifecycle = response_summary["lifecycle"].clone();
     assert_eq!(
         content,
@@ -14941,9 +14942,9 @@ fn d1_reconcile_migration_manifest_stdio_preserves_identical_reads_after_second_
             "custody_status": "retained_evidence_unverified",
             "query_sha256": query_sha256,
             "query_shape_receipt": query_shape_receipt,
-            "response_evidence": [response_summary.clone(), response_summary],
-            "provider_read_lifecycle": [lifecycle.clone(), lifecycle],
-            "provider_calls": 2,
+            "response_evidence": [selection_summary, response_summary.clone(), response_summary],
+            "provider_read_lifecycle": [selection_lifecycle, lifecycle.clone(), lifecycle],
+            "provider_calls": 3,
             "provider_mutations": 0,
             "local_namespace_mutations": 0,
             "error": {
@@ -14954,7 +14955,7 @@ fn d1_reconcile_migration_manifest_stdio_preserves_identical_reads_after_second_
         }),
         "{content}"
     );
-    assert_eq!(requests.lock().expect("request log").len(), 2);
+    assert_eq!(requests.lock().expect("request log").len(), 3);
     mcp.terminate();
     let _ = fs::remove_dir_all(lease_root);
 }
@@ -15043,8 +15044,8 @@ fn d1_reconcile_migration_manifest_stdio_keeps_post_read_contradictions_verified
         ),
         (
             ReconciliationFault::LedgerNotManifestPrefix,
-            "d1.migration_reconciliation_ledger_not_manifest_prefix",
-            "stable migration ledger is not an exact prefix of the supplied manifest",
+            "d1.migration_reconciliation_selected_ledger_changed",
+            "complete proof ledgers did not equal the exact initial selected ledger",
         ),
     ]
     .into_iter()
@@ -15089,11 +15090,12 @@ fn d1_reconcile_migration_manifest_stdio_keeps_post_read_contradictions_verified
         let content = structured_content(&response);
         let query_sha256 = content["query_sha256"].clone();
         let query_shape_receipt = content["query_shape_receipt"].clone();
+        let selection_binding = content["selection_binding"].clone();
         let response_evidence = content["response_evidence"].clone();
         let evidence = response_evidence
             .as_array()
-            .expect("two chronological response summaries");
-        assert_eq!(evidence.len(), 2, "{content}");
+            .expect("selection and two chronological response summaries");
+        assert_eq!(evidence.len(), 3, "{content}");
         for summary in evidence {
             assert_eq!(summary.as_object().map(|value| value.len()), Some(3));
             assert!(summary["response_body_sha256"].as_str().is_some());
@@ -15109,6 +15111,12 @@ fn d1_reconcile_migration_manifest_stdio_keeps_post_read_contradictions_verified
             );
         }
         let lifecycle = json!([
+            {
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 200,
+            },
             {
                 "dispatch_stage": "attempted",
                 "response_stage": "received",
@@ -15138,9 +15146,10 @@ fn d1_reconcile_migration_manifest_stdio_keeps_post_read_contradictions_verified
                 "custody_status": "retained_evidence_verified",
                 "query_sha256": query_sha256,
                 "query_shape_receipt": query_shape_receipt,
+                "selection_binding": selection_binding,
                 "response_evidence": response_evidence,
                 "provider_read_lifecycle": lifecycle,
-                "provider_calls": 2,
+                "provider_calls": 3,
                 "provider_mutations": 0,
                 "local_namespace_mutations": 0,
                 "error": {
@@ -15151,7 +15160,7 @@ fn d1_reconcile_migration_manifest_stdio_keeps_post_read_contradictions_verified
             }),
             "{content}"
         );
-        assert_eq!(requests.lock().expect("request log").len(), 2);
+        assert_eq!(requests.lock().expect("request log").len(), 3);
         assert_private_regular_active_lease(&lease_root);
         mcp.terminate();
         let _ = fs::remove_dir_all(lease_root);
@@ -15214,10 +15223,16 @@ fn d1_reconcile_migration_manifest_stdio_preserves_both_batches_when_second_call
         json!("retained_evidence_verified"),
         "{content}"
     );
-    assert_eq!(content["provider_calls"], json!(2), "{content}");
+    assert_eq!(content["provider_calls"], json!(3), "{content}");
     assert_eq!(
         content["provider_read_lifecycle"],
         json!([
+            {
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 200,
+            },
             {
                 "dispatch_stage": "attempted",
                 "response_stage": "received",
@@ -15236,17 +15251,17 @@ fn d1_reconcile_migration_manifest_stdio_preserves_both_batches_when_second_call
     let evidence = content["response_evidence"]
         .as_array()
         .expect("chronological response evidence");
-    assert_eq!(evidence.len(), 2, "{content}");
+    assert_eq!(evidence.len(), 3, "{content}");
     assert_ne!(
-        evidence[0]["response_body_sha256"], evidence[1]["response_body_sha256"],
+        evidence[1]["response_body_sha256"], evidence[2]["response_body_sha256"],
         "{content}"
     );
     assert_eq!(
-        evidence[1]["response_body_sha256"],
+        evidence[2]["response_body_sha256"],
         json!(expected_second_sha256),
         "{content}"
     );
-    assert_eq!(requests.lock().expect("request log").len(), 2);
+    assert_eq!(requests.lock().expect("request log").len(), 3);
     assert_private_regular_active_lease(&lease_root);
     mcp.terminate();
     let _ = fs::remove_dir_all(lease_root);
@@ -15300,17 +15315,17 @@ fn d1_reconcile_migration_manifest_stdio_reports_safe_allowlisted_second_error()
     );
     let content = structured_content(&response);
     assert_eq!(content["ok"], json!(false), "{content}");
-    assert_eq!(content["provider_calls"], json!(2), "{content}");
+    assert_eq!(content["provider_calls"], json!(3), "{content}");
     assert_eq!(
         content["response_evidence"].as_array().map(Vec::len),
-        Some(2)
+        Some(3)
     );
     assert_eq!(
         content["provider_read_lifecycle"][0]["http_status"],
         json!(200)
     );
     assert_eq!(
-        content["provider_read_lifecycle"][1]["http_status"],
+        content["provider_read_lifecycle"][2]["http_status"],
         json!(400)
     );
     assert_eq!(
@@ -15344,7 +15359,7 @@ fn d1_reconcile_migration_manifest_stdio_reports_safe_allowlisted_second_error()
     assert!(!serialized.contains(private_message));
     assert!(!serialized.contains("private_table"));
     assert!(!serialized.contains("/private/path"));
-    assert_eq!(requests.lock().expect("request log").len(), 2);
+    assert_eq!(requests.lock().expect("request log").len(), 3);
     assert_private_regular_active_lease(&lease_root);
     mcp.terminate();
     let _ = fs::remove_dir_all(lease_root);
@@ -15394,7 +15409,7 @@ fn d1_reconcile_migration_manifest_stdio_deep_error_is_generic_with_custody_reta
     );
     let content = structured_content(&response);
     assert_eq!(content["ok"], json!(false), "{content}");
-    assert_eq!(content["provider_calls"], json!(2), "{content}");
+    assert_eq!(content["provider_calls"], json!(3), "{content}");
     assert_eq!(content["provider_mutations"], json!(0), "{content}");
     assert_eq!(content["lease_retained"], json!(true), "{content}");
     assert_eq!(
@@ -15415,6 +15430,12 @@ fn d1_reconcile_migration_manifest_stdio_deep_error_is_generic_with_custody_reta
                 "dispatch_stage": "attempted",
                 "response_stage": "received",
                 "body_stage": "completely_read",
+                "http_status": 200,
+            },
+            {
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
                 "http_status": 400,
             }
         ]),
@@ -15422,7 +15443,7 @@ fn d1_reconcile_migration_manifest_stdio_deep_error_is_generic_with_custody_reta
     );
     assert_eq!(
         content["response_evidence"].as_array().map(Vec::len),
-        Some(2)
+        Some(3)
     );
     assert_eq!(
         content["provider_cause"],
@@ -15442,7 +15463,7 @@ fn d1_reconcile_migration_manifest_stdio_deep_error_is_generic_with_custody_reta
     assert!(!serialized.contains(private_message));
     assert!(!serialized.contains("private_table"));
     assert!(!serialized.contains("/private/path"));
-    assert_eq!(requests.lock().expect("request log").len(), 2);
+    assert_eq!(requests.lock().expect("request log").len(), 3);
     assert_private_regular_active_lease(&lease_root);
     mcp.terminate();
     let _ = fs::remove_dir_all(lease_root);
@@ -15494,7 +15515,9 @@ fn d1_reconcile_migration_manifest_stdio_preserves_second_transport_invocation_w
         let content = structured_content(&response);
         let query_sha256 = content["query_sha256"].clone();
         let query_shape_receipt = content["query_shape_receipt"].clone();
-        let first = content["response_evidence"][0].clone();
+        let selection = content["response_evidence"][0].clone();
+        let first = content["response_evidence"][1].clone();
+        assert_eq!(selection.as_object().map(|value| value.len()), Some(3));
         assert_eq!(first.as_object().map(|value| value.len()), Some(3));
         let mut expected = json!({
             "ok": false,
@@ -15514,8 +15537,9 @@ fn d1_reconcile_migration_manifest_stdio_preserves_second_transport_invocation_w
             },
             "query_sha256": query_sha256,
             "query_shape_receipt": query_shape_receipt,
-            "response_evidence": [first.clone()],
+            "response_evidence": [selection.clone(), first.clone()],
             "provider_read_lifecycle": [
+                selection["lifecycle"].clone(),
                 first["lifecycle"].clone(),
                 {
                     "dispatch_stage": "attempted",
@@ -15524,7 +15548,7 @@ fn d1_reconcile_migration_manifest_stdio_preserves_second_transport_invocation_w
                     "http_status": null,
                 },
             ],
-            "provider_calls": 2,
+            "provider_calls": 3,
             "provider_mutations": 0,
             "local_namespace_mutations": 0,
             "provider_cause": {
@@ -15550,7 +15574,7 @@ fn d1_reconcile_migration_manifest_stdio_preserves_second_transport_invocation_w
             );
         }
         assert_eq!(content, &expected, "custody_verified={custody_verified}");
-        assert_eq!(requests.lock().expect("request log").len(), 2);
+        assert_eq!(requests.lock().expect("request log").len(), 3);
         if custody_verified {
             assert_private_regular_active_lease(&lease_root);
         }
