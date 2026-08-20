@@ -2602,7 +2602,7 @@ fn predecessor_two_table_reconciliation_evidence(
         r#"{{"ledger":[{{"id":1,"name":"0001_current.sql"}}],"schema_objects":[{{"object_type":"table","name":"Current","table_name":"Current","sql_sha256":"{current_sql_sha256}"}}],"tables":[{{"name":"Current","columns":[{{"cid":0,"name":"id","declared_type":"TEXT","not_null":false,"default_value":null,"primary_key_position":1,"hidden":0}}],"foreign_keys":[]}},{{"name":"Future","columns":[],"foreign_keys":[]}}]}}"#
     );
     let canonical_snapshot_sha256 = sha256_hex(&snapshot);
-    let reconciliation_plan_sha256 = two_table_reconciliation_plan_sha256(
+    let reconciliation_plan_sha256 = historical_v2_two_table_reconciliation_plan_sha256(
         manifest,
         reconciled,
         &query_sha256,
@@ -2615,7 +2615,7 @@ fn predecessor_two_table_reconciliation_evidence(
     )
 }
 
-fn two_table_reconciliation_plan_sha256(
+fn historical_v2_two_table_reconciliation_plan_sha256(
     manifest: &Value,
     reconciled: &Value,
     query_sha256: &str,
@@ -2649,6 +2649,7 @@ fn two_table_reconciliation_plan_sha256(
         "outcome": "partial_state_converged",
         "query_sha256": query_sha256,
         "canonical_snapshot_sha256": canonical_snapshot_sha256,
+        "effect_assertion_id": "schema_create_only_v1",
         "retry_decision": "do_not_retry_same_attempt",
         "lease_decision": "retain",
         "next_slice": "persist_terminal_reconciliation_receipt_then_guarded_retirement",
@@ -12351,8 +12352,11 @@ fn d1_terminal_plan_rejects_effect_assertion_change_after_approval_for_identical
 }
 
 #[test]
-fn d1_terminal_equal_query_sha_uses_plan_bound_predecessor_chronology_from_active_custody() {
-    let (base_url, requests) = spawn_fake_reconciliation_api_for_calls(12);
+fn d1_terminal_equal_query_sha_preserves_historical_v2_chronology_across_custody() {
+    let (base_url, requests) = spawn_fake_reconciliation_api_with_fault_and_calls(
+        ReconciliationFault::RequestTransportFailure(11),
+        12,
+    );
     let lease_root = PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-terminal-equal-query-active-{}",
         std::process::id()
@@ -12392,7 +12396,7 @@ fn d1_terminal_equal_query_sha_uses_plan_bound_predecessor_chronology_from_activ
     let reconciled = structured_content(&reconciliation).clone();
     assert_eq!(reconciled["ok"], true, "{reconciled}");
     assert_eq!(reconciled["provider_calls"], 3);
-    let legacy_plan = json!({
+    let historical_v2_plan = json!({
         "version": 1,
         "operation": "d1_reconcile_migration_manifest",
         "target_key_sha256": sha256_hex("acct-1\0db-1"),
@@ -12406,12 +12410,24 @@ fn d1_terminal_equal_query_sha_uses_plan_bound_predecessor_chronology_from_activ
         "outcome": reconciled["outcome"],
         "query_sha256": reconciled["query_sha256"],
         "canonical_snapshot_sha256": reconciled["canonical_snapshot_sha256"],
+        "effect_assertion_id": "schema_create_only_v1",
         "retry_decision": "do_not_retry_same_attempt",
         "lease_decision": "retain",
         "next_slice": "persist_terminal_reconciliation_receipt_then_guarded_retirement",
     });
-    let legacy_plan_sha256 =
-        sha256_hex(&serde_json::to_string(&legacy_plan).expect("serialize equal-query plan"));
+    let historical_v2_plan_sha256 = sha256_hex(
+        &serde_json::to_string(&historical_v2_plan).expect("serialize equal-query plan"),
+    );
+    let mut scoped_v3_plan = historical_v2_plan.clone();
+    scoped_v3_plan["version"] = json!(3);
+    scoped_v3_plan["query_chronology"] = json!("selected_prefix_v1");
+    let scoped_v3_plan_sha256 =
+        sha256_hex(&serde_json::to_string(&scoped_v3_plan).expect("serialize scoped-v3 plan"));
+    assert_eq!(
+        reconciled["reconciliation_plan_sha256"], scoped_v3_plan_sha256,
+        "fresh reconciliation must emit the scoped-v3 plan family"
+    );
+    assert_ne!(historical_v2_plan_sha256, scoped_v3_plan_sha256);
     let mut terminal_args = terminal_args_from_reconciliation(
         &manifest,
         &state_expectations,
@@ -12443,7 +12459,7 @@ fn d1_terminal_equal_query_sha_uses_plan_bound_predecessor_chronology_from_activ
     let current_dry_content = structured_content(&current_dry);
     assert_eq!(current_dry_content["ok"], true, "{current_dry_content}");
     assert_eq!(current_dry_content["provider_calls"], 3);
-    terminal_args["expected_reconciliation_plan_sha256"] = json!(legacy_plan_sha256);
+    terminal_args["expected_reconciliation_plan_sha256"] = json!(historical_v2_plan_sha256);
 
     let dry = mcp.call_tool(
         949,
@@ -12455,20 +12471,16 @@ fn d1_terminal_equal_query_sha_uses_plan_bound_predecessor_chronology_from_activ
     assert_eq!(dry_content["provider_calls"], 2);
     terminal_args["dry_run"] = json!(false);
     terminal_args["approved_terminal_plan_sha256"] = dry_content["terminal_plan_sha256"].clone();
-    let live = mcp.call_tool(
+    let interrupted = mcp.call_tool(
         950,
         "d1_finalize_migration_reconciliation",
         terminal_args.clone(),
     );
-    let live_content = structured_content(&live);
-    assert_eq!(live_content["ok"], true, "{live_content}");
-    assert_eq!(live_content["provider_calls"], 4);
-    assert_eq!(live_content["local_namespace_mutations"], 3);
-    assert_eq!(live_content["terminal_receipt_version"], 2);
-    let replay = mcp.call_tool(951, "d1_finalize_migration_reconciliation", terminal_args);
-    let replay_content = structured_content(&replay);
-    assert_eq!(replay_content["ok"], true, "{replay_content}");
-    assert_eq!(replay_content["provider_calls"], 0);
+    let interrupted_content = structured_content(&interrupted);
+    assert_eq!(interrupted_content["ok"], false, "{interrupted_content}");
+    assert_eq!(interrupted_content["provider_calls"], 4);
+    assert_eq!(interrupted_content["local_namespace_mutations"], 1);
+    assert_eq!(interrupted_content["receipt_persisted"], true);
 
     let observed = requests.lock().expect("equal-query active requests");
     assert_eq!(observed.len(), 12);
@@ -12484,13 +12496,50 @@ fn d1_terminal_equal_query_sha_uses_plan_bound_predecessor_chronology_from_activ
         "fresh reconciliation and current-plan terminal proof select once, while equal-SHA predecessor terminal proof does not"
     );
     drop(observed);
-    assert_released_manifest_target_custody(&lease_root);
     mcp.terminate();
+
+    let target = manifest_target_path(&lease_root);
+    fs::rename(
+        target.join("active.lease.json"),
+        target.join("retiring.lease.json"),
+    )
+    .expect("model equal-query historical-v2 interruption in retiring namespace");
+    fs::File::open(&target)
+        .expect("open equal-query historical-v2 target")
+        .sync_all()
+        .expect("sync equal-query historical-v2 retiring namespace");
+
+    let (resume_url, resume_requests) = spawn_fake_reconciliation_api_for_calls(4);
+    let mut resume_mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", resume_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let resumed = resume_mcp.call_tool(
+        951,
+        "d1_finalize_migration_reconciliation",
+        terminal_args.clone(),
+    );
+    let resumed_content = structured_content(&resumed);
+    assert_eq!(resumed_content["ok"], true, "{resumed_content}");
+    assert_eq!(resumed_content["provider_calls"], 4);
+    assert_eq!(resumed_content["local_namespace_mutations"], 1);
+    assert_eq!(resumed_content["terminal_receipt_version"], 2);
+    assert_eq!(resume_requests.lock().expect("resume requests").len(), 4);
+
+    let replay = resume_mcp.call_tool(952, "d1_finalize_migration_reconciliation", terminal_args);
+    let replay_content = structured_content(&replay);
+    assert_eq!(replay_content["ok"], true, "{replay_content}");
+    assert_eq!(replay_content["provider_calls"], 0);
+    assert_released_manifest_target_custody(&lease_root);
+    resume_mcp.terminate();
     let _ = fs::remove_dir_all(lease_root);
 }
 
 #[test]
-fn d1_terminal_finalizes_and_replays_genuine_predecessor_full_union_evidence_from_active_custody() {
+fn d1_terminal_historical_v2_distinct_full_union_finalizes_and_replays_from_active_custody() {
     let (base_url, requests) = spawn_fake_predecessor_query_compatibility_api(9, None);
     let lease_root = PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-terminal-predecessor-active-{}",
@@ -12532,7 +12581,7 @@ fn d1_terminal_finalizes_and_replays_genuine_predecessor_full_union_evidence_fro
     assert_eq!(reconciled["ok"], true, "{reconciled}");
     assert_eq!(reconciled["current_manifest_prefix_length"], 1);
     assert_eq!(reconciled["provider_calls"], 3);
-    let (legacy_query_sha256, legacy_snapshot_sha256, legacy_plan_sha256) =
+    let (historical_query_sha256, historical_snapshot_sha256, historical_plan_sha256) =
         predecessor_two_table_reconciliation_evidence(&manifest, &reconciled);
 
     let mut terminal_args = terminal_args_from_reconciliation(
@@ -12543,15 +12592,15 @@ fn d1_terminal_finalizes_and_replays_genuine_predecessor_full_union_evidence_fro
         &lease_payload_sha256,
         &reconciled,
     );
-    terminal_args["expected_query_sha256"] = json!(legacy_query_sha256);
-    terminal_args["expected_canonical_snapshot_sha256"] = json!(legacy_snapshot_sha256);
-    terminal_args["expected_reconciliation_plan_sha256"] = json!(legacy_plan_sha256);
+    terminal_args["expected_query_sha256"] = json!(historical_query_sha256);
+    terminal_args["expected_canonical_snapshot_sha256"] = json!(historical_snapshot_sha256);
+    terminal_args["expected_reconciliation_plan_sha256"] = json!(historical_plan_sha256);
 
     let mut unknown_query_args = terminal_args.clone();
     let unknown_query_sha256 = "f".repeat(64);
     unknown_query_args["expected_query_sha256"] = json!(unknown_query_sha256);
     unknown_query_args["expected_reconciliation_plan_sha256"] =
-        json!(two_table_reconciliation_plan_sha256(
+        json!(historical_v2_two_table_reconciliation_plan_sha256(
             &manifest,
             &reconciled,
             &unknown_query_sha256,
@@ -12602,6 +12651,15 @@ fn d1_terminal_finalizes_and_replays_genuine_predecessor_full_union_evidence_fro
         &fs::read(&receipt_path).expect("read predecessor terminal receipt"),
     )
     .expect("decode predecessor terminal receipt");
+    assert_eq!(durable_receipt["version"], 2);
+    assert_eq!(
+        durable_receipt["effect_assertion_id"],
+        "schema_create_only_v1"
+    );
+    assert_eq!(
+        durable_receipt["reconciliation_plan_sha256"],
+        terminal_args["expected_reconciliation_plan_sha256"]
+    );
     assert_eq!(
         durable_receipt["query_sha256"], terminal_args["expected_query_sha256"],
         "the durable receipt must retain the exact predecessor query authority"
@@ -12643,7 +12701,7 @@ fn d1_terminal_finalizes_and_replays_genuine_predecessor_full_union_evidence_fro
 }
 
 #[test]
-fn d1_terminal_resumes_genuine_predecessor_full_union_receipt_from_retiring_custody() {
+fn d1_terminal_historical_v2_distinct_full_union_resumes_from_retiring_custody() {
     let (base_url, first_requests) = spawn_fake_predecessor_query_compatibility_api(9, Some(8));
     let lease_root = PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-terminal-predecessor-retiring-{}",
@@ -12683,7 +12741,7 @@ fn d1_terminal_resumes_genuine_predecessor_full_union_receipt_from_retiring_cust
     );
     let reconciled = structured_content(&reconciliation).clone();
     assert_eq!(reconciled["ok"], true, "{reconciled}");
-    let (legacy_query_sha256, legacy_snapshot_sha256, legacy_plan_sha256) =
+    let (historical_query_sha256, historical_snapshot_sha256, historical_plan_sha256) =
         predecessor_two_table_reconciliation_evidence(&manifest, &reconciled);
     let mut terminal_args = terminal_args_from_reconciliation(
         &manifest,
@@ -12693,9 +12751,9 @@ fn d1_terminal_resumes_genuine_predecessor_full_union_receipt_from_retiring_cust
         &lease_payload_sha256,
         &reconciled,
     );
-    terminal_args["expected_query_sha256"] = json!(legacy_query_sha256);
-    terminal_args["expected_canonical_snapshot_sha256"] = json!(legacy_snapshot_sha256);
-    terminal_args["expected_reconciliation_plan_sha256"] = json!(legacy_plan_sha256);
+    terminal_args["expected_query_sha256"] = json!(historical_query_sha256);
+    terminal_args["expected_canonical_snapshot_sha256"] = json!(historical_snapshot_sha256);
+    terminal_args["expected_reconciliation_plan_sha256"] = json!(historical_plan_sha256);
     let dry = first_mcp.call_tool(
         946,
         "d1_finalize_migration_reconciliation",
@@ -13083,7 +13141,7 @@ fn d1_terminal_replays_canonical_v1_retirement_as_legacy_and_rejects_extended_re
 }
 
 #[test]
-fn d1_terminal_resumes_canonical_v1_receipt_from_retiring_namespace() {
+fn d1_terminal_preserves_equal_query_v1_chronology_from_active_through_retiring() {
     #[derive(Serialize)]
     struct LegacyReceipt<'a> {
         version: u8,
@@ -13104,7 +13162,7 @@ fn d1_terminal_resumes_canonical_v1_receipt_from_retiring_namespace() {
         current_prefix_length: usize,
     }
 
-    let (base_url, requests) = spawn_fake_reconciliation_api_for_calls(7);
+    let (base_url, requests) = spawn_fake_reconciliation_api_for_calls(9);
     let lease_root = PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-terminal-v1-retiring-{}",
         std::process::id()
@@ -13189,6 +13247,26 @@ fn d1_terminal_resumes_canonical_v1_receipt_from_retiring_namespace() {
     let legacy_terminal_plan_sha256 = sha256_hex(
         &serde_json::to_string(&legacy_terminal_plan).expect("legacy terminal plan JSON"),
     );
+    let mut terminal_args = terminal_args_from_reconciliation(
+        &manifest,
+        &state_expectations,
+        &approved_plan_sha256,
+        &lease_nonce,
+        &lease_payload_sha256,
+        &reconciled,
+    );
+    terminal_args["expected_reconciliation_plan_sha256"] =
+        json!(legacy_reconciliation_plan_sha256.clone());
+    terminal_args["terminal_request_sha256"] = json!(terminal_request_sha256.clone());
+    terminal_args["terminal_attempt_sha256"] = json!(terminal_attempt_sha256.clone());
+    let active_dry = mcp.call_tool(
+        829,
+        "d1_finalize_migration_reconciliation",
+        terminal_args.clone(),
+    );
+    let active_dry_content = structured_content(&active_dry);
+    assert_eq!(active_dry_content["ok"], true, "{active_dry_content}");
+    assert_eq!(active_dry_content["provider_calls"], 2);
     let target_key_sha256 = sha256_hex("acct-1\0db-1");
     let receipt = LegacyReceipt {
         version: 1,
@@ -13240,17 +13318,6 @@ fn d1_terminal_resumes_canonical_v1_receipt_from_retiring_namespace() {
         .expect("open target")
         .sync_all()
         .expect("sync retiring state");
-    let mut terminal_args = terminal_args_from_reconciliation(
-        &manifest,
-        &state_expectations,
-        &approved_plan_sha256,
-        &lease_nonce,
-        &lease_payload_sha256,
-        &reconciled,
-    );
-    terminal_args["expected_reconciliation_plan_sha256"] = json!(legacy_reconciliation_plan_sha256);
-    terminal_args["terminal_request_sha256"] = json!(terminal_request_sha256);
-    terminal_args["terminal_attempt_sha256"] = json!(terminal_attempt_sha256);
     terminal_args["dry_run"] = json!(false);
     terminal_args["approved_terminal_plan_sha256"] = json!(legacy_terminal_plan_sha256);
     let resumed = mcp.call_tool(823, "d1_finalize_migration_reconciliation", terminal_args);
@@ -13265,7 +13332,7 @@ fn d1_terminal_resumes_canonical_v1_receipt_from_retiring_namespace() {
     assert_eq!(resumed_content["provider_mutations"], json!(0));
     assert_eq!(resumed_content["local_namespace_mutations"], json!(1));
     let observed = requests.lock().expect("request log");
-    assert_eq!(observed.len(), 7);
+    assert_eq!(observed.len(), 9);
     assert_eq!(
         observed
             .iter()
@@ -13274,8 +13341,8 @@ fn d1_terminal_resumes_canonical_v1_receipt_from_retiring_namespace() {
             )
             .len())
             .collect::<Vec<_>>(),
-        vec![2, 5, 5, 5, 5, 5, 5],
-        "the equal-SHA predecessor receipt must retain its historical no-selection chronology"
+        vec![2, 5, 5, 5, 5, 5, 5, 5, 5],
+        "equal-SHA legacy-v1 active and retiring proof must retain historical no-selection chronology"
     );
     drop(observed);
     assert_released_manifest_target_custody(&lease_root);

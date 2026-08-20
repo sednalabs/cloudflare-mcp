@@ -514,31 +514,33 @@ is mapped exclusively to `schema_create_only_v1`; it can resume active or
 retiring custody and replay a completed retirement. It never attests the
 extended assertion. Unknown fields, duplicate keys, malformed/noncanonical
 bytes, or an attempt to pair version 1 with the extended assertion fail closed
-before provider access. A newly written version-2 receipt may still bind an
-approved predecessor reconciliation plan when terminal finalization promotes
-historical active evidence; resume and replay preserve that receipt-bound plan
-family rather than inferring query chronology from the receipt schema version.
+before provider access. A version-2 receipt can bind a historical legacy-v1 or
+historical-v2 full-union plan when terminal finalization promotes existing
+active evidence, or the new scoped-v3 plan for a fresh reconciliation. Resume
+and replay preserve that receipt-bound plan family rather than inferring query
+chronology from the receipt schema version.
 
 Terminal query compatibility is independently evidence-bound. Before provider
-access, the finalizer independently recomputes both reconciliation-plan
+access, the finalizer independently recomputes the legacy-v1 full-union,
+historical-v2 effect-assertion full-union, and scoped-v3 selected-prefix plan
 families and requires exactly one to match
-`expected_reconciliation_plan_sha256`. That plan family selects the current
-selected-prefix or predecessor full-table-union chronology; only then must the
-exact approved `expected_query_sha256` and expected current prefix reproduce
-the selected constructor. Equal query digests do not change the selected
-chronology. Unknown, ambiguous, or plan/query-inconsistent combinations fail
-with zero provider calls. The predecessor non-seed form preserves its
+`expected_reconciliation_plan_sha256`. Only then must the exact approved
+`expected_query_sha256` and expected current prefix reproduce that family's
+constructor. Equal query digests do not change the selected chronology.
+Unknown, ambiguous, or plan/query-inconsistent combinations fail with zero
+provider calls. The predecessor non-seed form preserves its
 historical two complete reads without a selection call; the predecessor seed
 form preserves its historical selection plus two complete reads. This path is
 only for reproducing already-approved active/retiring evidence and durable
-receipts. New read-only reconciliation always emits the selected-prefix form.
+receipts. New read-only reconciliation always emits the scoped-v3
+selected-prefix form with explicit `query_chronology=selected_prefix_v1`.
 
 Completed-retirement replay is not receipt-only lookup. Before returning the
 zero-provider success, the terminal boundary reclassifies the supplied manifest,
 validates the complete typed expectations, and locally recomputes the applicable
-historical version-1 or current version-2 reconciliation-plan digest. Changed
-manifest names or bytes, expectation objects/tables, prefixes, or assertion
-scope therefore cannot borrow an incumbent receipt.
+legacy-v1, historical-v2 full-union, or scoped-v3 reconciliation-plan digest.
+Changed manifest names or bytes, expectation objects/tables, prefixes, or
+assertion scope therefore cannot borrow an incumbent receipt.
 
 The extended classifier keeps an entire trigger body together across internal
 semicolons and nested `CASE ... END`, then accepts only bounded canonical

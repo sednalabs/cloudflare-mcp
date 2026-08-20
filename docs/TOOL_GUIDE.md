@@ -270,18 +270,20 @@ referencing columns introduced by a later prefix, and requires the
 exact row set at and after INSERT. An unexpected intermediate row stops after
 the first complete proof with zero mutations. Fresh reconciliation evidence
 causes terminal reconciliation to rederive and repeat the same selected-prefix
-proof. Before provider access, terminal reconciliation independently recomputes
-the current and predecessor reconciliation-plan digests. Exactly one must match
-`expected_reconciliation_plan_sha256`; that plan family selects the query
-chronology, and `expected_query_sha256` plus the expected current prefix must
-then reproduce its exact query constructor. Equal current and predecessor query
-digests therefore cannot make historical evidence adopt current chronology.
-Unknown, ambiguous, or plan/query-inconsistent combinations fail with zero
-provider calls. Historical non-seed proofs retain their two full-union reads
+proof and emits only the scoped-v3 reconciliation plan, whose explicit
+`query_chronology=selected_prefix_v1` distinguishes it from historical plans.
+Before provider access, terminal reconciliation independently recomputes the
+legacy-v1 full-union, historical-v2 effect-assertion full-union, and scoped-v3
+plan digests. Exactly one must match `expected_reconciliation_plan_sha256`;
+that plan family selects the query chronology, and `expected_query_sha256` plus
+the expected current prefix must then reproduce its exact query constructor.
+Equal scoped and full-union query digests therefore cannot make either
+historical family adopt current chronology. Unknown, ambiguous, or
+plan/query-inconsistent combinations fail with zero provider calls. Historical
+non-seed proofs retain their two full-union reads
 without a selection call; historical seed proofs retain their selection read
-before the two full-union reads. The
-ordinary read-only reconciliation tool never emits this compatibility shape.
-Both complete proof ledgers must
+before the two full-union reads. The ordinary read-only reconciliation tool
+never emits this compatibility shape. Both complete proof ledgers must
 equal the exact initial selected ledger, and the two complete snapshots must
 also remain canonically equal; two mutually consistent responses at another
 prefix are contradictory. Inspect aggregate-safe `selection_binding` for the

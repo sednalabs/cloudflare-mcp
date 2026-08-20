@@ -17,9 +17,10 @@ use crate::d1_migration_lease::{
 };
 use crate::d1_migration_manifest::validate_generic_d1_migration_family;
 use crate::d1_migration_reconciliation::{
-    D1MigrationStateExpectation, canonical_effect_assertion_id,
-    prepare_d1_migration_reconciliation_for_expected_query, refresh_d1_migration_reconciliation,
-    replay_reconciliation_plan_sha256, validate_replay_manifest_expectations,
+    D1MigrationReconciliationPlanFamily, D1MigrationStateExpectation,
+    canonical_effect_assertion_id, prepare_d1_migration_reconciliation_for_expected_query,
+    refresh_d1_migration_reconciliation, replay_reconciliation_plan_sha256,
+    validate_replay_manifest_expectations,
 };
 use crate::d1_migration_terminal_semantics::valid_manifest_outcome_prefixes;
 use crate::server::CloudflareMcp;
@@ -296,7 +297,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
             evidence.receipt_persisted,
         );
     }
-    let recomputed_current_reconciliation_plan_sha256 = replay_reconciliation_plan_sha256(
+    let recomputed_scoped_reconciliation_plan_sha256 = replay_reconciliation_plan_sha256(
         account_id,
         database_id,
         family,
@@ -309,7 +310,22 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
         expected_query_sha256,
         expected_canonical_snapshot_sha256,
         selected_effect_assertion_id,
-        false,
+        D1MigrationReconciliationPlanFamily::ScopedV3SelectedPrefix,
+    );
+    let recomputed_historical_v2_reconciliation_plan_sha256 = replay_reconciliation_plan_sha256(
+        account_id,
+        database_id,
+        family,
+        migrations_table,
+        manifest,
+        &active_lease_identity,
+        expected_original_prefix_length,
+        expected_current_prefix_length,
+        expected_outcome,
+        expected_query_sha256,
+        expected_canonical_snapshot_sha256,
+        selected_effect_assertion_id,
+        D1MigrationReconciliationPlanFamily::HistoricalV2FullUnion,
     );
     let recomputed_legacy_reconciliation_plan_sha256 =
         (selected_effect_assertion_id == "schema_create_only_v1").then(|| {
@@ -326,23 +342,30 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
                 expected_query_sha256,
                 expected_canonical_snapshot_sha256,
                 selected_effect_assertion_id,
-                true,
+                D1MigrationReconciliationPlanFamily::LegacyV1FullUnion,
             )
         });
-    let current_plan_matches =
-        recomputed_current_reconciliation_plan_sha256 == expected_reconciliation_plan_sha256;
-    let predecessor_plan_matches = recomputed_legacy_reconciliation_plan_sha256
+    let scoped_plan_matches =
+        recomputed_scoped_reconciliation_plan_sha256 == expected_reconciliation_plan_sha256;
+    let historical_v2_plan_matches =
+        recomputed_historical_v2_reconciliation_plan_sha256 == expected_reconciliation_plan_sha256;
+    let legacy_v1_plan_matches = recomputed_legacy_reconciliation_plan_sha256
         .as_deref()
         .is_some_and(|plan| plan == expected_reconciliation_plan_sha256);
-    let predecessor_query_chronology = match (current_plan_matches, predecessor_plan_matches) {
-        (true, false) => false,
-        (false, true) => true,
+    let plan_family = match (
+        legacy_v1_plan_matches,
+        historical_v2_plan_matches,
+        scoped_plan_matches,
+    ) {
+        (true, false, false) => D1MigrationReconciliationPlanFamily::LegacyV1FullUnion,
+        (false, true, false) => D1MigrationReconciliationPlanFamily::HistoricalV2FullUnion,
+        (false, false, true) => D1MigrationReconciliationPlanFamily::ScopedV3SelectedPrefix,
         _ => {
             let evidence =
                 observed_terminal_evidence(&initial_lease, &receipt, legacy_receipt.as_ref());
             return terminal_error(
                 "d1.migration_terminal_approved_evidence_mismatch",
-                "expected reconciliation plan did not identify exactly one current or predecessor query chronology",
+                "expected reconciliation plan did not identify exactly one legacy-v1, historical-v2, or scoped-v3 query family",
                 evidence.custody,
                 0,
                 Vec::new(),
@@ -355,7 +378,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
     if initial_receipt
         .as_ref()
         .is_some_and(|evidence| evidence.receipt_version == 1)
-        && !predecessor_query_chronology
+        && plan_family != D1MigrationReconciliationPlanFamily::LegacyV1FullUnion
     {
         let evidence =
             observed_terminal_evidence(&initial_lease, &receipt, legacy_receipt.as_ref());
@@ -378,9 +401,10 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
             &replay_expectation_proof_sha256,
             expected_expectation_proof_sha256,
             expected_reconciliation_plan_sha256,
-            &recomputed_current_reconciliation_plan_sha256,
+            &recomputed_scoped_reconciliation_plan_sha256,
+            &recomputed_historical_v2_reconciliation_plan_sha256,
             recomputed_legacy_reconciliation_plan_sha256.as_deref(),
-            predecessor_query_chronology,
+            plan_family,
             &terminal_plan_sha256,
             legacy_terminal_plan_sha256.as_deref(),
             dry_run,
@@ -389,12 +413,18 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
         );
     }
     let initial_receipt_evidence = initial_receipt;
-    let recomputed_plan = if predecessor_query_chronology {
-        recomputed_legacy_reconciliation_plan_sha256
-            .as_deref()
-            .expect("predecessor chronology is reachable only for the legacy assertion")
-    } else {
-        recomputed_current_reconciliation_plan_sha256.as_str()
+    let recomputed_plan = match plan_family {
+        D1MigrationReconciliationPlanFamily::LegacyV1FullUnion => {
+            recomputed_legacy_reconciliation_plan_sha256
+                .as_deref()
+                .expect("legacy-v1 family is reachable only for the legacy assertion")
+        }
+        D1MigrationReconciliationPlanFamily::HistoricalV2FullUnion => {
+            recomputed_historical_v2_reconciliation_plan_sha256.as_str()
+        }
+        D1MigrationReconciliationPlanFamily::ScopedV3SelectedPrefix => {
+            recomputed_scoped_reconciliation_plan_sha256.as_str()
+        }
     };
     if initial_receipt_evidence.is_some()
         && (replay_expectation_proof_sha256 != expected_expectation_proof_sha256
@@ -454,7 +484,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
         state_expectations,
         expected_query_sha256,
         expected_current_prefix_length,
-        predecessor_query_chronology,
+        plan_family,
     )
     .await
     {
@@ -499,9 +529,10 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
                     &replay_expectation_proof_sha256,
                     expected_expectation_proof_sha256,
                     expected_reconciliation_plan_sha256,
-                    &recomputed_current_reconciliation_plan_sha256,
+                    &recomputed_scoped_reconciliation_plan_sha256,
+                    &recomputed_historical_v2_reconciliation_plan_sha256,
                     recomputed_legacy_reconciliation_plan_sha256.as_deref(),
-                    predecessor_query_chronology,
+                    plan_family,
                     &terminal_plan_sha256,
                     legacy_terminal_plan_sha256.as_deref(),
                     dry_run,
@@ -536,25 +567,39 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
     let base_provider_calls = proof.provider_calls();
     let mut response_evidence = proof.response_evidence();
     let mut lifecycle = proof.provider_read_lifecycle();
-    let exact_active_plan_matches = (predecessor_query_chronology || recovering_exact_receipt)
-        && if predecessor_query_chronology {
-            proof.legacy_plan_sha256_for_namespace(
-                account_id,
-                database_id,
-                family,
-                migrations_table,
-                manifest,
-                "active",
-            ) == expected_reconciliation_plan_sha256
-        } else {
-            proof.plan_sha256_for_namespace(
-                account_id,
-                database_id,
-                family,
-                migrations_table,
-                manifest,
-                "active",
-            ) == expected_reconciliation_plan_sha256
+    let exact_active_plan_matches = (plan_family.uses_predecessor_query_chronology()
+        || recovering_exact_receipt)
+        && match plan_family {
+            D1MigrationReconciliationPlanFamily::LegacyV1FullUnion => {
+                proof.legacy_plan_sha256_for_namespace(
+                    account_id,
+                    database_id,
+                    family,
+                    migrations_table,
+                    manifest,
+                    "active",
+                ) == expected_reconciliation_plan_sha256
+            }
+            D1MigrationReconciliationPlanFamily::HistoricalV2FullUnion => {
+                proof.historical_v2_plan_sha256_for_namespace(
+                    account_id,
+                    database_id,
+                    family,
+                    migrations_table,
+                    manifest,
+                    "active",
+                ) == expected_reconciliation_plan_sha256
+            }
+            D1MigrationReconciliationPlanFamily::ScopedV3SelectedPrefix => {
+                proof.plan_sha256_for_namespace(
+                    account_id,
+                    database_id,
+                    family,
+                    migrations_table,
+                    manifest,
+                    "active",
+                ) == expected_reconciliation_plan_sha256
+            }
         };
     if (proof.reconciliation_plan_sha256 != expected_reconciliation_plan_sha256
         && !exact_active_plan_matches)
@@ -767,9 +812,10 @@ fn completed_terminal_replay(
     replay_expectation_proof_sha256: &str,
     expected_expectation_proof_sha256: &str,
     expected_reconciliation_plan_sha256: &str,
-    recomputed_current_reconciliation_plan_sha256: &str,
+    recomputed_scoped_reconciliation_plan_sha256: &str,
+    recomputed_historical_v2_reconciliation_plan_sha256: &str,
     recomputed_legacy_reconciliation_plan_sha256: Option<&str>,
-    predecessor_query_chronology: bool,
+    plan_family: D1MigrationReconciliationPlanFamily,
     terminal_plan_sha256: &str,
     legacy_terminal_plan_sha256: Option<&str>,
     dry_run: bool,
@@ -791,13 +837,20 @@ fn completed_terminal_replay(
         }
         Some(evidence) => evidence,
     };
-    let recomputed_plan = if predecessor_query_chronology {
-        recomputed_legacy_reconciliation_plan_sha256
-            .expect("predecessor chronology is reachable only for the legacy assertion")
-    } else {
-        recomputed_current_reconciliation_plan_sha256
+    let recomputed_plan = match plan_family {
+        D1MigrationReconciliationPlanFamily::LegacyV1FullUnion => {
+            recomputed_legacy_reconciliation_plan_sha256
+                .expect("legacy-v1 family is reachable only for the legacy assertion")
+        }
+        D1MigrationReconciliationPlanFamily::HistoricalV2FullUnion => {
+            recomputed_historical_v2_reconciliation_plan_sha256
+        }
+        D1MigrationReconciliationPlanFamily::ScopedV3SelectedPrefix => {
+            recomputed_scoped_reconciliation_plan_sha256
+        }
     };
-    if (receipt_evidence.receipt_version == 1 && !predecessor_query_chronology)
+    if (receipt_evidence.receipt_version == 1
+        && plan_family != D1MigrationReconciliationPlanFamily::LegacyV1FullUnion)
         || replay_expectation_proof_sha256 != expected_expectation_proof_sha256
         || recomputed_plan != expected_reconciliation_plan_sha256
     {

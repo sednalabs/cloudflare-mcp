@@ -372,6 +372,19 @@ pub(crate) struct D1MigrationReconciliationProof {
     pub(crate) outcome: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum D1MigrationReconciliationPlanFamily {
+    LegacyV1FullUnion,
+    HistoricalV2FullUnion,
+    ScopedV3SelectedPrefix,
+}
+
+impl D1MigrationReconciliationPlanFamily {
+    pub(crate) fn uses_predecessor_query_chronology(self) -> bool {
+        matches!(self, Self::LegacyV1FullUnion | Self::HistoricalV2FullUnion)
+    }
+}
+
 impl D1MigrationReconciliationProof {
     pub(crate) fn query_sha256(&self) -> &str {
         &self.query.sha256
@@ -405,7 +418,35 @@ impl D1MigrationReconciliationProof {
     ) -> String {
         let mut identity = self.lease.identity.clone();
         identity.namespace = namespace.to_string();
-        reconciliation_plan_sha256(
+        reconciliation_plan_sha256_v3(
+            account_id,
+            database_id,
+            family,
+            migrations_table,
+            manifest,
+            &identity,
+            self.original_prefix_length,
+            self.current_prefix_length,
+            &self.outcome,
+            &self.query.sha256,
+            &self.canonical_snapshot_sha256,
+            &self.effect_assertion_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn historical_v2_plan_sha256_for_namespace(
+        &self,
+        account_id: &str,
+        database_id: &str,
+        family: &str,
+        migrations_table: &str,
+        manifest: &[D1MigrationManifestEntry],
+        namespace: &str,
+    ) -> String {
+        let mut identity = self.lease.identity.clone();
+        identity.namespace = namespace.to_string();
+        reconciliation_plan_sha256_v2(
             account_id,
             database_id,
             family,
@@ -514,7 +555,7 @@ pub(crate) async fn prepare_d1_migration_reconciliation_for_expected_query(
     state_expectations: Vec<D1MigrationStateExpectation>,
     expected_query_sha256: &str,
     expected_current_prefix_length: usize,
-    predecessor_query_chronology: bool,
+    plan_family: D1MigrationReconciliationPlanFamily,
 ) -> Result<D1MigrationReconciliationProof, CallToolResult> {
     prepare_d1_migration_reconciliation_with_query_authority(
         server,
@@ -531,7 +572,7 @@ pub(crate) async fn prepare_d1_migration_reconciliation_for_expected_query(
         Some((
             expected_query_sha256,
             expected_current_prefix_length,
-            predecessor_query_chronology,
+            plan_family,
         )),
     )
     .await
@@ -560,7 +601,7 @@ async fn prepare_d1_migration_reconciliation_with_query_authority(
     lease_payload_sha256: &str,
     effect_assertion_id: Option<&str>,
     state_expectations: Vec<D1MigrationStateExpectation>,
-    expected_query_authority: Option<(&str, usize, bool)>,
+    expected_query_authority: Option<(&str, usize, D1MigrationReconciliationPlanFamily)>,
 ) -> Result<D1MigrationReconciliationProof, CallToolResult> {
     if let Err(result) = validate_generic_d1_migration_family(family) {
         return Err(prelease_error(result, "not_inspected", None));
@@ -616,7 +657,7 @@ async fn prepare_d1_migration_reconciliation_with_query_authority(
     );
     let query_mode = match expected_query_authority {
         None => ReconciliationQueryMode::ScopedSelectedPrefix,
-        Some((expected_query_sha256, expected_prefix, predecessor_chronology)) => {
+        Some((expected_query_sha256, expected_prefix, plan_family)) => {
             let Some(expected_state) = validated.states.get(expected_prefix) else {
                 return Err(prelease_error(
                     reconciliation_error(
@@ -656,13 +697,17 @@ async fn prepare_d1_migration_reconciliation_with_query_authority(
                 &validated.proof_sha256,
                 seed_assertion,
             );
-            if predecessor_chronology && expected_query_sha256 == legacy_query.sha256 {
+            if plan_family.uses_predecessor_query_chronology()
+                && expected_query_sha256 == legacy_query.sha256
+            {
                 if seed_assertion {
                     ReconciliationQueryMode::LegacyFullUnionWithSelection
                 } else {
                     ReconciliationQueryMode::LegacyFullUnionWithoutSelection
                 }
-            } else if !predecessor_chronology && expected_query_sha256 == scoped_query.sha256 {
+            } else if !plan_family.uses_predecessor_query_chronology()
+                && expected_query_sha256 == scoped_query.sha256
+            {
                 ReconciliationQueryMode::ScopedSelectedPrefix
             } else {
                 return Err(prelease_error(
@@ -1052,7 +1097,7 @@ async fn prepare_d1_migration_reconciliation_with_query_authority(
     }
 
     let snapshot_sha256 = first_digest;
-    let reconciliation_plan_sha256 = reconciliation_plan_sha256(
+    let reconciliation_plan_sha256 = reconciliation_plan_sha256_v3(
         account_id,
         database_id,
         family,
@@ -3824,7 +3869,9 @@ fn adapter_batch_error(
     result
 }
 
-fn reconciliation_plan_sha256(
+// Base-era version-2 terminal receipts bound this exact effect-assertion
+// extension of the original plan schema. Preserve its serialized bytes.
+fn reconciliation_plan_sha256_v2(
     account_id: &str,
     database_id: &str,
     family: &str,
@@ -3860,6 +3907,49 @@ fn reconciliation_plan_sha256(
     sha256_bytes_hex(
         &serde_json::to_vec(&plan)
             .expect("reconciliation transition plan serialization is infallible"),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+// Version 3 makes selected-prefix query chronology explicit and therefore
+// cannot collide with either historical full-union plan family.
+fn reconciliation_plan_sha256_v3(
+    account_id: &str,
+    database_id: &str,
+    family: &str,
+    migrations_table: &str,
+    manifest: &[D1MigrationManifestEntry],
+    lease: &D1RetainedMigrationLeaseIdentity,
+    original_prefix: usize,
+    current_prefix: usize,
+    outcome: &str,
+    query_sha256: &str,
+    snapshot_sha256: &str,
+    effect_assertion_id: &str,
+) -> String {
+    let plan = json!({
+        "version": 3,
+        "operation": OPERATION,
+        "target_key_sha256": sha256_bytes_hex(format!("{account_id}\0{database_id}").as_bytes()),
+        "database_id": database_id,
+        "migration_family": family,
+        "migrations_table": migrations_table,
+        "manifest": d1_manifest_summaries(manifest),
+        "lease": lease,
+        "original_prefix_length": original_prefix,
+        "current_prefix_length": current_prefix,
+        "outcome": outcome,
+        "query_sha256": query_sha256,
+        "canonical_snapshot_sha256": snapshot_sha256,
+        "effect_assertion_id": effect_assertion_id,
+        "query_chronology": "selected_prefix_v1",
+        "retry_decision": "do_not_retry_same_attempt",
+        "lease_decision": "retain",
+        "next_slice": "persist_terminal_reconciliation_receipt_then_guarded_retirement",
+    });
+    sha256_bytes_hex(
+        &serde_json::to_vec(&plan)
+            .expect("scoped reconciliation transition plan serialization is infallible"),
     )
 }
 
@@ -3915,10 +4005,10 @@ pub(crate) fn replay_reconciliation_plan_sha256(
     query_sha256: &str,
     snapshot_sha256: &str,
     effect_assertion_id: &str,
-    legacy_v1: bool,
+    plan_family: D1MigrationReconciliationPlanFamily,
 ) -> String {
-    if legacy_v1 {
-        reconciliation_plan_sha256_v1(
+    match plan_family {
+        D1MigrationReconciliationPlanFamily::LegacyV1FullUnion => reconciliation_plan_sha256_v1(
             account_id,
             database_id,
             family,
@@ -3930,22 +4020,39 @@ pub(crate) fn replay_reconciliation_plan_sha256(
             outcome,
             query_sha256,
             snapshot_sha256,
-        )
-    } else {
-        reconciliation_plan_sha256(
-            account_id,
-            database_id,
-            family,
-            migrations_table,
-            manifest,
-            lease,
-            original_prefix,
-            current_prefix,
-            outcome,
-            query_sha256,
-            snapshot_sha256,
-            effect_assertion_id,
-        )
+        ),
+        D1MigrationReconciliationPlanFamily::HistoricalV2FullUnion => {
+            reconciliation_plan_sha256_v2(
+                account_id,
+                database_id,
+                family,
+                migrations_table,
+                manifest,
+                lease,
+                original_prefix,
+                current_prefix,
+                outcome,
+                query_sha256,
+                snapshot_sha256,
+                effect_assertion_id,
+            )
+        }
+        D1MigrationReconciliationPlanFamily::ScopedV3SelectedPrefix => {
+            reconciliation_plan_sha256_v3(
+                account_id,
+                database_id,
+                family,
+                migrations_table,
+                manifest,
+                lease,
+                original_prefix,
+                current_prefix,
+                outcome,
+                query_sha256,
+                snapshot_sha256,
+                effect_assertion_id,
+            )
+        }
     }
 }
 
