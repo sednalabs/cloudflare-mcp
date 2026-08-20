@@ -243,6 +243,15 @@ pub(crate) struct D1MigrationReconciliationBatchError {
     pub(crate) lifecycle: D1MigrationReconciliationReadLifecycle,
 }
 
+pub(crate) fn d1_migration_reconciliation_only_cause(error: &AdapterErrorPayload) -> Value {
+    json!({
+        "code": error.code,
+        "status": error.status,
+        "retryable": false,
+        "operator_guidance": "reconciliation_only",
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub(crate) struct D1MigrationReconciliationReadLifecycle {
     pub(crate) dispatch_stage: &'static str,
@@ -730,8 +739,12 @@ impl CloudflareClient {
             .send()
             .await
             .map_err(|error| {
-                let retryable = error.is_timeout() || error.is_connect() || error.is_request();
-                let code = if error.is_timeout() {
+                let pre_dispatch = error.is_builder();
+                let retryable = !pre_dispatch
+                    && (error.is_timeout() || error.is_connect() || error.is_request());
+                let code = if pre_dispatch {
+                    "cloudflare.request_build_failed"
+                } else if error.is_timeout() {
                     "cloudflare.timeout"
                 } else {
                     "cloudflare.transport_error"
@@ -748,8 +761,11 @@ impl CloudflareClient {
                     .payload(),
                     response_body_sha256: None,
                     response_body_size_bytes: None,
-                    lifecycle:
-                        D1MigrationReconciliationReadLifecycle::attempted_without_response(),
+                    lifecycle: if pre_dispatch {
+                        D1MigrationReconciliationReadLifecycle::pre_dispatch()
+                    } else {
+                        D1MigrationReconciliationReadLifecycle::attempted_without_response()
+                    },
                 }
             })?;
         let status = response.status();
@@ -4330,6 +4346,26 @@ mod tests {
             error.lifecycle,
             D1MigrationReconciliationReadLifecycle::pre_dispatch()
         );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_request_builder_failure_remains_pre_dispatch() {
+        let mut cfg = test_config(refused_loopback_url("builder-must-not-dispatch"));
+        cfg.api_token = Some("invalid\nheader".to_string());
+        let client = CloudflareClient::new(cfg).expect("client");
+        let error = client
+            .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+            .await
+            .expect_err("invalid authorization header must fail before dispatch");
+        assert_eq!(error.error.code, "cloudflare.request_build_failed");
+        assert!(!error.error.retryable);
+        assert_eq!(error.lifecycle.provider_calls(), 0);
+        assert_eq!(
+            error.lifecycle,
+            D1MigrationReconciliationReadLifecycle::pre_dispatch()
+        );
+        assert_eq!(error.response_body_sha256, None);
+        assert_eq!(error.response_body_size_bytes, None);
     }
 
     #[tokio::test]

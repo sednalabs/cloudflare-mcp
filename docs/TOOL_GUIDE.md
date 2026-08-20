@@ -103,6 +103,20 @@ single DDL acknowledgement may truthfully carry zero row counts; it must still
 prove primary service and `changed_db=true`, after which stable schema and
 empty-ledger readback supplies the effect proof.
 
+All bootstrap inventory and ledger reads use the recovery-grade HTTP boundary:
+one physical attempt per read, no redirect following, a 16 MiB body cap, and
+strict response decoding. Inspect `provider_read_lifecycle` for every logical
+read and `response_evidence` for exact body digest/size evidence when bytes were
+captured. `provider_calls` counts only attempted HTTP requests, so a
+pre-dispatch configuration failure is zero while transport loss after dispatch
+is one. Request-builder failures are also pre-dispatch. Every lifecycle and
+response entry retains its exact dry-run, live pre-dispatch, ambiguous-write,
+or post-write window plus first/second inventory or ledger phase and query
+digest even when no body exists. Nested provider causes are permanently
+reconciliation-only with `retryable=false` and omit body-derived messages;
+this includes initializer write failure. Never infer a hidden retry from two
+paired stability reads.
+
 If that one initializer dispatch has an ambiguous result, use
 `d1_reconcile_bootstrap_migration_ledger`; do not supply an empty manifest to
 the general manifest recovery tool. Bind the exact account/database,

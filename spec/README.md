@@ -100,8 +100,12 @@ Preserved curated tool families:
 - The first-ledger bootstrap (`d1_bootstrap_migration_ledger`) is a distinct
   mutating contract from manifest apply. Keep its exact empty-target dry-run
   digest, shared target custody, one-initializer maximum, no-retry ambiguity,
-  stable canonical-schema/empty-ledger readback, mutation accounting, and MCP
-  stdio negative-path coverage aligned with the snapshot. It must never become
+  stable canonical-schema/empty-ledger readback, one-attempt/no-redirect bounded
+  read client, window/phase/query-bound response/lifecycle evidence including
+  no-body events, privacy-safe reconciliation-only nested causes for reads and
+  initializer failure, physical provider-call and
+  mutation accounting, and MCP stdio negative-path coverage aligned with the
+  snapshot. It must never become
   a compatibility path for application-bearing or partially initialized D1
   databases.
 - Bootstrap recovery (`d1_reconcile_bootstrap_migration_ledger`,

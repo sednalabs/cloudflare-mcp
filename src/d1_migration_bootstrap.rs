@@ -9,6 +9,9 @@ use rmcp::model::CallToolResult;
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::cloudflare::client::{
+    D1MigrationReconciliationReadLifecycle, d1_migration_reconciliation_only_cause,
+};
 use crate::d1_migration_lease::{
     D1MigrationLease, acquire_d1_migration_lease, d1_migration_lease_requirements,
     preflight_d1_migration_target_custody,
@@ -152,12 +155,43 @@ fn is_exact_d1_bootstrap_schema(
 pub(crate) struct D1BootstrapReadFailure {
     pub(crate) result: CallToolResult,
     pub(crate) provider_calls: usize,
+    read_evidence: Vec<Value>,
 }
 
 pub(crate) struct D1BootstrapPostState {
     pub(crate) inventory: D1BootstrapInventory,
     pub(crate) ledger: Vec<D1ManifestLedgerRow>,
     pub(crate) provider_calls: usize,
+    read_evidence: Vec<Value>,
+}
+
+struct D1BootstrapStableRead<T> {
+    value: T,
+    provider_calls: usize,
+    read_evidence: Vec<Value>,
+}
+
+#[derive(Clone, Copy)]
+enum D1BootstrapReadWindow {
+    DryRunPreflight,
+    LivePredispatch,
+    AmbiguousWriteReconciliation,
+    PostWriteProof,
+}
+
+impl D1BootstrapReadWindow {
+    const fn prefix(self) -> &'static str {
+        match self {
+            Self::DryRunPreflight => "dry_run_preflight",
+            Self::LivePredispatch => "live_predispatch",
+            Self::AmbiguousWriteReconciliation => "ambiguous_write_reconciliation",
+            Self::PostWriteProof => "post_write_proof",
+        }
+    }
+
+    fn phase(self, read: &'static str) -> String {
+        format!("{}.{}", self.prefix(), read)
+    }
 }
 
 fn bootstrap_error(
@@ -174,16 +208,35 @@ fn bootstrap_error(
     }))
 }
 
-fn read_failure(
-    code: &'static str,
-    message: &'static str,
-    hint: &'static str,
-    provider_calls: usize,
-) -> D1BootstrapReadFailure {
-    D1BootstrapReadFailure {
-        result: bootstrap_error(code, message, hint),
-        provider_calls,
-    }
+fn exact_read_evidence(
+    phase: &str,
+    sql: &str,
+    lifecycle: &D1MigrationReconciliationReadLifecycle,
+    response_body_sha256: Option<&str>,
+    response_body_size_bytes: Option<usize>,
+    parse_state: &'static str,
+) -> Value {
+    json!({
+        "phase": phase,
+        "query_sha256": sha256_hex(sql),
+        "provider_call_attempted": lifecycle.dispatch_stage == "attempted",
+        "lifecycle": lifecycle,
+        "response": {
+            "body_sha256": response_body_sha256,
+            "body_size_bytes": response_body_size_bytes,
+            "complete_body_digest": response_body_sha256.is_some()
+                && lifecycle.body_stage == "completely_read",
+            "parse_state": parse_state,
+        },
+    })
+}
+
+fn provider_read_lifecycle(read_evidence: &[Value]) -> Vec<Value> {
+    read_evidence.to_vec()
+}
+
+fn response_evidence(read_evidence: &[Value]) -> Vec<Value> {
+    read_evidence.to_vec()
 }
 
 fn call_tool_error_code(result: &CallToolResult) -> Option<&str> {
@@ -203,6 +256,21 @@ fn bootstrap_initializer_ambiguous_write_evidence(
         "code": "d1.bootstrap_initializer_result_ambiguous",
         "classification": classification,
         "message": message,
+        "retryable": false,
+        "operator_guidance": "reconciliation_only",
+    })
+}
+
+fn bootstrap_initializer_provider_result_cause(detail: &Value) -> Value {
+    json!({
+        "kind": "provider_result",
+        "detail": {
+            "code": detail.get("code"),
+            "classification": detail.get("classification"),
+            "message": detail.get("message"),
+            "retryable": false,
+            "operator_guidance": "reconciliation_only",
+        },
     })
 }
 
@@ -295,6 +363,7 @@ fn contextualize_bootstrap_failure(
     computed_plan_sha256: Option<&str>,
     provider_calls: usize,
     provider_mutations: usize,
+    read_evidence: &[Value],
     lease: Option<&D1MigrationLease>,
     lease_retained: Option<bool>,
     provider_outcome: &'static str,
@@ -330,6 +399,8 @@ fn contextualize_bootstrap_failure(
             "target_inventory": source.get("target_inventory"),
             "ledger_row_count": source.get("ledger_row_count"),
         },
+        "provider_read_lifecycle": provider_read_lifecycle(read_evidence),
+        "response_evidence": response_evidence(read_evidence),
         "reconciliation_evidence": reconciliation_evidence,
         "automatic_retry_permitted": false,
         "operator_handoff": if provider_mutations == 0 && lease_retained != Some(true) {
@@ -544,59 +615,134 @@ async fn read_inventory_once(
     account_id: &str,
     database_id: &str,
     migrations_table: &str,
-) -> Result<D1BootstrapInventory, CallToolResult> {
-    let value = server
+    phase: &str,
+) -> Result<D1BootstrapStableRead<D1BootstrapInventory>, D1BootstrapReadFailure> {
+    let sql = d1_bootstrap_inventory_sql();
+    match server
         .cloudflare
-        .query_d1_migration_manifest(account_id, database_id, d1_bootstrap_inventory_sql(), &[])
+        .query_d1_migration_reconciliation_batch(account_id, database_id, sql)
         .await
-        .map_err(|error| {
-            CallToolResult::structured_error(json!({
+    {
+        Ok(batch) => {
+            let provider_calls = batch.lifecycle.provider_calls();
+            match parse_d1_bootstrap_inventory(&batch.result, migrations_table) {
+                Ok(value) => Ok(D1BootstrapStableRead {
+                    value,
+                    provider_calls,
+                    read_evidence: vec![exact_read_evidence(
+                        phase,
+                        sql,
+                        &batch.lifecycle,
+                        Some(&batch.response_body_sha256),
+                        Some(batch.response_body_size_bytes),
+                        "decoded",
+                    )],
+                }),
+                Err(cause) => Err(D1BootstrapReadFailure {
+                    result: CallToolResult::structured_error(json!({
+                        "ok": false,
+                        "operation": D1_BOOTSTRAP_OPERATION,
+                        "status": "blocked",
+                        "provider_mutations": 0,
+                        "error": {
+                            "code": "d1.bootstrap_inventory_malformed",
+                            "message": "the bounded empty-target inventory response was malformed or not primary-served",
+                            "hint": "Reconcile the exact provider evidence before bootstrap.",
+                            "cause_code": call_tool_error_code(&cause),
+                        },
+                    })),
+                    provider_calls,
+                    read_evidence: vec![exact_read_evidence(
+                        phase,
+                        sql,
+                        &batch.lifecycle,
+                        Some(&batch.response_body_sha256),
+                        Some(batch.response_body_size_bytes),
+                        "malformed",
+                    )],
+                }),
+            }
+        }
+        Err(failure) => {
+            let provider_calls = failure.lifecycle.provider_calls();
+            Err(D1BootstrapReadFailure {
+                result: CallToolResult::structured_error(json!({
                 "ok": false,
                 "operation": D1_BOOTSTRAP_OPERATION,
                 "status": "blocked",
                 "provider_mutations": 0,
                 "error": {
                     "code": "d1.bootstrap_inventory_unreadable",
-                    "message": "could not read the empty-target schema inventory from D1",
-                    "hint": "Reconcile target access and primary readback before bootstrap.",
-                    "cause": error.payload(),
+                    "message": "the bounded empty-target inventory response was unavailable or contradictory",
+                    "hint": "Reconcile target access and exact provider evidence before bootstrap.",
+                    "cause": d1_migration_reconciliation_only_cause(&failure.error),
                 },
-            }))
-        })?;
-    parse_d1_bootstrap_inventory(&value, migrations_table)
+                })),
+                provider_calls,
+                read_evidence: vec![exact_read_evidence(
+                    phase,
+                    sql,
+                    &failure.lifecycle,
+                    failure.response_body_sha256.as_deref(),
+                    failure.response_body_size_bytes,
+                    "unavailable",
+                )],
+            })
+        }
+    }
 }
 
-pub(crate) async fn read_stable_d1_bootstrap_inventory(
+async fn read_stable_d1_bootstrap_inventory(
     server: &CloudflareMcp,
     account_id: &str,
     database_id: &str,
     migrations_table: &str,
-) -> Result<(D1BootstrapInventory, usize), D1BootstrapReadFailure> {
-    let first = read_inventory_once(server, account_id, database_id, migrations_table)
+    window: D1BootstrapReadWindow,
+) -> Result<D1BootstrapStableRead<D1BootstrapInventory>, D1BootstrapReadFailure> {
+    let first_phase = window.phase("inventory.first");
+    let first = read_inventory_once(
+        server,
+        account_id,
+        database_id,
+        migrations_table,
+        &first_phase,
+    )
+    .await?;
+    let second_phase = window.phase("inventory.second");
+    let second = read_inventory_once(
+        server,
+        account_id,
+        database_id,
+        migrations_table,
+        &second_phase,
+    )
         .await
-        .map_err(|result| D1BootstrapReadFailure {
-            result,
-            provider_calls: 1,
+        .map_err(|mut failure| {
+            failure.provider_calls += first.provider_calls;
+            let mut evidence = first.read_evidence.clone();
+            evidence.extend(failure.read_evidence);
+            failure.read_evidence = evidence;
+            failure
         })?;
-    let second = read_inventory_once(server, account_id, database_id, migrations_table)
-        .await
-        .map_err(|_| {
-            read_failure(
+    let provider_calls = first.provider_calls + second.provider_calls;
+    let mut read_evidence = first.read_evidence;
+    read_evidence.extend(second.read_evidence);
+    if first.value != second.value {
+        return Err(D1BootstrapReadFailure {
+            result: bootstrap_error(
                 "d1.bootstrap_inventory_unstable",
-                "two primary empty-target inventory readbacks did not prove the same state",
+                "two exact one-attempt primary empty-target inventory readbacks disagreed",
                 "Reconcile concurrent or external schema activity before bootstrap.",
-                2,
-            )
-        })?;
-    if first != second {
-        return Err(read_failure(
-            "d1.bootstrap_inventory_unstable",
-            "two primary empty-target inventory readbacks disagreed",
-            "Reconcile concurrent or external schema activity before bootstrap.",
-            2,
-        ));
+            ),
+            provider_calls,
+            read_evidence,
+        });
     }
-    Ok((first, 2))
+    Ok(D1BootstrapStableRead {
+        value: first.value,
+        provider_calls,
+        read_evidence,
+    })
 }
 
 pub(crate) fn require_empty_d1_bootstrap_inventory(
@@ -624,91 +770,149 @@ async fn read_ledger_once(
     account_id: &str,
     database_id: &str,
     migrations_table: &str,
-) -> Result<Vec<D1ManifestLedgerRow>, CallToolResult> {
-    let value = server
+    phase: &str,
+) -> Result<D1BootstrapStableRead<Vec<D1ManifestLedgerRow>>, D1BootstrapReadFailure> {
+    let sql = d1_applied_migrations_sql(migrations_table);
+    match server
         .cloudflare
-        .query_d1_migration_manifest(
-            account_id,
-            database_id,
-            &d1_applied_migrations_sql(migrations_table),
-            &[],
-        )
+        .query_d1_migration_reconciliation_batch(account_id, database_id, &sql)
         .await
-        .map_err(|error| {
-            CallToolResult::structured_error(json!({
+    {
+        Ok(batch) => {
+            let provider_calls = batch.lifecycle.provider_calls();
+            match parse_d1_migration_ledger(&batch.result) {
+                Ok(value) => Ok(D1BootstrapStableRead {
+                    value,
+                    provider_calls,
+                    read_evidence: vec![exact_read_evidence(
+                        phase,
+                        &sql,
+                        &batch.lifecycle,
+                        Some(&batch.response_body_sha256),
+                        Some(batch.response_body_size_bytes),
+                        "decoded",
+                    )],
+                }),
+                Err(cause) => Err(D1BootstrapReadFailure {
+                    result: CallToolResult::structured_error(json!({
+                        "ok": false,
+                        "operation": D1_BOOTSTRAP_OPERATION,
+                        "status": "reconciliation_required",
+                        "error": {
+                            "code": "d1.bootstrap_ledger_malformed",
+                            "message": "initialized migration-ledger readback was malformed or not primary-served",
+                            "hint": "Retain custody and reconcile the exact provider state; do not retry bootstrap.",
+                            "cause_code": call_tool_error_code(&cause),
+                        },
+                    })),
+                    provider_calls,
+                    read_evidence: vec![exact_read_evidence(
+                        phase,
+                        &sql,
+                        &batch.lifecycle,
+                        Some(&batch.response_body_sha256),
+                        Some(batch.response_body_size_bytes),
+                        "malformed",
+                    )],
+                }),
+            }
+        }
+        Err(failure) => {
+            let provider_calls = failure.lifecycle.provider_calls();
+            Err(D1BootstrapReadFailure {
+                result: CallToolResult::structured_error(json!({
                 "ok": false,
                 "operation": D1_BOOTSTRAP_OPERATION,
                 "status": "reconciliation_required",
                 "error": {
                     "code": "d1.bootstrap_ledger_unreadable",
-                    "message": "could not read the initialized migration ledger",
+                    "message": "the bounded initialized-ledger response was unavailable or contradictory",
                     "hint": "Retain custody and reconcile the exact provider state; do not retry bootstrap.",
-                    "cause": error.payload(),
+                    "cause": d1_migration_reconciliation_only_cause(&failure.error),
                 },
-            }))
-        })?;
-    parse_d1_migration_ledger(&value).map_err(|result| {
-        CallToolResult::structured_error(json!({
-            "ok": false,
-            "operation": D1_BOOTSTRAP_OPERATION,
-            "status": "reconciliation_required",
-            "error": {
-                "code": "d1.bootstrap_ledger_malformed",
-                "message": "initialized migration-ledger readback was malformed or not primary-served",
-                "hint": "Retain custody and reconcile the exact provider state; do not retry bootstrap.",
-                "cause_code": call_tool_error_code(&result),
-            },
-        }))
-    })
+                })),
+                provider_calls,
+                read_evidence: vec![exact_read_evidence(
+                    phase,
+                    &sql,
+                    &failure.lifecycle,
+                    failure.response_body_sha256.as_deref(),
+                    failure.response_body_size_bytes,
+                    "unavailable",
+                )],
+            })
+        }
+    }
 }
 
-pub(crate) async fn read_stable_empty_d1_bootstrap_ledger(
+async fn read_stable_empty_d1_bootstrap_ledger(
     server: &CloudflareMcp,
     account_id: &str,
     database_id: &str,
     migrations_table: &str,
-) -> Result<(Vec<D1ManifestLedgerRow>, usize), D1BootstrapReadFailure> {
-    let first = read_ledger_once(server, account_id, database_id, migrations_table)
+    window: D1BootstrapReadWindow,
+) -> Result<D1BootstrapStableRead<Vec<D1ManifestLedgerRow>>, D1BootstrapReadFailure> {
+    let first_phase = window.phase("ledger.first");
+    let first = read_ledger_once(
+        server,
+        account_id,
+        database_id,
+        migrations_table,
+        &first_phase,
+    )
+    .await?;
+    let second_phase = window.phase("ledger.second");
+    let second = read_ledger_once(
+        server,
+        account_id,
+        database_id,
+        migrations_table,
+        &second_phase,
+    )
         .await
-        .map_err(|result| D1BootstrapReadFailure {
-            result,
-            provider_calls: 1,
+        .map_err(|mut failure| {
+            failure.provider_calls += first.provider_calls;
+            let mut evidence = first.read_evidence.clone();
+            evidence.extend(failure.read_evidence);
+            failure.read_evidence = evidence;
+            failure
         })?;
-    let second = read_ledger_once(server, account_id, database_id, migrations_table)
-        .await
-        .map_err(|_| {
-            read_failure(
+    let provider_calls = first.provider_calls + second.provider_calls;
+    let mut read_evidence = first.read_evidence;
+    read_evidence.extend(second.read_evidence);
+    if first.value != second.value {
+        return Err(D1BootstrapReadFailure {
+            result: bootstrap_error(
                 "d1.bootstrap_ledger_unstable",
-                "two primary initialized-ledger readbacks did not prove the same state",
+                "two exact one-attempt primary initialized-ledger readbacks disagreed",
                 "Retain custody and reconcile the exact provider state; do not retry bootstrap.",
-                2,
-            )
-        })?;
-    if first != second {
-        return Err(read_failure(
-            "d1.bootstrap_ledger_unstable",
-            "two primary initialized-ledger readbacks disagreed",
-            "Retain custody and reconcile the exact provider state; do not retry bootstrap.",
-            2,
-        ));
+            ),
+            provider_calls,
+            read_evidence,
+        });
     }
-    if !first.is_empty() {
+    if !first.value.is_empty() {
         return Err(D1BootstrapReadFailure {
             result: CallToolResult::structured_error(json!({
                 "ok": false,
                 "operation": D1_BOOTSTRAP_OPERATION,
                 "status": "reconciliation_required",
-                "ledger_row_count": first.len(),
+                "ledger_row_count": first.value.len(),
                 "error": {
                     "code": "d1.bootstrap_ledger_not_empty",
                     "message": "the initialized migration ledger was not empty",
                     "hint": "Retain custody and reconcile unexpected migration activity; do not retry bootstrap.",
                 },
             })),
-            provider_calls: 2,
+            provider_calls,
+            read_evidence,
         });
     }
-    Ok((first, 2))
+    Ok(D1BootstrapStableRead {
+        value: first.value,
+        provider_calls,
+        read_evidence,
+    })
 }
 
 pub(crate) async fn read_stable_d1_bootstrap_post_state(
@@ -717,35 +921,56 @@ pub(crate) async fn read_stable_d1_bootstrap_post_state(
     database_id: &str,
     migrations_table: &str,
 ) -> Result<D1BootstrapPostState, D1BootstrapReadFailure> {
-    let (inventory, inventory_calls) =
-        read_stable_d1_bootstrap_inventory(server, account_id, database_id, migrations_table)
-            .await?;
-    if inventory.state != D1BootstrapInventoryState::CanonicalLedger {
+    let inventory_read =
+        read_stable_d1_bootstrap_inventory(
+            server,
+            account_id,
+            database_id,
+            migrations_table,
+            D1BootstrapReadWindow::PostWriteProof,
+        )
+        .await?;
+    if inventory_read.value.state != D1BootstrapInventoryState::CanonicalLedger {
         return Err(D1BootstrapReadFailure {
             result: CallToolResult::structured_error(json!({
                 "ok": false,
                 "operation": D1_BOOTSTRAP_OPERATION,
                 "status": "reconciliation_required",
-                "target_inventory": inventory.summary(),
+                "target_inventory": inventory_read.value.summary(),
                 "error": {
                     "code": "d1.bootstrap_post_schema_invalid",
                     "message": "post-write readback did not prove exactly one canonical migration-ledger table and no application objects",
                     "hint": "Retain custody and reconcile the exact provider schema; do not retry bootstrap.",
                 },
             })),
-            provider_calls: inventory_calls,
+            provider_calls: inventory_read.provider_calls,
+            read_evidence: inventory_read.read_evidence,
         });
     }
-    match read_stable_empty_d1_bootstrap_ledger(server, account_id, database_id, migrations_table)
-        .await
+    match read_stable_empty_d1_bootstrap_ledger(
+        server,
+        account_id,
+        database_id,
+        migrations_table,
+        D1BootstrapReadWindow::PostWriteProof,
+    )
+    .await
     {
-        Ok((ledger, ledger_calls)) => Ok(D1BootstrapPostState {
-            inventory,
-            ledger,
-            provider_calls: inventory_calls + ledger_calls,
-        }),
+        Ok(ledger_read) => {
+            let mut read_evidence = inventory_read.read_evidence;
+            read_evidence.extend(ledger_read.read_evidence);
+            Ok(D1BootstrapPostState {
+                inventory: inventory_read.value,
+                ledger: ledger_read.value,
+                provider_calls: inventory_read.provider_calls + ledger_read.provider_calls,
+                read_evidence,
+            })
+        }
         Err(mut failure) => {
-            failure.provider_calls += inventory_calls;
+            failure.provider_calls += inventory_read.provider_calls;
+            let mut read_evidence = inventory_read.read_evidence;
+            read_evidence.extend(failure.read_evidence);
+            failure.read_evidence = read_evidence;
             Err(failure)
         }
     }
@@ -758,34 +983,49 @@ pub(crate) async fn d1_bootstrap_reconciliation_evidence(
     account_id: &str,
     database_id: &str,
     migrations_table: &str,
-) -> (Value, usize) {
-    match read_stable_d1_bootstrap_inventory(server, account_id, database_id, migrations_table)
-        .await
+) -> (Value, usize, Vec<Value>) {
+    match read_stable_d1_bootstrap_inventory(
+        server,
+        account_id,
+        database_id,
+        migrations_table,
+        D1BootstrapReadWindow::AmbiguousWriteReconciliation,
+    )
+    .await
     {
         Err(failure) => (
             json!({
                 "state": "unverified",
                 "reason": call_tool_error_code(&failure.result),
                 "effect_attribution": "unknown",
+                "provider_read_lifecycle": provider_read_lifecycle(&failure.read_evidence),
+                "response_evidence": response_evidence(&failure.read_evidence),
             }),
             failure.provider_calls,
+            failure.read_evidence,
         ),
-        Ok((inventory, inventory_calls)) => match inventory.state {
+        Ok(inventory_read) => match inventory_read.value.state {
             D1BootstrapInventoryState::Empty => (
                 json!({
                     "state": "ledger_absent",
-                    "target_inventory": inventory.summary(),
+                    "target_inventory": inventory_read.value.summary(),
                     "effect_attribution": "unknown",
+                    "provider_read_lifecycle": provider_read_lifecycle(&inventory_read.read_evidence),
+                    "response_evidence": response_evidence(&inventory_read.read_evidence),
                 }),
-                inventory_calls,
+                inventory_read.provider_calls,
+                inventory_read.read_evidence,
             ),
             D1BootstrapInventoryState::Conflicting => (
                 json!({
                     "state": "conflicting_objects",
-                    "target_inventory": inventory.summary(),
+                    "target_inventory": inventory_read.value.summary(),
                     "effect_attribution": "unknown",
+                    "provider_read_lifecycle": provider_read_lifecycle(&inventory_read.read_evidence),
+                    "response_evidence": response_evidence(&inventory_read.read_evidence),
                 }),
-                inventory_calls,
+                inventory_read.provider_calls,
+                inventory_read.read_evidence,
             ),
             D1BootstrapInventoryState::CanonicalLedger => {
                 match read_stable_empty_d1_bootstrap_ledger(
@@ -793,27 +1033,42 @@ pub(crate) async fn d1_bootstrap_reconciliation_evidence(
                     account_id,
                     database_id,
                     migrations_table,
+                    D1BootstrapReadWindow::AmbiguousWriteReconciliation,
                 )
                 .await
                 {
-                    Ok((ledger, ledger_calls)) => (
-                        json!({
-                            "state": "canonical_empty_ledger_observed",
-                            "target_inventory": inventory.summary(),
-                            "ledger_row_count": ledger.len(),
-                            "effect_attribution": "unknown",
-                        }),
-                        inventory_calls + ledger_calls,
-                    ),
-                    Err(failure) => (
-                        json!({
-                            "state": "ledger_unverified",
-                            "target_inventory": inventory.summary(),
-                            "reason": call_tool_error_code(&failure.result),
-                            "effect_attribution": "unknown",
-                        }),
-                        inventory_calls + failure.provider_calls,
-                    ),
+                    Ok(ledger_read) => {
+                        let mut read_evidence = inventory_read.read_evidence;
+                        read_evidence.extend(ledger_read.read_evidence);
+                        (
+                            json!({
+                                "state": "canonical_empty_ledger_observed",
+                                "target_inventory": inventory_read.value.summary(),
+                                "ledger_row_count": ledger_read.value.len(),
+                                "effect_attribution": "unknown",
+                                "provider_read_lifecycle": provider_read_lifecycle(&read_evidence),
+                                "response_evidence": response_evidence(&read_evidence),
+                            }),
+                            inventory_read.provider_calls + ledger_read.provider_calls,
+                            read_evidence,
+                        )
+                    }
+                    Err(failure) => {
+                        let mut read_evidence = inventory_read.read_evidence;
+                        read_evidence.extend(failure.read_evidence);
+                        (
+                            json!({
+                                "state": "ledger_unverified",
+                                "target_inventory": inventory_read.value.summary(),
+                                "reason": call_tool_error_code(&failure.result),
+                                "effect_attribution": "unknown",
+                                "provider_read_lifecycle": provider_read_lifecycle(&read_evidence),
+                                "response_evidence": response_evidence(&read_evidence),
+                            }),
+                            inventory_read.provider_calls + failure.provider_calls,
+                            read_evidence,
+                        )
+                    }
                 }
             }
         },
@@ -871,6 +1126,7 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
     let initializer_sql_sha256 = sha256_hex(&initializer_sql);
     let mut provider_calls = 0_usize;
     let mut provider_mutations = 0_usize;
+    let mut read_evidence = Vec::new();
 
     if input.dry_run {
         let inventory = match read_stable_d1_bootstrap_inventory(
@@ -878,21 +1134,25 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
             &input.account_id,
             &input.database_id,
             &input.migrations_table,
+            D1BootstrapReadWindow::DryRunPreflight,
         )
         .await
         {
-            Ok((inventory, calls)) => {
-                provider_calls += calls;
-                inventory
+            Ok(inventory_read) => {
+                provider_calls += inventory_read.provider_calls;
+                read_evidence.extend(inventory_read.read_evidence);
+                inventory_read.value
             }
             Err(failure) => {
                 provider_calls += failure.provider_calls;
+                read_evidence.extend(failure.read_evidence);
                 return contextualize_bootstrap_failure(
                     failure.result,
                     &input,
                     None,
                     provider_calls,
                     provider_mutations,
+                    &read_evidence,
                     None,
                     Some(false),
                     "not_dispatched",
@@ -909,6 +1169,7 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
                     None,
                     provider_calls,
                     provider_mutations,
+                    &read_evidence,
                     None,
                     Some(false),
                     "not_dispatched",
@@ -948,6 +1209,8 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
             "plan_sha256": plan_sha256,
             "provider_calls": provider_calls,
             "provider_mutations": provider_mutations,
+            "provider_read_lifecycle": provider_read_lifecycle(&read_evidence),
+            "response_evidence": response_evidence(&read_evidence),
             "lease": d1_migration_lease_requirements(
                 &input.account_id,
                 &input.database_id,
@@ -967,6 +1230,7 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
             None,
             provider_calls,
             provider_mutations,
+            &read_evidence,
             None,
             Some(false),
             "not_dispatched",
@@ -987,6 +1251,7 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
                 None,
                 provider_calls,
                 provider_mutations,
+                &read_evidence,
                 None,
                 Some(false),
                 "not_dispatched",
@@ -1001,6 +1266,7 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
             None,
             provider_calls,
             provider_mutations,
+            &read_evidence,
             Some(&lease),
             None,
             "not_dispatched",
@@ -1013,15 +1279,18 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
         &input.account_id,
         &input.database_id,
         &input.migrations_table,
+        D1BootstrapReadWindow::LivePredispatch,
     )
     .await
     {
-        Ok((inventory, calls)) => {
-            provider_calls += calls;
-            inventory
+        Ok(inventory_read) => {
+            provider_calls += inventory_read.provider_calls;
+            read_evidence.extend(inventory_read.read_evidence);
+            inventory_read.value
         }
         Err(failure) => {
             provider_calls += failure.provider_calls;
+            read_evidence.extend(failure.read_evidence);
             let result = failure.result;
             return match lease.release() {
                 Ok(()) => contextualize_bootstrap_failure(
@@ -1030,6 +1299,7 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
                     None,
                     provider_calls,
                     provider_mutations,
+                    &read_evidence,
                     Some(&lease),
                     Some(false),
                     "not_dispatched",
@@ -1041,6 +1311,7 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
                     None,
                     provider_calls,
                     provider_mutations,
+                    &read_evidence,
                     Some(&lease),
                     Some(true),
                     "not_dispatched",
@@ -1059,6 +1330,7 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
                     None,
                     provider_calls,
                     provider_mutations,
+                    &read_evidence,
                     Some(&lease),
                     Some(false),
                     "not_dispatched",
@@ -1070,6 +1342,7 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
                     None,
                     provider_calls,
                     provider_mutations,
+                    &read_evidence,
                     Some(&lease),
                     Some(true),
                     "not_dispatched",
@@ -1111,6 +1384,7 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
                 Some(&plan_sha256),
                 provider_calls,
                 provider_mutations,
+                &read_evidence,
                 Some(&lease),
                 Some(false),
                 "not_dispatched",
@@ -1122,6 +1396,7 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
                 Some(&plan_sha256),
                 provider_calls,
                 provider_mutations,
+                &read_evidence,
                 Some(&lease),
                 Some(true),
                 "not_dispatched",
@@ -1136,6 +1411,7 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
             Some(&plan_sha256),
             provider_calls,
             provider_mutations,
+            &read_evidence,
             Some(&lease),
             None,
             "not_dispatched",
@@ -1156,6 +1432,7 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
             Some(&plan_sha256),
             provider_calls,
             provider_mutations,
+            &read_evidence,
             Some(&lease),
             lease_retained,
             "not_dispatched",
@@ -1174,14 +1451,20 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
             &[],
         )
         .await
-        .map_err(|error| json!({"kind": "transport", "detail": error.payload()}))
+        .map_err(|error| {
+            json!({
+                "kind": "transport",
+                "detail": d1_migration_reconciliation_only_cause(&error.payload()),
+            })
+        })
         .and_then(|result| {
             validate_d1_bootstrap_initializer_write_result(&result)
-                .map_err(|detail| json!({"kind": "provider_result", "detail": detail}))?;
+                .map_err(|detail| bootstrap_initializer_provider_result_cause(&detail))?;
             Ok(())
         });
     if let Err(cause) = write_result {
-        let (reconciliation, calls) = d1_bootstrap_reconciliation_evidence(
+        let (reconciliation, calls, reconciliation_read_evidence) =
+            d1_bootstrap_reconciliation_evidence(
             server,
             &input.account_id,
             &input.database_id,
@@ -1189,6 +1472,7 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
         )
         .await;
         provider_calls += calls;
+        read_evidence.extend(reconciliation_read_evidence);
         let result = CallToolResult::structured_error(json!({
             "ok": false,
             "operation": D1_BOOTSTRAP_OPERATION,
@@ -1207,6 +1491,7 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
                 Some(&plan_sha256),
                 provider_calls,
                 provider_mutations,
+                &read_evidence,
                 Some(&lease),
                 Some(true),
                 "unknown",
@@ -1219,6 +1504,7 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
             Some(&plan_sha256),
             provider_calls,
             provider_mutations,
+            &read_evidence,
             Some(&lease),
             None,
             "unknown",
@@ -1236,10 +1522,12 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
     {
         Ok(post_state) => {
             provider_calls += post_state.provider_calls;
+            read_evidence.extend(post_state.read_evidence.clone());
             post_state
         }
         Err(failure) => {
             provider_calls += failure.provider_calls;
+            read_evidence.extend(failure.read_evidence);
             let lease_retained = if lease.revalidate().is_ok() {
                 lease.retain();
                 Some(true)
@@ -1252,6 +1540,7 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
                 Some(&plan_sha256),
                 provider_calls,
                 provider_mutations,
+                &read_evidence,
                 Some(&lease),
                 lease_retained,
                 "initializer_acknowledged_post_state_unproven",
@@ -1266,6 +1555,7 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
             Some(&plan_sha256),
             provider_calls,
             provider_mutations,
+            &read_evidence,
             Some(&lease),
             None,
             "applied_proven",
@@ -1279,6 +1569,7 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
             Some(&plan_sha256),
             provider_calls,
             provider_mutations,
+            &read_evidence,
             Some(&lease),
             Some(true),
             "applied_proven",
@@ -1308,6 +1599,8 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
         },
         "provider_calls": provider_calls,
         "provider_mutations": provider_mutations,
+        "provider_read_lifecycle": provider_read_lifecycle(&read_evidence),
+        "response_evidence": response_evidence(&read_evidence),
         "lease": d1_migration_lease_requirements(
             &input.account_id,
             &input.database_id,
@@ -1323,8 +1616,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        D1BootstrapInventoryState, d1_bootstrap_inventory_sql, d1_bootstrap_plan_matches,
-        d1_bootstrap_plan_sha256, parse_d1_bootstrap_inventory,
+        D1BootstrapInventoryState, bootstrap_initializer_provider_result_cause,
+        d1_bootstrap_inventory_sql, d1_bootstrap_plan_matches, d1_bootstrap_plan_sha256,
+        parse_d1_bootstrap_inventory,
         validate_d1_bootstrap_initializer_write_result,
     };
     use crate::d1_migration_manifest::d1_migrations_table_init_sql;
@@ -1452,21 +1746,61 @@ mod tests {
         validate_d1_bootstrap_initializer_write_result(&acknowledgement)
             .expect("DDL acknowledgement permits typed zero row counts");
 
+        let assert_no_retry_cause = |candidate: &Value, expected_classification: &str| {
+            let cause = validate_d1_bootstrap_initializer_write_result(candidate)
+                .expect_err("malformed initializer acknowledgement must fail closed");
+            assert_eq!(
+                cause,
+                json!({
+                    "code": "d1.bootstrap_initializer_result_ambiguous",
+                    "classification": expected_classification,
+                    "message": cause["message"],
+                    "retryable": false,
+                    "operator_guidance": "reconciliation_only",
+                })
+            );
+            assert!(cause["message"].as_str().is_some_and(|message| !message.is_empty()));
+        };
+
         let mut unchanged = acknowledgement.clone();
         unchanged[0]["meta"]["changed_db"] = json!(false);
-        assert!(validate_d1_bootstrap_initializer_write_result(&unchanged).is_err());
+        assert_no_retry_cause(&unchanged, "database_change_not_acknowledged");
 
         let mut non_primary = acknowledgement.clone();
         non_primary[0]["meta"]["served_by_primary"] = json!(false);
-        assert!(validate_d1_bootstrap_initializer_write_result(&non_primary).is_err());
+        assert_no_retry_cause(&non_primary, "write_not_served_by_primary");
 
         let mut malformed_count = acknowledgement.clone();
         malformed_count[0]["meta"]["rows_written"] = json!(-1);
-        assert!(validate_d1_bootstrap_initializer_write_result(&malformed_count).is_err());
+        assert_no_retry_cause(&malformed_count, "missing_or_malformed_write_metadata");
 
-        let mut unexpected_rows = acknowledgement;
+        let mut unexpected_rows = acknowledgement.clone();
         unexpected_rows[0]["results"] = json!([{"unexpected": true}]);
-        assert!(validate_d1_bootstrap_initializer_write_result(&unexpected_rows).is_err());
+        assert_no_retry_cause(&unexpected_rows, "unexpected_inner_results");
+
+        let mut provider_error = acknowledgement;
+        provider_error[0]["errors"] = json!([{
+            "code": 9911,
+            "message": "provider-private-result-marker",
+        }]);
+        let cause = validate_d1_bootstrap_initializer_write_result(&provider_error)
+            .expect_err("provider error rows must be static ambiguity evidence");
+        assert_eq!(cause["classification"], json!("inner_statement_error"));
+        assert_eq!(cause["retryable"], json!(false));
+        assert_eq!(cause["operator_guidance"], json!("reconciliation_only"));
+        assert!(!cause.to_string().contains("provider-private-result-marker"));
+        let nested = bootstrap_initializer_provider_result_cause(&cause);
+        assert_eq!(nested["kind"], json!("provider_result"));
+        assert_eq!(nested["detail"]["retryable"], json!(false));
+        assert_eq!(
+            nested["detail"]["operator_guidance"],
+            json!("reconciliation_only")
+        );
+        assert_eq!(
+            nested["detail"]["classification"],
+            json!("inner_statement_error")
+        );
+        assert!(!nested.to_string().contains("provider-private-result-marker"));
     }
 
     #[test]

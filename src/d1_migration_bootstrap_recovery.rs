@@ -11,7 +11,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::cloudflare::client::D1MigrationReconciliationReadLifecycle;
+use crate::cloudflare::client::{
+    D1MigrationReconciliationReadLifecycle, d1_migration_reconciliation_only_cause,
+};
 use crate::d1_migration_bootstrap::{
     D1_BOOTSTRAP_LEASE_FAMILY, D1BootstrapInventoryState, d1_bootstrap_installed_schema_sql,
     d1_bootstrap_inventory_sql, d1_bootstrap_plan_sha256, parse_d1_bootstrap_inventory,
@@ -461,7 +463,7 @@ async fn read_exact_inventory_once(
                 result: exact_read_failure(
                     "d1.bootstrap_recovery_inventory_unavailable",
                     "the bounded bootstrap inventory response was unavailable or malformed",
-                    json!(failure.error),
+                    d1_migration_reconciliation_only_cause(&failure.error),
                 ),
                 provider_calls,
                 lifecycle: vec![lifecycle],
@@ -579,7 +581,7 @@ async fn read_exact_ledger_once(
                 result: exact_read_failure(
                     "d1.bootstrap_recovery_ledger_unavailable",
                     "the bounded bootstrap ledger response was unavailable or malformed",
-                    json!(failure.error),
+                    d1_migration_reconciliation_only_cause(&failure.error),
                 ),
                 provider_calls,
                 lifecycle: vec![lifecycle],

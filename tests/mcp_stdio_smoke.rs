@@ -791,8 +791,12 @@ fn spawn_fake_bootstrap_api(
             if sql.starts_with("CREATE TABLE IF NOT EXISTS \"d1_migrations\"") {
                 initialized = true;
                 if ambiguous_initializer {
-                    write!(stream, "HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-length: 0\r\n\r\n")
+                    let response = br#"{"success":false,"errors":[{"code":9911,"message":"private-initializer-body-marker"}],"result":null}"#;
+                    write!(stream, "HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
                         .expect("write ambiguous initializer response");
+                    stream
+                        .write_all(response)
+                        .expect("write private ambiguous initializer body");
                     continue;
                 }
                 let response = serde_json::to_vec(&json!({
@@ -839,6 +843,119 @@ fn spawn_fake_bootstrap_api(
             stream
                 .write_all(&response)
                 .expect("write bootstrap response");
+        }
+    });
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
+}
+
+#[derive(Clone, Copy)]
+enum BootstrapReadFault {
+    HttpStatus(u16),
+    Redirect,
+    TransportLoss,
+    Truncated(bool),
+    Oversized,
+    MalformedJson,
+    InvalidUtf8,
+    PrimaryMarkerWrongType,
+    Unstable,
+}
+
+fn spawn_fake_bootstrap_read_fault_api(
+    fault: BootstrapReadFault,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind bootstrap read-fault API"); // DevSkim: ignore DS162092 -- loopback-only MCP test fixture
+    let addr = listener.local_addr().expect("bootstrap read-fault address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    let expected_calls = if matches!(fault, BootstrapReadFault::Unstable) {
+        2
+    } else {
+        1
+    };
+    thread::spawn(move || {
+        for (index, stream) in listener.incoming().take(expected_calls).enumerate() {
+            let mut stream = stream.expect("bootstrap read-fault stream");
+            let (headers, body) = read_http_request(&mut stream);
+            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            let request: Value =
+                serde_json::from_slice(&body).expect("bootstrap read-fault request JSON");
+            assert!(is_bootstrap_inventory_sql(
+                request["sql"].as_str().unwrap_or_default()
+            ));
+            requests_for_thread
+                .lock()
+                .expect("bootstrap read-fault request log")
+                .push(request);
+            match fault {
+                BootstrapReadFault::HttpStatus(status) => {
+                    let response = reconciliation_http_error_response(status);
+                    write!(stream, "HTTP/1.1 {status} Synthetic\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                        .expect("write bootstrap HTTP error headers");
+                    stream
+                        .write_all(&response)
+                        .expect("write bootstrap HTTP error body");
+                }
+                BootstrapReadFault::Redirect => {
+                    let response = b"redirect refused";
+                    write!(stream, "HTTP/1.1 302 Found\r\nconnection: close\r\nlocation: http://127.0.0.1:9/must-not-be-followed\r\ncontent-type: text/plain\r\ncontent-length: {}\r\n\r\n", response.len())
+                        .expect("write bootstrap redirect headers");
+                    stream
+                        .write_all(response)
+                        .expect("write bootstrap redirect body");
+                }
+                BootstrapReadFault::TransportLoss => {}
+                BootstrapReadFault::Truncated(partial) => {
+                    write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 64\r\n\r\n")
+                        .expect("write bootstrap truncated headers");
+                    if partial {
+                        stream
+                            .write_all(b"{")
+                            .expect("write bootstrap partial response body");
+                    }
+                }
+                BootstrapReadFault::Oversized => {
+                    write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", 16 * 1024 * 1024 + 1)
+                        .expect("write oversized bootstrap headers");
+                }
+                BootstrapReadFault::MalformedJson => {
+                    let response = b"{";
+                    write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                        .expect("write malformed bootstrap JSON headers");
+                    stream
+                        .write_all(response)
+                        .expect("write malformed bootstrap JSON");
+                }
+                BootstrapReadFault::InvalidUtf8 => {
+                    let response = [0xff, 0xfe];
+                    write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                        .expect("write invalid UTF-8 bootstrap headers");
+                    stream
+                        .write_all(&response)
+                        .expect("write invalid UTF-8 bootstrap body");
+                }
+                BootstrapReadFault::PrimaryMarkerWrongType => {
+                    let mut response = bootstrap_inventory_response(false, false, false);
+                    response["result"][0]["meta"]["served_by_primary"] = json!("true");
+                    let response =
+                        serde_json::to_vec(&response).expect("serialize primary-marker fault");
+                    write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                        .expect("write primary-marker fault headers");
+                    stream
+                        .write_all(&response)
+                        .expect("write primary-marker fault body");
+                }
+                BootstrapReadFault::Unstable => {
+                    let response = bootstrap_inventory_response(false, index == 1, false);
+                    let response =
+                        serde_json::to_vec(&response).expect("serialize unstable bootstrap read");
+                    write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                        .expect("write unstable bootstrap headers");
+                    stream
+                        .write_all(&response)
+                        .expect("write unstable bootstrap response");
+                }
+            }
         }
     });
     (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
@@ -5832,6 +5949,24 @@ fn d1_bootstrap_migration_ledger_dry_run_and_live_prove_one_initializer_only() {
     assert_eq!(dry["target_inventory"]["state"], json!("empty"));
     assert_eq!(dry["provider_calls"], json!(2));
     assert_eq!(dry["provider_mutations"], json!(0));
+    assert_eq!(
+        dry["provider_read_lifecycle"]
+            .as_array()
+            .map(Vec::len),
+        Some(2),
+        "{dry}"
+    );
+    assert!(dry["provider_read_lifecycle"].as_array().is_some_and(|reads| {
+        reads.iter().enumerate().all(|(index, read)| {
+            read["phase"] == json!(format!("dry_run_preflight.inventory.{}", if index == 0 { "first" } else { "second" }))
+                && read["query_sha256"].as_str().is_some_and(|value| value.len() == 64)
+                && read["lifecycle"]["dispatch_stage"] == json!("attempted")
+                && read["lifecycle"]["response_stage"] == json!("received")
+                && read["lifecycle"]["body_stage"] == json!("completely_read")
+                && read["lifecycle"]["http_status"] == json!(200)
+        })
+    }));
+    assert_eq!(dry["response_evidence"].as_array().map(Vec::len), Some(2));
     let plan = dry["plan_sha256"].as_str().expect("bootstrap plan");
 
     let live = mcp.call_tool(
@@ -5847,6 +5982,33 @@ fn d1_bootstrap_migration_ledger_dry_run_and_live_prove_one_initializer_only() {
     assert_eq!(live["status"], json!("applied_proven"));
     assert_eq!(live["provider_calls"], json!(7));
     assert_eq!(live["provider_mutations"], json!(1));
+    assert_eq!(
+        live["provider_read_lifecycle"].as_array().map(Vec::len),
+        Some(6),
+        "{live}"
+    );
+    assert_eq!(
+        live["response_evidence"].as_array().map(Vec::len),
+        Some(6),
+        "{live}"
+    );
+    assert_eq!(
+        live["provider_read_lifecycle"]
+            .as_array()
+            .expect("live lifecycle")
+            .iter()
+            .map(|entry| entry["phase"].as_str().expect("bounded phase"))
+            .collect::<Vec<_>>(),
+        vec![
+            "live_predispatch.inventory.first",
+            "live_predispatch.inventory.second",
+            "post_write_proof.inventory.first",
+            "post_write_proof.inventory.second",
+            "post_write_proof.ledger.first",
+            "post_write_proof.ledger.second",
+        ],
+        "{live}"
+    );
     assert_eq!(live["migration_sql_executed"], json!(false));
     assert_eq!(live["post_write"]["ledger_row_count"], json!(0));
     assert_eq!(
@@ -5872,6 +6034,312 @@ fn d1_bootstrap_migration_ledger_dry_run_and_live_prove_one_initializer_only() {
             .is_some_and(|sql| !sql.contains("INSERT INTO") && !sql.contains("ALTER TABLE"))
     }));
     let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_bootstrap_reads_are_one_attempt_bounded_and_report_exact_lifecycle() {
+    for (index, (fault, status, body_stage, expected_code, expected_calls)) in [
+        (
+            BootstrapReadFault::HttpStatus(400),
+            Some(400),
+            "completely_read",
+            "d1.bootstrap_inventory_unreadable",
+            1,
+        ),
+        (
+            BootstrapReadFault::HttpStatus(401),
+            Some(401),
+            "completely_read",
+            "d1.bootstrap_inventory_unreadable",
+            1,
+        ),
+        (
+            BootstrapReadFault::HttpStatus(403),
+            Some(403),
+            "completely_read",
+            "d1.bootstrap_inventory_unreadable",
+            1,
+        ),
+        (
+            BootstrapReadFault::HttpStatus(429),
+            Some(429),
+            "completely_read",
+            "d1.bootstrap_inventory_unreadable",
+            1,
+        ),
+        (
+            BootstrapReadFault::HttpStatus(503),
+            Some(503),
+            "completely_read",
+            "d1.bootstrap_inventory_unreadable",
+            1,
+        ),
+        (
+            BootstrapReadFault::Redirect,
+            Some(302),
+            "completely_read",
+            "d1.bootstrap_inventory_unreadable",
+            1,
+        ),
+        (
+            BootstrapReadFault::TransportLoss,
+            None,
+            "not_read",
+            "d1.bootstrap_inventory_unreadable",
+            1,
+        ),
+        (
+            BootstrapReadFault::Truncated(false),
+            Some(200),
+            "not_read",
+            "d1.bootstrap_inventory_unreadable",
+            1,
+        ),
+        (
+            BootstrapReadFault::Truncated(true),
+            Some(200),
+            "partially_read",
+            "d1.bootstrap_inventory_unreadable",
+            1,
+        ),
+        (
+            BootstrapReadFault::Oversized,
+            Some(200),
+            "not_read",
+            "d1.bootstrap_inventory_unreadable",
+            1,
+        ),
+        (
+            BootstrapReadFault::MalformedJson,
+            Some(200),
+            "completely_read",
+            "d1.bootstrap_inventory_unreadable",
+            1,
+        ),
+        (
+            BootstrapReadFault::InvalidUtf8,
+            Some(200),
+            "completely_read",
+            "d1.bootstrap_inventory_unreadable",
+            1,
+        ),
+        (
+            BootstrapReadFault::PrimaryMarkerWrongType,
+            Some(200),
+            "completely_read",
+            "d1.bootstrap_inventory_malformed",
+            1,
+        ),
+        (
+            BootstrapReadFault::Unstable,
+            Some(200),
+            "completely_read",
+            "d1.bootstrap_inventory_unstable",
+            2,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (base_url, requests) = spawn_fake_bootstrap_read_fault_api(fault);
+        let mut mcp = McpStdioProcess::start_with_env(vec![(
+            "CLOUDFLARE_MCP_API_BASE_URL",
+            base_url,
+        )]);
+        let content = structured_content(&mcp.call_tool(
+            500 + index as u64,
+            "d1_bootstrap_migration_ledger",
+            json!({"database_id": "db-1", "dry_run": true}),
+        ))
+        .clone();
+        assert_eq!(content["ok"], json!(false), "case {index}: {content}");
+        assert_eq!(
+            content["error"]["code"],
+            json!(expected_code),
+            "case {index}: {content}"
+        );
+        assert_eq!(
+            content["provider_calls"],
+            json!(expected_calls),
+            "case {index}: {content}"
+        );
+        assert_eq!(content["provider_mutations"], json!(0), "{content}");
+        assert_eq!(
+            content["automatic_retry_permitted"],
+            json!(false),
+            "case {index}: {content}"
+        );
+        assert_eq!(
+            content["provider_read_lifecycle"]
+                .as_array()
+                .map(Vec::len),
+            Some(expected_calls),
+            "case {index}: {content}"
+        );
+        assert_eq!(
+            content["provider_read_lifecycle"][expected_calls - 1]["lifecycle"]["http_status"],
+            status.map_or(Value::Null, Value::from),
+            "case {index}: {content}"
+        );
+        assert_eq!(
+            content["provider_read_lifecycle"][expected_calls - 1]["lifecycle"]["body_stage"],
+            json!(body_stage),
+            "case {index}: {content}"
+        );
+        for (read_index, entry) in content["provider_read_lifecycle"]
+            .as_array()
+            .expect("provider lifecycle array")
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(
+                entry["phase"],
+                json!(format!(
+                    "dry_run_preflight.inventory.{}",
+                    if read_index == 0 { "first" } else { "second" }
+                )),
+                "case {index}: {content}"
+            );
+            assert!(
+                entry["query_sha256"]
+                    .as_str()
+                    .is_some_and(|value| value.len() == 64),
+                "case {index}: {content}"
+            );
+        }
+        let evidence = content["response_evidence"]
+            .as_array()
+            .expect("response evidence array");
+        assert_eq!(evidence.len(), expected_calls, "case {index}: {content}");
+        let last = &evidence[expected_calls - 1];
+        assert_eq!(last["phase"], json!(if expected_calls == 1 {
+            "dry_run_preflight.inventory.first"
+        } else {
+            "dry_run_preflight.inventory.second"
+        }));
+        if body_stage == "completely_read" {
+            assert!(
+                last["response"]["body_sha256"]
+                    .as_str()
+                    .is_some_and(|value| value.len() == 64),
+                "case {index}: {content}"
+            );
+            assert_eq!(last["response"]["complete_body_digest"], json!(true), "{content}");
+        } else {
+            assert!(last["response"]["body_sha256"].is_null(), "case {index}: {content}");
+            assert_eq!(last["response"]["complete_body_digest"], json!(false), "{content}");
+            if status.is_some() {
+                assert!(
+                    last["response"]["body_size_bytes"].as_u64().is_some(),
+                    "case {index}: {content}"
+                );
+            } else {
+                assert!(last["response"]["body_size_bytes"].is_null(), "{content}");
+            }
+        }
+        if expected_code == "d1.bootstrap_inventory_unreadable" {
+            assert_eq!(content["error"]["cause"]["retryable"], json!(false), "{content}");
+            assert_eq!(
+                content["error"]["cause"]["operator_guidance"],
+                json!("reconciliation_only"),
+                "{content}"
+            );
+            assert!(content["error"]["cause"].get("hint").is_none(), "{content}");
+            assert!(content["error"]["cause"].get("message").is_none(), "{content}");
+            assert!(!content.to_string().contains("synthetic HTTP"), "{content}");
+        }
+        assert_eq!(
+            requests.lock().expect("bootstrap read-fault requests").len(),
+            expected_calls,
+            "case {index}: no hidden retry is permitted"
+        );
+        mcp.terminate();
+    }
+
+    let mut pre_dispatch = McpStdioProcess::start_with_env(vec![
+        (
+            "CLOUDFLARE_MCP_API_BASE_URL",
+            "http://127.0.0.1:9".to_string(),
+        ),
+        ("CLOUDFLARE_API_TOKEN", String::new()),
+        ("CLOUDFLARE_MCP_API_TOKEN", String::new()),
+    ]);
+    let content = structured_content(&pre_dispatch.call_tool(
+        599,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "dry_run": true}),
+    ))
+    .clone();
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["provider_calls"], json!(0), "{content}");
+    assert_eq!(content["automatic_retry_permitted"], json!(false), "{content}");
+    assert_eq!(
+        content["provider_read_lifecycle"][0]["lifecycle"],
+        json!({
+            "dispatch_stage": "pre_dispatch",
+            "response_stage": "not_received",
+            "body_stage": "not_read",
+            "http_status": null,
+        }),
+        "{content}"
+    );
+    assert_eq!(
+        content["provider_read_lifecycle"][0]["phase"],
+        json!("dry_run_preflight.inventory.first")
+    );
+    assert!(content["provider_read_lifecycle"][0]["query_sha256"]
+        .as_str()
+        .is_some_and(|value| value.len() == 64));
+    assert_eq!(content["response_evidence"].as_array().map(Vec::len), Some(1), "{content}");
+    assert!(content["response_evidence"][0]["response"]["body_sha256"].is_null());
+    pre_dispatch.terminate();
+
+    let mut builder_failure = McpStdioProcess::start_with_env(vec![
+        (
+            "CLOUDFLARE_MCP_API_BASE_URL",
+            "http://127.0.0.1:9".to_string(),
+        ),
+        ("CLOUDFLARE_API_TOKEN", "invalid\nheader".to_string()),
+        (
+            "CLOUDFLARE_MCP_API_TOKEN",
+            "invalid\nheader".to_string(),
+        ),
+    ]);
+    let content = structured_content(&builder_failure.call_tool(
+        600,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "dry_run": true}),
+    ))
+    .clone();
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["provider_calls"], json!(0), "{content}");
+    assert_eq!(
+        content["error"]["cause"]["code"],
+        json!("cloudflare.request_build_failed"),
+        "{content}"
+    );
+    assert_eq!(content["error"]["cause"]["retryable"], json!(false), "{content}");
+    assert_eq!(
+        content["error"]["cause"]["operator_guidance"],
+        json!("reconciliation_only"),
+        "{content}"
+    );
+    assert_eq!(
+        content["provider_read_lifecycle"][0]["phase"],
+        json!("dry_run_preflight.inventory.first"),
+        "{content}"
+    );
+    assert_eq!(
+        content["provider_read_lifecycle"][0]["lifecycle"]["dispatch_stage"],
+        json!("pre_dispatch"),
+        "{content}"
+    );
+    assert_eq!(
+        content["response_evidence"].as_array().map(Vec::len),
+        Some(1),
+        "{content}"
+    );
+    builder_failure.terminate();
 }
 
 #[test]
@@ -6189,12 +6657,83 @@ fn d1_bootstrap_migration_ledger_response_loss_retains_custody_and_never_retries
     assert_eq!(content["lease_retained"], json!(true));
     assert_eq!(content["automatic_retry_permitted"], json!(false));
     assert_eq!(
+        content["provider_read_lifecycle"]
+            .as_array()
+            .map(Vec::len),
+        Some(6),
+        "two pre-dispatch proof reads plus four ambiguity readbacks: {content}"
+    );
+    assert_eq!(
+        content["response_evidence"].as_array().map(Vec::len),
+        Some(6),
+        "{content}"
+    );
+    let phases = content["provider_read_lifecycle"]
+        .as_array()
+        .expect("ambiguous lifecycle")
+        .iter()
+        .map(|entry| entry["phase"].as_str().expect("bounded phase"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        phases,
+        vec![
+            "live_predispatch.inventory.first",
+            "live_predispatch.inventory.second",
+            "ambiguous_write_reconciliation.inventory.first",
+            "ambiguous_write_reconciliation.inventory.second",
+            "ambiguous_write_reconciliation.ledger.first",
+            "ambiguous_write_reconciliation.ledger.second",
+        ],
+        "{content}"
+    );
+    assert_eq!(
+        content["error"]["cause"],
+        json!({
+            "kind": "transport",
+            "detail": {
+                "code": "cloudflare.http_server_error",
+                "status": 503,
+                "retryable": false,
+                "operator_guidance": "reconciliation_only",
+            },
+        }),
+        "{content}"
+    );
+    assert!(
+        !content.to_string().contains("private-initializer-body-marker"),
+        "provider body excerpt leaked: {content}"
+    );
+    assert_eq!(
         content["reconciliation_evidence"]["state"],
         json!("canonical_empty_ledger_observed")
     );
     assert_eq!(
         content["reconciliation_evidence"]["effect_attribution"],
         json!("unknown")
+    );
+    assert_eq!(
+        content["reconciliation_evidence"]["provider_read_lifecycle"]
+            .as_array()
+            .map(Vec::len),
+        Some(4),
+        "{content}"
+    );
+    assert_eq!(
+        content["reconciliation_evidence"]["response_evidence"]
+            .as_array()
+            .map(Vec::len),
+        Some(4),
+        "{content}"
+    );
+    assert_eq!(
+        content["reconciliation_evidence"]["provider_read_lifecycle"]
+            .as_array()
+            .expect("reconciliation lifecycle")
+            .iter()
+            .map(|entry| entry["phase"].as_str().expect("bounded phase"))
+            .collect::<Vec<_>>(),
+        phases[2..],
+        "{content}"
     );
     assert_private_regular_active_lease(&lease_root);
 
@@ -7037,6 +7576,12 @@ fn d1_bootstrap_reconciliation_provider_failure_is_one_attempt_and_nonterminal()
     assert_eq!(content["provider_mutations"], json!(0), "{content}");
     assert_eq!(content["local_namespace_mutations"], json!(0), "{content}");
     assert_eq!(content["lease_retained"], json!(true), "{content}");
+    assert_eq!(content["error"]["cause"]["retryable"], json!(false), "{content}");
+    assert_eq!(
+        content["error"]["cause"]["operator_guidance"],
+        json!("reconciliation_only"),
+        "{content}"
+    );
     assert_eq!(
         content["provider_read_lifecycle"][0]["lifecycle"]["http_status"],
         json!(503),

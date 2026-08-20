@@ -89,7 +89,9 @@ or bypass `d1_apply_migration_manifest`.
 2. Call the bootstrap with `dry_run=true` and the exact account, database, and
    optional canonical ledger-table identifier. Confirm that the response
    reports two provider reads, zero mutations, `target_inventory.state=empty`,
-   and a lowercase `plan_sha256`.
+   a lowercase `plan_sha256`, two chronological one-attempt
+   `provider_read_lifecycle` entries, and matching exact-body
+   `response_evidence`.
 3. Independently confirm that this is the intended empty target. Approval of a
    manifest apply, an account default, or a similarly named database is not
    bootstrap approval.
@@ -105,8 +107,15 @@ or bypass `d1_apply_migration_manifest`.
    dry-run; bootstrap approval never approves migration SQL.
 
 If the initializer response is lost or malformed, do not retry. The tool makes
-read-only reconciliation calls, retains custody when it can prove the local
-chain, and reports the single mutation attempt. Escalate that exact evidence to
+bounded read-only reconciliation calls with no redirects or adapter retries,
+retains custody when it can prove the local chain, and reports the single
+mutation attempt plus exact physical read accounting. HTTP/auth/rate-limit/5xx,
+transport, truncated, oversized, malformed, invalid-UTF-8, non-primary, and
+unstable evidence stays fail-closed. Builder/config failures remain
+pre-dispatch with zero calls. Confirm every lifecycle/response entry retains
+its exact lifecycle window, phase, and query digest, and every nested provider
+cause says `retryable=false` with reconciliation-only guidance while omitting
+provider response text. Escalate that exact evidence to
 the governed reconciliation path. A canonical empty ledger observed afterward
 does not prove whether this call created it, so it is not permission to replay.
 
