@@ -10,7 +10,9 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::cloudflare::client::{
-    D1MigrationReconciliationReadLifecycle, d1_migration_reconciliation_only_cause,
+    D1MigrationManifestWrite, D1MigrationReconciliationReadLifecycle,
+    d1_migration_manifest_write_provider_result_cause,
+    d1_migration_manifest_write_reconciliation_cause, d1_migration_reconciliation_only_cause,
 };
 use crate::d1_migration_lease::{
     D1MigrationLease, acquire_d1_migration_lease, d1_migration_lease_requirements,
@@ -261,17 +263,11 @@ fn bootstrap_initializer_ambiguous_write_evidence(
     })
 }
 
-fn bootstrap_initializer_provider_result_cause(detail: &Value) -> Value {
-    json!({
-        "kind": "provider_result",
-        "detail": {
-            "code": detail.get("code"),
-            "classification": detail.get("classification"),
-            "message": detail.get("message"),
-            "retryable": false,
-            "operator_guidance": "reconciliation_only",
-        },
-    })
+fn bootstrap_initializer_provider_result_cause(
+    detail: &Value,
+    write: &D1MigrationManifestWrite,
+) -> Value {
+    d1_migration_manifest_write_provider_result_cause(write, detail)
 }
 
 /// Validate the one DDL-only initializer acknowledgement without importing the
@@ -1440,9 +1436,7 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
         );
     }
 
-    provider_calls += 1;
-    provider_mutations += 1;
-    let write_result = server
+    let write_result = match server
         .cloudflare
         .execute_d1_migration_manifest_write(
             &input.account_id,
@@ -1451,17 +1445,22 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
             &[],
         )
         .await
-        .map_err(|error| {
-            json!({
+    {
+        Ok(write) => {
+            provider_calls += write.lifecycle.provider_calls();
+            provider_mutations += write.lifecycle.provider_calls();
+            validate_d1_bootstrap_initializer_write_result(&write.result)
+                .map_err(|detail| bootstrap_initializer_provider_result_cause(&detail, &write))
+        }
+        Err(failure) => {
+            provider_calls += failure.lifecycle.provider_calls();
+            provider_mutations += failure.lifecycle.provider_calls();
+            Err(json!({
                 "kind": "transport",
-                "detail": d1_migration_reconciliation_only_cause(&error.payload()),
-            })
-        })
-        .and_then(|result| {
-            validate_d1_bootstrap_initializer_write_result(&result)
-                .map_err(|detail| bootstrap_initializer_provider_result_cause(&detail))?;
-            Ok(())
-        });
+                "detail": d1_migration_manifest_write_reconciliation_cause(&failure),
+            }))
+        }
+    };
     if let Err(cause) = write_result {
         let (reconciliation, calls, reconciliation_read_evidence) =
             d1_bootstrap_reconciliation_evidence(
@@ -1616,11 +1615,12 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        D1BootstrapInventoryState, bootstrap_initializer_provider_result_cause,
-        d1_bootstrap_inventory_sql, d1_bootstrap_plan_matches, d1_bootstrap_plan_sha256,
-        parse_d1_bootstrap_inventory,
+        D1BootstrapInventoryState, D1MigrationManifestWrite,
+        bootstrap_initializer_provider_result_cause, d1_bootstrap_inventory_sql,
+        d1_bootstrap_plan_matches, d1_bootstrap_plan_sha256, parse_d1_bootstrap_inventory,
         validate_d1_bootstrap_initializer_write_result,
     };
+    use crate::cloudflare::client::D1MigrationManifestWriteLifecycle;
     use crate::d1_migration_manifest::d1_migrations_table_init_sql;
 
     fn response(results: Value, primary: Value) -> Value {
@@ -1789,7 +1789,19 @@ mod tests {
         assert_eq!(cause["retryable"], json!(false));
         assert_eq!(cause["operator_guidance"], json!("reconciliation_only"));
         assert!(!cause.to_string().contains("provider-private-result-marker"));
-        let nested = bootstrap_initializer_provider_result_cause(&cause);
+        let write = D1MigrationManifestWrite {
+            result: Value::Null,
+            response_body_sha256:
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            response_body_size_bytes: 123,
+            lifecycle: D1MigrationManifestWriteLifecycle {
+                dispatch_stage: "attempted",
+                response_stage: "received",
+                body_stage: "completely_read",
+                http_status: Some(200),
+            },
+        };
+        let nested = bootstrap_initializer_provider_result_cause(&cause, &write);
         assert_eq!(nested["kind"], json!("provider_result"));
         assert_eq!(nested["detail"]["retryable"], json!(false));
         assert_eq!(
@@ -1800,6 +1812,20 @@ mod tests {
             nested["detail"]["classification"],
             json!("inner_statement_error")
         );
+        assert_eq!(
+            nested["detail"]["provider_write_lifecycle"],
+            json!({
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 200,
+            })
+        );
+        assert_eq!(
+            nested["detail"]["response_body_sha256"],
+            json!("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(nested["detail"]["response_body_size_bytes"], json!(123));
         assert!(!nested.to_string().contains("provider-private-result-marker"));
     }
 

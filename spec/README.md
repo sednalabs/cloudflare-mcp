@@ -109,13 +109,23 @@ Preserved curated tool families:
   mutating contract from manifest apply. Keep its exact empty-target dry-run
   digest, shared target custody, one-initializer maximum, no-retry ambiguity,
   stable canonical-schema/empty-ledger readback, one-attempt/no-redirect bounded
-  read client, window/phase/query-bound response/lifecycle evidence including
+  read client, a separate one-attempt/no-redirect migration-write client with a
+  16 MiB identity-response stream cap, window/phase/query-bound
+  response/lifecycle evidence including
   no-body events, privacy-safe reconciliation-only nested causes for reads and
   initializer failure, physical provider-call and
   mutation accounting, and MCP stdio negative-path coverage aligned with the
   snapshot. It must never become
   a compatibility path for application-bearing or partially initialized D1
   databases.
+- Manifest-owned provider writes use that same dedicated write boundary: no
+  redirects or adapter retry, identity response encoding, a 16 MiB streamed
+  response cap before UTF-8/strict-envelope decoding, truthful pre-dispatch
+  versus attempted lifecycle evidence, and permanent reconciliation-only
+  handling after any dispatched oversize/read/decode failure. A valid HTTP 200
+  outer envelope with missing, malformed, or failed inner D1 results preserves
+  the complete response digest, size, and attempted lifecycle while remaining
+  ambiguous and non-retryable.
 - Bootstrap recovery (`d1_reconcile_bootstrap_migration_ledger`,
   `d1_finalize_bootstrap_migration_ledger`, and
   `d1_abort_bootstrap_migration_ledger`) is its own retained-custody

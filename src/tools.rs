@@ -5394,11 +5394,21 @@ impl CloudflareMcp {
                 .cloudflare
                 .execute_d1_migration_manifest_write(account_id, &args.database_id, &statement, &[])
                 .await
-                .map_err(|error| json!({"kind": "transport", "detail": error.payload()}))
-                .and_then(|result| {
-                    validate_d1_manifest_write_result(&result)
-                        .map_err(|detail| json!({"kind": "provider_result", "detail": detail}))?;
-                    Ok(result)
+                .map_err(|failure| {
+                    json!({
+                        "kind": "transport",
+                        "detail": crate::cloudflare::client::d1_migration_manifest_write_reconciliation_cause(&failure),
+                    })
+                })
+                .and_then(|write| {
+                    validate_d1_manifest_write_result(&write.result)
+                        .map_err(|detail| {
+                            crate::cloudflare::client::d1_migration_manifest_write_provider_result_cause(
+                                &write,
+                                &detail,
+                            )
+                        })?;
+                    Ok(write.result)
                 });
             match write_result {
                 Ok(result) => {

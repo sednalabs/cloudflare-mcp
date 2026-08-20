@@ -120,6 +120,16 @@ reconciliation-only with `retryable=false` and omit body-derived messages;
 this includes initializer write failure. Never infer a hidden retry from two
 paired stability reads.
 
+The initializer and manifest-owned migration writes use a separate dedicated
+one-attempt client that also refuses redirects. It requests identity response
+encoding and caps the streamed response at 16 MiB before UTF-8 and strict JSON
+decoding. Pre-dispatch request construction failures count zero calls; any
+dispatched redirect, oversize, read, or decode failure records one attempted
+write lifecycle, retains reconciliation-only guidance and custody, and never
+authorizes replay. A valid HTTP 200 outer envelope does not discard that
+evidence: malformed or failed inner D1 results retain the complete response
+digest, byte count, and attempted write lifecycle while remaining ambiguous.
+
 If that one initializer dispatch has an ambiguous result, use
 `d1_reconcile_bootstrap_migration_ledger`; do not supply an empty manifest to
 the general manifest recovery tool. Bind the exact account/database,

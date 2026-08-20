@@ -242,6 +242,19 @@ moves the supplied manifest into validation without cloning its SQL strings.
 Split a larger migration family before review rather than increasing this
 operator-surface memory bound.
 
+Every manifest-owned provider write uses its own one-attempt HTTP client. It
+requests identity response encoding, never follows redirects, and consumes the
+response as a stream capped at 16 MiB before UTF-8 or strict-envelope decoding.
+A 307 or 308 is provider response evidence, never authority for a second POST.
+Declared or streamed oversize, unsupported content encoding, read failure,
+invalid UTF-8, malformed JSON, and contradictory envelopes after dispatch all
+retain the exact write lifecycle and bounded body digest/size evidence when
+available. Treat every such result as ambiguous: retain custody, reconcile,
+and never replay the migration write automatically. A decoded HTTP 200 outer
+envelope retains that same complete-body evidence through inner D1 result
+validation; malformed, missing, or failed inner results remain one attempted
+write with unknown outcome, not a replayable provider rejection.
+
 On a live manifest call, the MCP first performs a read-only inspection of any
 existing target custody. It never creates a target or guard during this step;
 an active or retiring entry therefore stops a fresh caller before any provider

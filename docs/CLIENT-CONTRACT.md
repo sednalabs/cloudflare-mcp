@@ -257,6 +257,17 @@ The exact family `migration-ledger-bootstrap-v1` is reserved to `d1_bootstrap_mi
 | `emergency_unpublish` | `hostname`; `zone_id` unless default zone configured | `reason`, `dry_run` | Idempotent emergency route disable. |
 | `portal_agent_request` | `url` | `method`, `body`, `use_agent_token`, `use_access_service_token`, `dry_run` | Allowlisted bridge to operator endpoints. Dry-run reports request/auth metadata without sending the request; live calls attach configured server-held credentials only when requested. |
 
+Manifest-owned and bootstrap-initializer D1 writes use a dedicated one-attempt
+HTTP client. It requests identity response encoding, refuses redirects, and
+caps the response stream at 16 MiB before UTF-8 and strict-envelope decoding.
+A 307/308 is not followed. After dispatch, oversize, unsupported encoding,
+stream-read, UTF-8, or decode failure is permanently reconciliation-only:
+bounded lifecycle and body digest/size evidence is returned when available,
+custody is retained when provable, and automatic replay remains forbidden.
+The same evidence survives a valid HTTP 200 outer envelope whose inner D1
+result is missing, malformed, or failed; that outcome remains ambiguous and
+non-retryable for both bootstrap and generic manifest apply.
+
 Successful `d1_reconcile_migration_manifest` evidence enumerates four closed
 `effect_assertion.scope.statement_class` values:
 `schema_create_only`, `schema_create_tables_indexes_views_triggers`,

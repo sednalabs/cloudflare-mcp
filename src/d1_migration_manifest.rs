@@ -1723,12 +1723,66 @@ fn d1_manifest_nonretryable_cause(error: Value) -> Value {
             );
         }
     }
+    if let Some(lifecycle) = detail
+        .and_then(|detail| detail.get("provider_write_lifecycle"))
+        .and_then(d1_manifest_write_lifecycle_evidence)
+    {
+        cause.insert("provider_write_lifecycle".to_string(), lifecycle);
+    }
+    if let Some(response_body_sha256) = detail
+        .and_then(|detail| detail.get("response_body_sha256"))
+        .filter(|value| {
+            value.is_null()
+                || value.as_str().is_some_and(|value| {
+                    value.len() == 64
+                        && value
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                })
+        })
+    {
+        cause.insert(
+            "response_body_sha256".to_string(),
+            response_body_sha256.clone(),
+        );
+    }
+    if let Some(response_body_size_bytes) = detail
+        .and_then(|detail| detail.get("response_body_size_bytes"))
+        .filter(|value| value.is_null() || value.as_u64().is_some())
+    {
+        cause.insert(
+            "response_body_size_bytes".to_string(),
+            response_body_size_bytes.clone(),
+        );
+    }
     cause.insert("retryable".to_string(), Value::Bool(false));
     cause.insert(
         "operator_guidance".to_string(),
         Value::String("reconciliation_only".to_string()),
     );
     Value::Object(cause)
+}
+
+fn d1_manifest_write_lifecycle_evidence(value: &Value) -> Option<Value> {
+    let lifecycle = value.as_object()?;
+    if lifecycle.len() != 4 {
+        return None;
+    }
+    let dispatch_stage = lifecycle.get("dispatch_stage")?.as_str()?;
+    let response_stage = lifecycle.get("response_stage")?.as_str()?;
+    let body_stage = lifecycle.get("body_stage")?.as_str()?;
+    let http_status = lifecycle.get("http_status")?;
+    let valid = match (dispatch_stage, response_stage, body_stage) {
+        ("pre_dispatch", "not_received", "not_read") => http_status.is_null(),
+        ("attempted", "not_received", "not_read") => http_status.is_null(),
+        ("attempted", "received", "not_read" | "partially_read" | "completely_read") => {
+            http_status
+                .as_u64()
+                .is_some_and(|status| (100..=599).contains(&status))
+        }
+        _ => false,
+    };
+    valid.then(|| value.clone())
 }
 
 /// Only classifications produced by `validate_d1_manifest_write_result` may
