@@ -1037,7 +1037,7 @@ impl CloudflareClient {
         if !status.is_success() {
             return Err(evidence_error(
                 d1_migration_reconciliation_http_status_error(status),
-                classify_d1_migration_provider_error(body),
+                classify_d1_migration_provider_error(body, sql.len()),
             ));
         }
         let envelope = decode_strict_d1_migration_reconciliation_envelope(body)
@@ -1236,7 +1236,7 @@ impl CloudflareClient {
         if !status.is_success() {
             return Err(evidence_error(
                 d1_migration_manifest_write_http_status_error(status),
-                classify_d1_migration_provider_error(body),
+                classify_d1_migration_provider_error(body, sql.len()),
             ));
         }
         let envelope = decode_strict_d1_migration_manifest_envelope(body)
@@ -3981,7 +3981,10 @@ fn decode_strict_d1_migration_reconciliation_envelope(
     validate_strict_d1_migration_manifest_envelope(envelope)
 }
 
-fn classify_d1_migration_provider_error(body: &str) -> Option<D1MigrationProviderError> {
+fn classify_d1_migration_provider_error(
+    body: &str,
+    dispatched_sql_size_bytes: usize,
+) -> Option<D1MigrationProviderError> {
     let Value::Object(envelope) = decode_json_rejecting_duplicate_object_keys(body).ok()? else {
         return None;
     };
@@ -4008,7 +4011,9 @@ fn classify_d1_migration_provider_error(body: &str) -> Option<D1MigrationProvide
     let location = (code == 7_500)
         .then(|| error.get("message").and_then(Value::as_str))
         .flatten()
-        .and_then(d1_migration_provider_error_location);
+        .and_then(|message| {
+            d1_migration_provider_error_location(message, dispatched_sql_size_bytes)
+        });
     Some(D1MigrationProviderError {
         code,
         category,
@@ -4018,7 +4023,10 @@ fn classify_d1_migration_provider_error(body: &str) -> Option<D1MigrationProvide
 
 const D1_MIGRATION_PROVIDER_ERROR_MESSAGE_SCAN_MAX_BYTES: usize = 4 * 1024;
 
-fn d1_migration_provider_error_location(message: &str) -> Option<D1MigrationProviderErrorLocation> {
+fn d1_migration_provider_error_location(
+    message: &str,
+    dispatched_sql_size_bytes: usize,
+) -> Option<D1MigrationProviderErrorLocation> {
     if message.len() > D1_MIGRATION_PROVIDER_ERROR_MESSAGE_SCAN_MAX_BYTES || !message.is_ascii() {
         return None;
     }
@@ -4036,7 +4044,7 @@ fn d1_migration_provider_error_location(message: &str) -> Option<D1MigrationProv
         return None;
     }
     let offset_bytes = tail[..digits_len].parse::<u64>().ok()?;
-    if offset_bytes > D1_MIGRATION_RESPONSE_MAX_BYTES as u64 {
+    if offset_bytes >= u64::try_from(dispatched_sql_size_bytes).ok()? {
         return None;
     }
     Some(D1MigrationProviderErrorLocation {
@@ -4944,7 +4952,7 @@ mod tests {
     #[tokio::test]
     async fn migration_manifest_write_http_error_surfaces_redacted_provider_location() {
         let private_message =
-            "D1_ERROR: too many arguments on function private_function at offset 761: SQLITE_ERROR";
+            "D1_ERROR: too many arguments on function private_function at offset 12: SQLITE_ERROR";
         let response_body = json!({
             "success": false,
             "errors": [{"code": 7500, "message": private_message}],
@@ -4986,7 +4994,7 @@ mod tests {
                 category: "d1_error",
                 location: Some(D1MigrationProviderErrorLocation {
                     kind: "sql_byte_offset",
-                    offset_bytes: 761,
+                    offset_bytes: 12,
                 }),
             })
         );
@@ -5638,7 +5646,7 @@ mod tests {
             })
             .to_string();
             assert_eq!(
-                classify_d1_migration_provider_error(&body),
+                classify_d1_migration_provider_error(&body, 1),
                 Some(D1MigrationProviderError {
                     code,
                     category,
@@ -5665,7 +5673,7 @@ mod tests {
             })
             .to_string();
             assert_eq!(
-                classify_d1_migration_provider_error(&body),
+                classify_d1_migration_provider_error(&body, offset_bytes as usize + 1),
                 Some(D1MigrationProviderError {
                     code: 7_500,
                     category: "d1_error",
@@ -5677,6 +5685,25 @@ mod tests {
             );
         }
 
+        let out_of_range_body = json!({
+            "success": false,
+            "errors": [{
+                "code": 7500,
+                "message": "D1_ERROR: private SQL at offset 42: SQLITE_ERROR"
+            }],
+            "messages": [],
+            "result": null,
+        })
+        .to_string();
+        assert_eq!(
+            classify_d1_migration_provider_error(&out_of_range_body, 42),
+            Some(D1MigrationProviderError {
+                code: 7_500,
+                category: "d1_error",
+                location: None,
+            })
+        );
+
         for body in [
             r#"{"success":false,"errors":[{"code":9999,"message":"private"}],"messages":[],"result":null}"#,
             r#"{"success":false,"errors":[{"code":7500}],"messages":[],"result":null}"#,
@@ -5687,7 +5714,11 @@ mod tests {
             r#"{"success":false,"success":true,"errors":[{"code":7500,"message":"private"}],"messages":[],"result":null}"#,
             "{",
         ] {
-            assert_eq!(classify_d1_migration_provider_error(body), None, "{body}");
+            assert_eq!(
+                classify_d1_migration_provider_error(body, 1_024),
+                None,
+                "{body}"
+            );
         }
     }
 
@@ -5769,7 +5800,7 @@ mod tests {
             r#"{{"success":false,"errors":[{{"code":7500,"message":"{private_message}","nested":{nested}}}],"messages":[],"result":null}}"#
         );
         assert_eq!(
-            classify_d1_migration_provider_error(&provider_error_body),
+            classify_d1_migration_provider_error(&provider_error_body, 1_024),
             None
         );
     }

@@ -7762,19 +7762,20 @@ fn d1_bootstrap_migration_ledger_response_loss_retains_custody_and_never_retries
     let _ = fs::remove_dir_all(lease_root);
 }
 
-#[test]
-fn d1_bootstrap_migration_ledger_http_error_reports_redacted_provider_location_without_retry() {
-    let private_message = "D1_ERROR: too many arguments on function private_initializer_function at offset 761: SQLITE_ERROR";
+fn assert_bootstrap_provider_error_location(offset_bytes: u64, expect_location: bool, label: &str) {
+    let private_message = format!(
+        "D1_ERROR: too many arguments on function private_initializer_function at offset {offset_bytes}: SQLITE_ERROR"
+    );
     let (base_url, requests) = spawn_fake_bootstrap_api_with_initializer_http_error(
         9,
         false,
         true,
         None,
-        Some((400, 7_500, private_message.to_string(), true)),
+        Some((400, 7_500, private_message.clone(), true)),
     );
     let lease_root = std::path::PathBuf::from("/tmp").join(format!(
-        "cloudflare-mcp-bootstrap-provider-error-{}",
-        std::process::id()
+        "cloudflare-mcp-bootstrap-provider-error-{}-{label}",
+        std::process::id(),
     ));
     let _ = fs::remove_dir_all(&lease_root);
     fs::create_dir_all(&lease_root).expect("create provider-error bootstrap lease root");
@@ -7824,9 +7825,12 @@ fn d1_bootstrap_migration_ledger_http_error_reports_redacted_provider_location_w
     assert_eq!(detail["status"], json!(400));
     assert_eq!(detail["provider_error_code"], json!(7_500));
     assert_eq!(detail["provider_error_category"], json!("d1_error"));
+    let expected_location =
+        expect_location.then(|| json!({"kind": "sql_byte_offset", "offset_bytes": offset_bytes}));
     assert_eq!(
-        detail["provider_error_location"],
-        json!({"kind": "sql_byte_offset", "offset_bytes": 761})
+        detail.get("provider_error_location"),
+        expected_location.as_ref(),
+        "{label}: {content}"
     );
     assert_eq!(detail["retryable"], json!(false));
     assert_eq!(detail["operator_guidance"], json!("reconciliation_only"));
@@ -7852,12 +7856,29 @@ fn d1_bootstrap_migration_ledger_http_error_reports_redacted_provider_location_w
         "{content}"
     );
     let serialized = serde_json::to_string(content).expect("serialize bootstrap provider error");
-    assert!(!serialized.contains(private_message));
+    assert!(!serialized.contains(&private_message));
     assert!(!serialized.contains("private_initializer_function"));
     assert_private_regular_active_lease(&lease_root);
 
     let observed = requests.lock().expect("provider-error request log").clone();
-    assert_eq!(observed.len(), 9, "one write plus bounded reconciliation");
+    assert_eq!(
+        observed.len(),
+        9,
+        "{label}: one write plus bounded reconciliation"
+    );
+    let dispatched_sql = observed
+        .iter()
+        .find_map(|request| {
+            request["sql"]
+                .as_str()
+                .filter(|sql| sql.starts_with("CREATE TABLE IF NOT EXISTS"))
+        })
+        .expect("dispatched bootstrap initializer SQL");
+    assert_eq!(
+        offset_bytes < dispatched_sql.len() as u64,
+        expect_location,
+        "{label}: location evidence must be strictly inside the dispatched SQL bytes"
+    );
     assert_eq!(
         observed
             .iter()
@@ -7889,6 +7910,12 @@ fn d1_bootstrap_migration_ledger_http_error_reports_redacted_provider_location_w
     );
     fresh.terminate();
     let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_bootstrap_migration_ledger_bounds_redacted_provider_location_without_retry() {
+    assert_bootstrap_provider_error_location(42, true, "valid");
+    assert_bootstrap_provider_error_location(761, false, "out-of-range");
 }
 
 #[test]
@@ -10024,15 +10051,15 @@ fn d1_apply_migration_manifest_response_loss_stops_without_retry_and_next_proces
     let _ = fs::remove_dir_all(lease_root);
 }
 
-#[test]
-fn d1_apply_migration_manifest_http_error_reports_redacted_provider_location_without_replay() {
-    let private_message =
-        "D1_ERROR: too many arguments on function private_function at offset 761: SQLITE_ERROR";
+fn assert_manifest_provider_error_location(offset_bytes: u64, expect_location: bool, label: &str) {
+    let private_message = format!(
+        "D1_ERROR: too many arguments on function private_function at offset {offset_bytes}: SQLITE_ERROR"
+    );
     let (base_url, requests) =
-        spawn_fake_manifest_http_error_api(false, Some((400, 7_500, private_message.to_string())));
+        spawn_fake_manifest_http_error_api(false, Some((400, 7_500, private_message.clone())));
     let lease_root = std::path::PathBuf::from("/tmp").join(format!(
-        "cloudflare-mcp-provider-error-manifest-{}",
-        std::process::id()
+        "cloudflare-mcp-provider-error-manifest-{}-{label}",
+        std::process::id(),
     ));
     let _ = fs::remove_dir_all(&lease_root);
     fs::create_dir_all(&lease_root).expect("create provider-error lease root");
@@ -10103,9 +10130,12 @@ fn d1_apply_migration_manifest_http_error_reports_redacted_provider_location_wit
         content["error"]["cause"]["provider_error_category"],
         json!("d1_error")
     );
+    let expected_location =
+        expect_location.then(|| json!({"kind": "sql_byte_offset", "offset_bytes": offset_bytes}));
     assert_eq!(
-        content["error"]["cause"]["provider_error_location"],
-        json!({"kind": "sql_byte_offset", "offset_bytes": 761})
+        content["error"]["cause"].get("provider_error_location"),
+        expected_location.as_ref(),
+        "{label}: {content}"
     );
     assert_eq!(content["error"]["cause"]["retryable"], json!(false));
     assert_eq!(
@@ -10134,10 +10164,27 @@ fn d1_apply_migration_manifest_http_error_reports_redacted_provider_location_wit
         "{content}"
     );
     let serialized = serde_json::to_string(content).expect("serialize provider error result");
-    assert!(!serialized.contains(private_message));
+    assert!(!serialized.contains(&private_message));
     assert!(!serialized.contains("private_function"));
     let observed = requests.lock().expect("provider-error request log").clone();
-    assert_eq!(observed.len(), 10, "one write plus bounded reconciliation");
+    assert_eq!(
+        observed.len(),
+        10,
+        "{label}: one write plus bounded reconciliation"
+    );
+    let dispatched_sql = observed
+        .iter()
+        .find_map(|request| {
+            request["sql"]
+                .as_str()
+                .filter(|sql| sql.contains("INSERT INTO \"d1_migrations\""))
+        })
+        .expect("dispatched manifest provider SQL");
+    assert_eq!(
+        offset_bytes < dispatched_sql.len() as u64,
+        expect_location,
+        "{label}: location evidence must be strictly inside the dispatched SQL bytes"
+    );
     assert_eq!(
         observed
             .iter()
@@ -10159,6 +10206,12 @@ fn d1_apply_migration_manifest_http_error_reports_redacted_provider_location_wit
         "provider HTTP error",
     );
     let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_apply_migration_manifest_bounds_redacted_provider_location_without_replay() {
+    assert_manifest_provider_error_location(42, true, "valid");
+    assert_manifest_provider_error_location(761, false, "out-of-range");
 }
 
 #[test]
