@@ -242,6 +242,31 @@ moves the supplied manifest into validation without cloning its SQL strings.
 Split a larger migration family before review rather than increasing this
 operator-surface memory bound.
 
+D1 already enforces foreign keys and runs migrations in an implicit
+transaction, so it rejects attempts to enable them inside the submitted query.
+See Cloudflare's
+[D1 foreign-key guidance](https://developers.cloudflare.com/d1/sql-api/foreign-keys/).
+If a reviewed source migration begins with the byte-exact text
+`PRAGMA foreign_keys = ON;` and then two LF bytes, dry run preserves the raw
+manifest authority and derives execution transform
+`drop-leading-pragma-foreign-keys-on-v1`. Confirm the returned
+`execution_manifest` contains the expected transform ID/version,
+`executed_sql_sha256`, and `provider_statement_sha256` before approving the
+version-2 `plan_sha256`. The executed provider SQL omits only that exact prefix;
+the source SHA-256 never changes. Any variant, duplicate, embedded occurrence,
+or empty transformed remainder is a pre-provider hard stop for a new dry-run or
+apply. Retained read-only reconciliation continues to recognize an exact
+predecessor version-1 plan under the existing effect-assertion grammar, but it
+cannot authorize fresh execution. Untransformed manifests keep their existing
+version-1 plan identity.
+
+For retained custody, always supply the original source manifest and the exact
+approved apply-plan digest. That digest commits the execution transform and is
+carried by the lease payload, reconciliation relationship, terminal receipt,
+finalization plan, and completed replay. Never reconstruct approval from the
+executed SQL or edit the manifest to remove the pragma after an ambiguous
+attempt; either change is conflicting evidence and must fail closed.
+
 Every manifest-owned provider write uses its own one-attempt HTTP client. It
 requests identity response encoding, never follows redirects, and consumes the
 response as a stream capped at 16 MiB before UTF-8 or strict-envelope decoding.

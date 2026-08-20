@@ -25,6 +25,107 @@ pub(crate) struct D1ManifestTarget {
 }
 
 pub(crate) const D1_BOOTSTRAP_RESERVED_MIGRATION_FAMILY: &str = "migration-ledger-bootstrap-v1";
+pub(crate) const D1_FOREIGN_KEYS_ON_EXECUTION_TRANSFORM_V1: &str =
+    "drop-leading-pragma-foreign-keys-on-v1";
+const D1_FOREIGN_KEYS_ON_PREFIX_V1: &str = "PRAGMA foreign_keys = ON;\n\n";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct D1MigrationExecution {
+    pub(crate) source_name: String,
+    pub(crate) source_sql_sha256: String,
+    pub(crate) transform_id: String,
+    pub(crate) transform_version: u8,
+    pub(crate) executed_sql: String,
+    pub(crate) executed_sql_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct D1ManifestExecutionPlan {
+    pub(crate) migrations: Vec<D1MigrationExecution>,
+    pub(crate) transformed: bool,
+}
+
+fn sql_word(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn contains_foreign_keys_pragma(sql: &str) -> bool {
+    let bytes = sql.as_bytes();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        if !sql_word(bytes[cursor]) {
+            cursor += 1;
+            continue;
+        }
+        let start = cursor;
+        while cursor < bytes.len() && sql_word(bytes[cursor]) {
+            cursor += 1;
+        }
+        if !bytes[start..cursor].eq_ignore_ascii_case(b"pragma") {
+            continue;
+        }
+        while cursor < bytes.len() {
+            if !sql_word(bytes[cursor]) {
+                cursor += 1;
+                continue;
+            }
+            let word_start = cursor;
+            while cursor < bytes.len() && sql_word(bytes[cursor]) {
+                cursor += 1;
+            }
+            if bytes[word_start..cursor].eq_ignore_ascii_case(b"foreign_keys") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub(crate) fn derive_d1_manifest_execution_plan(
+    manifest: &[D1MigrationManifestEntry],
+) -> Result<D1ManifestExecutionPlan, CallToolResult> {
+    let mut transformed = false;
+    let mut migrations = Vec::with_capacity(manifest.len());
+    for migration in manifest {
+        let (transform_id, transform_version, executed_sql) = if let Some(remainder) =
+            migration.sql.strip_prefix(D1_FOREIGN_KEYS_ON_PREFIX_V1)
+        {
+            if remainder.trim().is_empty() || contains_foreign_keys_pragma(remainder) {
+                return Err(invalid_argument_result(
+                    "d1.migration_execution_transform_ambiguous",
+                    "the reviewed leading foreign_keys pragma was empty, repeated, embedded, or otherwise ambiguous",
+                    "Keep exactly one byte-exact leading `PRAGMA foreign_keys = ON;` followed by one blank LF line and executable migration SQL; remove every other foreign_keys pragma.",
+                ));
+            }
+            transformed = true;
+            (
+                D1_FOREIGN_KEYS_ON_EXECUTION_TRANSFORM_V1,
+                1,
+                remainder.to_string(),
+            )
+        } else if contains_foreign_keys_pragma(&migration.sql) {
+            return Err(invalid_argument_result(
+                "d1.migration_execution_transform_unsupported",
+                "the migration contains a foreign_keys pragma outside the one exact reviewed leading no-op form",
+                "Use exactly `PRAGMA foreign_keys = ON;` at byte zero followed by two LF bytes, or remove the pragma from the reviewed source migration.",
+            ));
+        } else {
+            ("identity-v1", 1, migration.sql.clone())
+        };
+        migrations.push(D1MigrationExecution {
+            source_name: migration.name.clone(),
+            source_sql_sha256: migration.sql_sha256.to_ascii_lowercase(),
+            transform_id: transform_id.to_string(),
+            transform_version,
+            executed_sql_sha256: sha256_hex(&executed_sql),
+            executed_sql,
+        });
+    }
+    Ok(D1ManifestExecutionPlan {
+        migrations,
+        transformed,
+    })
+}
 
 pub(crate) fn validate_generic_d1_migration_family(family: &str) -> Result<(), CallToolResult> {
     if family == D1_BOOTSTRAP_RESERVED_MIGRATION_FAMILY {
@@ -778,7 +879,9 @@ mod tests {
 
     use super::{
         approved_d1_plan_digest_matches, current_wrangler_d1_migration_ledger_table_sql,
-        d1_manifest_write_result_classification, d1_migrations_table_init_sql,
+        d1_manifest_execution_summaries, d1_manifest_legacy_plan_sha256, d1_manifest_plan_sha256,
+        d1_manifest_write_result_classification, d1_migration_execution_provider_sql,
+        d1_migrations_table_init_sql, derive_d1_manifest_execution_plan,
         expected_d1_migration_ledger_table_sql, legacy_wrangler_d1_migration_ledger_table_sql,
         parse_d1_migration_ledger, parse_d1_migration_ledger_authority,
         validate_d1_manifest_write_result, validate_d1_migration_manifest,
@@ -798,6 +901,144 @@ mod tests {
                 "sql": expected_d1_migration_ledger_table_sql(table),
             }],
         }])
+    }
+
+    fn manifest_entry(sql: &str) -> D1MigrationManifestEntry {
+        D1MigrationManifestEntry {
+            name: "0001_core.sql".to_string(),
+            size_bytes: sql.len() as u64,
+            sql_sha256: sha256_hex(sql),
+            sql: sql.to_string(),
+        }
+    }
+
+    #[test]
+    fn execution_transform_is_exact_versioned_and_provider_bound() {
+        let source = "PRAGMA foreign_keys = ON;\n\nCREATE TABLE items(id INTEGER PRIMARY KEY);";
+        let manifest = vec![manifest_entry(source)];
+        let execution = derive_d1_manifest_execution_plan(&manifest).expect("exact transform");
+        assert!(execution.transformed);
+        assert_eq!(
+            execution.migrations[0].source_sql_sha256,
+            sha256_hex(source)
+        );
+        assert_eq!(
+            execution.migrations[0].executed_sql,
+            "CREATE TABLE items(id INTEGER PRIMARY KEY);"
+        );
+        assert_eq!(
+            execution.migrations[0].transform_id,
+            "drop-leading-pragma-foreign-keys-on-v1"
+        );
+        assert_eq!(execution.migrations[0].transform_version, 1);
+        let provider = d1_migration_execution_provider_sql(
+            &execution.migrations[0],
+            "d1_migrations",
+            "0001_core.sql",
+        );
+        assert_eq!(
+            provider,
+            "CREATE TABLE items(id INTEGER PRIMARY KEY);\n\nINSERT INTO \"d1_migrations\" (name) VALUES ('0001_core.sql');"
+        );
+        let summaries = d1_manifest_execution_summaries(&execution, "d1_migrations");
+        assert_eq!(
+            summaries[0]["executed_sql_sha256"],
+            sha256_hex(&execution.migrations[0].executed_sql)
+        );
+        assert_eq!(
+            summaries[0]["provider_statement_sha256"],
+            sha256_hex(&provider)
+        );
+
+        let ledger = Vec::new();
+        let plan = d1_manifest_plan_sha256(
+            "account",
+            "database",
+            "newsletter-core",
+            "d1_migrations",
+            &manifest,
+            &ledger,
+            &execution,
+        );
+        assert_ne!(
+            plan,
+            d1_manifest_legacy_plan_sha256(
+                "account",
+                "database",
+                "newsletter-core",
+                "d1_migrations",
+                &manifest,
+                &ledger,
+            )
+        );
+        let mut drifted = execution.clone();
+        drifted.migrations[0].executed_sql.push('\n');
+        drifted.migrations[0].executed_sql_sha256 = sha256_hex(&drifted.migrations[0].executed_sql);
+        assert_ne!(
+            plan,
+            d1_manifest_plan_sha256(
+                "account",
+                "database",
+                "newsletter-core",
+                "d1_migrations",
+                &manifest,
+                &ledger,
+                &drifted,
+            ),
+            "executed-byte drift must change plan, lease, receipt, and replay authority"
+        );
+    }
+
+    #[test]
+    fn execution_transform_rejects_variants_duplicates_and_embedded_pragmas() {
+        for sql in [
+            "pragma foreign_keys = on;\n\nCREATE TABLE items(id INTEGER);",
+            "PRAGMA foreign_keys = ON;\nCREATE TABLE items(id INTEGER);",
+            "-- leading\nPRAGMA foreign_keys = ON;\n\nCREATE TABLE items(id INTEGER);",
+            "PRAGMA foreign_keys = ON;\n\nPRAGMA foreign_keys = ON;\nCREATE TABLE items(id INTEGER);",
+            "CREATE TABLE items(id INTEGER); PRAGMA foreign_keys = ON;",
+            "PRAGMA main.foreign_keys = ON; CREATE TABLE items(id INTEGER);",
+            "PRAGMA/*;*/foreign_keys = ON; CREATE TABLE items(id INTEGER);",
+            "PRAGMA -- ;\n foreign_keys = ON; CREATE TABLE items(id INTEGER);",
+        ] {
+            assert!(
+                derive_d1_manifest_execution_plan(&[manifest_entry(sql)]).is_err(),
+                "unsupported form must fail closed: {sql:?}"
+            );
+        }
+
+        let identity_sql = "CREATE TABLE items(id INTEGER PRIMARY KEY);";
+        let identity_manifest = vec![manifest_entry(identity_sql)];
+        let identity = derive_d1_manifest_execution_plan(&identity_manifest).expect("identity");
+        assert!(!identity.transformed);
+        assert_eq!(identity.migrations[0].executed_sql, identity_sql);
+        assert_eq!(
+            d1_manifest_plan_sha256(
+                "account",
+                "database",
+                "newsletter-core",
+                "d1_migrations",
+                &identity_manifest,
+                &[],
+                &identity,
+            ),
+            d1_manifest_legacy_plan_sha256(
+                "account",
+                "database",
+                "newsletter-core",
+                "d1_migrations",
+                &identity_manifest,
+                &[],
+            ),
+            "untransformed manifests preserve existing plan identity"
+        );
+
+        let foreign_keys_identifier =
+            "CREATE TABLE items(id INTEGER PRIMARY KEY, foreign_keys TEXT);";
+        assert!(
+            derive_d1_manifest_execution_plan(&[manifest_entry(foreign_keys_identifier)]).is_ok(),
+            "an ordinary identifier is not a PRAGMA"
+        );
     }
 
     fn current_wrangler_authority(table: &str) -> serde_json::Value {
@@ -1335,6 +1576,45 @@ pub(crate) fn d1_manifest_summaries(manifest: &[D1MigrationManifestEntry]) -> Ve
         .collect()
 }
 
+pub(crate) fn d1_migration_execution_provider_sql(
+    execution: &D1MigrationExecution,
+    migrations_table: &str,
+    migration_name: &str,
+) -> String {
+    let table = quote_sql_identifier(migrations_table);
+    let migration_name = quote_sql_string(migration_name);
+    format!(
+        "{}\n\nINSERT INTO {table} (name) VALUES ({migration_name});",
+        execution.executed_sql
+    )
+}
+
+pub(crate) fn d1_manifest_execution_summaries(
+    execution_plan: &D1ManifestExecutionPlan,
+    migrations_table: &str,
+) -> Vec<Value> {
+    execution_plan
+        .migrations
+        .iter()
+        .map(|execution| {
+            let provider_sql = d1_migration_execution_provider_sql(
+                execution,
+                migrations_table,
+                &execution.source_name,
+            );
+            json!({
+                "source_name": execution.source_name,
+                "source_sql_sha256": execution.source_sql_sha256,
+                "transform_id": execution.transform_id,
+                "transform_version": execution.transform_version,
+                "executed_size_bytes": execution.executed_sql.len(),
+                "executed_sql_sha256": execution.executed_sql_sha256,
+                "provider_statement_sha256": sha256_hex(&provider_sql),
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn d1_ledger_summaries(ledger: &[D1ManifestLedgerRow]) -> Vec<Value> {
     ledger
         .iter()
@@ -1343,6 +1623,52 @@ pub(crate) fn d1_ledger_summaries(ledger: &[D1ManifestLedgerRow]) -> Vec<Value> 
 }
 
 pub(crate) fn d1_manifest_plan_sha256(
+    account_id: &str,
+    database_id: &str,
+    family: &str,
+    migrations_table: &str,
+    manifest: &[D1MigrationManifestEntry],
+    ledger: &[D1ManifestLedgerRow],
+    execution_plan: &D1ManifestExecutionPlan,
+) -> String {
+    if !execution_plan.transformed {
+        return d1_manifest_legacy_plan_sha256(
+            account_id,
+            database_id,
+            family,
+            migrations_table,
+            manifest,
+            ledger,
+        );
+    }
+    #[derive(Serialize)]
+    struct Plan<'a> {
+        version: u8,
+        operation: &'static str,
+        account_id: &'a str,
+        database_id: &'a str,
+        migration_family: &'a str,
+        migrations_table: &'a str,
+        manifest: Vec<Value>,
+        execution_manifest: Vec<Value>,
+        ledger: Vec<Value>,
+    }
+    let bytes = serde_json::to_vec(&Plan {
+        version: 2,
+        operation: "d1_apply_migration_manifest",
+        account_id,
+        database_id,
+        migration_family: family,
+        migrations_table,
+        manifest: d1_manifest_summaries(manifest),
+        execution_manifest: d1_manifest_execution_summaries(execution_plan, migrations_table),
+        ledger: d1_ledger_summaries(ledger),
+    })
+    .expect("serializing D1 manifest plan is infallible");
+    sha256_bytes_hex(&bytes)
+}
+
+pub(crate) fn d1_manifest_legacy_plan_sha256(
     account_id: &str,
     database_id: &str,
     family: &str,
@@ -1371,7 +1697,7 @@ pub(crate) fn d1_manifest_plan_sha256(
         manifest: d1_manifest_summaries(manifest),
         ledger: d1_ledger_summaries(ledger),
     })
-    .expect("serializing D1 manifest plan is infallible");
+    .expect("serializing legacy D1 manifest plan is infallible");
     sha256_bytes_hex(&bytes)
 }
 

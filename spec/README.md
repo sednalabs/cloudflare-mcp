@@ -159,6 +159,18 @@ Preserved curated tool families:
   for every view and trigger without issuing table PRAGMAs for those objects,
   and must keep trigger-body semicolons plus nested `CASE ... END` inside one
   fail-closed classified statement.
+  The exact leading source bytes `PRAGMA foreign_keys = ON;\n\n` are a separate
+  versioned execution concern: the source manifest remains unchanged, while
+  `drop-leading-pragma-foreign-keys-on-v1` commits its identity/version, exact
+  executed-byte digest, and full provider-statement digest into a version-2
+  apply plan. The approved plan digest is the transitive authority carried by
+  lease custody, retained reconciliation, terminal receipt/finalization, and
+  replay. Near matches, duplicates, embedded occurrences, transform drift, and
+  source/receipt mismatch must stop new plan/apply before provider or local
+  namespace effects. Exact retained predecessor version-1 plans remain
+  read-only reconcilable under the unchanged assertion grammars and cannot
+  authorize fresh execution. Identity-only manifests preserve the predecessor
+  version-1 plan digest.
   `schema_create_objects_additive_v1` is the separate closed additive
   assertion: it retains the extended CREATE proof, adds one bounded unqualified
   ADD COLUMN transition and semantic `PRAGMA foreign_keys = ON` intent per

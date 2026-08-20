@@ -26,8 +26,9 @@ use crate::d1_migration_lease::{
     D1RetainedMigrationLease, D1RetainedMigrationLeaseIdentity, inspect_retained_d1_migration_lease,
 };
 use crate::d1_migration_manifest::{
-    D1ManifestLedgerRow, classify_d1_manifest_ledger, d1_ledger_summaries, d1_manifest_plan_sha256,
-    d1_manifest_summaries, validate_generic_d1_migration_family,
+    D1ManifestExecutionPlan, D1ManifestLedgerRow, classify_d1_manifest_ledger, d1_ledger_summaries,
+    d1_manifest_legacy_plan_sha256, d1_manifest_plan_sha256, d1_manifest_summaries,
+    derive_d1_manifest_execution_plan, validate_generic_d1_migration_family,
 };
 use crate::d1_migration_seed_rows::{
     D1MigrationSeedTableExpectation, EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1,
@@ -405,6 +406,12 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
     if let Err(result) = validate_generic_d1_migration_family(family) {
         return Err(prelease_error(result, "not_inspected", None));
     }
+    // A current transformed apply must reconstruct its exact version-2 plan.
+    // A retained predecessor lease may predate this execution transform and
+    // therefore carry only the legacy version-1 source-manifest plan. Keep
+    // reconciliation read-only compatibility without making a noncanonical
+    // pragma eligible for a new plan or provider execution.
+    let execution_plan = derive_d1_manifest_execution_plan(manifest).ok();
     let selected_effect_assertion_id = match canonical_effect_assertion_id(effect_assertion_id) {
         Ok(id) => id,
         Err(result) => return Err(prelease_error(result, "not_inspected", None)),
@@ -661,6 +668,7 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
         manifest,
         &first.snapshot.ledger,
         approved_plan_sha256,
+        execution_plan.as_ref(),
     ) {
         Ok(prefix) => prefix,
         Err(result) => {
@@ -3303,16 +3311,32 @@ fn reconstruct_unique_original_prefix(
     manifest: &[D1MigrationManifestEntry],
     current_ledger: &[D1ManifestLedgerRow],
     approved_plan_sha256: &str,
+    execution_plan: Option<&D1ManifestExecutionPlan>,
 ) -> Result<usize, CallToolResult> {
     reconstruct_original_prefix_with(current_ledger.len(), approved_plan_sha256, |prefix| {
-        d1_manifest_plan_sha256(
-            account_id,
-            database_id,
-            family,
-            migrations_table,
-            manifest,
-            &current_ledger[..prefix],
-        )
+        execution_plan
+            .map(|execution_plan| {
+                d1_manifest_plan_sha256(
+                    account_id,
+                    database_id,
+                    family,
+                    migrations_table,
+                    manifest,
+                    &current_ledger[..prefix],
+                    execution_plan,
+                )
+            })
+            .filter(|current| current == approved_plan_sha256)
+            .unwrap_or_else(|| {
+                d1_manifest_legacy_plan_sha256(
+                    account_id,
+                    database_id,
+                    family,
+                    migrations_table,
+                    manifest,
+                    &current_ledger[..prefix],
+                )
+            })
     })
 }
 

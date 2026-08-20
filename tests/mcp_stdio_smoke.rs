@@ -156,6 +156,18 @@ fn create_retained_reconciliation_fixture(
         manifest: &'a Value,
         ledger: Vec<Value>,
     }
+    #[derive(Serialize)]
+    struct ApprovedPlanV2<'a> {
+        version: u8,
+        operation: &'static str,
+        account_id: &'static str,
+        database_id: &'static str,
+        migration_family: &'static str,
+        migrations_table: &'static str,
+        manifest: &'a Value,
+        execution_manifest: &'a Value,
+        ledger: Vec<Value>,
+    }
 
     let target = manifest_target_path(lease_root);
     fs::create_dir(&target).expect("create retained target");
@@ -182,18 +194,70 @@ fn create_retained_reconciliation_fixture(
             })
             .collect(),
     );
-    let plan = ApprovedPlan {
-        version: 1,
-        operation: "d1_apply_migration_manifest",
-        account_id: "acct-1",
-        database_id: "db-1",
-        migration_family: "newsletter-core",
-        migrations_table: "d1_migrations",
-        manifest: &manifest_summary,
-        ledger: Vec::new(),
-    };
     let approved_plan_sha256 = {
-        let bytes = serde_json::to_vec(&plan).expect("serialize approved plan");
+        let transformed = manifest
+            .as_array()
+            .expect("manifest array")
+            .iter()
+            .any(|entry| {
+                entry["sql"]
+                    .as_str()
+                    .is_some_and(|sql| sql.starts_with("PRAGMA foreign_keys = ON;\n\n"))
+            });
+        let bytes = if transformed {
+            let execution_manifest = Value::Array(
+                manifest
+                    .as_array()
+                    .expect("manifest array")
+                    .iter()
+                    .map(|entry| {
+                        let name = entry["name"].as_str().expect("migration name");
+                        let source_sql = entry["sql"].as_str().expect("migration SQL");
+                        let (transform_id, executed_sql) = source_sql
+                            .strip_prefix("PRAGMA foreign_keys = ON;\n\n")
+                            .map(|sql| ("drop-leading-pragma-foreign-keys-on-v1", sql))
+                            .unwrap_or(("identity-v1", source_sql));
+                        let provider_sql = format!(
+                            "{executed_sql}\n\nINSERT INTO \"d1_migrations\" (name) VALUES ('{}');",
+                            name.replace('\'', "''")
+                        );
+                        json!({
+                            "source_name": name,
+                            "source_sql_sha256": entry["sql_sha256"],
+                            "transform_id": transform_id,
+                            "transform_version": 1,
+                            "executed_size_bytes": executed_sql.len(),
+                            "executed_sql_sha256": sha256_hex(executed_sql),
+                            "provider_statement_sha256": sha256_hex(&provider_sql),
+                        })
+                    })
+                    .collect(),
+            );
+            serde_json::to_vec(&ApprovedPlanV2 {
+                version: 2,
+                operation: "d1_apply_migration_manifest",
+                account_id: "acct-1",
+                database_id: "db-1",
+                migration_family: "newsletter-core",
+                migrations_table: "d1_migrations",
+                manifest: &manifest_summary,
+                execution_manifest: &execution_manifest,
+                ledger: Vec::new(),
+            })
+            .expect("serialize transformed approved plan")
+        } else {
+            serde_json::to_vec(&ApprovedPlan {
+                version: 1,
+                operation: "d1_apply_migration_manifest",
+                account_id: "acct-1",
+                database_id: "db-1",
+                migration_family: "newsletter-core",
+                migrations_table: "d1_migrations",
+                manifest: &manifest_summary,
+                ledger: Vec::new(),
+            })
+            .expect("serialize legacy approved plan")
+        };
         let mut hasher = Sha256::new();
         hasher.update(bytes);
         format!("{:x}", hasher.finalize())
@@ -8147,6 +8211,54 @@ fn d1_apply_migration_manifest_dry_run_reaches_stdio_and_never_sends_sql_bytes()
 }
 
 #[test]
+fn d1_manifest_execution_transform_rejects_noncanonical_pragma_before_provider() {
+    let mut mcp = McpStdioProcess::start_with_env(vec![(
+        "CLOUDFLARE_MCP_API_BASE_URL",
+        "http://127.0.0.1:9".to_string(), // DevSkim: ignore DS137138 -- loopback-only zero-call fixture
+    )]);
+    for (index, sql) in [
+        "pragma foreign_keys = on;\n\nCREATE TABLE items(id INTEGER);",
+        "PRAGMA foreign_keys = ON;\nCREATE TABLE items(id INTEGER);",
+        "CREATE TABLE items(id INTEGER); PRAGMA foreign_keys = ON;",
+        "PRAGMA foreign_keys = ON;\n\nPRAGMA foreign_keys = ON;\nCREATE TABLE items(id INTEGER);",
+        "PRAGMA/*;*/foreign_keys = ON; CREATE TABLE items(id INTEGER);",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response = mcp.call_tool(
+            3000 + index as u64,
+            "d1_apply_migration_manifest",
+            json!({
+                "database_id": "db-1",
+                "migration_family": "newsletter-core",
+                "dry_run": true,
+                "manifest": [{
+                    "name": "0001_core.sql",
+                    "size_bytes": sql.len(),
+                    "sql_sha256": sha256_hex(sql),
+                    "sql": sql,
+                }],
+            }),
+        );
+        let content = structured_content(&response);
+        assert_eq!(content["ok"], json!(false), "{content}");
+        assert_eq!(content["provider_calls"], json!(0), "{content}");
+        assert_eq!(content["local_namespace_mutations"], json!(0), "{content}");
+        assert_eq!(
+            content["error"]["code"],
+            if index == 3 {
+                "d1.migration_execution_transform_ambiguous"
+            } else {
+                "d1.migration_execution_transform_unsupported"
+            },
+            "{content}"
+        );
+    }
+    mcp.terminate();
+}
+
+#[test]
 fn d1_apply_migration_manifest_rejects_malformed_ledger_before_any_provider_write() {
     for (index, (label, result_set)) in [
         ("missing success", json!({"results": []})),
@@ -8615,10 +8727,11 @@ fn d1_apply_migration_manifest_live_rechecks_plan_and_stably_reads_back_before_r
         ),
     ]);
     let first_sql = "CREATE TABLE submissions(id TEXT);";
-    let second_sql = "ALTER TABLE submissions ADD COLUMN status TEXT;";
+    let executed_second_sql = "ALTER TABLE submissions ADD COLUMN status TEXT;";
+    let second_sql = format!("PRAGMA foreign_keys = ON;\n\n{executed_second_sql}");
     let manifest = json!([
         {"name": "0001_initial.sql", "size_bytes": first_sql.len(), "sql_sha256": sha256_hex(first_sql), "sql": first_sql},
-        {"name": "0002_second.sql", "size_bytes": second_sql.len(), "sql_sha256": sha256_hex(second_sql), "sql": second_sql}
+        {"name": "0002_second.sql", "size_bytes": second_sql.len(), "sql_sha256": sha256_hex(&second_sql), "sql": second_sql}
     ]);
     let dry = mcp.call_tool(4, "d1_apply_migration_manifest", json!({
         "database_id": "db-1", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
@@ -8628,6 +8741,14 @@ fn d1_apply_migration_manifest_live_rechecks_plan_and_stably_reads_back_before_r
         .as_str()
         .expect("plan digest")
         .to_string();
+    assert_eq!(
+        dry_content["execution_manifest"][1]["transform_id"],
+        "drop-leading-pragma-foreign-keys-on-v1"
+    );
+    assert_eq!(
+        dry_content["execution_manifest"][1]["executed_sql_sha256"],
+        sha256_hex(executed_second_sql)
+    );
     let live = mcp.call_tool(
         5,
         "d1_apply_migration_manifest",
@@ -8640,8 +8761,16 @@ fn d1_apply_migration_manifest_live_rechecks_plan_and_stably_reads_back_before_r
     assert_eq!(content["ok"], json!(true), "{content}");
     assert_eq!(content["status"], json!("applied"));
     assert_eq!(
+        content["execution_manifest"][1]["transform_id"],
+        "drop-leading-pragma-foreign-keys-on-v1"
+    );
+    assert_eq!(
+        content["execution_manifest"][1]["executed_sql_sha256"],
+        sha256_hex(executed_second_sql)
+    );
+    assert_eq!(
         content["applied_migrations"][0]["sql_sha256"],
-        json!(sha256_hex(second_sql))
+        json!(sha256_hex(&second_sql))
     );
     assert_released_manifest_target_custody(&lease_root);
     let requests = requests.lock().expect("requests lock").clone();
@@ -8650,11 +8779,15 @@ fn d1_apply_migration_manifest_live_rechecks_plan_and_stably_reads_back_before_r
         12,
         "dry, initial authority, stable ledger, per-mutation authority, apply, post-apply ledger, and final-release authority proofs"
     );
+    assert_eq!(
+        requests[7]["sql"].as_str().expect("apply SQL"),
+        "ALTER TABLE submissions ADD COLUMN status TEXT;\n\nINSERT INTO \"d1_migrations\" (name) VALUES ('0002_second.sql');"
+    );
     assert!(
-        requests[7]["sql"]
+        !requests[7]["sql"]
             .as_str()
             .expect("apply SQL")
-            .contains(second_sql)
+            .contains("PRAGMA foreign_keys")
     );
     assert!(
         !requests[7]["sql"]
@@ -10383,7 +10516,7 @@ fn d1_v2_seven_null_seed_literals_bind_reconciliation_terminal_receipt_and_repla
         column_names.join(", "),
         ["NULL"; 7].join(", ")
     );
-    let migration_sql = format!("{table_sql};\n{insert_sql};");
+    let migration_sql = format!("PRAGMA foreign_keys = ON;\n\n{table_sql};\n{insert_sql};");
     let manifest = json!([{
         "name": "0001_bootstrap_state.sql",
         "size_bytes": migration_sql.len(),
@@ -10533,7 +10666,7 @@ fn d1_v2_seven_null_seed_literals_bind_reconciliation_terminal_receipt_and_repla
 
     let (base_url, requests) = spawn_fake_null_seed_reconciliation_api(
         11,
-        table_sql,
+        table_sql.clone(),
         vec![json!({"id": 1, "name": "0001_bootstrap_state.sql"})],
     );
     let lease_root = PathBuf::from("/tmp").join(format!(
@@ -10629,7 +10762,11 @@ fn d1_v2_seven_null_seed_literals_bind_reconciliation_terminal_receipt_and_repla
         "schema_create_objects_additive_seed_rows_v2"
     );
 
-    let replay = mcp.call_tool(904, "d1_finalize_migration_reconciliation", terminal_args);
+    let replay = mcp.call_tool(
+        904,
+        "d1_finalize_migration_reconciliation",
+        terminal_args.clone(),
+    );
     let replay_content = structured_content(&replay);
     assert_eq!(replay_content["ok"], json!(true), "{replay_content}");
     assert_eq!(
@@ -10637,6 +10774,23 @@ fn d1_v2_seven_null_seed_literals_bind_reconciliation_terminal_receipt_and_repla
         "terminal_reconciliation_already_complete"
     );
     assert_eq!(replay_content["provider_calls"], json!(0));
+    let drifted_sql = format!("{table_sql};\n{insert_sql};");
+    let mut drifted_args = terminal_args;
+    drifted_args["manifest"][0]["size_bytes"] = json!(drifted_sql.len());
+    drifted_args["manifest"][0]["sql_sha256"] = json!(sha256_hex(&drifted_sql));
+    drifted_args["manifest"][0]["sql"] = json!(drifted_sql);
+    let drifted = mcp.call_tool(905, "d1_finalize_migration_reconciliation", drifted_args);
+    let drifted_content = structured_content(&drifted);
+    assert_eq!(drifted_content["ok"], json!(false), "{drifted_content}");
+    assert_eq!(
+        drifted_content["provider_calls"],
+        json!(0),
+        "{drifted_content}"
+    );
+    assert_eq!(
+        drifted_content["error"]["code"],
+        "d1.migration_terminal_approved_evidence_mismatch"
+    );
     assert_eq!(requests.lock().expect("NULL seed request log").len(), 11);
     mcp.terminate();
     let _ = fs::remove_dir_all(lease_root);

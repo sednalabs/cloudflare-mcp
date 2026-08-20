@@ -182,6 +182,21 @@ the local custody chain before it can report `lease_retained=true`. Lost or
 unverifiable custody returns `lease_retained=null` with
 `custody_status=lost_or_unverifiable_after_ambiguous_apply`; it prohibits retry
 and does not turn an absent local file into permission for a new apply.
+
+D1 enforces foreign keys by default and cannot change `foreign_keys` inside its
+implicit migration transaction. For the exact reviewed leading bytes
+`PRAGMA foreign_keys = ON;\n\n`, the tool preserves the source manifest but
+executes the remainder under versioned transform
+`drop-leading-pragma-foreign-keys-on-v1`. Review `execution_manifest` in the
+dry run: its transform ID/version, executed-byte SHA-256, and provider-statement
+SHA-256 are part of the version-2 approved plan and therefore of retained
+custody and terminal/replay authority. Do not normalize a near match. Any case,
+spacing, comment, duplicate, embedded, empty, or ambiguous `foreign_keys` form
+is rejected by fresh plan/apply with zero provider calls. Retained read-only
+reconciliation may still prove an exact predecessor version-1 lease under its
+existing assertion grammar; it cannot turn that receipt into new apply
+authority.
+
 For every migration-write result set, success additionally requires literal
 `meta.served_by_primary=true`, boolean `meta.changed_db`, and non-negative JSON
 integer `meta.changes` and `meta.rows_written`. A non-mutating successful result
