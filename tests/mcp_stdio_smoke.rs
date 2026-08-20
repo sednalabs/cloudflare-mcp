@@ -5002,10 +5002,9 @@ fn stdio_tool_calls_cover_context_and_body_normalization_edges() {
         3,
         "api_mutate",
         json!({
-            "operation_id": "d1-query-database",
+            "operation_id": "d1-create-database",
             "path_params": {
-                "account_id": "acct-1",
-                "database_id": "db-1"
+                "account_id": "acct-1"
             },
             "body": "{\"sql\":\"UPDATE submissions SET status = ? WHERE id = ?\",\"params\":[\"in_progress\",\"sub-1\"]}",
             "dry_run": true,
@@ -15954,10 +15953,9 @@ fn api_mutate_keeps_invalid_json_strings_as_strings_in_dry_run_plan() {
         2,
         "api_mutate",
         json!({
-            "operation_id": "d1-query-database",
+            "operation_id": "d1-create-database",
             "path_params": {
-                "account_id": "acct-1",
-                "database_id": "db-1"
+                "account_id": "acct-1"
             },
             "body": "{\"sql\":",
             "dry_run": true
@@ -16041,6 +16039,159 @@ fn api_mutate_denies_generic_worker_script_upload_and_names_curated_path() {
 }
 
 #[test]
+fn api_mutate_denies_existing_target_d1_schema_mutations_before_request_construction() {
+    let provider = TcpListener::bind("127.0.0.1:0").expect("bind no-call D1 provider witness");
+    provider
+        .set_nonblocking(true)
+        .expect("make D1 provider witness nonblocking");
+    let provider_url = format!(
+        "http://{}",
+        provider.local_addr().expect("D1 provider witness address")
+    );
+    let mut mcp = McpStdioProcess::start_with_env(vec![(
+        "CLOUDFLARE_MCP_API_BASE_URL",
+        provider_url,
+    )]);
+
+    for (index, operation_id) in [
+        "d1-query-database",
+        "d1-raw-database-query",
+        "d1-import-database",
+        "d1-time-travel-restore",
+    ]
+        .into_iter()
+        .enumerate()
+    {
+        let mutation_payload_marker =
+            format!("CREATE TABLE forbidden_{index}(id INTEGER PRIMARY KEY)");
+        let response = mcp.call_tool(
+            20 + index as u64,
+            "api_mutate",
+            json!({
+                "operation_id": operation_id,
+                "path_params": {
+                    "account_id": "acct-1",
+                    "database_id": "db-1"
+                },
+                "body": {"sql": mutation_payload_marker},
+                "dry_run": false,
+                "confirmation_token": "untrusted-raw-d1-confirmation",
+                "reason": "negative policy proof"
+            }),
+        );
+        let content = structured_content(&response);
+        assert_eq!(content["ok"], json!(false), "{operation_id}: {content}");
+        assert_eq!(
+            content["error"]["code"],
+            json!("api_catalog.denied_by_default"),
+            "{operation_id}: {content}"
+        );
+        assert_eq!(
+            content["api_operation"]["operation_id"],
+            json!(operation_id)
+        );
+        assert_eq!(
+            content["api_operation"]["risk"],
+            json!("denied_by_default")
+        );
+        let expected_preferred_tool = match operation_id {
+            "d1-query-database" | "d1-raw-database-query" => {
+                Some("d1_query_read_only")
+            }
+            "d1-import-database" | "d1-time-travel-restore" => None,
+            _ => unreachable!(),
+        };
+        assert_eq!(content["preferred_tool"], json!(expected_preferred_tool));
+        if expected_preferred_tool.is_none() {
+            assert_eq!(
+                content["error"]["hint"],
+                json!(
+                    "Use a governed curated lifecycle for this operation; generic api_mutate remains denied."
+                )
+            );
+        }
+        assert_eq!(content["request_constructed"], json!(false));
+        assert_eq!(content["raw_body_dispatched"], json!(false));
+        assert_eq!(content["provider_calls"], json!(0));
+        assert_eq!(content["provider_mutations"], json!(0));
+        assert!(content.get("request_plan").is_none(), "{content}");
+        assert!(
+            !content.to_string().contains(&mutation_payload_marker),
+            "the denied mutation body must not be reflected or dispatched: {content}"
+        );
+    }
+
+    let discovery = mcp.call_tool(
+        24,
+        "find_tools",
+        json!({"group": "d1", "limit": 100, "include_schema": true}),
+    );
+    let discovery = structured_content(&discovery);
+    let curated_names = discovery["results"]
+        .as_array()
+        .expect("curated D1 discovery results")
+        .iter()
+        .filter_map(|result| result["name"].as_str())
+        .collect::<Vec<_>>();
+    for expected in [
+        "d1_query_read_only",
+        "d1_execute_write",
+        "d1_bootstrap_migration_ledger",
+        "d1_apply_migration_manifest",
+        "d1_reconcile_migration_manifest",
+        "d1_finalize_migration_reconciliation",
+        "d1_reconcile_bootstrap_migration_ledger",
+        "d1_finalize_bootstrap_migration_ledger",
+        "d1_abort_bootstrap_migration_ledger",
+    ] {
+        assert!(
+            curated_names.contains(&expected),
+            "curated D1 tool {expected} remains discoverable: {discovery}"
+        );
+        assert!(
+            discovery["schemas"][expected].is_object(),
+            "curated D1 tool {expected} remains loadable: {discovery}"
+        );
+    }
+
+    let curated_read = mcp.call_tool(
+        25,
+        "d1_query_read_only",
+        json!({
+            "account_id": "acct-1",
+            "database_id": "db-1",
+            "sql": "CREATE TABLE curated_read_guard(id INTEGER PRIMARY KEY)"
+        }),
+    );
+    assert_eq!(
+        structured_content(&curated_read)["error"]["code"],
+        json!("d1.sql_policy_denied"),
+        "curated read tool remains callable and guarded"
+    );
+    let curated_write = mcp.call_tool(
+        26,
+        "d1_execute_write",
+        json!({
+            "account_id": "acct-1",
+            "database_id": "db-1",
+            "sql": "CREATE TABLE curated_write_guard(id INTEGER PRIMARY KEY)",
+            "dry_run": true
+        }),
+    );
+    assert_eq!(
+        structured_content(&curated_write)["error"]["code"],
+        json!("d1.write_policy_denied"),
+        "curated write tool remains callable and guarded"
+    );
+
+    assert!(
+        matches!(provider.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "denied existing-target D1 operations and curated policy checks make zero provider connections"
+    );
+    mcp.terminate();
+}
+
+#[test]
 fn api_mutate_preserves_non_string_body_shapes_in_dry_run_plan() {
     let mut mcp = McpStdioProcess::start();
     let shapes = BTreeMap::from([
@@ -16054,10 +16205,9 @@ fn api_mutate_preserves_non_string_body_shapes_in_dry_run_plan() {
             10 + index as u64,
             "api_mutate",
             json!({
-                "operation_id": "d1-query-database",
+                "operation_id": "d1-create-database",
                 "path_params": {
-                    "account_id": "acct-1",
-                    "database_id": "db-1"
+                    "account_id": "acct-1"
                 },
                 "body": body,
                 "dry_run": true

@@ -10534,7 +10534,7 @@
       "summary": "Import SQL into your D1 Database",
       "deprecated": false,
       "scope": "account",
-      "risk": "mutating",
+      "risk": "denied_by_default",
       "path_params": [
         "account_id",
         "database_id"
@@ -10573,7 +10573,7 @@
       "summary": "Query D1 Database",
       "deprecated": false,
       "scope": "account",
-      "risk": "mutating",
+      "risk": "denied_by_default",
       "path_params": [
         "account_id",
         "database_id"
@@ -10591,7 +10591,7 @@
       "summary": "Raw D1 Database query",
       "deprecated": false,
       "scope": "account",
-      "risk": "mutating",
+      "risk": "denied_by_default",
       "path_params": [
         "account_id",
         "database_id"
@@ -10629,7 +10629,7 @@
       "summary": "Restore D1 Database to a bookmark or point in time",
       "deprecated": false,
       "scope": "account",
-      "risk": "mutating",
+      "risk": "denied_by_default",
       "path_params": [
         "account_id",
         "database_id"

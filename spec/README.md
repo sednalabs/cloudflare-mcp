@@ -88,6 +88,14 @@ Note on elicitation mode:
   and `Zone Settings Write` before the dry-run exposes a confirmation token.
   Missing or unverified permissions return guarded token inspection and repair
   calls instead of an interactive-login recommendation.
+- Generic `api_mutate` denies the exact `d1-query-database`,
+  `d1-raw-database-query`, `d1-import-database`, and
+  `d1-time-travel-restore` operations before request construction or provider
+  access. Query/raw SQL must use curated D1 policy surfaces; import and restore
+  require a separately governed curated lifecycle because they can replace
+  existing-target schema and data and have no preferred tool. Create, get,
+  list, export, and metadata operations retain their existing policy, while
+  delete retains its separate curated high-risk lifecycle.
 - Apart from the explicit `api_mutate.token_permissions` field above,
   elicitation does not alter tool argument schemas; it changes pre-execution
   policy behavior.

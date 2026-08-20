@@ -90,6 +90,16 @@ The generic `worker-script-put-content` operation is also denied: use the
 curated `workers_upload_script` flow, which binds its upload digest to dry-run
 confirmation and post-upload readback instead of treating executable code
 upload as a raw REST body.
+The generic `d1-query-database`, `d1-raw-database-query`,
+`d1-import-database`, and `d1-time-travel-restore` operations are likewise
+denied before request construction or provider access. Query and raw bodies can
+mutate schema outside the curated policy boundary; import and restore can
+replace existing-target schema and data wholesale. Use the curated D1 read,
+row-write, bootstrap, and migration-manifest tools where they cover the task.
+Import and time-travel restore require a separately governed curated lifecycle;
+they are not redirected to a nonexistent preferred tool. Create, get, list,
+export, and metadata updates retain their existing catalog policy, while delete
+retains its separate curated high-risk lifecycle.
 
 ## Catalog refresh
 

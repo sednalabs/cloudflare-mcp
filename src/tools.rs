@@ -2796,27 +2796,33 @@ impl CloudflareMcp {
             }));
         }
         if !operation_allowed_by_default(operation) {
-            if let Some(preferred_tool) = operation.preferred_tool.as_deref() {
-                return Ok(CallToolResult::structured_error(json!({
-                    "ok": false,
-                    "operation": "api_mutate",
-                    "api_operation": operation_detail(operation),
-                    "error": {
-                        "code": "api_catalog.denied_by_default",
-                        "message": format!(
-                            "operation '{}' is denied by default by the generic API executor",
-                            operation.operation_id,
-                        ),
-                        "hint": format!(
-                            "Use the curated {preferred_tool} tool for this operation; generic api_mutate remains denied.",
-                        ),
-                    },
-                    "preferred_tool": preferred_tool,
-                })));
-            }
-            return Ok(api_catalog_error_result(ApiCatalogError::DeniedByDefault(
-                operation.operation_id.clone(),
-            )));
+            let preferred_tool = operation.preferred_tool.as_deref();
+            let hint = match preferred_tool {
+                Some(preferred_tool) => format!(
+                    "Use the curated {preferred_tool} tool for this operation; generic api_mutate remains denied.",
+                ),
+                None => ApiCatalogError::DeniedByDefault(operation.operation_id.clone())
+                    .hint()
+                    .to_string(),
+            };
+            return Ok(CallToolResult::structured_error(json!({
+                "ok": false,
+                "operation": "api_mutate",
+                "api_operation": operation_detail(operation),
+                "error": {
+                    "code": "api_catalog.denied_by_default",
+                    "message": format!(
+                        "operation '{}' is denied by default by the generic API executor",
+                        operation.operation_id,
+                    ),
+                    "hint": hint,
+                },
+                "preferred_tool": preferred_tool,
+                "request_constructed": false,
+                "raw_body_dispatched": false,
+                "provider_calls": 0,
+                "provider_mutations": 0,
+            })));
         }
         let path = match render_path(
             operation,
@@ -19777,7 +19783,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -19789,11 +19795,11 @@ mod tests {
 
         let dry_run = server
             .cloudflare_api_mutate(Parameters(ApiMutateArgs {
-                operation_id: "d1-query-database".to_string(),
-                path_params: BTreeMap::from([
-                    ("account_id".to_string(), "acct-1".to_string()),
-                    ("database_id".to_string(), "db-1".to_string()),
-                ]),
+                operation_id: "d1-create-database".to_string(),
+                path_params: BTreeMap::from([(
+                    "account_id".to_string(),
+                    "acct-1".to_string(),
+                )]),
                 query: BTreeMap::new(),
                 body: Some(body.clone()),
                 dry_run: true,
@@ -19819,11 +19825,11 @@ mod tests {
 
         let result = server
             .cloudflare_api_mutate(Parameters(ApiMutateArgs {
-                operation_id: "d1-query-database".to_string(),
-                path_params: BTreeMap::from([
-                    ("account_id".to_string(), "acct-1".to_string()),
-                    ("database_id".to_string(), "db-1".to_string()),
-                ]),
+                operation_id: "d1-create-database".to_string(),
+                path_params: BTreeMap::from([(
+                    "account_id".to_string(),
+                    "acct-1".to_string(),
+                )]),
                 query: BTreeMap::new(),
                 body: Some(body),
                 dry_run: false,

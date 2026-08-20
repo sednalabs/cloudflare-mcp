@@ -609,6 +609,14 @@ impl ApiCatalogError {
             Self::MethodMismatch { .. } => {
                 "Use api_read for GET operations and api_mutate for POST/PUT/PATCH/DELETE operations."
             }
+            Self::DeniedByDefault(id)
+                if matches!(
+                    id.as_str(),
+                    "d1-import-database" | "d1-time-travel-restore"
+                ) =>
+            {
+                "Use a governed curated lifecycle for this operation; generic api_mutate remains denied."
+            }
             Self::DeniedByDefault(_) => {
                 "Use a curated safe tool when available, or explicitly allow this operation in a future policy profile."
             }
@@ -745,6 +753,42 @@ mod tests {
             operation.preferred_tool.as_deref(),
             Some("workers_upload_script")
         );
+    }
+
+    #[test]
+    fn generic_existing_target_d1_schema_mutations_are_exactly_denied_by_default() {
+        for operation_id in [
+            "d1-query-database",
+            "d1-raw-database-query",
+            "d1-import-database",
+            "d1-time-travel-restore",
+        ] {
+            let operation = find_operation(operation_id).expect("existing-target D1 operation");
+            assert_eq!(operation.risk, ApiRisk::DeniedByDefault);
+            assert!(!operation_allowed_by_default(operation));
+            let expected_preferred_tool = match operation_id {
+                "d1-query-database" | "d1-raw-database-query" => {
+                    Some("d1_query_read_only")
+                }
+                "d1-import-database" | "d1-time-travel-restore" => None,
+                _ => unreachable!(),
+            };
+            assert_eq!(operation.preferred_tool.as_deref(), expected_preferred_tool);
+        }
+
+        for (operation_id, expected_risk) in [
+            ("d1-create-database", ApiRisk::Mutating),
+            ("d1-get-database", ApiRisk::Read),
+            ("d1-list-databases", ApiRisk::Read),
+            ("d1-export-database", ApiRisk::Mutating),
+            ("d1-update-database", ApiRisk::Mutating),
+            ("d1-update-partial-database", ApiRisk::Mutating),
+            ("d1-delete-database", ApiRisk::HighRisk),
+        ] {
+            let unrelated = find_operation(operation_id).expect("unrelated D1 operation");
+            assert_eq!(unrelated.risk, expected_risk, "{operation_id}");
+            assert!(operation_allowed_by_default(unrelated), "{operation_id}");
+        }
     }
 
     #[test]
