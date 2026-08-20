@@ -172,6 +172,11 @@ Use `d1_reconcile_migration_manifest` only for exact retained
 `active.lease.json` or `retiring.lease.json` evidence after an ambiguous
 manifest apply. Supply the complete exact-byte manifest and one complete
 expected schema state for every prefix from zero through the full manifest.
+For every assertion, the tool first selects the exact primary-current ledger
+prefix, then runs two identical complete reads. The complete reads retain the
+full-manifest `sqlite_master` object-name union to detect premature future
+objects, but issue table xinfo, foreign-key definition/check, and seed reads
+only for tables in the selected state. An absent future table is never probed.
 
 For `d1_apply_migration_manifest`, every plan, live, post-apply, and ambiguous
 outcome filename-ledger read requires exactly one successful result set with
@@ -263,8 +268,22 @@ every seed target. The selected proof omits a not-yet-created target, requires
 an exact empty table projection after CREATE and before INSERT without
 referencing columns introduced by a later prefix, and requires the
 exact row set at and after INSERT. An unexpected intermediate row stops after
-the first complete proof with zero mutations. Terminal reconciliation rederives
-and repeats the same selected-prefix proof. Both complete proof ledgers must
+the first complete proof with zero mutations. Fresh reconciliation evidence
+causes terminal reconciliation to rederive and repeat the same selected-prefix
+proof and emits only the scoped-v3 reconciliation plan, whose explicit
+`query_chronology=selected_prefix_v1` distinguishes it from historical plans.
+Before provider access, terminal reconciliation independently recomputes the
+legacy-v1 full-union, historical-v2 effect-assertion full-union, and scoped-v3
+plan digests. Exactly one must match `expected_reconciliation_plan_sha256`;
+that plan family selects the query chronology, and `expected_query_sha256` plus
+the expected current prefix must then reproduce its exact query constructor.
+Equal scoped and full-union query digests therefore cannot make either
+historical family adopt current chronology. Unknown, ambiguous, or
+plan/query-inconsistent combinations fail with zero provider calls. Historical
+non-seed proofs retain their two full-union reads
+without a selection call; historical seed proofs retain their selection read
+before the two full-union reads. The ordinary read-only reconciliation tool
+never emits this compatibility shape. Both complete proof ledgers must
 equal the exact initial selected ledger, and the two complete snapshots must
 also remain canonically equal; two mutually consistent responses at another
 prefix are contradictory. Inspect aggregate-safe `selection_binding` for the
@@ -307,10 +326,12 @@ The bounded evidence retains every word, quoted identifier, and string-literal
 value across the complete post-parent trigger header (including `WHEN`) and
 body. An exact string-literal collision is deliberately rejected; longer
 unrelated token values and unrelated triggers remain supported.
-The boundary also requires every fixed result set in both batches to carry exact
+The boundary also requires every fixed result set in the selection read and
+both complete batches to carry exact
 `meta.served_by_primary=true` evidence; absent, false, null, non-boolean, or
 mixed primary markers are contradictory and cannot support positive
-reconciliation. It performs two bounded read-only batches and never retires
+reconciliation. It performs one bounded prefix-selection read plus two bounded
+complete read-only batches and never retires
 custody evidence or authorizes an apply retry. The boundary does not follow
 HTTP redirects and returns one chronological `provider_read_lifecycle` entry
 per invocation, distinguishing pre-dispatch, attempted-without-response,
