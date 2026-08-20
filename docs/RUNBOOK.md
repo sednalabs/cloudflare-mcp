@@ -553,6 +553,15 @@ or mixed primary marker fails closed as contradictory evidence. Response bodies
 are capped at 16 MiB from the HTTP stream; the adapter stops before buffering a
 body beyond that bound.
 
+Every reconciliation result reached after fixed-query construction includes a
+`query_shape_receipt`. Its version and receipt digest bind the exact
+`query_sha256` to aggregate statement counts and presence booleans for only the
+ledger, schema catalog, table xinfo, foreign-key definition, foreign-key check,
+and seed classes. It never contains SQL, schema/table names, paths, response
+excerpts, or row data. Pre-query semantic failures return the field as null.
+This output receipt does not alter the fixed query, its SHA-256, predecessor
+plan reconstruction, or terminal receipt authority.
+
 Before any successful-status reconciliation response object is converted to
 `serde_json::Value`, the bounded raw body is decoded through a reconciliation-
 local recursive visitor that rejects duplicate keys in the outer envelope and
@@ -572,6 +581,13 @@ body boundary and exact captured HTTP status. A response-stream failure is
 after at least one byte was accumulated. Preserve the status for invalid
 UTF-8, malformed JSON, truncated streams, and oversized bodies. Treat 401,
 403, 429, and every 5xx as unavailable and never retry the same attempt.
+When a completely read authenticated HTTP error body is an exact, duplicate-
+free Cloudflare error envelope, `provider_cause` may additionally expose only
+an allowlisted numeric code and stable category: 7500 as `d1_error` or 10000 as
+`authentication_error`. Provider messages are always discarded because they
+may echo SQL or identifiers. Partial, malformed, oversized, duplicate-key,
+multi-error, non-allowlisted, or otherwise unexpected envelopes retain generic
+HTTP classification and never expose provider body content.
 
 Interpret custody fields literally. Validation failures before custody lookup
 return `lease_retained=null` and `custody_status=not_inspected`. Inspection

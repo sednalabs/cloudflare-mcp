@@ -240,9 +240,16 @@ pub(crate) struct D1MigrationReconciliationBatch {
 #[derive(Debug, Clone)]
 pub(crate) struct D1MigrationReconciliationBatchError {
     pub(crate) error: AdapterErrorPayload,
+    pub(crate) provider_error: Option<D1MigrationProviderError>,
     pub(crate) response_body_sha256: Option<String>,
     pub(crate) response_body_size_bytes: Option<usize>,
     pub(crate) lifecycle: D1MigrationReconciliationReadLifecycle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct D1MigrationProviderError {
+    pub(crate) code: i64,
+    pub(crate) category: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -833,6 +840,7 @@ impl CloudflareClient {
         let account_id = require_non_empty("account_id", account_id).map_err(|error| {
             D1MigrationReconciliationBatchError {
                 error: error.payload(),
+                provider_error: None,
                 response_body_sha256: None,
                 response_body_size_bytes: None,
                 lifecycle: D1MigrationReconciliationReadLifecycle::pre_dispatch(),
@@ -841,6 +849,7 @@ impl CloudflareClient {
         let database_id = require_non_empty("database_id", database_id).map_err(|error| {
             D1MigrationReconciliationBatchError {
                 error: error.payload(),
+                provider_error: None,
                 response_body_sha256: None,
                 response_body_size_bytes: None,
                 lifecycle: D1MigrationReconciliationReadLifecycle::pre_dispatch(),
@@ -849,6 +858,7 @@ impl CloudflareClient {
         let sql =
             require_non_empty("sql", sql).map_err(|error| D1MigrationReconciliationBatchError {
                 error: error.payload(),
+                provider_error: None,
                 response_body_sha256: None,
                 response_body_size_bytes: None,
                 lifecycle: D1MigrationReconciliationReadLifecycle::pre_dispatch(),
@@ -857,6 +867,7 @@ impl CloudflareClient {
             .bearer_token()
             .map_err(|error| D1MigrationReconciliationBatchError {
                 error: error.payload(),
+                provider_error: None,
                 response_body_sha256: None,
                 response_body_size_bytes: None,
                 lifecycle: D1MigrationReconciliationReadLifecycle::pre_dispatch(),
@@ -895,6 +906,7 @@ impl CloudflareClient {
                     )
                     .with_retryable(retryable)
                     .payload(),
+                    provider_error: None,
                     response_body_sha256: None,
                     response_body_size_bytes: None,
                     lifecycle: if pre_dispatch {
@@ -918,6 +930,7 @@ impl CloudflareClient {
                 )
                 .with_status(Some(status.as_u16()))
                 .payload(),
+                provider_error: None,
                 response_body_sha256: None,
                 response_body_size_bytes: response
                     .content_length()
@@ -941,6 +954,7 @@ impl CloudflareClient {
                 )
                 .with_status(Some(status_code))
                 .payload(),
+                provider_error: None,
                 response_body_sha256: None,
                 response_body_size_bytes: Some(bytes.len()),
                 lifecycle: D1MigrationReconciliationReadLifecycle::body_read_failed(
@@ -958,6 +972,7 @@ impl CloudflareClient {
                     )
                     .with_status(Some(status.as_u16()))
                     .payload(),
+                    provider_error: None,
                     response_body_sha256: None,
                     response_body_size_bytes: Some(observed_size),
                     lifecycle:
@@ -969,12 +984,18 @@ impl CloudflareClient {
         }
         let response_body_size_bytes = bytes.len();
         let response_body_sha256 = format!("{:x}", hasher.finalize());
-        let evidence_error = |error: AdapterError| D1MigrationReconciliationBatchError {
-            error: error.payload(),
-            response_body_sha256: Some(response_body_sha256.clone()),
-            response_body_size_bytes: Some(response_body_size_bytes),
-            lifecycle: D1MigrationReconciliationReadLifecycle::body_completely_read(status_code),
-        };
+        let evidence_error =
+            |error: AdapterError, provider_error: Option<D1MigrationProviderError>| {
+                D1MigrationReconciliationBatchError {
+                    error: error.payload(),
+                    provider_error,
+                    response_body_sha256: Some(response_body_sha256.clone()),
+                    response_body_size_bytes: Some(response_body_size_bytes),
+                    lifecycle: D1MigrationReconciliationReadLifecycle::body_completely_read(
+                        status_code,
+                    ),
+                }
+            };
         let body = std::str::from_utf8(&bytes).map_err(|error| {
             evidence_error(
                 AdapterError::new(
@@ -983,13 +1004,17 @@ impl CloudflareClient {
                     "Treat the provider evidence as contradictory and retain the lease.",
                 )
                 .with_status(Some(status_code)),
+                None,
             )
         })?;
         if !status.is_success() {
-            return Err(evidence_error(http_status_error(status, body)));
+            return Err(evidence_error(
+                d1_migration_reconciliation_http_status_error(status),
+                classify_d1_migration_provider_error(body),
+            ));
         }
         let envelope = decode_strict_d1_migration_reconciliation_envelope(body)
-            .map_err(|error| evidence_error(error.with_status(Some(status_code))))?;
+            .map_err(|error| evidence_error(error.with_status(Some(status_code)), None))?;
         Ok(D1MigrationReconciliationBatch {
             result: envelope.result.unwrap_or(Value::Null),
             response_body_sha256,
@@ -3863,6 +3888,33 @@ fn decode_strict_d1_migration_reconciliation_envelope(
     validate_strict_d1_migration_manifest_envelope(envelope)
 }
 
+fn classify_d1_migration_provider_error(body: &str) -> Option<D1MigrationProviderError> {
+    let Value::Object(envelope) = decode_json_rejecting_duplicate_object_keys(body).ok()? else {
+        return None;
+    };
+    if envelope.len() != 4
+        || envelope.get("success") != Some(&Value::Bool(false))
+        || envelope.get("result") != Some(&Value::Null)
+        || !matches!(envelope.get("messages"), Some(Value::Array(messages)) if messages.is_empty())
+    {
+        return None;
+    }
+    let errors = envelope.get("errors")?.as_array()?;
+    let [Value::Object(error)] = errors.as_slice() else {
+        return None;
+    };
+    if error.len() != 2 || !error.get("message").is_some_and(Value::is_string) {
+        return None;
+    }
+    let code = error.get("code")?.as_i64()?;
+    let category = match code {
+        7_500 => "d1_error",
+        10_000 => "authentication_error",
+        _ => return None,
+    };
+    Some(D1MigrationProviderError { code, category })
+}
+
 fn decode_json_rejecting_duplicate_object_keys(
     body: &str,
 ) -> Result<Value, DuplicateSafeJsonError> {
@@ -4471,6 +4523,45 @@ fn http_status_error(status: StatusCode, body: &str) -> AdapterError {
     }
 }
 
+fn d1_migration_reconciliation_http_status_error(status: StatusCode) -> AdapterError {
+    let (code, hint) = match status {
+        StatusCode::UNAUTHORIZED => (
+            "cloudflare.http_unauthorized",
+            "Verify the configured API token before another reconciliation read.",
+        ),
+        StatusCode::FORBIDDEN => (
+            "cloudflare.http_forbidden",
+            "Verify the token's D1 read scope before another reconciliation read.",
+        ),
+        StatusCode::NOT_FOUND => (
+            "cloudflare.http_not_found",
+            "Verify the retained target identity before another reconciliation read.",
+        ),
+        StatusCode::TOO_MANY_REQUESTS => (
+            "cloudflare.http_rate_limited",
+            "Treat reconciliation evidence as unavailable and retain custody.",
+        ),
+        _ if status.is_server_error() => (
+            "cloudflare.http_server_error",
+            "Treat reconciliation evidence as unavailable and retain custody.",
+        ),
+        _ => (
+            "cloudflare.http_error",
+            "Treat reconciliation evidence as contradictory and retain custody.",
+        ),
+    };
+    AdapterError::new(
+        code,
+        format!(
+            "Cloudflare D1 reconciliation returned HTTP status {}",
+            status.as_u16()
+        ),
+        hint,
+    )
+    .with_retryable(false)
+    .with_status(Some(status.as_u16()))
+}
+
 fn invalid_or_expired_token_classification() -> ErrorClassificationPayload {
     ErrorClassificationPayload {
         code: "invalid_or_expired_token",
@@ -4515,7 +4606,8 @@ mod tests {
 
     use super::{
         AdapterError, CloudflareApiError, CloudflareClient, D1_MIGRATION_RESPONSE_MAX_BYTES,
-        D1MigrationManifestWriteLifecycle, D1MigrationReconciliationReadLifecycle,
+        D1MigrationManifestWriteLifecycle, D1MigrationProviderError,
+        D1MigrationReconciliationReadLifecycle, classify_d1_migration_provider_error,
         decode_strict_d1_migration_manifest_envelope,
         decode_strict_d1_migration_reconciliation_envelope, is_d1_sqlite_auth_error, path_segment,
         with_request_api_token_override, worker_listing_identity, worker_version_id,
@@ -4632,6 +4724,44 @@ mod tests {
                 D1MigrationReconciliationReadLifecycle::response_received(status.as_u16())
             );
         }
+    }
+
+    #[tokio::test]
+    async fn reconciliation_http_error_surfaces_only_allowlisted_code_and_category() {
+        let private_message = "SQL SELECT * FROM private_table at /private/path";
+        let router = Router::new().route(
+            "/accounts/acct-1/d1/database/db-1/query",
+            post(move || async move {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "success": false,
+                        "errors": [{"code": 7500, "message": private_message}],
+                        "messages": [],
+                        "result": null,
+                    })),
+                )
+            }),
+        );
+        let base = spawn_router(router).await;
+        let client = CloudflareClient::new(test_config(base)).expect("client");
+        let error = client
+            .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+            .await
+            .expect_err("HTTP error must fail closed");
+        assert_eq!(
+            error.provider_error,
+            Some(D1MigrationProviderError {
+                code: 7_500,
+                category: "d1_error",
+            })
+        );
+        assert_eq!(error.error.code, "cloudflare.http_error");
+        assert!(!error.error.message.contains(private_message));
+        assert!(!error.error.message.contains("private_table"));
+        assert_eq!(error.error.status, Some(400));
+        assert_eq!(error.lifecycle.body_stage, "completely_read");
+        assert!(error.response_body_sha256.is_some());
     }
 
     #[tokio::test]
@@ -5215,6 +5345,39 @@ mod tests {
         .expect("duplicate-free nested reconciliation envelope");
         assert!(envelope.success);
         assert!(envelope.result.is_some());
+    }
+
+    #[test]
+    fn reconciliation_provider_error_classifier_is_allowlisted_complete_and_message_blind() {
+        for (code, category) in [(7_500, "d1_error"), (10_000, "authentication_error")] {
+            let body = json!({
+                "success": false,
+                "errors": [{
+                    "code": code,
+                    "message": "SQL SELECT * FROM private_table at /private/path"
+                }],
+                "messages": [],
+                "result": null,
+            })
+            .to_string();
+            assert_eq!(
+                classify_d1_migration_provider_error(&body),
+                Some(D1MigrationProviderError { code, category })
+            );
+        }
+
+        for body in [
+            r#"{"success":false,"errors":[{"code":9999,"message":"private"}],"messages":[],"result":null}"#,
+            r#"{"success":false,"errors":[{"code":7500}],"messages":[],"result":null}"#,
+            r#"{"success":false,"errors":[{"code":"7500","message":"private"}],"messages":[],"result":null}"#,
+            r#"{"success":false,"errors":[{"code":7500,"message":"private"}],"result":null}"#,
+            r#"{"success":false,"errors":[{"code":7500,"message":"private"}],"messages":[{}],"result":null}"#,
+            r#"{"success":false,"errors":[{"code":7500,"message":"private"}],"messages":[],"result":null,"unexpected":true}"#,
+            r#"{"success":false,"success":true,"errors":[{"code":7500,"message":"private"}],"messages":[],"result":null}"#,
+            "{",
+        ] {
+            assert_eq!(classify_d1_migration_provider_error(body), None, "{body}");
+        }
     }
 
     #[test]

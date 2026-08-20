@@ -321,8 +321,19 @@ the raw provider JSON can collapse into a value, across the outer envelope and
 nested result, metadata, error, and row objects in either order. Rejection keeps
 the exact raw digest, size, status, lifecycle, and retained-custody evidence but
 never exposes the duplicate key or body content. This does not broaden generic
-Cloudflare response paths or the migration-write JSON policy. A
-stream failure before any body byte is `not_read`; it is `partially_read` only
+Cloudflare response paths or the migration-write JSON policy.
+versioned `query_shape_receipt` accompanies every success or failure after a
+fixed query exists. It binds the exact query digest to aggregate counts and
+presence booleans for ledger, schema-catalog, xinfo, foreign-key definition,
+foreign-key check, and seed statements without returning SQL, identifiers,
+paths, response excerpts, or data. Semantic failures before query construction
+report a null receipt. The receipt is output-only and leaves predecessor query
+and reconciliation-plan digests unchanged. A complete authenticated Cloudflare
+HTTP error envelope can expose only allowlisted code/category pairs (7500 /
+`d1_error`, 10000 / `authentication_error`) in `provider_cause`; provider
+messages are never returned. Malformed, partial, oversized, unexpected, or
+non-allowlisted envelopes remain generic. A stream failure before any body byte
+is `not_read`; it is `partially_read` only
 after at least one byte was accumulated. Local token/config failure therefore
 reports zero provider calls. Validation or
 custody-inspection failure before adapter invocation instead reports
