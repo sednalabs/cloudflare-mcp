@@ -957,21 +957,16 @@ impl D1RetainedMigrationLease {
                 local_namespace_mutations += 1;
                 self.evidence_name = RETIRING_LEASE_NAME.to_string();
                 self.identity.namespace = "retiring".to_string();
-                if sync_d1_lease_directory(&self.target).is_err() {
+                if sync_terminal_retirement_directory(
+                    &self.target,
+                    &self.identity.nonce,
+                    local_namespace_mutations,
+                )
+                .is_err()
+                {
                     return Err(D1TerminalRetirementFailure {
                         result: d1_terminal_reconciliation_error(
                             "retained lease entered retiring state but the directory sync failed",
-                        ),
-                        local_namespace_mutations,
-                    });
-                }
-                if terminal_retirement_test_failure_after(
-                    &self.identity.nonce,
-                    local_namespace_mutations,
-                ) {
-                    return Err(D1TerminalRetirementFailure {
-                        result: d1_terminal_reconciliation_error(
-                            "test-only failure after active lease entered retiring state",
                         ),
                         local_namespace_mutations,
                     });
@@ -993,21 +988,16 @@ impl D1RetainedMigrationLease {
             local_namespace_mutations += 1;
             self.evidence_name = retired_name;
             self.identity.namespace = "retired".to_string();
-            if sync_d1_lease_directory(&self.target).is_err() {
+            if sync_terminal_retirement_directory(
+                &self.target,
+                &self.identity.nonce,
+                local_namespace_mutations,
+            )
+            .is_err()
+            {
                 return Err(D1TerminalRetirementFailure {
                     result: d1_terminal_reconciliation_error(
                         "retained lease entered terminal retirement but the directory sync failed",
-                    ),
-                    local_namespace_mutations,
-                });
-            }
-            if terminal_retirement_test_failure_after(
-                &self.identity.nonce,
-                local_namespace_mutations,
-            ) {
-                return Err(D1TerminalRetirementFailure {
-                    result: d1_terminal_reconciliation_error(
-                        "test-only failure after retiring lease entered terminal retirement",
                     ),
                     local_namespace_mutations,
                 });
@@ -1307,12 +1297,21 @@ fn terminal_retirement_test_failure_after(
     }
 }
 
-#[cfg(not(test))]
-fn terminal_retirement_test_failure_after(
-    _lease_nonce: &str,
-    _local_namespace_mutations: usize,
-) -> bool {
-    false
+#[cfg(target_os = "linux")]
+fn sync_terminal_retirement_directory(
+    directory: &fs::File,
+    lease_nonce: &str,
+    local_namespace_mutations: usize,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    if terminal_retirement_test_failure_after(lease_nonce, local_namespace_mutations) {
+        return Err(std::io::Error::other(
+            "forced terminal retirement directory sync failure",
+        ));
+    }
+    #[cfg(not(test))]
+    let _ = (lease_nonce, local_namespace_mutations);
+    sync_d1_lease_directory(directory)
 }
 
 fn d1_terminal_reconciliation_error(message: &'static str) -> CallToolResult {
@@ -1633,27 +1632,15 @@ fn d1_migration_lease_nonce(target_hash: &str, plan_sha256: &str) -> String {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+    use libc::{
+        AT_FDCWD, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_PATH, O_RDONLY, O_RDWR,
+    };
     use std::ffi::{CStr, CString, c_char};
     use std::io;
     use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt};
 
-    const AT_FDCWD: i32 = -100;
-    const O_RDONLY: i32 = 0;
-    const O_RDWR: i32 = 2;
-    const O_CREAT: i32 = 0o100;
-    const O_EXCL: i32 = 0o200;
-    #[cfg(target_arch = "aarch64")]
-    const O_DIRECTORY: i32 = 0o40000;
-    #[cfg(target_arch = "aarch64")]
-    const O_NOFOLLOW: i32 = 0o100000;
-    #[cfg(not(target_arch = "aarch64"))]
-    const O_DIRECTORY: i32 = 0o200000;
-    #[cfg(not(target_arch = "aarch64"))]
-    const O_NOFOLLOW: i32 = 0o400000;
-    const O_CLOEXEC: i32 = 0o2000000;
-    const O_PATH: i32 = 0o10000000;
     const RENAME_NOREPLACE: u32 = 1;
     const MAX_LEASE_PAYLOAD_BYTES: u64 = 4096;
     pub(super) const MAX_TARGET_CUSTODY_DIRECTORY_ENTRIES: usize = 4096;
@@ -1697,7 +1684,6 @@ mod linux {
 
     unsafe extern "C" {
         fn geteuid() -> u32;
-        fn openat(dirfd: i32, pathname: *const std::ffi::c_char, flags: i32, mode: u32) -> i32;
         fn mkdirat(dirfd: i32, pathname: *const std::ffi::c_char, mode: u32) -> i32;
         fn renameat2(
             olddirfd: i32,
@@ -1747,7 +1733,7 @@ mod linux {
     }
 
     fn open_at(dirfd: i32, name: &CString, flags: i32, mode: u32) -> io::Result<fs::File> {
-        let fd = unsafe { openat(dirfd, name.as_ptr(), flags, mode) };
+        let fd = unsafe { libc::openat(dirfd, name.as_ptr(), flags, mode) };
         if fd < 0 {
             Err(io::Error::last_os_error())
         } else {
@@ -3612,6 +3598,7 @@ use linux::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[cfg(target_os = "linux")]
     fn terminal_receipt(
@@ -3862,7 +3849,9 @@ mod tests {
         let first = std::thread::spawn(move || {
             acquire_d1_migration_lease_at(first_root, "acct-1", "db-1", "first", &"a".repeat(64))
         });
-        entered_rx.recv().expect("first holds guard");
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first holds guard within the bounded test window");
         let unrelated_root = private_test_root("race-unrelated");
         let mut unrelated = acquire_d1_migration_lease_at(
             unrelated_root.clone(),
@@ -5429,7 +5418,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn terminal_retirement_failure_reports_each_physical_partial_namespace_transition() {
+    fn terminal_retirement_directory_sync_failure_reports_each_physical_namespace_transition() {
         for (after_mutations, expected_namespace) in [(1, "retiring"), (2, "retired")] {
             let root = private_test_root(&format!("terminal-partial-{after_mutations}"));
             let plan = "a".repeat(64);
@@ -5473,6 +5462,21 @@ mod tests {
             let failure = retained
                 .retire_after_terminal_receipt(&receipt)
                 .expect_err("test failure follows a physical namespace rename");
+            let failure_content = failure
+                .result
+                .structured_content
+                .as_ref()
+                .expect("structured directory-sync failure");
+            assert_eq!(
+                failure_content["error"]["message"],
+                if expected_namespace == "retiring" {
+                    json!("retained lease entered retiring state but the directory sync failed")
+                } else {
+                    json!(
+                        "retained lease entered terminal retirement but the directory sync failed"
+                    )
+                }
+            );
             assert_eq!(failure.local_namespace_mutations, after_mutations as usize);
             assert_eq!(retained.identity.namespace, expected_namespace);
             let expected_path = if expected_namespace == "retiring" {
@@ -5497,6 +5501,71 @@ mod tests {
             drop(retained);
             fs::remove_dir_all(root).expect("test cleanup");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn terminal_retirement_sync_and_readback_failure_never_infers_retired_custody() {
+        let root = private_test_root("terminal-sync-readback-failure");
+        let plan = "a".repeat(64);
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "db-1",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
+        let identity = owner.identity.clone();
+        let target = owner
+            .active_path_for_test()
+            .expect("active path")
+            .parent()
+            .expect("target")
+            .to_path_buf();
+        owner.retain();
+        drop(owner);
+        let expected = terminal_receipt(&identity, &plan);
+        let mut retained = inspect_terminal_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "db-1",
+            "newsletter-core",
+            &plan,
+            &identity.nonce,
+            &identity.payload_sha256,
+        )
+        .expect("inspect retained lease");
+        let (receipt, created) = retained
+            .persist_terminal_receipt(&expected)
+            .expect("persist exact terminal receipt");
+        assert!(created);
+        let _retirement_fault_guard =
+            install_terminal_retirement_failure_after(identity.nonce.clone(), 2)
+                .expect("install post-rename directory-sync fault");
+        let failure = retained
+            .retire_after_terminal_receipt(&receipt)
+            .expect_err("second rename succeeds before the directory-sync fault");
+        assert_eq!(failure.local_namespace_mutations, 2);
+        let retired = target.join(format!("retired.{}.lease.json", identity.nonce));
+        assert!(retired.is_file(), "physical retirement rename completed");
+        assert!(
+            target
+                .join(format!(
+                    "terminal-reconciliation.{}.receipt.json",
+                    identity.nonce
+                ))
+                .is_file(),
+            "the exact receipt remains physically present"
+        );
+
+        fs::remove_file(&retired).expect("inject descriptor readback failure");
+        let readback = retained.terminal_evidence_readback(&expected, None);
+        assert_eq!(readback.custody, D1TerminalCustodyNamespace::Unverified);
+        assert_eq!(readback.receipt_persisted, None);
+
+        drop(retained);
+        fs::remove_dir_all(root).expect("test cleanup");
     }
 
     #[cfg(target_os = "linux")]

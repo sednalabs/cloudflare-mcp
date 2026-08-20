@@ -1631,13 +1631,12 @@ pub(crate) async fn finalize_bootstrap_migration_ledger(
     let retirement = match proof.lease.retire_after_terminal_receipt(&receipt_evidence) {
         Ok(retirement) => retirement,
         Err(failure) => {
-            return contextualize_post_receipt_failure(
+            let readback = proof.lease.terminal_evidence_readback(&receipt, None);
+            return contextualize_post_create_receipt_failure(
                 failure.result,
-                "unknown",
                 provider_calls,
                 lifecycle,
-                custody_status(&proof.lease),
-                Value::Null,
+                readback,
                 local_receipt_mutations + failure.local_namespace_mutations,
             );
         }
@@ -2132,6 +2131,29 @@ mod tests {
         let content = result.structured_content.expect("structured failure");
         assert_eq!(content["receipt_persisted"], json!(true));
         assert_eq!(content["local_namespace_mutations"], json!(1));
+    }
+
+    #[test]
+    fn bootstrap_retirement_failure_never_promotes_unverified_readback_to_retired() {
+        let result = contextualize_post_create_receipt_failure(
+            recovery_error(
+                "d1.test_retirement_sync_failure",
+                "retirement rename completed but durable readback failed",
+            ),
+            16,
+            Vec::new(),
+            D1TerminalEvidenceReadback {
+                custody: D1TerminalCustodyNamespace::Unverified,
+                receipt_persisted: None,
+            },
+            3,
+        );
+        let content = result.structured_content.expect("structured failure");
+        assert_eq!(content["receipt_persisted"], Value::Null);
+        assert_eq!(content["custody_status"], "retained_evidence_unverified");
+        assert_ne!(content["custody_status"], "retired_evidence_verified");
+        assert_eq!(content["lease_retained"], Value::Null);
+        assert_eq!(content["local_namespace_mutations"], json!(3));
     }
 
     #[test]

@@ -11,17 +11,30 @@ permissions:
 
 jobs:
   test:
-    name: Test And Tool Contract
-    runs-on: ubuntu-24.04
+    name: Test And Tool Contract (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
 
     steps:
       - name: Checkout
         # actions/checkout v6
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+        with:
+          persist-credentials: false
 
       - name: Format check
         run: cargo fmt --check
+
+      - name: Trusted release download contract
+        run: tests/trusted_release_download_contract.sh
 
       - name: Unit and integration tests
         run: cargo test
@@ -58,13 +71,80 @@ jobs:
           jq '{source, binary: {sha256: .binary.sha256, size_bytes: .binary.size_bytes}, tools, contracts, dependencies}' \
             .tmp/release-provenance.json
 
+      - name: Package release binary bundle
+        run: |
+          set -euo pipefail
+          artifact="cloudflare-mcp-linux-${{ matrix.arch }}-stdio-${GITHUB_SHA}"
+          mkdir -p dist/package dist/verify
+          install -m 0755 target/release/cloudflare-mcp dist/package/cloudflare-mcp
+          install -m 0644 .tmp/release-provenance.json dist/package/release-provenance.json
+
+          test "$(stat -c '%a' dist/package/cloudflare-mcp)" = 755
+          case "${{ matrix.arch }}" in
+            x86_64) expected_machine='Advanced Micro Devices X86-64' ;;
+            aarch64) expected_machine='AArch64' ;;
+            *) echo "unsupported architecture: ${{ matrix.arch }}" >&2; exit 1 ;;
+          esac
+          readelf -h dist/package/cloudflare-mcp | grep -F 'Machine:' | grep -F "$expected_machine"
+          required_glibc="$({ readelf --version-info dist/package/cloudflare-mcp || true; } \
+            | grep -oE 'GLIBC_[0-9]+\.[0-9]+' \
+            | sed 's/^GLIBC_//' \
+            | sort -Vu \
+            | tail -n 1)"
+          test "$required_glibc" = 2.39
+          test "$(sha256sum dist/package/cloudflare-mcp | cut -d ' ' -f 1)" = \
+            "$(jq -r '.binary.sha256' dist/package/release-provenance.json)"
+          printf '%s\n' \
+            'format-version=1' \
+            'target-os=linux' \
+            'target-arch=${{ matrix.arch }}' \
+            'libc=glibc' \
+            "minimum-glibc=${required_glibc}" \
+            > dist/package/cloudflare-mcp.build-info
+
+          (
+            cd dist/package
+            sha256sum cloudflare-mcp cloudflare-mcp.build-info release-provenance.json > SHA256SUMS
+            sha256sum -c SHA256SUMS
+            tar -czf "../${artifact}.tar.gz" \
+              cloudflare-mcp \
+              cloudflare-mcp.build-info \
+              release-provenance.json \
+              SHA256SUMS
+          )
+          (
+            cd dist
+            sha256sum "${artifact}.tar.gz" > "${artifact}.tar.gz.sha256"
+            sha256sum -c "${artifact}.tar.gz.sha256"
+          )
+
+          tar -xzf "dist/${artifact}.tar.gz" -C dist/verify
+          test "$(stat -c '%a' dist/verify/cloudflare-mcp)" = 755
+          (cd dist/verify && sha256sum -c SHA256SUMS)
+          readelf -h dist/verify/cloudflare-mcp | grep -F 'Machine:' | grep -F "$expected_machine"
+          grep -Fx 'target-os=linux' dist/verify/cloudflare-mcp.build-info
+          grep -Fx 'target-arch=${{ matrix.arch }}' dist/verify/cloudflare-mcp.build-info
+          grep -Fx 'libc=glibc' dist/verify/cloudflare-mcp.build-info
+          grep -Fx 'minimum-glibc=2.39' dist/verify/cloudflare-mcp.build-info
+
       - name: Upload release binary bundle
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         # actions/upload-artifact v7
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: cloudflare-mcp-linux-x86_64-stdio-${{ github.sha }}
+          name: cloudflare-mcp-linux-${{ matrix.arch }}-stdio-${{ github.sha }}
           path: |
-            target/release/cloudflare-mcp
-            .tmp/release-provenance.json
+            dist/cloudflare-mcp-linux-${{ matrix.arch }}-stdio-${{ github.sha }}.tar.gz
+            dist/cloudflare-mcp-linux-${{ matrix.arch }}-stdio-${{ github.sha }}.tar.gz.sha256
           if-no-files-found: error
           retention-days: 14
+
+  test-required-gate:
+    name: Test And Tool Contract
+    if: always()
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require the complete native matrix
+        run: test '${{ needs.test.result }}' = success

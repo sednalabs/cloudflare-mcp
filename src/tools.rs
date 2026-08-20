@@ -14095,6 +14095,8 @@ mod tests {
     use crate::mutation::MutationApprovalAudit;
     use crate::portal::PortalAgentClient;
 
+    static D1_MIGRATION_TEST_SEQUENCE: AtomicUsize = AtomicUsize::new(1);
+
     fn fixture_material(label: &str) -> String {
         let mut value = String::from("fixture-");
         value.push_str(label);
@@ -14206,8 +14208,9 @@ mod tests {
         // Lease-custody fixtures require a non-writable or sticky ancestor.
         // `TMPDIR` may deliberately point at a shared build workspace, so use
         // the Unix sticky temporary root for this local-only test fixture.
+        let sequence = D1_MIGRATION_TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let dir = std::path::PathBuf::from("/tmp").join(format!(
-            "cloudflare-mcp-{name}-{}-{millis}",
+            "cloudflare-mcp-{name}-{}-{millis}-{sequence}",
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&dir);
