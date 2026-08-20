@@ -196,6 +196,7 @@ fn valid_terminal_receipt_authority(receipt: &D1TerminalReconciliationReceipt) -
                 | "schema_create_tables_indexes_views_triggers_v1"
                 | "schema_create_objects_additive_v1"
                 | "schema_create_objects_additive_seed_rows_v1"
+                | "schema_create_objects_additive_seed_rows_v2"
         ),
         "d1_finalize_bootstrap_migration_ledger" => {
             receipt.effect_assertion_id == "bootstrap_canonical_empty_ledger_v1"
@@ -3682,6 +3683,11 @@ mod tests {
         receipt.operation = "d1_finalize_bootstrap_migration_ledger".to_string();
         receipt.effect_assertion_id = "bootstrap_canonical_empty_ledger_v1".to_string();
         assert!(valid_terminal_receipt_authority(&receipt));
+
+        let mut null_seed_receipt = terminal_receipt(&identity, &"d".repeat(64));
+        null_seed_receipt.effect_assertion_id =
+            "schema_create_objects_additive_seed_rows_v2".to_string();
+        assert!(valid_terminal_receipt_authority(&null_seed_receipt));
 
         let mut wrong_effect = receipt.clone();
         wrong_effect.effect_assertion_id = "schema_create_only_v1".to_string();
