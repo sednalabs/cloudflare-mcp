@@ -5021,7 +5021,8 @@ fn stdio_tool_calls_cover_context_and_body_normalization_edges() {
     );
     assert!(
         result_names.contains(&"d1_reconcile_bootstrap_migration_ledger")
-            && result_names.contains(&"d1_finalize_bootstrap_migration_ledger"),
+            && result_names.contains(&"d1_finalize_bootstrap_migration_ledger")
+            && result_names.contains(&"d1_abort_bootstrap_migration_ledger"),
         "find_tools should expose the bootstrap-specific recovery boundary: {tools_content}"
     );
 }
@@ -5948,6 +5949,201 @@ fn d1_bootstrap_migration_ledger_rejects_stale_plan_after_fresh_empty_preflight(
 }
 
 #[test]
+fn d1_bootstrap_zero_dispatch_abort_retires_only_exact_marker_aware_custody() {
+    let (dry_url, _) = spawn_fake_bootstrap_api(2, false, false, true);
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-bootstrap-zero-dispatch-abort-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create zero-dispatch bootstrap lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make zero-dispatch lease root private");
+    }
+    let mut dry = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", dry_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let preview = dry.call_tool(
+        340,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "dry_run": true}),
+    );
+    let plan = structured_content(&preview)["plan_sha256"]
+        .as_str()
+        .expect("zero-dispatch bootstrap plan")
+        .to_string();
+    dry.terminate();
+
+    // Force a pre-dispatch provider conflict, then put the exact terminally
+    // released bytes back in active to model the reviewed release-failure seam.
+    let (conflict_url, conflict_requests) = spawn_fake_bootstrap_api(2, true, false, true);
+    let env = vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", conflict_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ];
+    let mut bootstrap = McpStdioProcess::start_with_env(env.clone());
+    let blocked = bootstrap.call_tool(
+        341,
+        "d1_bootstrap_migration_ledger",
+        json!({"database_id": "db-1", "approved_plan_sha256": plan}),
+    );
+    let blocked = structured_content(&blocked);
+    assert_eq!(blocked["ok"], json!(false), "{blocked}");
+    assert_eq!(blocked["provider_mutations"], json!(0), "{blocked}");
+    assert_eq!(blocked["provider_outcome"], json!("not_dispatched"));
+    let nonce = blocked["lease"]["nonce"]
+        .as_str()
+        .unwrap_or_else(|| panic!("zero-dispatch lease nonce: {blocked}"))
+        .to_string();
+    let payload = blocked["lease"]["payload_sha256"]
+        .as_str()
+        .unwrap_or_else(|| panic!("zero-dispatch lease payload: {blocked}"))
+        .to_string();
+    bootstrap.terminate();
+    assert_eq!(conflict_requests.lock().expect("conflict requests").len(), 2);
+    let target = manifest_target_path(&lease_root);
+    let retired = target.join(format!("retired.{nonce}.lease.json"));
+    let active = target.join("active.lease.json");
+    fs::rename(&retired, &active).expect("model zero-dispatch release failure");
+
+    let terminal_request = "7".repeat(64);
+    let terminal_attempt = "8".repeat(64);
+    let abort_args = |attempt: &str, dry_run: bool, approved: Option<&str>| {
+        let mut args = json!({
+            "database_id": "db-1",
+            "approved_bootstrap_plan_sha256": plan,
+            "lease_nonce": nonce,
+            "lease_payload_sha256": payload,
+            "terminal_request_sha256": terminal_request,
+            "terminal_attempt_sha256": attempt,
+            "dry_run": dry_run,
+        });
+        if let Some(approved) = approved {
+            args["approved_terminal_plan_sha256"] = json!(approved);
+        }
+        args
+    };
+    let mut abort = McpStdioProcess::start_with_env(env);
+
+    let displaced = target.join("displaced.active.lease.json");
+    fs::rename(&active, &displaced).expect("temporarily remove active evidence");
+    let absent = structured_content(&abort.call_tool(
+        342,
+        "d1_abort_bootstrap_migration_ledger",
+        abort_args(&terminal_attempt, true, None),
+    ))
+    .clone();
+    assert_eq!(absent["ok"], json!(false), "{absent}");
+    assert_eq!(absent["custody_status"], json!("inspection_failed"));
+    assert_eq!(absent["provider_calls"], json!(0));
+    fs::rename(&displaced, &active).expect("restore active evidence");
+
+    let retiring = target.join("retiring.lease.json");
+    fs::rename(&active, &retiring).expect("install retiring evidence");
+    let retiring_result = structured_content(&abort.call_tool(
+        343,
+        "d1_abort_bootstrap_migration_ledger",
+        abort_args(&terminal_attempt, true, None),
+    ))
+    .clone();
+    assert_eq!(retiring_result["ok"], json!(false), "{retiring_result}");
+    assert_eq!(
+        retiring_result["error"]["code"],
+        json!("d1.bootstrap_abort_terminal_receipt_absent")
+    );
+    fs::rename(&retiring, &active).expect("restore active from retiring fixture");
+
+    let marker = target.join(format!(
+        "bootstrap-initializer-attempt.{nonce}.receipt.json"
+    ));
+    fs::write(&marker, b"{malformed").expect("install malformed attempt evidence");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o600))
+            .expect("make malformed marker private");
+    }
+    let malformed = structured_content(&abort.call_tool(
+        344,
+        "d1_abort_bootstrap_migration_ledger",
+        abort_args(&terminal_attempt, true, None),
+    ))
+    .clone();
+    assert_eq!(malformed["ok"], json!(false), "{malformed}");
+    assert_eq!(
+        malformed["error"]["code"],
+        json!("d1.bootstrap_abort_dispatch_not_absent")
+    );
+    fs::remove_file(&marker).expect("remove malformed test fixture");
+
+    let preview = structured_content(&abort.call_tool(
+        345,
+        "d1_abort_bootstrap_migration_ledger",
+        abort_args(&terminal_attempt, true, None),
+    ))
+    .clone();
+    assert_eq!(preview["ok"], json!(true), "{preview}");
+    assert_eq!(
+        preview["status"],
+        json!("bootstrap_zero_dispatch_abort_plan_ready")
+    );
+    assert_eq!(preview["provider_initializer_dispatches"], json!(0));
+    assert_eq!(preview["provider_calls"], json!(0));
+    let terminal_plan = preview["terminal_plan_sha256"]
+        .as_str()
+        .expect("zero-dispatch terminal plan")
+        .to_string();
+
+    let completed = structured_content(&abort.call_tool(
+        346,
+        "d1_abort_bootstrap_migration_ledger",
+        abort_args(&terminal_attempt, false, Some(&terminal_plan)),
+    ))
+    .clone();
+    assert_eq!(completed["ok"], json!(true), "{completed}");
+    assert_eq!(
+        completed["status"],
+        json!("bootstrap_zero_dispatch_abort_complete")
+    );
+    assert_eq!(completed["custody_status"], json!("retired_evidence_verified"));
+    assert_eq!(completed["local_namespace_mutations"], json!(3));
+    assert_eq!(completed["provider_calls"], json!(0));
+
+    let replay = structured_content(&abort.call_tool(
+        347,
+        "d1_abort_bootstrap_migration_ledger",
+        abort_args(&terminal_attempt, false, Some(&terminal_plan)),
+    ))
+    .clone();
+    assert_eq!(replay["ok"], json!(true), "{replay}");
+    assert_eq!(replay["replayed"], json!(true));
+    assert_eq!(replay["local_namespace_mutations"], json!(0));
+    assert_eq!(replay["provider_calls"], json!(0));
+
+    let conflict = structured_content(&abort.call_tool(
+        348,
+        "d1_abort_bootstrap_migration_ledger",
+        abort_args(&"9".repeat(64), true, None),
+    ))
+    .clone();
+    assert_eq!(conflict["ok"], json!(false), "{conflict}");
+    assert_eq!(conflict["capability_state"], json!("contradictory"));
+    assert_eq!(conflict["provider_calls"], json!(0));
+    abort.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
 fn d1_bootstrap_migration_ledger_response_loss_retains_custody_and_never_retries() {
     let (base_url, requests) = spawn_fake_bootstrap_api(9, false, true, true);
     let lease_root = std::path::PathBuf::from("/tmp").join(format!(
@@ -6015,6 +6211,28 @@ fn d1_bootstrap_migration_ledger_response_loss_retains_custody_and_never_retries
         json!("d1.migration_target_lease_held")
     );
     assert_eq!(blocked["provider_calls"], json!(0));
+
+    let abort_after_attempt = fresh.call_tool(
+        37,
+        "d1_abort_bootstrap_migration_ledger",
+        json!({
+            "database_id": "db-1",
+            "approved_bootstrap_plan_sha256": plan,
+            "lease_nonce": content["lease"]["nonce"],
+            "lease_payload_sha256": content["lease"]["payload_sha256"],
+            "terminal_request_sha256": "7".repeat(64),
+            "terminal_attempt_sha256": "8".repeat(64),
+            "dry_run": true,
+        }),
+    );
+    let abort_after_attempt = structured_content(&abort_after_attempt);
+    assert_eq!(abort_after_attempt["ok"], json!(false), "{abort_after_attempt}");
+    assert_eq!(abort_after_attempt["provider_calls"], json!(0));
+    assert_eq!(
+        abort_after_attempt["error"]["code"],
+        json!("d1.bootstrap_abort_dispatch_not_absent")
+    );
+    assert_private_regular_active_lease(&lease_root);
 
     let requests = requests.lock().expect("request log").clone();
     assert_eq!(requests.len(), 9);

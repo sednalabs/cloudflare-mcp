@@ -1199,6 +1199,7 @@ mod tests {
             "d1_bootstrap_migration_ledger",
             "d1_reconcile_bootstrap_migration_ledger",
             "d1_finalize_bootstrap_migration_ledger",
+            "d1_abort_bootstrap_migration_ledger",
             "d1_reconcile_migration_manifest",
             "d1_finalize_migration_reconciliation",
             "d1_delete_database",

@@ -1455,6 +1455,67 @@
       "name": "connector_control"
     },
     {
+      "description": "Persist an approval-bound zero-initializer-dispatch receipt and terminally retire exact bootstrap custody without provider access.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "approved_bootstrap_plan_sha256": {
+            "type": "string"
+          },
+          "approved_terminal_plan_sha256": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "database_id": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "lease_nonce": {
+            "type": "string"
+          },
+          "lease_payload_sha256": {
+            "type": "string"
+          },
+          "migrations_table": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "terminal_attempt_sha256": {
+            "type": "string"
+          },
+          "terminal_request_sha256": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "database_id",
+          "approved_bootstrap_plan_sha256",
+          "lease_nonce",
+          "lease_payload_sha256",
+          "terminal_request_sha256",
+          "terminal_attempt_sha256"
+        ],
+        "type": "object"
+      },
+      "name": "d1_abort_bootstrap_migration_ledger"
+    },
+    {
       "description": "Apply a caller-supplied exact-byte D1 migration manifest under a target lease and approved dry-run plan.",
       "inputSchema": {
         "$defs": {

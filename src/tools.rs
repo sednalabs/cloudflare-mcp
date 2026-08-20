@@ -44,9 +44,11 @@ use crate::d1_migration_bootstrap::{
     execute_d1_bootstrap_migration_ledger,
 };
 use crate::d1_migration_bootstrap_recovery::{
-    D1_BOOTSTRAP_FINALIZE_OPERATION, D1_BOOTSTRAP_RECONCILE_OPERATION,
+    D1_BOOTSTRAP_ABORT_OPERATION, D1_BOOTSTRAP_FINALIZE_OPERATION,
+    D1_BOOTSTRAP_RECONCILE_OPERATION, D1AbortBootstrapMigrationLedgerArgs,
     D1FinalizeBootstrapMigrationLedgerArgs, D1ReconcileBootstrapMigrationLedgerArgs,
-    finalize_bootstrap_migration_ledger, reconcile_bootstrap_migration_ledger,
+    abort_bootstrap_migration_ledger, finalize_bootstrap_migration_ledger,
+    reconcile_bootstrap_migration_ledger,
 };
 use crate::d1_migration_lease::{
     acquire_d1_migration_lease, d1_migration_lease_requirements,
@@ -4660,6 +4662,8 @@ impl CloudflareMcp {
                 "lease_retained": null,
                 "custody_status": "not_inspected",
                 "provider_calls": 0,
+                "provider_read_lifecycle": [],
+                "response_evidence": [],
                 "provider_mutations": 0,
                 "local_namespace_mutations": 0,
                 "error": d1_call_tool_error_value(result),
@@ -4824,6 +4828,108 @@ impl CloudflareMcp {
             audit,
             dry_run,
         ))
+    }
+
+    #[tool(
+        name = "d1_abort_bootstrap_migration_ledger",
+        description = "Persist an approval-bound zero-initializer-dispatch receipt and terminally retire exact bootstrap custody without provider access."
+    )]
+    async fn cloudflare_d1_abort_bootstrap_migration_ledger(
+        &self,
+        Parameters(args): Parameters<D1AbortBootstrapMigrationLedgerArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let D1AbortBootstrapMigrationLedgerArgs {
+            account_id: requested_account_id,
+            database_id: requested_database_id,
+            migrations_table: requested_migrations_table,
+            approved_bootstrap_plan_sha256,
+            lease_nonce,
+            lease_payload_sha256,
+            terminal_request_sha256,
+            terminal_attempt_sha256,
+            dry_run,
+            approved_terminal_plan_sha256,
+        } = args;
+        let zero_call_error = |result: CallToolResult| {
+            CallToolResult::structured_error(json!({
+                "ok": false,
+                "operation": D1_BOOTSTRAP_ABORT_OPERATION,
+                "status": "reconciliation_required",
+                "capability_state": "contradictory",
+                "initializer_dispatch_state": "unproven",
+                "provider_initializer_dispatches": null,
+                "lease_retained": null,
+                "custody_status": "not_inspected",
+                "provider_calls": 0,
+                "provider_read_lifecycle": [],
+                "response_evidence": [],
+                "provider_mutations": 0,
+                "local_namespace_mutations": 0,
+                "error": d1_call_tool_error_value(result),
+            }))
+        };
+        if let Some(account_id) = requested_account_id.as_deref() {
+            if let Err(result) = normalize_d1_manifest_target(account_id, &requested_database_id) {
+                return Ok(zero_call_error(result));
+            }
+        }
+        let resolved_account_id = match resolve_account_id(self, requested_account_id.as_deref()) {
+            Ok(account_id) => account_id,
+            Err(_) => {
+                return Ok(zero_call_error(invalid_argument_result(
+                    "d1.invalid_manifest_target_identity",
+                    "account_id must be supplied or configured as a canonical identifier",
+                    "Use the exact account_id read from the intended Cloudflare resource.",
+                )));
+            }
+        };
+        let target = match normalize_d1_manifest_target(resolved_account_id, &requested_database_id)
+        {
+            Ok(target) => target,
+            Err(result) => return Ok(zero_call_error(result)),
+        };
+        let migrations_table =
+            match normalize_d1_bootstrap_migrations_table(requested_migrations_table.as_deref()) {
+                Ok(table) => table,
+                Err(result) => return Ok(zero_call_error(result)),
+            };
+        let mutation_target = json!({
+            "target_key_sha256": sha256_bytes_hex(
+                format!("{}\0{}", target.account_id, target.database_id).as_bytes()
+            ),
+            "migration_family": D1_BOOTSTRAP_LEASE_FAMILY,
+            "migrations_table": migrations_table,
+            "approved_bootstrap_plan_sha256": approved_bootstrap_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "terminal_request_sha256": terminal_request_sha256,
+            "terminal_attempt_sha256": terminal_attempt_sha256,
+        });
+        let mutation_plan = MutationPlan::new(D1_BOOTSTRAP_ABORT_OPERATION)
+            .step("prove_initializer_attempt_marker_absent", false, mutation_target.clone())
+            .step("persist_zero_dispatch_terminal_receipt", true, mutation_target.clone())
+            .step("reprove_initializer_attempt_marker_absent", false, mutation_target.clone())
+            .step("retire_bootstrap_custody", true, mutation_target.clone());
+        let audit = MutationAuditSession::start(
+            Some(&parts),
+            D1_BOOTSTRAP_ABORT_OPERATION,
+            mutation_target,
+            dry_run,
+        );
+        let result = abort_bootstrap_migration_ledger(
+            &target.account_id,
+            &target.database_id,
+            &migrations_table,
+            &approved_bootstrap_plan_sha256,
+            &lease_nonce,
+            &lease_payload_sha256,
+            &terminal_request_sha256,
+            &terminal_attempt_sha256,
+            dry_run,
+            approved_terminal_plan_sha256.as_deref(),
+        );
+        Ok(finalize_mutation_result(result, &mutation_plan, audit, dry_run))
     }
 
     #[tool(

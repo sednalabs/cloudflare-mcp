@@ -66,6 +66,14 @@ pub(crate) fn d1_bootstrap_mutation_plan(input: &D1BootstrapExecutionInput) -> M
             json!({"initializer_sql_sha256": initializer_sql_sha256}),
         )
         .step(
+            "persist_initializer_attempt_authority",
+            true,
+            json!({
+                "dispatch_protocol": crate::d1_migration_lease::D1_BOOTSTRAP_INITIALIZER_DISPATCH_PROTOCOL,
+                "initializer_sql_sha256": initializer_sql_sha256,
+            }),
+        )
+        .step(
             "initialize_canonical_empty_migration_ledger_once",
             true,
             json!({"initializer_sql_sha256": initializer_sql_sha256}),
@@ -1130,6 +1138,26 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
             provider_mutations,
             Some(&lease),
             None,
+            "not_dispatched",
+            None,
+        );
+    }
+
+    if let Err(result) = lease.record_bootstrap_initializer_attempt() {
+        let lease_retained = if lease.revalidate().is_ok() {
+            lease.retain();
+            Some(true)
+        } else {
+            None
+        };
+        return contextualize_bootstrap_failure(
+            result,
+            &input,
+            Some(&plan_sha256),
+            provider_calls,
+            provider_mutations,
+            Some(&lease),
+            lease_retained,
             "not_dispatched",
             None,
         );

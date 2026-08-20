@@ -75,6 +75,7 @@ Use curated D1 tools instead of generic API calls for database workflows:
 - `d1_bootstrap_migration_ledger`
 - `d1_reconcile_bootstrap_migration_ledger`
 - `d1_finalize_bootstrap_migration_ledger`
+- `d1_abort_bootstrap_migration_ledger`
 - `d1_apply_migration_manifest`
 - `d1_reconcile_migration_manifest`
 - `d1_finalize_migration_reconciliation`
@@ -128,6 +129,17 @@ persistence reports the durable receipt and local mutation while leaving
 retirement blocked. The final descriptor-bound readback remains authoritative:
 if it fails, its exact true/false/null receipt evidence replaces any earlier
 creation-time claim.
+
+Use `d1_abort_bootstrap_migration_ledger` only for marker-aware bootstrap
+custody whose exact initializer-attempt receipt is stably absent. This is the
+provider-free terminal path for a release failure before any initializer
+dispatch, not an alternative reconciler. Dry run returns an approval-bound
+terminal plan; live execution persists an exact `not_committed` receipt,
+rechecks marker absence, and retires custody. Active, retiring, retired, and
+absent physical evidence are classified independently. Exact completed replay
+converges with zero provider or local mutations; conflicting receipt identity,
+legacy custody, malformed marker evidence, or any durable attempt marker fails
+closed. A fresh bootstrap after successful retirement requires a new dry run.
 
 Use `d1_reconcile_migration_manifest` only for exact retained
 `active.lease.json` or `retiring.lease.json` evidence after an ambiguous

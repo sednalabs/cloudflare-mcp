@@ -29,6 +29,7 @@ use crate::tools::{d1_applied_migrations_sql, sha256_bytes_hex, sha256_hex};
 
 pub(crate) const D1_BOOTSTRAP_RECONCILE_OPERATION: &str = "d1_reconcile_bootstrap_migration_ledger";
 pub(crate) const D1_BOOTSTRAP_FINALIZE_OPERATION: &str = "d1_finalize_bootstrap_migration_ledger";
+pub(crate) const D1_BOOTSTRAP_ABORT_OPERATION: &str = "d1_abort_bootstrap_migration_ledger";
 const BOOTSTRAP_EFFECT_ASSERTION_ID: &str = "bootstrap_canonical_empty_ledger_v1";
 const BOOTSTRAP_OUTCOME: &str = "full_state_converged";
 
@@ -58,6 +59,24 @@ pub struct D1FinalizeBootstrapMigrationLedgerArgs {
     pub expected_initializer_authority_sha256: String,
     pub expected_query_authority_sha256: String,
     pub expected_canonical_snapshot_sha256: String,
+    pub terminal_request_sha256: String,
+    pub terminal_attempt_sha256: String,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub approved_terminal_plan_sha256: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct D1AbortBootstrapMigrationLedgerArgs {
+    #[serde(default)]
+    pub account_id: Option<String>,
+    pub database_id: String,
+    #[serde(default)]
+    pub migrations_table: Option<String>,
+    pub approved_bootstrap_plan_sha256: String,
+    pub lease_nonce: String,
+    pub lease_payload_sha256: String,
     pub terminal_request_sha256: String,
     pub terminal_attempt_sha256: String,
     #[serde(default)]
@@ -230,6 +249,31 @@ fn contextualize_post_create_receipt_failure(
             "unknown",
             provider_calls,
             lifecycle,
+            custody,
+            lease_retained,
+            local_namespace_mutations,
+        ),
+        readback
+            .receipt_persisted
+            .map(Value::Bool)
+            .unwrap_or(Value::Null),
+    )
+}
+
+fn contextualize_abort_post_create_failure(
+    result: CallToolResult,
+    capability_state: &'static str,
+    readback: D1TerminalEvidenceReadback,
+    local_namespace_mutations: usize,
+) -> CallToolResult {
+    let (custody, lease_retained) = terminal_readback_custody_fields(readback);
+    with_receipt_persisted(
+        contextualize_failure(
+            result,
+            D1_BOOTSTRAP_ABORT_OPERATION,
+            capability_state,
+            0,
+            Vec::new(),
             custody,
             lease_retained,
             local_namespace_mutations,
@@ -1637,6 +1681,384 @@ pub(crate) async fn finalize_bootstrap_migration_ledger(
         "response_evidence": response_evidence,
         "provider_mutations": 0,
         "local_namespace_mutations": local_receipt_mutations + retirement.local_namespace_mutations,
+    }))
+}
+
+fn bootstrap_abort_authorities() -> (String, String, String) {
+    let protocol = sha256_bytes_hex(
+        &serde_json::to_vec(&json!({
+            "version": 1,
+            "effect_assertion_id": "bootstrap_initializer_not_dispatched_v1",
+            "lease_protocol": crate::d1_migration_lease::D1_BOOTSTRAP_INITIALIZER_DISPATCH_PROTOCOL,
+            "dispatch_rule": "durable_attempt_marker_before_provider_dispatch",
+        }))
+        .expect("bootstrap abort protocol serialization is infallible"),
+    );
+    let query = sha256_bytes_hex(
+        &serde_json::to_vec(&json!({
+            "version": 1,
+            "evidence": "exact_initializer_attempt_marker_stably_absent_under_guard",
+            "physical_states": ["absent", "present", "malformed_or_contradictory"],
+        }))
+        .expect("bootstrap abort query serialization is infallible"),
+    );
+    let snapshot = sha256_bytes_hex(
+        &serde_json::to_vec(&json!({
+            "version": 1,
+            "initializer_dispatch_state": "not_dispatched",
+            "provider_initializer_dispatches": 0,
+        }))
+        .expect("bootstrap abort snapshot serialization is infallible"),
+    );
+    (protocol, query, snapshot)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bootstrap_abort_terminal_plan_sha256(
+    target_key_sha256: &str,
+    migrations_table: &str,
+    approved_bootstrap_plan_sha256: &str,
+    lease_nonce: &str,
+    lease_payload_sha256: &str,
+    protocol_authority_sha256: &str,
+    marker_query_sha256: &str,
+    zero_dispatch_snapshot_sha256: &str,
+    terminal_request_sha256: &str,
+    terminal_attempt_sha256: &str,
+) -> String {
+    sha256_bytes_hex(
+        &serde_json::to_vec(&json!({
+            "version": 1,
+            "operation": D1_BOOTSTRAP_ABORT_OPERATION,
+            "target_key_sha256": target_key_sha256,
+            "migration_family": D1_BOOTSTRAP_LEASE_FAMILY,
+            "migrations_table": migrations_table,
+            "approved_bootstrap_plan_sha256": approved_bootstrap_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "protocol_authority_sha256": protocol_authority_sha256,
+            "marker_query_sha256": marker_query_sha256,
+            "zero_dispatch_snapshot_sha256": zero_dispatch_snapshot_sha256,
+            "terminal_request_sha256": terminal_request_sha256,
+            "terminal_attempt_sha256": terminal_attempt_sha256,
+            "effect": "persist_zero_dispatch_terminal_receipt_then_retire_bootstrap_custody",
+            "provider_calls": 0,
+            "provider_mutations": 0,
+        }))
+        .expect("bootstrap abort terminal plan serialization is infallible"),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn abort_bootstrap_migration_ledger(
+    account_id: &str,
+    database_id: &str,
+    migrations_table: &str,
+    approved_bootstrap_plan_sha256: &str,
+    lease_nonce: &str,
+    lease_payload_sha256: &str,
+    terminal_request_sha256: &str,
+    terminal_attempt_sha256: &str,
+    dry_run: bool,
+    approved_terminal_plan_sha256: Option<&str>,
+) -> CallToolResult {
+    let hashes = [
+        approved_bootstrap_plan_sha256,
+        lease_nonce,
+        lease_payload_sha256,
+        terminal_request_sha256,
+        terminal_attempt_sha256,
+    ];
+    if hashes.into_iter().any(|value| !valid_lower_sha256(value))
+        || terminal_request_sha256 == terminal_attempt_sha256
+        || (!dry_run
+            && approved_terminal_plan_sha256.is_none_or(|value| !valid_lower_sha256(value)))
+    {
+        return contextualize_failure(
+            recovery_error(
+                "d1.bootstrap_abort_request_invalid",
+                "zero-dispatch bootstrap retirement requires canonical distinct request and attempt digests plus exact custody identity",
+            ),
+            D1_BOOTSTRAP_ABORT_OPERATION,
+            "contradictory",
+            0,
+            Vec::new(),
+            "not_inspected",
+            Value::Null,
+            0,
+        );
+    }
+    let initializer = d1_migrations_table_init_sql(migrations_table);
+    let computed_plan =
+        d1_bootstrap_plan_sha256(account_id, database_id, migrations_table, &initializer);
+    if computed_plan != approved_bootstrap_plan_sha256 {
+        return contextualize_failure(
+            recovery_error(
+                "d1.bootstrap_abort_plan_mismatch",
+                "the supplied bootstrap plan does not reproduce the exact target, table, and initializer authority",
+            ),
+            D1_BOOTSTRAP_ABORT_OPERATION,
+            "contradictory",
+            0,
+            Vec::new(),
+            "not_inspected",
+            Value::Null,
+            0,
+        );
+    }
+    let target_key_sha256 = sha256_bytes_hex(format!("{account_id}\0{database_id}").as_bytes());
+    let (protocol_authority_sha256, marker_query_sha256, zero_dispatch_snapshot_sha256) =
+        bootstrap_abort_authorities();
+    let terminal_plan_sha256 = bootstrap_abort_terminal_plan_sha256(
+        &target_key_sha256,
+        migrations_table,
+        approved_bootstrap_plan_sha256,
+        lease_nonce,
+        lease_payload_sha256,
+        &protocol_authority_sha256,
+        &marker_query_sha256,
+        &zero_dispatch_snapshot_sha256,
+        terminal_request_sha256,
+        terminal_attempt_sha256,
+    );
+    if !dry_run && approved_terminal_plan_sha256 != Some(terminal_plan_sha256.as_str()) {
+        return contextualize_failure(
+            recovery_error(
+                "d1.bootstrap_abort_terminal_plan_mismatch",
+                "approved_terminal_plan_sha256 does not match this exact zero-dispatch retirement plan",
+            ),
+            D1_BOOTSTRAP_ABORT_OPERATION,
+            "contradictory",
+            0,
+            Vec::new(),
+            "not_inspected",
+            Value::Null,
+            0,
+        );
+    }
+    let receipt = D1TerminalReconciliationReceipt {
+        version: 2,
+        operation: D1_BOOTSTRAP_ABORT_OPERATION.to_string(),
+        target_key_sha256,
+        lease_nonce: lease_nonce.to_string(),
+        lease_payload_sha256: lease_payload_sha256.to_string(),
+        approved_apply_plan_sha256: approved_bootstrap_plan_sha256.to_string(),
+        effect_assertion_id: "bootstrap_initializer_not_dispatched_v1".to_string(),
+        reconciliation_plan_sha256: protocol_authority_sha256.clone(),
+        expectation_proof_sha256: protocol_authority_sha256.clone(),
+        query_sha256: marker_query_sha256.clone(),
+        canonical_snapshot_sha256: zero_dispatch_snapshot_sha256.clone(),
+        terminal_request_sha256: terminal_request_sha256.to_string(),
+        terminal_attempt_sha256: terminal_attempt_sha256.to_string(),
+        terminal_plan_sha256: terminal_plan_sha256.clone(),
+        outcome: "not_committed".to_string(),
+        original_prefix_length: 0,
+        current_prefix_length: 0,
+    };
+    let mut lease = match inspect_terminal_d1_migration_lease(
+        account_id,
+        database_id,
+        D1_BOOTSTRAP_LEASE_FAMILY,
+        approved_bootstrap_plan_sha256,
+        lease_nonce,
+        lease_payload_sha256,
+    ) {
+        Ok(lease) => lease,
+        Err(result) => {
+            return contextualize_failure(
+                result,
+                D1_BOOTSTRAP_ABORT_OPERATION,
+                "contradictory",
+                0,
+                Vec::new(),
+                "inspection_failed",
+                Value::Null,
+                0,
+            );
+        }
+    };
+    if let Err(result) = lease.prove_bootstrap_initializer_not_dispatched() {
+        return contextualize_failure(
+            result,
+            D1_BOOTSTRAP_ABORT_OPERATION,
+            "contradictory",
+            0,
+            Vec::new(),
+            custody_status(&lease),
+            terminal_lease_retained(&lease),
+            0,
+        );
+    }
+    let receipt_state = match lease.terminal_receipt_state(&receipt) {
+        Ok(receipt) => receipt,
+        Err(result) => {
+            return contextualize_failure(
+                result,
+                D1_BOOTSTRAP_ABORT_OPERATION,
+                "contradictory",
+                0,
+                Vec::new(),
+                custody_status(&lease),
+                terminal_lease_retained(&lease),
+                0,
+            );
+        }
+    };
+    if lease.is_retired() {
+        return match receipt_state {
+            Some(evidence) => CallToolResult::structured(json!({
+                "ok": true,
+                "operation": D1_BOOTSTRAP_ABORT_OPERATION,
+                "dry_run": dry_run,
+                "status": "bootstrap_zero_dispatch_abort_already_complete",
+                "replayed": true,
+                "terminal_plan_sha256": terminal_plan_sha256,
+                "terminal_receipt_sha256": evidence.payload_sha256,
+                "initializer_dispatch_state": "not_dispatched",
+                "provider_initializer_dispatches": 0,
+                "retry_decision": "fresh_bootstrap_requires_new_dry_run",
+                "lease_decision": "retired",
+                "lease_retained": false,
+                "custody_status": "retired_evidence_verified",
+                "provider_calls": 0,
+                "provider_read_lifecycle": [],
+                "response_evidence": [],
+                "provider_mutations": 0,
+                "local_namespace_mutations": 0,
+            })),
+            None => contextualize_failure(
+                recovery_error(
+                    "d1.bootstrap_abort_terminal_receipt_absent",
+                    "retired bootstrap custody exists without its exact zero-dispatch terminal receipt",
+                ),
+                D1_BOOTSTRAP_ABORT_OPERATION,
+                "contradictory",
+                0,
+                Vec::new(),
+                "retired_evidence_verified",
+                json!(false),
+                0,
+            ),
+        };
+    }
+    if lease.identity.namespace == "retiring" && receipt_state.is_none() {
+        return contextualize_failure(
+            recovery_error(
+                "d1.bootstrap_abort_terminal_receipt_absent",
+                "bootstrap custody entered retiring state without its exact zero-dispatch terminal receipt",
+            ),
+            D1_BOOTSTRAP_ABORT_OPERATION,
+            "contradictory",
+            0,
+            Vec::new(),
+            "retiring_evidence_verified",
+            Value::Null,
+            0,
+        );
+    }
+    if dry_run {
+        return CallToolResult::structured(json!({
+            "ok": true,
+            "operation": D1_BOOTSTRAP_ABORT_OPERATION,
+            "dry_run": true,
+            "status": "bootstrap_zero_dispatch_abort_plan_ready",
+            "terminal_plan_sha256": terminal_plan_sha256,
+            "initializer_dispatch_state": "not_dispatched",
+            "provider_initializer_dispatches": 0,
+            "evidence": {
+                "protocol_authority_sha256": protocol_authority_sha256,
+                "marker_query_sha256": marker_query_sha256,
+                "zero_dispatch_snapshot_sha256": zero_dispatch_snapshot_sha256,
+            },
+            "retry_decision": "fresh_bootstrap_requires_new_dry_run",
+            "lease_decision": if lease.identity.namespace == "active" { json!("retain_until_approved_terminal_call") } else { Value::Null },
+            "lease_retained": terminal_lease_retained(&lease),
+            "custody_status": custody_status(&lease),
+            "provider_calls": 0,
+            "provider_read_lifecycle": [],
+            "response_evidence": [],
+            "provider_mutations": 0,
+            "local_namespace_mutations": 0,
+        }));
+    }
+    let (receipt_evidence, receipt_created) = match lease.persist_terminal_receipt(&receipt) {
+        Ok(receipt) => receipt,
+        Err(failure) => {
+            if failure.local_namespace_mutations > 0 {
+                let readback = lease.terminal_evidence_readback(&receipt, None);
+                return contextualize_abort_post_create_failure(
+                    failure.result,
+                    "unknown",
+                    readback,
+                    failure.local_namespace_mutations,
+                );
+            }
+            return contextualize_failure(
+                failure.result,
+                D1_BOOTSTRAP_ABORT_OPERATION,
+                "unknown",
+                0,
+                Vec::new(),
+                custody_status(&lease),
+                terminal_lease_retained(&lease),
+                failure.local_namespace_mutations,
+            );
+        }
+    };
+    if let Err(result) = lease.prove_bootstrap_initializer_not_dispatched() {
+        let readback = lease.terminal_evidence_readback(&receipt, None);
+        return contextualize_abort_post_create_failure(
+            result,
+            "contradictory",
+            readback,
+            usize::from(receipt_created),
+        );
+    }
+    let retirement = match lease.retire_after_terminal_receipt(&receipt_evidence) {
+        Ok(retirement) => retirement,
+        Err(failure) => {
+            let readback = lease.terminal_evidence_readback(&receipt, None);
+            return contextualize_abort_post_create_failure(
+                failure.result,
+                "unknown",
+                readback,
+                usize::from(receipt_created) + failure.local_namespace_mutations,
+            );
+        }
+    };
+    let final_readback = lease.terminal_evidence_readback(&receipt, None);
+    if final_readback.custody != D1TerminalCustodyNamespace::Retired
+        || final_readback.receipt_persisted != Some(true)
+    {
+        return contextualize_abort_post_create_failure(
+            recovery_error(
+                "d1.bootstrap_abort_terminal_readback_failed",
+                "zero-dispatch terminal receipt and retired bootstrap custody did not survive exact readback",
+            ),
+            "unknown",
+            final_readback,
+            usize::from(receipt_created) + retirement.local_namespace_mutations,
+        );
+    }
+    CallToolResult::structured(json!({
+        "ok": true,
+        "operation": D1_BOOTSTRAP_ABORT_OPERATION,
+        "dry_run": false,
+        "status": "bootstrap_zero_dispatch_abort_complete",
+        "replayed": !receipt_created && retirement.local_namespace_mutations == 0,
+        "terminal_plan_sha256": terminal_plan_sha256,
+        "terminal_receipt_sha256": receipt_evidence.payload_sha256,
+        "initializer_dispatch_state": "not_dispatched",
+        "provider_initializer_dispatches": 0,
+        "retry_decision": "fresh_bootstrap_requires_new_dry_run",
+        "lease_decision": "retired",
+        "lease_retained": false,
+        "custody_status": "retired_evidence_verified",
+        "provider_calls": 0,
+        "provider_read_lifecycle": [],
+        "response_evidence": [],
+        "provider_mutations": 0,
+        "local_namespace_mutations": usize::from(receipt_created) + retirement.local_namespace_mutations,
     }))
 }
 

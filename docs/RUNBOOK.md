@@ -110,6 +110,43 @@ chain, and reports the single mutation attempt. Escalate that exact evidence to
 the governed reconciliation path. A canonical empty ledger observed afterward
 does not prove whether this call created it, so it is not permission to replay.
 
+Every new bootstrap lease carries the
+`bootstrap-initializer-attempt-marker-v1` protocol. Immediately before the one
+initializer dispatch, the coordinator durably creates an exact attempt receipt
+under the held target guard. A failure before that receipt exists is therefore
+distinguishable from every attempted or ambiguous initializer outcome.
+
+### Retire bootstrap custody after a proven zero-dispatch failure
+
+Use `d1_abort_bootstrap_migration_ledger` only when a bootstrap result retained
+custody with `provider_outcome=not_dispatched` and zero provider mutations, such
+as a failed active-to-retiring release after the under-custody empty-target
+proof. Supply the exact target, ledger table, bootstrap plan, lease nonce and
+payload digest plus distinct terminal request and attempt SHA-256 identities.
+
+1. Call the abort tool with `dry_run=true`. It performs no provider access. It
+   accepts only marker-aware bootstrap lease bytes and proves the exact
+   initializer-attempt receipt is stably absent under the held guard. Legacy
+   custody, a present marker, malformed or contradictory marker evidence,
+   absent/conflicting lease evidence, or retiring/retired custody without the
+   exact terminal receipt fails closed.
+2. Independently approve the returned terminal-plan digest, then repeat with
+   `dry_run=false` and that exact digest. The tool creates a canonical
+   `not_committed` receipt, re-proves marker absence, and moves custody through
+   active -> retiring -> `retired.<nonce>.lease.json` with directory sync at
+   each boundary.
+3. Require `bootstrap_zero_dispatch_abort_complete`,
+   `provider_initializer_dispatches=0`, `provider_calls=0`,
+   `provider_mutations=0`, and verified retired custody. Exact replay returns
+   the same terminal receipt with zero mutations. Changed request/attempt or
+   plan authority conflicts with the incumbent receipt.
+
+Never use this path after an initializer attempt. A durable attempt marker is
+permanent no-retry evidence even when transport never returned a response. Use
+the read-only bootstrap reconciler and normal bootstrap finalizer for that
+state. After a successful zero-dispatch retirement, any later bootstrap is a
+new operation requiring a fresh empty-target dry run and approval.
+
 ### Recover retained bootstrap custody
 
 This recovery is bootstrap-specific. Never substitute an empty migration

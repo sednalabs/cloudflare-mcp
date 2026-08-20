@@ -27,6 +27,8 @@ use crate::tools::{invalid_argument_result, sha256_bytes_hex};
 use crate::verification::now_unix_ms;
 
 pub(crate) const D1_MANIFEST_LEASE_ROOT_ENV: &str = "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT";
+pub(crate) const D1_BOOTSTRAP_INITIALIZER_DISPATCH_PROTOCOL: &str =
+    "bootstrap-initializer-attempt-marker-v1";
 static D1_MANIFEST_LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 // Kept test-only so production retirement has no injectable branch. Faults
@@ -104,6 +106,8 @@ const ACTIVE_LEASE_NAME: &str = "active.lease.json";
 const RETIRING_LEASE_NAME: &str = "retiring.lease.json";
 #[cfg(target_os = "linux")]
 const GUARD_NAME: &str = "guard.lock";
+#[cfg(target_os = "linux")]
+const BOOTSTRAP_INITIALIZER_ATTEMPT_PREFIX: &str = "bootstrap-initializer-attempt.";
 
 #[derive(Debug)]
 pub(crate) struct D1MigrationLease {
@@ -129,6 +133,7 @@ pub(crate) struct D1MigrationLease {
     active_file_identity: D1LeaseFileIdentity,
     #[cfg(target_os = "linux")]
     released: bool,
+    bootstrap_initializer_dispatch_protocol: bool,
     pub(crate) identity: D1MigrationLeaseIdentity,
 }
 
@@ -157,6 +162,8 @@ struct D1RetainedMigrationLeasePayload {
     nonce: String,
     target_key_sha256: String,
     version: u8,
+    #[serde(default)]
+    initializer_dispatch_protocol: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -195,6 +202,12 @@ fn valid_terminal_receipt_authority(receipt: &D1TerminalReconciliationReceipt) -
                 && receipt.outcome == "full_state_converged"
                 && receipt.original_prefix_length == 0
                 && receipt.current_prefix_length == 1
+        }
+        "d1_abort_bootstrap_migration_ledger" => {
+            receipt.effect_assertion_id == "bootstrap_initializer_not_dispatched_v1"
+                && receipt.outcome == "not_committed"
+                && receipt.original_prefix_length == 0
+                && receipt.current_prefix_length == 0
         }
         _ => false,
     }
@@ -297,7 +310,22 @@ pub(crate) struct D1RetainedMigrationLease {
     evidence_file_identity: D1LeaseFileIdentity,
     #[cfg(target_os = "linux")]
     evidence_name: String,
+    bootstrap_initializer_dispatch_protocol: bool,
     pub(crate) identity: D1RetainedMigrationLeaseIdentity,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct D1BootstrapInitializerAttemptReceipt {
+    version: u8,
+    operation: String,
+    target_key_sha256: String,
+    lease_nonce: String,
+    lease_payload_sha256: String,
+    approved_bootstrap_plan_sha256: String,
+    migration_family: String,
+    dispatch_protocol: String,
+    state: String,
 }
 
 #[cfg(target_os = "linux")]
@@ -325,6 +353,41 @@ impl D1MigrationLease {
         #[cfg(target_os = "linux")]
         {
             self.guard.take();
+        }
+    }
+
+    /// Durably record initializer-attempt authority before the bootstrap
+    /// coordinator is permitted to cross the provider dispatch boundary.
+    pub(crate) fn record_bootstrap_initializer_attempt(&self) -> Result<(), CallToolResult> {
+        #[cfg(target_os = "linux")]
+        {
+            self.revalidate()?;
+            if !self.bootstrap_initializer_dispatch_protocol {
+                return Err(self.revalidation_failure(
+                    "bootstrap lease does not carry the initializer dispatch-marker protocol",
+                ));
+            }
+            let receipt = D1BootstrapInitializerAttemptReceipt {
+                version: 1,
+                operation: "d1_bootstrap_migration_ledger".to_string(),
+                target_key_sha256: self.identity.target_key_sha256.clone(),
+                lease_nonce: self.identity.nonce.clone(),
+                lease_payload_sha256: self.identity.payload_sha256.clone(),
+                approved_bootstrap_plan_sha256: linux::approved_plan_from_owned_lease(
+                    &self.active,
+                )
+                .map_err(|message| self.revalidation_failure(message))?,
+                migration_family: "migration-ledger-bootstrap-v1".to_string(),
+                dispatch_protocol: D1_BOOTSTRAP_INITIALIZER_DISPATCH_PROTOCOL.to_string(),
+                state: "attempt_authorized".to_string(),
+            };
+            linux::persist_bootstrap_initializer_attempt(&self.target, &receipt)
+                .map_err(|message| self.revalidation_failure(message))?;
+            self.revalidate()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(d1_lease_platform_unsupported())
         }
     }
 
@@ -547,6 +610,35 @@ impl D1RetainedMigrationLease {
 
     pub(crate) fn is_retired(&self) -> bool {
         self.identity.namespace == "retired"
+    }
+
+    /// Prove that this lease was created under the marker-before-dispatch
+    /// bootstrap protocol and that the exact initializer-attempt marker is
+    /// stably absent. Legacy custody can never satisfy this proof.
+    pub(crate) fn prove_bootstrap_initializer_not_dispatched(&self) -> Result<(), CallToolResult> {
+        #[cfg(target_os = "linux")]
+        {
+            self.revalidate()?;
+            if !self.bootstrap_initializer_dispatch_protocol {
+                return Err(d1_retained_lease_error(
+                    "d1.bootstrap_abort_dispatch_protocol_absent",
+                    "retained bootstrap custody predates or contradicts the marker-before-dispatch protocol",
+                ));
+            }
+            linux::prove_bootstrap_initializer_attempt_absent(&self.target, &self.identity)
+                .map_err(|message| {
+                    d1_retained_lease_error("d1.bootstrap_abort_dispatch_not_absent", message)
+                })?;
+            self.revalidate()?;
+            linux::prove_bootstrap_initializer_attempt_absent(&self.target, &self.identity)
+                .map_err(|message| {
+                    d1_retained_lease_error("d1.bootstrap_abort_dispatch_not_absent", message)
+                })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(d1_retained_lease_platform_unsupported())
+        }
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1552,7 +1644,13 @@ mod linux {
     const O_RDWR: i32 = 2;
     const O_CREAT: i32 = 0o100;
     const O_EXCL: i32 = 0o200;
+    #[cfg(target_arch = "aarch64")]
+    const O_DIRECTORY: i32 = 0o40000;
+    #[cfg(target_arch = "aarch64")]
+    const O_NOFOLLOW: i32 = 0o100000;
+    #[cfg(not(target_arch = "aarch64"))]
     const O_DIRECTORY: i32 = 0o200000;
+    #[cfg(not(target_arch = "aarch64"))]
     const O_NOFOLLOW: i32 = 0o400000;
     const O_CLOEXEC: i32 = 0o2000000;
     const O_PATH: i32 = 0o10000000;
@@ -2110,10 +2208,147 @@ mod linux {
             || !valid_lower_sha256(&payload.approved_plan_sha256)
             || !valid_retained_nonce(&payload.nonce)
             || !valid_retained_family(&payload.migration_family)
+            || payload.initializer_dispatch_protocol.as_deref().is_some_and(|protocol| {
+                payload.migration_family != "migration-ledger-bootstrap-v1"
+                    || protocol != D1_BOOTSTRAP_INITIALIZER_DISPATCH_PROTOCOL
+            })
         {
             return Err("retained lease payload contains noncanonical authority fields");
         }
         Ok(payload)
+    }
+
+    pub(super) fn approved_plan_from_owned_lease(
+        active: &fs::File,
+    ) -> Result<String, &'static str> {
+        let bytes = read_held_file(active)?;
+        Ok(parse_retained_lease_payload(&bytes)?.approved_plan_sha256)
+    }
+
+    fn bootstrap_initializer_attempt_name(nonce: &str) -> String {
+        format!("{BOOTSTRAP_INITIALIZER_ATTEMPT_PREFIX}{nonce}.receipt.json")
+    }
+
+    fn canonical_bootstrap_initializer_attempt_bytes(
+        receipt: &D1BootstrapInitializerAttemptReceipt,
+    ) -> Result<Vec<u8>, &'static str> {
+        if receipt.version != 1
+            || receipt.operation != "d1_bootstrap_migration_ledger"
+            || !valid_lower_sha256(&receipt.target_key_sha256)
+            || !valid_retained_nonce(&receipt.lease_nonce)
+            || !valid_lower_sha256(&receipt.lease_payload_sha256)
+            || !valid_lower_sha256(&receipt.approved_bootstrap_plan_sha256)
+            || receipt.migration_family != "migration-ledger-bootstrap-v1"
+            || receipt.dispatch_protocol != D1_BOOTSTRAP_INITIALIZER_DISPATCH_PROTOCOL
+            || receipt.state != "attempt_authorized"
+        {
+            return Err("bootstrap initializer-attempt receipt contains noncanonical authority fields");
+        }
+        serde_json::to_vec(receipt)
+            .map_err(|_| "bootstrap initializer-attempt receipt could not be encoded")
+    }
+
+    fn read_bootstrap_initializer_attempt(
+        target: &fs::File,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>, &'static str> {
+        let present = entry_present(target, name)?;
+        if !present {
+            return Ok(None);
+        }
+        let named = open_named_entry(target, name)
+            .map_err(|_| "bootstrap initializer-attempt receipt could not be opened")?;
+        let metadata = named
+            .metadata()
+            .map_err(|_| "bootstrap initializer-attempt receipt metadata is unavailable")?;
+        if !private_file(&metadata)
+            || metadata.nlink() != 1
+            || metadata.len() > MAX_LEASE_PAYLOAD_BYTES
+        {
+            return Err("bootstrap initializer-attempt receipt is not one bounded private regular file");
+        }
+        let expected = identity(&metadata);
+        let name_c = c_string_name(name)?;
+        let file = open_at(
+            target.as_raw_fd(),
+            &name_c,
+            O_RDONLY | O_NOFOLLOW | O_CLOEXEC,
+            0,
+        )
+        .map_err(|_| "bootstrap initializer-attempt receipt could not be rebound")?;
+        let held = file
+            .metadata()
+            .map_err(|_| "held bootstrap initializer-attempt receipt metadata is unavailable")?;
+        if !private_file(&held) || held.nlink() != 1 || identity(&held) != expected {
+            return Err("bootstrap initializer-attempt receipt changed while it was rebound");
+        }
+        read_held_file(&file).map(Some)
+    }
+
+    pub(super) fn persist_bootstrap_initializer_attempt(
+        target: &fs::File,
+        receipt: &D1BootstrapInitializerAttemptReceipt,
+    ) -> Result<(), &'static str> {
+        let bytes = canonical_bootstrap_initializer_attempt_bytes(receipt)?;
+        let name = bootstrap_initializer_attempt_name(&receipt.lease_nonce);
+        if read_bootstrap_initializer_attempt(target, &name)?.is_some() {
+            return Err("bootstrap initializer-attempt receipt already exists; initializer replay is forbidden");
+        }
+        if directory_entry_names(target)?.len() >= MAX_TARGET_CUSTODY_DIRECTORY_ENTRIES {
+            return Err("target custody directory has no capacity for initializer-attempt authority");
+        }
+        let name_c = c_string_name(&name)?;
+        let mut file = open_at(
+            target.as_raw_fd(),
+            &name_c,
+            O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+            0o600,
+        )
+        .map_err(|_| "bootstrap initializer-attempt receipt could not be created without replacement")?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| "bootstrap initializer-attempt receipt identity is unavailable")?;
+        if !private_file(&metadata) || metadata.nlink() != 1 {
+            return Err("bootstrap initializer-attempt receipt is not one private unaliased regular file");
+        }
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|_| "bootstrap initializer-attempt receipt could not be durably written")?;
+        sync_d1_lease_directory(target)
+            .map_err(|_| "bootstrap initializer-attempt receipt directory could not be synchronized")?;
+        let readback = read_bootstrap_initializer_attempt(target, &name)?
+            .ok_or("bootstrap initializer-attempt receipt disappeared after persistence")?;
+        if readback != bytes {
+            return Err("bootstrap initializer-attempt receipt contradicted exact readback");
+        }
+        Ok(())
+    }
+
+    pub(super) fn prove_bootstrap_initializer_attempt_absent(
+        target: &fs::File,
+        identity: &D1RetainedMigrationLeaseIdentity,
+    ) -> Result<(), &'static str> {
+        let name = bootstrap_initializer_attempt_name(&identity.nonce);
+        let first = read_bootstrap_initializer_attempt(target, &name)?;
+        let second = read_bootstrap_initializer_attempt(target, &name)?;
+        match (first, second) {
+            (None, None) => Ok(()),
+            (Some(first), Some(second)) if first == second => {
+                let receipt: D1BootstrapInitializerAttemptReceipt = serde_json::from_slice(&first)
+                    .map_err(|_| "bootstrap initializer-attempt evidence is malformed or duplicate-keyed")?;
+                let canonical = canonical_bootstrap_initializer_attempt_bytes(&receipt)?;
+                if canonical != first
+                    || receipt.target_key_sha256 != identity.target_key_sha256
+                    || receipt.lease_nonce != identity.nonce
+                    || receipt.lease_payload_sha256 != identity.payload_sha256
+                    || receipt.approved_bootstrap_plan_sha256 != identity.approved_plan_sha256
+                {
+                    return Err("bootstrap initializer-attempt evidence contradicts retained custody");
+                }
+                Err("a bootstrap initializer attempt was durably authorized; zero-dispatch retirement is forbidden")
+            }
+            _ => Err("bootstrap initializer-attempt evidence changed during stable readback"),
+        }
     }
 
     fn open_retained_named_lease(
@@ -2762,6 +2997,7 @@ mod linux {
         guard_identity: D1LeaseFileIdentity,
         identity: D1MigrationLeaseIdentity,
         payload: &[u8],
+        bootstrap_initializer_dispatch_protocol: bool,
     ) -> Result<D1MigrationLease, CallToolResult> {
         validate_d1_lease_custody(
             root_path,
@@ -2904,6 +3140,7 @@ mod linux {
             active,
             active_file_identity: active_identity,
             released: false,
+            bootstrap_initializer_dispatch_protocol,
             identity,
         })
     }
@@ -3187,6 +3424,10 @@ mod linux {
             evidence,
             evidence_file_identity,
             evidence_name,
+            bootstrap_initializer_dispatch_protocol: payload
+                .initializer_dispatch_protocol
+                .as_deref()
+                == Some(D1_BOOTSTRAP_INITIALIZER_DISPATCH_PROTOCOL),
             identity,
         };
         lease.revalidate()?;
@@ -3262,7 +3503,12 @@ mod linux {
         .map_err(|message| d1_lease_root_error("d1.migration_lease_custody_changed", message))?;
         maybe_pause_after_guard_for_test(&root_path);
         let nonce = d1_migration_lease_nonce(&target_hash, plan_sha256);
-        let payload = json!({"version": 2, "target_key_sha256": &target_hash, "nonce": &nonce, "approved_plan_sha256": plan_sha256, "migration_family": family, "created_at_unix_ms": now_unix_ms()});
+        let bootstrap_initializer_dispatch_protocol = family == "migration-ledger-bootstrap-v1";
+        let mut payload = json!({"version": 2, "target_key_sha256": &target_hash, "nonce": &nonce, "approved_plan_sha256": plan_sha256, "migration_family": family, "created_at_unix_ms": now_unix_ms()});
+        if bootstrap_initializer_dispatch_protocol {
+            payload["initializer_dispatch_protocol"] =
+                json!(D1_BOOTSTRAP_INITIALIZER_DISPATCH_PROTOCOL);
+        }
         let encoded =
             serde_json::to_vec(&payload).expect("serializing lease payload is infallible");
         let identity = D1MigrationLeaseIdentity {
@@ -3281,6 +3527,7 @@ mod linux {
             guard_identity,
             identity,
             &encoded,
+            bootstrap_initializer_dispatch_protocol,
         )
     }
 
@@ -4079,6 +4326,89 @@ mod tests {
             retired_bytes,
             fs::read(&retired_path).expect("retired bytes after inert release")
         );
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bootstrap_release_failure_before_dispatch_retains_provable_abort_authority() {
+        let root = private_test_root("bootstrap-zero-dispatch-release-failure");
+        let plan = "a".repeat(64);
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "db-1",
+            "migration-ledger-bootstrap-v1",
+            &plan,
+        )
+        .expect("marker-aware bootstrap lease");
+        let identity = owner.identity.clone();
+        linux::fail_next_directory_sync_for_test();
+        let failure = owner.release().expect_err("forced pre-dispatch release failure");
+        let content = failure.structured_content.expect("release failure content");
+        assert_eq!(
+            content["error"]["code"],
+            json!("d1.migration_lease_release_failed")
+        );
+        owner.retain();
+        drop(owner);
+
+        let retained = inspect_terminal_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "db-1",
+            "migration-ledger-bootstrap-v1",
+            &plan,
+            &identity.nonce,
+            &identity.payload_sha256,
+        )
+        .expect("exact retained bootstrap custody");
+        assert_eq!(retained.identity.namespace, "active");
+        retained
+            .prove_bootstrap_initializer_not_dispatched()
+            .expect("marker-aware stable absence proves zero initializer dispatches");
+        drop(retained);
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bootstrap_attempt_marker_permanently_blocks_zero_dispatch_abort() {
+        let root = private_test_root("bootstrap-attempt-marker");
+        let plan = "a".repeat(64);
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "db-1",
+            "migration-ledger-bootstrap-v1",
+            &plan,
+        )
+        .expect("marker-aware bootstrap lease");
+        let identity = owner.identity.clone();
+        owner
+            .record_bootstrap_initializer_attempt()
+            .expect("durable attempt marker before provider boundary");
+        owner.retain();
+        drop(owner);
+
+        let retained = inspect_terminal_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "db-1",
+            "migration-ledger-bootstrap-v1",
+            &plan,
+            &identity.nonce,
+            &identity.payload_sha256,
+        )
+        .expect("exact attempted bootstrap custody");
+        let error = retained
+            .prove_bootstrap_initializer_not_dispatched()
+            .expect_err("attempted initializer can never use zero-dispatch abort");
+        assert_eq!(
+            error.structured_content.expect("attempt rejection")["error"]["code"],
+            json!("d1.bootstrap_abort_dispatch_not_absent")
+        );
+        drop(retained);
         fs::remove_dir_all(root).expect("test cleanup");
     }
 
