@@ -49,32 +49,151 @@ fn sql_word(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
+#[derive(Clone, Copy)]
+enum ForeignKeysPragmaScan {
+    StatementStart,
+    PragmaName,
+    SchemaDot,
+    SchemaPragmaName,
+    IgnoreStatement,
+}
+
+fn consume_quoted_sql_token(
+    bytes: &[u8],
+    mut cursor: usize,
+    closing: u8,
+    expected: &[u8],
+) -> (usize, bool) {
+    cursor += 1;
+    let mut expected_cursor = 0usize;
+    let mut matches = true;
+    let mut closed = false;
+    while cursor < bytes.len() {
+        if bytes[cursor] == closing {
+            if bytes.get(cursor + 1) == Some(&closing) {
+                matches = false;
+                cursor += 2;
+                continue;
+            }
+            cursor += 1;
+            closed = true;
+            break;
+        }
+        matches &= expected
+            .get(expected_cursor)
+            .is_some_and(|expected| bytes[cursor].eq_ignore_ascii_case(expected));
+        expected_cursor += 1;
+        cursor += 1;
+    }
+    (
+        cursor,
+        closed && matches && expected_cursor == expected.len(),
+    )
+}
+
 fn contains_foreign_keys_pragma(sql: &str) -> bool {
     let bytes = sql.as_bytes();
     let mut cursor = 0usize;
+    let mut state = ForeignKeysPragmaScan::StatementStart;
     while cursor < bytes.len() {
-        if !sql_word(bytes[cursor]) {
-            cursor += 1;
-            continue;
-        }
-        let start = cursor;
-        while cursor < bytes.len() && sql_word(bytes[cursor]) {
-            cursor += 1;
-        }
-        if !bytes[start..cursor].eq_ignore_ascii_case(b"pragma") {
-            continue;
-        }
-        while cursor < bytes.len() {
-            if !sql_word(bytes[cursor]) {
-                cursor += 1;
-                continue;
-            }
-            let word_start = cursor;
-            while cursor < bytes.len() && sql_word(bytes[cursor]) {
+        match bytes[cursor] {
+            b';' => {
+                state = ForeignKeysPragmaScan::StatementStart;
                 cursor += 1;
             }
-            if bytes[word_start..cursor].eq_ignore_ascii_case(b"foreign_keys") {
-                return true;
+            b'-' if bytes.get(cursor + 1) == Some(&b'-') => {
+                cursor += 2;
+                while cursor < bytes.len() && !matches!(bytes[cursor], b'\n' | b'\r') {
+                    cursor += 1;
+                }
+            }
+            b'/' if bytes.get(cursor + 1) == Some(&b'*') => {
+                cursor += 2;
+                while cursor < bytes.len()
+                    && !(bytes[cursor] == b'*' && bytes.get(cursor + 1) == Some(&b'/'))
+                {
+                    cursor += 1;
+                }
+                cursor = (cursor + 2).min(bytes.len());
+            }
+            quote @ (b'\'' | b'"' | b'`') => {
+                let (next, is_foreign_keys) =
+                    consume_quoted_sql_token(bytes, cursor, quote, b"foreign_keys");
+                cursor = next;
+                state = match state {
+                    ForeignKeysPragmaScan::PragmaName | ForeignKeysPragmaScan::SchemaPragmaName
+                        if is_foreign_keys =>
+                    {
+                        return true;
+                    }
+                    ForeignKeysPragmaScan::PragmaName => ForeignKeysPragmaScan::SchemaDot,
+                    ForeignKeysPragmaScan::StatementStart
+                    | ForeignKeysPragmaScan::SchemaPragmaName => {
+                        ForeignKeysPragmaScan::IgnoreStatement
+                    }
+                    state => state,
+                };
+            }
+            b'[' => {
+                let (next, is_foreign_keys) =
+                    consume_quoted_sql_token(bytes, cursor, b']', b"foreign_keys");
+                cursor = next;
+                state = match state {
+                    ForeignKeysPragmaScan::PragmaName | ForeignKeysPragmaScan::SchemaPragmaName
+                        if is_foreign_keys =>
+                    {
+                        return true;
+                    }
+                    ForeignKeysPragmaScan::PragmaName => ForeignKeysPragmaScan::SchemaDot,
+                    ForeignKeysPragmaScan::StatementStart
+                    | ForeignKeysPragmaScan::SchemaPragmaName => {
+                        ForeignKeysPragmaScan::IgnoreStatement
+                    }
+                    state => state,
+                };
+            }
+            b'.' => {
+                state = match state {
+                    ForeignKeysPragmaScan::SchemaDot => ForeignKeysPragmaScan::SchemaPragmaName,
+                    ForeignKeysPragmaScan::IgnoreStatement => {
+                        ForeignKeysPragmaScan::IgnoreStatement
+                    }
+                    _ => ForeignKeysPragmaScan::IgnoreStatement,
+                };
+                cursor += 1;
+            }
+            byte if byte.is_ascii_whitespace() => cursor += 1,
+            byte if sql_word(byte) => {
+                let start = cursor;
+                while cursor < bytes.len() && sql_word(bytes[cursor]) {
+                    cursor += 1;
+                }
+                state = match state {
+                    ForeignKeysPragmaScan::StatementStart
+                        if bytes[start..cursor].eq_ignore_ascii_case(b"pragma") =>
+                    {
+                        ForeignKeysPragmaScan::PragmaName
+                    }
+                    ForeignKeysPragmaScan::PragmaName
+                        if bytes[start..cursor].eq_ignore_ascii_case(b"foreign_keys") =>
+                    {
+                        return true;
+                    }
+                    ForeignKeysPragmaScan::SchemaPragmaName
+                        if bytes[start..cursor].eq_ignore_ascii_case(b"foreign_keys") =>
+                    {
+                        return true;
+                    }
+                    ForeignKeysPragmaScan::PragmaName => ForeignKeysPragmaScan::SchemaDot,
+                    ForeignKeysPragmaScan::IgnoreStatement => {
+                        ForeignKeysPragmaScan::IgnoreStatement
+                    }
+                    _ => ForeignKeysPragmaScan::IgnoreStatement,
+                };
+            }
+            _ => {
+                state = ForeignKeysPragmaScan::IgnoreStatement;
+                cursor += 1;
             }
         }
     }
@@ -1000,6 +1119,13 @@ mod tests {
             "PRAGMA main.foreign_keys = ON; CREATE TABLE items(id INTEGER);",
             "PRAGMA/*;*/foreign_keys = ON; CREATE TABLE items(id INTEGER);",
             "PRAGMA -- ;\n foreign_keys = ON; CREATE TABLE items(id INTEGER);",
+            "PRAGMA optimize; PRAGMA foreign_keys(ON);",
+            "PRAGMA 'foreign_keys' = ON; CREATE TABLE items(id INTEGER);",
+            "PRAGMA \"foreign_keys\" = ON; CREATE TABLE items(id INTEGER);",
+            "PRAGMA `foreign_keys` = ON; CREATE TABLE items(id INTEGER);",
+            "PRAGMA [foreign_keys] = ON; CREATE TABLE items(id INTEGER);",
+            "PRAGMA \"main\".foreign_keys = ON; CREATE TABLE items(id INTEGER);",
+            "PRAGMA main.\"foreign_keys\" = ON; CREATE TABLE items(id INTEGER);",
         ] {
             assert!(
                 derive_d1_manifest_execution_plan(&[manifest_entry(sql)]).is_err(),
@@ -1033,12 +1159,21 @@ mod tests {
             "untransformed manifests preserve existing plan identity"
         );
 
-        let foreign_keys_identifier =
-            "CREATE TABLE items(id INTEGER PRIMARY KEY, foreign_keys TEXT);";
-        assert!(
-            derive_d1_manifest_execution_plan(&[manifest_entry(foreign_keys_identifier)]).is_ok(),
-            "an ordinary identifier is not a PRAGMA"
-        );
+        for sql in [
+            "CREATE TABLE items(id INTEGER PRIMARY KEY, foreign_keys TEXT);",
+            "CREATE TABLE notes(body TEXT DEFAULT 'PRAGMA foreign_keys');",
+            "CREATE TABLE \"PRAGMA foreign_keys\"(id INTEGER);",
+            "CREATE TABLE `PRAGMA foreign_keys`(id INTEGER);",
+            "CREATE TABLE [PRAGMA foreign_keys](id INTEGER);",
+            "-- PRAGMA foreign_keys = ON;\nCREATE TABLE notes(body TEXT);",
+            "/* PRAGMA foreign_keys = ON; */ CREATE TABLE notes(body TEXT);",
+            "PRAGMA optimize; CREATE TABLE foreign_keys(id INTEGER);",
+        ] {
+            assert!(
+                derive_d1_manifest_execution_plan(&[manifest_entry(sql)]).is_ok(),
+                "quoted, commented, cross-statement, and ordinary identifiers are not foreign_keys pragmas: {sql:?}"
+            );
+        }
     }
 
     fn current_wrangler_authority(table: &str) -> serde_json::Value {

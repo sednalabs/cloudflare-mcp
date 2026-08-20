@@ -8222,6 +8222,8 @@ fn d1_manifest_execution_transform_rejects_noncanonical_pragma_before_provider()
         "CREATE TABLE items(id INTEGER); PRAGMA foreign_keys = ON;",
         "PRAGMA foreign_keys = ON;\n\nPRAGMA foreign_keys = ON;\nCREATE TABLE items(id INTEGER);",
         "PRAGMA/*;*/foreign_keys = ON; CREATE TABLE items(id INTEGER);",
+        "PRAGMA -- ;\n foreign_keys = ON; CREATE TABLE items(id INTEGER);",
+        "PRAGMA optimize; PRAGMA main.foreign_keys(ON);",
     ]
     .into_iter()
     .enumerate()
