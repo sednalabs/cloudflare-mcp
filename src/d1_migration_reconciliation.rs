@@ -514,6 +514,7 @@ pub(crate) async fn prepare_d1_migration_reconciliation_for_expected_query(
     state_expectations: Vec<D1MigrationStateExpectation>,
     expected_query_sha256: &str,
     expected_current_prefix_length: usize,
+    predecessor_query_chronology: bool,
 ) -> Result<D1MigrationReconciliationProof, CallToolResult> {
     prepare_d1_migration_reconciliation_with_query_authority(
         server,
@@ -527,7 +528,11 @@ pub(crate) async fn prepare_d1_migration_reconciliation_for_expected_query(
         lease_payload_sha256,
         effect_assertion_id,
         state_expectations,
-        Some((expected_query_sha256, expected_current_prefix_length)),
+        Some((
+            expected_query_sha256,
+            expected_current_prefix_length,
+            predecessor_query_chronology,
+        )),
     )
     .await
 }
@@ -555,7 +560,7 @@ async fn prepare_d1_migration_reconciliation_with_query_authority(
     lease_payload_sha256: &str,
     effect_assertion_id: Option<&str>,
     state_expectations: Vec<D1MigrationStateExpectation>,
-    expected_query_authority: Option<(&str, usize)>,
+    expected_query_authority: Option<(&str, usize, bool)>,
 ) -> Result<D1MigrationReconciliationProof, CallToolResult> {
     if let Err(result) = validate_generic_d1_migration_family(family) {
         return Err(prelease_error(result, "not_inspected", None));
@@ -611,7 +616,7 @@ async fn prepare_d1_migration_reconciliation_with_query_authority(
     );
     let query_mode = match expected_query_authority {
         None => ReconciliationQueryMode::ScopedSelectedPrefix,
-        Some((expected_query_sha256, expected_prefix)) => {
+        Some((expected_query_sha256, expected_prefix, predecessor_chronology)) => {
             let Some(expected_state) = validated.states.get(expected_prefix) else {
                 return Err(prelease_error(
                     reconciliation_error(
@@ -651,14 +656,14 @@ async fn prepare_d1_migration_reconciliation_with_query_authority(
                 &validated.proof_sha256,
                 seed_assertion,
             );
-            if expected_query_sha256 == scoped_query.sha256 {
-                ReconciliationQueryMode::ScopedSelectedPrefix
-            } else if expected_query_sha256 == legacy_query.sha256 {
+            if predecessor_chronology && expected_query_sha256 == legacy_query.sha256 {
                 if seed_assertion {
                     ReconciliationQueryMode::LegacyFullUnionWithSelection
                 } else {
                     ReconciliationQueryMode::LegacyFullUnionWithoutSelection
                 }
+            } else if !predecessor_chronology && expected_query_sha256 == scoped_query.sha256 {
+                ReconciliationQueryMode::ScopedSelectedPrefix
             } else {
                 return Err(prelease_error(
                     reconciliation_error(
@@ -738,7 +743,7 @@ async fn prepare_d1_migration_reconciliation_with_query_authority(
             ));
         }
         if expected_query_authority
-            .is_some_and(|(_, expected_prefix)| batch.snapshot.ledger.len() != expected_prefix)
+            .is_some_and(|(_, expected_prefix, _)| batch.snapshot.ledger.len() != expected_prefix)
         {
             return Err(with_query_shape_receipt(
                 contextualize_error(
@@ -761,7 +766,7 @@ async fn prepare_d1_migration_reconciliation_with_query_authority(
     let selected_prefix = selection
         .as_ref()
         .map(|batch| batch.snapshot.ledger.len())
-        .or_else(|| expected_query_authority.map(|(_, prefix)| prefix));
+        .or_else(|| expected_query_authority.map(|(_, prefix, _)| prefix));
     let selected_seed_state = selected_prefix
         .and_then(|prefix| validated.seed_states.get(prefix))
         .map(Vec::as_slice)
@@ -799,7 +804,7 @@ async fn prepare_d1_migration_reconciliation_with_query_authority(
         }
     };
     if expected_query_authority
-        .is_some_and(|(expected_query_sha256, _)| query.sha256 != expected_query_sha256)
+        .is_some_and(|(expected_query_sha256, _, _)| query.sha256 != expected_query_sha256)
     {
         return Err(with_query_shape_receipt(
             contextualize_error(

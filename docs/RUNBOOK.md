@@ -514,13 +514,20 @@ is mapped exclusively to `schema_create_only_v1`; it can resume active or
 retiring custody and replay a completed retirement. It never attests the
 extended assertion. Unknown fields, duplicate keys, malformed/noncanonical
 bytes, or an attempt to pair version 1 with the extended assertion fail closed
-before provider access.
+before provider access. A newly written version-2 receipt may still bind an
+approved predecessor reconciliation plan when terminal finalization promotes
+historical active evidence; resume and replay preserve that receipt-bound plan
+family rather than inferring query chronology from the receipt schema version.
 
 Terminal query compatibility is independently evidence-bound. Before provider
-access, the finalizer combines the exact approved `expected_query_sha256` with
-the exact expected current prefix and accepts only the current selected-prefix
-constructor or the predecessor full-table-union constructor. Any other digest
-fails with zero provider calls. The predecessor non-seed form preserves its
+access, the finalizer independently recomputes both reconciliation-plan
+families and requires exactly one to match
+`expected_reconciliation_plan_sha256`. That plan family selects the current
+selected-prefix or predecessor full-table-union chronology; only then must the
+exact approved `expected_query_sha256` and expected current prefix reproduce
+the selected constructor. Equal query digests do not change the selected
+chronology. Unknown, ambiguous, or plan/query-inconsistent combinations fail
+with zero provider calls. The predecessor non-seed form preserves its
 historical two complete reads without a selection call; the predecessor seed
 form preserves its historical selection plus two complete reads. This path is
 only for reproducing already-approved active/retiring evidence and durable

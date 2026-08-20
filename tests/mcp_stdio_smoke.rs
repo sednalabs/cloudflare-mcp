@@ -2649,7 +2649,6 @@ fn two_table_reconciliation_plan_sha256(
         "outcome": "partial_state_converged",
         "query_sha256": query_sha256,
         "canonical_snapshot_sha256": canonical_snapshot_sha256,
-        "effect_assertion_id": "schema_create_only_v1",
         "retry_decision": "do_not_retry_same_attempt",
         "lease_decision": "retain",
         "next_slice": "persist_terminal_reconciliation_receipt_then_guarded_retirement",
@@ -12352,6 +12351,145 @@ fn d1_terminal_plan_rejects_effect_assertion_change_after_approval_for_identical
 }
 
 #[test]
+fn d1_terminal_equal_query_sha_uses_plan_bound_predecessor_chronology_from_active_custody() {
+    let (base_url, requests) = spawn_fake_reconciliation_api_for_calls(12);
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-terminal-equal-query-active-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create equal-query active root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make equal-query active root private");
+    }
+    let (manifest, state_expectations) = one_table_reconciliation_case();
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&lease_root, &manifest);
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let reconciliation = mcp.call_tool(
+        938,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest,
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_only_v1",
+            "state_expectations": state_expectations,
+        }),
+    );
+    let reconciled = structured_content(&reconciliation).clone();
+    assert_eq!(reconciled["ok"], true, "{reconciled}");
+    assert_eq!(reconciled["provider_calls"], 3);
+    let legacy_plan = json!({
+        "version": 1,
+        "operation": "d1_reconcile_migration_manifest",
+        "target_key_sha256": sha256_hex("acct-1\0db-1"),
+        "database_id": "db-1",
+        "migration_family": "newsletter-core",
+        "migrations_table": "d1_migrations",
+        "manifest": reconciled["manifest"],
+        "lease": reconciled["lease"],
+        "original_prefix_length": reconciled["reconstructed_original_prefix_length"],
+        "current_prefix_length": reconciled["current_manifest_prefix_length"],
+        "outcome": reconciled["outcome"],
+        "query_sha256": reconciled["query_sha256"],
+        "canonical_snapshot_sha256": reconciled["canonical_snapshot_sha256"],
+        "retry_decision": "do_not_retry_same_attempt",
+        "lease_decision": "retain",
+        "next_slice": "persist_terminal_reconciliation_receipt_then_guarded_retirement",
+    });
+    let legacy_plan_sha256 =
+        sha256_hex(&serde_json::to_string(&legacy_plan).expect("serialize equal-query plan"));
+    let mut terminal_args = terminal_args_from_reconciliation(
+        &manifest,
+        &state_expectations,
+        &approved_plan_sha256,
+        &lease_nonce,
+        &lease_payload_sha256,
+        &reconciled,
+    );
+    let mut unknown_plan_args = terminal_args.clone();
+    unknown_plan_args["expected_reconciliation_plan_sha256"] = json!("f".repeat(64));
+    let unknown = mcp.call_tool(
+        948,
+        "d1_finalize_migration_reconciliation",
+        unknown_plan_args,
+    );
+    let unknown_content = structured_content(&unknown);
+    assert_eq!(unknown_content["ok"], false, "{unknown_content}");
+    assert_eq!(unknown_content["provider_calls"], 0);
+    assert_eq!(
+        unknown_content["error"]["code"],
+        "d1.migration_terminal_approved_evidence_mismatch"
+    );
+    assert_eq!(requests.lock().expect("unknown-plan requests").len(), 3);
+    let current_dry = mcp.call_tool(
+        939,
+        "d1_finalize_migration_reconciliation",
+        terminal_args.clone(),
+    );
+    let current_dry_content = structured_content(&current_dry);
+    assert_eq!(current_dry_content["ok"], true, "{current_dry_content}");
+    assert_eq!(current_dry_content["provider_calls"], 3);
+    terminal_args["expected_reconciliation_plan_sha256"] = json!(legacy_plan_sha256);
+
+    let dry = mcp.call_tool(
+        949,
+        "d1_finalize_migration_reconciliation",
+        terminal_args.clone(),
+    );
+    let dry_content = structured_content(&dry).clone();
+    assert_eq!(dry_content["ok"], true, "{dry_content}");
+    assert_eq!(dry_content["provider_calls"], 2);
+    terminal_args["dry_run"] = json!(false);
+    terminal_args["approved_terminal_plan_sha256"] = dry_content["terminal_plan_sha256"].clone();
+    let live = mcp.call_tool(
+        950,
+        "d1_finalize_migration_reconciliation",
+        terminal_args.clone(),
+    );
+    let live_content = structured_content(&live);
+    assert_eq!(live_content["ok"], true, "{live_content}");
+    assert_eq!(live_content["provider_calls"], 4);
+    assert_eq!(live_content["local_namespace_mutations"], 3);
+    assert_eq!(live_content["terminal_receipt_version"], 2);
+    let replay = mcp.call_tool(951, "d1_finalize_migration_reconciliation", terminal_args);
+    let replay_content = structured_content(&replay);
+    assert_eq!(replay_content["ok"], true, "{replay_content}");
+    assert_eq!(replay_content["provider_calls"], 0);
+
+    let observed = requests.lock().expect("equal-query active requests");
+    assert_eq!(observed.len(), 12);
+    assert_eq!(
+        observed
+            .iter()
+            .map(|request| reconciliation_statement_markers(
+                request["sql"].as_str().expect("request SQL")
+            )
+            .len())
+            .collect::<Vec<_>>(),
+        vec![2, 5, 5, 2, 5, 5, 5, 5, 5, 5, 5, 5],
+        "fresh reconciliation and current-plan terminal proof select once, while equal-SHA predecessor terminal proof does not"
+    );
+    drop(observed);
+    assert_released_manifest_target_custody(&lease_root);
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
 fn d1_terminal_finalizes_and_replays_genuine_predecessor_full_union_evidence_from_active_custody() {
     let (base_url, requests) = spawn_fake_predecessor_query_compatibility_api(9, None);
     let lease_root = PathBuf::from("/tmp").join(format!(
@@ -12966,7 +13104,7 @@ fn d1_terminal_resumes_canonical_v1_receipt_from_retiring_namespace() {
         current_prefix_length: usize,
     }
 
-    let (base_url, requests) = spawn_fake_reconciliation_api_for_calls(8);
+    let (base_url, requests) = spawn_fake_reconciliation_api_for_calls(7);
     let lease_root = PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-terminal-v1-retiring-{}",
         std::process::id()
@@ -13123,10 +13261,23 @@ fn d1_terminal_resumes_canonical_v1_receipt_from_retiring_namespace() {
         json!("terminal_reconciliation_complete")
     );
     assert_eq!(resumed_content["terminal_receipt_version"], json!(1));
-    assert_eq!(resumed_content["provider_calls"], json!(5));
+    assert_eq!(resumed_content["provider_calls"], json!(4));
     assert_eq!(resumed_content["provider_mutations"], json!(0));
     assert_eq!(resumed_content["local_namespace_mutations"], json!(1));
-    assert_eq!(requests.lock().expect("request log").len(), 8);
+    let observed = requests.lock().expect("request log");
+    assert_eq!(observed.len(), 7);
+    assert_eq!(
+        observed
+            .iter()
+            .map(|request| reconciliation_statement_markers(
+                request["sql"].as_str().expect("request SQL")
+            )
+            .len())
+            .collect::<Vec<_>>(),
+        vec![2, 5, 5, 5, 5, 5, 5],
+        "the equal-SHA predecessor receipt must retain its historical no-selection chronology"
+    );
+    drop(observed);
     assert_released_manifest_target_custody(&lease_root);
     mcp.terminate();
     let _ = fs::remove_dir_all(lease_root);

@@ -270,12 +270,16 @@ referencing columns introduced by a later prefix, and requires the
 exact row set at and after INSERT. An unexpected intermediate row stops after
 the first complete proof with zero mutations. Fresh reconciliation evidence
 causes terminal reconciliation to rederive and repeat the same selected-prefix
-proof. Exact historical active or retiring evidence instead uses the approved
-`expected_query_sha256` plus expected current prefix to select the predecessor
-full-table-union constructor deterministically before provider access. An
-unrecognized query digest fails with zero provider calls. Historical non-seed
-proofs retain their two full-union reads without a selection call; historical
-seed proofs retain their selection read before the two full-union reads. The
+proof. Before provider access, terminal reconciliation independently recomputes
+the current and predecessor reconciliation-plan digests. Exactly one must match
+`expected_reconciliation_plan_sha256`; that plan family selects the query
+chronology, and `expected_query_sha256` plus the expected current prefix must
+then reproduce its exact query constructor. Equal current and predecessor query
+digests therefore cannot make historical evidence adopt current chronology.
+Unknown, ambiguous, or plan/query-inconsistent combinations fail with zero
+provider calls. Historical non-seed proofs retain their two full-union reads
+without a selection call; historical seed proofs retain their selection read
+before the two full-union reads. The
 ordinary read-only reconciliation tool never emits this compatibility shape.
 Both complete proof ledgers must
 equal the exact initial selected ledger, and the two complete snapshots must

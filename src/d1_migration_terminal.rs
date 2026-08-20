@@ -277,6 +277,25 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
         };
     let mut active_lease_identity = initial_lease.identity.clone();
     active_lease_identity.namespace = "active".to_string();
+    if initial_receipt.is_none() && initial_lease.identity.namespace != "active" {
+        let evidence =
+            observed_terminal_evidence(&initial_lease, &receipt, legacy_receipt.as_ref());
+        let message = if initial_lease.is_retired() {
+            "terminal retirement exists without its exact terminal receipt"
+        } else {
+            "terminal retirement began without its exact durable terminal receipt"
+        };
+        return terminal_error(
+            "d1.migration_terminal_receipt_absent",
+            message,
+            evidence.custody,
+            0,
+            Vec::new(),
+            Vec::new(),
+            0,
+            evidence.receipt_persisted,
+        );
+    }
     let recomputed_current_reconciliation_plan_sha256 = replay_reconciliation_plan_sha256(
         account_id,
         database_id,
@@ -310,6 +329,47 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
                 true,
             )
         });
+    let current_plan_matches =
+        recomputed_current_reconciliation_plan_sha256 == expected_reconciliation_plan_sha256;
+    let predecessor_plan_matches = recomputed_legacy_reconciliation_plan_sha256
+        .as_deref()
+        .is_some_and(|plan| plan == expected_reconciliation_plan_sha256);
+    let predecessor_query_chronology = match (current_plan_matches, predecessor_plan_matches) {
+        (true, false) => false,
+        (false, true) => true,
+        _ => {
+            let evidence =
+                observed_terminal_evidence(&initial_lease, &receipt, legacy_receipt.as_ref());
+            return terminal_error(
+                "d1.migration_terminal_approved_evidence_mismatch",
+                "expected reconciliation plan did not identify exactly one current or predecessor query chronology",
+                evidence.custody,
+                0,
+                Vec::new(),
+                Vec::new(),
+                0,
+                evidence.receipt_persisted,
+            );
+        }
+    };
+    if initial_receipt
+        .as_ref()
+        .is_some_and(|evidence| evidence.receipt_version == 1)
+        && !predecessor_query_chronology
+    {
+        let evidence =
+            observed_terminal_evidence(&initial_lease, &receipt, legacy_receipt.as_ref());
+        return terminal_error(
+            "d1.migration_terminal_approved_evidence_mismatch",
+            "a predecessor version-1 receipt requires its predecessor reconciliation-plan chronology",
+            evidence.custody,
+            0,
+            Vec::new(),
+            Vec::new(),
+            0,
+            evidence.receipt_persisted,
+        );
+    }
     if initial_lease.is_retired() {
         let evidence =
             observed_terminal_evidence(&initial_lease, &receipt, legacy_receipt.as_ref());
@@ -320,6 +380,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
             expected_reconciliation_plan_sha256,
             &recomputed_current_reconciliation_plan_sha256,
             recomputed_legacy_reconciliation_plan_sha256.as_deref(),
+            predecessor_query_chronology,
             &terminal_plan_sha256,
             legacy_terminal_plan_sha256.as_deref(),
             dry_run,
@@ -327,31 +388,11 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
             evidence,
         );
     }
-    let initial_receipt_evidence = match initial_receipt {
-        Some(evidence) => Some(evidence),
-        None if initial_lease.identity.namespace == "active" => None,
-        None => {
-            let evidence =
-                observed_terminal_evidence(&initial_lease, &receipt, legacy_receipt.as_ref());
-            return terminal_error(
-                "d1.migration_terminal_receipt_absent",
-                "terminal retirement began without its exact durable terminal receipt",
-                evidence.custody,
-                0,
-                Vec::new(),
-                Vec::new(),
-                0,
-                evidence.receipt_persisted,
-            );
-        }
-    };
-    let recomputed_plan = if initial_receipt_evidence
-        .as_ref()
-        .is_some_and(|evidence| evidence.receipt_version == 1)
-    {
+    let initial_receipt_evidence = initial_receipt;
+    let recomputed_plan = if predecessor_query_chronology {
         recomputed_legacy_reconciliation_plan_sha256
             .as_deref()
-            .expect("v1 receipt is reachable only for the legacy assertion")
+            .expect("predecessor chronology is reachable only for the legacy assertion")
     } else {
         recomputed_current_reconciliation_plan_sha256.as_str()
     };
@@ -396,9 +437,6 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
             evidence.receipt_persisted,
         );
     }
-    let recovering_legacy_receipt = initial_receipt_evidence
-        .as_ref()
-        .is_some_and(|evidence| evidence.receipt_version == 1);
     let recovering_exact_receipt = initial_receipt_evidence.is_some();
     drop(initial_lease);
 
@@ -416,6 +454,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
         state_expectations,
         expected_query_sha256,
         expected_current_prefix_length,
+        predecessor_query_chronology,
     )
     .await
     {
@@ -462,6 +501,7 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
                     expected_reconciliation_plan_sha256,
                     &recomputed_current_reconciliation_plan_sha256,
                     recomputed_legacy_reconciliation_plan_sha256.as_deref(),
+                    predecessor_query_chronology,
                     &terminal_plan_sha256,
                     legacy_terminal_plan_sha256.as_deref(),
                     dry_run,
@@ -496,8 +536,8 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
     let base_provider_calls = proof.provider_calls();
     let mut response_evidence = proof.response_evidence();
     let mut lifecycle = proof.provider_read_lifecycle();
-    let exact_active_plan_matches = recovering_exact_receipt
-        && if recovering_legacy_receipt {
+    let exact_active_plan_matches = (predecessor_query_chronology || recovering_exact_receipt)
+        && if predecessor_query_chronology {
             proof.legacy_plan_sha256_for_namespace(
                 account_id,
                 database_id,
@@ -729,6 +769,7 @@ fn completed_terminal_replay(
     expected_reconciliation_plan_sha256: &str,
     recomputed_current_reconciliation_plan_sha256: &str,
     recomputed_legacy_reconciliation_plan_sha256: Option<&str>,
+    predecessor_query_chronology: bool,
     terminal_plan_sha256: &str,
     legacy_terminal_plan_sha256: Option<&str>,
     dry_run: bool,
@@ -750,13 +791,14 @@ fn completed_terminal_replay(
         }
         Some(evidence) => evidence,
     };
-    let recomputed_plan = if receipt_evidence.receipt_version == 1 {
+    let recomputed_plan = if predecessor_query_chronology {
         recomputed_legacy_reconciliation_plan_sha256
-            .expect("v1 receipt is reachable only for the legacy assertion")
+            .expect("predecessor chronology is reachable only for the legacy assertion")
     } else {
         recomputed_current_reconciliation_plan_sha256
     };
-    if replay_expectation_proof_sha256 != expected_expectation_proof_sha256
+    if (receipt_evidence.receipt_version == 1 && !predecessor_query_chronology)
+        || replay_expectation_proof_sha256 != expected_expectation_proof_sha256
         || recomputed_plan != expected_reconciliation_plan_sha256
     {
         return terminal_error(
