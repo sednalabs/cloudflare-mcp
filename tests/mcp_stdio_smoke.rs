@@ -5516,7 +5516,7 @@ fn pages_deploy_directory_live_apply_uses_direct_upload_manifest_through_stdio_b
             "POST /accounts/acct-1/pages/projects/site/deployments",
         ]
     );
-    let _ = fs::remove_dir_all(directory);
+    let _ = fs::remove_dir_all(directory); // codeql[rust/path-injection] -- test-owned temporary directory
 }
 
 #[test]
@@ -5554,7 +5554,7 @@ fn pages_deploy_directory_live_apply_uploads_advanced_mode_worker_through_stdio_
             "POST /accounts/acct-1/pages/projects/site/deployments",
         ]
     );
-    let _ = fs::remove_dir_all(directory);
+    let _ = fs::remove_dir_all(directory); // codeql[rust/path-injection] -- test-owned temporary directory
 }
 
 #[test]
@@ -5898,7 +5898,7 @@ fn d1_apply_migrations_retires_live_mutation_through_stdio_boundary() {
     assert_eq!(content["provider_mutations"], json!(0));
     let requests = requests.lock().expect("request log lock").clone();
     assert!(requests.is_empty(), "retired live path must not call D1");
-    let _ = fs::remove_dir_all(dir);
+    let _ = fs::remove_dir_all(dir); // codeql[rust/path-injection] -- test-owned temporary directory
 }
 
 #[test]
@@ -5937,7 +5937,7 @@ fn d1_apply_migrations_retires_before_any_ledger_or_provider_access() {
         0,
         "retired migration path must not probe or mutate the provider"
     );
-    let _ = fs::remove_dir_all(dir);
+    let _ = fs::remove_dir_all(dir); // codeql[rust/path-injection] -- test-owned temporary directory
 }
 
 #[test]
