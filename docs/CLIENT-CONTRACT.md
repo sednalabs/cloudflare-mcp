@@ -297,12 +297,15 @@ The NULL-capable class still rejects `NULL` for an `INTEGER PRIMARY KEY` in a
 rowid table because SQLite would generate an integer rowid instead of
 preserving the asserted NULL.
 
-For D1 migration provider-error locations, `sql_byte_offset` is emitted only
-when the parsed numeric offset is strictly inside the exact SQL byte string
-dispatched by that provider call. An offset equal to or greater than the
-dispatched SQL byte length is impossible evidence and is omitted while the
-allowlisted provider code/category, complete-body digest, custody, and no-retry
-semantics remain unchanged.
+For D1 migration HTTP-error classification, the outer envelope must have
+`success=false`, `result=null`, exactly one allowlisted error object, and no
+unexpected members. Its `messages` member may be omitted or be an empty array;
+any other shape remains generic. Provider message text is always discarded. A
+`sql_byte_offset` is emitted only when the parsed numeric offset is strictly
+inside the exact SQL byte string dispatched by that provider call. An offset
+equal to or greater than the dispatched SQL byte length is impossible evidence
+and is omitted while the allowlisted provider code/category, complete-body
+digest, custody, and no-retry semantics remain unchanged.
 
 ## Structured payload details for complex tools
 
