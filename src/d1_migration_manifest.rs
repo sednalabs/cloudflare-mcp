@@ -24,12 +24,9 @@ pub(crate) struct D1ManifestTarget {
     pub(crate) database_id: String,
 }
 
-pub(crate) const D1_BOOTSTRAP_RESERVED_MIGRATION_FAMILY: &str =
-    "migration-ledger-bootstrap-v1";
+pub(crate) const D1_BOOTSTRAP_RESERVED_MIGRATION_FAMILY: &str = "migration-ledger-bootstrap-v1";
 
-pub(crate) fn validate_generic_d1_migration_family(
-    family: &str,
-) -> Result<(), CallToolResult> {
+pub(crate) fn validate_generic_d1_migration_family(family: &str) -> Result<(), CallToolResult> {
     if family == D1_BOOTSTRAP_RESERVED_MIGRATION_FAMILY {
         return Err(invalid_argument_result(
             "d1.reserved_migration_family",
@@ -1775,11 +1772,9 @@ fn d1_manifest_write_lifecycle_evidence(value: &Value) -> Option<Value> {
     let valid = match (dispatch_stage, response_stage, body_stage) {
         ("pre_dispatch", "not_received", "not_read") => http_status.is_null(),
         ("attempted", "not_received", "not_read") => http_status.is_null(),
-        ("attempted", "received", "not_read" | "partially_read" | "completely_read") => {
-            http_status
-                .as_u64()
-                .is_some_and(|status| (100..=599).contains(&status))
-        }
+        ("attempted", "received", "not_read" | "partially_read" | "completely_read") => http_status
+            .as_u64()
+            .is_some_and(|status| (100..=599).contains(&status)),
         _ => false,
     };
     valid.then(|| value.clone())

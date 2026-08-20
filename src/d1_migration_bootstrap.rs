@@ -19,8 +19,8 @@ use crate::d1_migration_lease::{
     preflight_d1_migration_target_custody,
 };
 use crate::d1_migration_manifest::{
-    D1_BOOTSTRAP_RESERVED_MIGRATION_FAMILY, D1ManifestLedgerRow,
-    d1_migrations_table_init_sql, parse_d1_migration_ledger, parse_d1_migration_ledger_authority,
+    D1_BOOTSTRAP_RESERVED_MIGRATION_FAMILY, D1ManifestLedgerRow, d1_migrations_table_init_sql,
+    parse_d1_migration_ledger, parse_d1_migration_ledger_authority,
 };
 use crate::mutation::{MutationAuditSession, MutationPlan};
 use crate::server::CloudflareMcp;
@@ -712,14 +712,14 @@ async fn read_stable_d1_bootstrap_inventory(
         migrations_table,
         &second_phase,
     )
-        .await
-        .map_err(|mut failure| {
-            failure.provider_calls += first.provider_calls;
-            let mut evidence = first.read_evidence.clone();
-            evidence.extend(failure.read_evidence);
-            failure.read_evidence = evidence;
-            failure
-        })?;
+    .await
+    .map_err(|mut failure| {
+        failure.provider_calls += first.provider_calls;
+        let mut evidence = first.read_evidence.clone();
+        evidence.extend(failure.read_evidence);
+        failure.read_evidence = evidence;
+        failure
+    })?;
     let provider_calls = first.provider_calls + second.provider_calls;
     let mut read_evidence = first.read_evidence;
     read_evidence.extend(second.read_evidence);
@@ -865,14 +865,14 @@ async fn read_stable_empty_d1_bootstrap_ledger(
         migrations_table,
         &second_phase,
     )
-        .await
-        .map_err(|mut failure| {
-            failure.provider_calls += first.provider_calls;
-            let mut evidence = first.read_evidence.clone();
-            evidence.extend(failure.read_evidence);
-            failure.read_evidence = evidence;
-            failure
-        })?;
+    .await
+    .map_err(|mut failure| {
+        failure.provider_calls += first.provider_calls;
+        let mut evidence = first.read_evidence.clone();
+        evidence.extend(failure.read_evidence);
+        failure.read_evidence = evidence;
+        failure
+    })?;
     let provider_calls = first.provider_calls + second.provider_calls;
     let mut read_evidence = first.read_evidence;
     read_evidence.extend(second.read_evidence);
@@ -917,15 +917,14 @@ pub(crate) async fn read_stable_d1_bootstrap_post_state(
     database_id: &str,
     migrations_table: &str,
 ) -> Result<D1BootstrapPostState, D1BootstrapReadFailure> {
-    let inventory_read =
-        read_stable_d1_bootstrap_inventory(
-            server,
-            account_id,
-            database_id,
-            migrations_table,
-            D1BootstrapReadWindow::PostWriteProof,
-        )
-        .await?;
+    let inventory_read = read_stable_d1_bootstrap_inventory(
+        server,
+        account_id,
+        database_id,
+        migrations_table,
+        D1BootstrapReadWindow::PostWriteProof,
+    )
+    .await?;
     if inventory_read.value.state != D1BootstrapInventoryState::CanonicalLedger {
         return Err(D1BootstrapReadFailure {
             result: CallToolResult::structured_error(json!({
@@ -1464,12 +1463,12 @@ pub(crate) async fn execute_d1_bootstrap_migration_ledger(
     if let Err(cause) = write_result {
         let (reconciliation, calls, reconciliation_read_evidence) =
             d1_bootstrap_reconciliation_evidence(
-            server,
-            &input.account_id,
-            &input.database_id,
-            &input.migrations_table,
-        )
-        .await;
+                server,
+                &input.account_id,
+                &input.database_id,
+                &input.migrations_table,
+            )
+            .await;
         provider_calls += calls;
         read_evidence.extend(reconciliation_read_evidence);
         let result = CallToolResult::structured_error(json!({
@@ -1759,7 +1758,11 @@ mod tests {
                     "operator_guidance": "reconciliation_only",
                 })
             );
-            assert!(cause["message"].as_str().is_some_and(|message| !message.is_empty()));
+            assert!(
+                cause["message"]
+                    .as_str()
+                    .is_some_and(|message| !message.is_empty())
+            );
         };
 
         let mut unchanged = acknowledgement.clone();
@@ -1792,7 +1795,7 @@ mod tests {
         let write = D1MigrationManifestWrite {
             result: Value::Null,
             response_body_sha256:
-                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(), // DevSkim: ignore DS173237 -- synthetic SHA-256 fixture, not a credential
             response_body_size_bytes: 123,
             lifecycle: D1MigrationManifestWriteLifecycle {
                 dispatch_stage: "attempted",
@@ -1823,10 +1826,14 @@ mod tests {
         );
         assert_eq!(
             nested["detail"]["response_body_sha256"],
-            json!("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            json!("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef") // DevSkim: ignore DS173237 -- synthetic SHA-256 fixture, not a credential
         );
         assert_eq!(nested["detail"]["response_body_size_bytes"], json!(123));
-        assert!(!nested.to_string().contains("provider-private-result-marker"));
+        assert!(
+            !nested
+                .to_string()
+                .contains("provider-private-result-marker")
+        );
     }
 
     #[test]

@@ -373,10 +373,8 @@ impl D1MigrationLease {
                 target_key_sha256: self.identity.target_key_sha256.clone(),
                 lease_nonce: self.identity.nonce.clone(),
                 lease_payload_sha256: self.identity.payload_sha256.clone(),
-                approved_bootstrap_plan_sha256: linux::approved_plan_from_owned_lease(
-                    &self.active,
-                )
-                .map_err(|message| self.revalidation_failure(message))?,
+                approved_bootstrap_plan_sha256: linux::approved_plan_from_owned_lease(&self.active)
+                    .map_err(|message| self.revalidation_failure(message))?,
                 migration_family: "migration-ledger-bootstrap-v1".to_string(),
                 dispatch_protocol: D1_BOOTSTRAP_INITIALIZER_DISPATCH_PROTOCOL.to_string(),
                 state: "attempt_authorized".to_string(),
@@ -630,10 +628,11 @@ impl D1RetainedMigrationLease {
                     d1_retained_lease_error("d1.bootstrap_abort_dispatch_not_absent", message)
                 })?;
             self.revalidate()?;
-            linux::prove_bootstrap_initializer_attempt_absent(&self.target, &self.identity)
-                .map_err(|message| {
+            linux::prove_bootstrap_initializer_attempt_absent(&self.target, &self.identity).map_err(
+                |message| {
                     d1_retained_lease_error("d1.bootstrap_abort_dispatch_not_absent", message)
-                })
+                },
+            )
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -2194,10 +2193,13 @@ mod linux {
             || !valid_lower_sha256(&payload.approved_plan_sha256)
             || !valid_retained_nonce(&payload.nonce)
             || !valid_retained_family(&payload.migration_family)
-            || payload.initializer_dispatch_protocol.as_deref().is_some_and(|protocol| {
-                payload.migration_family != "migration-ledger-bootstrap-v1"
-                    || protocol != D1_BOOTSTRAP_INITIALIZER_DISPATCH_PROTOCOL
-            })
+            || payload
+                .initializer_dispatch_protocol
+                .as_deref()
+                .is_some_and(|protocol| {
+                    payload.migration_family != "migration-ledger-bootstrap-v1"
+                        || protocol != D1_BOOTSTRAP_INITIALIZER_DISPATCH_PROTOCOL
+                })
         {
             return Err("retained lease payload contains noncanonical authority fields");
         }
@@ -2228,7 +2230,9 @@ mod linux {
             || receipt.dispatch_protocol != D1_BOOTSTRAP_INITIALIZER_DISPATCH_PROTOCOL
             || receipt.state != "attempt_authorized"
         {
-            return Err("bootstrap initializer-attempt receipt contains noncanonical authority fields");
+            return Err(
+                "bootstrap initializer-attempt receipt contains noncanonical authority fields",
+            );
         }
         serde_json::to_vec(receipt)
             .map_err(|_| "bootstrap initializer-attempt receipt could not be encoded")
@@ -2251,7 +2255,9 @@ mod linux {
             || metadata.nlink() != 1
             || metadata.len() > MAX_LEASE_PAYLOAD_BYTES
         {
-            return Err("bootstrap initializer-attempt receipt is not one bounded private regular file");
+            return Err(
+                "bootstrap initializer-attempt receipt is not one bounded private regular file",
+            );
         }
         let expected = identity(&metadata);
         let name_c = c_string_name(name)?;
@@ -2278,10 +2284,14 @@ mod linux {
         let bytes = canonical_bootstrap_initializer_attempt_bytes(receipt)?;
         let name = bootstrap_initializer_attempt_name(&receipt.lease_nonce);
         if read_bootstrap_initializer_attempt(target, &name)?.is_some() {
-            return Err("bootstrap initializer-attempt receipt already exists; initializer replay is forbidden");
+            return Err(
+                "bootstrap initializer-attempt receipt already exists; initializer replay is forbidden",
+            );
         }
         if directory_entry_names(target)?.len() >= MAX_TARGET_CUSTODY_DIRECTORY_ENTRIES {
-            return Err("target custody directory has no capacity for initializer-attempt authority");
+            return Err(
+                "target custody directory has no capacity for initializer-attempt authority",
+            );
         }
         let name_c = c_string_name(&name)?;
         let mut file = open_at(
@@ -2290,18 +2300,23 @@ mod linux {
             O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
             0o600,
         )
-        .map_err(|_| "bootstrap initializer-attempt receipt could not be created without replacement")?;
+        .map_err(
+            |_| "bootstrap initializer-attempt receipt could not be created without replacement",
+        )?;
         let metadata = file
             .metadata()
             .map_err(|_| "bootstrap initializer-attempt receipt identity is unavailable")?;
         if !private_file(&metadata) || metadata.nlink() != 1 {
-            return Err("bootstrap initializer-attempt receipt is not one private unaliased regular file");
+            return Err(
+                "bootstrap initializer-attempt receipt is not one private unaliased regular file",
+            );
         }
         file.write_all(&bytes)
             .and_then(|()| file.sync_all())
             .map_err(|_| "bootstrap initializer-attempt receipt could not be durably written")?;
-        sync_d1_lease_directory(target)
-            .map_err(|_| "bootstrap initializer-attempt receipt directory could not be synchronized")?;
+        sync_d1_lease_directory(target).map_err(
+            |_| "bootstrap initializer-attempt receipt directory could not be synchronized",
+        )?;
         let readback = read_bootstrap_initializer_attempt(target, &name)?
             .ok_or("bootstrap initializer-attempt receipt disappeared after persistence")?;
         if readback != bytes {
@@ -2329,9 +2344,13 @@ mod linux {
                     || receipt.lease_payload_sha256 != identity.payload_sha256
                     || receipt.approved_bootstrap_plan_sha256 != identity.approved_plan_sha256
                 {
-                    return Err("bootstrap initializer-attempt evidence contradicts retained custody");
+                    return Err(
+                        "bootstrap initializer-attempt evidence contradicts retained custody",
+                    );
                 }
-                Err("a bootstrap initializer attempt was durably authorized; zero-dispatch retirement is forbidden")
+                Err(
+                    "a bootstrap initializer attempt was durably authorized; zero-dispatch retirement is forbidden",
+                )
             }
             _ => Err("bootstrap initializer-attempt evidence changed during stable readback"),
         }
@@ -4333,7 +4352,9 @@ mod tests {
         .expect("marker-aware bootstrap lease");
         let identity = owner.identity.clone();
         linux::fail_next_directory_sync_for_test();
-        let failure = owner.release().expect_err("forced pre-dispatch release failure");
+        let failure = owner
+            .release()
+            .expect_err("forced pre-dispatch release failure");
         let content = failure.structured_content.expect("release failure content");
         assert_eq!(
             content["error"]["code"],
@@ -5508,14 +5529,9 @@ mod tests {
     fn terminal_retirement_sync_and_readback_failure_never_infers_retired_custody() {
         let root = private_test_root("terminal-sync-readback-failure");
         let plan = "a".repeat(64);
-        let mut owner = acquire_d1_migration_lease_at(
-            root.clone(),
-            "acct-1",
-            "db-1",
-            "newsletter-core",
-            &plan,
-        )
-        .expect("create retained evidence");
+        let mut owner =
+            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
+                .expect("create retained evidence");
         let identity = owner.identity.clone();
         let target = owner
             .active_path_for_test()

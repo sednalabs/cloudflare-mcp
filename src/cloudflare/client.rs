@@ -4514,8 +4514,8 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{
-        AdapterError, CloudflareApiError, CloudflareClient, D1MigrationManifestWriteLifecycle,
-        D1MigrationReconciliationReadLifecycle, D1_MIGRATION_RESPONSE_MAX_BYTES,
+        AdapterError, CloudflareApiError, CloudflareClient, D1_MIGRATION_RESPONSE_MAX_BYTES,
+        D1MigrationManifestWriteLifecycle, D1MigrationReconciliationReadLifecycle,
         decode_strict_d1_migration_manifest_envelope,
         decode_strict_d1_migration_reconciliation_envelope, is_d1_sqlite_auth_error, path_segment,
         with_request_api_token_override, worker_listing_identity, worker_version_id,
@@ -4938,7 +4938,7 @@ mod tests {
 
     #[tokio::test]
     async fn migration_manifest_write_stream_failure_is_ambiguous_without_replay() {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind("127.0.0.1:0") // DevSkim: ignore DS162092 -- loopback-only migration-write fixture
             .await
             .expect("bind truncated migration-write fixture");
         let addr = listener
@@ -4979,7 +4979,7 @@ mod tests {
                 .await
                 .expect("write truncated migration response");
         });
-        let client = CloudflareClient::new(test_config(format!("http://{addr}")))
+        let client = CloudflareClient::new(test_config(format!("http://{addr}"))) // DevSkim: ignore DS137138 -- loopback-only migration-write fixture
             .expect("migration-write client");
         let error = client
             .execute_d1_migration_manifest_write(

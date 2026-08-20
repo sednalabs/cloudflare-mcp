@@ -58,12 +58,12 @@ use crate::d1_migration_manifest::{
     D1ManifestReconciliationEvidence, approved_d1_plan_digest_matches, classify_d1_manifest_ledger,
     contextualize_d1_manifest_semantic_error, d1_ledger_summaries,
     d1_manifest_contextualize_failure, d1_manifest_plan_mismatch_result, d1_manifest_plan_sha256,
-    d1_manifest_reconciliation_custody_lost_result,
-    d1_manifest_reconciliation_required_result, d1_manifest_summaries,
-    d1_manifest_unknown_ledger_result, d1_migrations_table_init_sql, normalize_d1_manifest_target,
-    normalize_d1_migration_family, parse_d1_migration_ledger, read_stable_d1_migration_ledger,
-    read_stable_d1_migration_ledger_authority, validate_d1_manifest_write_result,
-    validate_d1_migration_manifest, validate_generic_d1_migration_family,
+    d1_manifest_reconciliation_custody_lost_result, d1_manifest_reconciliation_required_result,
+    d1_manifest_summaries, d1_manifest_unknown_ledger_result, d1_migrations_table_init_sql,
+    normalize_d1_manifest_target, normalize_d1_migration_family, parse_d1_migration_ledger,
+    read_stable_d1_migration_ledger, read_stable_d1_migration_ledger_authority,
+    validate_d1_manifest_write_result, validate_d1_migration_manifest,
+    validate_generic_d1_migration_family,
 };
 use crate::d1_migration_reconciliation::{
     D1ReconcileMigrationManifestArgs, contextualize_d1_reconciliation_semantic_error,
@@ -4914,9 +4914,21 @@ impl CloudflareMcp {
             "terminal_attempt_sha256": terminal_attempt_sha256,
         });
         let mutation_plan = MutationPlan::new(D1_BOOTSTRAP_ABORT_OPERATION)
-            .step("prove_initializer_attempt_marker_absent", false, mutation_target.clone())
-            .step("persist_zero_dispatch_terminal_receipt", true, mutation_target.clone())
-            .step("reprove_initializer_attempt_marker_absent", false, mutation_target.clone())
+            .step(
+                "prove_initializer_attempt_marker_absent",
+                false,
+                mutation_target.clone(),
+            )
+            .step(
+                "persist_zero_dispatch_terminal_receipt",
+                true,
+                mutation_target.clone(),
+            )
+            .step(
+                "reprove_initializer_attempt_marker_absent",
+                false,
+                mutation_target.clone(),
+            )
             .step("retire_bootstrap_custody", true, mutation_target.clone());
         let audit = MutationAuditSession::start(
             Some(&parts),
@@ -4936,7 +4948,12 @@ impl CloudflareMcp {
             dry_run,
             approved_terminal_plan_sha256.as_deref(),
         );
-        Ok(finalize_mutation_result(result, &mutation_plan, audit, dry_run))
+        Ok(finalize_mutation_result(
+            result,
+            &mutation_plan,
+            audit,
+            dry_run,
+        ))
     }
 
     #[tool(
@@ -19806,10 +19823,7 @@ mod tests {
         let dry_run = server
             .cloudflare_api_mutate(Parameters(ApiMutateArgs {
                 operation_id: "d1-create-database".to_string(),
-                path_params: BTreeMap::from([(
-                    "account_id".to_string(),
-                    "acct-1".to_string(),
-                )]),
+                path_params: BTreeMap::from([("account_id".to_string(), "acct-1".to_string())]),
                 query: BTreeMap::new(),
                 body: Some(body.clone()),
                 dry_run: true,
@@ -19836,10 +19850,7 @@ mod tests {
         let result = server
             .cloudflare_api_mutate(Parameters(ApiMutateArgs {
                 operation_id: "d1-create-database".to_string(),
-                path_params: BTreeMap::from([(
-                    "account_id".to_string(),
-                    "acct-1".to_string(),
-                )]),
+                path_params: BTreeMap::from([("account_id".to_string(), "acct-1".to_string())]),
                 query: BTreeMap::new(),
                 body: Some(body),
                 dry_run: false,

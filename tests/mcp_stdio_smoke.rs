@@ -533,7 +533,7 @@ fn spawn_fake_r2_api_with_requests(expected_requests: usize) -> (String, Arc<Mut
             }
         }
     });
-    (format!("http://{addr}"), requests)
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
 }
 
 fn spawn_fake_r2_binary_api() -> (String, Arc<Mutex<Vec<String>>>) {
@@ -914,7 +914,7 @@ fn spawn_fake_bootstrap_read_fault_api(
                 }
                 BootstrapReadFault::Redirect => {
                     let response = b"redirect refused";
-                    write!(stream, "HTTP/1.1 302 Found\r\nconnection: close\r\nlocation: http://127.0.0.1:9/must-not-be-followed\r\ncontent-type: text/plain\r\ncontent-length: {}\r\n\r\n", response.len())
+                    write!(stream, "HTTP/1.1 302 Found\r\nconnection: close\r\nlocation: http://127.0.0.1:9/must-not-be-followed\r\ncontent-type: text/plain\r\ncontent-length: {}\r\n\r\n", response.len()) // DevSkim: ignore DS137138 -- loopback-only no-follow fixture
                         .expect("write bootstrap redirect headers");
                     stream
                         .write_all(response)
@@ -1459,11 +1459,11 @@ fn spawn_fake_manifest_ambiguous_api(
             stream.write_all(&response).expect("write response");
         }
     });
-    (format!("http://{addr}"), requests)
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
 }
 
 fn spawn_fake_manifest_oversized_write_api() -> (String, Arc<Mutex<Vec<Value>>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind oversized manifest D1 API");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind oversized manifest D1 API"); // DevSkim: ignore DS162092 -- loopback-only MCP test fixture
     let addr = listener.local_addr().expect("oversized manifest D1 addr");
     let requests = Arc::new(Mutex::new(Vec::new()));
     let requests_for_thread = requests.clone();
@@ -6012,22 +6012,30 @@ fn d1_bootstrap_migration_ledger_dry_run_and_live_prove_one_initializer_only() {
     assert_eq!(dry["provider_calls"], json!(2));
     assert_eq!(dry["provider_mutations"], json!(0));
     assert_eq!(
-        dry["provider_read_lifecycle"]
-            .as_array()
-            .map(Vec::len),
+        dry["provider_read_lifecycle"].as_array().map(Vec::len),
         Some(2),
         "{dry}"
     );
-    assert!(dry["provider_read_lifecycle"].as_array().is_some_and(|reads| {
-        reads.iter().enumerate().all(|(index, read)| {
-            read["phase"] == json!(format!("dry_run_preflight.inventory.{}", if index == 0 { "first" } else { "second" }))
-                && read["query_sha256"].as_str().is_some_and(|value| value.len() == 64)
-                && read["lifecycle"]["dispatch_stage"] == json!("attempted")
-                && read["lifecycle"]["response_stage"] == json!("received")
-                && read["lifecycle"]["body_stage"] == json!("completely_read")
-                && read["lifecycle"]["http_status"] == json!(200)
-        })
-    }));
+    assert!(
+        dry["provider_read_lifecycle"]
+            .as_array()
+            .is_some_and(|reads| {
+                reads.iter().enumerate().all(|(index, read)| {
+                    read["phase"]
+                        == json!(format!(
+                            "dry_run_preflight.inventory.{}",
+                            if index == 0 { "first" } else { "second" }
+                        ))
+                        && read["query_sha256"]
+                            .as_str()
+                            .is_some_and(|value| value.len() == 64)
+                        && read["lifecycle"]["dispatch_stage"] == json!("attempted")
+                        && read["lifecycle"]["response_stage"] == json!("received")
+                        && read["lifecycle"]["body_stage"] == json!("completely_read")
+                        && read["lifecycle"]["http_status"] == json!(200)
+                })
+            })
+    );
     assert_eq!(dry["response_evidence"].as_array().map(Vec::len), Some(2));
     let plan = dry["plan_sha256"].as_str().expect("bootstrap plan");
 
@@ -6204,10 +6212,8 @@ fn d1_bootstrap_reads_are_one_attempt_bounded_and_report_exact_lifecycle() {
     .enumerate()
     {
         let (base_url, requests) = spawn_fake_bootstrap_read_fault_api(fault);
-        let mut mcp = McpStdioProcess::start_with_env(vec![(
-            "CLOUDFLARE_MCP_API_BASE_URL",
-            base_url,
-        )]);
+        let mut mcp =
+            McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
         let content = structured_content(&mcp.call_tool(
             500 + index as u64,
             "d1_bootstrap_migration_ledger",
@@ -6232,9 +6238,7 @@ fn d1_bootstrap_reads_are_one_attempt_bounded_and_report_exact_lifecycle() {
             "case {index}: {content}"
         );
         assert_eq!(
-            content["provider_read_lifecycle"]
-                .as_array()
-                .map(Vec::len),
+            content["provider_read_lifecycle"].as_array().map(Vec::len),
             Some(expected_calls),
             "case {index}: {content}"
         );
@@ -6274,11 +6278,14 @@ fn d1_bootstrap_reads_are_one_attempt_bounded_and_report_exact_lifecycle() {
             .expect("response evidence array");
         assert_eq!(evidence.len(), expected_calls, "case {index}: {content}");
         let last = &evidence[expected_calls - 1];
-        assert_eq!(last["phase"], json!(if expected_calls == 1 {
-            "dry_run_preflight.inventory.first"
-        } else {
-            "dry_run_preflight.inventory.second"
-        }));
+        assert_eq!(
+            last["phase"],
+            json!(if expected_calls == 1 {
+                "dry_run_preflight.inventory.first"
+            } else {
+                "dry_run_preflight.inventory.second"
+            })
+        );
         if body_stage == "completely_read" {
             assert!(
                 last["response"]["body_sha256"]
@@ -6286,10 +6293,21 @@ fn d1_bootstrap_reads_are_one_attempt_bounded_and_report_exact_lifecycle() {
                     .is_some_and(|value| value.len() == 64),
                 "case {index}: {content}"
             );
-            assert_eq!(last["response"]["complete_body_digest"], json!(true), "{content}");
+            assert_eq!(
+                last["response"]["complete_body_digest"],
+                json!(true),
+                "{content}"
+            );
         } else {
-            assert!(last["response"]["body_sha256"].is_null(), "case {index}: {content}");
-            assert_eq!(last["response"]["complete_body_digest"], json!(false), "{content}");
+            assert!(
+                last["response"]["body_sha256"].is_null(),
+                "case {index}: {content}"
+            );
+            assert_eq!(
+                last["response"]["complete_body_digest"],
+                json!(false),
+                "{content}"
+            );
             if status.is_some() {
                 assert!(
                     last["response"]["body_size_bytes"].as_u64().is_some(),
@@ -6300,18 +6318,28 @@ fn d1_bootstrap_reads_are_one_attempt_bounded_and_report_exact_lifecycle() {
             }
         }
         if expected_code == "d1.bootstrap_inventory_unreadable" {
-            assert_eq!(content["error"]["cause"]["retryable"], json!(false), "{content}");
+            assert_eq!(
+                content["error"]["cause"]["retryable"],
+                json!(false),
+                "{content}"
+            );
             assert_eq!(
                 content["error"]["cause"]["operator_guidance"],
                 json!("reconciliation_only"),
                 "{content}"
             );
             assert!(content["error"]["cause"].get("hint").is_none(), "{content}");
-            assert!(content["error"]["cause"].get("message").is_none(), "{content}");
+            assert!(
+                content["error"]["cause"].get("message").is_none(),
+                "{content}"
+            );
             assert!(!content.to_string().contains("synthetic HTTP"), "{content}");
         }
         assert_eq!(
-            requests.lock().expect("bootstrap read-fault requests").len(),
+            requests
+                .lock()
+                .expect("bootstrap read-fault requests")
+                .len(),
             expected_calls,
             "case {index}: no hidden retry is permitted"
         );
@@ -6334,7 +6362,11 @@ fn d1_bootstrap_reads_are_one_attempt_bounded_and_report_exact_lifecycle() {
     .clone();
     assert_eq!(content["ok"], json!(false), "{content}");
     assert_eq!(content["provider_calls"], json!(0), "{content}");
-    assert_eq!(content["automatic_retry_permitted"], json!(false), "{content}");
+    assert_eq!(
+        content["automatic_retry_permitted"],
+        json!(false),
+        "{content}"
+    );
     assert_eq!(
         content["provider_read_lifecycle"][0]["lifecycle"],
         json!({
@@ -6349,10 +6381,16 @@ fn d1_bootstrap_reads_are_one_attempt_bounded_and_report_exact_lifecycle() {
         content["provider_read_lifecycle"][0]["phase"],
         json!("dry_run_preflight.inventory.first")
     );
-    assert!(content["provider_read_lifecycle"][0]["query_sha256"]
-        .as_str()
-        .is_some_and(|value| value.len() == 64));
-    assert_eq!(content["response_evidence"].as_array().map(Vec::len), Some(1), "{content}");
+    assert!(
+        content["provider_read_lifecycle"][0]["query_sha256"]
+            .as_str()
+            .is_some_and(|value| value.len() == 64)
+    );
+    assert_eq!(
+        content["response_evidence"].as_array().map(Vec::len),
+        Some(1),
+        "{content}"
+    );
     assert!(content["response_evidence"][0]["response"]["body_sha256"].is_null());
     pre_dispatch.terminate();
 
@@ -6362,10 +6400,7 @@ fn d1_bootstrap_reads_are_one_attempt_bounded_and_report_exact_lifecycle() {
             "http://127.0.0.1:9".to_string(),
         ),
         ("CLOUDFLARE_API_TOKEN", "invalid\nheader".to_string()),
-        (
-            "CLOUDFLARE_MCP_API_TOKEN",
-            "invalid\nheader".to_string(),
-        ),
+        ("CLOUDFLARE_MCP_API_TOKEN", "invalid\nheader".to_string()),
     ]);
     let content = structured_content(&builder_failure.call_tool(
         600,
@@ -6380,7 +6415,11 @@ fn d1_bootstrap_reads_are_one_attempt_bounded_and_report_exact_lifecycle() {
         json!("cloudflare.request_build_failed"),
         "{content}"
     );
-    assert_eq!(content["error"]["cause"]["retryable"], json!(false), "{content}");
+    assert_eq!(
+        content["error"]["cause"]["retryable"],
+        json!(false),
+        "{content}"
+    );
     assert_eq!(
         content["error"]["cause"]["operator_guidance"],
         json!("reconciliation_only"),
@@ -6540,7 +6579,10 @@ fn d1_bootstrap_zero_dispatch_abort_retires_only_exact_marker_aware_custody() {
         .unwrap_or_else(|| panic!("zero-dispatch lease payload: {blocked}"))
         .to_string();
     bootstrap.terminate();
-    assert_eq!(conflict_requests.lock().expect("conflict requests").len(), 2);
+    assert_eq!(
+        conflict_requests.lock().expect("conflict requests").len(),
+        2
+    );
     let target = manifest_target_path(&lease_root);
     let retired = target.join(format!("retired.{nonce}.lease.json"));
     let active = target.join("active.lease.json");
@@ -6645,7 +6687,10 @@ fn d1_bootstrap_zero_dispatch_abort_retires_only_exact_marker_aware_custody() {
         completed["status"],
         json!("bootstrap_zero_dispatch_abort_complete")
     );
-    assert_eq!(completed["custody_status"], json!("retired_evidence_verified"));
+    assert_eq!(
+        completed["custody_status"],
+        json!("retired_evidence_verified")
+    );
     assert_eq!(completed["local_namespace_mutations"], json!(3));
     assert_eq!(completed["provider_calls"], json!(0));
 
@@ -6707,17 +6752,12 @@ fn d1_bootstrap_migration_ledger_ambiguous_inner_results_preserve_write_evidence
             "result": inner_result.clone(),
         }))
         .expect("serialize expected ambiguous initializer response");
-        let expected_write_response_sha256 = sha256_hex(&String::from_utf8(
-            expected_write_response.clone(),
-        )
-        .expect("expected ambiguous initializer response is UTF-8"));
-        let (base_url, requests) = spawn_fake_bootstrap_api_with_inner_result(
-            9,
-            false,
-            false,
-            true,
-            Some(inner_result),
+        let expected_write_response_sha256 = sha256_hex(
+            &String::from_utf8(expected_write_response.clone())
+                .expect("expected ambiguous initializer response is UTF-8"),
         );
+        let (base_url, requests) =
+            spawn_fake_bootstrap_api_with_inner_result(9, false, false, true, Some(inner_result));
         let lease_root = std::path::PathBuf::from("/tmp").join(format!(
             "cloudflare-mcp-bootstrap-inner-result-{index}-{}",
             std::process::id()
@@ -6821,7 +6861,10 @@ fn d1_bootstrap_migration_ledger_ambiguous_inner_results_preserve_write_evidence
             json!({"database_id": "db-1", "approved_plan_sha256": "a".repeat(64)}),
         );
         let blocked = structured_content(&blocked);
-        assert_eq!(blocked["error"]["code"], json!("d1.migration_target_lease_held"));
+        assert_eq!(
+            blocked["error"]["code"],
+            json!("d1.migration_target_lease_held")
+        );
         assert_eq!(blocked["provider_calls"], json!(0), "{label}");
         assert_eq!(
             requests.lock().expect("request log").len(),
@@ -6879,9 +6922,7 @@ fn d1_bootstrap_migration_ledger_response_loss_retains_custody_and_never_retries
     assert_eq!(content["lease_retained"], json!(true));
     assert_eq!(content["automatic_retry_permitted"], json!(false));
     assert_eq!(
-        content["provider_read_lifecycle"]
-            .as_array()
-            .map(Vec::len),
+        content["provider_read_lifecycle"].as_array().map(Vec::len),
         Some(6),
         "two pre-dispatch proof reads plus four ambiguity readbacks: {content}"
     );
@@ -6930,7 +6971,9 @@ fn d1_bootstrap_migration_ledger_response_loss_retains_custody_and_never_retries
         "{content}"
     );
     assert!(
-        !content.to_string().contains("private-initializer-body-marker"),
+        !content
+            .to_string()
+            .contains("private-initializer-body-marker"),
         "provider body excerpt leaked: {content}"
     );
     assert_eq!(
@@ -6995,7 +7038,11 @@ fn d1_bootstrap_migration_ledger_response_loss_retains_custody_and_never_retries
         }),
     );
     let abort_after_attempt = structured_content(&abort_after_attempt);
-    assert_eq!(abort_after_attempt["ok"], json!(false), "{abort_after_attempt}");
+    assert_eq!(
+        abort_after_attempt["ok"],
+        json!(false),
+        "{abort_after_attempt}"
+    );
     assert_eq!(abort_after_attempt["provider_calls"], json!(0));
     assert_eq!(
         abort_after_attempt["error"]["code"],
@@ -7806,7 +7853,11 @@ fn d1_bootstrap_reconciliation_provider_failure_is_one_attempt_and_nonterminal()
     assert_eq!(content["provider_mutations"], json!(0), "{content}");
     assert_eq!(content["local_namespace_mutations"], json!(0), "{content}");
     assert_eq!(content["lease_retained"], json!(true), "{content}");
-    assert_eq!(content["error"]["cause"]["retryable"], json!(false), "{content}");
+    assert_eq!(
+        content["error"]["cause"]["retryable"],
+        json!(false),
+        "{content}"
+    );
     assert_eq!(
         content["error"]["cause"]["operator_guidance"],
         json!("reconciliation_only"),
@@ -9070,10 +9121,7 @@ fn d1_apply_migration_manifest_oversized_write_response_retains_custody_without_
         content["error"]["code"],
         json!("d1.migration_apply_outcome_unknown")
     );
-    assert_eq!(
-        content["error"]["cause"]["kind"],
-        json!("transport")
-    );
+    assert_eq!(content["error"]["cause"]["kind"], json!("transport"));
     assert_eq!(
         content["error"]["cause"]["code"],
         json!("cloudflare.d1.migration_manifest_response_too_large")
@@ -9101,7 +9149,10 @@ fn d1_apply_migration_manifest_oversized_write_response_retains_custody_without_
         content["error"]["cause"]["response_body_size_bytes"],
         json!(16 * 1024 * 1024 + 1)
     );
-    let observed = requests.lock().expect("oversized-write request log").clone();
+    let observed = requests
+        .lock()
+        .expect("oversized-write request log")
+        .clone();
     assert_eq!(observed.len(), 10, "one write plus bounded reconciliation");
     assert_eq!(
         observed
@@ -9465,11 +9516,7 @@ fn generic_manifest_tools_reject_the_reserved_bootstrap_family_before_any_effect
     );
     terminal_args["account_id"] = json!("acct-1");
     terminal_args["migration_family"] = json!(reserved_family);
-    let finalize = mcp.call_tool(
-        739,
-        "d1_finalize_migration_reconciliation",
-        terminal_args,
-    );
+    let finalize = mcp.call_tool(739, "d1_finalize_migration_reconciliation", terminal_args);
 
     for (operation, response) in [
         ("d1_apply_migration_manifest", apply),
@@ -9486,11 +9533,7 @@ fn generic_manifest_tools_reject_the_reserved_bootstrap_family_before_any_effect
         );
         assert_eq!(content["provider_calls"], json!(0), "{content}");
         assert_eq!(content["provider_mutations"], json!(0), "{content}");
-        assert_eq!(
-            content["local_namespace_mutations"],
-            json!(0),
-            "{content}"
-        );
+        assert_eq!(content["local_namespace_mutations"], json!(0), "{content}");
         assert_eq!(content["lease_retained"], Value::Null, "{content}");
         assert_eq!(content["custody_status"], "not_inspected", "{content}");
     }
@@ -16460,10 +16503,8 @@ fn api_mutate_denies_existing_target_d1_schema_mutations_before_request_construc
         "http://{}",
         provider.local_addr().expect("D1 provider witness address")
     );
-    let mut mcp = McpStdioProcess::start_with_env(vec![(
-        "CLOUDFLARE_MCP_API_BASE_URL",
-        provider_url,
-    )]);
+    let mut mcp =
+        McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", provider_url)]);
 
     for (index, operation_id) in [
         "d1-query-database",
@@ -16471,8 +16512,8 @@ fn api_mutate_denies_existing_target_d1_schema_mutations_before_request_construc
         "d1-import-database",
         "d1-time-travel-restore",
     ]
-        .into_iter()
-        .enumerate()
+    .into_iter()
+    .enumerate()
     {
         let mutation_payload_marker =
             format!("CREATE TABLE forbidden_{index}(id INTEGER PRIMARY KEY)");
@@ -16502,14 +16543,9 @@ fn api_mutate_denies_existing_target_d1_schema_mutations_before_request_construc
             content["api_operation"]["operation_id"],
             json!(operation_id)
         );
-        assert_eq!(
-            content["api_operation"]["risk"],
-            json!("denied_by_default")
-        );
+        assert_eq!(content["api_operation"]["risk"], json!("denied_by_default"));
         let expected_preferred_tool = match operation_id {
-            "d1-query-database" | "d1-raw-database-query" => {
-                Some("d1_query_read_only")
-            }
+            "d1-query-database" | "d1-raw-database-query" => Some("d1_query_read_only"),
             "d1-import-database" | "d1-time-travel-restore" => None,
             _ => unreachable!(),
         };
