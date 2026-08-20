@@ -86,6 +86,9 @@ Read/query tools use restricted SQL checks. Write and migration tools preserve
 dry-run discipline and fail closed on unsafe or ambiguous state. Use
 `d1_apply_migration_manifest` for every live migration; the legacy
 directory-backed `d1_apply_migrations` tool refuses live mutation.
+The exact family `migration-ledger-bootstrap-v1` belongs only to the dedicated
+bootstrap apply/reconcile/finalize/abort lifecycle. All three generic manifest
+tools reject it before provider, custody, receipt, or namespace activity.
 
 Use `d1_bootstrap_migration_ledger` only before the first migration on a
 separately selected, genuinely empty D1 database. Its dry run binds the exact

@@ -17,15 +17,15 @@ use crate::d1_migration_lease::{
     preflight_d1_migration_target_custody,
 };
 use crate::d1_migration_manifest::{
-    D1ManifestLedgerRow, d1_migrations_table_init_sql, parse_d1_migration_ledger,
-    parse_d1_migration_ledger_authority,
+    D1_BOOTSTRAP_RESERVED_MIGRATION_FAMILY, D1ManifestLedgerRow,
+    d1_migrations_table_init_sql, parse_d1_migration_ledger, parse_d1_migration_ledger_authority,
 };
 use crate::mutation::{MutationAuditSession, MutationPlan};
 use crate::server::CloudflareMcp;
 use crate::tools::{d1_applied_migrations_sql, sha256_bytes_hex, sha256_hex};
 
 pub(crate) const D1_BOOTSTRAP_OPERATION: &str = "d1_bootstrap_migration_ledger";
-pub(crate) const D1_BOOTSTRAP_LEASE_FAMILY: &str = "migration-ledger-bootstrap-v1";
+pub(crate) const D1_BOOTSTRAP_LEASE_FAMILY: &str = D1_BOOTSTRAP_RESERVED_MIGRATION_FAMILY;
 
 pub(crate) struct D1BootstrapExecutionInput {
     pub(crate) account_id: String,

@@ -207,6 +207,11 @@ cannot reconcile or retire bootstrap-family custody.
 ## Exact-byte D1 migration manifests
 
 Use `d1_apply_migration_manifest` for an approval-gated D1 migration family.
+Never pass the reserved exact family `migration-ledger-bootstrap-v1` to this
+generic tool or to generic reconciliation/finalization. Only the dedicated
+bootstrap lifecycle owns that family; generic boundaries reject it before
+provider access or local custody/receipt activity.
+
 First run it with `dry_run=true`; retain the returned `plan_sha256`, which is
 bound to the exact SQL bytes and current Wrangler ledger prefix. A live call
 must submit that exact lowercase value, without whitespace or case changes, as

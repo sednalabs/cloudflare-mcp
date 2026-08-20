@@ -9023,6 +9023,124 @@ fn d1_reconcile_migration_manifest_stdio_wraps_semantic_validation_in_fixed_orde
 }
 
 #[test]
+fn generic_manifest_tools_reject_the_reserved_bootstrap_family_before_any_effect() {
+    let provider = TcpListener::bind("127.0.0.1:0").expect("bind no-call provider witness");
+    provider
+        .set_nonblocking(true)
+        .expect("make provider witness nonblocking");
+    let provider_url = format!(
+        "http://{}",
+        provider.local_addr().expect("provider witness address")
+    );
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-reserved-bootstrap-family-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create private lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make lease root private");
+    }
+
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", provider_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let (manifest, state_expectations) = one_table_reconciliation_case();
+    let reserved_family = "migration-ledger-bootstrap-v1";
+    let apply = mcp.call_tool(
+        737,
+        "d1_apply_migration_manifest",
+        json!({
+            "account_id": "acct-1",
+            "database_id": "db-1",
+            "migration_family": reserved_family,
+            "manifest": manifest.clone(),
+            "approved_plan_sha256": "a".repeat(64),
+            "dry_run": false,
+        }),
+    );
+    let reconcile = mcp.call_tool(
+        738,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "account_id": "acct-1",
+            "database_id": "db-1",
+            "migration_family": reserved_family,
+            "manifest": manifest.clone(),
+            "approved_plan_sha256": "a".repeat(64),
+            "lease_nonce": "b".repeat(64),
+            "lease_payload_sha256": "c".repeat(64),
+            "effect_assertion_id": "schema_create_only_v1",
+            "state_expectations": state_expectations.clone(),
+        }),
+    );
+    let mut terminal_args = terminal_request_args(
+        &manifest,
+        &state_expectations,
+        &"a".repeat(64),
+        &"b".repeat(64),
+        &"c".repeat(64),
+    );
+    terminal_args["account_id"] = json!("acct-1");
+    terminal_args["migration_family"] = json!(reserved_family);
+    let finalize = mcp.call_tool(
+        739,
+        "d1_finalize_migration_reconciliation",
+        terminal_args,
+    );
+
+    for (operation, response) in [
+        ("d1_apply_migration_manifest", apply),
+        ("d1_reconcile_migration_manifest", reconcile),
+        ("d1_finalize_migration_reconciliation", finalize),
+    ] {
+        let content = structured_content(&response);
+        assert_eq!(content["ok"], json!(false), "{operation}: {content}");
+        assert_eq!(content["operation"], json!(operation), "{content}");
+        assert_eq!(
+            content["error"]["code"],
+            json!("d1.reserved_migration_family"),
+            "{operation}: {content}"
+        );
+        assert_eq!(content["provider_calls"], json!(0), "{content}");
+        assert_eq!(content["provider_mutations"], json!(0), "{content}");
+        assert_eq!(
+            content["local_namespace_mutations"],
+            json!(0),
+            "{content}"
+        );
+        assert_eq!(content["lease_retained"], Value::Null, "{content}");
+        assert_eq!(content["custody_status"], "not_inspected", "{content}");
+    }
+
+    assert!(
+        matches!(provider.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "reserved-family rejection must not connect to the provider"
+    );
+    assert!(
+        !manifest_target_path(&lease_root).exists(),
+        "reserved-family rejection must not create or retire target custody"
+    );
+    assert_eq!(
+        fs::read_dir(&lease_root)
+            .expect("read empty lease root")
+            .count(),
+        0,
+        "reserved-family rejection leaves no local custody or receipt artifact"
+    );
+
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
 fn d1_reconcile_migration_manifest_proves_stable_full_state_without_retry_or_mutation() {
     let (base_url, requests) = spawn_fake_reconciliation_api();
     let lease_root = PathBuf::from("/tmp").join(format!(

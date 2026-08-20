@@ -15,6 +15,7 @@ use crate::d1_migration_lease::{
     D1TerminalReconciliationReceiptEvidence, D1TerminalReconciliationReceiptV1,
     inspect_terminal_d1_migration_lease,
 };
+use crate::d1_migration_manifest::validate_generic_d1_migration_family;
 use crate::d1_migration_reconciliation::{
     D1MigrationStateExpectation, canonical_effect_assertion_id,
     prepare_d1_migration_reconciliation, refresh_d1_migration_reconciliation,
@@ -109,6 +110,9 @@ pub(crate) async fn finalize_d1_migration_reconciliation(
     dry_run: bool,
     approved_terminal_plan_sha256: Option<&str>,
 ) -> CallToolResult {
+    if let Err(result) = validate_generic_d1_migration_family(family) {
+        return contextualize_terminal_semantic_error(result);
+    }
     let selected_effect_assertion_id = match canonical_effect_assertion_id(effect_assertion_id) {
         Ok(id) => id,
         Err(result) => return contextualize_terminal_semantic_error(result),

@@ -56,13 +56,14 @@ use crate::d1_migration_lease::{
 };
 use crate::d1_migration_manifest::{
     D1ManifestReconciliationEvidence, approved_d1_plan_digest_matches, classify_d1_manifest_ledger,
-    d1_ledger_summaries, d1_manifest_contextualize_failure, d1_manifest_plan_mismatch_result,
-    d1_manifest_plan_sha256, d1_manifest_reconciliation_custody_lost_result,
+    contextualize_d1_manifest_semantic_error, d1_ledger_summaries,
+    d1_manifest_contextualize_failure, d1_manifest_plan_mismatch_result, d1_manifest_plan_sha256,
+    d1_manifest_reconciliation_custody_lost_result,
     d1_manifest_reconciliation_required_result, d1_manifest_summaries,
     d1_manifest_unknown_ledger_result, d1_migrations_table_init_sql, normalize_d1_manifest_target,
     normalize_d1_migration_family, parse_d1_migration_ledger, read_stable_d1_migration_ledger,
     read_stable_d1_migration_ledger_authority, validate_d1_manifest_write_result,
-    validate_d1_migration_manifest,
+    validate_d1_migration_manifest, validate_generic_d1_migration_family,
 };
 use crate::d1_migration_reconciliation::{
     D1ReconcileMigrationManifestArgs, contextualize_d1_reconciliation_semantic_error,
@@ -4997,6 +4998,9 @@ impl CloudflareMcp {
             Ok(family) => family,
             Err(result) => return Ok(result),
         };
+        if let Err(result) = validate_generic_d1_migration_family(&family) {
+            return Ok(contextualize_d1_manifest_semantic_error(result, dry_run));
+        }
         let max_rows = max_rows.unwrap_or(100).clamp(1, 1000);
         let mutation_target = json!({
             "target_key_sha256": sha256_bytes_hex(
@@ -5681,6 +5685,9 @@ impl CloudflareMcp {
                 return Ok(contextualize_d1_reconciliation_semantic_error(result));
             }
         };
+        if let Err(result) = validate_generic_d1_migration_family(&family) {
+            return Ok(contextualize_d1_reconciliation_semantic_error(result));
+        }
         Ok(reconcile_d1_migration_manifest(
             self,
             &target.account_id,
@@ -5765,6 +5772,9 @@ impl CloudflareMcp {
             Ok(family) => family,
             Err(result) => return Ok(contextualize_terminal_semantic_error(result)),
         };
+        if let Err(result) = validate_generic_d1_migration_family(&family) {
+            return Ok(contextualize_terminal_semantic_error(result));
+        }
         let mutation_target = json!({
             "target_key_sha256": sha256_bytes_hex(
                 format!("{}\0{}", target.account_id, target.database_id).as_bytes()

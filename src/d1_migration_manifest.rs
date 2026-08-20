@@ -24,6 +24,43 @@ pub(crate) struct D1ManifestTarget {
     pub(crate) database_id: String,
 }
 
+pub(crate) const D1_BOOTSTRAP_RESERVED_MIGRATION_FAMILY: &str =
+    "migration-ledger-bootstrap-v1";
+
+pub(crate) fn validate_generic_d1_migration_family(
+    family: &str,
+) -> Result<(), CallToolResult> {
+    if family == D1_BOOTSTRAP_RESERVED_MIGRATION_FAMILY {
+        return Err(invalid_argument_result(
+            "d1.reserved_migration_family",
+            "migration-ledger-bootstrap-v1 is reserved for the dedicated bootstrap migration-ledger lifecycle",
+            "Use d1_bootstrap_migration_ledger and its dedicated reconcile, finalize, or abort tool; use a different exact family for generic manifests.",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn contextualize_d1_manifest_semantic_error(
+    result: CallToolResult,
+    dry_run: bool,
+) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": "d1_apply_migration_manifest",
+        "dry_run": dry_run,
+        "status": "reconciliation_required",
+        "outcome": "not_started",
+        "retry_decision": "do_not_retry_same_attempt",
+        "lease_decision": "not_acquired",
+        "lease_retained": null,
+        "custody_status": "not_inspected",
+        "provider_calls": 0,
+        "provider_mutations": 0,
+        "local_namespace_mutations": 0,
+        "error": d1_call_tool_error_value(result),
+    }))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct D1ManifestLedgerRow {
     pub(crate) id: i64,
@@ -748,6 +785,7 @@ mod tests {
         expected_d1_migration_ledger_table_sql, legacy_wrangler_d1_migration_ledger_table_sql,
         parse_d1_migration_ledger, parse_d1_migration_ledger_authority,
         validate_d1_manifest_write_result, validate_d1_migration_manifest,
+        validate_generic_d1_migration_family,
     };
     use crate::tools::{D1MigrationManifestEntry, sha256_hex};
 
@@ -787,6 +825,21 @@ mod tests {
                 .expect("test table is a valid Wrangler identifier")
         );
         authority
+    }
+
+    #[test]
+    fn generic_manifest_family_reservation_is_exact() {
+        let reserved = validate_generic_d1_migration_family("migration-ledger-bootstrap-v1")
+            .expect_err("the dedicated bootstrap family is reserved");
+        assert_eq!(
+            reserved.structured_content.expect("structured reservation")["error"]["code"],
+            json!("d1.reserved_migration_family")
+        );
+        assert!(
+            validate_generic_d1_migration_family("migration-ledger-bootstrap-v1-next").is_ok(),
+            "the reservation must not reject a broader label prefix"
+        );
+        assert!(validate_generic_d1_migration_family("newsletter-core").is_ok());
     }
 
     #[test]

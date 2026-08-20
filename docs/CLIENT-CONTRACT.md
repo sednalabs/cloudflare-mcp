@@ -140,6 +140,8 @@ contains the current template plus a read-only-only optional approval override.
 
 For `d1_bootstrap_migration_ledger` and `d1_apply_migration_manifest`, a live `approved_plan_sha256` is the exact lowercase 64-character `plan_sha256` returned by that tool's dry run. Case changes and surrounding whitespace are rejected so apply and retained recovery bind one canonical approval identity. The bootstrap plan is valid only for the same exact account, database, ledger-table identity, canonical initializer bytes, and primary-served empty schema observed by the live preflight. Manifest names may be current Wrangler relative POSIX paths such as `0001_init/migration.sql`, not only flat basenames. They must be canonical and are ordered with Wrangler's segment-wise leading-number comparison and lexical tie-breaking; absolute paths, backslashes, empty segments, `.`/`..`, and NUL are rejected.
 
+The exact family `migration-ledger-bootstrap-v1` is reserved to `d1_bootstrap_migration_ledger` and its dedicated reconcile, finalize, and abort tools. Generic manifest apply, read-only reconciliation, and terminal finalization reject that family before provider access, custody inspection or creation, receipt access, or local namespace mutation; similarly prefixed family labels are not reserved.
+
 | Tool | Required arguments | Optional arguments | Notes |
 | --- | --- | --- | --- |
 | `health` | none | none | Runtime status summary. |

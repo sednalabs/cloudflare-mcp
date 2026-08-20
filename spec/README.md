@@ -125,6 +125,11 @@ Preserved curated tool families:
   attempt receipt; it must reject legacy, malformed, contradictory, present,
   or unstable marker evidence and preserve permanent no-retry semantics after
   any attempted or ambiguous initializer.
+- The exact `migration-ledger-bootstrap-v1` family is reserved to that
+  dedicated bootstrap lifecycle. Generic manifest apply, reconciliation, and
+  terminal finalization/replay must reject it before provider, custody,
+  receipt, or local namespace activity; the reservation is exact rather than
+  prefix-based.
 - Retained-manifest reconciliation (`d1_reconcile_migration_manifest`) is a
   first-class read-only D1 recovery contract. Keep its exact structured
   expectation schema, manifest-derived complete prefix inventory, query-bound
