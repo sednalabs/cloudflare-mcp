@@ -10459,6 +10459,78 @@ fn d1_v2_seven_null_seed_literals_bind_reconciliation_terminal_receipt_and_repla
     );
     v1_mcp.terminate();
 
+    let rowid_table_sql = "CREATE TABLE rowid_seed(id INTEGER PRIMARY KEY) STRICT";
+    let rowid_insert_sql = "INSERT INTO rowid_seed (id) VALUES (NULL)";
+    let rowid_migration_sql = format!("{rowid_table_sql};\n{rowid_insert_sql};");
+    let rowid_manifest = json!([{
+        "name": "0001_rowid_seed.sql",
+        "size_bytes": rowid_migration_sql.len(),
+        "sql_sha256": sha256_hex(&rowid_migration_sql),
+        "sql": rowid_migration_sql,
+    }]);
+    let rowid_state_expectations = json!([
+        {"manifest_prefix_length": 0, "schema_objects": [], "tables": []},
+        {
+            "manifest_prefix_length": 1,
+            "schema_objects": [{
+                "object_type": "table",
+                "name": "rowid_seed",
+                "table_name": "rowid_seed",
+                "sql_sha256": sha256_hex(rowid_table_sql),
+            }],
+            "tables": [{
+                "name": "rowid_seed",
+                "columns": [{
+                    "cid": 0,
+                    "name": "id",
+                    "declared_type": "INTEGER",
+                    "not_null": false,
+                    "default_value": null,
+                    "primary_key_position": 1,
+                    "hidden": 0,
+                }],
+                "foreign_keys": [],
+            }],
+            "seed_tables": [{
+                "table_name": "rowid_seed",
+                "columns": ["id"],
+                "row_count": 1,
+                "rows_sha256": typed_seed_rowset_sha256_version(
+                    2,
+                    "rowid_seed",
+                    &["id"],
+                    vec![vec![json!({"storage_class": "null", "value": null})]],
+                ),
+            }],
+        },
+    ]);
+    let mut rowid_mcp = McpStdioProcess::start_with_env(vec![(
+        "CLOUDFLARE_MCP_API_BASE_URL",
+        "http://127.0.0.1:9".to_string(), // DevSkim: ignore DS137138 -- loopback-only zero-call fixture
+    )]);
+    let rowid_rejection = rowid_mcp.call_tool(
+        905,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": rowid_manifest,
+            "approved_plan_sha256": "a".repeat(64),
+            "lease_nonce": "b".repeat(64),
+            "lease_payload_sha256": "c".repeat(64),
+            "effect_assertion_id": "schema_create_objects_additive_seed_rows_v2",
+            "state_expectations": rowid_state_expectations,
+        }),
+    );
+    let rowid_content = structured_content(&rowid_rejection);
+    assert_eq!(rowid_content["ok"], json!(false), "{rowid_content}");
+    assert_eq!(rowid_content["provider_calls"], json!(0), "{rowid_content}");
+    assert_eq!(
+        rowid_content["error"]["code"],
+        "d1.migration_reconciliation_seed_affinity_unstable"
+    );
+    rowid_mcp.terminate();
+
     let (base_url, requests) = spawn_fake_null_seed_reconciliation_api(
         11,
         table_sql,

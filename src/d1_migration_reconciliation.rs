@@ -34,7 +34,7 @@ use crate::d1_migration_seed_rows::{
     EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V2, SeedAssertionVersion, SeedContractError,
     SeedInsertEffect, SeedManifestPlan, SeedTableRegistration, SeedTableState,
     classify_seed_insert, insert_seed_effect, observed_seed_summary, seed_data_fields,
-    seed_literal_is_identity_stable_for_declared_type, seed_select_sql,
+    seed_literal_is_identity_stable_for_reviewed_column, seed_select_sql,
     sqlite_ascii_identifier_key, state_summaries,
 };
 use crate::server::CloudflareMcp;
@@ -1039,6 +1039,7 @@ fn validate_expectations(
             &derived_seed_state,
             &state.tables,
             seed_plan.map(|plan| &plan.strict_table_keys),
+            seed_plan.map(|plan| &plan.rowid_table_keys),
         )?;
         let derived_seed_summaries = state_summaries(&derived_seed_state);
         if state.seed_tables != derived_seed_summaries {
@@ -1262,6 +1263,7 @@ fn validate_seed_storage_affinity(
     seed_tables: &[SeedTableState],
     tables: &[D1MigrationTableExpectation],
     strict_table_keys: Option<&BTreeSet<String>>,
+    rowid_table_keys: Option<&BTreeSet<String>>,
 ) -> Result<(), CallToolResult> {
     if seed_tables.is_empty() {
         return Ok(());
@@ -1311,11 +1313,13 @@ fn validate_seed_storage_affinity(
                     )
                 })?;
             if seed_table.rows.iter().any(|row| {
-                !seed_literal_is_identity_stable_for_declared_type(
+                !seed_literal_is_identity_stable_for_reviewed_column(
                     &row[column_index],
                     &column.declared_type,
                     strict_table_keys.is_some_and(|keys| keys.contains(&table_key)),
                     column.not_null,
+                    column.primary_key_position,
+                    rowid_table_keys.is_some_and(|keys| keys.contains(&table_key)),
                 )
             }) {
                 return Err(reconciliation_error(
@@ -1541,6 +1545,7 @@ fn derive_additive_effect_assertion(
     let mut trigger_seen = BTreeSet::new();
     let mut seeded_tables = BTreeSet::new();
     let mut strict_seed_table_keys = BTreeSet::new();
+    let mut rowid_seed_table_keys = BTreeSet::new();
     let mut table_identity_spellings = BTreeMap::<String, String>::new();
     for migration in manifest {
         let statements = tokenize_sql_statements(&migration.sql).ok_or_else(|| {
@@ -1583,6 +1588,9 @@ fn derive_additive_effect_assertion(
                     }
                     if schema_create_table_is_strict(&tokens) {
                         strict_seed_table_keys.insert(authority_key.clone());
+                    }
+                    if !schema_create_table_is_without_rowid(&tokens) {
+                        rowid_seed_table_keys.insert(authority_key.clone());
                     }
                     table_identity_spellings
                         .entry(authority_key)
@@ -1855,6 +1863,7 @@ fn derive_additive_effect_assertion(
         seed_plan: allow_seed_rows.then_some(SeedManifestPlan {
             states: seed_states,
             strict_table_keys: strict_seed_table_keys,
+            rowid_table_keys: rowid_seed_table_keys,
             registry: seed_registry,
             preexisting_table_spellings,
         }),
@@ -2357,6 +2366,21 @@ fn schema_create_table_is_strict(tokens: &[SqlToken]) -> bool {
     tokens[after_definition..]
         .iter()
         .any(|token| token_is_word(Some(token), "strict"))
+}
+
+fn schema_create_table_is_without_rowid(tokens: &[SqlToken]) -> bool {
+    let Some(definition_start) = tokens
+        .iter()
+        .position(|token| token == &SqlToken::Symbol('('))
+    else {
+        return false;
+    };
+    let Some(after_definition) = balanced_parenthesized_end(tokens, definition_start) else {
+        return false;
+    };
+    tokens[after_definition..].windows(2).any(|window| {
+        token_is_word(window.first(), "without") && token_is_word(window.get(1), "rowid")
+    })
 }
 
 fn tokenize_sql_statements(sql: &str) -> Option<Vec<Vec<SqlToken>>> {
@@ -4321,6 +4345,7 @@ mod tests {
                 foreign_keys: Vec::new(),
             }],
             Some(&seed_plan.strict_table_keys),
+            Some(&seed_plan.rowid_table_keys),
         )
         .expect("the zero-row prefix need not expose a later seed column");
 

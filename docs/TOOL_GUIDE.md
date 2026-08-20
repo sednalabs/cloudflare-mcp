@@ -257,8 +257,10 @@ selection-query digest, selected-ledger digest and prefix, and both
 complete-ledger digests. Responses return aggregate
 row-count/digest evidence only; raw
 seed values are never returned. Implicit columns, INSERT SELECT, expressions,
-NULL/REAL/BLOB values, conflict clauses, qualified or quoted identities,
-duplicate rows/targets, other DML, and any readback mismatch fail closed.
+REAL/BLOB values, conflict clauses, qualified or quoted identities, duplicate
+rows/targets, other DML, and any readback mismatch fail closed. Under the v1
+assertion specifically, SQL `NULL` literals also fail closed; only the separate
+v2 assertion described below admits them.
 Predecessor assertions remain closed to top-level INSERT.
 When the exact manifest contains canonical SQL `NULL` seed literals, select the
 separate `schema_create_objects_additive_seed_rows_v2` assertion instead. Do
@@ -266,8 +268,10 @@ not relabel the manifest as v1: v1 deliberately continues to reject NULL and
 retains its established query, hash, receipt, and replay identities. Version 2
 adds NULL while preserving all seed ordering and boundedness rules. Represent
 an expected NULL as `{"storage_class":"null","value":null}` in the local
-version-2 row-set proof, require its reviewed column to be nullable, and reject
-every contradictory storage-class/value pairing. The v2 assertion ID remains
+version-2 row-set proof, require its reviewed column to be nullable, reject an
+`INTEGER PRIMARY KEY` NULL in a rowid table because SQLite would generate a
+rowid instead of preserving NULL, and reject every contradictory
+storage-class/value pairing. The v2 assertion ID remains
 bound through reconciliation, terminal dry run, live finalization, durable
 receipt, and completed replay. Provider migration-write and PRAGMA transmission
 are outside this reconciliation-only selection and require their own execution

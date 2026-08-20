@@ -203,6 +203,19 @@ Preserved curated tool families:
   `schema_create_objects_additive`, while the seed assertion reports
   `schema_create_objects_additive_seed_rows`, each with its complete closed
   object/operation array.
+  `schema_create_objects_additive_seed_rows_v2` is a separate assertion, not a
+  widening or relabeling of v1. It adds only canonical SQL `NULL` literals to
+  the v1 seed grammar and reports the distinct
+  `schema_create_objects_additive_seed_rows_with_nulls` statement class. Its
+  typed row-set digest uses version 2 and represents each NULL cell exactly as
+  `{"storage_class":"null","value":null}`; storage-class/value
+  contradictions fail closed. A reviewed target column must be nullable, and
+  NULL is rejected for an `INTEGER PRIMARY KEY` in a rowid table because SQLite
+  would replace that literal with a generated rowid rather than preserve the
+  asserted NULL. Reconciliation, terminal dry run, live finalization, durable
+  receipt authority, and exact completed replay all remain bound to the v2
+  assertion identity and its version-2 digest domain. The v1 query, digest,
+  receipt, and replay identities remain unchanged.
   Every assertion also treats the configured migration-ledger table as a
   reserved SQLite identifier: case variants in CREATE identities, index or
   trigger parents, any exact admitted trigger header/body lexical token, and additive

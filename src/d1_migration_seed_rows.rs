@@ -124,6 +124,8 @@ pub(crate) struct SeedManifestPlan {
     pub(crate) states: Vec<Vec<SeedTableState>>,
     /// SQLite ASCII-normalized identities of manifest-created STRICT tables.
     pub(crate) strict_table_keys: BTreeSet<String>,
+    /// SQLite ASCII-normalized identities of manifest-created rowid tables.
+    pub(crate) rowid_table_keys: BTreeSet<String>,
     /// Full-manifest projection registry. A registered table exists in every
     /// state at or after `created_prefix`, with zero rows until `seeded_prefix`.
     pub(crate) registry: Vec<SeedTableRegistration>,
@@ -369,6 +371,29 @@ pub(crate) fn seed_literal_is_identity_stable_for_declared_type(
         (literal, affinity),
         (SeedLiteral::Text(_), "text" | "blob")
             | (SeedLiteral::Integer(_), "integer" | "numeric" | "blob")
+    )
+}
+
+pub(crate) fn seed_literal_is_identity_stable_for_reviewed_column(
+    literal: &SeedLiteral,
+    declared_type: &str,
+    strict_table: bool,
+    not_null: bool,
+    primary_key_position: i64,
+    rowid_table: bool,
+) -> bool {
+    if matches!(literal, SeedLiteral::Null)
+        && rowid_table
+        && primary_key_position > 0
+        && declared_type.eq_ignore_ascii_case("INTEGER")
+    {
+        return false;
+    }
+    seed_literal_is_identity_stable_for_declared_type(
+        literal,
+        declared_type,
+        strict_table,
+        not_null,
     )
 }
 
@@ -1006,6 +1031,33 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn null_rejects_a_reviewed_integer_primary_key_rowid_alias() {
+        let null = SeedLiteral::Null;
+        for strict in [false, true] {
+            assert!(!seed_literal_is_identity_stable_for_reviewed_column(
+                &null, "INTEGER", strict, false, 1, true,
+            ));
+            assert!(seed_literal_is_identity_stable_for_reviewed_column(
+                &null, "INTEGER", strict, false, 1, false,
+            ));
+            assert!(seed_literal_is_identity_stable_for_reviewed_column(
+                &null, "TEXT", strict, false, 1, true,
+            ));
+            assert!(seed_literal_is_identity_stable_for_reviewed_column(
+                &null, "INTEGER", strict, false, 0, true,
+            ));
+        }
+        assert!(seed_literal_is_identity_stable_for_reviewed_column(
+            &SeedLiteral::Integer(1),
+            "INTEGER",
+            true,
+            false,
+            1,
+            true,
+        ));
     }
 
     #[test]
