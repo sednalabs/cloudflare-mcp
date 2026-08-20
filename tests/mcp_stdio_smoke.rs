@@ -33,6 +33,7 @@ fn expected_d1_reconciliation_semantic_error(code: &str, message: &str, hint: &s
         "lease_retained": null,
         "custody_status": "not_inspected",
         "query_sha256": null,
+        "query_shape_receipt": null,
         "response_evidence": [],
         "provider_calls": 0,
         "provider_read_lifecycle": [],
@@ -1573,6 +1574,52 @@ fn spawn_fake_manifest_oversized_write_api() -> (String, Arc<Mutex<Vec<Value>>>)
     (format!("http://{addr}"), requests)
 }
 
+fn spawn_fake_manifest_deep_write_api(private_message: &str) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind deep manifest D1 API");
+    let addr = listener.local_addr().expect("deep manifest D1 addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    let private_message = private_message.to_string();
+    thread::spawn(move || {
+        for stream in listener.incoming().take(10) {
+            let mut stream = stream.expect("deep manifest D1 stream");
+            let (headers, body) = read_http_request(&mut stream);
+            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            let body_json: Value =
+                serde_json::from_slice(&body).expect("deep manifest request JSON");
+            requests_for_thread
+                .lock()
+                .expect("deep manifest request log")
+                .push(body_json.clone());
+            let sql = body_json["sql"].as_str().unwrap_or_default();
+            let response = if is_manifest_ledger_authority_sql(sql) {
+                serde_json::to_vec(&manifest_ledger_authority_response("d1_migrations"))
+                    .expect("serialize deep fixture authority response")
+            } else if sql.contains("INSERT INTO \"d1_migrations\"") {
+                let nested = format!("{}0{}", "[".repeat(40), "]".repeat(40));
+                format!(
+                    r#"{{"success":true,"errors":[],"messages":[],"result":[{{"success":true,"errors":[],"results":[{{"ok":true,"message":{},"nested":{nested}}}],"meta":{{"served_by_primary":true,"changed_db":true,"changes":1,"rows_written":1}}}}]}}"#,
+                    serde_json::to_string(&private_message)
+                        .expect("serialize private deep acknowledgement message")
+                )
+                .into_bytes()
+            } else {
+                assert_eq!(sql, "SELECT * FROM \"d1_migrations\" ORDER BY id");
+                serde_json::to_vec(&manifest_ledger_response(vec![json!({
+                    "id": 1,
+                    "name": "0001_initial.sql"
+                })]))
+                .expect("serialize deep fixture ledger response")
+            };
+            write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write deep manifest response headers");
+            stream
+                .write_all(&response)
+                .expect("write deep manifest response");
+        }
+    });
+    (format!("http://{addr}"), requests)
+}
+
 /// Coordinate one response-loss boundary so the test can alter local custody
 /// only after the non-idempotent write has reached its provider boundary.
 fn spawn_blocked_ambiguous_manifest_api() -> (
@@ -1662,6 +1709,8 @@ enum ReconciliationFault {
     MixedPrimaryMarkers,
     SecondBatchPrimaryFalse,
     SecondBatchHttpStatus(u16),
+    SecondBatchAllowlistedHttpError(u16, i64, String),
+    SecondBatchDeepHttpError(u16, String),
     SecondBatchTransportFailure(Option<PathBuf>),
     RequestTransportFailure(usize),
     DuplicateOuterSuccess(bool, Arc<Mutex<Vec<u8>>>),
@@ -2501,6 +2550,40 @@ fn spawn_fake_reconciliation_api_with_fault_and_calls(
                     continue;
                 }
             }
+            if let ReconciliationFault::SecondBatchAllowlistedHttpError(status, code, message) =
+                &fault
+            {
+                if request_index == 1 {
+                    let response = serde_json::to_vec(&json!({
+                        "success": false,
+                        "errors": [{"code": code, "message": message}],
+                        "messages": [],
+                        "result": null,
+                    }))
+                    .expect("serialize allowlisted reconciliation HTTP error");
+                    write!(stream, "HTTP/1.1 {status} Synthetic\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write allowlisted second reconciliation HTTP error headers");
+                    stream
+                        .write_all(&response)
+                        .expect("write allowlisted second reconciliation HTTP error");
+                    continue;
+                }
+            }
+            if let ReconciliationFault::SecondBatchDeepHttpError(status, message) = &fault {
+                if request_index == 1 {
+                    let nested = format!("{}0{}", "[".repeat(40), "]".repeat(40));
+                    let response = format!(
+                        r#"{{"success":false,"errors":[{{"code":7500,"message":{},"nested":{nested}}}],"messages":[],"result":null}}"#,
+                        serde_json::to_string(message)
+                            .expect("serialize deep reconciliation error message")
+                    )
+                    .into_bytes();
+                    write!(stream, "HTTP/1.1 {status} Synthetic\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len()).expect("write deep second reconciliation HTTP error headers");
+                    stream
+                        .write_all(&response)
+                        .expect("write deep second reconciliation HTTP error");
+                    continue;
+                }
+            }
             if let ReconciliationFault::OversizedHttpStatus(status) = &fault {
                 write!(stream, "HTTP/1.1 {status} Synthetic\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", 16 * 1024 * 1024 + 1).expect("write oversized reconciliation HTTP error headers");
                 continue;
@@ -2647,6 +2730,8 @@ fn spawn_fake_reconciliation_api_with_fault_and_calls(
                 | ReconciliationFault::SecondBatchCustodyDrift(_)
                 | ReconciliationFault::SecondBatchPrimaryFalse
                 | ReconciliationFault::SecondBatchHttpStatus(_)
+                | ReconciliationFault::SecondBatchAllowlistedHttpError(_, _, _)
+                | ReconciliationFault::SecondBatchDeepHttpError(_, _)
                 | ReconciliationFault::SecondBatchTransportFailure(_)
                 | ReconciliationFault::RequestTransportFailure(_)
                 | ReconciliationFault::DuplicateOuterSuccess(_, _)
@@ -9526,6 +9611,132 @@ fn d1_apply_migration_manifest_oversized_write_response_retains_custody_without_
     let _ = fs::remove_dir_all(lease_root);
 }
 
+#[test]
+fn d1_apply_migration_manifest_over_depth_acknowledgement_is_ambiguous_and_retains_custody() {
+    let private_message = "SQL SELECT * FROM private_table at /private/path";
+    let (base_url, requests) = spawn_fake_manifest_deep_write_api(private_message);
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-deep-manifest-write-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create deep-write lease root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make deep-write lease root private");
+    }
+    let env = vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ];
+    let mut mcp = McpStdioProcess::start_with_env(env.clone());
+    let first_sql = "CREATE TABLE submissions(id TEXT);";
+    let second_sql = "ALTER TABLE submissions ADD COLUMN status TEXT;";
+    let manifest = json!([
+        {"name": "0001_initial.sql", "size_bytes": first_sql.len(), "sql_sha256": sha256_hex(first_sql), "sql": first_sql},
+        {"name": "0002_second.sql", "size_bytes": second_sql.len(), "sql_sha256": sha256_hex(second_sql), "sql": second_sql}
+    ]);
+    let dry = mcp.call_tool(
+        1765,
+        "d1_apply_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "dry_run": true,
+            "manifest": manifest.clone(),
+        }),
+    );
+    let plan = structured_content(&dry)["plan_sha256"]
+        .as_str()
+        .expect("deep-write plan")
+        .to_string();
+    let live = mcp.call_tool(
+        1766,
+        "d1_apply_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest.clone(),
+            "approved_plan_sha256": plan.clone(),
+        }),
+    );
+    let content = structured_content(&live);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["status"], json!("reconciliation_required"));
+    assert_eq!(content["outcome"], json!("unknown"));
+    assert_eq!(content["lease_retained"], json!(true));
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.migration_apply_outcome_unknown")
+    );
+    assert_eq!(
+        content["error"]["cause"]["code"],
+        json!("cloudflare.d1.migration_manifest_malformed_envelope")
+    );
+    assert_eq!(content["error"]["cause"]["status"], json!(200));
+    assert_eq!(content["error"]["cause"]["retryable"], json!(false));
+    assert_eq!(
+        content["error"]["cause"]["operator_guidance"],
+        json!("reconciliation_only")
+    );
+    assert_eq!(
+        content["error"]["cause"]["provider_write_lifecycle"],
+        json!({
+            "dispatch_stage": "attempted",
+            "response_stage": "received",
+            "body_stage": "completely_read",
+            "http_status": 200,
+        })
+    );
+    assert!(
+        content["error"]["cause"]["response_body_sha256"]
+            .as_str()
+            .is_some_and(|digest| digest.len() == 64),
+        "{content}"
+    );
+    assert!(
+        content["error"]["cause"]["response_body_size_bytes"]
+            .as_u64()
+            .is_some_and(|size| size > 0),
+        "{content}"
+    );
+    let serialized = serde_json::to_string(content).expect("serialize deep write result");
+    assert!(!serialized.contains(private_message));
+    assert!(!serialized.contains("private_table"));
+    assert!(!serialized.contains("/private/path"));
+    let observed = requests.lock().expect("deep-write request log").clone();
+    assert_eq!(observed.len(), 10, "one write plus bounded reconciliation");
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|request| request["sql"]
+                .as_str()
+                .is_some_and(|sql| sql.contains("INSERT INTO \"d1_migrations\"")))
+            .count(),
+        1,
+        "over-depth acknowledgement must not replay the non-idempotent write"
+    );
+    let active = assert_private_regular_active_lease(&lease_root);
+    let target = active.parent().expect("manifest custody target");
+    assert!(!target.join("retiring.lease.json").exists());
+    assert!(!target.join("retired.lease.json").exists());
+    mcp.terminate();
+    assert_fresh_process_blocked_without_provider_request(
+        env,
+        &manifest,
+        &plan,
+        &requests,
+        10,
+        "over-depth migration-write acknowledgement",
+    );
+    let _ = fs::remove_dir_all(lease_root);
+}
+
 #[cfg(unix)]
 #[test]
 fn d1_apply_migration_manifest_ambiguous_apply_never_claims_retained_custody_after_drift() {
@@ -10014,6 +10225,25 @@ fn d1_reconcile_migration_manifest_proves_stable_full_state_without_retry_or_mut
         })
     );
     assert!(content["query_sha256"].as_str().is_some());
+    assert_eq!(
+        content["query_shape_receipt"]["receipt_version"],
+        json!("d1-reconciliation-query-shape-v1")
+    );
+    assert_eq!(
+        content["query_shape_receipt"]["query_sha256"],
+        content["query_sha256"]
+    );
+    assert_eq!(
+        content["query_shape_receipt"]["statement_classes"],
+        json!({
+            "ledger": {"count": 1, "present": true},
+            "schema_catalog": {"count": 1, "present": true},
+            "table_xinfo": {"count": 1, "present": true},
+            "foreign_key_definition": {"count": 1, "present": true},
+            "foreign_key_check": {"count": 1, "present": true},
+            "seed": {"count": 0, "present": false},
+        })
+    );
     assert!(content["canonical_snapshot_sha256"].as_str().is_some());
     assert!(content["reconciliation_plan_sha256"].as_str().is_some());
     assert_eq!(
@@ -13131,6 +13361,7 @@ fn d1_finalize_migration_reconciliation_stdio_does_not_claim_retention_after_cus
     );
     let drift_content = structured_content(&drift);
     let query_sha256 = drift_content["query_sha256"].clone();
+    let query_shape_receipt = drift_content["query_shape_receipt"].clone();
     let response_evidence = drift_content["response_evidence"].clone();
     let provider_lifecycle = drift_content["provider_read_lifecycle"].clone();
     assert_eq!(
@@ -13156,6 +13387,7 @@ fn d1_finalize_migration_reconciliation_stdio_does_not_claim_retention_after_cus
             "custody_status": "retained_evidence_unverified",
             "receipt_persisted": null,
             "query_sha256": query_sha256,
+            "query_shape_receipt": query_shape_receipt,
             "response_evidence": response_evidence,
             "provider_calls": 1,
             "provider_read_lifecycle": provider_lifecycle,
@@ -13395,6 +13627,7 @@ fn d1_reconcile_migration_manifest_stdio_rejects_unproven_effects_and_incomplete
             "lease_retained": null,
             "custody_status": "not_inspected",
             "query_sha256": null,
+            "query_shape_receipt": null,
             "response_evidence": [],
             "provider_calls": 0,
             "provider_read_lifecycle": [],
@@ -13449,6 +13682,7 @@ fn d1_reconcile_migration_manifest_stdio_rejects_unproven_effects_and_incomplete
             "lease_retained": null,
             "custody_status": "not_inspected",
             "query_sha256": null,
+            "query_shape_receipt": null,
             "response_evidence": [],
             "provider_calls": 0,
             "provider_read_lifecycle": [],
@@ -13512,6 +13746,7 @@ fn d1_reconcile_migration_manifest_stdio_rejects_unproven_effects_and_incomplete
         })
         .expect("canonical fixed-query SHA-256")
         .to_string();
+    let query_shape_receipt = content["query_shape_receipt"].clone();
     assert_eq!(
         content,
         &json!({
@@ -13525,6 +13760,7 @@ fn d1_reconcile_migration_manifest_stdio_rejects_unproven_effects_and_incomplete
             "lease_retained": null,
             "custody_status": "inspection_failed",
             "query_sha256": query_sha256,
+            "query_shape_receipt": query_shape_receipt,
             "provider_calls": 0,
             "provider_read_lifecycle": [],
             "provider_mutations": 0,
@@ -14363,6 +14599,7 @@ fn d1_reconcile_migration_manifest_stdio_reports_pre_dispatch_without_provider_c
     );
     let content = structured_content(&response);
     let query_sha256 = content["query_sha256"].clone();
+    let query_shape_receipt = content["query_shape_receipt"].clone();
     assert_eq!(
         content,
         &json!({
@@ -14378,6 +14615,7 @@ fn d1_reconcile_migration_manifest_stdio_reports_pre_dispatch_without_provider_c
             "lease_retained": true,
             "custody_status": "retained_evidence_verified",
             "query_sha256": query_sha256,
+            "query_shape_receipt": query_shape_receipt,
             "response_evidence": [],
             "provider_read_lifecycle": [{
                 "dispatch_stage": "pre_dispatch",
@@ -14681,6 +14919,7 @@ fn d1_reconcile_migration_manifest_stdio_preserves_identical_reads_after_second_
     );
     let content = structured_content(&response);
     let query_sha256 = content["query_sha256"].clone();
+    let query_shape_receipt = content["query_shape_receipt"].clone();
     let evidence = content["response_evidence"]
         .as_array()
         .expect("two chronological response summaries");
@@ -14701,6 +14940,7 @@ fn d1_reconcile_migration_manifest_stdio_preserves_identical_reads_after_second_
             "lease_retained": null,
             "custody_status": "retained_evidence_unverified",
             "query_sha256": query_sha256,
+            "query_shape_receipt": query_shape_receipt,
             "response_evidence": [response_summary.clone(), response_summary],
             "provider_read_lifecycle": [lifecycle.clone(), lifecycle],
             "provider_calls": 2,
@@ -14848,6 +15088,7 @@ fn d1_reconcile_migration_manifest_stdio_keeps_post_read_contradictions_verified
         );
         let content = structured_content(&response);
         let query_sha256 = content["query_sha256"].clone();
+        let query_shape_receipt = content["query_shape_receipt"].clone();
         let response_evidence = content["response_evidence"].clone();
         let evidence = response_evidence
             .as_array()
@@ -14896,6 +15137,7 @@ fn d1_reconcile_migration_manifest_stdio_keeps_post_read_contradictions_verified
                 "lease_retained": true,
                 "custody_status": "retained_evidence_verified",
                 "query_sha256": query_sha256,
+                "query_shape_receipt": query_shape_receipt,
                 "response_evidence": response_evidence,
                 "provider_read_lifecycle": lifecycle,
                 "provider_calls": 2,
@@ -15011,6 +15253,202 @@ fn d1_reconcile_migration_manifest_stdio_preserves_both_batches_when_second_call
 }
 
 #[test]
+fn d1_reconcile_migration_manifest_stdio_reports_safe_allowlisted_second_error() {
+    let (manifest, expectations) = one_table_reconciliation_case();
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-reconcile-safe-provider-error-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create safe-provider-error reconciliation root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make safe-provider-error reconciliation root private");
+    }
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&lease_root, &manifest);
+    let private_message = "SQL SELECT * FROM private_table at /private/path";
+    let (base_url, requests) = spawn_fake_reconciliation_api_with_fault(
+        ReconciliationFault::SecondBatchAllowlistedHttpError(
+            400,
+            7_500,
+            private_message.to_string(),
+        ),
+    );
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let response = mcp.call_tool(
+        1763,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest,
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_only_v1",
+            "state_expectations": expectations,
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["provider_calls"], json!(2), "{content}");
+    assert_eq!(
+        content["response_evidence"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        content["provider_read_lifecycle"][0]["http_status"],
+        json!(200)
+    );
+    assert_eq!(
+        content["provider_read_lifecycle"][1]["http_status"],
+        json!(400)
+    );
+    assert_eq!(
+        content["provider_cause"]["provider_error_code"],
+        json!(7_500)
+    );
+    assert_eq!(
+        content["provider_cause"]["provider_error_category"],
+        json!("d1_error")
+    );
+    let receipt = &content["query_shape_receipt"];
+    assert_eq!(
+        receipt["receipt_version"],
+        json!("d1-reconciliation-query-shape-v1")
+    );
+    assert_eq!(receipt["query_sha256"], content["query_sha256"]);
+    assert_eq!(receipt["statement_count"], json!(5));
+    assert_eq!(
+        receipt["statement_classes"],
+        json!({
+            "ledger": {"count": 1, "present": true},
+            "schema_catalog": {"count": 1, "present": true},
+            "table_xinfo": {"count": 1, "present": true},
+            "foreign_key_definition": {"count": 1, "present": true},
+            "foreign_key_check": {"count": 1, "present": true},
+            "seed": {"count": 0, "present": false},
+        })
+    );
+    assert_eq!(receipt["receipt_sha256"].as_str().map(str::len), Some(64));
+    let serialized = serde_json::to_string(content).expect("serialize safe provider error");
+    assert!(!serialized.contains(private_message));
+    assert!(!serialized.contains("private_table"));
+    assert!(!serialized.contains("/private/path"));
+    assert_eq!(requests.lock().expect("request log").len(), 2);
+    assert_private_regular_active_lease(&lease_root);
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_reconcile_migration_manifest_stdio_deep_error_is_generic_with_custody_retained() {
+    let (manifest, expectations) = one_table_reconciliation_case();
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-reconcile-deep-provider-error-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create deep-provider-error reconciliation root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make deep-provider-error reconciliation root private");
+    }
+    let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
+        create_retained_reconciliation_fixture(&lease_root, &manifest);
+    let private_message = "SQL SELECT * FROM private_table at /private/path";
+    let (base_url, requests) = spawn_fake_reconciliation_api_with_fault(
+        ReconciliationFault::SecondBatchDeepHttpError(400, private_message.to_string()),
+    );
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let response = mcp.call_tool(
+        1764,
+        "d1_reconcile_migration_manifest",
+        json!({
+            "database_id": "db-1",
+            "migration_family": "newsletter-core",
+            "manifest": manifest,
+            "approved_plan_sha256": approved_plan_sha256,
+            "lease_nonce": lease_nonce,
+            "lease_payload_sha256": lease_payload_sha256,
+            "effect_assertion_id": "schema_create_only_v1",
+            "state_expectations": expectations,
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["provider_calls"], json!(2), "{content}");
+    assert_eq!(content["provider_mutations"], json!(0), "{content}");
+    assert_eq!(content["lease_retained"], json!(true), "{content}");
+    assert_eq!(
+        content["custody_status"],
+        json!("retained_evidence_verified"),
+        "{content}"
+    );
+    assert_eq!(
+        content["provider_read_lifecycle"],
+        json!([
+            {
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 200,
+            },
+            {
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 400,
+            }
+        ]),
+        "{content}"
+    );
+    assert_eq!(
+        content["response_evidence"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        content["provider_cause"],
+        json!({
+            "code": "cloudflare.http_error",
+            "operator_guidance": "reconciliation_only",
+            "retryable": false,
+            "status": 400,
+        }),
+        "{content}"
+    );
+    assert_eq!(
+        content["query_shape_receipt"]["query_sha256"],
+        content["query_sha256"]
+    );
+    let serialized = serde_json::to_string(content).expect("serialize deep provider error");
+    assert!(!serialized.contains(private_message));
+    assert!(!serialized.contains("private_table"));
+    assert!(!serialized.contains("/private/path"));
+    assert_eq!(requests.lock().expect("request log").len(), 2);
+    assert_private_regular_active_lease(&lease_root);
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
 fn d1_reconcile_migration_manifest_stdio_preserves_second_transport_invocation_without_body() {
     let (manifest, expectations) = one_table_reconciliation_case();
     for (index, custody_verified) in [true, false].into_iter().enumerate() {
@@ -15055,6 +15493,7 @@ fn d1_reconcile_migration_manifest_stdio_preserves_second_transport_invocation_w
         );
         let content = structured_content(&response);
         let query_sha256 = content["query_sha256"].clone();
+        let query_shape_receipt = content["query_shape_receipt"].clone();
         let first = content["response_evidence"][0].clone();
         assert_eq!(first.as_object().map(|value| value.len()), Some(3));
         let mut expected = json!({
@@ -15074,6 +15513,7 @@ fn d1_reconcile_migration_manifest_stdio_preserves_second_transport_invocation_w
                 "retained_evidence_unverified"
             },
             "query_sha256": query_sha256,
+            "query_shape_receipt": query_shape_receipt,
             "response_evidence": [first.clone()],
             "provider_read_lifecycle": [
                 first["lifecycle"].clone(),
@@ -15174,6 +15614,7 @@ fn d1_reconcile_migration_manifest_stdio_rejects_recursive_duplicate_keys_in_bot
         let response_body_sha256 = sha256_hex(raw_response_text);
         let content = structured_content(&response);
         let query_sha256 = content["query_sha256"].clone();
+        let query_shape_receipt = content["query_shape_receipt"].clone();
         let lifecycle = json!({
             "dispatch_stage": "attempted",
             "response_stage": "received",
@@ -15195,6 +15636,7 @@ fn d1_reconcile_migration_manifest_stdio_rejects_recursive_duplicate_keys_in_bot
                 "lease_retained": true,
                 "custody_status": "retained_evidence_verified",
                 "query_sha256": query_sha256,
+                "query_shape_receipt": query_shape_receipt,
                 "response_evidence": [{
                     "response_body_sha256": response_body_sha256,
                     "response_body_size_bytes": raw_response.len(),
@@ -15347,6 +15789,22 @@ fn d1_reconcile_migration_manifest_stdio_treats_auth_rate_limit_and_5xx_evidence
             content["provider_cause"]["status"],
             json!(status),
             "{content}"
+        );
+        assert!(
+            content["provider_cause"]
+                .get("provider_error_code")
+                .is_none(),
+            "non-allowlisted or incomplete evidence must stay generic: {content}"
+        );
+        assert!(
+            content["provider_cause"]
+                .get("provider_error_category")
+                .is_none(),
+            "non-allowlisted or incomplete evidence must stay generic: {content}"
+        );
+        assert_eq!(
+            content["query_shape_receipt"]["query_sha256"],
+            content["query_sha256"]
         );
         assert_eq!(
             content["provider_read_lifecycle"],

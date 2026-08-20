@@ -14185,6 +14185,7 @@ mod tests {
             "lease_retained": null,
             "custody_status": "not_inspected",
             "query_sha256": null,
+            "query_shape_receipt": null,
             "response_evidence": [],
             "provider_calls": 0,
             "provider_read_lifecycle": [],

@@ -71,6 +71,7 @@ pub(crate) fn contextualize_d1_reconciliation_semantic_error(
         "lease_retained": null,
         "custody_status": "not_inspected",
         "query_sha256": null,
+        "query_shape_receipt": null,
         "response_evidence": [],
         "provider_calls": 0,
         "provider_read_lifecycle": [],
@@ -87,6 +88,7 @@ const MAX_SCHEMA_OBJECTS: usize = 128;
 const MAX_TABLES: usize = 64;
 const MAX_COLUMNS_PER_TABLE: usize = 256;
 const MAX_FOREIGN_KEYS_PER_TABLE: usize = 256;
+const QUERY_SHAPE_RECEIPT_VERSION: &str = "d1-reconciliation-query-shape-v1";
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct D1ReconcileMigrationManifestArgs {
@@ -274,6 +276,82 @@ struct FixedQuery {
     proof_sha256: String,
     statements: Vec<BatchStatement>,
     table_identity_spellings: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+struct QueryShapeClassReceipt {
+    count: usize,
+    present: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct QueryShapeClassesReceipt {
+    ledger: QueryShapeClassReceipt,
+    schema_catalog: QueryShapeClassReceipt,
+    table_xinfo: QueryShapeClassReceipt,
+    foreign_key_definition: QueryShapeClassReceipt,
+    foreign_key_check: QueryShapeClassReceipt,
+    seed: QueryShapeClassReceipt,
+}
+
+#[derive(Debug, Serialize)]
+struct QueryShapeReceiptAuthority<'a> {
+    receipt_version: &'static str,
+    query_sha256: &'a str,
+    statement_count: usize,
+    statement_classes: QueryShapeClassesReceipt,
+}
+
+impl FixedQuery {
+    fn shape_receipt(&self) -> Value {
+        let class = |predicate: fn(&BatchStatement) -> bool| {
+            let count = self
+                .statements
+                .iter()
+                .filter(|statement| predicate(statement))
+                .count();
+            QueryShapeClassReceipt {
+                count,
+                present: count != 0,
+            }
+        };
+        let authority = QueryShapeReceiptAuthority {
+            receipt_version: QUERY_SHAPE_RECEIPT_VERSION,
+            query_sha256: &self.sha256,
+            statement_count: self.statements.len(),
+            statement_classes: QueryShapeClassesReceipt {
+                ledger: class(|statement| matches!(statement, BatchStatement::Ledger)),
+                schema_catalog: class(|statement| matches!(statement, BatchStatement::Schema)),
+                table_xinfo: class(|statement| matches!(statement, BatchStatement::TableXinfo(_))),
+                foreign_key_definition: class(|statement| {
+                    matches!(statement, BatchStatement::ForeignKeyList(_))
+                }),
+                foreign_key_check: class(|statement| {
+                    matches!(statement, BatchStatement::ForeignKeyCheck(_))
+                }),
+                seed: class(|statement| matches!(statement, BatchStatement::SeedRows(_))),
+            },
+        };
+        let receipt_sha256 = sha256_bytes_hex(
+            &serde_json::to_vec(&authority)
+                .expect("query-shape receipt serialization is infallible"),
+        );
+        let mut receipt = serde_json::to_value(authority)
+            .expect("query-shape receipt serialization is infallible");
+        receipt["receipt_sha256"] = json!(receipt_sha256);
+        receipt
+    }
+}
+
+fn add_query_shape_receipt(result: &mut CallToolResult, query: &FixedQuery) {
+    if let Some(Value::Object(content)) = result.structured_content.as_mut() {
+        content.insert("query_shape_receipt".to_string(), query.shape_receipt());
+    }
+}
+
+fn with_query_shape_receipt(mut result: CallToolResult, query: &FixedQuery) -> CallToolResult {
+    add_query_shape_receipt(&mut result, query);
+    result
 }
 
 #[derive(Debug)]
@@ -473,10 +551,9 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
     ) {
         Ok(lease) => lease,
         Err(result) => {
-            return Err(prelease_error(
-                result,
-                "inspection_failed",
-                Some(&selection_query.sha256),
+            return Err(with_query_shape_receipt(
+                prelease_error(result, "inspection_failed", Some(&selection_query.sha256)),
+                &selection_query,
             ));
         }
     };
@@ -496,17 +573,20 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
             Err(result) => return Err(result),
         };
         if classify_d1_manifest_ledger(manifest, &batch.snapshot.ledger).is_err() {
-            return Err(contextualize_error(
-                reconciliation_error_with_evidence(
-                    "contradictory",
-                    "d1.migration_reconciliation_ledger_not_manifest_prefix",
-                    "seed-row selection evidence did not contain an exact manifest ledger prefix",
+            return Err(with_query_shape_receipt(
+                contextualize_error(
+                    reconciliation_error_with_evidence(
+                        "contradictory",
+                        "d1.migration_reconciliation_ledger_not_manifest_prefix",
+                        "seed-row selection evidence did not contain an exact manifest ledger prefix",
+                        Some(&selection_query.sha256),
+                        &[response_digest_summary(&batch)],
+                    ),
                     Some(&selection_query.sha256),
-                    &[response_digest_summary(&batch)],
+                    &[],
+                    1,
                 ),
-                Some(&selection_query.sha256),
-                &[],
-                1,
+                &selection_query,
             ));
         }
         Some(batch)
@@ -583,11 +663,14 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
     stable_evidence.push(response_digest_summary(&second));
     let stable_provider_calls = stable_evidence.len();
     if let Err(result) = lease.revalidate() {
-        return Err(contextualize_unverified_custody_error(
-            result,
-            Some(&query.sha256),
-            &stable_evidence,
-            stable_provider_calls,
+        return Err(with_query_shape_receipt(
+            contextualize_unverified_custody_error(
+                result,
+                Some(&query.sha256),
+                &stable_evidence,
+                stable_provider_calls,
+            ),
+            &query,
         ));
     }
     let second_digest = batch_digest(&second);
@@ -609,11 +692,9 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
                 &[&first, &second],
             );
         }
-        return Err(contextualize_error(
-            result,
-            Some(&query.sha256),
-            &[],
-            stable_provider_calls,
+        return Err(with_query_shape_receipt(
+            contextualize_error(result, Some(&query.sha256), &[], stable_provider_calls),
+            &query,
         ));
     }
     if let (Some(selection), Some(selection_query_sha256)) =
@@ -634,11 +715,9 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
             selection_query_sha256,
             &[&first, &second],
         );
-        return Err(contextualize_error(
-            result,
-            Some(&query.sha256),
-            &[],
-            stable_provider_calls,
+        return Err(with_query_shape_receipt(
+            contextualize_error(result, Some(&query.sha256), &[], stable_provider_calls),
+            &query,
         ));
     }
 
@@ -646,17 +725,20 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
     {
         Ok(classification) => classification,
         Err(_) => {
-            return Err(contextualize_error(
-                reconciliation_error_with_evidence(
-                    "contradictory",
-                    "d1.migration_reconciliation_ledger_not_manifest_prefix",
-                    "stable migration ledger is not an exact prefix of the supplied manifest",
+            return Err(with_query_shape_receipt(
+                contextualize_error(
+                    reconciliation_error_with_evidence(
+                        "contradictory",
+                        "d1.migration_reconciliation_ledger_not_manifest_prefix",
+                        "stable migration ledger is not an exact prefix of the supplied manifest",
+                        Some(&query.sha256),
+                        &stable_evidence,
+                    ),
                     Some(&query.sha256),
-                    &stable_evidence,
+                    &[],
+                    stable_provider_calls,
                 ),
-                Some(&query.sha256),
-                &[],
-                stable_provider_calls,
+                &query,
             ));
         }
     };
@@ -672,11 +754,14 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
     ) {
         Ok(prefix) => prefix,
         Err(result) => {
-            return Err(contextualize_error(
-                result,
-                Some(&query.sha256),
-                &stable_evidence,
-                stable_provider_calls,
+            return Err(with_query_shape_receipt(
+                contextualize_error(
+                    result,
+                    Some(&query.sha256),
+                    &stable_evidence,
+                    stable_provider_calls,
+                ),
+                &query,
             ));
         }
     };
@@ -688,17 +773,20 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
     {
         Some(state) => state,
         None => {
-            return Err(contextualize_error(
-                reconciliation_error_with_evidence(
-                    "capability_gap",
-                    "d1.migration_reconciliation_state_expectation_missing",
-                    "no bounded reviewed state expectation covers the stable current manifest prefix",
+            return Err(with_query_shape_receipt(
+                contextualize_error(
+                    reconciliation_error_with_evidence(
+                        "capability_gap",
+                        "d1.migration_reconciliation_state_expectation_missing",
+                        "no bounded reviewed state expectation covers the stable current manifest prefix",
+                        Some(&query.sha256),
+                        &stable_evidence,
+                    ),
                     Some(&query.sha256),
-                    &stable_evidence,
+                    &[],
+                    stable_provider_calls,
                 ),
-                Some(&query.sha256),
-                &[],
-                stable_provider_calls,
+                &query,
             ));
         }
     };
@@ -711,11 +799,14 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
             .count(),
         &first.snapshot,
     ) {
-        return Err(contextualize_error(
-            result,
-            Some(&query.sha256),
-            &stable_evidence,
-            stable_provider_calls,
+        return Err(with_query_shape_receipt(
+            contextualize_error(
+                result,
+                Some(&query.sha256),
+                &stable_evidence,
+                stable_provider_calls,
+            ),
+            &query,
         ));
     }
 
@@ -729,17 +820,20 @@ pub(crate) async fn prepare_d1_migration_reconciliation(
         "unknown"
     };
     if outcome == "unknown" {
-        return Err(contextualize_error(
-            reconciliation_error_with_evidence(
-                "contradictory",
-                "d1.migration_reconciliation_plan_relationship_contradictory",
-                "stable ledger precedes the uniquely reconstructed approved-plan prefix",
+        return Err(with_query_shape_receipt(
+            contextualize_error(
+                reconciliation_error_with_evidence(
+                    "contradictory",
+                    "d1.migration_reconciliation_plan_relationship_contradictory",
+                    "stable ledger precedes the uniquely reconstructed approved-plan prefix",
+                    Some(&query.sha256),
+                    &stable_evidence,
+                ),
                 Some(&query.sha256),
-                &stable_evidence,
+                &[],
+                stable_provider_calls,
             ),
-            Some(&query.sha256),
-            &[],
-            stable_provider_calls,
+            &query,
         ));
     }
 
@@ -834,6 +928,7 @@ pub(crate) async fn reconcile_d1_migration_manifest(
         "ledger": d1_ledger_summaries(&proof.first.snapshot.ledger),
         "lease": proof.lease.identity,
         "query_sha256": proof.query.sha256,
+        "query_shape_receipt": proof.query.shape_receipt(),
         "expectation_proof_sha256": proof.expectation_proof_sha256,
         "query_sha256s": query_sha256s,
         "response_evidence": response_evidence,
@@ -903,27 +998,33 @@ pub(crate) async fn refresh_d1_migration_reconciliation(
     )
     .await?;
     proof.lease.revalidate().map_err(|result| {
-        contextualize_unverified_custody_error(
-            result,
-            Some(&proof.query.sha256),
-            &[response_digest_summary(&batch)],
-            1,
+        with_query_shape_receipt(
+            contextualize_unverified_custody_error(
+                result,
+                Some(&proof.query.sha256),
+                &[response_digest_summary(&batch)],
+                1,
+            ),
+            &proof.query,
         )
     })?;
     if batch.snapshot != proof.first.snapshot
         || batch_digest(&batch) != proof.canonical_snapshot_sha256
     {
-        return Err(contextualize_error(
-            reconciliation_error_with_evidence(
-                "contradictory",
-                "d1.migration_reconciliation_fresh_state_changed",
-                "fresh primary-current evidence no longer matches the approved canonical snapshot",
+        return Err(with_query_shape_receipt(
+            contextualize_error(
+                reconciliation_error_with_evidence(
+                    "contradictory",
+                    "d1.migration_reconciliation_fresh_state_changed",
+                    "fresh primary-current evidence no longer matches the approved canonical snapshot",
+                    Some(&proof.query.sha256),
+                    &[response_digest_summary(&batch)],
+                ),
                 Some(&proof.query.sha256),
-                &[response_digest_summary(&batch)],
+                &[],
+                1,
             ),
-            Some(&proof.query.sha256),
-            &[],
-            1,
+            &proof.query,
         ));
     }
     Ok(D1MigrationReconciliationRefresh {
@@ -949,7 +1050,10 @@ async fn read_complete_batch(
     manifest: &[D1MigrationManifestEntry],
 ) -> Result<ParsedBatch, CallToolResult> {
     lease.revalidate().map_err(|result| {
-        contextualize_unverified_custody_error(result, Some(&query.sha256), &[], 0)
+        with_query_shape_receipt(
+            contextualize_unverified_custody_error(result, Some(&query.sha256), &[], 0),
+            query,
+        )
     })?;
     let batch = match server
         .cloudflare
@@ -960,15 +1064,18 @@ async fn read_complete_batch(
         Err(error) => {
             let provider_calls = error.lifecycle.provider_calls();
             let provider_error = adapter_batch_error(error, &query.sha256);
-            return Err(match lease.revalidate() {
-                Ok(()) => contextualize_error(provider_error, Some(&query.sha256), &[], 0),
-                Err(custody_error) => contextualize_provider_error_with_unverified_custody(
-                    provider_error,
-                    custody_error,
-                    Some(&query.sha256),
-                    provider_calls,
-                ),
-            });
+            return Err(with_query_shape_receipt(
+                match lease.revalidate() {
+                    Ok(()) => contextualize_error(provider_error, Some(&query.sha256), &[], 0),
+                    Err(custody_error) => contextualize_provider_error_with_unverified_custody(
+                        provider_error,
+                        custody_error,
+                        Some(&query.sha256),
+                        provider_calls,
+                    ),
+                },
+                query,
+            ));
         }
     };
     let snapshot = parse_complete_batch(
@@ -979,19 +1086,25 @@ async fn read_complete_batch(
         &query.table_identity_spellings,
     );
     lease.revalidate().map_err(|result| {
-        contextualize_unverified_custody_error(
-            result,
-            Some(&query.sha256),
-            &[response_digest_summary_from_adapter(&batch)],
-            1,
+        with_query_shape_receipt(
+            contextualize_unverified_custody_error(
+                result,
+                Some(&query.sha256),
+                &[response_digest_summary_from_adapter(&batch)],
+                1,
+            ),
+            query,
         )
     })?;
     let snapshot = snapshot.map_err(|result| {
-        contextualize_error(
-            result,
-            Some(&query.sha256),
-            &[response_digest_summary_from_adapter(&batch)],
-            1,
+        with_query_shape_receipt(
+            contextualize_error(
+                result,
+                Some(&query.sha256),
+                &[response_digest_summary_from_adapter(&batch)],
+                1,
+            ),
+            query,
         )
     })?;
     Ok(ParsedBatch {
@@ -3429,6 +3542,7 @@ fn adapter_batch_error(
     query_sha256: &str,
 ) -> CallToolResult {
     let lifecycle = failure.lifecycle;
+    let provider_error = failure.provider_error;
     let capability_state =
         if failure.error.status.is_some_and(|status| {
             matches!(status, 401 | 403 | 429) || (500..=599).contains(&status)
@@ -3481,15 +3595,17 @@ fn adapter_batch_error(
             "provider_calls".to_string(),
             json!(lifecycle.provider_calls()),
         );
-        content.insert(
-            "provider_cause".to_string(),
-            json!({
-                "code": failure.error.code,
-                "status": failure.error.status,
-                "retryable": false,
-                "operator_guidance": "reconciliation_only",
-            }),
-        );
+        let mut provider_cause = json!({
+            "code": failure.error.code,
+            "status": failure.error.status,
+            "retryable": false,
+            "operator_guidance": "reconciliation_only",
+        });
+        if let Some(provider_error) = provider_error {
+            provider_cause["provider_error_code"] = json!(provider_error.code);
+            provider_cause["provider_error_category"] = json!(provider_error.category);
+        }
+        content.insert("provider_cause".to_string(), provider_cause);
     }
     result
 }
@@ -3647,6 +3763,9 @@ fn contextualize_error(
             );
         }
         content.insert("query_sha256".to_string(), json!(query_sha256));
+        content
+            .entry("query_shape_receipt".to_string())
+            .or_insert(Value::Null);
         let already_contains_prior = product_already_contains_prior_invocations(
             content,
             response_evidence,
@@ -3926,6 +4045,7 @@ fn reconciliation_error_with_evidence(
         "lease_retained": null,
         "custody_status": "not_inspected",
         "query_sha256": query_sha256,
+        "query_shape_receipt": null,
         "response_evidence": response_evidence,
         "provider_mutations": 0,
         "local_namespace_mutations": 0,
@@ -4974,6 +5094,7 @@ mod tests {
                     "lease_retained": null,
                     "custody_status": custody_status,
                     "query_sha256": query_sha256,
+                    "query_shape_receipt": null,
                     "response_evidence": [],
                     "provider_calls": 0,
                     "provider_read_lifecycle": [],
@@ -5023,6 +5144,54 @@ mod tests {
         assert!(!query.sql.contains("UPDATE"));
         assert!(!query.sql.contains("DELETE"));
         assert!(query.sql.contains("WHERE name COLLATE NOCASE IN"));
+    }
+
+    #[test]
+    fn fixed_query_shape_receipt_is_stable_aggregate_only_and_query_bound() {
+        let seed_state = SeedTableState {
+            assertion_version: SeedAssertionVersion::V1,
+            table_name: "private_table_name".to_string(),
+            columns: vec!["private_column_name".to_string()],
+            rows: Vec::new(),
+        };
+        let query = build_fixed_query(
+            "private_ledger_name",
+            2,
+            &["private_table_name".to_string()],
+            &["private_table_name".to_string()],
+            &[seed_state],
+            PROOF,
+            false,
+        );
+        let first = query.shape_receipt();
+        let second = query.shape_receipt();
+        assert_eq!(first, second);
+        assert_eq!(first["receipt_version"], QUERY_SHAPE_RECEIPT_VERSION);
+        assert_eq!(first["query_sha256"], query.sha256);
+        assert_eq!(first["statement_count"], 6);
+        assert_eq!(
+            first["statement_classes"],
+            json!({
+                "ledger": {"count": 1, "present": true},
+                "schema_catalog": {"count": 1, "present": true},
+                "table_xinfo": {"count": 1, "present": true},
+                "foreign_key_definition": {"count": 1, "present": true},
+                "foreign_key_check": {"count": 1, "present": true},
+                "seed": {"count": 1, "present": true},
+            })
+        );
+        assert_eq!(first["receipt_sha256"].as_str().map(str::len), Some(64));
+        let serialized = serde_json::to_string(&first).expect("serialize receipt");
+        for forbidden in [
+            "private_ledger_name",
+            "private_table_name",
+            "private_column_name",
+            "SELECT",
+            "sqlite_master",
+        ] {
+            assert!(!serialized.contains(forbidden), "leaked {forbidden}");
+        }
+        assert_eq!(query.sha256, sha256_bytes_hex(query.sql.as_bytes()));
     }
 
     #[test]
@@ -5247,6 +5416,7 @@ mod tests {
                     status: Some(503),
                     classification: None,
                 },
+                provider_error: None,
                 response_body_sha256: Some(PROOF.to_string()),
                 response_body_size_bytes: Some(31),
                 lifecycle: D1MigrationReconciliationReadLifecycle {
@@ -5387,6 +5557,7 @@ mod tests {
                 "lease_retained": null,
                 "custody_status": "retained_evidence_unverified",
                 "query_sha256": PROOF,
+                "query_shape_receipt": null,
                 "response_evidence": [response.clone(), response.clone()],
                 "provider_read_lifecycle": [
                     response["lifecycle"].clone(),
@@ -5473,6 +5644,7 @@ mod tests {
                         status: None,
                         classification: None,
                     },
+                    provider_error: None,
                     response_body_sha256: None,
                     response_body_size_bytes: None,
                     lifecycle: second_lifecycle,
@@ -5514,6 +5686,7 @@ mod tests {
                     "retained_evidence_unverified"
                 },
                 "query_sha256": PROOF,
+                "query_shape_receipt": null,
                 "response_evidence": [first.clone()],
                 "provider_read_lifecycle": [first_lifecycle.clone(), second_lifecycle],
                 "provider_calls": if pre_dispatch { 1 } else { 2 },
@@ -5668,6 +5841,7 @@ mod tests {
                 "lease_retained": true,
                 "custody_status": "retained_evidence_verified",
                 "query_sha256": PROOF,
+                "query_shape_receipt": null,
                 "response_evidence": [first, second],
                 "provider_read_lifecycle": [
                     {
@@ -5708,6 +5882,7 @@ mod tests {
                         status: Some(status),
                         classification: None,
                     },
+                    provider_error: None,
                     response_body_sha256: Some(PROOF.to_string()),
                     response_body_size_bytes: Some(2),
                     lifecycle: D1MigrationReconciliationReadLifecycle {
