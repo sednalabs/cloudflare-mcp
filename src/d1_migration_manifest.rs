@@ -248,7 +248,7 @@ fn contains_non_trivia_sql(sql: &str) -> bool {
     while cursor < bytes.len() {
         if bytes[cursor..].starts_with(UTF8_BOM) {
             cursor += UTF8_BOM.len();
-        } else if bytes[cursor].is_ascii_whitespace() {
+        } else if bytes[cursor].is_ascii_whitespace() || bytes[cursor] == b';' {
             cursor += 1;
         } else if bytes[cursor..].starts_with(b"--") {
             cursor += 2;
@@ -1067,8 +1067,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        approved_d1_plan_digest_matches, current_wrangler_d1_migration_ledger_table_sql,
-        d1_manifest_execution_summaries, d1_manifest_legacy_plan_sha256, d1_manifest_plan_sha256,
+        D1_FOREIGN_KEYS_ON_PREFIX_V1, approved_d1_plan_digest_matches,
+        current_wrangler_d1_migration_ledger_table_sql, d1_manifest_execution_summaries,
+        d1_manifest_legacy_plan_sha256, d1_manifest_plan_sha256,
         d1_manifest_write_result_classification, d1_migration_execution_provider_sql,
         d1_migrations_table_init_sql, derive_d1_manifest_execution_plan,
         expected_d1_migration_ledger_table_sql, legacy_wrangler_d1_migration_ledger_table_sql,
@@ -1209,12 +1210,23 @@ mod tests {
             "PRAGMA foreign_keys = ON;\n\n\u{feff}",
             "PRAGMA foreign_keys = ON;\n\n \t\u{feff}\r\n",
             "PRAGMA foreign_keys = ON;\n\n\u{feff}/* trivia only */ -- end",
+            "PRAGMA foreign_keys = ON;\n\n;",
+            "PRAGMA foreign_keys = ON;\n\n;;;",
+            "PRAGMA foreign_keys = ON;\n\n; \u{feff}\t/* empty */;-- empty\n;;",
         ] {
             assert!(
                 derive_d1_manifest_execution_plan(&[manifest_entry(sql)]).is_err(),
                 "unsupported form must fail closed: {sql:?}"
             );
         }
+
+        let separated_remainder =
+            ";; \u{feff}/* leading empty commands */;\nCREATE TABLE kept(id INTEGER);;;";
+        let separated_source = format!("{D1_FOREIGN_KEYS_ON_PREFIX_V1}{separated_remainder}");
+        let separated = derive_d1_manifest_execution_plan(&[manifest_entry(&separated_source)])
+            .expect("empty commands around real SQL remain executable content");
+        assert!(separated.transformed);
+        assert_eq!(separated.migrations[0].executed_sql, separated_remainder);
 
         let identity_sql = "CREATE TABLE items(id INTEGER PRIMARY KEY);";
         let identity_manifest = vec![manifest_entry(identity_sql)];

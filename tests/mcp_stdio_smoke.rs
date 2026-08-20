@@ -8273,6 +8273,18 @@ fn d1_manifest_execution_transform_rejects_noncanonical_pragma_before_provider()
             "PRAGMA foreign_keys = ON;\n\n \t\u{feff}\r\n",
             "d1.migration_execution_transform_ambiguous",
         ),
+        (
+            "PRAGMA foreign_keys = ON;\n\n;",
+            "d1.migration_execution_transform_ambiguous",
+        ),
+        (
+            "PRAGMA foreign_keys = ON;\n\n;;;",
+            "d1.migration_execution_transform_ambiguous",
+        ),
+        (
+            "PRAGMA foreign_keys = ON;\n\n; \u{feff}\t/* empty */;-- empty\n;;",
+            "d1.migration_execution_transform_ambiguous",
+        ),
     ]
     .into_iter()
     .enumerate()
