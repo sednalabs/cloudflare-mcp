@@ -6,6 +6,7 @@ mod email_routing;
 pub mod model;
 mod pages;
 mod queues;
+pub(crate) mod worker_versions;
 mod workers_observability;
 
 pub use client::{

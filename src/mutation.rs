@@ -174,6 +174,12 @@ impl MutationAuditSession {
     pub fn set_target(&mut self, target: Value) {
         self.target = target;
     }
+
+    pub fn redact_public_approval_digest(&mut self) {
+        if let Some(approval) = self.approval.as_mut() {
+            approval.request_digest = "withheld_private_candidate".to_string();
+        }
+    }
 }
 
 pub fn emit_mutation_audit_log(record: &MutationAuditRecord) {
@@ -535,6 +541,105 @@ pub fn plan_upload_worker_script(
                 "script_name": script_name,
             }),
         )
+}
+
+pub fn plan_upload_worker_version(
+    account_id: &str,
+    script_name: &str,
+    base_version_id: &str,
+    phase: &'static str,
+) -> MutationPlan {
+    let plan = MutationPlan::new("workers_upload_version").step(
+        "validate_complete_private_candidate",
+        false,
+        json!({
+            "account_id": account_id,
+            "script_name": script_name,
+            "base_version_id": base_version_id,
+            "phase": phase,
+            "candidate_evidence": "private_only",
+        }),
+    );
+    if phase == "preview" {
+        return plan;
+    }
+    if phase == "prepare" {
+        return plan.step(
+            "create_private_opaque_approval",
+            true,
+            json!({
+                "authority": "random_handle_exact_private_candidate",
+                "provider_access": false,
+            }),
+        );
+    }
+    if phase == "invalid" {
+        return plan;
+    }
+    plan.step(
+        "load_bind_and_consume_private_approval",
+        true,
+        json!({
+            "authority": "random_handle_exact_private_candidate",
+            "transition": "prepared_to_consumed_before_provider_access",
+        }),
+    )
+    .step(
+        "verify_pinned_pre_upload_state",
+        false,
+        json!({
+            "account_id": account_id,
+            "script_name": script_name,
+            "base_version_id": base_version_id,
+            "evidence_pins": "private_approval_bound",
+        }),
+    )
+    .step(
+        "persist_one_use_dispatch_attempt",
+        true,
+        json!({
+            "account_id": account_id,
+            "script_name": script_name,
+            "authority": "separate_dispatch_attempt_custody",
+            "transition": "prepared_to_dispatched_before_provider_post",
+        }),
+    )
+    .step(
+        "revalidate_pinned_pre_upload_state_under_attempt_guard",
+        false,
+        json!({
+            "account_id": account_id,
+            "script_name": script_name,
+            "base_version_id": base_version_id,
+            "evidence_pins": "private_approval_bound",
+        }),
+    )
+    .step(
+        "upload_disabled_worker_version",
+        true,
+        json!({
+            "account_id": account_id,
+            "script_name": script_name,
+            "bindings_inherit": "strict",
+            "candidate_evidence": "private_only",
+        }),
+    )
+    .step(
+        "verify_exact_candidate_version",
+        false,
+        json!({
+            "account_id": account_id,
+            "script_name": script_name,
+        }),
+    )
+    .step(
+        "verify_deployments_unchanged",
+        false,
+        json!({
+            "account_id": account_id,
+            "script_name": script_name,
+        }),
+    )
 }
 
 pub fn plan_cache_mutation(operation: &'static str, zone_id: &str, target: Value) -> MutationPlan {

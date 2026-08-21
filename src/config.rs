@@ -647,6 +647,15 @@ fn validate_elicitation_required_tools(required_tools: &[String]) -> Result<(), 
     if required_tools.is_empty() {
         return Ok(());
     }
+    if required_tools
+        .iter()
+        .any(|tool| tool == "workers_upload_version")
+    {
+        return Err(
+            "workers_upload_version cannot use generic argument-based elicitation because its complete candidate may contain private low-entropy values; use its explicit private prepare/apply approval_handle lifecycle."
+                .to_string(),
+        );
+    }
 
     let validation =
         crate::tool_surface::validate_mutating_tool_subset(required_tools).map_err(|err| {
@@ -1629,6 +1638,27 @@ mod tests {
                 "missing default elicitation gate for {tool}"
             );
         }
+        assert!(
+            !cfg.elicitation
+                .required_tools
+                .iter()
+                .any(|required| required == "workers_upload_version")
+        );
+    }
+
+    #[test]
+    fn rejects_worker_version_upload_in_generic_elicitation_policy() {
+        let err = with_env(
+            &[
+                ("CLOUDFLARE_MCP_AUTH_MODE", Some("off")),
+                (
+                    "CLOUDFLARE_MCP_ELICITATION_REQUIRED_TOOLS",
+                    Some("workers_upload_version"),
+                ),
+            ],
+            || load_config().expect_err("private approval tool must reject generic elicitation"),
+        );
+        assert!(err.contains("cannot use generic argument-based elicitation"));
     }
 
     #[test]

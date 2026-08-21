@@ -340,6 +340,7 @@ impl McpStdioProcess {
         command
             .arg("--stdio")
             .env_remove("CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT")
+            .env_remove("CLOUDFLARE_MCP_WORKER_UPLOAD_ROOT")
             .env("RUST_LOG", "off")
             .env("CLOUDFLARE_MCP_AUTH_MODE", "off")
             .env("CLOUDFLARE_API_TOKEN", fixture_material("cf-api"))
@@ -4999,6 +5000,163 @@ fn spawn_fake_d1_database_mutation_api(
 
 fn spawn_fake_worker_upload_api(expected_requests: usize) -> (String, Arc<Mutex<Vec<Value>>>) {
     spawn_fake_worker_upload_api_with_readback(expected_requests, "worker.js")
+}
+
+fn spawn_fake_worker_version_api(expected_requests: usize) -> (String, Arc<Mutex<Vec<Value>>>) {
+    spawn_fake_worker_version_api_with_initial_state(expected_requests, false)
+}
+
+fn spawn_fake_worker_version_api_with_initial_state(
+    expected_requests: usize,
+    initially_uploaded: bool,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0") // DevSkim: ignore DS162092 -- loopback-only test fixture listener.
+        .expect("bind fake Worker version API");
+    let addr = listener.local_addr().expect("fake Worker version API addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        let base_id = "11111111-1111-4111-8111-111111111111";
+        let candidate_id = "22222222-2222-4222-8222-222222222222";
+        let mut uploaded = initially_uploaded;
+        for stream in listener.incoming().take(expected_requests) {
+            let mut stream = stream.expect("fake Worker version API stream");
+            let (headers, body) = read_http_request(&mut stream);
+            let request_line = headers.lines().next().unwrap_or_default().to_string();
+            let mut request_parts = request_line.split_whitespace();
+            let method = request_parts.next().unwrap_or_default().to_string();
+            let path = request_parts.next().unwrap_or_default().to_string();
+            let content_type = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-type:"))
+                .or_else(|| {
+                    headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Content-Type:"))
+                })
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string();
+            let authorization_present = headers.lines().any(|line| {
+                line.to_ascii_lowercase()
+                    .starts_with("authorization: bearer ")
+            });
+            requests_for_thread
+                .lock()
+                .expect("request log lock")
+                .push(json!({
+                    "method": method,
+                    "path": path,
+                    "content_type": content_type,
+                    "authorization_present": authorization_present,
+                    "body_sha256": format!("{:x}", Sha256::digest(&body)),
+                }));
+
+            let path_without_query = path.split('?').next().unwrap_or_default();
+            let response = if method == "GET"
+                && path_without_query == "/accounts/acct-1/workers/scripts/worker-a/versions"
+            {
+                let mut items = vec![json!({"id": base_id})];
+                if uploaded {
+                    items.insert(0, json!({"id": candidate_id}));
+                }
+                json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": {"items": items},
+                })
+            } else if method == "GET"
+                && path_without_query
+                    == format!("/accounts/acct-1/workers/scripts/worker-a/versions/{base_id}")
+            {
+                json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": {
+                        "id": base_id,
+                        "resources": {
+                            "script": {"etag": "a".repeat(64)},
+                            "script_runtime": {"compatibility_date":"2026-07-10","compatibility_flags":[]},
+                            "bindings": [
+                                {"name":"SECRET","type":"secret_text","text":"never-surface"},
+                                {"name":"MODE","type":"plain_text","text":"private-fixture-value"}
+                            ]
+                        }
+                    },
+                })
+            } else if method == "GET"
+                && path_without_query
+                    == format!("/accounts/acct-1/workers/scripts/worker-a/versions/{candidate_id}")
+            {
+                json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": {
+                        "id": candidate_id,
+                        "resources": {
+                            "script": {"etag": "b".repeat(64)},
+                            "script_runtime": {"compatibility_date":"2026-07-10","compatibility_flags":[]},
+                            "bindings": [
+                                {"name":"SECRET","type":"secret_text","text":"never-surface"},
+                                {"name":"MODE","type":"plain_text","text":"private-fixture-value"}
+                            ]
+                        }
+                    },
+                })
+            } else if method == "GET"
+                && path_without_query == "/accounts/acct-1/workers/scripts/worker-a/deployments"
+            {
+                json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": {"deployments": []},
+                })
+            } else if method == "POST"
+                && path_without_query == "/accounts/acct-1/workers/scripts/worker-a/versions"
+            {
+                assert!(path.contains("bindings_inherit=strict"));
+                assert!(content_type.starts_with("multipart/form-data;"));
+                assert!(!body.is_empty());
+                uploaded = true;
+                json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": {
+                        "id": candidate_id,
+                        "resources": {
+                            "script": {"etag": "b".repeat(64)},
+                            "script_runtime": {"compatibility_date":"2026-07-10","compatibility_flags":[]},
+                            "bindings": [
+                                {"name":"SECRET","type":"secret_text","text":"never-surface"},
+                                {"name":"MODE","type":"plain_text","text":"private-fixture-value"}
+                            ]
+                        }
+                    },
+                })
+            } else {
+                json!({
+                    "success": false,
+                    "errors": [{"code":7000,"message":format!("unexpected request: {method} {path}")}],
+                    "messages": [],
+                    "result": null,
+                })
+            };
+            let response = serde_json::to_vec(&response).expect("serialize response");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                response.len()
+            )
+            .expect("write response headers");
+            stream.write_all(&response).expect("write response body");
+        }
+    });
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only test fixture URL.
 }
 
 fn spawn_fake_worker_upload_api_with_readback(
@@ -17751,6 +17909,792 @@ fn workers_upload_script_requires_token_and_reads_back_through_stdio_boundary() 
         json!("/accounts/acct-1/workers/scripts/worker-a/settings")
     );
     assert_eq!(requests[0]["if_none_match"], json!(""));
+}
+
+#[test]
+fn workers_upload_version_preview_is_private_and_provider_free() {
+    let (base_url, requests) = spawn_fake_worker_upload_api(0);
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let response = mcp.call_tool(
+        2,
+        "workers_upload_version",
+        json!({
+            "script_name":"worker-a",
+            "base_version_id":"11111111-1111-4111-8111-111111111111",
+            "base_version_etag":"a".repeat(64),
+            "pre_upload_version_snapshot_sha256":"b".repeat(64),
+            "pre_upload_deployment_snapshot_sha256":"c".repeat(64),
+            "bindings_inherit":"strict",
+            "main_module":"index.js",
+            "script_content":"export default { fetch() { return new Response('ok') } }",
+            "metadata":{
+                "main_module":"index.js",
+                "compatibility_date":"2026-07-10",
+                "compatibility_flags":[],
+                "bindings":[
+                    {"name":"SECRET","type":"inherit","version_id":"11111111-1111-4111-8111-111111111111"},
+                    {"name":"DATABASE","type":"d1","database_id":"db-current"},
+                    {"name":"LEGACY_DATABASE","type":"d1","id":"db-legacy"},
+                    {"name":"SEARCH","type":"ai_search","instance_name":"articles"},
+                    {"name":"SERVICE","type":"service","service":"worker-service"},
+                    {"name":"BUCKET","type":"r2_bucket","bucket_name":"article-assets"},
+                    {"name":"MODE","type":"plain_text","text":"private-fixture-value"}
+                ]
+            },
+            "dry_run":true,
+            "reason":"stdio guarded version regression"
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(true), "{content}");
+    assert_eq!(content["planned"], json!(true));
+    assert_eq!(content["status"], json!("preview_validated"));
+    assert_eq!(content["deployment_created"], json!(false));
+    assert_eq!(content["local_mutation_performed"], json!(false));
+    assert_eq!(content["provider_calls"], json!(0));
+    assert_eq!(content["preparation_required"], json!(true));
+    let outward = content.to_string();
+    assert!(!outward.contains("private-fixture-value"));
+    assert!(!outward.contains("script_content"));
+    assert!(!outward.contains("body_sha256"));
+    assert!(!outward.contains("metadata_sha256"));
+    assert!(!outward.contains("size_bytes"));
+    assert!(!outward.contains("upload_contract_sha256"));
+    assert!(!outward.contains("required_confirmation_token"));
+    assert!(requests.lock().expect("request log lock").is_empty());
+}
+
+#[test]
+fn workers_upload_version_supported_sources_prepare_opaque_private_plans() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos();
+    let artifact_root = std::env::temp_dir().join(format!(
+        "cloudflare-mcp-version-source-matrix-{}-{suffix}",
+        std::process::id()
+    ));
+    fs::create_dir(&artifact_root).expect("create artifact root");
+    fs::set_permissions(&artifact_root, fs::Permissions::from_mode(0o700))
+        .expect("make artifact root private");
+    fs::write(artifact_root.join("candidate.js"), b"export default {}")
+        .expect("write module fixture");
+    let multipart = concat!(
+        "--fixture\r\n",
+        "Content-Disposition: form-data; name=\"metadata\"\r\n\r\n",
+        "{\"bindings\":[],\"compatibility_date\":\"2026-07-10\",\"compatibility_flags\":[],\"main_module\":\"index.js\"}\r\n",
+        "--fixture\r\n",
+        "Content-Disposition: form-data; name=\"index.js\"; filename=\"index.js\"\r\n",
+        "Content-Type: application/javascript+module\r\n\r\n",
+        "export default {}\r\n",
+        "--fixture--\r\n"
+    );
+    fs::write(artifact_root.join("candidate.multipart"), multipart)
+        .expect("write multipart fixture");
+    let approval_root = std::env::temp_dir().join(format!(
+        "cloudflare-mcp-version-approval-source-matrix-{}-{suffix}",
+        std::process::id()
+    ));
+    fs::create_dir(&approval_root).expect("create approval root");
+    fs::set_permissions(&approval_root, fs::Permissions::from_mode(0o700))
+        .expect("make approval root private");
+
+    let (base_url, requests) = spawn_fake_worker_upload_api(0);
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_WORKER_UPLOAD_ROOT",
+            artifact_root.to_string_lossy().to_string(),
+        ),
+        (
+            "CLOUDFLARE_MCP_WORKER_VERSION_APPROVAL_ROOT",
+            approval_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let base = json!({
+        "script_name":"worker-a",
+        "base_version_id":"11111111-1111-4111-8111-111111111111",
+        "base_version_etag":"a".repeat(64),
+        "pre_upload_version_snapshot_sha256":"b".repeat(64),
+        "pre_upload_deployment_snapshot_sha256":"c".repeat(64),
+        "bindings_inherit":"strict",
+        "main_module":"index.js",
+        "metadata":{
+            "main_module":"index.js",
+            "compatibility_date":"2026-07-10",
+            "compatibility_flags":[],
+            "bindings":[]
+        },
+        "prepare":true
+    });
+    let sources = [
+        ("inline", json!({"script_content":"export default {}"})),
+        (
+            "base64",
+            json!({"script_content_base64":"ZXhwb3J0IGRlZmF1bHQge30="}),
+        ),
+        ("file", json!({"script_path":"candidate.js"})),
+        (
+            "multipart",
+            json!({
+                "multipart_path":"candidate.multipart",
+                "content_type":"multipart/form-data; boundary=fixture"
+            }),
+        ),
+    ];
+    let mut handles = Vec::new();
+    for (index, (label, source)) in sources.into_iter().enumerate() {
+        let mut arguments = base.clone();
+        arguments
+            .as_object_mut()
+            .expect("base arguments")
+            .extend(source.as_object().expect("source arguments").clone());
+        let response = mcp.call_tool(10 + index as u64, "workers_upload_version", arguments);
+        let content = structured_content(&response);
+        assert_eq!(content["ok"], json!(true), "{label}: {content}");
+        assert_eq!(content["status"], json!("approval_prepared"));
+        let handle = content["approval"]["approval_handle"]
+            .as_str()
+            .expect("opaque approval handle");
+        assert!(handle.starts_with("wvpa-") && handle.len() == 69);
+        handles.push(handle.to_string());
+        let outward = content.to_string();
+        assert!(!outward.contains("body_sha256"), "{label}: {content}");
+        assert!(!outward.contains("metadata_sha256"), "{label}: {content}");
+        assert!(!outward.contains("size_bytes"), "{label}: {content}");
+        assert!(
+            !outward.contains("upload_contract_sha256"),
+            "{label}: {content}"
+        );
+    }
+    handles.sort();
+    handles.dedup();
+    assert_eq!(
+        handles.len(),
+        4,
+        "every preparation needs fresh random authority"
+    );
+    assert!(requests.lock().expect("request log lock").is_empty());
+    mcp.terminate();
+    fs::remove_dir_all(artifact_root).expect("remove artifact root");
+    fs::remove_dir_all(approval_root).expect("remove approval root");
+}
+
+#[test]
+fn workers_upload_version_rejects_non_strict_inheritance_before_provider_access() {
+    let (base_url, requests) = spawn_fake_worker_upload_api(0);
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let response = mcp.call_tool(
+        2,
+        "workers_upload_version",
+        json!({
+            "script_name":"worker-a",
+            "base_version_id":"11111111-1111-4111-8111-111111111111",
+            "base_version_etag":"a".repeat(64),
+            "pre_upload_version_snapshot_sha256":"b".repeat(64),
+            "pre_upload_deployment_snapshot_sha256":"c".repeat(64),
+            "bindings_inherit":"best_effort",
+            "script_content":"export default {}",
+            "metadata":{"main_module":"index.js"},
+            "dry_run":true
+        }),
+    );
+    assert!(response.to_string().contains("best_effort"), "{response}");
+    assert!(
+        response["error"].is_object() || response["result"]["isError"] == json!(true),
+        "{response}"
+    );
+    assert!(requests.lock().expect("request log lock").is_empty());
+}
+
+#[test]
+fn workers_upload_version_schema_and_deserialization_are_closed() {
+    fn resolve_local<'a>(schema: &'a Value, node: &'a Value) -> &'a Value {
+        if let Some(reference) = node.get("$ref").and_then(Value::as_str) {
+            let name = reference
+                .strip_prefix("#/$defs/")
+                .expect("local schema reference");
+            &schema["$defs"][name]
+        } else {
+            node
+        }
+    }
+
+    let (base_url, requests) = spawn_fake_worker_upload_api(0);
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let tools = mcp.request(2, "tools/list", json!({}));
+    let tool = tools["result"]["tools"]
+        .as_array()
+        .and_then(|tools| {
+            tools
+                .iter()
+                .find(|tool| tool["name"] == json!("workers_upload_version"))
+        })
+        .expect("workers_upload_version schema");
+    let schema = &tool["inputSchema"];
+    assert_eq!(schema["additionalProperties"], json!(false));
+    let inherit_ref = schema["properties"]["bindings_inherit"]["$ref"]
+        .as_str()
+        .expect("strict inheritance ref");
+    let inherit_name = inherit_ref
+        .strip_prefix("#/$defs/")
+        .expect("local inheritance ref");
+    assert_eq!(schema["$defs"][inherit_name]["enum"], json!(["strict"]));
+    assert_eq!(schema["properties"]["per_page"]["minimum"], json!(1));
+    assert_eq!(schema["properties"]["per_page"]["maximum"], json!(100));
+    assert_eq!(schema["properties"]["prepare"]["type"], json!("boolean"));
+    assert_eq!(
+        schema["properties"]["approval_handle"]["type"],
+        json!(["string", "null"])
+    );
+    assert!(schema["properties"].get("confirmation_token").is_none());
+    let metadata_ref = schema["properties"]["metadata"]["$ref"]
+        .as_str()
+        .expect("typed metadata ref");
+    let metadata_name = metadata_ref
+        .strip_prefix("#/$defs/")
+        .expect("local metadata ref");
+    assert_eq!(
+        schema["$defs"][metadata_name]["additionalProperties"],
+        json!(false)
+    );
+    let binding_items = &schema["$defs"][metadata_name]["properties"]["bindings"]["items"];
+    assert_ne!(binding_items, &json!(true), "binding items must be typed");
+    let binding_schema = resolve_local(schema, binding_items);
+    let binding_variants = binding_schema["oneOf"]
+        .as_array()
+        .expect("closed binding union");
+    assert_eq!(binding_variants.len(), 24);
+    assert!(binding_variants.iter().all(|variant| {
+        let variant = resolve_local(schema, variant);
+        variant["additionalProperties"] == json!(false)
+            && variant["properties"]["type"]["const"].is_string()
+    }));
+    let d1_variant = binding_variants
+        .iter()
+        .map(|variant| resolve_local(schema, variant))
+        .find(|variant| variant["properties"]["type"]["const"] == json!("d1"))
+        .expect("D1 binding variant");
+    assert_eq!(
+        d1_variant["anyOf"],
+        json!([
+            {"required": ["database_id"]},
+            {"required": ["id"]}
+        ])
+    );
+    assert_eq!(
+        d1_variant["properties"]["database_id"]["type"],
+        json!("string")
+    );
+    assert_eq!(d1_variant["properties"]["id"]["type"], json!("string"));
+    assert!(
+        !d1_variant["required"]
+            .as_array()
+            .expect("D1 binding required fields")
+            .iter()
+            .any(|field| field == "database_id" || field == "id")
+    );
+
+    let base_args = json!({
+        "script_name":"worker-a",
+        "base_version_id":"11111111-1111-4111-8111-111111111111",
+        "base_version_etag":"a".repeat(64),
+        "pre_upload_version_snapshot_sha256":"b".repeat(64),
+        "pre_upload_deployment_snapshot_sha256":"c".repeat(64),
+        "bindings_inherit":"strict",
+        "script_content":"export default {}",
+        "metadata":{
+            "main_module":"index.js",
+            "compatibility_date":"2026-07-10",
+            "compatibility_flags":[],
+            "bindings":[]
+        },
+        "dry_run":true
+    });
+    for (label, mut arguments) in [
+        ("unknown top-level", base_args.clone()),
+        ("unknown metadata", base_args.clone()),
+        ("unknown binding field", base_args.clone()),
+    ] {
+        if label == "unknown top-level" {
+            arguments["future_control"] = json!(true);
+        } else if label == "unknown metadata" {
+            arguments["metadata"]["future_control"] = json!(true);
+        } else {
+            arguments["metadata"]["bindings"] = json!([{
+                "name":"DB",
+                "type":"d1",
+                "database_id":"db-1",
+                "future_control":true
+            }]);
+        }
+        let response = mcp.call_tool(3, "workers_upload_version", arguments);
+        assert!(
+            response.to_string().contains("unknown field"),
+            "{label}: {response}"
+        );
+        assert!(
+            response["error"].is_object() || response["result"]["isError"] == json!(true),
+            "{label}: {response}"
+        );
+    }
+    let mut primitive_binding = base_args.clone();
+    primitive_binding["metadata"]["bindings"] = json!([7]);
+    let response = mcp.call_tool(4, "workers_upload_version", primitive_binding);
+    assert!(response.to_string().contains("invalid type"), "{response}");
+    assert!(
+        response["error"].is_object() || response["result"]["isError"] == json!(true),
+        "{response}"
+    );
+    let mut null_optional_binding = base_args.clone();
+    null_optional_binding["metadata"]["bindings"] = json!([{
+        "name":"SECRET",
+        "type":"inherit",
+        "version_id":"11111111-1111-4111-8111-111111111111",
+        "old_name":null
+    }]);
+    let response = mcp.call_tool(5, "workers_upload_version", null_optional_binding);
+    assert!(
+        response
+            .to_string()
+            .contains("must be omitted instead of null"),
+        "{response}"
+    );
+    assert!(
+        response["error"].is_object() || response["result"]["isError"] == json!(true),
+        "{response}"
+    );
+    let mut unknown_binding_type = base_args.clone();
+    unknown_binding_type["metadata"]["bindings"] = json!([{
+        "name":"FUTURE",
+        "type":"future_binding_type"
+    }]);
+    let response = mcp.call_tool(6, "workers_upload_version", unknown_binding_type);
+    assert!(
+        response.to_string().contains("unknown variant"),
+        "{response}"
+    );
+    assert!(
+        response["error"].is_object() || response["result"]["isError"] == json!(true),
+        "{response}"
+    );
+    for (id, per_page) in [(7, 0), (8, 101)] {
+        let mut arguments = base_args.clone();
+        arguments["per_page"] = json!(per_page);
+        let response = mcp.call_tool(id, "workers_upload_version", arguments);
+        let content = structured_content(&response);
+        assert_eq!(
+            content["error"]["code"],
+            json!("workers.version_upload_per_page_invalid"),
+            "{content}"
+        );
+        assert!(content["plan"].is_object(), "{content}");
+        assert!(content["audit"].is_object(), "{content}");
+        assert_eq!(content["local_mutation_performed"], json!(false));
+        assert_eq!(content["provider_calls"], json!(0));
+    }
+    let mut invalid_phase = base_args;
+    invalid_phase["dry_run"] = json!(false);
+    let response = mcp.call_tool(9, "workers_upload_version", invalid_phase);
+    let content = structured_content(&response);
+    assert_eq!(
+        content["error"]["code"],
+        json!("workers.version_upload_phase_invalid")
+    );
+    assert!(content["plan"].is_object(), "{content}");
+    assert!(content["audit"].is_object(), "{content}");
+    assert_eq!(content["local_mutation_performed"], json!(false));
+    assert_eq!(content["provider_calls"], json!(0));
+    assert!(requests.lock().expect("request log lock").is_empty());
+}
+
+#[test]
+fn workers_upload_version_rejects_symlink_artifact_before_provider_access() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::symlink;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "cloudflare-mcp-version-symlink-{}-{suffix}",
+        std::process::id()
+    ));
+    fs::create_dir(&directory).expect("create fixture directory"); // lgtm[rust/path-injection] -- process-owned test fixture.
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+        .expect("make fixture directory private");
+    let target = directory.join("private-target.js");
+    let link = directory.join("candidate.js");
+    fs::write(&target, b"private-source-content").expect("write target"); // lgtm[rust/path-injection] -- process-owned test fixture.
+    symlink(&target, &link).expect("create symlink"); // lgtm[rust/path-injection] -- process-owned test fixture.
+
+    let (base_url, requests) = spawn_fake_worker_upload_api(0);
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_WORKER_UPLOAD_ROOT",
+            directory.to_str().expect("UTF-8 root").to_string(),
+        ),
+    ]);
+    let response = mcp.call_tool(
+        2,
+        "workers_upload_version",
+        json!({
+            "script_name":"worker-a",
+            "base_version_id":"11111111-1111-4111-8111-111111111111",
+            "base_version_etag":"a".repeat(64),
+            "pre_upload_version_snapshot_sha256":"b".repeat(64),
+            "pre_upload_deployment_snapshot_sha256":"c".repeat(64),
+            "bindings_inherit":"strict",
+            "main_module":"index.js",
+            "script_path":"candidate.js",
+            "metadata":{"main_module":"index.js","compatibility_date":"2026-07-10","compatibility_flags":[],"bindings":[]},
+            "dry_run":true
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(
+        content["error"]["code"],
+        json!("workers.upload_file_not_regular")
+    );
+    let outward = content.to_string();
+    assert!(!outward.contains("candidate.js"));
+    assert!(!outward.contains("private-target.js"));
+    assert!(!outward.contains("private-source-content"));
+    assert!(requests.lock().expect("request log lock").is_empty());
+    fs::remove_dir_all(directory).expect("remove fixture directory"); // lgtm[rust/path-injection] -- process-owned test fixture.
+}
+
+#[test]
+fn workers_upload_version_oversized_private_artifact_error_withholds_exact_size() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "cloudflare-mcp-version-oversized-{}-{suffix}",
+        std::process::id()
+    ));
+    fs::create_dir(&directory).expect("create fixture directory");
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+        .expect("make fixture directory private");
+    let artifact = directory.join("candidate.js");
+    let file = fs::File::create(&artifact).expect("create oversized fixture");
+    let exact_private_size = 25 * 1024 * 1024 + 1;
+    file.set_len(exact_private_size)
+        .expect("make sparse oversized fixture");
+
+    let (base_url, requests) = spawn_fake_worker_upload_api(0);
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_WORKER_UPLOAD_ROOT",
+            directory.to_string_lossy().to_string(),
+        ),
+    ]);
+    let response = mcp.call_tool(
+        2,
+        "workers_upload_version",
+        json!({
+            "script_name":"worker-a",
+            "base_version_id":"11111111-1111-4111-8111-111111111111",
+            "base_version_etag":"a".repeat(64),
+            "pre_upload_version_snapshot_sha256":"b".repeat(64),
+            "pre_upload_deployment_snapshot_sha256":"c".repeat(64),
+            "bindings_inherit":"strict",
+            "main_module":"index.js",
+            "script_path":"candidate.js",
+            "metadata":{"main_module":"index.js","compatibility_date":"2026-07-10","compatibility_flags":[],"bindings":[]},
+            "dry_run":true
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["error"]["code"], json!("workers.upload_too_large"));
+    assert!(content["plan"].is_object(), "{content}");
+    assert!(content["audit"].is_object(), "{content}");
+    assert_eq!(content["local_mutation_performed"], json!(false));
+    assert_eq!(content["provider_calls"], json!(0));
+    let outward = content.to_string();
+    assert!(!outward.contains(&exact_private_size.to_string()));
+    assert!(!outward.contains("size_bytes"));
+    assert!(requests.lock().expect("request log lock").is_empty());
+    mcp.terminate();
+    fs::remove_dir_all(directory).expect("remove fixture directory");
+}
+
+#[test]
+fn workers_upload_version_stdio_applies_once_and_proves_disabled_candidate() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (base_url, requests) = spawn_fake_worker_version_api(21);
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos();
+    let attempt_root = std::env::temp_dir().join(format!(
+        "cloudflare-mcp-version-attempt-{}-{suffix}",
+        std::process::id()
+    ));
+    fs::create_dir(&attempt_root).expect("create attempt root");
+    fs::set_permissions(&attempt_root, fs::Permissions::from_mode(0o700))
+        .expect("make attempt root private");
+    let approval_root = std::env::temp_dir().join(format!(
+        "cloudflare-mcp-version-approval-{}-{suffix}",
+        std::process::id()
+    ));
+    fs::create_dir(&approval_root).expect("create approval root");
+    fs::set_permissions(&approval_root, fs::Permissions::from_mode(0o700))
+        .expect("make approval root private");
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_WORKER_VERSION_ATTEMPT_ROOT",
+            attempt_root.to_str().expect("UTF-8 root").to_string(),
+        ),
+        (
+            "CLOUDFLARE_MCP_WORKER_VERSION_APPROVAL_ROOT",
+            approval_root.to_str().expect("UTF-8 root").to_string(),
+        ),
+    ]);
+    let base_id = "11111111-1111-4111-8111-111111111111";
+    let candidate_id = "22222222-2222-4222-8222-222222222222";
+
+    let preflight = mcp.call_tool(
+        2,
+        "workers_capture_version_evidence",
+        json!({
+            "script_name":"worker-a",
+            "per_page":100,
+            "version_id":base_id
+        }),
+    );
+    let preflight_content = structured_content(&preflight);
+    assert_eq!(preflight_content["ok"], json!(true), "{preflight_content}");
+    let version_snapshot_sha256 =
+        preflight_content["evidence"]["versions"]["semantic_snapshot_sha256"]
+            .as_str()
+            .expect("version snapshot pin")
+            .to_string();
+    let deployment_snapshot_sha256 =
+        preflight_content["evidence"]["deployments"]["semantic_snapshot_sha256"]
+            .as_str()
+            .expect("deployment snapshot pin")
+            .to_string();
+
+    let upload_args = json!({
+        "script_name":"worker-a",
+        "base_version_id":base_id,
+        "base_version_etag":"a".repeat(64),
+        "pre_upload_version_snapshot_sha256":version_snapshot_sha256,
+        "pre_upload_deployment_snapshot_sha256":deployment_snapshot_sha256,
+        "bindings_inherit":"strict",
+        "main_module":"index.js",
+        "script_content":"export default { fetch() { return new Response('ok') } }",
+        "metadata":{
+            "main_module":"index.js",
+            "compatibility_date":"2026-07-10",
+            "compatibility_flags":[],
+            "bindings":[
+                {"name":"SECRET","type":"inherit","version_id":base_id},
+                {"name":"MODE","type":"plain_text","text":"private-fixture-value"}
+            ]
+        },
+        "per_page":100,
+        "dry_run":true,
+        "reason":"stdio guarded version apply regression"
+    });
+    let dry_run = mcp.call_tool(3, "workers_upload_version", upload_args.clone());
+    let dry_run_content = structured_content(&dry_run);
+    assert_eq!(dry_run_content["ok"], json!(true), "{dry_run_content}");
+    assert_eq!(dry_run_content["planned"], json!(true));
+    assert_eq!(requests.lock().expect("request log lock").len(), 5);
+
+    let mut prepare_args = upload_args.clone();
+    prepare_args["dry_run"] = json!(false);
+    prepare_args["prepare"] = json!(true);
+    let prepared = mcp.call_tool(4, "workers_upload_version", prepare_args);
+    let prepared_content = structured_content(&prepared);
+    assert_eq!(prepared_content["ok"], json!(true), "{prepared_content}");
+    assert_eq!(prepared_content["status"], json!("approval_prepared"));
+    assert_eq!(requests.lock().expect("request log lock").len(), 5);
+
+    let mut apply_args = upload_args;
+    apply_args["dry_run"] = json!(false);
+    apply_args["approval_handle"] = prepared_content["approval"]["approval_handle"].clone();
+    let replay_args = apply_args.clone();
+    let apply = mcp.call_tool(5, "workers_upload_version", apply_args);
+    let apply_content = structured_content(&apply);
+    assert_eq!(apply_content["ok"], json!(true), "{apply_content}");
+    assert_eq!(
+        apply_content["status"],
+        json!("candidate_created_private_exact_candidate")
+    );
+    assert_eq!(
+        apply_content["request_evidence"]["status"],
+        json!("private_exact_candidate_consumed")
+    );
+    assert_eq!(
+        apply_content["request_evidence"]["public_digest_disclosed"],
+        json!(false)
+    );
+    assert_eq!(
+        apply_content["request_evidence"]["public_size_disclosed"],
+        json!(false)
+    );
+    assert_eq!(
+        apply_content["source_proof"]["status"],
+        json!("source_provider_unverified")
+    );
+    assert_eq!(
+        apply_content["provider_proof_scope"]["source_bytes"],
+        json!(false)
+    );
+    assert_eq!(apply_content["candidate_version_id"], json!(candidate_id));
+    assert_eq!(apply_content["candidate_verified"], json!(true));
+    assert_eq!(apply_content["deployment_created"], json!(false));
+    assert_eq!(
+        apply_content["dispatch_attempt_authority"]["state"],
+        json!("terminal")
+    );
+    assert_eq!(
+        apply_content["dispatch_attempt_authority"]["reconciliation_only"],
+        json!(true)
+    );
+    assert_eq!(
+        apply_content["provider_request_lifecycle"],
+        json!({
+            "request_prepared": true,
+            "dispatch_attempted": true,
+            "provider_response_received": true,
+        })
+    );
+    assert_eq!(apply_content["binding_verification_matched"], json!(true));
+    let outward = apply_content.to_string();
+    assert!(!outward.contains("private-fixture-value"));
+    assert!(!outward.contains("never-surface"));
+    assert!(!outward.contains("body_sha256"));
+    assert!(!outward.contains("metadata_sha256"));
+    assert!(!outward.contains("size_bytes"));
+    assert!(!outward.contains("upload_contract_sha256"));
+
+    let replay = mcp.call_tool(6, "workers_upload_version", replay_args);
+    let replay_content = structured_content(&replay);
+    assert_eq!(replay_content["ok"], json!(false), "{replay_content}");
+    assert_eq!(
+        replay_content["error"]["code"],
+        json!("workers.version_upload_approval_consumed")
+    );
+    assert_eq!(replay_content["approval_state"], json!("retired"));
+
+    let requests = requests.lock().expect("request log lock");
+    assert_eq!(requests.len(), 21);
+    let posts = requests
+        .iter()
+        .filter(|request| request["method"] == json!("POST"))
+        .collect::<Vec<_>>();
+    assert_eq!(posts.len(), 1, "{requests:?}");
+    assert_eq!(
+        requests
+            .iter()
+            .position(|request| request["method"] == json!("POST")),
+        Some(15),
+        "the pinned provider state must be captured a third time while durable attempt custody is held and before POST: {requests:?}"
+    );
+    assert!(
+        posts[0]["path"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("/versions?bindings_inherit=strict")
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request["authorization_present"] == json!(true))
+    );
+    assert!(!requests.iter().any(|request| {
+        request["method"] == json!("POST")
+            && request["path"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("/deployments")
+    }));
+    drop(requests);
+    mcp.terminate();
+    fs::remove_dir_all(attempt_root).expect("remove attempt root");
+    fs::remove_dir_all(approval_root).expect("remove approval root");
+}
+
+#[test]
+fn workers_reconcile_version_upload_never_attributes_a_sole_new_candidate() {
+    let base_id = "11111111-1111-4111-8111-111111111111";
+    let candidate_id = "22222222-2222-4222-8222-222222222222";
+    let (pre_base_url, pre_requests) = spawn_fake_worker_version_api(5);
+    let mut pre_mcp =
+        McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", pre_base_url)]);
+    let preflight = pre_mcp.call_tool(
+        2,
+        "workers_capture_version_evidence",
+        json!({
+            "script_name":"worker-a",
+            "per_page":100,
+            "version_id":base_id
+        }),
+    );
+    let preflight_content = structured_content(&preflight);
+    assert_eq!(preflight_content["ok"], json!(true), "{preflight_content}");
+    let versions = &preflight_content["evidence"]["versions"];
+    let deployments = &preflight_content["evidence"]["deployments"];
+    let pre_upload_version_ids = versions["version_ids"].clone();
+    let pre_upload_version_ids_sha256 = versions["version_ids_sha256"].clone();
+    let pre_upload_deployments = deployments["deployments"].clone();
+    let pre_upload_deployment_snapshot_sha256 = deployments["semantic_snapshot_sha256"].clone();
+    assert_eq!(pre_requests.lock().expect("request log lock").len(), 5);
+    pre_mcp.terminate();
+
+    let (base_url, requests) = spawn_fake_worker_version_api_with_initial_state(10, true);
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let response = mcp.call_tool(
+        2,
+        "workers_reconcile_version_upload",
+        json!({
+            "script_name":"worker-a",
+            "base_version_id":base_id,
+            "base_version_etag":"a".repeat(64),
+            "pre_upload_version_ids":pre_upload_version_ids,
+            "pre_upload_version_ids_sha256":pre_upload_version_ids_sha256,
+            "pre_upload_deployments":pre_upload_deployments,
+            "pre_upload_deployment_snapshot_sha256":pre_upload_deployment_snapshot_sha256,
+            "per_page":100
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["status"], json!("reconciliation_required"));
+    assert_eq!(content["attribution_state"], json!("unattributed"));
+    assert_eq!(
+        content["candidate_relationship"],
+        json!("sole_new_version_since_pinned_snapshot")
+    );
+    assert_eq!(content["candidate_version_id"], json!(candidate_id));
+    assert_eq!(content["mutation_performed"], json!(false));
+    assert_eq!(content["deployment_created"], json!(false));
+    assert_eq!(content["retry_decision"], json!("do_not_retry"));
+    assert!(!content.to_string().contains("upload_contract_sha256"));
+    let requests = requests.lock().expect("request log lock");
+    assert_eq!(requests.len(), 10);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request["method"] == json!("GET"))
+    );
 }
 
 #[test]

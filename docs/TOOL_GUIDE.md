@@ -463,12 +463,41 @@ like "what rule blocked this path?" or "is this rule still firing?"
 
 ## Workers and Bindings
 
+### Version-only upload capability matrix
+
+| Workflow | Tool | Class | Required inputs | Proof and redaction | Negative coverage | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| Capture an immutable pre/post provider state | `workers_capture_version_evidence` | read | Exact account/script, fixed `per_page`, optional exact version ID and candidate exclusion ID | Two stable, bounded all-page version reads; exact sanitized version detail; two stable complete deployment reads; request/response artifact SHA-256 values. Binding values and raw provider bodies are never returned. | Wrong target or detail ID, malformed/duplicate/truncated/drifting pagination, invalid or over-cap deployments, missing script ETag, candidate present in a deployment | Implemented and focused-tested |
+| Create one disabled Worker version | `workers_upload_version` | preview / private prepare / apply | One reviewed inline or private-root file artifact; closed complete metadata; exact base ID/ETag and pinned pre-state; `bindings_inherit="strict"`; explicit `dry_run=true`, `prepare=true`, or opaque `approval_handle`; canonical private approval and dispatch-attempt roots for their respective phases | Preview is mutation-free and non-actionable. Prepare stores the complete exact candidate create-only under a kernel-random handle with descriptor/no-follow/private/bounded/canonical/fsync/lock safety and exposes no candidate digest or size. Apply reloads and byte-binds the full candidate, consumes approval before provider access, retires it only after distinct dispatch-attempt custody exists, sends one non-retrying POST, and proves one exact disabled candidate with unchanged deployments. Public apply evidence contains only candidate identity plus non-sensitive lifecycle/boolean facts; source remains `source_provider_unverified`. | Every source mode; absent/present, object/null/array/primitive, valid/malformed/contradictory custody; exact/conflicting/concurrent apply; prepared/consumed/expired/retired; crash/restart/replay; request failure/response loss; symlink/FIFO/socket/device; namespace/artifact bounds; root drift; stale provider state; unknown binding/runtime fields; candidate deployed | Implemented and focused-tested |
+| Collect response-loss evidence without another upload | `workers_reconcile_version_upload` | read | Exact script/base/upload contract, pinned pre-upload version IDs and deployments plus their hashes | Fresh stable version/deployment evidence; sole-new-candidate relationship and exact sanitized detail; explicit unattributed state; no deployment mutation | Inventory never proves the candidate came from the lost request or matches its reviewed complete bytes/binding plan; no/multiple candidates, removed predecessor, snapshot/hash mismatch, pagination drift, deployment drift, candidate deployed | Implemented and focused-tested |
+
+These tools deliberately have no deployment-create path. A successful version
+upload is only disabled candidate evidence; it never authorizes traffic or a
+later deployment.
+
+The MCP schema represents each upload binding as a tagged, deny-unknown union;
+arbitrary binding values and unknown per-type fields fail at deserialization.
+The guarded upload plan currently supports explicit `inherit` bound to the exact
+pinned base. Provider detail must materialize that binding before it can become
+proof: implicit, `latest`, or still-inherited provider projections are rejected
+because this bounded ceremony does not capture a recursive inheritance chain.
+The closed projection also supports `d1`,
+`plain_text`, `secret_text`, `json`, `service`, `r2_bucket`, `queue`,
+`analytics_engine`, `kv_namespace`, `vectorize`, `hyperdrive`, `pipelines`,
+`mtls_certificate`, `messaging`, `secrets_store_secret`, `ai`, `ai_search`,
+`ai_search_namespace`, `assets`, `browser`, `images`, `media`, and
+`version_metadata`. Each type has a closed field set. Extend that set in a
+reviewed change rather than passing unknown provider fields through.
+
 Use these to inspect Workers, settings, bindings, and event telemetry:
 
 - `list_workers`
 - `workers_list_scripts`
 - `get_worker_settings`
 - `workers_get_script_settings`
+- `workers_capture_version_evidence`
+- `workers_upload_version`
+- `workers_reconcile_version_upload`
 - `workers_upload_script`
 - `patch_worker_settings`
 - `workers_list_tails`

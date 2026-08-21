@@ -19,8 +19,10 @@ matter more than raw endpoint breadth:
 - Pages deployments and custom domains.
 - D1 database discovery, read-only queries, guarded writes, and migrations.
 - R2 object inspection, bounded reads/downloads, and writes.
-- Workers script upload with digest-based summaries and settings readback,
-  bindings discovery, and observability event queries.
+- Workers script upload with digest-based summaries and settings readback;
+  guarded version-only candidate upload with exact-base inheritance,
+  response-loss reconciliation, and unchanged-deployment proof; bindings
+  discovery; and observability event queries.
 - Queues health, backlog, metrics, consumers, and DLQ readback.
 - Account billing usage and Cloudflare Analytics GraphQL attribution for
   usage-spike investigations.
@@ -61,6 +63,10 @@ not only in documentation:
 - Curated tool workflows are preserved for operations with product-specific
   safety policy.
 - Mutating tools support deterministic dry-run plans.
+- Worker version uploads use a separate explicit private preparation phase and
+  random opaque approval handle when deterministic public confirmation would
+  expose an oracle over secret-bearing metadata. They are excluded from the
+  generic argument-digest/preview elicitation path for the same reason.
 - Dangerous apply calls can require MCP elicitation approval.
 - Mutation responses include structured audit metadata with correlation IDs.
 - Publish flows evaluate policy gates before DNS mutation.

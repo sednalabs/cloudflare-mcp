@@ -1042,6 +1042,150 @@ Multipart uploads still require dry-run review and the confirmation token, but
 `readback_verification` reports module-name verification as not applicable
 because the bundle owns its module graph.
 
+### Create a disabled Worker version without changing traffic
+
+Use this ceremony when a reviewed candidate must exist in Cloudflare but must
+not be deployed yet. It is intentionally separate from
+`workers_upload_script`, and these tools contain no deployment-create path.
+`workers_upload_version` must not be placed in
+`CLOUDFLARE_MCP_ELICITATION_REQUIRED_TOOLS`: generic elicitation hashes and
+previews full arguments, while this tool's sole approval path is its private
+random-handle preparation lifecycle.
+
+1. Call `workers_capture_version_evidence` with the exact account, script,
+   fixed `per_page`, and exact base version ID. Review the two stable complete
+   version-list passes, exact base ETag and sanitized binding descriptors, and
+   two identical deployment reads. Preserve `version_ids`,
+   `version_ids_sha256`, both semantic snapshot SHA-256 values, and the
+   deployment projection. Stop on any drift, malformed evidence, duplicate,
+   cross-target detail, missing ETag, or pagination/cap failure.
+2. Call `workers_upload_version` with `dry_run:true`, that exact base and
+   pre-state evidence, one reviewed module or multipart artifact, complete
+   metadata, and `bindings_inherit:"strict"`. Metadata is a deny-unknown
+   contract containing exactly `main_module`, a valid `compatibility_date`, a
+   duplicate-free `compatibility_flags` array, and the complete `bindings`
+   array. Every binding item must match one tagged, deny-unknown supported-type
+   schema before its values reach the stricter runtime canonicalizer. Omission
+   is never interpreted as an empty binding plan. Export
+   reconciliation, migrations, durable-object lifecycle inputs, assets/cache
+   controls, annotations, dependencies, logpush/tails/tags/observability,
+   placement, limits, usage model, and other runtime controls are rejected
+   before any provider request. Every inherited binding must
+   explicitly name the exact base version; never use implicit or `latest`
+   inheritance. For a path artifact, set
+   `CLOUDFLARE_MCP_WORKER_UPLOAD_ROOT` to an operator-owned mode-0700 directory
+   and pass only a canonical relative path beneath it. The MCP opens every
+   component descriptor-relatively without following symlinks, then validates,
+   bounds, and reads the final regular file through that same descriptor.
+   The closed binding projection rejects unknown types or fields and normalizes
+   only documented representation equivalence: deprecated D1 `id` to
+   `database_id`, and an omitted AI Search instance namespace to `default`.
+   Preview returns no candidate digest, size, or actionable token. It performs
+   no local mutation and no provider call.
+3. Repeat the complete byte-identical candidate with `dry_run:false` and
+   `prepare:true`. This is an explicit local custody mutation, not a dry-run.
+   Configure `CLOUDFLARE_MCP_WORKER_VERSION_APPROVAL_ROOT` as a pre-created,
+   canonical, operator-owned mode-0700 directory shared by every upload
+   process. Every canonical ancestor must be a real directory owned by root or
+   the effective user and must not be group/world writable. Preparation creates an exact private candidate under a
+   cryptographically random opaque handle. Review the lifecycle result and
+   retain only `approval.approval_handle`; public output deliberately contains
+   no deterministic candidate hash, candidate-derived size, private path, or
+   receipt bytes. A handle expires after 15 minutes.
+
+   If preparation returns `workers.version_upload_approval_rotation_required`,
+   treat its bounded `custody_capacity` as a stop receipt; `safe_to_rotate` is
+   deliberately false. Use this exact order: stop new operator preparation;
+   run the bounded terminal-only audit; while holding the incumbent root guard
+   exclusively, install and fsync the create-only `retired-root.json` fence
+   naming the new canonical generation; verify that fence from the same root
+   descriptor; only then archive terminal expired/rejected/retired evidence;
+   create a fresh ancestor-safe mode-0700 root; atomically update and restart
+   every upload process. The retirement helper refuses prepared-only,
+   consumed-only, locked, incomplete, malformed, or contradictory authority.
+   In-flight loads retain a shared root guard, and every prepare, load, and
+   consume rejects a retired root after restart. Never split processes across
+   roots or use rotation to authorize or retry a provider request.
+   The local custody model assumes the effective UID does not mutate these
+   files outside the guarded helper; same-UID out-of-band writers are outside
+   this trusted boundary.
+
+   After the audit and before any archival/cutover, install the fence with
+   `cargo run --quiet --bin cloudflare-mcp-retire-worker-version-approval-root -- "$CLOUDFLARE_MCP_WORKER_VERSION_APPROVAL_ROOT" GENERATION`.
+   The route-less helper emits no path or receipt content and performs zero
+   provider calls.
+4. Apply once with unchanged complete inputs, `prepare:false`, and the exact
+   `approval_handle`. Apply reloads the private body and canonical metadata,
+   binds every target/base/pre-state field byte-for-byte, and durably consumes
+   approval before any provider access. Absent, expired, consumed, retired,
+   conflicting, concurrent, malformed, noncanonical, symlink, FIFO, socket,
+   device, oversized, unexpected-entry, or root-drift evidence fails closed.
+   Physical presence is evidence; do not delete or repair a plan namespace.
+   The MCP also requires `CLOUDFLARE_MCP_WORKER_VERSION_ATTEMPT_ROOT` to be a pre-created,
+   canonical, operator-owned mode-0700 directory shared by every MCP process
+   that can upload Worker versions. It checks this permanent custody before
+   provider preflight, re-captures the base and pre-state, then creates an
+   append-only `prepared.json` receipt beneath an approval-handle-bound attempt
+   key. While the shared attempt guard remains held, it captures and matches
+   that pinned provider state again so a differently confirmed concurrent
+   attempt cannot dispatch from a stale snapshot. It then synchronizes the
+   append-only `dispatched.json` receipt before entering the one
+   non-retrying version POST. A complete response adds `terminal.json`; a
+   crash or response loss leaves prepared or dispatched evidence in place.
+   Any retained, conflicting, malformed, or concurrently owned attempt is
+   reconciliation-only across restart and can never authorize another POST.
+   Cloudflare exposes no atomic compare-and-create precondition between the
+   final provider pre-state read and the version POST. Local one-use custody
+   prevents duplicate POST replay but does not make that external interval
+   atomic.
+   Restored namespaces are a closed maximum of the three named receipts.
+   Receipt custody opens descriptor-first with nonblocking/no-follow flags,
+   verifies a private bounded regular file before reading, caps the descriptor
+   read, and revalidates that same descriptor afterward. FIFOs, sockets,
+   devices, oversized namespaces, dangling symlinks, and every other
+   physically present malformed receipt fail closed without being treated as
+   absence. Do not delete or repair an attempt namespace in place. The MCP then
+   requires exactly one new candidate, exact candidate ID/ETag, exact allowed
+   compatibility date/flags, response-to-readback script/runtime/version
+   metadata projections, and a complete binding projection matching
+   both explicit metadata and exact-base inheritance. If provider detail still
+   contains an `inherit` binding, stop: this ceremony deliberately rejects it
+   rather than pretending to prove an uncaptured recursive inheritance chain.
+   It also requires an
+   unchanged sorted two-pass deployment projection with an explicit known
+   `percentage` strategy and `candidate_absent:true`.
+   `candidate_created_private_exact_candidate` means a disabled candidate exists and the
+   provider-visible identity/runtime/binding/deployment projections match. It
+   public result deliberately omits all deterministic candidate/request hashes
+   and candidate-derived sizes. Exact candidate bytes and canonical metadata
+   remain only in private approval custody; append-only attempt receipts govern
+   the separate provider-dispatch ambiguity boundary.
+   `source_proof.status=source_provider_unverified` is intentional: Version
+   Detail cannot authenticate the submitted module graph or source bytes. The
+   result does not authorize or create a deployment and must never be described
+   as provider proof of source-byte identity. Because this ceremony rejects
+   script-level logpush, tails, tags, observability and similar settings inputs,
+   it does not claim a separate Script Settings before/after proof; that scope
+   is reported as false rather than silently inferred.
+5. Preserve the opaque approval handle and lifecycle result privately. Public
+   results intentionally do not provide request/response digests or byte sizes
+   that could become confirmation oracles for low-entropy secret bindings.
+
+If the upload response is lost before or after provider visibility, rejected,
+malformed, oversized, unexpectedly encoded, or followed by
+failed/contradictory readback, never repeat the POST. The durable attempt state
+is authoritative even when provider inventory shows no new candidate.
+Call `workers_reconcile_version_upload` with the exact pinned pre-upload IDs,
+deployment projection and hashes plus the base ID/ETag. Do not supply or
+publish an upload-contract digest. Reconciliation is read-only. Exactly one new version over the
+predecessor set, a matching base, unchanged deployments, and a disabled
+candidate prove only a sole-new-candidate relationship. They do not attribute
+that candidate to the lost POST or prove its complete reviewed bytes and
+binding plan, so the result remains `reconciliation_required` and
+`unattributed`. Zero or multiple candidates, a missing predecessor, any
+hash/state drift, or a deployed candidate also remains unresolved. No outcome
+authorizes an upload retry.
+
 ## Apply Sequence
 
 For exposure workflows, use this order:

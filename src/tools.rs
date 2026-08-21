@@ -34,6 +34,11 @@ use crate::cache::{
     CacheZoneSettingAction, purge_confirmation_token, replace_rules_confirmation_token,
 };
 use crate::cloudflare::model::WorkerScript;
+use crate::cloudflare::worker_versions::{
+    WorkerVersionOperationError, prepare_worker_binding_expectation,
+    validate_worker_deployment_projection, validate_worker_version_ids,
+    verify_worker_candidate_bindings, verify_worker_candidate_runtime,
+};
 use crate::cloudflare::{
     AccessAppUpsertRequest, AccessPolicyWrite, BulkRedirectItemWrite, CacheRule, CacheRuleset,
     DnsRecordUpsertRequest, PagesDeploymentTriggerRequest, with_request_api_token_override,
@@ -81,7 +86,8 @@ use crate::mutation::{
     MutationAuditSession, MutationPlan, emit_mutation_audit_log, plan_apply_access_allowlist,
     plan_cache_mutation, plan_connector_control, plan_emergency_unpublish, plan_ensure_tunnel,
     plan_lock_first_publish, plan_patch_worker_settings, plan_replace_access_policies,
-    plan_upload_worker_script, plan_upsert_access_app, plan_upsert_dns_cname,
+    plan_upload_worker_script, plan_upload_worker_version, plan_upsert_access_app,
+    plan_upsert_dns_cname,
 };
 use crate::pages_deploy::{
     MAX_PAGES_ASSET_COUNT_DEFAULT, PagesDirectoryInspectOptions,
@@ -108,6 +114,15 @@ use crate::verification::{
 use crate::worker_upload::{
     WorkerUploadBody, WorkerUploadError, WorkerUploadInput, build_worker_upload,
 };
+use crate::worker_version_approval::{
+    WorkerVersionApprovalCandidate, WorkerVersionApprovalError, load_worker_version_approval,
+    prepare_worker_version_approval,
+};
+use crate::worker_version_attempt::{
+    WorkerVersionAttemptError, WorkerVersionAttemptInput,
+    preflight_worker_version_dispatch_attempt, prepare_worker_version_dispatch_attempt,
+};
+use crate::worker_version_upload::build_worker_version_upload;
 use mcp_toolkit_core::tool_inventory::{ToolOperation, ToolSearchFilter, ToolSearchResponse};
 use mcp_toolkit_policy_core::{RestrictedSqlError, classify_restricted_sql};
 
@@ -771,6 +786,259 @@ pub struct WorkersUploadScriptArgs {
     pub confirmation_token: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+fn default_worker_version_per_page() -> u32 {
+    100
+}
+
+fn deserialize_present_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)?.map_or_else(
+        || {
+            Err(serde::de::Error::custom(
+                "optional Worker version binding fields must be omitted instead of null",
+            ))
+        },
+        |value| Ok(Some(value)),
+    )
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WorkersCaptureVersionEvidenceArgs {
+    #[serde(default)]
+    pub account_id: Option<String>,
+    pub script_name: String,
+    #[serde(default = "default_worker_version_per_page")]
+    pub per_page: u32,
+    #[serde(default)]
+    pub version_id: Option<String>,
+    #[serde(default)]
+    pub candidate_must_be_absent: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerVersionBindingsInherit {
+    Strict,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkerVersionUploadBinding {
+    Inherit {
+        name: String,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_present_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schemars(with = "String")]
+        old_name: Option<String>,
+        version_id: String,
+    },
+    #[schemars(extend("anyOf" = [{"required": ["database_id"]}, {"required": ["id"]}]))]
+    D1 {
+        name: String,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_present_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schemars(with = "String")]
+        database_id: Option<String>,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_present_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schemars(with = "String")]
+        id: Option<String>,
+    },
+    AiSearch {
+        name: String,
+        instance_name: String,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_present_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schemars(with = "String")]
+        namespace: Option<String>,
+    },
+    AiSearchNamespace {
+        name: String,
+        namespace: String,
+    },
+    PlainText {
+        name: String,
+        text: String,
+    },
+    SecretText {
+        name: String,
+        text: String,
+    },
+    Json {
+        name: String,
+        json: Value,
+    },
+    Service {
+        name: String,
+        service: String,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_present_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schemars(with = "String")]
+        environment: Option<String>,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_present_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schemars(with = "String")]
+        entrypoint: Option<String>,
+    },
+    R2Bucket {
+        name: String,
+        bucket_name: String,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_present_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schemars(with = "WorkerVersionR2Jurisdiction")]
+        jurisdiction: Option<WorkerVersionR2Jurisdiction>,
+    },
+    Queue {
+        name: String,
+        queue_name: String,
+    },
+    AnalyticsEngine {
+        name: String,
+        dataset: String,
+    },
+    KvNamespace {
+        name: String,
+        namespace_id: String,
+    },
+    Vectorize {
+        name: String,
+        index_name: String,
+    },
+    Hyperdrive {
+        name: String,
+        id: String,
+    },
+    Pipelines {
+        name: String,
+        pipeline: String,
+    },
+    MtlsCertificate {
+        name: String,
+        certificate_id: String,
+    },
+    Messaging {
+        name: String,
+        namespace: String,
+    },
+    SecretsStoreSecret {
+        name: String,
+        secret_name: String,
+        store_id: String,
+    },
+    Ai {
+        name: String,
+    },
+    Assets {
+        name: String,
+    },
+    Browser {
+        name: String,
+    },
+    Images {
+        name: String,
+    },
+    Media {
+        name: String,
+    },
+    VersionMetadata {
+        name: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerVersionR2Jurisdiction {
+    Eu,
+    Fedramp,
+    #[serde(rename = "fedramp-high")]
+    FedrampHigh,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerVersionUploadMetadata {
+    pub main_module: String,
+    pub compatibility_date: String,
+    pub compatibility_flags: Vec<String>,
+    pub bindings: Vec<WorkerVersionUploadBinding>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkersUploadVersionArgs {
+    #[serde(default)]
+    pub account_id: Option<String>,
+    pub script_name: String,
+    pub base_version_id: String,
+    pub base_version_etag: String,
+    pub pre_upload_version_snapshot_sha256: String,
+    pub pre_upload_deployment_snapshot_sha256: String,
+    pub bindings_inherit: WorkerVersionBindingsInherit,
+    #[serde(default)]
+    pub main_module: Option<String>,
+    #[serde(default)]
+    pub script_path: Option<String>,
+    #[serde(default)]
+    pub script_content: Option<String>,
+    #[serde(default)]
+    pub script_content_base64: Option<String>,
+    #[serde(default)]
+    pub multipart_path: Option<String>,
+    pub metadata: WorkerVersionUploadMetadata,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    #[serde(default = "default_worker_version_per_page")]
+    #[schemars(range(min = 1, max = 100))]
+    pub per_page: u32,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub prepare: bool,
+    #[serde(default)]
+    pub approval_handle: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WorkersReconcileVersionUploadArgs {
+    #[serde(default)]
+    pub account_id: Option<String>,
+    pub script_name: String,
+    pub base_version_id: String,
+    pub base_version_etag: String,
+    pub pre_upload_version_ids: Vec<String>,
+    pub pre_upload_version_ids_sha256: String,
+    pub pre_upload_deployments: Value,
+    pub pre_upload_deployment_snapshot_sha256: String,
+    #[serde(default = "default_worker_version_per_page")]
+    pub per_page: u32,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -8064,6 +8332,955 @@ impl CloudflareMcp {
     }
 
     #[tool(
+        name = "workers_capture_version_evidence",
+        description = "Capture stable bounded Worker version pagination, optional exact sanitized version detail, and two-pass deployment evidence without mutation."
+    )]
+    async fn cloudflare_workers_capture_version_evidence(
+        &self,
+        Parameters(args): Parameters<WorkersCaptureVersionEvidenceArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        match self
+            .cloudflare
+            .capture_worker_version_state(
+                account_id,
+                &args.script_name,
+                args.per_page,
+                args.version_id.as_deref(),
+                args.candidate_must_be_absent.as_deref(),
+            )
+            .await
+        {
+            Ok(evidence) => Ok(CallToolResult::structured(json!({
+                "ok": true,
+                "operation": "workers_capture_version_evidence",
+                "account_id": account_id,
+                "evidence": evidence,
+                "mutation_performed": false,
+                "deployment_created": false,
+            }))),
+            Err(error) => Ok(worker_version_operation_error_result(
+                "workers_capture_version_evidence",
+                error,
+            )),
+        }
+    }
+
+    #[tool(
+        name = "workers_upload_version",
+        description = "Preview, privately prepare under a random opaque approval handle, or apply once to upload one disabled Worker version with exact-candidate custody, pinned pre-state, non-retrying provider submission, exact candidate readback, and unchanged-deployment proof."
+    )]
+    async fn cloudflare_workers_upload_version(
+        &self,
+        Parameters(args): Parameters<WorkersUploadVersionArgs>,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        let script_name = args.script_name.trim();
+        let phase = if args.dry_run && !args.prepare && args.approval_handle.is_none() {
+            "preview"
+        } else if !args.dry_run && args.prepare && args.approval_handle.is_none() {
+            "prepare"
+        } else if !args.dry_run && !args.prepare && args.approval_handle.is_some() {
+            "apply"
+        } else {
+            "invalid"
+        };
+        let plan =
+            plan_upload_worker_version(account_id, script_name, &args.base_version_id, phase);
+        let mut audit = MutationAuditSession::start(
+            Some(&parts),
+            "workers_upload_version",
+            json!({
+                "account_id": account_id,
+                "script_name": script_name,
+                "base_version_id": args.base_version_id,
+                "phase": phase,
+                "candidate_evidence": "private_only",
+                "reason": args.reason.as_deref().map(str::trim),
+            }),
+            args.dry_run,
+        );
+        audit.redact_public_approval_digest();
+        if script_name.is_empty() || script_name != args.script_name {
+            return Ok(finalize_mutation_result(
+                worker_version_simple_error_result(
+                    "workers_upload_version",
+                    "workers.version_target_invalid",
+                    "script_name must be a canonical non-empty string",
+                    "Use the exact script identity from authenticated inventory.",
+                ),
+                &plan,
+                audit,
+                args.dry_run,
+            ));
+        }
+        if !(1..=100).contains(&args.per_page) {
+            return Ok(finalize_mutation_result(
+                worker_version_simple_error_result(
+                    "workers_upload_version",
+                    "workers.version_upload_per_page_invalid",
+                    "per_page must be between 1 and 100",
+                    "Use the same bounded page size for pre-state capture and upload readback.",
+                ),
+                &plan,
+                audit,
+                args.dry_run,
+            ));
+        }
+        if phase == "invalid" {
+            return Ok(finalize_mutation_result(
+                worker_version_simple_error_result(
+                    "workers_upload_version",
+                    "workers.version_upload_phase_invalid",
+                    "choose exactly one preview, prepare, or apply phase",
+                    "Use dry_run=true for a side-effect-free preview, prepare=true to create private approval custody, or supply approval_handle for apply.",
+                ),
+                &plan,
+                audit,
+                args.dry_run,
+            ));
+        }
+        if !is_lower_hex_sha256(&args.base_version_etag)
+            || !is_lower_hex_sha256(&args.pre_upload_version_snapshot_sha256)
+            || !is_lower_hex_sha256(&args.pre_upload_deployment_snapshot_sha256)
+        {
+            return Ok(finalize_mutation_result(
+                worker_version_simple_error_result(
+                    "workers_upload_version",
+                    "workers.version_upload_evidence_digest_invalid",
+                    "base ETag and pre-upload snapshot pins must be 64-character lowercase hexadecimal values",
+                    "Use the exact evidence returned by workers_capture_version_evidence.",
+                ),
+                &plan,
+                audit,
+                args.dry_run,
+            ));
+        }
+        let typed_metadata = serde_json::to_value(&args.metadata)
+            .expect("typed Worker version metadata is finite JSON");
+        let artifact = match build_worker_version_upload(
+            WorkerUploadInput {
+                script_path: args.script_path.as_deref(),
+                script_content: args.script_content.as_deref(),
+                script_content_base64: args.script_content_base64.as_deref(),
+                multipart_path: args.multipart_path.as_deref(),
+                main_module: args.main_module.as_deref(),
+                metadata: &typed_metadata,
+                content_type: args.content_type.as_deref(),
+            },
+            &args.base_version_id,
+        ) {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                return Ok(finalize_mutation_result(
+                    worker_version_upload_artifact_error_result(error),
+                    &plan,
+                    audit,
+                    args.dry_run,
+                ));
+            }
+        };
+        let canonical_binding_metadata = artifact.canonical_metadata.clone();
+        let expected_compatibility_date = artifact
+            .canonical_metadata
+            .get("compatibility_date")
+            .and_then(Value::as_str)
+            .expect("closed upload metadata has compatibility_date")
+            .to_string();
+        let expected_compatibility_flags = artifact
+            .canonical_metadata
+            .get("compatibility_flags")
+            .and_then(Value::as_array)
+            .expect("closed upload metadata has compatibility_flags")
+            .iter()
+            .map(|flag| {
+                flag.as_str()
+                    .expect("closed upload metadata has string flags")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        let upload_contract_sha256 = artifact.summary.upload_contract_sha256.clone();
+        if args.dry_run {
+            return Ok(finalize_mutation_result(
+                CallToolResult::structured(json!({
+                    "ok": true,
+                    "planned": true,
+                    "status": "preview_validated",
+                    "operation": "workers_upload_version",
+                    "preparation_required": true,
+                    "local_mutation_performed": false,
+                    "provider_calls": 0,
+                    "deployment_created": false,
+                    "dry_run_note": "The complete candidate validated in memory. No approval custody or provider request was created.",
+                })),
+                &plan,
+                audit,
+                true,
+            ));
+        }
+        let approval_candidate = WorkerVersionApprovalCandidate {
+            account_id,
+            script_name,
+            base_version_id: &args.base_version_id,
+            base_version_etag: &args.base_version_etag,
+            pre_upload_version_snapshot_sha256: &args.pre_upload_version_snapshot_sha256,
+            pre_upload_deployment_snapshot_sha256: &args.pre_upload_deployment_snapshot_sha256,
+            per_page: args.per_page,
+            content_type: &artifact.content_type,
+            canonical_metadata: &artifact.canonical_metadata,
+            body: &artifact.body,
+        };
+        if args.prepare {
+            let evidence = match prepare_worker_version_approval(&approval_candidate) {
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    return Ok(finalize_mutation_result(
+                        worker_version_approval_error_result(error),
+                        &plan,
+                        audit,
+                        false,
+                    ));
+                }
+            };
+            return Ok(finalize_mutation_result(
+                CallToolResult::structured(json!({
+                    "ok": true,
+                    "status": "approval_prepared",
+                    "approval": evidence,
+                    "local_mutation_performed": true,
+                    "provider_calls": 0,
+                    "deployment_created": false,
+                    "next_action": "Review this preparation result, then apply the complete byte-identical candidate with approval_handle before expiry.",
+                })),
+                &plan,
+                audit,
+                false,
+            ));
+        }
+        let approval_handle = args
+            .approval_handle
+            .as_deref()
+            .expect("apply phase has a handle");
+        let mut approval = match load_worker_version_approval(approval_handle, &approval_candidate)
+        {
+            Ok(approval) => approval,
+            Err(error) => {
+                return Ok(finalize_mutation_result(
+                    worker_version_approval_error_result(error),
+                    &plan,
+                    audit,
+                    false,
+                ));
+            }
+        };
+        let consumed_approval = match approval.consume() {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return Ok(finalize_mutation_result(
+                    worker_version_approval_error_result(error),
+                    &plan,
+                    audit,
+                    false,
+                ));
+            }
+        };
+        let attempt_input = WorkerVersionAttemptInput {
+            account_id,
+            script_name,
+            approval_handle,
+            upload_contract_sha256: &upload_contract_sha256,
+            base_version_id: &args.base_version_id,
+            base_version_etag: &args.base_version_etag,
+            pre_upload_version_snapshot_sha256: &args.pre_upload_version_snapshot_sha256,
+            pre_upload_deployment_snapshot_sha256: &args.pre_upload_deployment_snapshot_sha256,
+        };
+        if let Err(error) = preflight_worker_version_dispatch_attempt(&attempt_input) {
+            return Ok(finalize_mutation_result(
+                worker_version_with_approval(
+                    worker_version_attempt_error_result(error),
+                    &consumed_approval,
+                ),
+                &plan,
+                audit,
+                false,
+            ));
+        }
+        let pre_state = match self
+            .cloudflare
+            .capture_worker_version_state(
+                account_id,
+                script_name,
+                args.per_page,
+                Some(&args.base_version_id),
+                None,
+            )
+            .await
+        {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return Ok(finalize_mutation_result(
+                    worker_version_with_approval(
+                        worker_version_upload_operation_error_result(error),
+                        &consumed_approval,
+                    ),
+                    &plan,
+                    audit,
+                    false,
+                ));
+            }
+        };
+        let base_matches = pre_state
+            .detail
+            .as_ref()
+            .is_some_and(|detail| detail.script_etag == args.base_version_etag);
+        if pre_state.versions.semantic_snapshot_sha256 != args.pre_upload_version_snapshot_sha256
+            || pre_state.deployments.semantic_snapshot_sha256
+                != args.pre_upload_deployment_snapshot_sha256
+            || !base_matches
+        {
+            return Ok(finalize_mutation_result(
+                CallToolResult::structured_error(json!({
+                    "ok": false,
+                    "operation": "workers_upload_version",
+                    "error": {
+                        "code": "workers.version_upload_pre_state_drift",
+                        "message": "authenticated pre-upload state did not match the pinned review evidence",
+                        "hint": "Capture, review, and approve a fresh version/deployment snapshot; no upload was dispatched.",
+                    },
+                    "approval": consumed_approval,
+                    "local_mutation_performed": true,
+                    "deployment_created": false,
+                    "provider_request_lifecycle": {
+                        "request_prepared": false,
+                        "dispatch_attempted": false,
+                        "provider_response_received": false,
+                    },
+                })),
+                &plan,
+                audit,
+                false,
+            ));
+        }
+        let binding_expectation = match pre_state.detail.as_ref() {
+            Some(base_detail) => {
+                match prepare_worker_binding_expectation(base_detail, &canonical_binding_metadata) {
+                    Ok(expectation) => expectation,
+                    Err(error) => {
+                        return Ok(finalize_mutation_result(
+                            CallToolResult::structured_error(json!({
+                                "ok": false,
+                                "operation": "workers_upload_version",
+                                "error": worker_version_operation_error_public_value(&error),
+                                "approval": consumed_approval,
+                                "local_mutation_performed": true,
+                                "deployment_created": false,
+                                "provider_request_lifecycle": {
+                                    "request_prepared": false,
+                                    "dispatch_attempted": false,
+                                    "provider_response_received": false,
+                                },
+                            })),
+                            &plan,
+                            audit,
+                            false,
+                        ));
+                    }
+                }
+            }
+            None => unreachable!("exact base detail is required by the pre-state proof"),
+        };
+        let mut dispatch_attempt = match prepare_worker_version_dispatch_attempt(&attempt_input) {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                return Ok(finalize_mutation_result(
+                    worker_version_with_approval(
+                        worker_version_attempt_error_result(error),
+                        &consumed_approval,
+                    ),
+                    &plan,
+                    audit,
+                    false,
+                ));
+            }
+        };
+        let dispatch_pre_state = match self
+            .cloudflare
+            .capture_worker_version_state(
+                account_id,
+                script_name,
+                args.per_page,
+                Some(&args.base_version_id),
+                None,
+            )
+            .await
+        {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return Ok(finalize_mutation_result(
+                    CallToolResult::structured_error(json!({
+                        "ok": false,
+                        "operation": "workers_upload_version",
+                        "status": "reconciliation_required",
+                        "error": {
+                            "code": "workers.version_upload_dispatch_pre_state_unavailable",
+                            "message": "pinned pre-upload state could not be revalidated while the durable attempt guard was held",
+                            "hint": "Do not replay this prepared attempt. Preserve its custody and reconcile the pinned provider state.",
+                            "cause": worker_version_operation_error_public_value(&error),
+                            "retryable": false,
+                            "outcome_ambiguous": false,
+                        },
+                        "dispatch_attempt_authority": dispatch_attempt.evidence("prepared"),
+                        "approval": consumed_approval,
+                        "local_mutation_performed": true,
+                        "provider_request_lifecycle": {
+                            "request_prepared": true,
+                            "dispatch_attempted": false,
+                            "provider_response_received": false,
+                        },
+                        "deployment_created": false,
+                        "retry_decision": "do_not_retry; prepared custody is permanent",
+                    })),
+                    &plan,
+                    audit,
+                    false,
+                ));
+            }
+        };
+        let dispatch_base_matches = dispatch_pre_state
+            .detail
+            .as_ref()
+            .is_some_and(|detail| detail.script_etag == args.base_version_etag);
+        if dispatch_pre_state.versions.semantic_snapshot_sha256
+            != args.pre_upload_version_snapshot_sha256
+            || dispatch_pre_state.deployments.semantic_snapshot_sha256
+                != args.pre_upload_deployment_snapshot_sha256
+            || !dispatch_base_matches
+        {
+            return Ok(finalize_mutation_result(
+                CallToolResult::structured_error(json!({
+                    "ok": false,
+                    "operation": "workers_upload_version",
+                    "status": "reconciliation_required",
+                    "error": {
+                        "code": "workers.version_upload_dispatch_pre_state_drift",
+                        "message": "pinned pre-upload state changed before the attempt could be consumed for provider dispatch",
+                        "hint": "Do not replay this prepared attempt. Preserve its custody and review a new independently confirmed attempt against fresh provider evidence.",
+                        "retryable": false,
+                        "outcome_ambiguous": false,
+                    },
+                    "dispatch_attempt_authority": dispatch_attempt.evidence("prepared"),
+                    "approval": consumed_approval,
+                    "local_mutation_performed": true,
+                    "provider_request_lifecycle": {
+                        "request_prepared": true,
+                        "dispatch_attempted": false,
+                        "provider_response_received": false,
+                    },
+                    "deployment_created": false,
+                    "retry_decision": "do_not_retry; prepared custody is permanent",
+                })),
+                &plan,
+                audit,
+                false,
+            ));
+        }
+        let retired_approval = match approval.retire() {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return Ok(finalize_mutation_result(
+                    CallToolResult::structured_error(json!({
+                        "ok": false,
+                        "operation": "workers_upload_version",
+                        "status": "approval_retirement_failed",
+                        "error": {
+                            "code": error.code,
+                            "message": error.message,
+                            "hint": error.hint,
+                            "retryable": false,
+                            "outcome_ambiguous": false,
+                        },
+                        "approval": consumed_approval,
+                        "dispatch_attempt_authority": dispatch_attempt.evidence("prepared"),
+                        "provider_calls": null,
+                        "provider_reads_performed": true,
+                        "provider_mutation_performed": false,
+                        "local_mutation_performed": true,
+                        "deployment_created": false,
+                        "retry_decision": "do_not_retry; preserve both approval and dispatch-attempt custody",
+                    })),
+                    &plan,
+                    audit,
+                    false,
+                ));
+            }
+        };
+        if let Err(error) = approval.validate_for_provider_dispatch() {
+            return Ok(finalize_mutation_result(
+                CallToolResult::structured_error(json!({
+                    "ok": false,
+                    "operation": "workers_upload_version",
+                    "status": "approval_custody_unreachable_before_dispatch",
+                    "error": {
+                        "code": error.code,
+                        "message": error.message,
+                        "hint": error.hint,
+                        "retryable": false,
+                        "outcome_ambiguous": false,
+                    },
+                    "approval": retired_approval,
+                    "dispatch_attempt_authority": dispatch_attempt.evidence("prepared"),
+                    "provider_calls": null,
+                    "provider_reads_performed": true,
+                    "provider_mutation_performed": false,
+                    "local_mutation_performed": true,
+                    "deployment_created": false,
+                    "retry_decision": "do_not_retry; preserve detached custody for reconciliation",
+                })),
+                &plan,
+                audit,
+                false,
+            ));
+        }
+        let dispatched_attempt = match dispatch_attempt.consume_for_dispatch() {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return Ok(finalize_mutation_result(
+                    worker_version_with_approval(
+                        worker_version_attempt_error_result(error),
+                        &retired_approval,
+                    ),
+                    &plan,
+                    audit,
+                    false,
+                ));
+            }
+        };
+        let upload = match self
+            .cloudflare
+            .upload_worker_version_once(
+                account_id,
+                script_name,
+                &artifact.content_type,
+                artifact.body,
+            )
+            .await
+        {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                let provider_request_lifecycle = error.provider_request_lifecycle;
+                let response_artifact_sha256 = error.response_artifact_sha256.clone();
+                let terminal_attempt = match dispatch_attempt.mark_terminal(
+                    "provider_outcome_ambiguous_or_rejected",
+                    response_artifact_sha256.as_deref(),
+                ) {
+                    Ok(evidence) => evidence,
+                    Err(custody_error) => {
+                        return Ok(finalize_mutation_result(
+                            worker_version_with_approval(
+                                worker_version_attempt_terminal_error_result(
+                                    custody_error,
+                                    &dispatched_attempt,
+                                    provider_request_lifecycle.provider_response_received,
+                                ),
+                                &retired_approval,
+                            ),
+                            &plan,
+                            audit,
+                            false,
+                        ));
+                    }
+                };
+                return Ok(finalize_mutation_result(
+                    CallToolResult::structured_error(json!({
+                        "ok": false,
+                        "operation": "workers_upload_version",
+                        "error": worker_version_operation_error_public_value(&error),
+                        "approval": retired_approval,
+                        "local_mutation_performed": true,
+                        "dispatch_attempt_authority": terminal_attempt,
+                        "provider_request_lifecycle": provider_request_lifecycle,
+                        "deployment_created": false,
+                        "retry_decision": "do_not_retry; use workers_reconcile_version_upload against the pinned pre-upload snapshot",
+                    })),
+                    &plan,
+                    audit,
+                    false,
+                ));
+            }
+        };
+        let terminal_attempt = match dispatch_attempt.mark_terminal(
+            "provider_response_received",
+            Some(&upload.provider_proof.response_artifact_sha256),
+        ) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return Ok(finalize_mutation_result(
+                    worker_version_with_approval(
+                        worker_version_attempt_terminal_error_result(
+                            error,
+                            &dispatched_attempt,
+                            true,
+                        ),
+                        &retired_approval,
+                    ),
+                    &plan,
+                    audit,
+                    false,
+                ));
+            }
+        };
+        let post_state = match self
+            .cloudflare
+            .capture_worker_version_state(
+                account_id,
+                script_name,
+                args.per_page,
+                Some(&upload.candidate_version_id),
+                Some(&upload.candidate_version_id),
+            )
+            .await
+        {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return Ok(finalize_mutation_result(
+                    CallToolResult::structured_error(json!({
+                        "ok": false,
+                        "operation": "workers_upload_version",
+                        "error": {
+                            "code": "workers.version_upload_post_readback_failed",
+                            "message": "Worker version upload returned a candidate but exact post-upload proof failed",
+                            "hint": "Do not upload again. Reconcile the returned candidate and unchanged deployment state.",
+                            "cause": worker_version_operation_error_public_value(&error),
+                        },
+                        "candidate_version_id": upload.candidate_version_id,
+                        "approval": retired_approval,
+                        "local_mutation_performed": true,
+                        "dispatch_attempt_authority": terminal_attempt,
+                        "provider_request_lifecycle": {
+                            "request_prepared": true,
+                            "dispatch_attempted": true,
+                            "provider_response_received": true,
+                        },
+                        "deployment_created": false,
+                        "retry_decision": "do_not_retry",
+                    })),
+                    &plan,
+                    audit,
+                    false,
+                ));
+            }
+        };
+        let pre_ids = pre_state
+            .versions
+            .version_ids
+            .iter()
+            .collect::<BTreeSet<_>>();
+        let post_ids = post_state
+            .versions
+            .version_ids
+            .iter()
+            .collect::<BTreeSet<_>>();
+        let added = post_ids.difference(&pre_ids).copied().collect::<Vec<_>>();
+        // DevSkim: ignore DS197836 -- these SHA-256 values are exact evidence digests, not secrets or KDF inputs.
+        let post_detail_matches = post_state.detail.as_ref().is_some_and(|detail| {
+            detail.version_id == upload.candidate_version_id
+                && detail.script_etag == upload.script_etag
+                && detail.compatibility_date == upload.compatibility_date
+                && detail.compatibility_flags == upload.compatibility_flags
+                && detail.script_projection_sha256 == upload.script_projection_sha256
+                && detail.runtime_projection_sha256 == upload.runtime_projection_sha256
+                && detail.version_metadata_projection_sha256
+                    == upload.version_metadata_projection_sha256
+                && detail.binding_projection_sha256 == upload.binding_projection_sha256
+        });
+        let binding_verification = post_state
+            .detail
+            .as_ref()
+            .map(|detail| verify_worker_candidate_bindings(&binding_expectation, detail));
+        let runtime_verification = post_state.detail.as_ref().map(|detail| {
+            verify_worker_candidate_runtime(
+                &expected_compatibility_date,
+                &expected_compatibility_flags,
+                detail,
+            )
+        });
+        let bindings_match = binding_verification
+            .as_ref()
+            .is_some_and(|verification| verification.matched);
+        let runtime_matches = runtime_verification
+            .as_ref()
+            .is_some_and(|verification| verification.matched);
+        let exact_candidate = added.len() == 1
+            && added[0].as_str() == upload.candidate_version_id
+            && pre_ids.is_subset(&post_ids)
+            && post_ids.len() == pre_ids.len() + 1;
+        let deployments_unchanged = pre_state.deployments.semantic_snapshot_sha256
+            == post_state.deployments.semantic_snapshot_sha256
+            && post_state.deployments.candidate_absent == Some(true);
+        if !exact_candidate
+            || !post_detail_matches
+            || !bindings_match
+            || !runtime_matches
+            || !deployments_unchanged
+        {
+            return Ok(finalize_mutation_result(
+                CallToolResult::structured_error(json!({
+                    "ok": false,
+                    "operation": "workers_upload_version",
+                    "error": {
+                        "code": "workers.version_upload_post_state_conflict",
+                        "message": "post-upload version or deployment evidence did not prove one disabled exact candidate",
+                        "hint": "Do not upload again or deploy. Reconcile the exact provider state and evidence pins.",
+                    },
+                    "candidate_version_id": upload.candidate_version_id,
+                    "approval": retired_approval,
+                    "local_mutation_performed": true,
+                    "dispatch_attempt_authority": terminal_attempt,
+                    "binding_verification_matched": bindings_match,
+                    "runtime_verification_matched": runtime_matches,
+                    "provider_request_lifecycle": {
+                        "request_prepared": true,
+                        "dispatch_attempted": true,
+                        "provider_response_received": true,
+                    },
+                    "deployment_created": false,
+                    "retry_decision": "do_not_retry",
+                })),
+                &plan,
+                audit,
+                false,
+            ));
+        }
+        Ok(finalize_mutation_result(
+            CallToolResult::structured(json!({
+                "ok": true,
+                "status": "candidate_created_private_exact_candidate",
+                "request_evidence": {
+                    "status": "private_exact_candidate_consumed",
+                    "public_digest_disclosed": false,
+                    "public_size_disclosed": false,
+                    "reason": "Exact candidate bytes and metadata remain in private one-use approval custody."
+                },
+                "source_proof": {
+                    "status": "source_provider_unverified",
+                    "reason": "Provider version detail does not prove source bytes; private custody proves only the submitted candidate."
+                },
+                "provider_proof_scope": {
+                    "candidate_id": true,
+                    "script_etag": true,
+                    "runtime_projection": true,
+                    "binding_projection": true,
+                    "exports_reconciliation": false,
+                    "script_settings_unchanged": false,
+                    "deployment_state_unchanged": true,
+                    "candidate_absent_from_deployments": true,
+                    "source_bytes": false
+                },
+                "operation": "workers_upload_version",
+                "candidate_version_id": upload.candidate_version_id,
+                "candidate_verified": true,
+                "approval": retired_approval,
+                "local_mutation_performed": true,
+                "dispatch_attempt_authority": terminal_attempt,
+                "binding_verification_matched": true,
+                "runtime_verification_matched": true,
+                "bindings_inherit": "strict",
+                "provider_request_lifecycle": {
+                    "request_prepared": true,
+                    "dispatch_attempted": true,
+                    "provider_response_received": true,
+                },
+                "deployment_created": false,
+                "retry_decision": "terminal_success; never replay this pre-upload snapshot",
+            })),
+            &plan,
+            audit,
+            false,
+        ))
+    }
+
+    #[tool(
+        name = "workers_reconcile_version_upload",
+        description = "Reconcile an ambiguous Worker version upload by enumerating only new versions against a pinned pre-upload snapshot; never uploads or creates a deployment."
+    )]
+    async fn cloudflare_workers_reconcile_version_upload(
+        &self,
+        Parameters(args): Parameters<WorkersReconcileVersionUploadArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        if !is_lower_hex_sha256(&args.base_version_etag)
+            || !is_lower_hex_sha256(&args.pre_upload_version_ids_sha256)
+            || !is_lower_hex_sha256(&args.pre_upload_deployment_snapshot_sha256)
+        {
+            return Ok(worker_version_simple_error_result(
+                "workers_reconcile_version_upload",
+                "workers.version_reconciliation_digest_invalid",
+                "reconciliation evidence pins must be 64-character lowercase hexadecimal values",
+                "Use the exact dry-run and pre-upload evidence values.",
+            ));
+        }
+        let observed_version_ids_sha256 =
+            match validate_worker_version_ids(&args.pre_upload_version_ids) {
+                Ok(digest) => digest,
+                Err(error) => {
+                    return Ok(worker_version_operation_error_result(
+                        "workers_reconcile_version_upload",
+                        error,
+                    ));
+                }
+            };
+        if observed_version_ids_sha256 != args.pre_upload_version_ids_sha256 {
+            return Ok(worker_version_simple_error_result(
+                "workers_reconcile_version_upload",
+                "workers.version_reconciliation_snapshot_hash_mismatch",
+                "pre-upload version IDs did not match their pinned digest",
+                "Use the exact pre-upload version_ids array and version_ids_sha256 from the evidence capture.",
+            ));
+        }
+        let (pre_deployments, observed_deployment_sha256) =
+            match validate_worker_deployment_projection(
+                &args.script_name,
+                &args.pre_upload_deployments,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    return Ok(worker_version_operation_error_result(
+                        "workers_reconcile_version_upload",
+                        error,
+                    ));
+                }
+            };
+        if observed_deployment_sha256 != args.pre_upload_deployment_snapshot_sha256 {
+            return Ok(worker_version_simple_error_result(
+                "workers_reconcile_version_upload",
+                "workers.version_reconciliation_deployment_hash_mismatch",
+                "pre-upload deployments did not match their pinned digest",
+                "Use the exact pre-upload deployment projection and snapshot SHA-256.",
+            ));
+        }
+        if !args
+            .pre_upload_version_ids
+            .iter()
+            .any(|version_id| version_id == &args.base_version_id)
+        {
+            return Ok(worker_version_simple_error_result(
+                "workers_reconcile_version_upload",
+                "workers.version_reconciliation_base_missing",
+                "exact base version was absent from the supplied pre-upload snapshot",
+                "Use the exact reviewed pre-upload snapshot.",
+            ));
+        }
+        let current = match self
+            .cloudflare
+            .capture_worker_version_state(
+                account_id,
+                &args.script_name,
+                args.per_page,
+                Some(&args.base_version_id),
+                None,
+            )
+            .await
+        {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return Ok(worker_version_operation_error_result(
+                    "workers_reconcile_version_upload",
+                    error,
+                ));
+            }
+        };
+        if current
+            .detail
+            .as_ref()
+            .is_none_or(|detail| detail.script_etag != args.base_version_etag)
+            || current.deployments.deployments != pre_deployments
+        {
+            return Ok(worker_version_simple_error_result(
+                "workers_reconcile_version_upload",
+                "workers.version_reconciliation_authority_drift",
+                "base version or deployment state drifted from the pinned pre-upload authority",
+                "Stop and reconcile the target before attributing a new version to the ambiguous request.",
+            ));
+        }
+        let pre_ids = args.pre_upload_version_ids.iter().collect::<BTreeSet<_>>();
+        let current_ids = current.versions.version_ids.iter().collect::<BTreeSet<_>>();
+        let added = current_ids
+            .difference(&pre_ids)
+            .copied()
+            .collect::<Vec<_>>();
+        if !pre_ids.is_subset(&current_ids)
+            || current_ids.len() != pre_ids.len() + 1
+            || added.len() != 1
+        {
+            return Ok(CallToolResult::structured_error(json!({
+                "ok": false,
+                "operation": "workers_reconcile_version_upload",
+                "error": {
+                    "code": "workers.version_reconciliation_candidate_ambiguous",
+                    "message": "stable provider inventory did not contain exactly one new version over the pinned pre-upload set",
+                    "hint": "Do not retry the upload; preserve the ambiguous evidence for operator reconciliation.",
+                },
+                "current_state": current,
+                "mutation_performed": false,
+                "deployment_created": false,
+                "retry_decision": "do_not_retry",
+            })));
+        }
+        let candidate_id = added[0].to_string();
+        let candidate = match self
+            .cloudflare
+            .capture_worker_version_state(
+                account_id,
+                &args.script_name,
+                args.per_page,
+                Some(&candidate_id),
+                Some(&candidate_id),
+            )
+            .await
+        {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return Ok(worker_version_operation_error_result(
+                    "workers_reconcile_version_upload",
+                    error,
+                ));
+            }
+        };
+        if candidate.versions.version_ids != current.versions.version_ids
+            || candidate.deployments.deployments != pre_deployments
+        {
+            return Ok(worker_version_simple_error_result(
+                "workers_reconcile_version_upload",
+                "workers.version_reconciliation_state_drift",
+                "version or deployment state changed during exact candidate reconciliation",
+                "Do not retry the upload; repeat only the read-only reconciliation after state stabilizes.",
+            ));
+        }
+        Ok(CallToolResult::structured_error(json!({
+            "ok": false,
+            "status": "reconciliation_required",
+            "operation": "workers_reconcile_version_upload",
+            "account_id": account_id,
+            "script_name": args.script_name,
+            "base_version_id": args.base_version_id,
+            "candidate_version_id": candidate_id,
+            "candidate_detail": candidate.detail,
+            "current_state": candidate,
+            "attribution_state": "unattributed",
+            "candidate_relationship": "sole_new_version_since_pinned_snapshot",
+            "unproven": [
+                "candidate was created by the original POST",
+                "candidate bytes and complete binding plan match the reviewed upload contract"
+            ],
+            "mutation_performed": false,
+            "deployment_created": false,
+            "retry_decision": "do_not_retry",
+            "operator_guidance": "Provider inventory proves only one new disabled candidate. It does not independently attribute that candidate to the lost request; preserve the evidence and resolve candidate provenance out of band.",
+        })))
+    }
+
+    #[tool(
         name = "workers_list_tails",
         description = "List Worker tail consumers for a script."
     )]
@@ -11830,6 +13047,190 @@ fn worker_upload_error_result(err: WorkerUploadError) -> CallToolResult {
         "ok": false,
         "error": err.payload(),
     }))
+}
+
+fn worker_version_upload_artifact_error_result(err: WorkerUploadError) -> CallToolResult {
+    if err.code == "workers.upload_too_large" {
+        return CallToolResult::structured_error(json!({
+            "ok": false,
+            "operation": "workers_upload_version",
+            "error": {
+                "code": err.code,
+                "message": "Worker version candidate exceeds the private upload bound",
+                "hint": "Reduce the private candidate beneath the documented Worker upload limit without disclosing its exact size.",
+            },
+            "local_mutation_performed": false,
+            "provider_calls": 0,
+            "deployment_created": false,
+        }));
+    }
+    let mut result = worker_upload_error_result(err);
+    if let Some(payload) = result
+        .structured_content
+        .as_mut()
+        .and_then(Value::as_object_mut)
+    {
+        payload.insert("operation".to_string(), json!("workers_upload_version"));
+        payload.insert("local_mutation_performed".to_string(), json!(false));
+        payload.insert("provider_calls".to_string(), json!(0));
+        payload.insert("deployment_created".to_string(), json!(false));
+    }
+    result
+}
+
+fn worker_version_operation_error_result(
+    operation: &'static str,
+    error: WorkerVersionOperationError,
+) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": operation,
+        "error": error,
+        "deployment_created": false,
+    }))
+}
+
+fn worker_version_operation_error_public_value(error: &WorkerVersionOperationError) -> Value {
+    json!({
+        "code": error.code,
+        "message": error.message,
+        "hint": error.hint,
+        "retryable": error.retryable,
+        "outcome_ambiguous": error.outcome_ambiguous,
+        "provider_request_lifecycle": error.provider_request_lifecycle,
+        "http_status": error.http_status,
+    })
+}
+
+fn worker_version_upload_operation_error_result(
+    error: WorkerVersionOperationError,
+) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": "workers_upload_version",
+        "error": worker_version_operation_error_public_value(&error),
+        "deployment_created": false,
+    }))
+}
+
+fn worker_version_approval_error_result(error: WorkerVersionApprovalError) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": "workers_upload_version",
+        "status": "approval_not_authorized",
+        "error": {
+            "code": error.code,
+            "message": error.message,
+            "hint": error.hint,
+            "retryable": false,
+            "outcome_ambiguous": error.state == Some("locked"),
+        },
+        "approval_state": error.state,
+        "custody_capacity": error.custody_capacity,
+        "local_mutation_performed": error.local_mutation_performed,
+        "provider_calls": 0,
+        "deployment_created": false,
+    }))
+}
+
+fn worker_version_with_approval(
+    mut result: CallToolResult,
+    approval: &crate::worker_version_approval::WorkerVersionApprovalEvidence,
+) -> CallToolResult {
+    if let Some(payload) = result
+        .structured_content
+        .as_mut()
+        .and_then(Value::as_object_mut)
+    {
+        payload.insert("approval".to_string(), json!(approval));
+        payload.insert("local_mutation_performed".to_string(), json!(true));
+    }
+    result
+}
+
+fn worker_version_attempt_error_result(error: WorkerVersionAttemptError) -> CallToolResult {
+    let state = error.evidence.as_ref().map(|evidence| evidence.state);
+    let request_prepared = state.is_some();
+    let dispatch_attempted = matches!(state, Some("dispatched" | "terminal"));
+    let outcome_ambiguous = dispatch_attempted
+        || error.code == "workers.version_upload_attempt_guard_locked"
+        || error.code == "workers.version_upload_attempt_custody_malformed";
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": "workers_upload_version",
+        "status": "reconciliation_required",
+        "error": {
+            "code": error.code,
+            "message": error.message,
+            "hint": error.hint,
+            "retryable": false,
+            "outcome_ambiguous": outcome_ambiguous,
+        },
+        "dispatch_attempt_authority": error.evidence,
+        "provider_request_lifecycle": {
+            "request_prepared": request_prepared,
+            "dispatch_attempted": dispatch_attempted,
+            "provider_response_received": false,
+        },
+        "deployment_created": false,
+        "retry_decision": "do_not_retry; preserve custody and reconcile the pinned provider state",
+    }))
+}
+
+fn worker_version_attempt_terminal_error_result(
+    error: WorkerVersionAttemptError,
+    dispatched_attempt: &crate::worker_version_attempt::WorkerVersionAttemptEvidence,
+    provider_response_received: bool,
+) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": "workers_upload_version",
+        "status": "reconciliation_required",
+        "error": {
+            "code": error.code,
+            "message": error.message,
+            "hint": error.hint,
+            "retryable": false,
+            "outcome_ambiguous": true,
+        },
+        "dispatch_attempt_authority": dispatched_attempt,
+        "provider_request_lifecycle": {
+            "request_prepared": true,
+            "dispatch_attempted": true,
+            "provider_response_received": provider_response_received,
+        },
+        "deployment_created": false,
+        "retry_decision": "do_not_retry; dispatched custody is durable even though terminal custody failed",
+    }))
+}
+
+fn worker_version_simple_error_result(
+    operation: &'static str,
+    code: &'static str,
+    message: impl Into<String>,
+    hint: &'static str,
+) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": operation,
+        "error": {
+            "code": code,
+            "message": message.into(),
+            "hint": hint,
+            "retryable": false,
+            "outcome_ambiguous": false,
+        },
+        "local_mutation_performed": false,
+        "provider_calls": 0,
+        "deployment_created": false,
+    }))
+}
+
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn publish_gate_denied_result(

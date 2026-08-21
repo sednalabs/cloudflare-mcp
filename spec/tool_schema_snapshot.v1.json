@@ -5056,6 +5056,49 @@
       "name": "waf_security_events_summary"
     },
     {
+      "description": "Capture stable bounded Worker version pagination, optional exact sanitized version detail, and two-pass deployment evidence without mutation.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "candidate_must_be_absent": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "per_page": {
+            "default": 100,
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "script_name": {
+            "type": "string"
+          },
+          "version_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "script_name"
+        ],
+        "type": "object"
+      },
+      "name": "workers_capture_version_evidence"
+    },
+    {
       "description": "Get Cloudflare Worker script settings.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -5427,6 +5470,60 @@
       "name": "workers_observability_query_events"
     },
     {
+      "description": "Reconcile an ambiguous Worker version upload by enumerating only new versions against a pinned pre-upload snapshot; never uploads or creates a deployment.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "base_version_etag": {
+            "type": "string"
+          },
+          "base_version_id": {
+            "type": "string"
+          },
+          "per_page": {
+            "default": 100,
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pre_upload_deployment_snapshot_sha256": {
+            "type": "string"
+          },
+          "pre_upload_deployments": true,
+          "pre_upload_version_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "pre_upload_version_ids_sha256": {
+            "type": "string"
+          },
+          "script_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "script_name",
+          "base_version_id",
+          "base_version_etag",
+          "pre_upload_version_ids",
+          "pre_upload_version_ids_sha256",
+          "pre_upload_deployments",
+          "pre_upload_deployment_snapshot_sha256"
+        ],
+        "type": "object"
+      },
+      "name": "workers_reconcile_version_upload"
+    },
+    {
       "description": "Upload a Cloudflare Worker module script or prebuilt multipart bundle with dry-run planning, confirmation-token apply, and settings readback.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -5515,6 +5612,686 @@
         "type": "object"
       },
       "name": "workers_upload_script"
+    },
+    {
+      "description": "Preview, privately prepare under a random opaque approval handle, or apply once to upload one disabled Worker version with exact-candidate custody, pinned pre-state, non-retrying provider submission, exact candidate readback, and unchanged-deployment proof.",
+      "inputSchema": {
+        "$defs": {
+          "WorkerVersionBindingsInherit": {
+            "enum": [
+              "strict"
+            ],
+            "type": "string"
+          },
+          "WorkerVersionR2Jurisdiction": {
+            "enum": [
+              "eu",
+              "fedramp",
+              "fedramp-high"
+            ],
+            "type": "string"
+          },
+          "WorkerVersionUploadBinding": {
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "old_name": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "inherit",
+                    "type": "string"
+                  },
+                  "version_id": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "name",
+                  "version_id"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "anyOf": [
+                  {
+                    "required": [
+                      "database_id"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "id"
+                    ]
+                  }
+                ],
+                "properties": {
+                  "database_id": {
+                    "type": "string"
+                  },
+                  "id": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "d1",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "name"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "instance_name": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "namespace": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "ai_search",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "name",
+                  "instance_name"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "namespace": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "ai_search_namespace",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "name",
+                  "namespace"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "text": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "plain_text",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "name",
+                  "text"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "text": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "secret_text",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "name",
+                  "text"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "json": true,
+                  "name": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "json",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "name",
+                  "json"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "entrypoint": {
+                    "type": "string"
+                  },
+                  "environment": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "service": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "service",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "name",
+                  "service"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "bucket_name": {
+                    "type": "string"
+                  },
+                  "jurisdiction": {
+                    "$ref": "#/$defs/WorkerVersionR2Jurisdiction"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "r2_bucket",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "name",
+                  "bucket_name"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "queue_name": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "queue",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "name",
+                  "queue_name"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "dataset": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "analytics_engine",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "name",
+                  "dataset"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "namespace_id": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "kv_namespace",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "name",
+                  "namespace_id"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "index_name": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "vectorize",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "name",
+                  "index_name"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "id": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "hyperdrive",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "name",
+                  "id"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "pipeline": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "pipelines",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "name",
+                  "pipeline"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "certificate_id": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "mtls_certificate",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "name",
+                  "certificate_id"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "namespace": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "messaging",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "name",
+                  "namespace"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "secret_name": {
+                    "type": "string"
+                  },
+                  "store_id": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "secrets_store_secret",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "name",
+                  "secret_name",
+                  "store_id"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "ai",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "name"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "assets",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "name"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "browser",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "name"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "images",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "name"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "media",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "name"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "const": "version_metadata",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "type",
+                  "name"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "WorkerVersionUploadMetadata": {
+            "additionalProperties": false,
+            "properties": {
+              "bindings": {
+                "items": {
+                  "$ref": "#/$defs/WorkerVersionUploadBinding"
+                },
+                "type": "array"
+              },
+              "compatibility_date": {
+                "type": "string"
+              },
+              "compatibility_flags": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "main_module": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "main_module",
+              "compatibility_date",
+              "compatibility_flags",
+              "bindings"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "approval_handle": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "base_version_etag": {
+            "type": "string"
+          },
+          "base_version_id": {
+            "type": "string"
+          },
+          "bindings_inherit": {
+            "$ref": "#/$defs/WorkerVersionBindingsInherit"
+          },
+          "content_type": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "main_module": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {
+            "$ref": "#/$defs/WorkerVersionUploadMetadata"
+          },
+          "multipart_path": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "per_page": {
+            "default": 100,
+            "format": "uint32",
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "pre_upload_deployment_snapshot_sha256": {
+            "type": "string"
+          },
+          "pre_upload_version_snapshot_sha256": {
+            "type": "string"
+          },
+          "prepare": {
+            "default": false,
+            "type": "boolean"
+          },
+          "reason": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "script_content": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "script_content_base64": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "script_name": {
+            "type": "string"
+          },
+          "script_path": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "script_name",
+          "base_version_id",
+          "base_version_etag",
+          "pre_upload_version_snapshot_sha256",
+          "pre_upload_deployment_snapshot_sha256",
+          "bindings_inherit",
+          "metadata"
+        ],
+        "type": "object"
+      },
+      "name": "workers_upload_version"
     }
   ],
   "version": 1
