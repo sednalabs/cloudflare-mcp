@@ -37,7 +37,7 @@ use crate::cloudflare::model::WorkerScript;
 use crate::cloudflare::worker_versions::{
     WorkerVersionOperationError, prepare_worker_binding_expectation,
     validate_worker_deployment_projection, validate_worker_version_ids,
-    verify_worker_candidate_bindings,
+    verify_worker_candidate_bindings, verify_worker_candidate_runtime,
 };
 use crate::cloudflare::{
     AccessAppUpsertRequest, AccessPolicyWrite, BulkRedirectItemWrite, CacheRule, CacheRuleset,
@@ -8240,6 +8240,24 @@ impl CloudflareMcp {
             Err(error) => return Ok(worker_upload_error_result(error)),
         };
         let canonical_binding_metadata = artifact.canonical_metadata.clone();
+        let expected_compatibility_date = artifact
+            .canonical_metadata
+            .get("compatibility_date")
+            .and_then(Value::as_str)
+            .expect("closed upload metadata has compatibility_date")
+            .to_string();
+        let expected_compatibility_flags = artifact
+            .canonical_metadata
+            .get("compatibility_flags")
+            .and_then(Value::as_array)
+            .expect("closed upload metadata has compatibility_flags")
+            .iter()
+            .map(|flag| {
+                flag.as_str()
+                    .expect("closed upload metadata has string flags")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
         let upload_summary = json!(&artifact.summary);
         let upload_contract_sha256 = artifact.summary.upload_contract_sha256.clone();
         let operation = find_operation("worker-versions-upload-version").ok_or_else(|| {
@@ -8489,13 +8507,29 @@ impl CloudflareMcp {
         let post_detail_matches = post_state.detail.as_ref().is_some_and(|detail| {
             detail.version_id == upload.candidate_version_id
                 && detail.script_etag == upload.script_etag
+                && detail.compatibility_date == upload.compatibility_date
+                && detail.compatibility_flags == upload.compatibility_flags
+                && detail.script_projection_sha256 == upload.script_projection_sha256
+                && detail.runtime_projection_sha256 == upload.runtime_projection_sha256
+                && detail.version_metadata_projection_sha256
+                    == upload.version_metadata_projection_sha256
                 && detail.binding_projection_sha256 == upload.binding_projection_sha256
         });
         let binding_verification = post_state
             .detail
             .as_ref()
             .map(|detail| verify_worker_candidate_bindings(&binding_expectation, detail));
+        let runtime_verification = post_state.detail.as_ref().map(|detail| {
+            verify_worker_candidate_runtime(
+                &expected_compatibility_date,
+                &expected_compatibility_flags,
+                detail,
+            )
+        });
         let bindings_match = binding_verification
+            .as_ref()
+            .is_some_and(|verification| verification.matched);
+        let runtime_matches = runtime_verification
             .as_ref()
             .is_some_and(|verification| verification.matched);
         let exact_candidate = added.len() == 1
@@ -8503,8 +8537,14 @@ impl CloudflareMcp {
             && pre_ids.is_subset(&post_ids)
             && post_ids.len() == pre_ids.len() + 1;
         let deployments_unchanged = pre_state.deployments.semantic_snapshot_sha256
-            == post_state.deployments.semantic_snapshot_sha256;
-        if !exact_candidate || !post_detail_matches || !bindings_match || !deployments_unchanged {
+            == post_state.deployments.semantic_snapshot_sha256
+            && post_state.deployments.candidate_absent == Some(true);
+        if !exact_candidate
+            || !post_detail_matches
+            || !bindings_match
+            || !runtime_matches
+            || !deployments_unchanged
+        {
             return Ok(finalize_mutation_result(
                 CallToolResult::structured_error(json!({
                     "ok": false,
@@ -8518,6 +8558,7 @@ impl CloudflareMcp {
                     "pre_upload_state": pre_state,
                     "post_upload_state": post_state,
                     "binding_verification": binding_verification,
+                    "runtime_verification": runtime_verification,
                     "provider_request_lifecycle": {
                         "request_prepared": true,
                         "dispatch_attempted": true,
@@ -8534,7 +8575,28 @@ impl CloudflareMcp {
         Ok(finalize_mutation_result(
             CallToolResult::structured(json!({
                 "ok": true,
-                "status": "applied_proven",
+                "status": "candidate_created_custodied",
+                "source_proof": {
+                    "status": "source_provider_unverified",
+                    "submitted_body_sha256": artifact.summary.body_sha256,
+                    "submitted_body_size_bytes": artifact.summary.size_bytes,
+                    "submitted_metadata_sha256": artifact.summary.metadata_sha256,
+                    "upload_contract_sha256": artifact.summary.upload_contract_sha256,
+                    "provider_exports_reconciliation_sha256": upload.exports_reconciliation_sha256.clone(),
+                    "provider_startup_time_ms": upload.startup_time_ms,
+                    "reason": "Cloudflare Version Detail exposes an ETag and runtime/resource projections, not the submitted module graph or source bytes. The exact request remains locally custodied; source-byte identity is not claimed as provider-proven."
+                },
+                "provider_proof_scope": {
+                    "candidate_id": true,
+                    "script_etag": true,
+                    "runtime_projection": true,
+                    "binding_projection": true,
+                    "exports_reconciliation": false,
+                    "script_settings_unchanged": false,
+                    "deployment_state_unchanged": true,
+                    "candidate_absent_from_deployments": true,
+                    "source_bytes": false
+                },
                 "operation": "workers_upload_version",
                 "account_id": account_id,
                 "script_name": script_name,
@@ -8543,6 +8605,7 @@ impl CloudflareMcp {
                 "pre_upload_state": pre_state,
                 "post_upload_state": post_state,
                 "binding_verification": binding_verification,
+                "runtime_verification": runtime_verification,
                 "bindings_inherit": "strict",
                 "provider_request_lifecycle": {
                     "request_prepared": true,

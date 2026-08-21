@@ -9,6 +9,12 @@ use crate::worker_upload::{
 };
 
 const MAX_BINDINGS: usize = 256;
+const ALLOWED_VERSION_METADATA_FIELDS: [&str; 4] = [
+    "bindings",
+    "compatibility_date",
+    "compatibility_flags",
+    "main_module",
+];
 
 #[derive(Debug, Clone)]
 pub(crate) struct WorkerVersionUploadArtifact {
@@ -179,17 +185,92 @@ fn canonicalize_version_metadata(
     metadata: &Map<String, Value>,
     base_version_id: &str,
 ) -> Result<(Value, usize, usize), WorkerUploadError> {
-    let mut canonical_metadata = metadata.clone();
-    let Some(bindings) = metadata.get("bindings") else {
-        return Ok((Value::Object(canonical_metadata), 0, 0));
-    };
-    let bindings = bindings.as_array().ok_or_else(|| {
-        version_upload_error(
-            "workers.version_upload_bindings_invalid",
-            "metadata.bindings must be an array when present",
-            "Provide the complete reviewed binding array for the version upload.",
-        )
-    })?;
+    if metadata
+        .keys()
+        .any(|key| !ALLOWED_VERSION_METADATA_FIELDS.contains(&key.as_str()))
+    {
+        return Err(version_upload_error(
+            "workers.version_upload_metadata_unknown_field",
+            "metadata contained a field outside the closed guarded version-upload contract",
+            "Provide only main_module, compatibility_date, compatibility_flags, and the complete bindings array.",
+        ));
+    }
+    let main_module = metadata
+        .get("main_module")
+        .and_then(Value::as_str)
+        .and_then(canonical_nonempty)
+        .ok_or_else(|| {
+            version_upload_error(
+                "workers.version_upload_main_module_missing",
+                "metadata.main_module must be a canonical non-empty string",
+                "Provide the exact main module name used by the reviewed artifact.",
+            )
+        })?;
+    let compatibility_date = metadata
+        .get("compatibility_date")
+        .and_then(Value::as_str)
+        .filter(|value| canonical_compatibility_date(value))
+        .ok_or_else(|| {
+            version_upload_error(
+                "workers.version_upload_compatibility_date_invalid",
+                "metadata.compatibility_date must be a valid YYYY-MM-DD date",
+                "Provide the exact reviewed Worker compatibility date.",
+            )
+        })?;
+    let flags = metadata
+        .get("compatibility_flags")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            version_upload_error(
+                "workers.version_upload_compatibility_flags_invalid",
+                "metadata.compatibility_flags must be a complete array",
+                "Provide the complete reviewed compatibility flag set, using an empty array when none apply.",
+            )
+        })?;
+    let mut flag_set = BTreeSet::new();
+    for flag in flags {
+        let flag = flag
+            .as_str()
+            .and_then(canonical_compatibility_flag)
+            .ok_or_else(|| {
+                version_upload_error(
+                    "workers.version_upload_compatibility_flags_invalid",
+                    "metadata.compatibility_flags contained a non-canonical flag",
+                    "Use distinct non-empty ASCII compatibility flag names.",
+                )
+            })?;
+        if !flag_set.insert(flag.to_string()) {
+            return Err(version_upload_error(
+                "workers.version_upload_compatibility_flags_duplicate",
+                "metadata.compatibility_flags contained a duplicate flag",
+                "Provide each reviewed compatibility flag exactly once.",
+            ));
+        }
+    }
+    let bindings = metadata
+        .get("bindings")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            version_upload_error(
+                "workers.version_upload_bindings_missing",
+                "metadata.bindings must be a complete array",
+                "Provide the complete reviewed binding plan, using an empty array only when the candidate truly has no bindings.",
+            )
+        })?;
+    let mut canonical_metadata = Map::new();
+    canonical_metadata.insert("bindings".to_string(), Value::Array(Vec::new()));
+    canonical_metadata.insert(
+        "compatibility_date".to_string(),
+        Value::String(compatibility_date.to_string()),
+    );
+    canonical_metadata.insert(
+        "compatibility_flags".to_string(),
+        Value::Array(flag_set.into_iter().map(Value::String).collect()),
+    );
+    canonical_metadata.insert(
+        "main_module".to_string(),
+        Value::String(main_module.to_string()),
+    );
     if bindings.len() > MAX_BINDINGS {
         return Err(version_upload_error(
             "workers.version_upload_bindings_over_cap",
@@ -234,6 +315,46 @@ fn canonicalize_version_metadata(
     }
     canonical_metadata.insert("bindings".to_string(), Value::Array(canonical_bindings));
     Ok((Value::Object(canonical_metadata), inherited, explicit))
+}
+
+fn canonical_compatibility_flag(value: &str) -> Option<&str> {
+    (!value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+    .then_some(value)
+}
+
+fn canonical_compatibility_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| index != 4 && index != 7 && !byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let number = |slice: &[u8]| {
+        slice
+            .iter()
+            .fold(0u32, |value, byte| value * 10 + u32::from(byte - b'0'))
+    };
+    let year = number(&bytes[..4]);
+    let month = number(&bytes[5..7]);
+    let day = number(&bytes[8..]);
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    year != 0 && (1..=max_day).contains(&day)
 }
 
 pub(crate) fn canonicalize_provider_binding(
@@ -712,6 +833,7 @@ mod tests {
         let metadata = json!({
             "main_module": "index.js",
             "compatibility_date": "2026-07-10",
+            "compatibility_flags": [],
             "bindings": [
                 {"name":"DB","type":"inherit","version_id":BASE},
                 {"name":"MODE","type":"plain_text","text":"disabled"}
@@ -739,6 +861,8 @@ mod tests {
     fn implicit_latest_inheritance_fails_closed() {
         let metadata = json!({
             "main_module": "index.js",
+            "compatibility_date": "2026-07-10",
+            "compatibility_flags": [],
             "bindings": [{"name":"DB","type":"inherit"}]
         });
         let error = build_worker_version_upload(
@@ -761,6 +885,8 @@ mod tests {
     fn canonical_bindings_remain_exact_and_ai_search_default_is_explicit() {
         let metadata = json!({
             "main_module":"index.js",
+            "compatibility_date": "2026-07-10",
+            "compatibility_flags": [],
             "bindings":[
                 {"name":"DB","type":"d1","database_id":"db-canonical"},
                 {"name":"SEARCH","type":"ai_search","instance_name":"articles"}
@@ -812,10 +938,14 @@ mod tests {
     fn deprecated_d1_id_alias_normalizes_before_request_hashing() {
         let canonical_metadata = json!({
             "main_module":"index.js",
+            "compatibility_date": "2026-07-10",
+            "compatibility_flags": [],
             "bindings":[{"name":"DB","type":"d1","database_id":"db-1"}]
         });
         let deprecated_metadata = json!({
             "main_module":"index.js",
+            "compatibility_date": "2026-07-10",
+            "compatibility_flags": [],
             "bindings":[{"name":"DB","type":"d1","id":"db-1"}]
         });
         let build = |metadata: &Value| {
@@ -851,6 +981,8 @@ mod tests {
 
         let conflicting = json!({
             "main_module":"index.js",
+            "compatibility_date": "2026-07-10",
+            "compatibility_flags": [],
             "bindings":[{
                 "name":"DB",
                 "type":"d1",
@@ -878,6 +1010,8 @@ mod tests {
     fn unknown_binding_fields_fail_before_artifact_construction() {
         let metadata = json!({
             "main_module":"index.js",
+            "compatibility_date": "2026-07-10",
+            "compatibility_flags": [],
             "bindings":[{
                 "name":"DB",
                 "type":"d1",
@@ -926,5 +1060,121 @@ mod tests {
         assert_ne!(expected, drifted);
         assert_eq!(expected["namespace"], json!("default"));
         assert_eq!(drifted["namespace"], json!("tenant-a"));
+    }
+
+    #[test]
+    fn metadata_contract_is_closed_and_requires_complete_runtime_and_bindings() {
+        let build = |metadata: &Value| {
+            build_worker_version_upload(
+                WorkerUploadInput {
+                    script_path: None,
+                    script_content: Some("export default {}"),
+                    script_content_base64: None,
+                    multipart_path: None,
+                    main_module: Some("index.js"),
+                    metadata,
+                    content_type: None,
+                },
+                BASE,
+            )
+        };
+        for forbidden in [
+            "annotations",
+            "assets",
+            "cache_options",
+            "dependencies",
+            "exports_reconciliation",
+            "keep_assets",
+            "limits",
+            "logpush",
+            "migrations",
+            "observability",
+            "placement",
+            "tags",
+            "tails",
+            "usage_model",
+        ] {
+            let mut metadata = json!({
+                "main_module":"index.js",
+                "compatibility_date":"2026-07-10",
+                "compatibility_flags":[],
+                "bindings":[]
+            });
+            metadata[forbidden] = json!(true);
+            let error = build(&metadata).expect_err("unknown metadata must fail");
+            assert_eq!(error.code, "workers.version_upload_metadata_unknown_field");
+        }
+
+        for (missing, code) in [
+            ("bindings", "workers.version_upload_bindings_missing"),
+            (
+                "compatibility_date",
+                "workers.version_upload_compatibility_date_invalid",
+            ),
+            (
+                "compatibility_flags",
+                "workers.version_upload_compatibility_flags_invalid",
+            ),
+        ] {
+            let mut metadata = json!({
+                "main_module":"index.js",
+                "compatibility_date":"2026-07-10",
+                "compatibility_flags":[],
+                "bindings":[]
+            });
+            metadata.as_object_mut().expect("metadata").remove(missing);
+            assert_eq!(build(&metadata).expect_err("required").code, code);
+        }
+    }
+
+    #[test]
+    fn compatibility_flags_are_duplicate_free_and_canonicalized() {
+        let metadata = json!({
+            "main_module":"index.js",
+            "compatibility_date":"2024-02-29",
+            "compatibility_flags":["nodejs_compat","global_fetch_strictly_public"],
+            "bindings":[]
+        });
+        let artifact = build_worker_version_upload(
+            WorkerUploadInput {
+                script_path: None,
+                script_content: Some("export default {}"),
+                script_content_base64: None,
+                multipart_path: None,
+                main_module: Some("index.js"),
+                metadata: &metadata,
+                content_type: None,
+            },
+            BASE,
+        )
+        .expect("canonical flags");
+        assert_eq!(
+            artifact.canonical_metadata["compatibility_flags"],
+            json!(["global_fetch_strictly_public", "nodejs_compat"])
+        );
+
+        let duplicate = json!({
+            "main_module":"index.js",
+            "compatibility_date":"2026-07-10",
+            "compatibility_flags":["nodejs_compat","nodejs_compat"],
+            "bindings":[]
+        });
+        let error = build_worker_version_upload(
+            WorkerUploadInput {
+                script_path: None,
+                script_content: Some("export default {}"),
+                script_content_base64: None,
+                multipart_path: None,
+                main_module: Some("index.js"),
+                metadata: &duplicate,
+                content_type: None,
+            },
+            BASE,
+        )
+        .expect_err("duplicate flag");
+        assert_eq!(
+            error.code,
+            "workers.version_upload_compatibility_flags_duplicate"
+        );
     }
 }

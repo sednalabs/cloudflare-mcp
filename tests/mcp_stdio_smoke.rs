@@ -5077,6 +5077,7 @@ fn spawn_fake_worker_version_api_with_initial_state(
                         "id": base_id,
                         "resources": {
                             "script": {"etag": "a".repeat(64)},
+                            "script_runtime": {"compatibility_date":"2026-07-10","compatibility_flags":[]},
                             "bindings": [
                                 {"name":"SECRET","type":"secret_text","text":"never-surface"},
                                 {"name":"MODE","type":"plain_text","text":"private-fixture-value"}
@@ -5096,6 +5097,7 @@ fn spawn_fake_worker_version_api_with_initial_state(
                         "id": candidate_id,
                         "resources": {
                             "script": {"etag": "b".repeat(64)},
+                            "script_runtime": {"compatibility_date":"2026-07-10","compatibility_flags":[]},
                             "bindings": [
                                 {"name":"SECRET","type":"secret_text","text":"never-surface"},
                                 {"name":"MODE","type":"plain_text","text":"private-fixture-value"}
@@ -5127,6 +5129,7 @@ fn spawn_fake_worker_version_api_with_initial_state(
                         "id": candidate_id,
                         "resources": {
                             "script": {"etag": "b".repeat(64)},
+                            "script_runtime": {"compatibility_date":"2026-07-10","compatibility_flags":[]},
                             "bindings": [
                                 {"name":"SECRET","type":"secret_text","text":"never-surface"},
                                 {"name":"MODE","type":"plain_text","text":"private-fixture-value"}
@@ -17927,6 +17930,7 @@ fn workers_upload_version_dry_run_is_strict_digest_bound_and_provider_free() {
             "metadata":{
                 "main_module":"index.js",
                 "compatibility_date":"2026-07-10",
+                "compatibility_flags":[],
                 "bindings":[
                     {"name":"SECRET","type":"inherit","version_id":"11111111-1111-4111-8111-111111111111"},
                     {"name":"MODE","type":"plain_text","text":"private-fixture-value"}
@@ -18015,7 +18019,7 @@ fn workers_upload_version_rejects_symlink_artifact_before_provider_access() {
             "bindings_inherit":"strict",
             "main_module":"index.js",
             "script_path":link,
-            "metadata":{"main_module":"index.js","bindings":[]},
+            "metadata":{"main_module":"index.js","compatibility_date":"2026-07-10","compatibility_flags":[],"bindings":[]},
             "dry_run":true
         }),
     );
@@ -18074,6 +18078,7 @@ fn workers_upload_version_stdio_applies_once_and_proves_disabled_candidate() {
         "metadata":{
             "main_module":"index.js",
             "compatibility_date":"2026-07-10",
+            "compatibility_flags":[],
             "bindings":[
                 {"name":"SECRET","type":"inherit","version_id":base_id},
                 {"name":"MODE","type":"plain_text","text":"private-fixture-value"}
@@ -18095,7 +18100,18 @@ fn workers_upload_version_stdio_applies_once_and_proves_disabled_candidate() {
     let apply = mcp.call_tool(4, "workers_upload_version", apply_args);
     let apply_content = structured_content(&apply);
     assert_eq!(apply_content["ok"], json!(true), "{apply_content}");
-    assert_eq!(apply_content["status"], json!("applied_proven"));
+    assert_eq!(
+        apply_content["status"],
+        json!("candidate_created_custodied")
+    );
+    assert_eq!(
+        apply_content["source_proof"]["status"],
+        json!("source_provider_unverified")
+    );
+    assert_eq!(
+        apply_content["provider_proof_scope"]["source_bytes"],
+        json!(false)
+    );
     assert_eq!(
         apply_content["upload_result"]["candidate_version_id"],
         json!(candidate_id)

@@ -54,6 +54,15 @@ pub(crate) struct WorkerBindingDescriptor {
 pub(crate) struct WorkerVersionDetailEvidence {
     pub(crate) version_id: String,
     pub(crate) script_etag: String,
+    pub(crate) compatibility_date: String,
+    pub(crate) compatibility_flags: Vec<String>,
+    pub(crate) script_projection_sha256: String,
+    pub(crate) runtime_projection_sha256: String,
+    pub(crate) version_metadata_projection_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) upload_exports_reconciliation_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) upload_startup_time_ms: Option<u64>,
     pub(crate) binding_descriptors: Vec<WorkerBindingDescriptor>,
     pub(crate) binding_descriptors_sha256: String,
     pub(crate) binding_projection_sha256: String,
@@ -83,6 +92,17 @@ pub(crate) struct WorkerBindingExpectation {
     projection: BTreeMap<String, Value>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct WorkerRuntimeVerification {
+    pub(crate) expected_compatibility_date: String,
+    pub(crate) observed_compatibility_date: String,
+    pub(crate) expected_compatibility_flags_sha256: String,
+    pub(crate) observed_compatibility_flags_sha256: String,
+    pub(crate) compatibility_date_matched: bool,
+    pub(crate) compatibility_flags_matched: bool,
+    pub(crate) matched: bool,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct WorkerDeploymentVersion {
     pub(crate) version_id: String,
@@ -92,6 +112,7 @@ pub(crate) struct WorkerDeploymentVersion {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct WorkerDeploymentProjection {
     pub(crate) deployment_id: String,
+    pub(crate) strategy: String,
     pub(crate) versions: Vec<WorkerDeploymentVersion>,
 }
 
@@ -125,6 +146,15 @@ pub(crate) struct WorkerVersionStateEvidence {
 pub(crate) struct WorkerVersionUploadEvidence {
     pub(crate) candidate_version_id: String,
     pub(crate) script_etag: String,
+    pub(crate) compatibility_date: String,
+    pub(crate) compatibility_flags: Vec<String>,
+    pub(crate) script_projection_sha256: String,
+    pub(crate) runtime_projection_sha256: String,
+    pub(crate) version_metadata_projection_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) exports_reconciliation_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) startup_time_ms: Option<u64>,
     pub(crate) binding_projection_sha256: String,
     pub(crate) raw_result_sha256: String,
     pub(crate) request_body_sha256: String,
@@ -366,6 +396,13 @@ impl CloudflareClient {
         Ok(WorkerVersionUploadEvidence {
             candidate_version_id: detail.version_id,
             script_etag: detail.script_etag,
+            compatibility_date: detail.compatibility_date,
+            compatibility_flags: detail.compatibility_flags,
+            script_projection_sha256: detail.script_projection_sha256,
+            runtime_projection_sha256: detail.runtime_projection_sha256,
+            version_metadata_projection_sha256: detail.version_metadata_projection_sha256,
+            exports_reconciliation_sha256: detail.upload_exports_reconciliation_sha256,
+            startup_time_ms: detail.upload_startup_time_ms,
             binding_projection_sha256: detail.binding_projection_sha256,
             raw_result_sha256: detail.raw_result_sha256,
             request_body_sha256,
@@ -801,6 +838,30 @@ fn sanitize_version_detail(
             "Treat the exact version evidence as malformed.",
         )
     })?;
+    let upload_response = expected_version_id.is_none();
+    if object.keys().any(|key| {
+        !matches!(key.as_str(), "id" | "metadata" | "number" | "resources")
+            && !(upload_response
+                && matches!(key.as_str(), "exports_reconciliation" | "startup_time_ms"))
+    }) {
+        return Err(operation_error(
+            "workers.version_detail_unknown_field",
+            "version result contained a field outside the closed documented evidence projection",
+            "Treat the candidate as provider-unverified and do not deploy it.",
+        ));
+    }
+    let upload_exports_reconciliation_sha256 =
+        object.get("exports_reconciliation").map(sha256_json);
+    let upload_startup_time_ms = match object.get("startup_time_ms") {
+        None => None,
+        Some(value) => Some(value.as_u64().ok_or_else(|| {
+            operation_error(
+                "workers.version_upload_startup_time_invalid",
+                "version upload result contained an invalid startup_time_ms",
+                "Treat the upload response as malformed and reconcile without retrying.",
+            )
+        })?),
+    };
     let version_id = object.get("id").and_then(Value::as_str).ok_or_else(|| {
         operation_error(
             "workers.version_detail_id_missing",
@@ -826,10 +887,40 @@ fn sanitize_version_detail(
                 "Treat the exact version evidence as incomplete.",
             )
         })?;
-    let script_etag = resources
+    if resources
+        .keys()
+        .any(|key| !matches!(key.as_str(), "bindings" | "script" | "script_runtime"))
+    {
+        return Err(operation_error(
+            "workers.version_detail_resources_unknown_field",
+            "version detail resources contained a field outside the closed evidence projection",
+            "Treat the candidate as provider-unverified and do not deploy it.",
+        ));
+    }
+    let script = resources
         .get("script")
         .and_then(Value::as_object)
-        .and_then(|script| script.get("etag"))
+        .ok_or_else(|| {
+            operation_error(
+                "workers.version_detail_script_missing",
+                "version detail omitted its script object",
+                "Treat the exact version evidence as incomplete.",
+            )
+        })?;
+    if script.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "etag" | "handlers" | "last_deployed_from" | "named_handlers"
+        )
+    }) {
+        return Err(operation_error(
+            "workers.version_detail_script_unknown_field",
+            "version detail script contained a field outside the closed evidence projection",
+            "Treat the candidate as provider-unverified and do not deploy it.",
+        ));
+    }
+    let script_etag = script
+        .get("etag")
         .and_then(Value::as_str)
         .and_then(canonical_script_etag)
         .ok_or_else(|| {
@@ -839,6 +930,54 @@ fn sanitize_version_detail(
                 "Treat the exact version evidence as incomplete.",
             )
         })?;
+    validate_script_projection(script)?;
+    let script_projection_sha256 = sha256_json(script);
+    let runtime = resources
+        .get("script_runtime")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            operation_error(
+                "workers.version_detail_runtime_missing",
+                "version detail omitted its script_runtime object",
+                "Treat the exact version evidence as incomplete.",
+            )
+        })?;
+    if runtime.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "compatibility_date"
+                | "compatibility_flags"
+                | "exports"
+                | "limits"
+                | "migration_tag"
+                | "usage_model"
+        )
+    }) {
+        return Err(operation_error(
+            "workers.version_detail_runtime_unknown_field",
+            "version detail script_runtime contained a field outside the closed evidence projection",
+            "Treat the candidate as provider-unverified and do not deploy it.",
+        ));
+    }
+    let compatibility_date = runtime
+        .get("compatibility_date")
+        .and_then(Value::as_str)
+        .filter(|value| canonical_date(value))
+        .ok_or_else(|| {
+            operation_error(
+                "workers.version_detail_compatibility_date_invalid",
+                "version detail omitted a canonical compatibility date",
+                "Treat the exact runtime evidence as incomplete.",
+            )
+        })?
+        .to_string();
+    let compatibility_flags = canonical_flags(runtime.get("compatibility_flags"))?;
+    validate_runtime_projection(runtime)?;
+    let runtime_projection_sha256 = sha256_json(runtime);
+    let version_metadata_projection_sha256 = sha256_json(&json!({
+        "metadata": object.get("metadata"),
+        "number": object.get("number"),
+    }));
     let bindings = match resources.get("bindings") {
         None => &[][..],
         Some(Value::Array(bindings)) => bindings.as_slice(),
@@ -916,6 +1055,13 @@ fn sanitize_version_detail(
     Ok(WorkerVersionDetailEvidence {
         version_id,
         script_etag: script_etag.to_string(),
+        compatibility_date,
+        compatibility_flags,
+        script_projection_sha256,
+        runtime_projection_sha256,
+        version_metadata_projection_sha256,
+        upload_exports_reconciliation_sha256,
+        upload_startup_time_ms,
         binding_descriptors,
         binding_descriptors_sha256,
         binding_projection_sha256,
@@ -923,6 +1069,124 @@ fn sanitize_version_detail(
         provider_proof,
         binding_projection,
     })
+}
+
+fn canonical_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| index != 4 && index != 7 && !byte.is_ascii_digit())
+    {
+        return false;
+    }
+    let number = |slice: &[u8]| {
+        slice
+            .iter()
+            .fold(0u32, |value, byte| value * 10 + u32::from(byte - b'0'))
+    };
+    let year = number(&bytes[..4]);
+    let month = number(&bytes[5..7]);
+    let day = number(&bytes[8..]);
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return false,
+    };
+    year != 0 && (1..=max_day).contains(&day)
+}
+
+fn canonical_flags(value: Option<&Value>) -> Result<Vec<String>, WorkerVersionOperationError> {
+    let flags = value.and_then(Value::as_array).ok_or_else(|| {
+        operation_error(
+            "workers.version_detail_compatibility_flags_invalid",
+            "version detail omitted its compatibility flag array",
+            "Treat the exact runtime evidence as incomplete.",
+        )
+    })?;
+    let mut canonical = BTreeSet::new();
+    for flag in flags {
+        let flag = flag.as_str().filter(|flag| {
+            !flag.is_empty()
+                && flag.len() <= 128
+                && flag
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        });
+        let flag = flag.ok_or_else(|| {
+            operation_error(
+                "workers.version_detail_compatibility_flags_invalid",
+                "version detail contained a non-canonical compatibility flag",
+                "Treat the exact runtime evidence as malformed.",
+            )
+        })?;
+        if !canonical.insert(flag.to_string()) {
+            return Err(operation_error(
+                "workers.version_detail_compatibility_flags_duplicate",
+                "version detail contained a duplicate compatibility flag",
+                "Treat the exact runtime evidence as contradictory.",
+            ));
+        }
+    }
+    Ok(canonical.into_iter().collect())
+}
+
+fn validate_script_projection(
+    script: &serde_json::Map<String, Value>,
+) -> Result<(), WorkerVersionOperationError> {
+    for key in ["handlers", "named_handlers"] {
+        if let Some(value) = script.get(key) {
+            if !value.is_array() {
+                return Err(operation_error(
+                    "workers.version_detail_script_invalid",
+                    "version detail script handlers were malformed",
+                    "Treat the exact script evidence as malformed.",
+                ));
+            }
+        }
+    }
+    if script
+        .get("last_deployed_from")
+        .is_some_and(|value| !value.is_string())
+    {
+        return Err(operation_error(
+            "workers.version_detail_script_invalid",
+            "version detail script last_deployed_from was malformed",
+            "Treat the exact script evidence as malformed.",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_runtime_projection(
+    runtime: &serde_json::Map<String, Value>,
+) -> Result<(), WorkerVersionOperationError> {
+    if runtime
+        .get("usage_model")
+        .is_some_and(|value| !matches!(value.as_str(), Some("bundled" | "unbound" | "standard")))
+        || runtime
+            .get("migration_tag")
+            .is_some_and(|value| !value.is_string())
+        || runtime
+            .get("exports")
+            .is_some_and(|value| !value.is_object())
+        || runtime
+            .get("limits")
+            .is_some_and(|value| !value.is_object())
+    {
+        return Err(operation_error(
+            "workers.version_detail_runtime_invalid",
+            "version detail script_runtime contained malformed documented fields",
+            "Treat the candidate as provider-unverified and do not deploy it.",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn prepare_worker_binding_expectation(
@@ -1085,6 +1349,24 @@ pub(crate) fn verify_worker_candidate_bindings(
     }
 }
 
+pub(crate) fn verify_worker_candidate_runtime(
+    expected_compatibility_date: &str,
+    expected_compatibility_flags: &[String],
+    candidate: &WorkerVersionDetailEvidence,
+) -> WorkerRuntimeVerification {
+    let compatibility_date_matched = candidate.compatibility_date == expected_compatibility_date;
+    let compatibility_flags_matched = candidate.compatibility_flags == expected_compatibility_flags;
+    WorkerRuntimeVerification {
+        expected_compatibility_date: expected_compatibility_date.to_string(),
+        observed_compatibility_date: candidate.compatibility_date.clone(),
+        expected_compatibility_flags_sha256: sha256_json(&expected_compatibility_flags),
+        observed_compatibility_flags_sha256: sha256_json(&candidate.compatibility_flags),
+        compatibility_date_matched,
+        compatibility_flags_matched,
+        matched: compatibility_date_matched && compatibility_flags_matched,
+    }
+}
+
 fn sanitize_deployments(
     result: &Value,
 ) -> Result<Vec<WorkerDeploymentProjection>, WorkerVersionOperationError> {
@@ -1134,6 +1416,18 @@ fn sanitize_deployments(
                 "Treat the provider deployment evidence as contradictory.",
             ));
         }
+        let strategy = deployment
+            .get("strategy")
+            .and_then(Value::as_str)
+            .filter(|strategy| *strategy == "percentage")
+            .ok_or_else(|| {
+                operation_error(
+                    "workers.version_deployment_strategy_invalid",
+                    "deployment omitted the only known percentage strategy",
+                    "Treat the provider deployment evidence as malformed.",
+                )
+            })?
+            .to_string();
         let versions = deployment
             .get("versions")
             .and_then(Value::as_array)
@@ -1198,11 +1492,14 @@ fn sanitize_deployments(
                 "Treat the provider deployment evidence as contradictory.",
             ));
         }
+        projected_versions.sort_by(|left, right| left.version_id.cmp(&right.version_id));
         projections.push(WorkerDeploymentProjection {
             deployment_id,
+            strategy,
             versions: projected_versions,
         });
     }
+    projections.sort_by(|left, right| left.deployment_id.cmp(&right.deployment_id));
     Ok(projections)
 }
 
@@ -1449,12 +1746,12 @@ mod tests {
     use axum::http::HeaderMap;
     use axum::routing::{get, post};
     use axum::{Json, Router};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tokio::net::TcpListener;
 
     use super::{
         WorkerProviderProof, prepare_worker_binding_expectation, sanitize_deployments,
-        sanitize_version_detail, verify_worker_candidate_bindings,
+        sanitize_version_detail, verify_worker_candidate_bindings, verify_worker_candidate_runtime,
     };
     use crate::cloudflare::CloudflareClient;
     use crate::config::{ApiTokenSource, CloudflareApiConfig};
@@ -1499,6 +1796,10 @@ mod tests {
         }
     }
 
+    fn runtime() -> Value {
+        json!({"compatibility_date":"2026-07-10","compatibility_flags":[]})
+    }
+
     #[test]
     fn detail_projection_omits_binding_values_and_requires_etag() {
         let detail = sanitize_version_detail(
@@ -1506,6 +1807,7 @@ mod tests {
                 "id":"11111111-1111-4111-8111-111111111111",
                 "resources":{
                     "script":{"etag":"a".repeat(64)},
+                    "script_runtime":runtime(),
                     "bindings":[
                         {"name":"SECRET","type":"secret_text","text":"must-not-leak"},
                         {"name":"DB","type":"d1","database_id":"private-id"}
@@ -1548,7 +1850,7 @@ mod tests {
         let base = sanitize_version_detail(
             json!({
                 "id":base_id,
-                "resources":{"script":{"etag":"a".repeat(64)},"bindings":base_bindings}
+                "resources":{"script":{"etag":"a".repeat(64)},"script_runtime":runtime(),"bindings":base_bindings}
             }),
             Some(base_id),
             proof(),
@@ -1567,7 +1869,7 @@ mod tests {
         let exact = sanitize_version_detail(
             json!({
                 "id":candidate_id,
-                "resources":{"script":{"etag":"b".repeat(64)},"bindings":candidate_bindings.clone()}
+                "resources":{"script":{"etag":"b".repeat(64)},"script_runtime":runtime(),"bindings":candidate_bindings.clone()}
             }),
             Some(candidate_id),
             proof(),
@@ -1595,7 +1897,7 @@ mod tests {
             let detail = sanitize_version_detail(
                 json!({
                     "id":candidate_id,
-                    "resources":{"script":{"etag":"b".repeat(64)},"bindings":drifted}
+                    "resources":{"script":{"etag":"b".repeat(64)},"script_runtime":runtime(),"bindings":drifted}
                 }),
                 Some(candidate_id),
                 proof(),
@@ -1626,7 +1928,7 @@ mod tests {
         let missing = sanitize_version_detail(
             json!({
                 "id":candidate_id,
-                "resources":{"script":{"etag":"b".repeat(64)},"bindings":missing}
+                "resources":{"script":{"etag":"b".repeat(64)},"script_runtime":runtime(),"bindings":missing}
             }),
             Some(candidate_id),
             proof(),
@@ -1644,7 +1946,7 @@ mod tests {
         let unexpected = sanitize_version_detail(
             json!({
                 "id":candidate_id,
-                "resources":{"script":{"etag":"b".repeat(64)},"bindings":unexpected}
+                "resources":{"script":{"etag":"b".repeat(64)},"script_runtime":runtime(),"bindings":unexpected}
             }),
             Some(candidate_id),
             proof(),
@@ -1667,7 +1969,7 @@ mod tests {
         let base = sanitize_version_detail(
             json!({
                 "id":base_id,
-                "resources":{"script":{"etag":"a".repeat(64)},"bindings":[]}
+                "resources":{"script":{"etag":"a".repeat(64)},"script_runtime":runtime(),"bindings":[]}
             }),
             Some(base_id),
             proof(),
@@ -1689,6 +1991,7 @@ mod tests {
                 "id":candidate_id,
                 "resources":{
                     "script":{"etag":"b".repeat(64)},
+                    "script_runtime":runtime(),
                     "bindings":[
                         {"name":"DB","type":"d1","database_id":"db-1"},
                         {
@@ -1714,6 +2017,7 @@ mod tests {
                 "id":candidate_id,
                 "resources":{
                     "script":{"etag":"b".repeat(64)},
+                    "script_runtime":runtime(),
                     "bindings":[
                         {"name":"DB","type":"d1","database_id":"db-1"},
                         {
@@ -1738,6 +2042,7 @@ mod tests {
                 "id":candidate_id,
                 "resources":{
                     "script":{"etag":"b".repeat(64)},
+                    "script_runtime":runtime(),
                     "bindings":[{
                         "name":"DB",
                         "type":"d1",
@@ -1766,6 +2071,7 @@ mod tests {
         let error = sanitize_deployments(&json!({
             "deployments":[{
                 "id":"22222222-2222-4222-8222-222222222222",
+                "strategy":"percentage",
                 "versions":[{
                     "version_id":"11111111-1111-4111-8111-111111111111",
                     "percentage":99
@@ -1774,6 +2080,97 @@ mod tests {
         }))
         .expect_err("must fail");
         assert_eq!(error.code, "workers.version_deployment_weights_invalid");
+    }
+
+    #[test]
+    fn deployment_projection_rejects_unknown_or_missing_strategy() {
+        for strategy in [None, Some("gradual")] {
+            let mut deployment = json!({
+                "id":"22222222-2222-4222-8222-222222222222",
+                "versions":[{
+                    "version_id":"11111111-1111-4111-8111-111111111111",
+                    "percentage":100
+                }]
+            });
+            if let Some(strategy) = strategy {
+                deployment["strategy"] = json!(strategy);
+            }
+            let error = sanitize_deployments(&json!({"deployments":[deployment]}))
+                .expect_err("strategy must fail closed");
+            assert_eq!(error.code, "workers.version_deployment_strategy_invalid");
+        }
+    }
+
+    #[test]
+    fn version_detail_rejects_unknown_runtime_semantics() {
+        let error = sanitize_version_detail(
+            json!({
+                "id":"11111111-1111-4111-8111-111111111111",
+                "resources":{
+                    "script":{"etag":"a".repeat(64)},
+                    "script_runtime":{
+                        "compatibility_date":"2026-07-10",
+                        "compatibility_flags":[],
+                        "future_runtime_control":true
+                    },
+                    "bindings":[]
+                }
+            }),
+            Some("11111111-1111-4111-8111-111111111111"),
+            proof(),
+        )
+        .expect_err("unknown runtime semantics must fail closed");
+        assert_eq!(error.code, "workers.version_detail_runtime_unknown_field");
+
+        let error = sanitize_version_detail(
+            json!({
+                "id":"11111111-1111-4111-8111-111111111111",
+                "future_semantic_control":true,
+                "resources":{
+                    "script":{"etag":"a".repeat(64)},
+                    "script_runtime":runtime(),
+                    "bindings":[]
+                }
+            }),
+            Some("11111111-1111-4111-8111-111111111111"),
+            proof(),
+        )
+        .expect_err("unknown version semantics must fail closed");
+        assert_eq!(error.code, "workers.version_detail_unknown_field");
+    }
+
+    #[test]
+    fn runtime_verification_detects_each_allowed_runtime_mismatch() {
+        let detail = sanitize_version_detail(
+            json!({
+                "id":"11111111-1111-4111-8111-111111111111",
+                "resources":{
+                    "script":{"etag":"a".repeat(64)},
+                    "script_runtime":{
+                        "compatibility_date":"2026-07-10",
+                        "compatibility_flags":["nodejs_compat"]
+                    },
+                    "bindings":[]
+                }
+            }),
+            Some("11111111-1111-4111-8111-111111111111"),
+            proof(),
+        )
+        .expect("detail");
+        let exact =
+            verify_worker_candidate_runtime("2026-07-10", &["nodejs_compat".to_string()], &detail);
+        assert!(exact.matched);
+
+        let date =
+            verify_worker_candidate_runtime("2026-07-11", &["nodejs_compat".to_string()], &detail);
+        assert!(!date.matched);
+        assert!(!date.compatibility_date_matched);
+        assert!(date.compatibility_flags_matched);
+
+        let flags = verify_worker_candidate_runtime("2026-07-10", &[], &detail);
+        assert!(!flags.matched);
+        assert!(flags.compatibility_date_matched);
+        assert!(!flags.compatibility_flags_matched);
     }
 
     #[tokio::test]
@@ -1806,8 +2203,11 @@ mod tests {
                             "messages":[],
                             "result":{
                                 "id":"11111111-1111-4111-8111-111111111111",
+                                "exports_reconciliation":{},
+                                "startup_time_ms":7,
                                 "resources":{
                                     "script":{"etag":"a".repeat(64)},
+                                    "script_runtime":runtime(),
                                     "bindings":[{"name":"SECRET","type":"secret_text","text":"never-return"}]
                                 }
                             }
@@ -1837,6 +2237,14 @@ mod tests {
         assert!(!outward.contains("fixture-worker-version-token"));
         assert_eq!(evidence.provider_proof.request_artifact_sha256.len(), 64);
         assert_eq!(evidence.provider_proof.response_artifact_sha256.len(), 64);
+        assert_eq!(evidence.startup_time_ms, Some(7));
+        assert_eq!(
+            evidence
+                .exports_reconciliation_sha256
+                .as_deref()
+                .map(str::len),
+            Some(64)
+        );
     }
 
     #[tokio::test]
@@ -1999,7 +2407,7 @@ mod tests {
                         "success":true,"errors":[],"messages":[],
                         "result":{
                             "id":"22222222-2222-4222-8222-222222222222",
-                            "resources":{"script":{"etag":"a".repeat(64)},"bindings":[]}
+                            "resources":{"script":{"etag":"a".repeat(64)},"script_runtime":runtime(),"bindings":[]}
                         }
                     }))
                 }),

@@ -1057,7 +1057,14 @@ not be deployed yet. It is intentionally separate from
    cross-target detail, missing ETag, or pagination/cap failure.
 2. Call `workers_upload_version` with `dry_run:true`, that exact base and
    pre-state evidence, one reviewed module or multipart artifact, complete
-   metadata, and `bindings_inherit:"strict"`. Every inherited binding must
+   metadata, and `bindings_inherit:"strict"`. Metadata is a deny-unknown
+   contract containing exactly `main_module`, a valid `compatibility_date`, a
+   duplicate-free `compatibility_flags` array, and the complete `bindings`
+   array. Omission is never interpreted as an empty binding plan. Export
+   reconciliation, migrations, durable-object lifecycle inputs, assets/cache
+   controls, annotations, dependencies, logpush/tails/tags/observability,
+   placement, limits, usage model, and other runtime controls are rejected
+   before any provider request. Every inherited binding must
    explicitly name the exact base version; never use implicit or `latest`
    inheritance. Path artifacts are opened once without following a final
    symlink and are validated, bounded, and read through that same descriptor.
@@ -1068,12 +1075,22 @@ not be deployed yet. It is intentionally separate from
    retain the confirmation token. Dry-run performs no provider call.
 3. Apply once with unchanged inputs and the exact confirmation token. The MCP
    re-captures the base and pre-state, sends one non-retrying version POST, and
-   requires exactly one new candidate, exact candidate ID/ETag/detail, exact
-   response-to-readback equality, and a complete binding projection matching
+   requires exactly one new candidate, exact candidate ID/ETag, exact allowed
+   compatibility date/flags, response-to-readback script/runtime/version
+   metadata projections, and a complete binding projection matching
    both explicit metadata and exact-base inheritance. It also requires an
-   unchanged two-pass deployment projection with `candidate_absent:true`.
-   `applied_proven` means only that a disabled candidate exists. It does not
-   authorize or create a deployment.
+   unchanged sorted two-pass deployment projection with an explicit known
+   `percentage` strategy and `candidate_absent:true`.
+   `candidate_created_custodied` means a disabled candidate exists, the exact
+   submitted request remains in descriptor-bound local custody, and the
+   provider-visible identity/runtime/binding/deployment projections match.
+   `source_proof.status=source_provider_unverified` is intentional: Version
+   Detail cannot authenticate the submitted module graph or source bytes. The
+   result does not authorize or create a deployment and must never be described
+   as provider proof of source-byte identity. Because this ceremony rejects
+   script-level logpush, tails, tags, observability and similar settings inputs,
+   it does not claim a separate Script Settings before/after proof; that scope
+   is reported as false rather than silently inferred.
 4. Preserve the returned request/response artifact SHA-256 values as exact
    authenticated exchange evidence. They intentionally replace outward raw
    credential headers, response bodies, module bytes, metadata values, and
