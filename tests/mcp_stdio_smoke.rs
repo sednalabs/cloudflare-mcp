@@ -17933,6 +17933,11 @@ fn workers_upload_version_dry_run_is_strict_digest_bound_and_provider_free() {
                 "compatibility_flags":[],
                 "bindings":[
                     {"name":"SECRET","type":"inherit","version_id":"11111111-1111-4111-8111-111111111111"},
+                    {"name":"DATABASE","type":"d1","database_id":"db-current"},
+                    {"name":"LEGACY_DATABASE","type":"d1","id":"db-legacy"},
+                    {"name":"SEARCH","type":"ai_search","instance_name":"articles"},
+                    {"name":"SERVICE","type":"service","service":"worker-service"},
+                    {"name":"BUCKET","type":"r2_bucket","bucket_name":"article-assets"},
                     {"name":"MODE","type":"plain_text","text":"private-fixture-value"}
                 ]
             },
@@ -18042,6 +18047,30 @@ fn workers_upload_version_schema_and_deserialization_are_closed() {
         variant["additionalProperties"] == json!(false)
             && variant["properties"]["type"]["const"].is_string()
     }));
+    let d1_variant = binding_variants
+        .iter()
+        .map(|variant| resolve_local(schema, variant))
+        .find(|variant| variant["properties"]["type"]["const"] == json!("d1"))
+        .expect("D1 binding variant");
+    assert_eq!(
+        d1_variant["anyOf"],
+        json!([
+            {"required": ["database_id"]},
+            {"required": ["id"]}
+        ])
+    );
+    assert_eq!(
+        d1_variant["properties"]["database_id"]["type"],
+        json!("string")
+    );
+    assert_eq!(d1_variant["properties"]["id"]["type"], json!("string"));
+    assert!(
+        !d1_variant["required"]
+            .as_array()
+            .expect("D1 binding required fields")
+            .iter()
+            .any(|field| field == "database_id" || field == "id")
+    );
 
     let base_args = json!({
         "script_name":"worker-a",
@@ -18094,12 +18123,30 @@ fn workers_upload_version_schema_and_deserialization_are_closed() {
         response["error"].is_object() || response["result"]["isError"] == json!(true),
         "{response}"
     );
+    let mut null_optional_binding = base_args.clone();
+    null_optional_binding["metadata"]["bindings"] = json!([{
+        "name":"SECRET",
+        "type":"inherit",
+        "version_id":"11111111-1111-4111-8111-111111111111",
+        "old_name":null
+    }]);
+    let response = mcp.call_tool(5, "workers_upload_version", null_optional_binding);
+    assert!(
+        response
+            .to_string()
+            .contains("must be omitted instead of null"),
+        "{response}"
+    );
+    assert!(
+        response["error"].is_object() || response["result"]["isError"] == json!(true),
+        "{response}"
+    );
     let mut unknown_binding_type = base_args.clone();
     unknown_binding_type["metadata"]["bindings"] = json!([{
         "name":"FUTURE",
         "type":"future_binding_type"
     }]);
-    let response = mcp.call_tool(5, "workers_upload_version", unknown_binding_type);
+    let response = mcp.call_tool(6, "workers_upload_version", unknown_binding_type);
     assert!(
         response.to_string().contains("unknown variant"),
         "{response}"
@@ -18108,7 +18155,7 @@ fn workers_upload_version_schema_and_deserialization_are_closed() {
         response["error"].is_object() || response["result"]["isError"] == json!(true),
         "{response}"
     );
-    for (id, per_page) in [(6, 0), (7, 101)] {
+    for (id, per_page) in [(7, 0), (8, 101)] {
         let mut arguments = base_args.clone();
         arguments["per_page"] = json!(per_page);
         let response = mcp.call_tool(id, "workers_upload_version", arguments);

@@ -5644,11 +5644,7 @@
                     "type": "string"
                   },
                   "old_name": {
-                    "default": null,
-                    "type": [
-                      "string",
-                      "null"
-                    ]
+                    "type": "string"
                   },
                   "type": {
                     "const": "inherit",
@@ -5667,20 +5663,24 @@
               },
               {
                 "additionalProperties": false,
-                "properties": {
-                  "database_id": {
-                    "default": null,
-                    "type": [
-                      "string",
-                      "null"
+                "anyOf": [
+                  {
+                    "required": [
+                      "database_id"
                     ]
                   },
-                  "id": {
-                    "default": null,
-                    "type": [
-                      "string",
-                      "null"
+                  {
+                    "required": [
+                      "id"
                     ]
+                  }
+                ],
+                "properties": {
+                  "database_id": {
+                    "type": "string"
+                  },
+                  "id": {
+                    "type": "string"
                   },
                   "name": {
                     "type": "string"
@@ -5706,11 +5706,7 @@
                     "type": "string"
                   },
                   "namespace": {
-                    "default": null,
-                    "type": [
-                      "string",
-                      "null"
-                    ]
+                    "type": "string"
                   },
                   "type": {
                     "const": "ai_search",
@@ -5810,18 +5806,10 @@
                 "additionalProperties": false,
                 "properties": {
                   "entrypoint": {
-                    "default": null,
-                    "type": [
-                      "string",
-                      "null"
-                    ]
+                    "type": "string"
                   },
                   "environment": {
-                    "default": null,
-                    "type": [
-                      "string",
-                      "null"
-                    ]
+                    "type": "string"
                   },
                   "name": {
                     "type": "string"
@@ -5848,15 +5836,7 @@
                     "type": "string"
                   },
                   "jurisdiction": {
-                    "anyOf": [
-                      {
-                        "$ref": "#/$defs/WorkerVersionR2Jurisdiction"
-                      },
-                      {
-                        "type": "null"
-                      }
-                    ],
-                    "default": null
+                    "$ref": "#/$defs/WorkerVersionR2Jurisdiction"
                   },
                   "name": {
                     "type": "string"

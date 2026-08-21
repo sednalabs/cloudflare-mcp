@@ -784,6 +784,21 @@ fn default_worker_version_per_page() -> u32 {
     100
 }
 
+fn deserialize_present_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)?.map_or_else(
+        || {
+            Err(serde::de::Error::custom(
+                "optional Worker version binding fields must be omitted instead of null",
+            ))
+        },
+        |value| Ok(Some(value)),
+    )
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct WorkersCaptureVersionEvidenceArgs {
     #[serde(default)]
@@ -808,21 +823,42 @@ pub enum WorkerVersionBindingsInherit {
 pub enum WorkerVersionUploadBinding {
     Inherit {
         name: String,
-        #[serde(default)]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_present_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schemars(with = "String")]
         old_name: Option<String>,
         version_id: String,
     },
+    #[schemars(extend("anyOf" = [{"required": ["database_id"]}, {"required": ["id"]}]))]
     D1 {
         name: String,
-        #[serde(default)]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_present_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schemars(with = "String")]
         database_id: Option<String>,
-        #[serde(default)]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_present_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schemars(with = "String")]
         id: Option<String>,
     },
     AiSearch {
         name: String,
         instance_name: String,
-        #[serde(default)]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_present_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schemars(with = "String")]
         namespace: Option<String>,
     },
     AiSearchNamespace {
@@ -844,15 +880,30 @@ pub enum WorkerVersionUploadBinding {
     Service {
         name: String,
         service: String,
-        #[serde(default)]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_present_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schemars(with = "String")]
         environment: Option<String>,
-        #[serde(default)]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_present_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schemars(with = "String")]
         entrypoint: Option<String>,
     },
     R2Bucket {
         name: String,
         bucket_name: String,
-        #[serde(default)]
+        #[serde(
+            default,
+            deserialize_with = "deserialize_present_option",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schemars(with = "WorkerVersionR2Jurisdiction")]
         jurisdiction: Option<WorkerVersionR2Jurisdiction>,
     },
     Queue {
