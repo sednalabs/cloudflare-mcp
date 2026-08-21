@@ -279,6 +279,8 @@ fn build_openai_tool_search_config() -> String {
         "queues_health",
         "workers_list_scripts",
         "workers_get_script_settings",
+        "workers_capture_version_evidence",
+        "workers_reconcile_version_upload",
         "workers_list_tails",
         "workers_observability_query_events",
         "workers_observability_list_keys",

@@ -537,6 +537,54 @@ pub fn plan_upload_worker_script(
         )
 }
 
+pub fn plan_upload_worker_version(
+    account_id: &str,
+    script_name: &str,
+    base_version_id: &str,
+    upload: Value,
+    pre_upload_version_snapshot_sha256: &str,
+    pre_upload_deployment_snapshot_sha256: &str,
+) -> MutationPlan {
+    MutationPlan::new("workers_upload_version")
+        .step(
+            "verify_pinned_pre_upload_state",
+            false,
+            json!({
+                "account_id": account_id,
+                "script_name": script_name,
+                "base_version_id": base_version_id,
+                "version_snapshot_sha256": pre_upload_version_snapshot_sha256,
+                "deployment_snapshot_sha256": pre_upload_deployment_snapshot_sha256,
+            }),
+        )
+        .step(
+            "upload_disabled_worker_version",
+            true,
+            json!({
+                "account_id": account_id,
+                "script_name": script_name,
+                "bindings_inherit": "strict",
+                "upload": upload,
+            }),
+        )
+        .step(
+            "verify_exact_candidate_version",
+            false,
+            json!({
+                "account_id": account_id,
+                "script_name": script_name,
+            }),
+        )
+        .step(
+            "verify_deployments_unchanged",
+            false,
+            json!({
+                "account_id": account_id,
+                "script_name": script_name,
+            }),
+        )
+}
+
 pub fn plan_cache_mutation(operation: &'static str, zone_id: &str, target: Value) -> MutationPlan {
     MutationPlan::new(operation)
         .step(

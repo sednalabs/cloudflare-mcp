@@ -5056,6 +5056,49 @@
       "name": "waf_security_events_summary"
     },
     {
+      "description": "Capture stable bounded Worker version pagination, optional exact sanitized version detail, and two-pass deployment evidence without mutation.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "candidate_must_be_absent": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "per_page": {
+            "default": 100,
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "script_name": {
+            "type": "string"
+          },
+          "version_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "script_name"
+        ],
+        "type": "object"
+      },
+      "name": "workers_capture_version_evidence"
+    },
+    {
       "description": "Get Cloudflare Worker script settings.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -5427,6 +5470,64 @@
       "name": "workers_observability_query_events"
     },
     {
+      "description": "Reconcile an ambiguous Worker version upload by enumerating only new versions against a pinned pre-upload snapshot; never uploads or creates a deployment.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "base_version_etag": {
+            "type": "string"
+          },
+          "base_version_id": {
+            "type": "string"
+          },
+          "per_page": {
+            "default": 100,
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pre_upload_deployment_snapshot_sha256": {
+            "type": "string"
+          },
+          "pre_upload_deployments": true,
+          "pre_upload_version_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "pre_upload_version_ids_sha256": {
+            "type": "string"
+          },
+          "script_name": {
+            "type": "string"
+          },
+          "upload_contract_sha256": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "script_name",
+          "base_version_id",
+          "base_version_etag",
+          "upload_contract_sha256",
+          "pre_upload_version_ids",
+          "pre_upload_version_ids_sha256",
+          "pre_upload_deployments",
+          "pre_upload_deployment_snapshot_sha256"
+        ],
+        "type": "object"
+      },
+      "name": "workers_reconcile_version_upload"
+    },
+    {
       "description": "Upload a Cloudflare Worker module script or prebuilt multipart bundle with dry-run planning, confirmation-token apply, and settings readback.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -5515,6 +5616,117 @@
         "type": "object"
       },
       "name": "workers_upload_script"
+    },
+    {
+      "description": "Upload one disabled Worker version with strict exact-base binding inheritance, dry-run confirmation, pinned pre-state, non-retrying provider submission, exact candidate readback, and unchanged-deployment proof.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "base_version_etag": {
+            "type": "string"
+          },
+          "base_version_id": {
+            "type": "string"
+          },
+          "bindings_inherit": {
+            "type": "string"
+          },
+          "confirmation_token": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "content_type": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "main_module": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": true,
+          "multipart_path": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "per_page": {
+            "default": 100,
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pre_upload_deployment_snapshot_sha256": {
+            "type": "string"
+          },
+          "pre_upload_version_snapshot_sha256": {
+            "type": "string"
+          },
+          "reason": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "script_content": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "script_content_base64": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "script_name": {
+            "type": "string"
+          },
+          "script_path": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "script_name",
+          "base_version_id",
+          "base_version_etag",
+          "pre_upload_version_snapshot_sha256",
+          "pre_upload_deployment_snapshot_sha256",
+          "bindings_inherit",
+          "metadata"
+        ],
+        "type": "object"
+      },
+      "name": "workers_upload_version"
     }
   ],
   "version": 1

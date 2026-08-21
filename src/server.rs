@@ -1263,6 +1263,9 @@ mod tests {
             "workers_observability_list_values",
             "workers_observability_query_events",
             "workers_upload_script",
+            "workers_capture_version_evidence",
+            "workers_upload_version",
+            "workers_reconcile_version_upload",
         ];
         for name in required {
             assert!(tools.contains(name), "{name} missing from tool inventory");

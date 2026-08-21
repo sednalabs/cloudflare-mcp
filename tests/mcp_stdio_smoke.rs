@@ -5001,6 +5001,149 @@ fn spawn_fake_worker_upload_api(expected_requests: usize) -> (String, Arc<Mutex<
     spawn_fake_worker_upload_api_with_readback(expected_requests, "worker.js")
 }
 
+fn spawn_fake_worker_version_api(expected_requests: usize) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake Worker version API");
+    let addr = listener.local_addr().expect("fake Worker version API addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        let base_id = "11111111-1111-4111-8111-111111111111";
+        let candidate_id = "22222222-2222-4222-8222-222222222222";
+        let mut uploaded = false;
+        for stream in listener.incoming().take(expected_requests) {
+            let mut stream = stream.expect("fake Worker version API stream");
+            let (headers, body) = read_http_request(&mut stream);
+            let request_line = headers.lines().next().unwrap_or_default().to_string();
+            let mut request_parts = request_line.split_whitespace();
+            let method = request_parts.next().unwrap_or_default().to_string();
+            let path = request_parts.next().unwrap_or_default().to_string();
+            let content_type = headers
+                .lines()
+                .find_map(|line| line.strip_prefix("content-type:"))
+                .or_else(|| {
+                    headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Content-Type:"))
+                })
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string();
+            let authorization_present = headers.lines().any(|line| {
+                line.to_ascii_lowercase()
+                    .starts_with("authorization: bearer ")
+            });
+            requests_for_thread
+                .lock()
+                .expect("request log lock")
+                .push(json!({
+                    "method": method,
+                    "path": path,
+                    "content_type": content_type,
+                    "authorization_present": authorization_present,
+                    "body_sha256": format!("{:x}", Sha256::digest(&body)),
+                }));
+
+            let path_without_query = path.split('?').next().unwrap_or_default();
+            let response = if method == "GET"
+                && path_without_query == "/accounts/acct-1/workers/scripts/worker-a/versions"
+            {
+                let mut items = vec![json!({"id": base_id})];
+                if uploaded {
+                    items.insert(0, json!({"id": candidate_id}));
+                }
+                json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": {"items": items},
+                })
+            } else if method == "GET"
+                && path_without_query
+                    == format!("/accounts/acct-1/workers/scripts/worker-a/versions/{base_id}")
+            {
+                json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": {
+                        "id": base_id,
+                        "resources": {
+                            "script": {"etag": "a".repeat(64)},
+                            "bindings": [
+                                {"name":"SECRET","type":"secret_text","text":"never-surface"}
+                            ]
+                        }
+                    },
+                })
+            } else if method == "GET"
+                && path_without_query
+                    == format!("/accounts/acct-1/workers/scripts/worker-a/versions/{candidate_id}")
+            {
+                json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": {
+                        "id": candidate_id,
+                        "resources": {
+                            "script": {"etag": "b".repeat(64)},
+                            "bindings": [
+                                {"name":"SECRET","type":"secret_text","text":"never-surface"}
+                            ]
+                        }
+                    },
+                })
+            } else if method == "GET"
+                && path_without_query == "/accounts/acct-1/workers/scripts/worker-a/deployments"
+            {
+                json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": {"deployments": []},
+                })
+            } else if method == "POST"
+                && path_without_query == "/accounts/acct-1/workers/scripts/worker-a/versions"
+            {
+                assert!(path.contains("bindings_inherit=strict"));
+                assert!(content_type.starts_with("multipart/form-data;"));
+                assert!(!body.is_empty());
+                uploaded = true;
+                json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": {
+                        "id": candidate_id,
+                        "resources": {
+                            "script": {"etag": "b".repeat(64)},
+                            "bindings": [
+                                {"name":"SECRET","type":"secret_text","text":"never-surface"}
+                            ]
+                        }
+                    },
+                })
+            } else {
+                json!({
+                    "success": false,
+                    "errors": [{"code":7000,"message":format!("unexpected request: {method} {path}")}],
+                    "messages": [],
+                    "result": null,
+                })
+            };
+            let response = serde_json::to_vec(&response).expect("serialize response");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                response.len()
+            )
+            .expect("write response headers");
+            stream.write_all(&response).expect("write response body");
+        }
+    });
+    (format!("http://{addr}"), requests)
+}
+
 fn spawn_fake_worker_upload_api_with_readback(
     expected_requests: usize,
     readback_main_module: &'static str,
@@ -17751,6 +17894,184 @@ fn workers_upload_script_requires_token_and_reads_back_through_stdio_boundary() 
         json!("/accounts/acct-1/workers/scripts/worker-a/settings")
     );
     assert_eq!(requests[0]["if_none_match"], json!(""));
+}
+
+#[test]
+fn workers_upload_version_dry_run_is_strict_digest_bound_and_provider_free() {
+    let (base_url, requests) = spawn_fake_worker_upload_api(0);
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let response = mcp.call_tool(
+        2,
+        "workers_upload_version",
+        json!({
+            "script_name":"worker-a",
+            "base_version_id":"11111111-1111-4111-8111-111111111111",
+            "base_version_etag":"a".repeat(64),
+            "pre_upload_version_snapshot_sha256":"b".repeat(64),
+            "pre_upload_deployment_snapshot_sha256":"c".repeat(64),
+            "bindings_inherit":"strict",
+            "main_module":"index.js",
+            "script_content":"export default { fetch() { return new Response('ok') } }",
+            "metadata":{
+                "main_module":"index.js",
+                "compatibility_date":"2026-07-10",
+                "bindings":[
+                    {"name":"SECRET","type":"inherit","version_id":"11111111-1111-4111-8111-111111111111"},
+                    {"name":"MODE","type":"plain_text","text":"private-fixture-value"}
+                ]
+            },
+            "dry_run":true,
+            "reason":"stdio guarded version regression"
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(true), "{content}");
+    assert_eq!(content["planned"], json!(true));
+    assert_eq!(
+        content["request_query"]["bindings_inherit"],
+        json!("strict")
+    );
+    assert_eq!(content["deployment_created"], json!(false));
+    assert!(content["required_confirmation_token"].is_string());
+    assert!(content["upload"]["body_sha256"].is_string());
+    assert!(content["upload"]["metadata_sha256"].is_string());
+    assert!(content["upload"]["upload_contract_sha256"].is_string());
+    let outward = content.to_string();
+    assert!(!outward.contains("private-fixture-value"));
+    assert!(!outward.contains("script_content"));
+    assert!(requests.lock().expect("request log lock").is_empty());
+}
+
+#[test]
+fn workers_upload_version_rejects_non_strict_inheritance_before_provider_access() {
+    let (base_url, requests) = spawn_fake_worker_upload_api(0);
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let response = mcp.call_tool(
+        2,
+        "workers_upload_version",
+        json!({
+            "script_name":"worker-a",
+            "base_version_id":"11111111-1111-4111-8111-111111111111",
+            "base_version_etag":"a".repeat(64),
+            "pre_upload_version_snapshot_sha256":"b".repeat(64),
+            "pre_upload_deployment_snapshot_sha256":"c".repeat(64),
+            "bindings_inherit":"best_effort",
+            "script_content":"export default {}",
+            "metadata":{"main_module":"index.js"},
+            "dry_run":true
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(
+        content["error"]["code"],
+        json!("workers.version_upload_strict_inheritance_required")
+    );
+    assert!(requests.lock().expect("request log lock").is_empty());
+}
+
+#[test]
+fn workers_upload_version_stdio_applies_once_and_proves_disabled_candidate() {
+    let (base_url, requests) = spawn_fake_worker_version_api(16);
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let base_id = "11111111-1111-4111-8111-111111111111";
+    let candidate_id = "22222222-2222-4222-8222-222222222222";
+
+    let preflight = mcp.call_tool(
+        2,
+        "workers_capture_version_evidence",
+        json!({
+            "script_name":"worker-a",
+            "per_page":100,
+            "version_id":base_id
+        }),
+    );
+    let preflight_content = structured_content(&preflight);
+    assert_eq!(preflight_content["ok"], json!(true), "{preflight_content}");
+    let version_snapshot_sha256 =
+        preflight_content["evidence"]["versions"]["semantic_snapshot_sha256"]
+            .as_str()
+            .expect("version snapshot pin")
+            .to_string();
+    let deployment_snapshot_sha256 =
+        preflight_content["evidence"]["deployments"]["semantic_snapshot_sha256"]
+            .as_str()
+            .expect("deployment snapshot pin")
+            .to_string();
+
+    let upload_args = json!({
+        "script_name":"worker-a",
+        "base_version_id":base_id,
+        "base_version_etag":"a".repeat(64),
+        "pre_upload_version_snapshot_sha256":version_snapshot_sha256,
+        "pre_upload_deployment_snapshot_sha256":deployment_snapshot_sha256,
+        "bindings_inherit":"strict",
+        "main_module":"index.js",
+        "script_content":"export default { fetch() { return new Response('ok') } }",
+        "metadata":{
+            "main_module":"index.js",
+            "compatibility_date":"2026-07-10",
+            "bindings":[
+                {"name":"SECRET","type":"inherit","version_id":base_id},
+                {"name":"MODE","type":"plain_text","text":"private-fixture-value"}
+            ]
+        },
+        "per_page":100,
+        "dry_run":true,
+        "reason":"stdio guarded version apply regression"
+    });
+    let dry_run = mcp.call_tool(3, "workers_upload_version", upload_args.clone());
+    let dry_run_content = structured_content(&dry_run);
+    assert_eq!(dry_run_content["ok"], json!(true), "{dry_run_content}");
+    assert_eq!(dry_run_content["planned"], json!(true));
+    assert_eq!(requests.lock().expect("request log lock").len(), 5);
+
+    let mut apply_args = upload_args;
+    apply_args["dry_run"] = json!(false);
+    apply_args["confirmation_token"] = dry_run_content["required_confirmation_token"].clone();
+    let apply = mcp.call_tool(4, "workers_upload_version", apply_args);
+    let apply_content = structured_content(&apply);
+    assert_eq!(apply_content["ok"], json!(true), "{apply_content}");
+    assert_eq!(apply_content["status"], json!("applied_proven"));
+    assert_eq!(
+        apply_content["upload_result"]["candidate_version_id"],
+        json!(candidate_id)
+    );
+    assert_eq!(
+        apply_content["post_upload_state"]["deployments"]["candidate_absent"],
+        json!(true)
+    );
+    assert_eq!(apply_content["deployment_created"], json!(false));
+    assert_eq!(apply_content["provider_mutation_dispatched"], json!(true));
+    let outward = apply_content.to_string();
+    assert!(!outward.contains("private-fixture-value"));
+    assert!(!outward.contains("never-surface"));
+
+    let requests = requests.lock().expect("request log lock");
+    assert_eq!(requests.len(), 16);
+    let posts = requests
+        .iter()
+        .filter(|request| request["method"] == json!("POST"))
+        .collect::<Vec<_>>();
+    assert_eq!(posts.len(), 1, "{requests:?}");
+    assert!(
+        posts[0]["path"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("/versions?bindings_inherit=strict")
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request["authorization_present"] == json!(true))
+    );
+    assert!(!requests.iter().any(|request| {
+        request["method"] == json!("POST")
+            && request["path"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("/deployments")
+    }));
 }
 
 #[test]

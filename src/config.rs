@@ -12,7 +12,7 @@ use mcp_toolkit_auth::upstream_oauth::OAuthClientAuthMethod;
 use mcp_toolkit_auth::{AuthConfig, AuthMode, AuthSecurityProfile, ClientAuthMethod};
 use url::Url;
 
-const DEFAULT_ELICITATION_REQUIRED_TOOLS: &str = "account_api_tokens,api_mutate,lock_first_publish,emergency_unpublish,replace_access_policies,apply_access_allowlist,portal_agent_request,cache_purge,cache_rules,r2_put_object,workers_upload_script,waf_ruleset_apply_change";
+const DEFAULT_ELICITATION_REQUIRED_TOOLS: &str = "account_api_tokens,api_mutate,lock_first_publish,emergency_unpublish,replace_access_policies,apply_access_allowlist,portal_agent_request,cache_purge,cache_rules,r2_put_object,workers_upload_script,workers_upload_version,waf_ruleset_apply_change";
 const MANDATORY_ELICITATION_REQUIRED_TOOLS: &[&str] = &["account_api_tokens", "api_mutate"];
 const DEFAULT_ELICITATION_TIMEOUT_MS: i64 = 30_000;
 const INSECURE_DEV_DELEGATION_SECRET: &str = "cloudflare-mcp-loopback-fixture";
@@ -1619,6 +1619,7 @@ mod tests {
             "cache_rules",
             "r2_put_object",
             "workers_upload_script",
+            "workers_upload_version",
             "waf_ruleset_apply_change",
         ] {
             assert!(

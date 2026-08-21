@@ -19,8 +19,10 @@ matter more than raw endpoint breadth:
 - Pages deployments and custom domains.
 - D1 database discovery, read-only queries, guarded writes, and migrations.
 - R2 object inspection, bounded reads/downloads, and writes.
-- Workers script upload with digest-based summaries and settings readback,
-  bindings discovery, and observability event queries.
+- Workers script upload with digest-based summaries and settings readback;
+  guarded version-only candidate upload with exact-base inheritance,
+  response-loss reconciliation, and unchanged-deployment proof; bindings
+  discovery; and observability event queries.
 - Queues health, backlog, metrics, consumers, and DLQ readback.
 - Account billing usage and Cloudflare Analytics GraphQL attribution for
   usage-spike investigations.

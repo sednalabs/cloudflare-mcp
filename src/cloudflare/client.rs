@@ -118,6 +118,7 @@ pub struct CloudflareClient {
     pub(crate) http: reqwest::Client,
     reconciliation_http: reqwest::Client,
     migration_write_http: reqwest::Client,
+    pub(crate) worker_version_http: reqwest::Client,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -561,11 +562,23 @@ impl CloudflareClient {
                     "Verify TLS/runtime dependencies and CLOUDFLARE_MCP_API_TIMEOUT_MS settings.",
                 )
             })?;
+        let worker_version_http = reqwest::Client::builder()
+            .timeout(cfg.request_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|err| {
+                AdapterError::new(
+                    "cloudflare.client_init_failed",
+                    format!("failed to create Worker-version HTTP client: {err}"),
+                    "Verify TLS/runtime dependencies and CLOUDFLARE_MCP_API_TIMEOUT_MS settings.",
+                )
+            })?;
         Ok(Self {
             cfg,
             http,
             reconciliation_http,
             migration_write_http,
+            worker_version_http,
         })
     }
 
@@ -3817,7 +3830,7 @@ const D1_MIGRATION_JSON_MAX_CONTAINER_DEPTH: usize = 32;
 struct DuplicateSafeJsonValue(Value);
 
 #[derive(Debug)]
-enum DuplicateSafeJsonError {
+pub(crate) enum DuplicateSafeJsonError {
     DuplicateObjectKey,
     NestingDepthExceeded,
     Malformed(serde_json::Error),
@@ -4058,7 +4071,7 @@ fn d1_migration_provider_error_location(
     })
 }
 
-fn decode_json_rejecting_duplicate_object_keys(
+pub(crate) fn decode_json_rejecting_duplicate_object_keys(
     body: &str,
 ) -> Result<Value, DuplicateSafeJsonError> {
     let mut deserializer = serde_json::Deserializer::from_str(body);

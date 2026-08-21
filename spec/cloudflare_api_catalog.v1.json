@@ -45811,7 +45811,7 @@
       "summary": "Upload Version",
       "deprecated": false,
       "scope": "account",
-      "risk": "mutating",
+      "risk": "denied_by_default",
       "path_params": [
         "account_id",
         "script_name"
@@ -45821,7 +45821,7 @@
       ],
       "required_query_params": [],
       "has_request_body": true,
-      "preferred_tool": null
+      "preferred_tool": "workers_upload_version"
     },
     {
       "operation_id": "createWorker",

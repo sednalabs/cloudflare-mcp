@@ -1042,6 +1042,46 @@ Multipart uploads still require dry-run review and the confirmation token, but
 `readback_verification` reports module-name verification as not applicable
 because the bundle owns its module graph.
 
+### Create a disabled Worker version without changing traffic
+
+Use this ceremony when a reviewed candidate must exist in Cloudflare but must
+not be deployed yet. It is intentionally separate from
+`workers_upload_script`, and these tools contain no deployment-create path.
+
+1. Call `workers_capture_version_evidence` with the exact account, script,
+   fixed `per_page`, and exact base version ID. Review the two stable complete
+   version-list passes, exact base ETag and sanitized binding descriptors, and
+   two identical deployment reads. Preserve `version_ids`,
+   `version_ids_sha256`, both semantic snapshot SHA-256 values, and the
+   deployment projection. Stop on any drift, malformed evidence, duplicate,
+   cross-target detail, missing ETag, or pagination/cap failure.
+2. Call `workers_upload_version` with `dry_run:true`, that exact base and
+   pre-state evidence, one reviewed module or multipart artifact, complete
+   metadata, and `bindings_inherit:"strict"`. Every inherited binding must
+   explicitly name the exact base version; never use implicit or `latest`
+   inheritance. Review the body, metadata, and upload-contract SHA-256 values
+   and retain the confirmation token. Dry-run performs no provider call.
+3. Apply once with unchanged inputs and the exact confirmation token. The MCP
+   re-captures the base and pre-state, sends one non-retrying version POST, and
+   requires exactly one new candidate, exact candidate ID/ETag/detail, and an
+   unchanged two-pass deployment projection with `candidate_absent:true`.
+   `applied_proven` means only that a disabled candidate exists. It does not
+   authorize or create a deployment.
+4. Preserve the returned request/response artifact SHA-256 values as exact
+   authenticated exchange evidence. They intentionally replace outward raw
+   credential headers, response bodies, module bytes, metadata values, and
+   binding values.
+
+If the upload response is lost, rejected, malformed, oversized, unexpectedly
+encoded, or followed by failed/contradictory readback, never repeat the POST.
+Call `workers_reconcile_version_upload` with the exact pinned pre-upload IDs,
+deployment projection and hashes, base ID/ETag, and dry-run upload-contract
+SHA-256. Reconciliation is read-only and succeeds only when there is exactly
+one new version over the predecessor set, the base still matches, deployments
+are unchanged, and the new candidate remains absent from deployments. Zero or
+multiple candidates, a missing predecessor, any hash/state drift, or a deployed
+candidate remains unresolved and never authorizes an upload retry.
+
 ## Apply Sequence
 
 For exposure workflows, use this order:

@@ -463,12 +463,27 @@ like "what rule blocked this path?" or "is this rule still firing?"
 
 ## Workers and Bindings
 
+### Version-only upload capability matrix
+
+| Workflow | Tool | Class | Required inputs | Proof and redaction | Negative coverage | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| Capture an immutable pre/post provider state | `workers_capture_version_evidence` | read | Exact account/script, fixed `per_page`, optional exact version ID and candidate exclusion ID | Two stable, bounded all-page version reads; exact sanitized version detail; two stable complete deployment reads; request/response artifact SHA-256 values. Binding values and raw provider bodies are never returned. | Wrong target or detail ID, malformed/duplicate/truncated/drifting pagination, invalid or over-cap deployments, missing script ETag, candidate present in a deployment | Implemented and focused-tested |
+| Create one disabled Worker version | `workers_upload_version` | apply | One reviewed module or multipart artifact, complete metadata, exact base version ID and ETag, pinned pre-upload version/deployment snapshot hashes, mandatory `bindings_inherit="strict"`, dry-run confirmation | Confirmation-bound upload/body/metadata digests; pre-state equality; one non-retrying POST; exact returned candidate ID/ETag and request/response artifact SHA-256; exact candidate detail; unchanged deployment proof | Missing confirmation, wrong base, `latest`/implicit inherit, pre-state drift, response loss, missing ID/ETag, cross-target detail, secret-shaped outward data, candidate deployed | Implemented and focused-tested |
+| Resolve response loss without another upload | `workers_reconcile_version_upload` | read | Exact script/base/upload contract, pinned pre-upload version IDs and deployments plus their hashes | Fresh stable version/deployment evidence; exactly one new candidate; exact sanitized detail and ETag; no deployment mutation | No/multiple candidates, removed predecessor, snapshot/hash mismatch, pagination drift, deployment drift, candidate deployed | Implemented and focused-tested |
+
+These tools deliberately have no deployment-create path. A successful version
+upload is only disabled candidate evidence; it never authorizes traffic or a
+later deployment.
+
 Use these to inspect Workers, settings, bindings, and event telemetry:
 
 - `list_workers`
 - `workers_list_scripts`
 - `get_worker_settings`
 - `workers_get_script_settings`
+- `workers_capture_version_evidence`
+- `workers_upload_version`
+- `workers_reconcile_version_upload`
 - `workers_upload_script`
 - `patch_worker_settings`
 - `workers_list_tails`
