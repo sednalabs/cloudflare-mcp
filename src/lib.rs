@@ -32,6 +32,7 @@ pub mod tunnel;
 pub mod upstream_oauth;
 pub mod verification;
 pub(crate) mod worker_upload;
+pub(crate) mod worker_version_attempt;
 pub(crate) mod worker_version_upload;
 
 pub type McpError = rmcp::ErrorData;

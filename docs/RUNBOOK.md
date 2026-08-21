@@ -1079,7 +1079,20 @@ not be deployed yet. It is intentionally separate from
    Review the body, normalized-metadata, and upload-contract SHA-256 values and
    retain the confirmation token. Dry-run performs no provider call.
 3. Apply once with unchanged inputs and the exact confirmation token. The MCP
-   re-captures the base and pre-state, sends one non-retrying version POST, and
+   requires `CLOUDFLARE_MCP_WORKER_VERSION_ATTEMPT_ROOT` to be a pre-created,
+   canonical, operator-owned mode-0700 directory shared by every MCP process
+   that can upload Worker versions. It checks this permanent custody before
+   provider preflight, re-captures the base and pre-state, then creates an
+   append-only `prepared.json` receipt beneath a confirmation-bound attempt
+   key. While the shared attempt guard remains held, it captures and matches
+   that pinned provider state again so a differently confirmed concurrent
+   attempt cannot dispatch from a stale snapshot. It then synchronizes the
+   append-only `dispatched.json` receipt before entering the one
+   non-retrying version POST. A complete response adds `terminal.json`; a
+   crash or response loss leaves prepared or dispatched evidence in place.
+   Any retained, conflicting, malformed, or concurrently owned attempt is
+   reconciliation-only across restart and can never authorize another POST.
+   Do not delete or repair an attempt namespace in place. The MCP then
    requires exactly one new candidate, exact candidate ID/ETag, exact allowed
    compatibility date/flags, response-to-readback script/runtime/version
    metadata projections, and a complete binding projection matching
@@ -1104,8 +1117,10 @@ not be deployed yet. It is intentionally separate from
    credential headers, response bodies, module bytes, metadata values, and
    binding values.
 
-If the upload response is lost, rejected, malformed, oversized, unexpectedly
-encoded, or followed by failed/contradictory readback, never repeat the POST.
+If the upload response is lost before or after provider visibility, rejected,
+malformed, oversized, unexpectedly encoded, or followed by
+failed/contradictory readback, never repeat the POST. The durable attempt state
+is authoritative even when provider inventory shows no new candidate.
 Call `workers_reconcile_version_upload` with the exact pinned pre-upload IDs,
 deployment projection and hashes, base ID/ETag, and dry-run upload-contract
 SHA-256. Reconciliation is read-only. Exactly one new version over the

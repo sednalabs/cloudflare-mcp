@@ -114,6 +114,10 @@ use crate::verification::{
 use crate::worker_upload::{
     WorkerUploadBody, WorkerUploadError, WorkerUploadInput, build_worker_upload,
 };
+use crate::worker_version_attempt::{
+    WorkerVersionAttemptError, WorkerVersionAttemptInput,
+    preflight_worker_version_dispatch_attempt, prepare_worker_version_dispatch_attempt,
+};
 use crate::worker_version_upload::build_worker_version_upload;
 use mcp_toolkit_core::tool_inventory::{ToolOperation, ToolSearchFilter, ToolSearchResponse};
 use mcp_toolkit_policy_core::{RestrictedSqlError, classify_restricted_sql};
@@ -8533,6 +8537,24 @@ impl CloudflareMcp {
                 false,
             ));
         }
+        let attempt_input = WorkerVersionAttemptInput {
+            account_id,
+            script_name,
+            confirmation_token: &required_confirmation_token,
+            upload_contract_sha256: &upload_contract_sha256,
+            base_version_id: &args.base_version_id,
+            base_version_etag: &args.base_version_etag,
+            pre_upload_version_snapshot_sha256: &args.pre_upload_version_snapshot_sha256,
+            pre_upload_deployment_snapshot_sha256: &args.pre_upload_deployment_snapshot_sha256,
+        };
+        if let Err(error) = preflight_worker_version_dispatch_attempt(&attempt_input) {
+            return Ok(finalize_mutation_result(
+                worker_version_attempt_error_result(error),
+                &plan,
+                audit,
+                false,
+            ));
+        }
         let pre_state = match self
             .cloudflare
             .capture_worker_version_state(
@@ -8612,6 +8634,106 @@ impl CloudflareMcp {
             }
             None => unreachable!("exact base detail is required by the pre-state proof"),
         };
+        let mut dispatch_attempt = match prepare_worker_version_dispatch_attempt(&attempt_input) {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                return Ok(finalize_mutation_result(
+                    worker_version_attempt_error_result(error),
+                    &plan,
+                    audit,
+                    false,
+                ));
+            }
+        };
+        let dispatch_pre_state = match self
+            .cloudflare
+            .capture_worker_version_state(
+                account_id,
+                script_name,
+                args.per_page,
+                Some(&args.base_version_id),
+                None,
+            )
+            .await
+        {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return Ok(finalize_mutation_result(
+                    CallToolResult::structured_error(json!({
+                        "ok": false,
+                        "operation": "workers_upload_version",
+                        "status": "reconciliation_required",
+                        "error": {
+                            "code": "workers.version_upload_dispatch_pre_state_unavailable",
+                            "message": "pinned pre-upload state could not be revalidated while the durable attempt guard was held",
+                            "hint": "Do not replay this prepared attempt. Preserve its custody and reconcile the pinned provider state.",
+                            "cause": error,
+                            "retryable": false,
+                            "outcome_ambiguous": false,
+                        },
+                        "dispatch_attempt_authority": dispatch_attempt.evidence("prepared"),
+                        "provider_request_lifecycle": {
+                            "request_prepared": true,
+                            "dispatch_attempted": false,
+                            "provider_response_received": false,
+                        },
+                        "deployment_created": false,
+                        "retry_decision": "do_not_retry; prepared custody is permanent",
+                    })),
+                    &plan,
+                    audit,
+                    false,
+                ));
+            }
+        };
+        let dispatch_base_matches = dispatch_pre_state
+            .detail
+            .as_ref()
+            .is_some_and(|detail| detail.script_etag == args.base_version_etag);
+        if dispatch_pre_state.versions.semantic_snapshot_sha256
+            != args.pre_upload_version_snapshot_sha256
+            || dispatch_pre_state.deployments.semantic_snapshot_sha256
+                != args.pre_upload_deployment_snapshot_sha256
+            || !dispatch_base_matches
+        {
+            return Ok(finalize_mutation_result(
+                CallToolResult::structured_error(json!({
+                    "ok": false,
+                    "operation": "workers_upload_version",
+                    "status": "reconciliation_required",
+                    "error": {
+                        "code": "workers.version_upload_dispatch_pre_state_drift",
+                        "message": "pinned pre-upload state changed before the attempt could be consumed for provider dispatch",
+                        "hint": "Do not replay this prepared attempt. Preserve its custody and review a new independently confirmed attempt against fresh provider evidence.",
+                        "retryable": false,
+                        "outcome_ambiguous": false,
+                    },
+                    "dispatch_attempt_authority": dispatch_attempt.evidence("prepared"),
+                    "dispatch_pre_upload_state": dispatch_pre_state,
+                    "provider_request_lifecycle": {
+                        "request_prepared": true,
+                        "dispatch_attempted": false,
+                        "provider_response_received": false,
+                    },
+                    "deployment_created": false,
+                    "retry_decision": "do_not_retry; prepared custody is permanent",
+                })),
+                &plan,
+                audit,
+                false,
+            ));
+        }
+        let dispatched_attempt = match dispatch_attempt.consume_for_dispatch() {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return Ok(finalize_mutation_result(
+                    worker_version_attempt_error_result(error),
+                    &plan,
+                    audit,
+                    false,
+                ));
+            }
+        };
         let upload = match self
             .cloudflare
             .upload_worker_version_once(
@@ -8625,6 +8747,25 @@ impl CloudflareMcp {
             Ok(evidence) => evidence,
             Err(error) => {
                 let provider_request_lifecycle = error.provider_request_lifecycle;
+                let response_artifact_sha256 = error.response_artifact_sha256.clone();
+                let terminal_attempt = match dispatch_attempt.mark_terminal(
+                    "provider_outcome_ambiguous_or_rejected",
+                    response_artifact_sha256.as_deref(),
+                ) {
+                    Ok(evidence) => evidence,
+                    Err(custody_error) => {
+                        return Ok(finalize_mutation_result(
+                            worker_version_attempt_terminal_error_result(
+                                custody_error,
+                                &dispatched_attempt,
+                                provider_request_lifecycle.provider_response_received,
+                            ),
+                            &plan,
+                            audit,
+                            false,
+                        ));
+                    }
+                };
                 return Ok(finalize_mutation_result(
                     CallToolResult::structured_error(json!({
                         "ok": false,
@@ -8632,10 +8773,25 @@ impl CloudflareMcp {
                         "error": error,
                         "upload": upload_summary,
                         "pre_upload_state": pre_state,
+                        "dispatch_attempt_authority": terminal_attempt,
                         "provider_request_lifecycle": provider_request_lifecycle,
                         "deployment_created": false,
                         "retry_decision": "do_not_retry; use workers_reconcile_version_upload against the pinned pre-upload snapshot",
                     })),
+                    &plan,
+                    audit,
+                    false,
+                ));
+            }
+        };
+        let terminal_attempt = match dispatch_attempt.mark_terminal(
+            "provider_response_received",
+            Some(&upload.provider_proof.response_artifact_sha256),
+        ) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return Ok(finalize_mutation_result(
+                    worker_version_attempt_terminal_error_result(error, &dispatched_attempt, true),
                     &plan,
                     audit,
                     false,
@@ -8667,6 +8823,7 @@ impl CloudflareMcp {
                         },
                         "upload_result": upload,
                         "pre_upload_state": pre_state,
+                        "dispatch_attempt_authority": terminal_attempt,
                         "provider_request_lifecycle": {
                             "request_prepared": true,
                             "dispatch_attempted": true,
@@ -8746,6 +8903,7 @@ impl CloudflareMcp {
                     "upload_result": upload,
                     "pre_upload_state": pre_state,
                     "post_upload_state": post_state,
+                    "dispatch_attempt_authority": terminal_attempt,
                     "binding_verification": binding_verification,
                     "runtime_verification": runtime_verification,
                     "provider_request_lifecycle": {
@@ -8793,6 +8951,7 @@ impl CloudflareMcp {
                 "upload_result": upload,
                 "pre_upload_state": pre_state,
                 "post_upload_state": post_state,
+                "dispatch_attempt_authority": terminal_attempt,
                 "binding_verification": binding_verification,
                 "runtime_verification": runtime_verification,
                 "bindings_inherit": "strict",
@@ -12771,6 +12930,62 @@ fn worker_version_operation_error_result(
         "operation": operation,
         "error": error,
         "deployment_created": false,
+    }))
+}
+
+fn worker_version_attempt_error_result(error: WorkerVersionAttemptError) -> CallToolResult {
+    let state = error.evidence.as_ref().map(|evidence| evidence.state);
+    let request_prepared = state.is_some();
+    let dispatch_attempted = matches!(state, Some("dispatched" | "terminal"));
+    let outcome_ambiguous = dispatch_attempted
+        || error.code == "workers.version_upload_attempt_guard_locked"
+        || error.code == "workers.version_upload_attempt_custody_malformed";
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": "workers_upload_version",
+        "status": "reconciliation_required",
+        "error": {
+            "code": error.code,
+            "message": error.message,
+            "hint": error.hint,
+            "retryable": false,
+            "outcome_ambiguous": outcome_ambiguous,
+        },
+        "dispatch_attempt_authority": error.evidence,
+        "provider_request_lifecycle": {
+            "request_prepared": request_prepared,
+            "dispatch_attempted": dispatch_attempted,
+            "provider_response_received": false,
+        },
+        "deployment_created": false,
+        "retry_decision": "do_not_retry; preserve custody and reconcile the pinned provider state",
+    }))
+}
+
+fn worker_version_attempt_terminal_error_result(
+    error: WorkerVersionAttemptError,
+    dispatched_attempt: &crate::worker_version_attempt::WorkerVersionAttemptEvidence,
+    provider_response_received: bool,
+) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": "workers_upload_version",
+        "status": "reconciliation_required",
+        "error": {
+            "code": error.code,
+            "message": error.message,
+            "hint": error.hint,
+            "retryable": false,
+            "outcome_ambiguous": true,
+        },
+        "dispatch_attempt_authority": dispatched_attempt,
+        "provider_request_lifecycle": {
+            "request_prepared": true,
+            "dispatch_attempted": true,
+            "provider_response_received": provider_response_received,
+        },
+        "deployment_created": false,
+        "retry_decision": "do_not_retry; dispatched custody is durable even though terminal custody failed",
     }))
 }
 

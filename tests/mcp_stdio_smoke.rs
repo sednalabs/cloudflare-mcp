@@ -18231,8 +18231,27 @@ fn workers_upload_version_rejects_symlink_artifact_before_provider_access() {
 
 #[test]
 fn workers_upload_version_stdio_applies_once_and_proves_disabled_candidate() {
-    let (base_url, requests) = spawn_fake_worker_version_api(16);
-    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    use std::os::unix::fs::PermissionsExt;
+
+    let (base_url, requests) = spawn_fake_worker_version_api(21);
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos();
+    let attempt_root = std::env::temp_dir().join(format!(
+        "cloudflare-mcp-version-attempt-{}-{suffix}",
+        std::process::id()
+    ));
+    fs::create_dir(&attempt_root).expect("create attempt root");
+    fs::set_permissions(&attempt_root, fs::Permissions::from_mode(0o700))
+        .expect("make attempt root private");
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_WORKER_VERSION_ATTEMPT_ROOT",
+            attempt_root.to_str().expect("UTF-8 root").to_string(),
+        ),
+    ]);
     let base_id = "11111111-1111-4111-8111-111111111111";
     let candidate_id = "22222222-2222-4222-8222-222222222222";
 
@@ -18289,6 +18308,7 @@ fn workers_upload_version_stdio_applies_once_and_proves_disabled_candidate() {
     let mut apply_args = upload_args;
     apply_args["dry_run"] = json!(false);
     apply_args["confirmation_token"] = dry_run_content["required_confirmation_token"].clone();
+    let replay_args = apply_args.clone();
     let apply = mcp.call_tool(4, "workers_upload_version", apply_args);
     let apply_content = structured_content(&apply);
     assert_eq!(apply_content["ok"], json!(true), "{apply_content}");
@@ -18314,6 +18334,14 @@ fn workers_upload_version_stdio_applies_once_and_proves_disabled_candidate() {
     );
     assert_eq!(apply_content["deployment_created"], json!(false));
     assert_eq!(
+        apply_content["dispatch_attempt_authority"]["state"],
+        json!("terminal")
+    );
+    assert_eq!(
+        apply_content["dispatch_attempt_authority"]["reconciliation_only"],
+        json!(true)
+    );
+    assert_eq!(
         apply_content["provider_request_lifecycle"],
         json!({
             "request_prepared": true,
@@ -18337,13 +18365,32 @@ fn workers_upload_version_stdio_applies_once_and_proves_disabled_candidate() {
     assert!(!outward.contains("private-fixture-value"));
     assert!(!outward.contains("never-surface"));
 
+    let replay = mcp.call_tool(5, "workers_upload_version", replay_args);
+    let replay_content = structured_content(&replay);
+    assert_eq!(replay_content["ok"], json!(false), "{replay_content}");
+    assert_eq!(
+        replay_content["error"]["code"],
+        json!("workers.version_upload_attempt_reconciliation_required")
+    );
+    assert_eq!(
+        replay_content["dispatch_attempt_authority"]["state"],
+        json!("terminal")
+    );
+
     let requests = requests.lock().expect("request log lock");
-    assert_eq!(requests.len(), 16);
+    assert_eq!(requests.len(), 21);
     let posts = requests
         .iter()
         .filter(|request| request["method"] == json!("POST"))
         .collect::<Vec<_>>();
     assert_eq!(posts.len(), 1, "{requests:?}");
+    assert_eq!(
+        requests
+            .iter()
+            .position(|request| request["method"] == json!("POST")),
+        Some(15),
+        "the pinned provider state must be captured a third time while durable attempt custody is held and before POST: {requests:?}"
+    );
     assert!(
         posts[0]["path"]
             .as_str()
@@ -18362,6 +18409,9 @@ fn workers_upload_version_stdio_applies_once_and_proves_disabled_candidate() {
                 .unwrap_or_default()
                 .contains("/deployments")
     }));
+    drop(requests);
+    mcp.terminate();
+    fs::remove_dir_all(attempt_root).expect("remove attempt root");
 }
 
 #[test]

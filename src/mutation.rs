@@ -558,6 +558,27 @@ pub fn plan_upload_worker_version(
             }),
         )
         .step(
+            "persist_one_use_dispatch_attempt",
+            true,
+            json!({
+                "account_id": account_id,
+                "script_name": script_name,
+                "authority": "confirmation_and_pre_state_bound",
+                "transition": "prepared_to_dispatched_before_provider_post",
+            }),
+        )
+        .step(
+            "revalidate_pinned_pre_upload_state_under_attempt_guard",
+            false,
+            json!({
+                "account_id": account_id,
+                "script_name": script_name,
+                "base_version_id": base_version_id,
+                "version_snapshot_sha256": pre_upload_version_snapshot_sha256,
+                "deployment_snapshot_sha256": pre_upload_deployment_snapshot_sha256,
+            }),
+        )
+        .step(
             "upload_disabled_worker_version",
             true,
             json!({
