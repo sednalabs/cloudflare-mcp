@@ -17983,6 +17983,57 @@ fn workers_upload_version_rejects_non_strict_inheritance_before_provider_access(
 }
 
 #[test]
+fn workers_upload_version_rejects_symlink_artifact_before_provider_access() {
+    use std::os::unix::fs::symlink;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "cloudflare-mcp-version-symlink-{}-{suffix}",
+        std::process::id()
+    ));
+    fs::create_dir(&directory).expect("create fixture directory");
+    let target = directory.join("private-target.js");
+    let link = directory.join("candidate.js");
+    fs::write(&target, b"private-source-content").expect("write target");
+    symlink(&target, &link).expect("create symlink");
+
+    let (base_url, requests) = spawn_fake_worker_upload_api(0);
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let response = mcp.call_tool(
+        2,
+        "workers_upload_version",
+        json!({
+            "script_name":"worker-a",
+            "base_version_id":"11111111-1111-4111-8111-111111111111",
+            "base_version_etag":"a".repeat(64),
+            "pre_upload_version_snapshot_sha256":"b".repeat(64),
+            "pre_upload_deployment_snapshot_sha256":"c".repeat(64),
+            "bindings_inherit":"strict",
+            "main_module":"index.js",
+            "script_path":link,
+            "metadata":{"main_module":"index.js","bindings":[]},
+            "dry_run":true
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(
+        content["error"]["code"],
+        json!("workers.upload_file_not_regular")
+    );
+    let outward = content.to_string();
+    assert!(!outward.contains("candidate.js"));
+    assert!(!outward.contains("private-target.js"));
+    assert!(!outward.contains("private-source-content"));
+    assert!(requests.lock().expect("request log lock").is_empty());
+    fs::remove_dir_all(directory).expect("remove fixture directory");
+}
+
+#[test]
 fn workers_upload_version_stdio_applies_once_and_proves_disabled_candidate() {
     let (base_url, requests) = spawn_fake_worker_version_api(16);
     let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);

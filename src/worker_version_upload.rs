@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::worker_upload::{
@@ -14,6 +14,7 @@ const MAX_BINDINGS: usize = 256;
 pub(crate) struct WorkerVersionUploadArtifact {
     pub(crate) content_type: String,
     pub(crate) body: Vec<u8>,
+    pub(crate) canonical_metadata: Value,
     pub(crate) summary: WorkerVersionUploadSummary,
 }
 
@@ -36,7 +37,6 @@ pub(crate) fn build_worker_version_upload(
     input: WorkerUploadInput<'_>,
     base_version_id: &str,
 ) -> Result<WorkerVersionUploadArtifact, WorkerUploadError> {
-    let metadata_value = input.metadata;
     let base_version_id = canonical_version_id(base_version_id).map_err(|message| {
         version_upload_error(
             "workers.version_upload_base_version_invalid",
@@ -44,17 +44,23 @@ pub(crate) fn build_worker_version_upload(
             "Provide the exact canonical base version ID captured by workers_capture_version_evidence.",
         )
     })?;
-    let metadata = metadata_value.as_object().ok_or_else(|| {
+    let metadata = input.metadata.as_object().ok_or_else(|| {
         version_upload_error(
             "workers.version_upload_metadata_invalid",
             "metadata must be a complete JSON object for a Worker version upload",
             "Provide the reviewed version metadata, including main_module and the complete binding plan.",
         )
     })?;
+    let (canonical_metadata, inherited_binding_count, explicit_binding_count) =
+        canonicalize_version_metadata(metadata, &base_version_id)?;
+    let metadata = canonical_metadata
+        .as_object()
+        .expect("canonical version metadata is an object");
     let main_module = metadata
         .get("main_module")
         .and_then(Value::as_str)
         .and_then(canonical_nonempty)
+        .map(str::to_string)
         .ok_or_else(|| {
             version_upload_error(
                 "workers.version_upload_main_module_missing",
@@ -65,7 +71,7 @@ pub(crate) fn build_worker_version_upload(
     if input
         .main_module
         .and_then(canonical_nonempty)
-        .is_some_and(|requested| requested != main_module)
+        .is_some_and(|requested| requested != main_module.as_str())
     {
         return Err(version_upload_error(
             "workers.version_upload_main_module_conflict",
@@ -73,13 +79,16 @@ pub(crate) fn build_worker_version_upload(
             "Use one byte-identical main module identity in the reviewed metadata and module artifact.",
         ));
     }
-    let (inherited_binding_count, explicit_binding_count) =
-        validate_bindings(metadata_value, &base_version_id)?;
     let upload = build_worker_upload(WorkerUploadInput {
-        main_module: Some(main_module),
-        ..input
+        script_path: input.script_path,
+        script_content: input.script_content,
+        script_content_base64: input.script_content_base64,
+        multipart_path: input.multipart_path,
+        main_module: Some(&main_module),
+        metadata: &canonical_metadata,
+        content_type: input.content_type,
     })?;
-    let metadata_bytes = serde_json::to_vec(metadata_value).map_err(|_| {
+    let metadata_bytes = serde_json::to_vec(&canonical_metadata).map_err(|_| {
         version_upload_error(
             "workers.version_upload_metadata_invalid",
             "metadata could not be serialized canonically",
@@ -125,7 +134,7 @@ pub(crate) fn build_worker_version_upload(
             content_type,
             bytes,
         } => {
-            validate_multipart_metadata(&content_type, &bytes, metadata_value, main_module)?;
+            validate_multipart_metadata(&content_type, &bytes, &canonical_metadata, &main_module)?;
             ("multipart", content_type, bytes)
         }
     };
@@ -149,13 +158,14 @@ pub(crate) fn build_worker_version_upload(
     Ok(WorkerVersionUploadArtifact {
         content_type,
         body,
+        canonical_metadata,
         summary: WorkerVersionUploadSummary {
             source_kind,
             size_bytes: body_size_bytes,
             body_sha256,
             metadata_sha256,
             metadata_keys,
-            main_module: main_module.to_string(),
+            main_module,
             base_version_id,
             bindings_inherit: "strict",
             inherited_binding_count,
@@ -165,12 +175,13 @@ pub(crate) fn build_worker_version_upload(
     })
 }
 
-fn validate_bindings(
-    metadata: &Value,
+fn canonicalize_version_metadata(
+    metadata: &Map<String, Value>,
     base_version_id: &str,
-) -> Result<(usize, usize), WorkerUploadError> {
+) -> Result<(Value, usize, usize), WorkerUploadError> {
+    let mut canonical_metadata = metadata.clone();
     let Some(bindings) = metadata.get("bindings") else {
-        return Ok((0, 0));
+        return Ok((Value::Object(canonical_metadata), 0, 0));
     };
     let bindings = bindings.as_array().ok_or_else(|| {
         version_upload_error(
@@ -189,6 +200,7 @@ fn validate_bindings(
     let mut names = BTreeSet::new();
     let mut inherited = 0usize;
     let mut explicit = 0usize;
+    let mut canonical_bindings = Vec::with_capacity(bindings.len());
     for binding in bindings {
         let binding = binding.as_object().ok_or_else(|| {
             version_upload_error(
@@ -197,17 +209,11 @@ fn validate_bindings(
                 "Provide a complete typed binding object.",
             )
         })?;
-        let name = binding
+        let canonical = canonicalize_binding(binding, Some(base_version_id))?;
+        let name = canonical
             .get("name")
             .and_then(Value::as_str)
-            .and_then(canonical_nonempty)
-            .ok_or_else(|| {
-                version_upload_error(
-                    "workers.version_upload_binding_invalid",
-                    "every binding must have a canonical non-empty name",
-                    "Correct the reviewed binding plan before upload.",
-                )
-            })?;
+            .expect("canonical binding has a name");
         if !names.insert(name.to_string()) {
             return Err(version_upload_error(
                 "workers.version_upload_binding_duplicate",
@@ -215,29 +221,62 @@ fn validate_bindings(
                 "Each binding name must appear exactly once in the complete upload metadata.",
             ));
         }
-        let binding_type = binding
+        let binding_type = canonical
             .get("type")
             .and_then(Value::as_str)
-            .and_then(canonical_nonempty)
-            .ok_or_else(|| {
+            .expect("canonical binding has a type");
+        if binding_type == "inherit" {
+            inherited += 1;
+        } else {
+            explicit += 1;
+        }
+        canonical_bindings.push(Value::Object(canonical));
+    }
+    canonical_metadata.insert("bindings".to_string(), Value::Array(canonical_bindings));
+    Ok((Value::Object(canonical_metadata), inherited, explicit))
+}
+
+pub(crate) fn canonicalize_provider_binding(
+    binding: &Map<String, Value>,
+) -> Result<Map<String, Value>, WorkerUploadError> {
+    canonicalize_binding(binding, None)
+}
+
+fn canonicalize_binding(
+    binding: &Map<String, Value>,
+    upload_base_version_id: Option<&str>,
+) -> Result<Map<String, Value>, WorkerUploadError> {
+    let name = binding
+        .get("name")
+        .and_then(Value::as_str)
+        .and_then(canonical_binding_name)
+        .ok_or_else(binding_invalid)?;
+    let binding_type = binding
+        .get("type")
+        .and_then(Value::as_str)
+        .and_then(canonical_binding_type)
+        .ok_or_else(binding_invalid)?;
+    let mut canonical = Map::new();
+    canonical.insert("name".to_string(), Value::String(name.to_string()));
+    canonical.insert("type".to_string(), Value::String(binding_type.to_string()));
+
+    match binding_type {
+        "inherit" => {
+            require_only_fields(binding, &["name", "type", "old_name", "version_id"])?;
+            let base_version_id = upload_base_version_id.ok_or_else(|| {
                 version_upload_error(
-                    "workers.version_upload_binding_invalid",
-                    "every binding must have a canonical non-empty type",
-                    "Correct the reviewed binding plan before upload.",
+                    "workers.version_binding_provider_inherit_invalid",
+                    "provider version detail contained an unresolved inherit binding",
+                    "Treat the provider binding projection as malformed.",
                 )
             })?;
-        if binding_type == "inherit" {
-            let inherited_from = binding
-                .get("version_id")
-                .and_then(Value::as_str)
-                .and_then(canonical_nonempty)
-                .ok_or_else(|| {
-                    version_upload_error(
-                        "workers.version_upload_inherit_base_missing",
-                        "every inherit binding must name the exact base version_id",
-                        "Never use implicit or explicit latest inheritance for a guarded version upload.",
-                    )
-                })?;
+            let inherited_from = required_nonempty_string(binding, "version_id").map_err(|_| {
+                version_upload_error(
+                    "workers.version_upload_inherit_base_missing",
+                    "every inherit binding must name the exact base version_id",
+                    "Never use implicit or explicit latest inheritance for a guarded version upload.",
+                )
+            })?;
             if inherited_from == "latest" || inherited_from != base_version_id {
                 return Err(version_upload_error(
                     "workers.version_upload_inherit_base_mismatch",
@@ -245,19 +284,211 @@ fn validate_bindings(
                     "Set every inherit binding version_id to the exact reviewed base version ID.",
                 ));
             }
-            inherited += 1;
-        } else {
-            if binding.contains_key("version_id") {
-                return Err(version_upload_error(
-                    "workers.version_upload_binding_invalid",
-                    "only inherit bindings may contain version_id",
-                    "Correct the reviewed binding plan before upload.",
-                ));
+            canonical.insert(
+                "version_id".to_string(),
+                Value::String(inherited_from.to_string()),
+            );
+            if let Some(old_name) = optional_nonempty_string(binding, "old_name")? {
+                let old_name = canonical_binding_name(old_name).ok_or_else(binding_invalid)?;
+                canonical.insert("old_name".to_string(), Value::String(old_name.to_string()));
             }
-            explicit += 1;
+        }
+        "d1" => {
+            require_only_fields(binding, &["name", "type", "database_id", "id"])?;
+            let database_id = optional_nonempty_string(binding, "database_id")?;
+            let deprecated_id = optional_nonempty_string(binding, "id")?;
+            let database_id = match (database_id, deprecated_id) {
+                (Some(current), Some(deprecated)) if current == deprecated => current,
+                (Some(_), Some(_)) => {
+                    return Err(version_upload_error(
+                        "workers.version_binding_alias_conflict",
+                        "D1 binding database_id and deprecated id disagreed",
+                        "Use one canonical database_id value.",
+                    ));
+                }
+                (Some(current), None) => current,
+                (None, Some(deprecated)) => deprecated,
+                (None, None) => return Err(binding_invalid()),
+            };
+            canonical.insert(
+                "database_id".to_string(),
+                Value::String(database_id.to_string()),
+            );
+        }
+        "ai_search" => {
+            require_only_fields(binding, &["name", "type", "instance_name", "namespace"])?;
+            insert_required_string(&mut canonical, binding, "instance_name")?;
+            let namespace = optional_nonempty_string(binding, "namespace")?.unwrap_or("default");
+            canonical.insert(
+                "namespace".to_string(),
+                Value::String(namespace.to_string()),
+            );
+        }
+        "ai_search_namespace" => {
+            require_only_fields(binding, &["name", "type", "namespace"])?;
+            insert_required_string(&mut canonical, binding, "namespace")?;
+        }
+        "plain_text" | "secret_text" => {
+            require_only_fields(binding, &["name", "type", "text"])?;
+            insert_required_string_allow_empty(&mut canonical, binding, "text")?;
+        }
+        "json" => {
+            require_only_fields(binding, &["name", "type", "json"])?;
+            let value = binding.get("json").ok_or_else(binding_invalid)?;
+            canonical.insert("json".to_string(), value.clone());
+        }
+        "service" => {
+            require_only_fields(
+                binding,
+                &["name", "type", "service", "environment", "entrypoint"],
+            )?;
+            insert_required_string(&mut canonical, binding, "service")?;
+            insert_optional_string(&mut canonical, binding, "environment")?;
+            insert_optional_string(&mut canonical, binding, "entrypoint")?;
+        }
+        "r2_bucket" => {
+            require_only_fields(binding, &["name", "type", "bucket_name", "jurisdiction"])?;
+            insert_required_string(&mut canonical, binding, "bucket_name")?;
+            if let Some(jurisdiction) = optional_nonempty_string(binding, "jurisdiction")? {
+                if !matches!(jurisdiction, "eu" | "fedramp" | "fedramp-high") {
+                    return Err(binding_invalid());
+                }
+                canonical.insert(
+                    "jurisdiction".to_string(),
+                    Value::String(jurisdiction.to_string()),
+                );
+            }
+        }
+        "queue" => canonicalize_one_string_field(binding, &mut canonical, "queue_name")?,
+        "analytics_engine" => canonicalize_one_string_field(binding, &mut canonical, "dataset")?,
+        "kv_namespace" => canonicalize_one_string_field(binding, &mut canonical, "namespace_id")?,
+        "vectorize" => canonicalize_one_string_field(binding, &mut canonical, "index_name")?,
+        "hyperdrive" => canonicalize_one_string_field(binding, &mut canonical, "id")?,
+        "pipelines" => canonicalize_one_string_field(binding, &mut canonical, "pipeline")?,
+        "mtls_certificate" => {
+            canonicalize_one_string_field(binding, &mut canonical, "certificate_id")?
+        }
+        "messaging" => canonicalize_one_string_field(binding, &mut canonical, "namespace")?,
+        "secrets_store_secret" => {
+            require_only_fields(binding, &["name", "type", "secret_name", "store_id"])?;
+            insert_required_string(&mut canonical, binding, "secret_name")?;
+            insert_required_string(&mut canonical, binding, "store_id")?;
+        }
+        "ai" | "assets" | "browser" | "images" | "media" | "version_metadata" => {
+            require_only_fields(binding, &["name", "type"])?;
+        }
+        _ => {
+            return Err(version_upload_error(
+                "workers.version_binding_type_unsupported",
+                "binding type is outside the closed guarded version-upload projection",
+                "Use a supported canonical binding or extend the projection in a reviewed change.",
+            ));
         }
     }
-    Ok((inherited, explicit))
+    Ok(canonical)
+}
+
+fn canonicalize_one_string_field(
+    binding: &Map<String, Value>,
+    canonical: &mut Map<String, Value>,
+    field: &'static str,
+) -> Result<(), WorkerUploadError> {
+    require_only_fields(binding, &["name", "type", field])?;
+    insert_required_string(canonical, binding, field)
+}
+
+fn insert_required_string(
+    canonical: &mut Map<String, Value>,
+    binding: &Map<String, Value>,
+    field: &'static str,
+) -> Result<(), WorkerUploadError> {
+    let value = required_nonempty_string(binding, field)?;
+    canonical.insert(field.to_string(), Value::String(value.to_string()));
+    Ok(())
+}
+
+fn insert_required_string_allow_empty(
+    canonical: &mut Map<String, Value>,
+    binding: &Map<String, Value>,
+    field: &'static str,
+) -> Result<(), WorkerUploadError> {
+    let value = binding
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(binding_invalid)?;
+    canonical.insert(field.to_string(), Value::String(value.to_string()));
+    Ok(())
+}
+
+fn insert_optional_string(
+    canonical: &mut Map<String, Value>,
+    binding: &Map<String, Value>,
+    field: &'static str,
+) -> Result<(), WorkerUploadError> {
+    if let Some(value) = optional_nonempty_string(binding, field)? {
+        canonical.insert(field.to_string(), Value::String(value.to_string()));
+    }
+    Ok(())
+}
+
+fn required_nonempty_string<'a>(
+    binding: &'a Map<String, Value>,
+    field: &str,
+) -> Result<&'a str, WorkerUploadError> {
+    optional_nonempty_string(binding, field)?.ok_or_else(binding_invalid)
+}
+
+fn optional_nonempty_string<'a>(
+    binding: &'a Map<String, Value>,
+    field: &str,
+) -> Result<Option<&'a str>, WorkerUploadError> {
+    match binding.get(field) {
+        None => Ok(None),
+        Some(Value::String(value)) => canonical_nonempty(value)
+            .map(Some)
+            .ok_or_else(binding_invalid),
+        Some(_) => Err(binding_invalid()),
+    }
+}
+
+fn require_only_fields(
+    binding: &Map<String, Value>,
+    allowed: &[&str],
+) -> Result<(), WorkerUploadError> {
+    if binding.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err(version_upload_error(
+            "workers.version_binding_unknown_field",
+            "binding contained a field outside its closed canonical projection",
+            "Remove unknown fields or extend the projection in a reviewed change.",
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_binding_name(value: &str) -> Option<&str> {
+    let mut bytes = value.bytes();
+    let first = bytes.next()?;
+    (value.len() <= 128
+        && (first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
+    .then_some(value)
+}
+
+fn canonical_binding_type(value: &str) -> Option<&str> {
+    (!value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'))
+    .then_some(value)
+}
+
+fn binding_invalid() -> WorkerUploadError {
+    version_upload_error(
+        "workers.version_upload_binding_invalid",
+        "binding did not match its closed canonical field and value contract",
+        "Correct the reviewed binding plan before upload.",
+    )
 }
 
 fn deterministic_module_multipart(
@@ -469,9 +700,9 @@ fn version_upload_error(
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
 
-    use super::build_worker_version_upload;
+    use super::{build_worker_version_upload, canonicalize_provider_binding};
     use crate::worker_upload::WorkerUploadInput;
 
     const BASE: &str = "11111111-1111-4111-8111-111111111111";
@@ -524,5 +755,176 @@ mod tests {
         )
         .expect_err("must fail");
         assert_eq!(error.code, "workers.version_upload_inherit_base_missing");
+    }
+
+    #[test]
+    fn canonical_bindings_remain_exact_and_ai_search_default_is_explicit() {
+        let metadata = json!({
+            "main_module":"index.js",
+            "bindings":[
+                {"name":"DB","type":"d1","database_id":"db-canonical"},
+                {"name":"SEARCH","type":"ai_search","instance_name":"articles"}
+            ]
+        });
+        let artifact = build_worker_version_upload(
+            WorkerUploadInput {
+                script_path: None,
+                script_content: Some("export default {}"),
+                script_content_base64: None,
+                multipart_path: None,
+                main_module: Some("index.js"),
+                metadata: &metadata,
+                content_type: None,
+            },
+            BASE,
+        )
+        .expect("canonical upload");
+        assert_eq!(
+            artifact.canonical_metadata["bindings"][0],
+            json!({"name":"DB","type":"d1","database_id":"db-canonical"})
+        );
+        assert_eq!(
+            artifact.canonical_metadata["bindings"][1],
+            json!({
+                "name":"SEARCH",
+                "type":"ai_search",
+                "instance_name":"articles",
+                "namespace":"default"
+            })
+        );
+
+        let omitted = json!({"name":"SEARCH","type":"ai_search","instance_name":"articles"});
+        let explicit = json!({
+            "name":"SEARCH",
+            "type":"ai_search",
+            "instance_name":"articles",
+            "namespace":"default"
+        });
+        assert_eq!(
+            canonicalize_provider_binding(omitted.as_object().expect("binding"))
+                .expect("omitted default"),
+            canonicalize_provider_binding(explicit.as_object().expect("binding"))
+                .expect("explicit default")
+        );
+    }
+
+    #[test]
+    fn deprecated_d1_id_alias_normalizes_before_request_hashing() {
+        let canonical_metadata = json!({
+            "main_module":"index.js",
+            "bindings":[{"name":"DB","type":"d1","database_id":"db-1"}]
+        });
+        let deprecated_metadata = json!({
+            "main_module":"index.js",
+            "bindings":[{"name":"DB","type":"d1","id":"db-1"}]
+        });
+        let build = |metadata: &Value| {
+            build_worker_version_upload(
+                WorkerUploadInput {
+                    script_path: None,
+                    script_content: Some("export default {}"),
+                    script_content_base64: None,
+                    multipart_path: None,
+                    main_module: Some("index.js"),
+                    metadata,
+                    content_type: None,
+                },
+                BASE,
+            )
+            .expect("version upload")
+        };
+        let canonical = build(&canonical_metadata);
+        let deprecated = build(&deprecated_metadata);
+        assert_eq!(canonical.canonical_metadata, deprecated.canonical_metadata);
+        assert_eq!(
+            canonical.summary.metadata_sha256,
+            deprecated.summary.metadata_sha256
+        );
+        assert_eq!(
+            canonical.summary.body_sha256,
+            deprecated.summary.body_sha256
+        );
+        assert_eq!(
+            deprecated.canonical_metadata["bindings"][0],
+            json!({"name":"DB","type":"d1","database_id":"db-1"})
+        );
+
+        let conflicting = json!({
+            "main_module":"index.js",
+            "bindings":[{
+                "name":"DB",
+                "type":"d1",
+                "database_id":"db-1",
+                "id":"db-2"
+            }]
+        });
+        let error = build_worker_version_upload(
+            WorkerUploadInput {
+                script_path: None,
+                script_content: Some("export default {}"),
+                script_content_base64: None,
+                multipart_path: None,
+                main_module: Some("index.js"),
+                metadata: &conflicting,
+                content_type: None,
+            },
+            BASE,
+        )
+        .expect_err("conflicting aliases must fail");
+        assert_eq!(error.code, "workers.version_binding_alias_conflict");
+    }
+
+    #[test]
+    fn unknown_binding_fields_fail_before_artifact_construction() {
+        let metadata = json!({
+            "main_module":"index.js",
+            "bindings":[{
+                "name":"DB",
+                "type":"d1",
+                "database_id":"db-1",
+                "unreviewed":"must-not-be-ignored"
+            }]
+        });
+        let error = build_worker_version_upload(
+            WorkerUploadInput {
+                script_path: None,
+                script_content: Some("export default {}"),
+                script_content_base64: None,
+                multipart_path: None,
+                main_module: Some("index.js"),
+                metadata: &metadata,
+                content_type: None,
+            },
+            BASE,
+        )
+        .expect_err("unknown field must fail");
+        assert_eq!(error.code, "workers.version_binding_unknown_field");
+        assert!(
+            !serde_json::to_string(&error.payload())
+                .expect("serialize error")
+                .contains("must-not-be-ignored")
+        );
+    }
+
+    #[test]
+    fn provider_normalization_preserves_semantic_drift() {
+        let expected = json!({
+            "name":"SEARCH",
+            "type":"ai_search",
+            "instance_name":"articles"
+        });
+        let drifted = json!({
+            "name":"SEARCH",
+            "type":"ai_search",
+            "instance_name":"articles",
+            "namespace":"tenant-a"
+        });
+        let expected = canonicalize_provider_binding(expected.as_object().expect("binding"))
+            .expect("expected projection");
+        let drifted = canonicalize_provider_binding(drifted.as_object().expect("binding"))
+            .expect("drifted projection");
+        assert_ne!(expected, drifted);
+        assert_eq!(expected["namespace"], json!("default"));
+        assert_eq!(drifted["namespace"], json!("tenant-a"));
     }
 }

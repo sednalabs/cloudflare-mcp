@@ -1059,8 +1059,13 @@ not be deployed yet. It is intentionally separate from
    pre-state evidence, one reviewed module or multipart artifact, complete
    metadata, and `bindings_inherit:"strict"`. Every inherited binding must
    explicitly name the exact base version; never use implicit or `latest`
-   inheritance. Review the body, metadata, and upload-contract SHA-256 values
-   and retain the confirmation token. Dry-run performs no provider call.
+   inheritance. Path artifacts are opened once without following a final
+   symlink and are validated, bounded, and read through that same descriptor.
+   The closed binding projection rejects unknown types or fields and normalizes
+   only documented representation equivalence: deprecated D1 `id` to
+   `database_id`, and an omitted AI Search instance namespace to `default`.
+   Review the body, normalized-metadata, and upload-contract SHA-256 values and
+   retain the confirmation token. Dry-run performs no provider call.
 3. Apply once with unchanged inputs and the exact confirmation token. The MCP
    re-captures the base and pre-state, sends one non-retrying version POST, and
    requires exactly one new candidate, exact candidate ID/ETag/detail, exact

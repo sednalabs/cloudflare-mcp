@@ -1,4 +1,6 @@
-use std::fs;
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use base64::Engine as _;
@@ -227,29 +229,61 @@ fn build_multipart_upload(
 }
 
 fn read_regular_file(path: &str) -> Result<Vec<u8>, WorkerUploadError> {
+    read_regular_file_with_hook(path, || {})
+}
+
+fn read_regular_file_with_hook(
+    path: &str,
+    after_open: impl FnOnce(),
+) -> Result<Vec<u8>, WorkerUploadError> {
     let path = Path::new(path.trim());
-    let metadata = fs::symlink_metadata(path).map_err(|err| {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                WorkerUploadError::new(
+                    "workers.upload_file_not_regular",
+                    "Worker upload path must identify a regular file without following a symlink",
+                    "Provide a checked-in build artifact or generated Worker bundle file.",
+                )
+            } else {
+                WorkerUploadError::new(
+                    "workers.upload_file_open_failed",
+                    "Worker upload file could not be opened safely",
+                    "Check that the exact path exists, is readable, and identifies a regular file.",
+                )
+            }
+        })?;
+    after_open();
+    let metadata = file.metadata().map_err(|_| {
         WorkerUploadError::new(
             "workers.upload_file_metadata_failed",
-            format!("failed reading Worker upload file metadata: {err}"),
-            "Check the path and permissions, then retry.",
+            "Worker upload file metadata could not be read from the opened descriptor",
+            "Check the artifact and permissions, then retry.",
         )
     })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    if !metadata.is_file() {
         return Err(WorkerUploadError::new(
             "workers.upload_file_not_regular",
-            "Worker upload path must be a regular file, not a directory or symlink",
+            "Worker upload path must identify a regular file without following a symlink",
             "Provide a checked-in build artifact or generated Worker bundle file.",
         ));
     }
     enforce_size(metadata.len())?;
-    fs::read(path).map_err(|err| {
-        WorkerUploadError::new(
-            "workers.upload_file_read_failed",
-            format!("failed reading Worker upload file: {err}"),
-            "Check the path and permissions, then retry.",
-        )
-    })
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_WORKER_UPLOAD_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| {
+            WorkerUploadError::new(
+                "workers.upload_file_read_failed",
+                "Worker upload file could not be read completely from the opened descriptor",
+                "Check the path and permissions, then retry.",
+            )
+        })?;
+    enforce_size(bytes.len() as u64)?;
+    Ok(bytes)
 }
 
 fn enforce_size(size: u64) -> Result<(), WorkerUploadError> {
@@ -331,7 +365,22 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    static TEST_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn test_directory(label: &str) -> std::path::PathBuf {
+        let suffix = TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "cloudflare-mcp-worker-upload-{}-{label}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).expect("create test directory");
+        path
+    }
 
     #[test]
     fn builds_single_module_upload_with_main_module_metadata() {
@@ -378,5 +427,57 @@ mod tests {
             content_type.as_deref(),
             Some("multipart/form-data; boundary=----formdata-worker-bundle")
         );
+    }
+
+    #[test]
+    fn descriptor_read_rejects_symlinks_without_leaking_path_or_content() {
+        use std::os::unix::fs::symlink;
+
+        let directory = test_directory("symlink");
+        let target = directory.join("private-target.js");
+        let link = directory.join("candidate.js");
+        fs::write(&target, b"private-source-content").expect("write target");
+        symlink(&target, &link).expect("create symlink");
+        let error = read_regular_file(link.to_str().expect("UTF-8 path"))
+            .expect_err("symlink must fail closed");
+        assert_eq!(error.code, "workers.upload_file_not_regular");
+        let outward = serde_json::to_string(&error.payload()).expect("serialize error");
+        assert!(!outward.contains("candidate.js"));
+        assert!(!outward.contains("private-target.js"));
+        assert!(!outward.contains("private-source-content"));
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn descriptor_read_rejects_nonregular_files_without_leaking_path() {
+        let directory = test_directory("nonregular");
+        let nonregular = directory.join("private-directory");
+        fs::create_dir(&nonregular).expect("create nonregular target");
+        let error = read_regular_file(nonregular.to_str().expect("UTF-8 path"))
+            .expect_err("directory must fail closed");
+        assert_eq!(error.code, "workers.upload_file_not_regular");
+        let outward = serde_json::to_string(&error.payload()).expect("serialize error");
+        assert!(!outward.contains("private-directory"));
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn descriptor_read_is_bound_to_the_opened_file_across_path_swap() {
+        use std::os::unix::fs::symlink;
+
+        let directory = test_directory("swap");
+        let candidate = directory.join("candidate.js");
+        let opened = directory.join("opened.js");
+        let replacement = directory.join("replacement.js");
+        fs::write(&candidate, b"reviewed-original").expect("write candidate");
+        fs::write(&replacement, b"unreviewed-replacement").expect("write replacement");
+        let bytes = read_regular_file_with_hook(candidate.to_str().expect("UTF-8 path"), || {
+            fs::rename(&candidate, &opened).expect("park opened file");
+            symlink(&replacement, &candidate).expect("swap path to symlink");
+        })
+        .expect("opened descriptor remains authoritative");
+        assert_eq!(bytes, b"reviewed-original");
+        assert_ne!(bytes, b"unreviewed-replacement");
+        fs::remove_dir_all(directory).expect("remove test directory");
     }
 }

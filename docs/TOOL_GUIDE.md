@@ -468,12 +468,20 @@ like "what rule blocked this path?" or "is this rule still firing?"
 | Workflow | Tool | Class | Required inputs | Proof and redaction | Negative coverage | Status |
 | --- | --- | --- | --- | --- | --- | --- |
 | Capture an immutable pre/post provider state | `workers_capture_version_evidence` | read | Exact account/script, fixed `per_page`, optional exact version ID and candidate exclusion ID | Two stable, bounded all-page version reads; exact sanitized version detail; two stable complete deployment reads; request/response artifact SHA-256 values. Binding values and raw provider bodies are never returned. | Wrong target or detail ID, malformed/duplicate/truncated/drifting pagination, invalid or over-cap deployments, missing script ETag, candidate present in a deployment | Implemented and focused-tested |
-| Create one disabled Worker version | `workers_upload_version` | apply | One reviewed module or multipart artifact, complete metadata, exact base version ID and ETag, pinned pre-upload version/deployment snapshot hashes, mandatory `bindings_inherit="strict"`, dry-run confirmation | Confirmation-bound upload/body/metadata digests; pre-state equality; one non-retrying POST; truthful request lifecycle; exact returned candidate ID/ETag and request/response artifact SHA-256; exact response-to-readback detail; complete secret-safe binding projection matched to explicit metadata plus exact-base inheritance; unchanged deployment proof | Missing confirmation, wrong base, `latest`/implicit inherit, pre-state drift, response loss, malformed detail, missing ID/ETag, cross-target detail, binding drift, secret-shaped outward data, candidate deployed | Implemented and focused-tested |
+| Create one disabled Worker version | `workers_upload_version` | apply | One reviewed descriptor-bound module or multipart artifact, complete closed/canonical metadata, exact base version ID and ETag, pinned pre-upload version/deployment snapshot hashes, mandatory `bindings_inherit="strict"`, dry-run confirmation | No-follow regular-file read; confirmation-bound upload/body/normalized-metadata digests; D1 alias and AI Search default normalization; pre-state equality; one non-retrying POST; truthful request lifecycle; exact returned candidate ID/ETag and request/response artifact SHA-256; exact response-to-readback detail; complete secret-safe binding projection matched to explicit metadata plus exact-base inheritance; unchanged deployment proof | Symlink/nonregular/swap substitution, unknown binding types/fields, conflicting D1 aliases, semantic binding drift, missing confirmation, wrong base, `latest`/implicit inherit, pre-state drift, response loss, malformed detail, missing ID/ETag, cross-target detail, secret-shaped outward data, candidate deployed | Implemented and focused-tested |
 | Collect response-loss evidence without another upload | `workers_reconcile_version_upload` | read | Exact script/base/upload contract, pinned pre-upload version IDs and deployments plus their hashes | Fresh stable version/deployment evidence; sole-new-candidate relationship and exact sanitized detail; explicit unattributed state; no deployment mutation | Inventory never proves the candidate came from the lost request or matches its reviewed complete bytes/binding plan; no/multiple candidates, removed predecessor, snapshot/hash mismatch, pagination drift, deployment drift, candidate deployed | Implemented and focused-tested |
 
 These tools deliberately have no deployment-create path. A successful version
 upload is only disabled candidate evidence; it never authorizes traffic or a
 later deployment.
+
+The guarded version projection currently supports `inherit`, `d1`,
+`plain_text`, `secret_text`, `json`, `service`, `r2_bucket`, `queue`,
+`analytics_engine`, `kv_namespace`, `vectorize`, `hyperdrive`, `pipelines`,
+`mtls_certificate`, `messaging`, `secrets_store_secret`, `ai`, `ai_search`,
+`ai_search_namespace`, `assets`, `browser`, `images`, `media`, and
+`version_metadata`. Each type has a closed field set. Extend that set in a
+reviewed change rather than passing unknown provider fields through.
 
 Use these to inspect Workers, settings, bindings, and event telemetry:
 

@@ -8239,6 +8239,7 @@ impl CloudflareMcp {
             Ok(artifact) => artifact,
             Err(error) => return Ok(worker_upload_error_result(error)),
         };
+        let canonical_binding_metadata = artifact.canonical_metadata.clone();
         let upload_summary = json!(&artifact.summary);
         let upload_contract_sha256 = artifact.summary.upload_contract_sha256.clone();
         let operation = find_operation("worker-versions-upload-version").ok_or_else(|| {
@@ -8380,7 +8381,7 @@ impl CloudflareMcp {
         }
         let binding_expectation = match pre_state.detail.as_ref() {
             Some(base_detail) => {
-                match prepare_worker_binding_expectation(base_detail, &args.metadata) {
+                match prepare_worker_binding_expectation(base_detail, &canonical_binding_metadata) {
                     Ok(expectation) => expectation,
                     Err(error) => {
                         return Ok(finalize_mutation_result(

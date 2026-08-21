@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::client::{AdapterError, CloudflareClient, decode_json_rejecting_duplicate_object_keys};
+use crate::worker_version_upload::canonicalize_provider_binding;
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_VERSION_IDS: usize = 4096;
@@ -896,11 +897,18 @@ fn sanitize_version_detail(
                 "Treat the exact version evidence as contradictory.",
             ));
         }
+        let canonical_binding = canonicalize_provider_binding(binding).map_err(|_| {
+            operation_error(
+                "workers.version_detail_binding_projection_invalid",
+                "version detail binding was outside the closed canonical provider projection",
+                "Treat the exact version evidence as malformed.",
+            )
+        })?;
         binding_descriptors.push(WorkerBindingDescriptor {
             name: name.to_string(),
             binding_type: binding_type.to_string(),
         });
-        binding_projection.insert(name.to_string(), Value::Object(binding.clone()));
+        binding_projection.insert(name.to_string(), Value::Object(canonical_binding));
     }
     let raw_result_sha256 = sha256_json(&result);
     let binding_descriptors_sha256 = sha256_json(&binding_descriptors);
@@ -1007,7 +1015,13 @@ pub(crate) fn prepare_worker_binding_expectation(
             inherited.insert("name".to_string(), Value::String(name.to_string()));
             Value::Object(inherited)
         } else {
-            Value::Object(binding.clone())
+            Value::Object(canonicalize_provider_binding(binding).map_err(|_| {
+                operation_error(
+                    "workers.version_binding_plan_invalid",
+                    "reviewed explicit binding was outside the closed canonical projection",
+                    "Use the canonical metadata accepted by the version-upload preview.",
+                )
+            })?)
         };
         if expected
             .insert(name.to_string(), expected_binding)
@@ -1643,6 +1657,107 @@ mod tests {
             !serde_json::to_string(&verification)
                 .expect("serialize verification")
                 .contains("extra-private")
+        );
+    }
+
+    #[test]
+    fn binding_projection_normalizes_documented_aliases_and_defaults_only() {
+        let base_id = "11111111-1111-4111-8111-111111111111";
+        let candidate_id = "22222222-2222-4222-8222-222222222222";
+        let base = sanitize_version_detail(
+            json!({
+                "id":base_id,
+                "resources":{"script":{"etag":"a".repeat(64)},"bindings":[]}
+            }),
+            Some(base_id),
+            proof(),
+        )
+        .expect("base");
+        let expectation = prepare_worker_binding_expectation(
+            &base,
+            &json!({
+                "main_module":"index.js",
+                "bindings":[
+                    {"name":"DB","type":"d1","id":"db-1"},
+                    {"name":"SEARCH","type":"ai_search","instance_name":"articles"}
+                ]
+            }),
+        )
+        .expect("canonical expectation");
+        let candidate = sanitize_version_detail(
+            json!({
+                "id":candidate_id,
+                "resources":{
+                    "script":{"etag":"b".repeat(64)},
+                    "bindings":[
+                        {"name":"DB","type":"d1","database_id":"db-1"},
+                        {
+                            "name":"SEARCH",
+                            "type":"ai_search",
+                            "instance_name":"articles",
+                            "namespace":"default"
+                        }
+                    ]
+                }
+            }),
+            Some(candidate_id),
+            proof(),
+        )
+        .expect("provider-normalized candidate");
+        assert!(
+            verify_worker_candidate_bindings(&expectation, &candidate).matched,
+            "documented aliases and defaults should normalize"
+        );
+
+        let drifted = sanitize_version_detail(
+            json!({
+                "id":candidate_id,
+                "resources":{
+                    "script":{"etag":"b".repeat(64)},
+                    "bindings":[
+                        {"name":"DB","type":"d1","database_id":"db-1"},
+                        {
+                            "name":"SEARCH",
+                            "type":"ai_search",
+                            "instance_name":"articles",
+                            "namespace":"tenant-a"
+                        }
+                    ]
+                }
+            }),
+            Some(candidate_id),
+            proof(),
+        )
+        .expect("drifted candidate");
+        let verification = verify_worker_candidate_bindings(&expectation, &drifted);
+        assert!(!verification.matched);
+        assert_eq!(verification.changed_binding_names, vec!["SEARCH"]);
+
+        let error = sanitize_version_detail(
+            json!({
+                "id":candidate_id,
+                "resources":{
+                    "script":{"etag":"b".repeat(64)},
+                    "bindings":[{
+                        "name":"DB",
+                        "type":"d1",
+                        "database_id":"db-1",
+                        "unknown":"must-not-be-ignored"
+                    }]
+                }
+            }),
+            Some(candidate_id),
+            proof(),
+        )
+        .expect_err("unknown provider field must fail closed");
+        assert_eq!(
+            error.code,
+            "workers.version_detail_binding_projection_invalid"
+        );
+        assert!(
+            !serde_json::to_string(&error)
+                .expect("serialize error")
+                .contains("must-not-be-ignored")
         );
     }
 
