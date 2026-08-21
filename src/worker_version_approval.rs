@@ -22,6 +22,7 @@ pub(crate) const WORKER_VERSION_APPROVAL_ROOT_ENV: &str =
     "CLOUDFLARE_MCP_WORKER_VERSION_APPROVAL_ROOT";
 
 const ROOT_GUARD_NAME: &str = "guard.lock";
+const ROOT_RETIRED_NAME: &str = "retired-root.json";
 const PLAN_GUARD_NAME: &str = "guard.lock";
 const CANDIDATE_NAME: &str = "candidate.body";
 const PREPARED_NAME: &str = "prepared.json";
@@ -35,6 +36,15 @@ const APPROVAL_TTL_MS: u64 = 15 * 60 * 1000;
 const MAX_RECEIPT_BYTES: u64 = 256 * 1024;
 const MAX_ROOT_ENTRIES: usize = 4_097;
 const MAX_PLAN_ENTRIES: usize = 5;
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RootRetirementReceipt {
+    version: u8,
+    state: String,
+    generation: String,
+    retired_at_unix_ms: u64,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct WorkerVersionApprovalCandidate<'a> {
@@ -85,6 +95,7 @@ pub(crate) struct WorkerVersionApproval {
     plan_name: String,
     plan_dir_handle: File,
     plan_identity: FileIdentity,
+    _root_guard: File,
     _plan_guard: File,
     prepared: PreparedReceipt,
 }
@@ -148,6 +159,7 @@ impl WorkerVersionApproval {
         now: u64,
     ) -> Result<WorkerVersionApprovalEvidence, WorkerVersionApprovalError> {
         self.validate_namespace()?;
+        self.revalidate_candidate_before_consume(now)?;
         if now < self.prepared.created_at_unix_ms {
             return Err(custody_error(
                 "system time precedes the approval creation time",
@@ -227,12 +239,52 @@ impl WorkerVersionApproval {
 
     fn validate_namespace(&self) -> Result<(), WorkerVersionApprovalError> {
         validate_root_identity(&self.root_path, &self.root_handle, self.root_identity)?;
+        ensure_root_active(&self.root_handle)?;
         validate_child_identity(
             &self.root_handle,
             &self.plan_name,
             &self.plan_dir_handle,
             self.plan_identity,
         )
+    }
+
+    fn revalidate_candidate_before_consume(
+        &self,
+        now: u64,
+    ) -> Result<(), WorkerVersionApprovalError> {
+        let presence = inspect_plan_namespace(&self.plan_name_path(), self.plan_identity)?;
+        if !presence.prepared || !presence.candidate {
+            return Err(custody_error(
+                "approval namespace omits required physical evidence before consumption",
+            ));
+        }
+        let prepared: PreparedReceipt = read_receipt(&self.plan_dir_handle, PREPARED_NAME)?;
+        if prepared != self.prepared {
+            return Err(custody_error(
+                "prepared approval receipt changed before consumption",
+            ));
+        }
+        let body = read_bounded_file(
+            &self.plan_dir_handle,
+            CANDIDATE_NAME,
+            MAX_WORKER_UPLOAD_BYTES,
+        )?;
+        if body.len() as u64 != prepared.candidate_body_size_bytes
+            || sha256_bytes(&body) != prepared.candidate_body_sha256
+        {
+            return Err(custody_error(
+                "private approval candidate changed before consumption",
+            ));
+        }
+        validate_existing_transitions(&self.plan_dir_handle, &prepared, &presence, now)?;
+        if presence.consumed || presence.expired || presence.rejected || presence.retired {
+            return Err(custody_error("approval state changed before consumption"));
+        }
+        Ok(())
+    }
+
+    fn plan_name_path(&self) -> PathBuf {
+        self.root_path.join(&self.plan_name)
     }
 }
 
@@ -260,6 +312,92 @@ fn configured_root() -> Result<PathBuf, WorkerVersionApprovalError> {
             "Worker version approval custody requires a configured private root",
             "Set CLOUDFLARE_MCP_WORKER_VERSION_APPROVAL_ROOT to a pre-created operator-owned mode-0700 directory shared by every upload process.",
         ))
+}
+
+pub(crate) fn retire_worker_version_approval_root_at(
+    root: &Path,
+    generation: &str,
+    now: u64,
+) -> Result<(), WorkerVersionApprovalError> {
+    validate_generation(generation)?;
+    let root_handle = open_private_root(root)?;
+    let root_identity = metadata_identity(
+        &root_handle
+            .metadata()
+            .map_err(|_| custody_error("approval root metadata is unavailable"))?,
+    );
+    let root_guard = open_or_create_private_file(&root_handle, ROOT_GUARD_NAME)?;
+    try_lock_exclusive(&root_guard, "workers.version_upload_approval_root_locked")?;
+    validate_root_namespace(root, root_identity, false)?;
+    audit_terminal_root(&root_handle, root, now)?;
+    let receipt = RootRetirementReceipt {
+        version: 1,
+        state: "retired".to_string(),
+        generation: generation.to_string(),
+        retired_at_unix_ms: now,
+    };
+    write_new_receipt(&root_handle, ROOT_RETIRED_NAME, &receipt)?;
+    validate_root_identity(root, &root_handle, root_identity)?;
+    validate_root_retirement(&read_receipt(&root_handle, ROOT_RETIRED_NAME)?)?;
+    Ok(())
+}
+
+pub(crate) fn retire_worker_version_approval_root(
+    root: &Path,
+    generation: &str,
+) -> Result<(), WorkerVersionApprovalError> {
+    retire_worker_version_approval_root_at(root, generation, now_unix_ms()?)
+}
+
+fn audit_terminal_root(
+    root_handle: &File,
+    root: &Path,
+    now: u64,
+) -> Result<(), WorkerVersionApprovalError> {
+    for entry in fs::read_dir(root)
+        .map_err(|_| custody_error("approval root could not be audited for retirement"))?
+    {
+        let entry =
+            entry.map_err(|_| custody_error("approval root retirement audit was incomplete"))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| custody_error("approval root contains a non-UTF-8 entry"))?;
+        if name == ROOT_GUARD_NAME || name == ROOT_RETIRED_NAME {
+            continue;
+        }
+        let directory = open_private_directory_at(root_handle, &name)?;
+        let identity = metadata_identity(
+            &directory
+                .metadata()
+                .map_err(|_| custody_error("approval namespace metadata is unavailable"))?,
+        );
+        let guard = open_or_create_private_file(&directory, PLAN_GUARD_NAME)?;
+        try_lock_exclusive(&guard, "workers.version_upload_approval_guard_locked")?;
+        let presence = inspect_plan_namespace(&entry.path(), identity)?;
+        if !presence.prepared || !presence.candidate {
+            return Err(custody_error(
+                "root retirement audit found incomplete approval authority",
+            ));
+        }
+        let prepared: PreparedReceipt = read_receipt(&directory, PREPARED_NAME)?;
+        validate_prepared(&prepared, &name)?;
+        let body = read_bounded_file(&directory, CANDIDATE_NAME, MAX_WORKER_UPLOAD_BYTES)?;
+        if body.len() as u64 != prepared.candidate_body_size_bytes
+            || sha256_bytes(&body) != prepared.candidate_body_sha256
+        {
+            return Err(custody_error(
+                "root retirement audit found conflicting candidate evidence",
+            ));
+        }
+        validate_existing_transitions(&directory, &prepared, &presence, now)?;
+        if !presence.expired && !presence.rejected && !presence.retired {
+            return Err(custody_error(
+                "root retirement requires every approval to have durable terminal evidence",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn prepare_worker_version_approval_at(
@@ -349,6 +487,8 @@ fn load_worker_version_approval_at(
             .metadata()
             .map_err(|_| custody_error("approval root metadata is unavailable"))?,
     );
+    let root_guard = open_or_create_private_file(&root_handle, ROOT_GUARD_NAME)?;
+    try_lock_shared(&root_guard, "workers.version_upload_approval_root_locked")?;
     validate_root_namespace(root, root_identity, false)?;
     let plan_dir = root.join(handle);
     let plan_dir_handle = open_private_directory_at(&root_handle, handle)?;
@@ -453,6 +593,7 @@ fn load_worker_version_approval_at(
         plan_name: handle.to_string(),
         plan_dir_handle,
         plan_identity,
+        _root_guard: root_guard,
         _plan_guard: plan_guard,
         prepared,
     })
@@ -685,18 +826,20 @@ fn validate_root_namespace_with_limit(
     for entry in
         fs::read_dir(root).map_err(|_| custody_error("approval root could not be enumerated"))?
     {
-        count += 1;
-        if count > limit {
-            return Err(capacity_error(count, limit));
-        }
         let entry = entry.map_err(|_| custody_error("approval root enumeration was incomplete"))?;
         let name = entry
             .file_name()
             .into_string()
             .map_err(|_| custody_error("approval root contains a non-UTF-8 entry"))?;
+        if name != ROOT_RETIRED_NAME {
+            count += 1;
+            if count > limit {
+                return Err(capacity_error(count, limit));
+            }
+        }
         let entry_metadata = fs::symlink_metadata(entry.path())
             .map_err(|_| custody_error("approval root entry metadata is unavailable"))?;
-        let valid_entry = if name == ROOT_GUARD_NAME {
+        let valid_entry = if name == ROOT_GUARD_NAME || name == ROOT_RETIRED_NAME {
             private_file(&entry_metadata)
         } else {
             valid_handle(&name) && private_directory(&entry_metadata)
@@ -710,8 +853,62 @@ fn validate_root_namespace_with_limit(
     if !private_directory(&metadata) || metadata_identity(&metadata) != expected_identity {
         return Err(custody_error("approval root changed during inspection"));
     }
+    ensure_root_active(&open_private_root(root)?)?;
     if require_free_entry && count >= limit {
         return Err(capacity_error(count, limit));
+    }
+    Ok(())
+}
+
+fn ensure_root_active(directory: &File) -> Result<(), WorkerVersionApprovalError> {
+    let name = c_name(ROOT_RETIRED_NAME)?;
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let status = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if status != 0 {
+        if std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+            return Ok(());
+        }
+        return Err(custody_error(
+            "approval root retirement fence could not be inspected",
+        ));
+    }
+    let receipt: RootRetirementReceipt = read_receipt(directory, ROOT_RETIRED_NAME)?;
+    validate_root_retirement(&receipt)?;
+    Err(state_error(
+        "workers.version_upload_approval_root_retired",
+        "this approval custody root is durably retired",
+        "Use only the freshly provisioned approval root generation; never prepare or consume authority from this retired root.",
+        "root_retired",
+    ))
+}
+
+fn validate_root_retirement(
+    receipt: &RootRetirementReceipt,
+) -> Result<(), WorkerVersionApprovalError> {
+    if receipt.version != 1 || receipt.state != "retired" {
+        return Err(custody_error(
+            "approval root retirement fence is semantically malformed",
+        ));
+    }
+    validate_generation(&receipt.generation)
+}
+
+fn validate_generation(generation: &str) -> Result<(), WorkerVersionApprovalError> {
+    if !(8..=128).contains(&generation.len())
+        || !generation
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    {
+        return Err(custody_error(
+            "approval root generation is outside its canonical grammar",
+        ));
     }
     Ok(())
 }
@@ -1020,6 +1217,19 @@ fn try_lock_exclusive(file: &File, code: &'static str) -> Result<(), WorkerVersi
     }
 }
 
+fn try_lock_shared(file: &File, code: &'static str) -> Result<(), WorkerVersionApprovalError> {
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
+        Ok(())
+    } else {
+        Err(state_error(
+            code,
+            "another invocation owns the approval-root retirement guard",
+            "Wait for the incumbent root operation to finish, then re-read the same root generation before proceeding.",
+            "locked",
+        ))
+    }
+}
+
 fn random_handle() -> Result<String, WorkerVersionApprovalError> {
     let mut bytes = [0u8; HANDLE_RANDOM_BYTES];
     let mut offset = 0usize;
@@ -1264,6 +1474,99 @@ mod tests {
         assert_eq!(evidence.root_entry_limit, 2);
         assert!(evidence.rotation_required);
         assert!(!evidence.safe_to_rotate);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retired_root_fence_blocks_prepare_load_and_survives_restart() {
+        let root = test_root("retired-root");
+        let metadata = json!({"bindings":[]});
+        let prepared =
+            prepare_worker_version_approval_at(&root, &candidate(b"one", &metadata), 1_000)
+                .unwrap();
+
+        let loaded = load_worker_version_approval_at(
+            &root,
+            &prepared.approval_handle,
+            &candidate(b"one", &metadata),
+            2_000,
+        )
+        .unwrap();
+        assert_eq!(
+            retire_worker_version_approval_root_at(&root, "generation-0001", 3_000)
+                .unwrap_err()
+                .code,
+            "workers.version_upload_approval_root_locked"
+        );
+        drop(loaded);
+
+        assert_eq!(
+            load_worker_version_approval_at(
+                &root,
+                &prepared.approval_handle,
+                &candidate(b"one", &metadata),
+                1_000 + APPROVAL_TTL_MS,
+            )
+            .unwrap_err()
+            .code,
+            "workers.version_upload_approval_expired"
+        );
+        retire_worker_version_approval_root_at(&root, "generation-0001", 1_001 + APPROVAL_TTL_MS)
+            .unwrap();
+
+        for error in [
+            prepare_worker_version_approval_at(
+                &root,
+                &candidate(b"two", &metadata),
+                1_002 + APPROVAL_TTL_MS,
+            )
+            .unwrap_err(),
+            load_worker_version_approval_at(
+                &root,
+                &prepared.approval_handle,
+                &candidate(b"one", &metadata),
+                1_002 + APPROVAL_TTL_MS,
+            )
+            .unwrap_err(),
+        ] {
+            assert_eq!(error.code, "workers.version_upload_approval_root_retired");
+        }
+        let receipt: RootRetirementReceipt =
+            read_receipt(&open_private_root(&root).unwrap(), ROOT_RETIRED_NAME).unwrap();
+        assert_eq!(receipt.generation, "generation-0001");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn consume_rechecks_retired_root_fence_under_held_guards() {
+        let root = test_root("retired-before-consume");
+        let metadata = json!({"bindings":[]});
+        let prepared =
+            prepare_worker_version_approval_at(&root, &candidate(b"one", &metadata), 1_000)
+                .unwrap();
+        let mut loaded = load_worker_version_approval_at(
+            &root,
+            &prepared.approval_handle,
+            &candidate(b"one", &metadata),
+            2_000,
+        )
+        .unwrap();
+        write_new_receipt(
+            &open_private_root(&root).unwrap(),
+            ROOT_RETIRED_NAME,
+            &RootRetirementReceipt {
+                version: 1,
+                state: "retired".to_string(),
+                generation: "generation-0002".to_string(),
+                retired_at_unix_ms: 2_500,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            loaded.consume_at(3_000).unwrap_err().code,
+            "workers.version_upload_approval_root_retired"
+        );
+        drop(loaded);
         fs::remove_dir_all(root).unwrap();
     }
     fn candidate<'a>(body: &'a [u8], metadata: &'a Value) -> WorkerVersionApprovalCandidate<'a> {

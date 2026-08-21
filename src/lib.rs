@@ -33,6 +33,15 @@ pub mod upstream_oauth;
 pub mod verification;
 pub(crate) mod worker_upload;
 pub(crate) mod worker_version_approval;
+
+/// Route-less local operator helper. It performs no provider I/O.
+pub fn retire_worker_version_approval_root(
+    root: &std::path::Path,
+    generation: &str,
+) -> Result<(), String> {
+    worker_version_approval::retire_worker_version_approval_root(root, generation)
+        .map_err(|error| format!("{}: {}", error.code, error.message))
+}
 pub(crate) mod worker_version_attempt;
 pub(crate) mod worker_version_upload;
 

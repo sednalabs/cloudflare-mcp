@@ -1095,13 +1095,25 @@ random-handle preparation lifecycle.
 
    If preparation returns `workers.version_upload_approval_rotation_required`,
    treat its bounded `custody_capacity` as a stop receipt; `safe_to_rotate` is
-   deliberately false. Under the root guard, a bounded offline audit must
-   prove zero unexpired prepared, consumed-only, locked, or malformed
-   namespaces. Any such authority blocks rotation. Preserve the incumbent root
-   immutable, archive terminal expired/rejected/retired evidence under the
-   private retention policy, create a fresh ancestor-safe mode-0700 root, then
-   atomically update and restart every upload process. Never split processes
-   across roots or use rotation to authorize or retry a provider request.
+   deliberately false. Use this exact order: stop new operator preparation;
+   run the bounded terminal-only audit; while holding the incumbent root guard
+   exclusively, install and fsync the create-only `retired-root.json` fence
+   naming the new canonical generation; verify that fence from the same root
+   descriptor; only then archive terminal expired/rejected/retired evidence;
+   create a fresh ancestor-safe mode-0700 root; atomically update and restart
+   every upload process. The retirement helper refuses prepared-only,
+   consumed-only, locked, incomplete, malformed, or contradictory authority.
+   In-flight loads retain a shared root guard, and every prepare, load, and
+   consume rejects a retired root after restart. Never split processes across
+   roots or use rotation to authorize or retry a provider request.
+   The local custody model assumes the effective UID does not mutate these
+   files outside the guarded helper; same-UID out-of-band writers are outside
+   this trusted boundary.
+
+   After the audit and before any archival/cutover, install the fence with
+   `cargo run --quiet --bin cloudflare-mcp-retire-worker-version-approval-root -- "$CLOUDFLARE_MCP_WORKER_VERSION_APPROVAL_ROOT" GENERATION`.
+   The route-less helper emits no path or receipt content and performs zero
+   provider calls.
 4. Apply once with unchanged complete inputs, `prepare:false`, and the exact
    `approval_handle`. Apply reloads the private body and canonical metadata,
    binds every target/base/pre-state field byte-for-byte, and durably consumes
@@ -1122,6 +1134,10 @@ random-handle preparation lifecycle.
    crash or response loss leaves prepared or dispatched evidence in place.
    Any retained, conflicting, malformed, or concurrently owned attempt is
    reconciliation-only across restart and can never authorize another POST.
+   Cloudflare exposes no atomic compare-and-create precondition between the
+   final provider pre-state read and the version POST. Local one-use custody
+   prevents duplicate POST replay but does not make that external interval
+   atomic.
    Restored namespaces are a closed maximum of the three named receipts.
    Receipt custody opens descriptor-first with nonblocking/no-follow flags,
    verifies a private bounded regular file before reading, caps the descriptor
