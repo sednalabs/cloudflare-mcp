@@ -35,7 +35,9 @@ use crate::cache::{
 };
 use crate::cloudflare::model::WorkerScript;
 use crate::cloudflare::worker_versions::{
-    WorkerVersionOperationError, validate_worker_deployment_projection, validate_worker_version_ids,
+    WorkerVersionOperationError, prepare_worker_binding_expectation,
+    validate_worker_deployment_projection, validate_worker_version_ids,
+    verify_worker_candidate_bindings,
 };
 use crate::cloudflare::{
     AccessAppUpsertRequest, AccessPolicyWrite, BulkRedirectItemWrite, CacheRule, CacheRuleset,
@@ -8189,6 +8191,12 @@ impl CloudflareMcp {
                     hint: "Use the exact script identity from authenticated inventory.",
                     retryable: false,
                     outcome_ambiguous: false,
+                    provider_request_lifecycle:
+                        crate::cloudflare::worker_versions::WorkerRequestLifecycle {
+                            request_prepared: false,
+                            dispatch_attempted: false,
+                            provider_response_received: false,
+                        },
                     request_artifact_sha256: None,
                     response_artifact_sha256: None,
                     response_body_sha256: None,
@@ -8359,13 +8367,44 @@ impl CloudflareMcp {
                     },
                     "pre_upload_state": pre_state,
                     "deployment_created": false,
-                    "provider_mutation_dispatched": false,
+                    "provider_request_lifecycle": {
+                        "request_prepared": false,
+                        "dispatch_attempted": false,
+                        "provider_response_received": false,
+                    },
                 })),
                 &plan,
                 audit,
                 false,
             ));
         }
+        let binding_expectation = match pre_state.detail.as_ref() {
+            Some(base_detail) => {
+                match prepare_worker_binding_expectation(base_detail, &args.metadata) {
+                    Ok(expectation) => expectation,
+                    Err(error) => {
+                        return Ok(finalize_mutation_result(
+                            CallToolResult::structured_error(json!({
+                                "ok": false,
+                                "operation": "workers_upload_version",
+                                "error": error,
+                                "pre_upload_state": pre_state,
+                                "deployment_created": false,
+                                "provider_request_lifecycle": {
+                                    "request_prepared": false,
+                                    "dispatch_attempted": false,
+                                    "provider_response_received": false,
+                                },
+                            })),
+                            &plan,
+                            audit,
+                            false,
+                        ));
+                    }
+                }
+            }
+            None => unreachable!("exact base detail is required by the pre-state proof"),
+        };
         let upload = match self
             .cloudflare
             .upload_worker_version_once(
@@ -8378,7 +8417,7 @@ impl CloudflareMcp {
         {
             Ok(evidence) => evidence,
             Err(error) => {
-                let provider_mutation_dispatched = error.request_artifact_sha256.is_some();
+                let provider_request_lifecycle = error.provider_request_lifecycle;
                 return Ok(finalize_mutation_result(
                     CallToolResult::structured_error(json!({
                         "ok": false,
@@ -8386,7 +8425,7 @@ impl CloudflareMcp {
                         "error": error,
                         "upload": upload_summary,
                         "pre_upload_state": pre_state,
-                        "provider_mutation_dispatched": provider_mutation_dispatched,
+                        "provider_request_lifecycle": provider_request_lifecycle,
                         "deployment_created": false,
                         "retry_decision": "do_not_retry; use workers_reconcile_version_upload against the pinned pre-upload snapshot",
                     })),
@@ -8421,7 +8460,11 @@ impl CloudflareMcp {
                         },
                         "upload_result": upload,
                         "pre_upload_state": pre_state,
-                        "provider_mutation_dispatched": true,
+                        "provider_request_lifecycle": {
+                            "request_prepared": true,
+                            "dispatch_attempted": true,
+                            "provider_response_received": true,
+                        },
                         "deployment_created": false,
                         "retry_decision": "do_not_retry",
                     })),
@@ -8445,14 +8488,22 @@ impl CloudflareMcp {
         let post_detail_matches = post_state.detail.as_ref().is_some_and(|detail| {
             detail.version_id == upload.candidate_version_id
                 && detail.script_etag == upload.script_etag
+                && detail.binding_projection_sha256 == upload.binding_projection_sha256
         });
+        let binding_verification = post_state
+            .detail
+            .as_ref()
+            .map(|detail| verify_worker_candidate_bindings(&binding_expectation, detail));
+        let bindings_match = binding_verification
+            .as_ref()
+            .is_some_and(|verification| verification.matched);
         let exact_candidate = added.len() == 1
             && added[0].as_str() == upload.candidate_version_id
             && pre_ids.is_subset(&post_ids)
             && post_ids.len() == pre_ids.len() + 1;
         let deployments_unchanged = pre_state.deployments.semantic_snapshot_sha256
             == post_state.deployments.semantic_snapshot_sha256;
-        if !exact_candidate || !post_detail_matches || !deployments_unchanged {
+        if !exact_candidate || !post_detail_matches || !bindings_match || !deployments_unchanged {
             return Ok(finalize_mutation_result(
                 CallToolResult::structured_error(json!({
                     "ok": false,
@@ -8465,7 +8516,12 @@ impl CloudflareMcp {
                     "upload_result": upload,
                     "pre_upload_state": pre_state,
                     "post_upload_state": post_state,
-                    "provider_mutation_dispatched": true,
+                    "binding_verification": binding_verification,
+                    "provider_request_lifecycle": {
+                        "request_prepared": true,
+                        "dispatch_attempted": true,
+                        "provider_response_received": true,
+                    },
                     "deployment_created": false,
                     "retry_decision": "do_not_retry",
                 })),
@@ -8485,8 +8541,13 @@ impl CloudflareMcp {
                 "upload_result": upload,
                 "pre_upload_state": pre_state,
                 "post_upload_state": post_state,
+                "binding_verification": binding_verification,
                 "bindings_inherit": "strict",
-                "provider_mutation_dispatched": true,
+                "provider_request_lifecycle": {
+                    "request_prepared": true,
+                    "dispatch_attempted": true,
+                    "provider_response_received": true,
+                },
                 "deployment_created": false,
                 "retry_decision": "terminal_success; never replay this pre-upload snapshot",
             })),
@@ -8620,7 +8681,7 @@ impl CloudflareMcp {
                 },
                 "current_state": current,
                 "upload_contract_sha256": args.upload_contract_sha256,
-                "provider_mutation_dispatched": false,
+                "mutation_performed": false,
                 "deployment_created": false,
                 "retry_decision": "do_not_retry",
             })));
@@ -8655,9 +8716,9 @@ impl CloudflareMcp {
                 "Do not retry the upload; repeat only the read-only reconciliation after state stabilizes.",
             ));
         }
-        Ok(CallToolResult::structured(json!({
-            "ok": true,
-            "status": "reconciled_proven",
+        Ok(CallToolResult::structured_error(json!({
+            "ok": false,
+            "status": "reconciliation_required",
             "operation": "workers_reconcile_version_upload",
             "account_id": account_id,
             "script_name": args.script_name,
@@ -8666,9 +8727,16 @@ impl CloudflareMcp {
             "candidate_version_id": candidate_id,
             "candidate_detail": candidate.detail,
             "current_state": candidate,
-            "provider_mutation_dispatched": false,
+            "attribution_state": "unattributed",
+            "candidate_relationship": "sole_new_version_since_pinned_snapshot",
+            "unproven": [
+                "candidate was created by the original POST",
+                "candidate bytes and complete binding plan match the reviewed upload contract"
+            ],
+            "mutation_performed": false,
             "deployment_created": false,
-            "retry_decision": "terminal_reconciled; never replay the upload",
+            "retry_decision": "do_not_retry",
+            "operator_guidance": "Provider inventory proves only one new disabled candidate. It does not independently attribute that candidate to the lost request; preserve the evidence and resolve candidate provenance out of band.",
         })))
     }
 

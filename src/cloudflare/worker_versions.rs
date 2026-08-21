@@ -55,8 +55,31 @@ pub(crate) struct WorkerVersionDetailEvidence {
     pub(crate) script_etag: String,
     pub(crate) binding_descriptors: Vec<WorkerBindingDescriptor>,
     pub(crate) binding_descriptors_sha256: String,
+    pub(crate) binding_projection_sha256: String,
     pub(crate) raw_result_sha256: String,
     pub(crate) provider_proof: WorkerProviderProof,
+    #[serde(skip_serializing)]
+    binding_projection: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct WorkerBindingVerification {
+    pub(crate) expected_binding_count: usize,
+    pub(crate) observed_binding_count: usize,
+    pub(crate) expected_projection_sha256: String,
+    pub(crate) observed_projection_sha256: String,
+    pub(crate) missing_binding_names: Vec<String>,
+    pub(crate) unexpected_binding_names: Vec<String>,
+    pub(crate) changed_binding_names: Vec<String>,
+    pub(crate) matched: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct WorkerBindingExpectation {
+    pub(crate) binding_count: usize,
+    pub(crate) projection_sha256: String,
+    #[serde(skip_serializing)]
+    projection: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -101,6 +124,7 @@ pub(crate) struct WorkerVersionStateEvidence {
 pub(crate) struct WorkerVersionUploadEvidence {
     pub(crate) candidate_version_id: String,
     pub(crate) script_etag: String,
+    pub(crate) binding_projection_sha256: String,
     pub(crate) raw_result_sha256: String,
     pub(crate) request_body_sha256: String,
     pub(crate) request_body_size_bytes: usize,
@@ -114,6 +138,7 @@ pub(crate) struct WorkerVersionOperationError {
     pub(crate) hint: &'static str,
     pub(crate) retryable: bool,
     pub(crate) outcome_ambiguous: bool,
+    pub(crate) provider_request_lifecycle: WorkerRequestLifecycle,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) request_artifact_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -124,6 +149,25 @@ pub(crate) struct WorkerVersionOperationError {
     pub(crate) response_body_size_bytes: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) http_status: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub(crate) struct WorkerRequestLifecycle {
+    pub(crate) request_prepared: bool,
+    pub(crate) dispatch_attempted: bool,
+    pub(crate) provider_response_received: bool,
+}
+
+fn worker_request_lifecycle(
+    request_prepared: bool,
+    dispatch_attempted: bool,
+    provider_response_received: bool,
+) -> WorkerRequestLifecycle {
+    WorkerRequestLifecycle {
+        request_prepared,
+        dispatch_attempted,
+        provider_response_received,
+    }
 }
 
 struct ExactExchange {
@@ -304,10 +348,24 @@ impl CloudflareClient {
                 true,
             )
             .await?;
-        let detail = sanitize_version_detail(exchange.result, None, exchange.proof.clone())?;
+        let detail = sanitize_version_detail(exchange.result, None, exchange.proof.clone())
+            .map_err(|mut error| {
+                error.outcome_ambiguous = true;
+                error.retryable = false;
+                error.provider_request_lifecycle = worker_request_lifecycle(true, true, true);
+                error.request_artifact_sha256 =
+                    Some(exchange.proof.request_artifact_sha256.clone());
+                error.response_artifact_sha256 =
+                    Some(exchange.proof.response_artifact_sha256.clone());
+                error.response_body_sha256 = Some(exchange.proof.response_body_sha256.clone());
+                error.response_body_size_bytes = Some(exchange.proof.response_body_size_bytes);
+                error.http_status = Some(exchange.proof.http_status);
+                error
+            })?;
         Ok(WorkerVersionUploadEvidence {
             candidate_version_id: detail.version_id,
             script_etag: detail.script_etag,
+            binding_projection_sha256: detail.binding_projection_sha256,
             raw_result_sha256: detail.raw_result_sha256,
             request_body_sha256,
             request_body_size_bytes,
@@ -502,6 +560,7 @@ impl CloudflareClient {
                 },
                 retryable: !non_idempotent,
                 outcome_ambiguous: non_idempotent,
+                provider_request_lifecycle: worker_request_lifecycle(true, true, false),
                 request_artifact_sha256: Some(request_artifact_sha256.clone()),
                 response_artifact_sha256: None,
                 response_body_sha256: None,
@@ -521,6 +580,7 @@ impl CloudflareClient {
                 },
                 retryable: !non_idempotent,
                 outcome_ambiguous: non_idempotent,
+                provider_request_lifecycle: worker_request_lifecycle(true, true, true),
                 request_artifact_sha256: Some(request_artifact_sha256),
                 response_artifact_sha256: None,
                 response_body_sha256: None,
@@ -543,6 +603,7 @@ impl CloudflareClient {
                 },
                 retryable: false,
                 outcome_ambiguous: non_idempotent,
+                provider_request_lifecycle: worker_request_lifecycle(true, true, true),
                 request_artifact_sha256: Some(request_artifact_sha256),
                 response_artifact_sha256: None,
                 response_body_sha256: None,
@@ -563,6 +624,7 @@ impl CloudflareClient {
                 },
                 retryable: !non_idempotent,
                 outcome_ambiguous: non_idempotent,
+                provider_request_lifecycle: worker_request_lifecycle(true, true, true),
                 request_artifact_sha256: Some(request_artifact_sha256.clone()),
                 response_artifact_sha256: None,
                 response_body_sha256: None,
@@ -581,6 +643,7 @@ impl CloudflareClient {
                     },
                     retryable: false,
                     outcome_ambiguous: non_idempotent,
+                    provider_request_lifecycle: worker_request_lifecycle(true, true, true),
                     request_artifact_sha256: Some(request_artifact_sha256),
                     response_artifact_sha256: None,
                     response_body_sha256: None,
@@ -614,6 +677,7 @@ impl CloudflareClient {
                 // provider rejection into permission to repeat the POST; the
                 // pinned version snapshot is the only reconciliation basis.
                 outcome_ambiguous: non_idempotent,
+                provider_request_lifecycle: worker_request_lifecycle(true, true, true),
                 request_artifact_sha256: Some(request_artifact_sha256),
                 response_artifact_sha256: Some(response_artifact_sha256),
                 response_body_sha256: Some(response_body_sha256),
@@ -632,6 +696,7 @@ impl CloudflareClient {
                 },
                 retryable: false,
                 outcome_ambiguous: non_idempotent,
+                provider_request_lifecycle: worker_request_lifecycle(true, true, true),
                 request_artifact_sha256: Some(request_artifact_sha256.clone()),
                 response_artifact_sha256: Some(response_artifact_sha256.clone()),
                 response_body_sha256: Some(response_body_sha256.clone()),
@@ -652,6 +717,7 @@ impl CloudflareClient {
                 },
                 retryable: false,
                 outcome_ambiguous: non_idempotent,
+                provider_request_lifecycle: worker_request_lifecycle(true, true, true),
                 request_artifact_sha256: Some(request_artifact_sha256.clone()),
                 response_artifact_sha256: Some(response_artifact_sha256.clone()),
                 response_body_sha256: Some(response_body_sha256.clone()),
@@ -661,6 +727,8 @@ impl CloudflareClient {
             })?;
         let result = valid_envelope_result(&envelope).map_err(|mut error| {
             error.outcome_ambiguous = non_idempotent;
+            error.retryable = false;
+            error.provider_request_lifecycle = worker_request_lifecycle(true, true, true);
             error.request_artifact_sha256 = Some(request_artifact_sha256);
             error.response_artifact_sha256 = Some(response_artifact_sha256);
             error.response_body_sha256 = Some(response_body_sha256);
@@ -790,6 +858,7 @@ fn sanitize_version_detail(
     }
     let mut names = BTreeSet::new();
     let mut binding_descriptors = Vec::with_capacity(bindings.len());
+    let mut binding_projection = BTreeMap::new();
     for binding in bindings {
         let binding = binding.as_object().ok_or_else(|| {
             operation_error(
@@ -831,17 +900,175 @@ fn sanitize_version_detail(
             name: name.to_string(),
             binding_type: binding_type.to_string(),
         });
+        binding_projection.insert(name.to_string(), Value::Object(binding.clone()));
     }
     let raw_result_sha256 = sha256_json(&result);
     let binding_descriptors_sha256 = sha256_json(&binding_descriptors);
+    let binding_projection_sha256 = sha256_json(&binding_projection);
     Ok(WorkerVersionDetailEvidence {
         version_id,
         script_etag: script_etag.to_string(),
         binding_descriptors,
         binding_descriptors_sha256,
+        binding_projection_sha256,
         raw_result_sha256,
         provider_proof,
+        binding_projection,
     })
+}
+
+pub(crate) fn prepare_worker_binding_expectation(
+    base: &WorkerVersionDetailEvidence,
+    metadata: &Value,
+) -> Result<WorkerBindingExpectation, WorkerVersionOperationError> {
+    let bindings = metadata
+        .as_object()
+        .and_then(|metadata| metadata.get("bindings"))
+        .map(|bindings| {
+            bindings.as_array().ok_or_else(|| {
+                operation_error(
+                    "workers.version_binding_plan_invalid",
+                    "reviewed metadata bindings were not an array",
+                    "Use the exact complete metadata accepted by the version-upload preview.",
+                )
+            })
+        })
+        .transpose()?
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if bindings.len() > MAX_BINDINGS {
+        return Err(operation_error(
+            "workers.version_binding_plan_invalid",
+            "reviewed metadata bindings exceeded the bounded evidence cap",
+            "Use the exact complete metadata accepted by the version-upload preview.",
+        ));
+    }
+
+    let mut expected = BTreeMap::<String, Value>::new();
+    for binding in bindings {
+        let binding = binding.as_object().ok_or_else(|| {
+            operation_error(
+                "workers.version_binding_plan_invalid",
+                "reviewed metadata contained a non-object binding",
+                "Use the exact complete metadata accepted by the version-upload preview.",
+            )
+        })?;
+        let name = binding
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(canonical_binding_name)
+            .ok_or_else(|| {
+                operation_error(
+                    "workers.version_binding_plan_invalid",
+                    "reviewed metadata binding omitted a canonical name",
+                    "Use the exact complete metadata accepted by the version-upload preview.",
+                )
+            })?;
+        let binding_type = binding
+            .get("type")
+            .and_then(Value::as_str)
+            .and_then(canonical_binding_type)
+            .ok_or_else(|| {
+                operation_error(
+                    "workers.version_binding_plan_invalid",
+                    "reviewed metadata binding omitted a canonical type",
+                    "Use the exact complete metadata accepted by the version-upload preview.",
+                )
+            })?;
+        let expected_binding = if binding_type == "inherit" {
+            let source_name = binding
+                .get("old_name")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .and_then(canonical_binding_name)
+                        .ok_or_else(|| {
+                            operation_error(
+                                "workers.version_binding_plan_invalid",
+                                "inherit old_name was not a canonical binding name",
+                                "Use the exact reviewed base binding identity.",
+                            )
+                        })
+                })
+                .transpose()?
+                .unwrap_or(name);
+            let mut inherited = base
+                .binding_projection
+                .get(source_name)
+                .and_then(Value::as_object)
+                .cloned()
+                .ok_or_else(|| {
+                    operation_error(
+                        "workers.version_binding_inherit_source_missing",
+                        "an inherited binding was absent from the exact base version detail",
+                        "Do not upload or deploy until the reviewed inheritance plan matches the base version.",
+                    )
+                })?;
+            inherited.insert("name".to_string(), Value::String(name.to_string()));
+            Value::Object(inherited)
+        } else {
+            Value::Object(binding.clone())
+        };
+        if expected
+            .insert(name.to_string(), expected_binding)
+            .is_some()
+        {
+            return Err(operation_error(
+                "workers.version_binding_plan_duplicate",
+                "reviewed metadata contained a duplicate binding name",
+                "Use one complete unambiguous binding plan.",
+            ));
+        }
+    }
+
+    Ok(WorkerBindingExpectation {
+        binding_count: expected.len(),
+        projection_sha256: sha256_json(&expected),
+        projection: expected,
+    })
+}
+
+pub(crate) fn verify_worker_candidate_bindings(
+    expectation: &WorkerBindingExpectation,
+    candidate: &WorkerVersionDetailEvidence,
+) -> WorkerBindingVerification {
+    let observed = &candidate.binding_projection;
+    let missing_binding_names = expectation
+        .projection
+        .keys()
+        .filter(|name| !observed.contains_key(*name))
+        .cloned()
+        .collect::<Vec<_>>();
+    let unexpected_binding_names = observed
+        .keys()
+        .filter(|name| !expectation.projection.contains_key(*name))
+        .cloned()
+        .collect::<Vec<_>>();
+    let changed_binding_names = expectation
+        .projection
+        .iter()
+        .filter_map(|(name, expected_value)| {
+            observed
+                .get(name)
+                .is_some_and(|observed_value| observed_value != expected_value)
+                .then(|| name.clone())
+        })
+        .collect::<Vec<_>>();
+    let observed_projection_sha256 = candidate.binding_projection_sha256.clone();
+    let matched = missing_binding_names.is_empty()
+        && unexpected_binding_names.is_empty()
+        && changed_binding_names.is_empty()
+        && expectation.projection_sha256 == observed_projection_sha256;
+    WorkerBindingVerification {
+        expected_binding_count: expectation.binding_count,
+        observed_binding_count: observed.len(),
+        expected_projection_sha256: expectation.projection_sha256.clone(),
+        observed_projection_sha256,
+        missing_binding_names,
+        unexpected_binding_names,
+        changed_binding_names,
+        matched,
+    }
 }
 
 fn sanitize_deployments(
@@ -1167,6 +1394,7 @@ fn adapter_pre_dispatch_error(error: AdapterError) -> WorkerVersionOperationErro
         hint: error.hint,
         retryable: false,
         outcome_ambiguous: false,
+        provider_request_lifecycle: worker_request_lifecycle(false, false, false),
         request_artifact_sha256: None,
         response_artifact_sha256: None,
         response_body_sha256: None,
@@ -1186,6 +1414,7 @@ fn operation_error(
         hint,
         retryable: false,
         outcome_ambiguous: false,
+        provider_request_lifecycle: worker_request_lifecycle(false, false, false),
         request_artifact_sha256: None,
         response_artifact_sha256: None,
         response_body_sha256: None,
@@ -1209,7 +1438,10 @@ mod tests {
     use serde_json::json;
     use tokio::net::TcpListener;
 
-    use super::{WorkerProviderProof, sanitize_deployments, sanitize_version_detail};
+    use super::{
+        WorkerProviderProof, prepare_worker_binding_expectation, sanitize_deployments,
+        sanitize_version_detail, verify_worker_candidate_bindings,
+    };
     use crate::cloudflare::CloudflareClient;
     use crate::config::{ApiTokenSource, CloudflareApiConfig};
 
@@ -1233,11 +1465,13 @@ mod tests {
     }
 
     async fn spawn_router(router: Router) -> String {
+        // DevSkim: ignore DS162092 -- loopback-only test fixture listener.
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
         });
+        // DevSkim: ignore DS137138 -- loopback-only test fixture URL.
         format!("http://{addr}")
     }
 
@@ -1272,6 +1506,144 @@ mod tests {
         assert!(!outward.contains("must-not-leak"));
         assert!(!outward.contains("private-id"));
         assert_eq!(detail.binding_descriptors.len(), 2);
+        assert_eq!(detail.binding_projection_sha256.len(), 64);
+    }
+
+    #[test]
+    fn candidate_binding_verification_detects_resource_and_secret_safe_drift() {
+        let base_id = "11111111-1111-4111-8111-111111111111";
+        let candidate_id = "22222222-2222-4222-8222-222222222222";
+        let base_bindings = json!([
+            {"name":"DB","type":"d1","database_id":"db-private"},
+            {"name":"SERVICE","type":"service","service":"service-private"},
+            {"name":"QUEUE","type":"queue","queue_name":"queue-private"},
+            {"name":"BUCKET","type":"r2_bucket","bucket_name":"bucket-private"},
+            {"name":"SECRET","type":"secret_text","text":"secret-private"}
+        ]);
+        let metadata = json!({
+            "main_module":"index.js",
+            "bindings":[
+                {"name":"DB","type":"inherit","version_id":base_id},
+                {"name":"SERVICE","type":"inherit","version_id":base_id},
+                {"name":"QUEUE","type":"inherit","version_id":base_id},
+                {"name":"BUCKET","type":"inherit","version_id":base_id},
+                {"name":"SECRET","type":"inherit","version_id":base_id},
+                {"name":"MODE","type":"plain_text","text":"plain-private"}
+            ]
+        });
+        let base = sanitize_version_detail(
+            json!({
+                "id":base_id,
+                "resources":{"script":{"etag":"a".repeat(64)},"bindings":base_bindings}
+            }),
+            Some(base_id),
+            proof(),
+        )
+        .expect("base");
+        let expectation =
+            prepare_worker_binding_expectation(&base, &metadata).expect("expectation");
+        let candidate_bindings = json!([
+            {"name":"DB","type":"d1","database_id":"db-private"},
+            {"name":"SERVICE","type":"service","service":"service-private"},
+            {"name":"QUEUE","type":"queue","queue_name":"queue-private"},
+            {"name":"BUCKET","type":"r2_bucket","bucket_name":"bucket-private"},
+            {"name":"SECRET","type":"secret_text","text":"secret-private"},
+            {"name":"MODE","type":"plain_text","text":"plain-private"}
+        ]);
+        let exact = sanitize_version_detail(
+            json!({
+                "id":candidate_id,
+                "resources":{"script":{"etag":"b".repeat(64)},"bindings":candidate_bindings.clone()}
+            }),
+            Some(candidate_id),
+            proof(),
+        )
+        .expect("candidate");
+        let verification = verify_worker_candidate_bindings(&expectation, &exact);
+        assert!(verification.matched, "{verification:?}");
+
+        for (name, field, replacement) in [
+            ("DB", "database_id", "db-drift"),
+            ("SERVICE", "service", "service-drift"),
+            ("QUEUE", "queue_name", "queue-drift"),
+            ("BUCKET", "bucket_name", "bucket-drift"),
+            ("SECRET", "text", "secret-drift"),
+            ("MODE", "text", "plain-drift"),
+        ] {
+            let mut drifted = candidate_bindings.clone();
+            let binding = drifted
+                .as_array_mut()
+                .expect("bindings")
+                .iter_mut()
+                .find(|binding| binding["name"] == json!(name))
+                .expect("named binding");
+            binding[field] = json!(replacement);
+            let detail = sanitize_version_detail(
+                json!({
+                    "id":candidate_id,
+                    "resources":{"script":{"etag":"b".repeat(64)},"bindings":drifted}
+                }),
+                Some(candidate_id),
+                proof(),
+            )
+            .expect("drifted candidate");
+            let verification = verify_worker_candidate_bindings(&expectation, &detail);
+            assert!(!verification.matched, "{name}");
+            assert_eq!(verification.changed_binding_names, vec![name.to_string()]);
+            let outward = serde_json::to_string(&verification).expect("serialize verification");
+            for secret in [
+                "db-private",
+                "service-private",
+                "queue-private",
+                "bucket-private",
+                "secret-private",
+                "plain-private",
+                replacement,
+            ] {
+                assert!(!outward.contains(secret), "{name}: {secret}");
+            }
+        }
+
+        let mut missing = candidate_bindings.clone();
+        missing
+            .as_array_mut()
+            .expect("bindings")
+            .retain(|binding| binding["name"] != json!("QUEUE"));
+        let missing = sanitize_version_detail(
+            json!({
+                "id":candidate_id,
+                "resources":{"script":{"etag":"b".repeat(64)},"bindings":missing}
+            }),
+            Some(candidate_id),
+            proof(),
+        )
+        .expect("missing candidate");
+        let verification = verify_worker_candidate_bindings(&expectation, &missing);
+        assert!(!verification.matched);
+        assert_eq!(verification.missing_binding_names, vec!["QUEUE"]);
+
+        let mut unexpected = candidate_bindings;
+        unexpected
+            .as_array_mut()
+            .expect("bindings")
+            .push(json!({"name":"EXTRA","type":"plain_text","text":"extra-private"}));
+        let unexpected = sanitize_version_detail(
+            json!({
+                "id":candidate_id,
+                "resources":{"script":{"etag":"b".repeat(64)},"bindings":unexpected}
+            }),
+            Some(candidate_id),
+            proof(),
+        )
+        .expect("unexpected candidate");
+        let verification = verify_worker_candidate_bindings(&expectation, &unexpected);
+        assert!(!verification.matched);
+        assert_eq!(verification.unexpected_binding_names, vec!["EXTRA"]);
+        assert!(
+            !serde_json::to_string(&verification)
+                .expect("serialize verification")
+                .contains("extra-private")
+        );
     }
 
     #[test]
@@ -1389,6 +1761,10 @@ mod tests {
         assert!(!error.retryable);
         assert!(error.request_artifact_sha256.is_some());
         assert!(error.response_artifact_sha256.is_some());
+        assert_eq!(
+            error.provider_request_lifecycle,
+            super::worker_request_lifecycle(true, true, true)
+        );
     }
 
     #[tokio::test]
@@ -1427,6 +1803,55 @@ mod tests {
         assert_eq!(error.code, "workers.version_response_invalid");
         assert!(error.outcome_ambiguous);
         assert!(!error.retryable);
+        assert_eq!(
+            error.provider_request_lifecycle,
+            super::worker_request_lifecycle(true, true, true)
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_upload_detail_retains_complete_response_lifecycle_and_proof() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = Router::new().route(
+            "/accounts/acct-1/workers/scripts/worker-a/versions",
+            post({
+                let calls = calls.clone();
+                move || {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({
+                            "success":true,
+                            "errors":[],
+                            "messages":[],
+                            "result":{"resources":{"script":{"etag":"a".repeat(64)},"bindings":[]}}
+                        }))
+                    }
+                }
+            }),
+        );
+        let base = spawn_router(router).await;
+        let client = CloudflareClient::new(test_config(base)).expect("client");
+        let error = client
+            .upload_worker_version_once(
+                "acct-1",
+                "worker-a",
+                "multipart/form-data; boundary=fixture",
+                b"reviewed-multipart".to_vec(),
+            )
+            .await
+            .expect_err("malformed detail must remain ambiguous");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(error.outcome_ambiguous);
+        assert!(!error.retryable);
+        assert_eq!(
+            error.provider_request_lifecycle,
+            super::worker_request_lifecycle(true, true, true)
+        );
+        assert!(error.request_artifact_sha256.is_some());
+        assert!(error.response_artifact_sha256.is_some());
+        assert!(error.response_body_sha256.is_some());
+        assert_eq!(error.http_status, Some(200));
     }
 
     #[tokio::test]

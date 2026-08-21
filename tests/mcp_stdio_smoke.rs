@@ -5002,6 +5002,14 @@ fn spawn_fake_worker_upload_api(expected_requests: usize) -> (String, Arc<Mutex<
 }
 
 fn spawn_fake_worker_version_api(expected_requests: usize) -> (String, Arc<Mutex<Vec<Value>>>) {
+    spawn_fake_worker_version_api_with_initial_state(expected_requests, false)
+}
+
+fn spawn_fake_worker_version_api_with_initial_state(
+    expected_requests: usize,
+    initially_uploaded: bool,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    // DevSkim: ignore DS162092 -- loopback-only test fixture listener.
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake Worker version API");
     let addr = listener.local_addr().expect("fake Worker version API addr");
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -5009,7 +5017,7 @@ fn spawn_fake_worker_version_api(expected_requests: usize) -> (String, Arc<Mutex
     thread::spawn(move || {
         let base_id = "11111111-1111-4111-8111-111111111111";
         let candidate_id = "22222222-2222-4222-8222-222222222222";
-        let mut uploaded = false;
+        let mut uploaded = initially_uploaded;
         for stream in listener.incoming().take(expected_requests) {
             let mut stream = stream.expect("fake Worker version API stream");
             let (headers, body) = read_http_request(&mut stream);
@@ -5070,7 +5078,8 @@ fn spawn_fake_worker_version_api(expected_requests: usize) -> (String, Arc<Mutex
                         "resources": {
                             "script": {"etag": "a".repeat(64)},
                             "bindings": [
-                                {"name":"SECRET","type":"secret_text","text":"never-surface"}
+                                {"name":"SECRET","type":"secret_text","text":"never-surface"},
+                                {"name":"MODE","type":"plain_text","text":"private-fixture-value"}
                             ]
                         }
                     },
@@ -5088,7 +5097,8 @@ fn spawn_fake_worker_version_api(expected_requests: usize) -> (String, Arc<Mutex
                         "resources": {
                             "script": {"etag": "b".repeat(64)},
                             "bindings": [
-                                {"name":"SECRET","type":"secret_text","text":"never-surface"}
+                                {"name":"SECRET","type":"secret_text","text":"never-surface"},
+                                {"name":"MODE","type":"plain_text","text":"private-fixture-value"}
                             ]
                         }
                     },
@@ -5118,7 +5128,8 @@ fn spawn_fake_worker_version_api(expected_requests: usize) -> (String, Arc<Mutex
                         "resources": {
                             "script": {"etag": "b".repeat(64)},
                             "bindings": [
-                                {"name":"SECRET","type":"secret_text","text":"never-surface"}
+                                {"name":"SECRET","type":"secret_text","text":"never-surface"},
+                                {"name":"MODE","type":"plain_text","text":"private-fixture-value"}
                             ]
                         }
                     },
@@ -5141,6 +5152,7 @@ fn spawn_fake_worker_version_api(expected_requests: usize) -> (String, Arc<Mutex
             stream.write_all(&response).expect("write response body");
         }
     });
+    // DevSkim: ignore DS137138 -- loopback-only test fixture URL.
     (format!("http://{addr}"), requests)
 }
 
@@ -18042,7 +18054,26 @@ fn workers_upload_version_stdio_applies_once_and_proves_disabled_candidate() {
         json!(true)
     );
     assert_eq!(apply_content["deployment_created"], json!(false));
-    assert_eq!(apply_content["provider_mutation_dispatched"], json!(true));
+    assert_eq!(
+        apply_content["provider_request_lifecycle"],
+        json!({
+            "request_prepared": true,
+            "dispatch_attempted": true,
+            "provider_response_received": true,
+        })
+    );
+    assert_eq!(
+        apply_content["binding_verification"]["matched"],
+        json!(true)
+    );
+    assert_eq!(
+        apply_content["binding_verification"]["expected_binding_count"],
+        json!(2)
+    );
+    assert_eq!(
+        apply_content["binding_verification"]["observed_binding_count"],
+        json!(2)
+    );
     let outward = apply_content.to_string();
     assert!(!outward.contains("private-fixture-value"));
     assert!(!outward.contains("never-surface"));
@@ -18072,6 +18103,71 @@ fn workers_upload_version_stdio_applies_once_and_proves_disabled_candidate() {
                 .unwrap_or_default()
                 .contains("/deployments")
     }));
+}
+
+#[test]
+fn workers_reconcile_version_upload_never_attributes_a_sole_new_candidate() {
+    let base_id = "11111111-1111-4111-8111-111111111111";
+    let candidate_id = "22222222-2222-4222-8222-222222222222";
+    let (pre_base_url, pre_requests) = spawn_fake_worker_version_api(5);
+    let mut pre_mcp =
+        McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", pre_base_url)]);
+    let preflight = pre_mcp.call_tool(
+        2,
+        "workers_capture_version_evidence",
+        json!({
+            "script_name":"worker-a",
+            "per_page":100,
+            "version_id":base_id
+        }),
+    );
+    let preflight_content = structured_content(&preflight);
+    assert_eq!(preflight_content["ok"], json!(true), "{preflight_content}");
+    let versions = &preflight_content["evidence"]["versions"];
+    let deployments = &preflight_content["evidence"]["deployments"];
+    let pre_upload_version_ids = versions["version_ids"].clone();
+    let pre_upload_version_ids_sha256 = versions["version_ids_sha256"].clone();
+    let pre_upload_deployments = deployments["deployments"].clone();
+    let pre_upload_deployment_snapshot_sha256 = deployments["semantic_snapshot_sha256"].clone();
+    assert_eq!(pre_requests.lock().expect("request log lock").len(), 5);
+    pre_mcp.terminate();
+
+    let (base_url, requests) = spawn_fake_worker_version_api_with_initial_state(10, true);
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let response = mcp.call_tool(
+        2,
+        "workers_reconcile_version_upload",
+        json!({
+            "script_name":"worker-a",
+            "base_version_id":base_id,
+            "base_version_etag":"a".repeat(64),
+            "upload_contract_sha256":"d".repeat(64),
+            "pre_upload_version_ids":pre_upload_version_ids,
+            "pre_upload_version_ids_sha256":pre_upload_version_ids_sha256,
+            "pre_upload_deployments":pre_upload_deployments,
+            "pre_upload_deployment_snapshot_sha256":pre_upload_deployment_snapshot_sha256,
+            "per_page":100
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["status"], json!("reconciliation_required"));
+    assert_eq!(content["attribution_state"], json!("unattributed"));
+    assert_eq!(
+        content["candidate_relationship"],
+        json!("sole_new_version_since_pinned_snapshot")
+    );
+    assert_eq!(content["candidate_version_id"], json!(candidate_id));
+    assert_eq!(content["mutation_performed"], json!(false));
+    assert_eq!(content["deployment_created"], json!(false));
+    assert_eq!(content["retry_decision"], json!("do_not_retry"));
+    let requests = requests.lock().expect("request log lock");
+    assert_eq!(requests.len(), 10);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request["method"] == json!("GET"))
+    );
 }
 
 #[test]

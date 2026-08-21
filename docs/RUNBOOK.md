@@ -1063,7 +1063,9 @@ not be deployed yet. It is intentionally separate from
    and retain the confirmation token. Dry-run performs no provider call.
 3. Apply once with unchanged inputs and the exact confirmation token. The MCP
    re-captures the base and pre-state, sends one non-retrying version POST, and
-   requires exactly one new candidate, exact candidate ID/ETag/detail, and an
+   requires exactly one new candidate, exact candidate ID/ETag/detail, exact
+   response-to-readback equality, and a complete binding projection matching
+   both explicit metadata and exact-base inheritance. It also requires an
    unchanged two-pass deployment projection with `candidate_absent:true`.
    `applied_proven` means only that a disabled candidate exists. It does not
    authorize or create a deployment.
@@ -1076,11 +1078,14 @@ If the upload response is lost, rejected, malformed, oversized, unexpectedly
 encoded, or followed by failed/contradictory readback, never repeat the POST.
 Call `workers_reconcile_version_upload` with the exact pinned pre-upload IDs,
 deployment projection and hashes, base ID/ETag, and dry-run upload-contract
-SHA-256. Reconciliation is read-only and succeeds only when there is exactly
-one new version over the predecessor set, the base still matches, deployments
-are unchanged, and the new candidate remains absent from deployments. Zero or
-multiple candidates, a missing predecessor, any hash/state drift, or a deployed
-candidate remains unresolved and never authorizes an upload retry.
+SHA-256. Reconciliation is read-only. Exactly one new version over the
+predecessor set, a matching base, unchanged deployments, and a disabled
+candidate prove only a sole-new-candidate relationship. They do not attribute
+that candidate to the lost POST or prove its complete reviewed bytes and
+binding plan, so the result remains `reconciliation_required` and
+`unattributed`. Zero or multiple candidates, a missing predecessor, any
+hash/state drift, or a deployed candidate also remains unresolved. No outcome
+authorizes an upload retry.
 
 ## Apply Sequence
 
