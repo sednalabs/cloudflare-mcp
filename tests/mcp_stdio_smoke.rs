@@ -17987,6 +17987,17 @@ fn workers_upload_version_rejects_non_strict_inheritance_before_provider_access(
 
 #[test]
 fn workers_upload_version_schema_and_deserialization_are_closed() {
+    fn resolve_local<'a>(schema: &'a Value, node: &'a Value) -> &'a Value {
+        if let Some(reference) = node.get("$ref").and_then(Value::as_str) {
+            let name = reference
+                .strip_prefix("#/$defs/")
+                .expect("local schema reference");
+            &schema["$defs"][name]
+        } else {
+            node
+        }
+    }
+
     let (base_url, requests) = spawn_fake_worker_upload_api(0);
     let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
     let tools = mcp.request(2, "tools/list", json!({}));
@@ -18019,6 +18030,18 @@ fn workers_upload_version_schema_and_deserialization_are_closed() {
         schema["$defs"][metadata_name]["additionalProperties"],
         json!(false)
     );
+    let binding_items = &schema["$defs"][metadata_name]["properties"]["bindings"]["items"];
+    assert_ne!(binding_items, &json!(true), "binding items must be typed");
+    let binding_schema = resolve_local(schema, binding_items);
+    let binding_variants = binding_schema["oneOf"]
+        .as_array()
+        .expect("closed binding union");
+    assert_eq!(binding_variants.len(), 24);
+    assert!(binding_variants.iter().all(|variant| {
+        let variant = resolve_local(schema, variant);
+        variant["additionalProperties"] == json!(false)
+            && variant["properties"]["type"]["const"].is_string()
+    }));
 
     let base_args = json!({
         "script_name":"worker-a",
@@ -18039,11 +18062,19 @@ fn workers_upload_version_schema_and_deserialization_are_closed() {
     for (label, mut arguments) in [
         ("unknown top-level", base_args.clone()),
         ("unknown metadata", base_args.clone()),
+        ("unknown binding field", base_args.clone()),
     ] {
         if label == "unknown top-level" {
             arguments["future_control"] = json!(true);
-        } else {
+        } else if label == "unknown metadata" {
             arguments["metadata"]["future_control"] = json!(true);
+        } else {
+            arguments["metadata"]["bindings"] = json!([{
+                "name":"DB",
+                "type":"d1",
+                "database_id":"db-1",
+                "future_control":true
+            }]);
         }
         let response = mcp.call_tool(3, "workers_upload_version", arguments);
         assert!(
@@ -18055,7 +18086,29 @@ fn workers_upload_version_schema_and_deserialization_are_closed() {
             "{label}: {response}"
         );
     }
-    for (id, per_page) in [(5, 0), (6, 101)] {
+    let mut primitive_binding = base_args.clone();
+    primitive_binding["metadata"]["bindings"] = json!([7]);
+    let response = mcp.call_tool(4, "workers_upload_version", primitive_binding);
+    assert!(response.to_string().contains("invalid type"), "{response}");
+    assert!(
+        response["error"].is_object() || response["result"]["isError"] == json!(true),
+        "{response}"
+    );
+    let mut unknown_binding_type = base_args.clone();
+    unknown_binding_type["metadata"]["bindings"] = json!([{
+        "name":"FUTURE",
+        "type":"future_binding_type"
+    }]);
+    let response = mcp.call_tool(5, "workers_upload_version", unknown_binding_type);
+    assert!(
+        response.to_string().contains("unknown variant"),
+        "{response}"
+    );
+    assert!(
+        response["error"].is_object() || response["result"]["isError"] == json!(true),
+        "{response}"
+    );
+    for (id, per_page) in [(6, 0), (7, 101)] {
         let mut arguments = base_args.clone();
         arguments["per_page"] = json!(per_page);
         let response = mcp.call_tool(id, "workers_upload_version", arguments);

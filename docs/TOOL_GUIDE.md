@@ -475,6 +475,8 @@ These tools deliberately have no deployment-create path. A successful version
 upload is only disabled candidate evidence; it never authorizes traffic or a
 later deployment.
 
+The MCP schema represents each upload binding as a tagged, deny-unknown union;
+arbitrary binding values and unknown per-type fields fail at deserialization.
 The guarded upload plan currently supports explicit `inherit` bound to the exact
 pinned base. Provider detail must materialize that binding before it can become
 proof: implicit, `latest`, or still-inherited provider projections are rejected

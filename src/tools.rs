@@ -804,12 +804,130 @@ pub enum WorkerVersionBindingsInherit {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkerVersionUploadBinding {
+    Inherit {
+        name: String,
+        #[serde(default)]
+        old_name: Option<String>,
+        version_id: String,
+    },
+    D1 {
+        name: String,
+        #[serde(default)]
+        database_id: Option<String>,
+        #[serde(default)]
+        id: Option<String>,
+    },
+    AiSearch {
+        name: String,
+        instance_name: String,
+        #[serde(default)]
+        namespace: Option<String>,
+    },
+    AiSearchNamespace {
+        name: String,
+        namespace: String,
+    },
+    PlainText {
+        name: String,
+        text: String,
+    },
+    SecretText {
+        name: String,
+        text: String,
+    },
+    Json {
+        name: String,
+        json: Value,
+    },
+    Service {
+        name: String,
+        service: String,
+        #[serde(default)]
+        environment: Option<String>,
+        #[serde(default)]
+        entrypoint: Option<String>,
+    },
+    R2Bucket {
+        name: String,
+        bucket_name: String,
+        #[serde(default)]
+        jurisdiction: Option<WorkerVersionR2Jurisdiction>,
+    },
+    Queue {
+        name: String,
+        queue_name: String,
+    },
+    AnalyticsEngine {
+        name: String,
+        dataset: String,
+    },
+    KvNamespace {
+        name: String,
+        namespace_id: String,
+    },
+    Vectorize {
+        name: String,
+        index_name: String,
+    },
+    Hyperdrive {
+        name: String,
+        id: String,
+    },
+    Pipelines {
+        name: String,
+        pipeline: String,
+    },
+    MtlsCertificate {
+        name: String,
+        certificate_id: String,
+    },
+    Messaging {
+        name: String,
+        namespace: String,
+    },
+    SecretsStoreSecret {
+        name: String,
+        secret_name: String,
+        store_id: String,
+    },
+    Ai {
+        name: String,
+    },
+    Assets {
+        name: String,
+    },
+    Browser {
+        name: String,
+    },
+    Images {
+        name: String,
+    },
+    Media {
+        name: String,
+    },
+    VersionMetadata {
+        name: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkerVersionR2Jurisdiction {
+    Eu,
+    Fedramp,
+    #[serde(rename = "fedramp-high")]
+    FedrampHigh,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerVersionUploadMetadata {
     pub main_module: String,
     pub compatibility_date: String,
     pub compatibility_flags: Vec<String>,
-    pub bindings: Vec<Value>,
+    pub bindings: Vec<WorkerVersionUploadBinding>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

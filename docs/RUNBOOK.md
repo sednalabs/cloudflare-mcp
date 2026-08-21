@@ -1060,7 +1060,9 @@ not be deployed yet. It is intentionally separate from
    metadata, and `bindings_inherit:"strict"`. Metadata is a deny-unknown
    contract containing exactly `main_module`, a valid `compatibility_date`, a
    duplicate-free `compatibility_flags` array, and the complete `bindings`
-   array. Omission is never interpreted as an empty binding plan. Export
+   array. Every binding item must match one tagged, deny-unknown supported-type
+   schema before its values reach the stricter runtime canonicalizer. Omission
+   is never interpreted as an empty binding plan. Export
    reconciliation, migrations, durable-object lifecycle inputs, assets/cache
    controls, annotations, dependencies, logpush/tails/tags/observability,
    placement, limits, usage model, and other runtime controls are rejected
