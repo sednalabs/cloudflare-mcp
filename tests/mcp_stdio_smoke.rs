@@ -17957,10 +17957,132 @@ fn workers_upload_version_dry_run_is_strict_digest_bound_and_provider_free() {
     assert!(content["upload"]["body_sha256"].is_string());
     assert!(content["upload"]["metadata_sha256"].is_string());
     assert!(content["upload"]["upload_contract_sha256"].is_string());
+    assert_eq!(content["request_evidence"]["status"], json!("digest_only"));
+    assert_eq!(
+        content["request_evidence"]["exact_request_bytes_retained"],
+        json!(false)
+    );
+    assert_eq!(
+        content["request_evidence"]["canonical_request_manifest_retained"],
+        json!(false)
+    );
+    assert_eq!(
+        content["request_evidence"]["attempt_authority_commits_upload_contract_digest"],
+        json!(false)
+    );
     let outward = content.to_string();
     assert!(!outward.contains("private-fixture-value"));
     assert!(!outward.contains("script_content"));
     assert!(requests.lock().expect("request log lock").is_empty());
+}
+
+#[test]
+fn workers_upload_version_supported_sources_all_report_digest_only_evidence() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos();
+    let artifact_root = std::env::temp_dir().join(format!(
+        "cloudflare-mcp-version-source-matrix-{}-{suffix}",
+        std::process::id()
+    ));
+    fs::create_dir(&artifact_root).expect("create artifact root");
+    fs::set_permissions(&artifact_root, fs::Permissions::from_mode(0o700))
+        .expect("make artifact root private");
+    fs::write(artifact_root.join("candidate.js"), b"export default {}")
+        .expect("write module fixture");
+    let multipart = concat!(
+        "--fixture\r\n",
+        "Content-Disposition: form-data; name=\"metadata\"\r\n\r\n",
+        "{\"bindings\":[],\"compatibility_date\":\"2026-07-10\",\"compatibility_flags\":[],\"main_module\":\"index.js\"}\r\n",
+        "--fixture\r\n",
+        "Content-Disposition: form-data; name=\"index.js\"; filename=\"index.js\"\r\n",
+        "Content-Type: application/javascript+module\r\n\r\n",
+        "export default {}\r\n",
+        "--fixture--\r\n"
+    );
+    fs::write(artifact_root.join("candidate.multipart"), multipart)
+        .expect("write multipart fixture");
+
+    let (base_url, requests) = spawn_fake_worker_upload_api(0);
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_WORKER_UPLOAD_ROOT",
+            artifact_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let base = json!({
+        "script_name":"worker-a",
+        "base_version_id":"11111111-1111-4111-8111-111111111111",
+        "base_version_etag":"a".repeat(64),
+        "pre_upload_version_snapshot_sha256":"b".repeat(64),
+        "pre_upload_deployment_snapshot_sha256":"c".repeat(64),
+        "bindings_inherit":"strict",
+        "main_module":"index.js",
+        "metadata":{
+            "main_module":"index.js",
+            "compatibility_date":"2026-07-10",
+            "compatibility_flags":[],
+            "bindings":[]
+        },
+        "dry_run":true
+    });
+    let sources = [
+        ("inline", json!({"script_content":"export default {}"})),
+        (
+            "base64",
+            json!({"script_content_base64":"ZXhwb3J0IGRlZmF1bHQge30="}),
+        ),
+        ("file", json!({"script_path":"candidate.js"})),
+        (
+            "multipart",
+            json!({
+                "multipart_path":"candidate.multipart",
+                "content_type":"multipart/form-data; boundary=fixture"
+            }),
+        ),
+    ];
+    let mut module_body_digests = Vec::new();
+    for (index, (label, source)) in sources.into_iter().enumerate() {
+        let mut arguments = base.clone();
+        arguments
+            .as_object_mut()
+            .expect("base arguments")
+            .extend(source.as_object().expect("source arguments").clone());
+        let response = mcp.call_tool(10 + index as u64, "workers_upload_version", arguments);
+        let content = structured_content(&response);
+        assert_eq!(content["ok"], json!(true), "{label}: {content}");
+        assert_eq!(
+            content["request_evidence"]["status"],
+            json!("digest_only"),
+            "{label}: {content}"
+        );
+        assert_eq!(
+            content["request_evidence"]["exact_request_bytes_retained"],
+            json!(false),
+            "{label}: {content}"
+        );
+        assert_eq!(
+            content["request_evidence"]["canonical_request_manifest_retained"],
+            json!(false),
+            "{label}: {content}"
+        );
+        if label != "multipart" {
+            module_body_digests.push(content["upload"]["body_sha256"].clone());
+        }
+    }
+    assert!(
+        module_body_digests
+            .windows(2)
+            .all(|pair| pair[0] == pair[1]),
+        "inline, base64, and file sources with identical bytes must build one canonical request"
+    );
+    assert!(requests.lock().expect("request log lock").is_empty());
+    mcp.terminate();
+    fs::remove_dir_all(artifact_root).expect("remove artifact root");
 }
 
 #[test]
@@ -18314,7 +18436,28 @@ fn workers_upload_version_stdio_applies_once_and_proves_disabled_candidate() {
     assert_eq!(apply_content["ok"], json!(true), "{apply_content}");
     assert_eq!(
         apply_content["status"],
-        json!("candidate_created_custodied")
+        json!("candidate_created_digest_only")
+    );
+    assert_eq!(
+        apply_content["request_evidence"]["status"],
+        json!("digest_only")
+    );
+    assert_eq!(
+        apply_content["request_evidence"]["exact_request_bytes_retained"],
+        json!(false)
+    );
+    assert_eq!(
+        apply_content["request_evidence"]["canonical_request_manifest_retained"],
+        json!(false)
+    );
+    assert_eq!(
+        apply_content["request_evidence"]["attempt_authority_commits_upload_contract_digest"],
+        json!(true)
+    );
+    assert!(
+        apply_content["request_evidence"]["authenticated_request_artifact_sha256"]
+            .as_str()
+            .is_some_and(|value| value.len() == 64)
     );
     assert_eq!(
         apply_content["source_proof"]["status"],

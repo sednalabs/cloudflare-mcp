@@ -8452,6 +8452,17 @@ impl CloudflareMcp {
             .collect::<Vec<_>>();
         let upload_summary = json!(&artifact.summary);
         let upload_contract_sha256 = artifact.summary.upload_contract_sha256.clone();
+        let dry_run_request_evidence = json!({
+            "status": "digest_only",
+            "exact_request_bytes_retained": false,
+            "canonical_request_manifest_retained": false,
+            "attempt_authority_commits_upload_contract_digest": false,
+            "submitted_body_sha256": artifact.summary.body_sha256,
+            "submitted_body_size_bytes": artifact.summary.size_bytes,
+            "submitted_metadata_sha256": artifact.summary.metadata_sha256,
+            "upload_contract_sha256": artifact.summary.upload_contract_sha256,
+            "reason": "The canonical request is constructed in memory. Dry-run returns exact digests and size but does not retain request bytes or a reconstructable request manifest."
+        });
         let operation = find_operation("worker-versions-upload-version").ok_or_else(|| {
             crate::McpError::internal_error(
                 "missing Worker version upload operation catalog entry",
@@ -8513,6 +8524,7 @@ impl CloudflareMcp {
                     "base_version_id": args.base_version_id,
                     "base_version_etag": args.base_version_etag,
                     "upload": upload_summary,
+                    "request_evidence": dry_run_request_evidence,
                     "pre_upload_version_snapshot_sha256": args.pre_upload_version_snapshot_sha256,
                     "pre_upload_deployment_snapshot_sha256": args.pre_upload_deployment_snapshot_sha256,
                     "required_confirmation_token": required_confirmation_token,
@@ -8922,7 +8934,19 @@ impl CloudflareMcp {
         Ok(finalize_mutation_result(
             CallToolResult::structured(json!({
                 "ok": true,
-                "status": "candidate_created_custodied",
+                "status": "candidate_created_digest_only",
+                "request_evidence": {
+                    "status": "digest_only",
+                    "exact_request_bytes_retained": false,
+                    "canonical_request_manifest_retained": false,
+                    "attempt_authority_commits_upload_contract_digest": true,
+                    "submitted_body_sha256": artifact.summary.body_sha256,
+                    "submitted_body_size_bytes": artifact.summary.size_bytes,
+                    "submitted_metadata_sha256": artifact.summary.metadata_sha256,
+                    "upload_contract_sha256": artifact.summary.upload_contract_sha256,
+                    "authenticated_request_artifact_sha256": upload.provider_proof.request_artifact_sha256,
+                    "reason": "The durable attempt receipt commits to the upload-contract digest, and the result returns exact body and authenticated-request digests. The canonical request bytes and a reconstructable request manifest are not retained."
+                },
                 "source_proof": {
                     "status": "source_provider_unverified",
                     "submitted_body_sha256": artifact.summary.body_sha256,
@@ -8931,7 +8955,7 @@ impl CloudflareMcp {
                     "upload_contract_sha256": artifact.summary.upload_contract_sha256,
                     "provider_exports_reconciliation_sha256": upload.exports_reconciliation_sha256.clone(),
                     "provider_startup_time_ms": upload.startup_time_ms,
-                    "reason": "Cloudflare Version Detail exposes an ETag and runtime/resource projections, not the submitted module graph or source bytes. The exact request remains locally custodied; source-byte identity is not claimed as provider-proven."
+                    "reason": "Cloudflare Version Detail exposes an ETag and runtime/resource projections, not the submitted module graph or source bytes. Only request digests are retained; neither exact request bytes nor source-byte identity is claimed as provider-proven."
                 },
                 "provider_proof_scope": {
                     "candidate_id": true,

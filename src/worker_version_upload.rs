@@ -865,6 +865,40 @@ mod tests {
     }
 
     #[test]
+    fn inline_and_base64_sources_produce_the_same_digest_only_request() {
+        let metadata = json!({
+            "main_module": "index.js",
+            "compatibility_date": "2026-07-10",
+            "compatibility_flags": [],
+            "bindings": []
+        });
+        let build = |script_content, script_content_base64| {
+            build_worker_version_upload(
+                WorkerUploadInput {
+                    script_path: None,
+                    script_content,
+                    script_content_base64,
+                    multipart_path: None,
+                    main_module: Some("index.js"),
+                    metadata: &metadata,
+                    content_type: None,
+                },
+                BASE,
+            )
+            .expect("version upload")
+        };
+        let inline = build(Some("export default {}"), None);
+        let encoded = build(None, Some("ZXhwb3J0IGRlZmF1bHQge30="));
+        assert_eq!(inline.body, encoded.body);
+        assert_eq!(inline.summary.body_sha256, encoded.summary.body_sha256);
+        assert_eq!(inline.summary.size_bytes, encoded.summary.size_bytes);
+        assert_eq!(
+            inline.summary.upload_contract_sha256,
+            encoded.summary.upload_contract_sha256
+        );
+    }
+
+    #[test]
     fn implicit_latest_inheritance_fails_closed() {
         let metadata = json!({
             "main_module": "index.js",

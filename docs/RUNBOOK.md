@@ -1108,9 +1108,18 @@ not be deployed yet. It is intentionally separate from
    It also requires an
    unchanged sorted two-pass deployment projection with an explicit known
    `percentage` strategy and `candidate_absent:true`.
-   `candidate_created_custodied` means a disabled candidate exists, the exact
-   submitted request remains in descriptor-bound local custody, and the
-   provider-visible identity/runtime/binding/deployment projections match.
+   `candidate_created_digest_only` means a disabled candidate exists and the
+   provider-visible identity/runtime/binding/deployment projections match. It
+   deliberately does **not** claim request-byte custody: the canonical request
+   is constructed in memory, the durable attempt authority commits to the
+   upload-contract digest, and the result returns exact body/request digests
+   plus size. Neither the exact request bytes nor a reconstructable canonical
+   request manifest is retained across process exit.
+   Consequently there is no request-artifact create/write/fsync/readback
+   lifecycle to recover after a partial artifact write. Request construction
+   fails before attempt preparation or dispatch; after preparation, restart,
+   exact replay, conflicting replay, and response loss are governed only by
+   the append-only attempt receipts and digest commitments described above.
    `source_proof.status=source_provider_unverified` is intentional: Version
    Detail cannot authenticate the submitted module graph or source bytes. The
    result does not authorize or create a deployment and must never be described
@@ -1118,10 +1127,12 @@ not be deployed yet. It is intentionally separate from
    script-level logpush, tails, tags, observability and similar settings inputs,
    it does not claim a separate Script Settings before/after proof; that scope
    is reported as false rather than silently inferred.
-4. Preserve the returned request/response artifact SHA-256 values as exact
-   authenticated exchange evidence. They intentionally replace outward raw
-   credential headers, response bodies, module bytes, metadata values, and
-   binding values.
+4. Preserve the returned request/response artifact SHA-256 values as
+   digest-only exchange evidence. They are computed over the exact in-memory
+   exchange and intentionally replace outward raw credential headers, response
+   bodies, module bytes, metadata values, and binding values. The digests are
+   not proof that the underlying request or response bytes were durably
+   retained.
 
 If the upload response is lost before or after provider visibility, rejected,
 malformed, oversized, unexpectedly encoded, or followed by

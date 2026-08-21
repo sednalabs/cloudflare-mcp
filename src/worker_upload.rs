@@ -514,6 +514,27 @@ mod tests {
     }
 
     #[test]
+    fn rejects_oversized_inline_source_before_request_construction() {
+        let oversized = "x".repeat(MAX_WORKER_UPLOAD_BYTES as usize + 1);
+        let error = build_worker_upload(WorkerUploadInput {
+            script_path: None,
+            script_content: Some(&oversized),
+            script_content_base64: None,
+            multipart_path: None,
+            main_module: Some("worker.js"),
+            metadata: &json!({"compatibility_date": "2026-06-03"}),
+            content_type: None,
+        })
+        .expect_err("oversized source must fail closed");
+        assert_eq!(error.code, "workers.upload_too_large");
+        assert!(
+            !serde_json::to_string(&error.payload())
+                .expect("serialize error")
+                .contains(&oversized)
+        );
+    }
+
+    #[test]
     fn infers_multipart_content_type_from_first_boundary() {
         let content_type =
             infer_multipart_content_type(b"------formdata-worker-bundle\r\nContent-Disposition: form-data; name=\"metadata\"\r\n");
