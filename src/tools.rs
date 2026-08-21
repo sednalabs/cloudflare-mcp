@@ -797,7 +797,23 @@ pub struct WorkersCaptureVersionEvidenceArgs {
     pub candidate_must_be_absent: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerVersionBindingsInherit {
+    Strict,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerVersionUploadMetadata {
+    pub main_module: String,
+    pub compatibility_date: String,
+    pub compatibility_flags: Vec<String>,
+    pub bindings: Vec<Value>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WorkersUploadVersionArgs {
     #[serde(default)]
     pub account_id: Option<String>,
@@ -806,7 +822,7 @@ pub struct WorkersUploadVersionArgs {
     pub base_version_etag: String,
     pub pre_upload_version_snapshot_sha256: String,
     pub pre_upload_deployment_snapshot_sha256: String,
-    pub bindings_inherit: String,
+    pub bindings_inherit: WorkerVersionBindingsInherit,
     #[serde(default)]
     pub main_module: Option<String>,
     #[serde(default)]
@@ -817,10 +833,11 @@ pub struct WorkersUploadVersionArgs {
     pub script_content_base64: Option<String>,
     #[serde(default)]
     pub multipart_path: Option<String>,
-    pub metadata: Value,
+    pub metadata: WorkerVersionUploadMetadata,
     #[serde(default)]
     pub content_type: Option<String>,
     #[serde(default = "default_worker_version_per_page")]
+    #[schemars(range(min = 1, max = 100))]
     pub per_page: u32,
     #[serde(default)]
     pub dry_run: bool,
@@ -8205,12 +8222,12 @@ impl CloudflareMcp {
                 },
             ));
         }
-        if args.bindings_inherit != "strict" {
+        if !(1..=100).contains(&args.per_page) {
             return Ok(worker_version_simple_error_result(
                 "workers_upload_version",
-                "workers.version_upload_strict_inheritance_required",
-                "bindings_inherit must be exactly strict",
-                "The version-only upload path never permits silent binding drops.",
+                "workers.version_upload_per_page_invalid",
+                "per_page must be between 1 and 100",
+                "Use the same bounded page size for pre-state capture and upload readback.",
             ));
         }
         if !is_lower_hex_sha256(&args.base_version_etag)
@@ -8224,6 +8241,8 @@ impl CloudflareMcp {
                 "Use the exact evidence returned by workers_capture_version_evidence.",
             ));
         }
+        let typed_metadata = serde_json::to_value(&args.metadata)
+            .expect("typed Worker version metadata is finite JSON");
         let artifact = match build_worker_version_upload(
             WorkerUploadInput {
                 script_path: args.script_path.as_deref(),
@@ -8231,7 +8250,7 @@ impl CloudflareMcp {
                 script_content_base64: args.script_content_base64.as_deref(),
                 multipart_path: args.multipart_path.as_deref(),
                 main_module: args.main_module.as_deref(),
-                metadata: &args.metadata,
+                metadata: &typed_metadata,
                 content_type: args.content_type.as_deref(),
             },
             &args.base_version_id,
@@ -8504,6 +8523,7 @@ impl CloudflareMcp {
             .iter()
             .collect::<BTreeSet<_>>();
         let added = post_ids.difference(&pre_ids).copied().collect::<Vec<_>>();
+        // DevSkim: ignore DS197836 -- these SHA-256 values are exact evidence digests, not secrets or KDF inputs.
         let post_detail_matches = post_state.detail.as_ref().is_some_and(|detail| {
             detail.version_id == upload.candidate_version_id
                 && detail.script_etag == upload.script_etag

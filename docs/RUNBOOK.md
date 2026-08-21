@@ -1066,8 +1066,11 @@ not be deployed yet. It is intentionally separate from
    placement, limits, usage model, and other runtime controls are rejected
    before any provider request. Every inherited binding must
    explicitly name the exact base version; never use implicit or `latest`
-   inheritance. Path artifacts are opened once without following a final
-   symlink and are validated, bounded, and read through that same descriptor.
+   inheritance. For a path artifact, set
+   `CLOUDFLARE_MCP_WORKER_UPLOAD_ROOT` to an operator-owned mode-0700 directory
+   and pass only a canonical relative path beneath it. The MCP opens every
+   component descriptor-relatively without following symlinks, then validates,
+   bounds, and reads the final regular file through that same descriptor.
    The closed binding projection rejects unknown types or fields and normalizes
    only documented representation equivalence: deprecated D1 `id` to
    `database_id`, and an omitted AI Search instance namespace to `default`.
@@ -1078,7 +1081,10 @@ not be deployed yet. It is intentionally separate from
    requires exactly one new candidate, exact candidate ID/ETag, exact allowed
    compatibility date/flags, response-to-readback script/runtime/version
    metadata projections, and a complete binding projection matching
-   both explicit metadata and exact-base inheritance. It also requires an
+   both explicit metadata and exact-base inheritance. If provider detail still
+   contains an `inherit` binding, stop: this ceremony deliberately rejects it
+   rather than pretending to prove an uncaptured recursive inheritance chain.
+   It also requires an
    unchanged sorted two-pass deployment projection with an explicit known
    `percentage` strategy and `candidate_absent:true`.
    `candidate_created_custodied` means a disabled candidate exists, the exact

@@ -360,6 +360,13 @@ fn canonical_compatibility_date(value: &str) -> bool {
 pub(crate) fn canonicalize_provider_binding(
     binding: &Map<String, Value>,
 ) -> Result<Map<String, Value>, WorkerUploadError> {
+    if binding.get("type").and_then(Value::as_str) == Some("inherit") {
+        return Err(version_upload_error(
+            "workers.version_binding_provider_inherit_unresolved",
+            "provider version detail retained an inherit binding but this bounded ceremony has no captured recursive inheritance chain",
+            "Capture a provider detail whose binding projection is fully materialized; implicit, latest, and unresolved provider inheritance cannot be proven.",
+        ));
+    }
     canonicalize_binding(binding, None)
 }
 

@@ -340,6 +340,7 @@ impl McpStdioProcess {
         command
             .arg("--stdio")
             .env_remove("CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT")
+            .env_remove("CLOUDFLARE_MCP_WORKER_UPLOAD_ROOT")
             .env("RUST_LOG", "off")
             .env("CLOUDFLARE_MCP_AUTH_MODE", "off")
             .env("CLOUDFLARE_API_TOKEN", fixture_material("cf-api"))
@@ -5009,8 +5010,8 @@ fn spawn_fake_worker_version_api_with_initial_state(
     expected_requests: usize,
     initially_uploaded: bool,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
-    // DevSkim: ignore DS162092 -- loopback-only test fixture listener.
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake Worker version API");
+    let listener = TcpListener::bind("127.0.0.1:0") // DevSkim: ignore DS162092 -- loopback-only test fixture listener.
+        .expect("bind fake Worker version API");
     let addr = listener.local_addr().expect("fake Worker version API addr");
     let requests = Arc::new(Mutex::new(Vec::new()));
     let requests_for_thread = requests.clone();
@@ -5155,8 +5156,7 @@ fn spawn_fake_worker_version_api_with_initial_state(
             stream.write_all(&response).expect("write response body");
         }
     });
-    // DevSkim: ignore DS137138 -- loopback-only test fixture URL.
-    (format!("http://{addr}"), requests)
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only test fixture URL.
 }
 
 fn spawn_fake_worker_upload_api_with_readback(
@@ -17977,17 +17977,101 @@ fn workers_upload_version_rejects_non_strict_inheritance_before_provider_access(
             "dry_run":true
         }),
     );
-    let content = structured_content(&response);
-    assert_eq!(content["ok"], json!(false), "{content}");
-    assert_eq!(
-        content["error"]["code"],
-        json!("workers.version_upload_strict_inheritance_required")
+    assert!(response.to_string().contains("best_effort"), "{response}");
+    assert!(
+        response["error"].is_object() || response["result"]["isError"] == json!(true),
+        "{response}"
     );
     assert!(requests.lock().expect("request log lock").is_empty());
 }
 
 #[test]
+fn workers_upload_version_schema_and_deserialization_are_closed() {
+    let (base_url, requests) = spawn_fake_worker_upload_api(0);
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let tools = mcp.request(2, "tools/list", json!({}));
+    let tool = tools["result"]["tools"]
+        .as_array()
+        .and_then(|tools| {
+            tools
+                .iter()
+                .find(|tool| tool["name"] == json!("workers_upload_version"))
+        })
+        .expect("workers_upload_version schema");
+    let schema = &tool["inputSchema"];
+    assert_eq!(schema["additionalProperties"], json!(false));
+    let inherit_ref = schema["properties"]["bindings_inherit"]["$ref"]
+        .as_str()
+        .expect("strict inheritance ref");
+    let inherit_name = inherit_ref
+        .strip_prefix("#/$defs/")
+        .expect("local inheritance ref");
+    assert_eq!(schema["$defs"][inherit_name]["enum"], json!(["strict"]));
+    assert_eq!(schema["properties"]["per_page"]["minimum"], json!(1));
+    assert_eq!(schema["properties"]["per_page"]["maximum"], json!(100));
+    let metadata_ref = schema["properties"]["metadata"]["$ref"]
+        .as_str()
+        .expect("typed metadata ref");
+    let metadata_name = metadata_ref
+        .strip_prefix("#/$defs/")
+        .expect("local metadata ref");
+    assert_eq!(
+        schema["$defs"][metadata_name]["additionalProperties"],
+        json!(false)
+    );
+
+    let base_args = json!({
+        "script_name":"worker-a",
+        "base_version_id":"11111111-1111-4111-8111-111111111111",
+        "base_version_etag":"a".repeat(64),
+        "pre_upload_version_snapshot_sha256":"b".repeat(64),
+        "pre_upload_deployment_snapshot_sha256":"c".repeat(64),
+        "bindings_inherit":"strict",
+        "script_content":"export default {}",
+        "metadata":{
+            "main_module":"index.js",
+            "compatibility_date":"2026-07-10",
+            "compatibility_flags":[],
+            "bindings":[]
+        },
+        "dry_run":true
+    });
+    for (label, mut arguments) in [
+        ("unknown top-level", base_args.clone()),
+        ("unknown metadata", base_args.clone()),
+    ] {
+        if label == "unknown top-level" {
+            arguments["future_control"] = json!(true);
+        } else {
+            arguments["metadata"]["future_control"] = json!(true);
+        }
+        let response = mcp.call_tool(3, "workers_upload_version", arguments);
+        assert!(
+            response.to_string().contains("unknown field"),
+            "{label}: {response}"
+        );
+        assert!(
+            response["error"].is_object() || response["result"]["isError"] == json!(true),
+            "{label}: {response}"
+        );
+    }
+    for (id, per_page) in [(5, 0), (6, 101)] {
+        let mut arguments = base_args.clone();
+        arguments["per_page"] = json!(per_page);
+        let response = mcp.call_tool(id, "workers_upload_version", arguments);
+        let content = structured_content(&response);
+        assert_eq!(
+            content["error"]["code"],
+            json!("workers.version_upload_per_page_invalid"),
+            "{content}"
+        );
+    }
+    assert!(requests.lock().expect("request log lock").is_empty());
+}
+
+#[test]
 fn workers_upload_version_rejects_symlink_artifact_before_provider_access() {
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::symlink;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -17999,14 +18083,22 @@ fn workers_upload_version_rejects_symlink_artifact_before_provider_access() {
         "cloudflare-mcp-version-symlink-{}-{suffix}",
         std::process::id()
     ));
-    fs::create_dir(&directory).expect("create fixture directory");
+    fs::create_dir(&directory).expect("create fixture directory"); // lgtm[rust/path-injection] -- process-owned test fixture.
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+        .expect("make fixture directory private");
     let target = directory.join("private-target.js");
     let link = directory.join("candidate.js");
-    fs::write(&target, b"private-source-content").expect("write target");
-    symlink(&target, &link).expect("create symlink");
+    fs::write(&target, b"private-source-content").expect("write target"); // lgtm[rust/path-injection] -- process-owned test fixture.
+    symlink(&target, &link).expect("create symlink"); // lgtm[rust/path-injection] -- process-owned test fixture.
 
     let (base_url, requests) = spawn_fake_worker_upload_api(0);
-    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_WORKER_UPLOAD_ROOT",
+            directory.to_str().expect("UTF-8 root").to_string(),
+        ),
+    ]);
     let response = mcp.call_tool(
         2,
         "workers_upload_version",
@@ -18018,7 +18110,7 @@ fn workers_upload_version_rejects_symlink_artifact_before_provider_access() {
             "pre_upload_deployment_snapshot_sha256":"c".repeat(64),
             "bindings_inherit":"strict",
             "main_module":"index.js",
-            "script_path":link,
+            "script_path":"candidate.js",
             "metadata":{"main_module":"index.js","compatibility_date":"2026-07-10","compatibility_flags":[],"bindings":[]},
             "dry_run":true
         }),
@@ -18034,7 +18126,7 @@ fn workers_upload_version_rejects_symlink_artifact_before_provider_access() {
     assert!(!outward.contains("private-target.js"));
     assert!(!outward.contains("private-source-content"));
     assert!(requests.lock().expect("request log lock").is_empty());
-    fs::remove_dir_all(directory).expect("remove fixture directory");
+    fs::remove_dir_all(directory).expect("remove fixture directory"); // lgtm[rust/path-injection] -- process-owned test fixture.
 }
 
 #[test]

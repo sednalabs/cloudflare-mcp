@@ -5620,7 +5620,44 @@
     {
       "description": "Upload one disabled Worker version with strict exact-base binding inheritance, dry-run confirmation, pinned pre-state, non-retrying provider submission, exact candidate readback, and unchanged-deployment proof.",
       "inputSchema": {
+        "$defs": {
+          "WorkerVersionBindingsInherit": {
+            "enum": [
+              "strict"
+            ],
+            "type": "string"
+          },
+          "WorkerVersionUploadMetadata": {
+            "additionalProperties": false,
+            "properties": {
+              "bindings": {
+                "items": true,
+                "type": "array"
+              },
+              "compatibility_date": {
+                "type": "string"
+              },
+              "compatibility_flags": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "main_module": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "main_module",
+              "compatibility_date",
+              "compatibility_flags",
+              "bindings"
+            ],
+            "type": "object"
+          }
+        },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
         "properties": {
           "account_id": {
             "default": null,
@@ -5636,7 +5673,7 @@
             "type": "string"
           },
           "bindings_inherit": {
-            "type": "string"
+            "$ref": "#/$defs/WorkerVersionBindingsInherit"
           },
           "confirmation_token": {
             "default": null,
@@ -5663,7 +5700,9 @@
               "null"
             ]
           },
-          "metadata": true,
+          "metadata": {
+            "$ref": "#/$defs/WorkerVersionUploadMetadata"
+          },
           "multipart_path": {
             "default": null,
             "type": [
@@ -5674,7 +5713,8 @@
           "per_page": {
             "default": 100,
             "format": "uint32",
-            "minimum": 0,
+            "maximum": 100,
+            "minimum": 1,
             "type": "integer"
           },
           "pre_upload_deployment_snapshot_sha256": {

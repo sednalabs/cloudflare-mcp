@@ -393,6 +393,7 @@ impl CloudflareClient {
                 error.http_status = Some(exchange.proof.http_status);
                 error
             })?;
+        // DevSkim: ignore DS197836 -- these SHA-256 values are evidence digests, not secrets or KDF inputs.
         Ok(WorkerVersionUploadEvidence {
             candidate_version_id: detail.version_id,
             script_etag: detail.script_etag,
@@ -850,8 +851,14 @@ fn sanitize_version_detail(
             "Treat the candidate as provider-unverified and do not deploy it.",
         ));
     }
-    let upload_exports_reconciliation_sha256 =
-        object.get("exports_reconciliation").map(sha256_json);
+    if object.contains_key("exports_reconciliation") {
+        return Err(operation_error(
+            "workers.version_upload_exports_reconciliation_unexpected",
+            "version upload returned exports reconciliation even though the closed request contract forbids exports and migrations",
+            "Treat the upload outcome as ambiguous and reconcile without retrying.",
+        ));
+    }
+    let upload_exports_reconciliation_sha256 = None;
     let upload_startup_time_ms = match object.get("startup_time_ms") {
         None => None,
         Some(value) => Some(value.as_u64().ok_or_else(|| {
@@ -930,8 +937,8 @@ fn sanitize_version_detail(
                 "Treat the exact version evidence as incomplete.",
             )
         })?;
-    validate_script_projection(script)?;
-    let script_projection_sha256 = sha256_json(script);
+    let canonical_script = canonicalize_script_projection(script)?;
+    let script_projection_sha256 = sha256_json(&canonical_script);
     let runtime = resources
         .get("script_runtime")
         .and_then(Value::as_object)
@@ -972,12 +979,10 @@ fn sanitize_version_detail(
         })?
         .to_string();
     let compatibility_flags = canonical_flags(runtime.get("compatibility_flags"))?;
-    validate_runtime_projection(runtime)?;
-    let runtime_projection_sha256 = sha256_json(runtime);
-    let version_metadata_projection_sha256 = sha256_json(&json!({
-        "metadata": object.get("metadata"),
-        "number": object.get("number"),
-    }));
+    let canonical_runtime = canonicalize_runtime_projection(runtime)?;
+    let runtime_projection_sha256 = sha256_json(&canonical_runtime); // DevSkim: ignore DS197836 -- collision-resistant evidence digest, not a secret.
+    let canonical_version_metadata = canonicalize_version_metadata_projection(object)?;
+    let version_metadata_projection_sha256 = sha256_json(&canonical_version_metadata); // DevSkim: ignore DS197836 -- collision-resistant evidence digest, not a secret.
     let bindings = match resources.get("bindings") {
         None => &[][..],
         Some(Value::Array(bindings)) => bindings.as_slice(),
@@ -1036,13 +1041,8 @@ fn sanitize_version_detail(
                 "Treat the exact version evidence as contradictory.",
             ));
         }
-        let canonical_binding = canonicalize_provider_binding(binding).map_err(|_| {
-            operation_error(
-                "workers.version_detail_binding_projection_invalid",
-                "version detail binding was outside the closed canonical provider projection",
-                "Treat the exact version evidence as malformed.",
-            )
-        })?;
+        let canonical_binding = canonicalize_provider_binding(binding)
+            .map_err(|error| operation_error(error.code, error.message, error.hint))?;
         binding_descriptors.push(WorkerBindingDescriptor {
             name: name.to_string(),
             binding_type: binding_type.to_string(),
@@ -1137,56 +1137,471 @@ fn canonical_flags(value: Option<&Value>) -> Result<Vec<String>, WorkerVersionOp
     Ok(canonical.into_iter().collect())
 }
 
-fn validate_script_projection(
+fn canonical_text(value: &Value, max_len: usize) -> Option<&str> {
+    value.as_str().filter(|value| {
+        !value.is_empty()
+            && value.len() <= max_len
+            && value.trim() == *value
+            && !value.as_bytes().contains(&0)
+    })
+}
+
+fn canonical_string_array(
+    value: &Value,
+    label: &'static str,
+) -> Result<Vec<String>, WorkerVersionOperationError> {
+    let values = value
+        .as_array()
+        .filter(|values| values.len() <= 256)
+        .ok_or_else(|| {
+            operation_error(
+                "workers.version_detail_script_invalid",
+                format!("version detail {label} was not a bounded array"),
+                "Treat the exact script evidence as malformed.",
+            )
+        })?;
+    let mut canonical = BTreeSet::new();
+    for value in values {
+        let value = canonical_text(value, 256).ok_or_else(|| {
+            operation_error(
+                "workers.version_detail_script_invalid",
+                format!("version detail {label} contained a non-canonical name"),
+                "Treat the exact script evidence as malformed.",
+            )
+        })?;
+        if !canonical.insert(value.to_string()) {
+            return Err(operation_error(
+                "workers.version_detail_script_invalid",
+                format!("version detail {label} contained a duplicate name"),
+                "Treat the exact script evidence as contradictory.",
+            ));
+        }
+    }
+    Ok(canonical.into_iter().collect())
+}
+
+fn canonicalize_script_projection(
     script: &serde_json::Map<String, Value>,
-) -> Result<(), WorkerVersionOperationError> {
-    for key in ["handlers", "named_handlers"] {
-        if let Some(value) = script.get(key) {
-            if !value.is_array() {
-                return Err(operation_error(
+) -> Result<Value, WorkerVersionOperationError> {
+    let mut canonical = serde_json::Map::new();
+    canonical.insert(
+        "etag".to_string(),
+        Value::String(
+            script
+                .get("etag")
+                .and_then(Value::as_str)
+                .and_then(canonical_script_etag)
+                .ok_or_else(|| {
+                    operation_error(
+                        "workers.version_detail_etag_missing",
+                        "version detail omitted a canonical script ETag",
+                        "Treat the exact script evidence as incomplete.",
+                    )
+                })?
+                .to_string(),
+        ),
+    );
+    if let Some(handlers) = script.get("handlers") {
+        canonical.insert(
+            "handlers".to_string(),
+            json!(canonical_string_array(handlers, "script.handlers")?),
+        );
+    }
+    if let Some(source) = script.get("last_deployed_from") {
+        let source = source
+            .as_str()
+            .filter(|source| {
+                matches!(
+                    *source,
+                    "unknown"
+                        | "api"
+                        | "wrangler"
+                        | "terraform"
+                        | "dash"
+                        | "cf_cli"
+                        | "dash_template"
+                        | "integration"
+                        | "quick_editor"
+                        | "playground"
+                        | "workersci"
+                )
+            })
+            .ok_or_else(|| {
+                operation_error(
                     "workers.version_detail_script_invalid",
-                    "version detail script handlers were malformed",
+                    "version detail script.last_deployed_from was outside the documented enum",
                     "Treat the exact script evidence as malformed.",
+                )
+            })?;
+        canonical.insert("last_deployed_from".to_string(), json!(source));
+    }
+    if let Some(named_handlers) = script.get("named_handlers") {
+        let named_handlers = named_handlers
+            .as_array()
+            .filter(|values| values.len() <= 256)
+            .ok_or_else(|| {
+                operation_error(
+                    "workers.version_detail_named_handlers_invalid",
+                    "version detail named_handlers was not a bounded array",
+                    "Treat the exact script evidence as malformed.",
+                )
+            })?;
+        let mut names = BTreeSet::new();
+        let mut projected = Vec::with_capacity(named_handlers.len());
+        for named in named_handlers {
+            let named = named
+                .as_object()
+                .filter(|named| {
+                    named
+                        .keys()
+                        .all(|key| matches!(key.as_str(), "handlers" | "name"))
+                })
+                .ok_or_else(|| {
+                    operation_error(
+                        "workers.version_detail_named_handlers_invalid",
+                        "version detail named handler contained an unknown field",
+                        "Treat the exact script evidence as malformed.",
+                    )
+                })?;
+            let name = named
+                .get("name")
+                .and_then(|value| canonical_text(value, 256))
+                .ok_or_else(|| {
+                    operation_error(
+                        "workers.version_detail_named_handlers_invalid",
+                        "version detail named handler omitted a canonical name",
+                        "Treat the exact script evidence as malformed.",
+                    )
+                })?;
+            if !names.insert(name.to_string()) {
+                return Err(operation_error(
+                    "workers.version_detail_named_handlers_invalid",
+                    "version detail contained a duplicate named handler",
+                    "Treat the exact script evidence as contradictory.",
+                ));
+            }
+            let handlers = canonical_string_array(
+                named.get("handlers").ok_or_else(|| {
+                    operation_error(
+                        "workers.version_detail_named_handlers_invalid",
+                        "version detail named handler omitted handlers",
+                        "Treat the exact script evidence as malformed.",
+                    )
+                })?,
+                "named_handlers.handlers",
+            )?;
+            projected.push(json!({"name":name,"handlers":handlers}));
+        }
+        projected.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+        canonical.insert("named_handlers".to_string(), Value::Array(projected));
+    }
+    Ok(Value::Object(canonical))
+}
+
+fn canonicalize_exports(exports: &Value) -> Result<Value, WorkerVersionOperationError> {
+    let exports = exports
+        .as_object()
+        .filter(|exports| exports.len() <= 256)
+        .ok_or_else(|| {
+            operation_error(
+                "workers.version_detail_exports_invalid",
+                "version detail exports was not a bounded object",
+                "Treat the runtime evidence as malformed.",
+            )
+        })?;
+    let mut canonical = serde_json::Map::new();
+    for (name, export) in exports {
+        if canonical_text(&Value::String(name.clone()), 128).is_none() {
+            return Err(operation_error(
+                "workers.version_detail_exports_invalid",
+                "version detail export had a non-canonical name",
+                "Treat the runtime evidence as malformed.",
+            ));
+        }
+        let export = export.as_object().ok_or_else(|| {
+            operation_error(
+                "workers.version_detail_exports_invalid",
+                "version detail export was not an object",
+                "Treat the runtime evidence as malformed.",
+            )
+        })?;
+        let export_type = export.get("type").and_then(Value::as_str).ok_or_else(|| {
+            operation_error(
+                "workers.version_detail_exports_invalid",
+                "version detail export omitted its type",
+                "Treat the runtime evidence as malformed.",
+            )
+        })?;
+        let mut projected = serde_json::Map::new();
+        projected.insert("type".to_string(), json!(export_type));
+        match export_type {
+            "worker" => {
+                if export
+                    .keys()
+                    .any(|key| !matches!(key.as_str(), "cache" | "state" | "type"))
+                    || export.get("state").is_some_and(|state| state != "created")
+                {
+                    return Err(operation_error(
+                        "workers.version_detail_exports_invalid",
+                        "Worker export contained an unsupported field or state",
+                        "Treat the runtime evidence as malformed.",
+                    ));
+                }
+                if let Some(cache) = export.get("cache") {
+                    let cache = cache
+                        .as_object()
+                        .filter(|cache| {
+                            cache.len() == 1 && cache.get("enabled").is_some_and(Value::is_boolean)
+                        })
+                        .ok_or_else(|| {
+                            operation_error(
+                                "workers.version_detail_exports_invalid",
+                                "Worker export cache was outside the closed enabled-boolean shape",
+                                "Treat the runtime evidence as malformed.",
+                            )
+                        })?;
+                    projected.insert("cache".to_string(), Value::Object(cache.clone()));
+                }
+                if export.contains_key("state") {
+                    projected.insert("state".to_string(), json!("created"));
+                }
+            }
+            "durable-object" => {
+                let state = export
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("created");
+                let allowed = match state {
+                    "created" => &["container", "state", "storage", "type"][..],
+                    "expecting-transfer" => {
+                        &["container", "state", "storage", "transfer_from", "type"][..]
+                    }
+                    _ => {
+                        return Err(operation_error(
+                            "workers.version_detail_exports_invalid",
+                            "Version Detail returned a non-live Durable Object export",
+                            "Tombstones are not valid Version Detail evidence for this ceremony.",
+                        ));
+                    }
+                };
+                if export.keys().any(|key| !allowed.contains(&key.as_str())) {
+                    return Err(operation_error(
+                        "workers.version_detail_exports_invalid",
+                        "Durable Object export contained an unknown field",
+                        "Treat the runtime evidence as malformed.",
+                    ));
+                }
+                let storage = export
+                    .get("storage")
+                    .and_then(Value::as_str)
+                    .filter(|storage| matches!(*storage, "sqlite" | "legacy-kv"))
+                    .ok_or_else(|| {
+                        operation_error(
+                            "workers.version_detail_exports_invalid",
+                            "Durable Object export omitted a documented storage type",
+                            "Treat the runtime evidence as malformed.",
+                        )
+                    })?;
+                projected.insert("storage".to_string(), json!(storage));
+                if state != "created" || export.contains_key("state") {
+                    projected.insert("state".to_string(), json!(state));
+                }
+                for field in ["container", "transfer_from"] {
+                    if let Some(value) = export.get(field) {
+                        let value = canonical_text(value, 128).ok_or_else(|| {
+                            operation_error(
+                                "workers.version_detail_exports_invalid",
+                                "Durable Object export contained a non-canonical identity",
+                                "Treat the runtime evidence as malformed.",
+                            )
+                        })?;
+                        projected.insert(field.to_string(), json!(value));
+                    }
+                }
+                if state == "expecting-transfer" && !projected.contains_key("transfer_from") {
+                    return Err(operation_error(
+                        "workers.version_detail_exports_invalid",
+                        "expecting-transfer export omitted transfer_from",
+                        "Treat the runtime evidence as malformed.",
+                    ));
+                }
+            }
+            _ => {
+                return Err(operation_error(
+                    "workers.version_detail_exports_invalid",
+                    "version detail export type was outside the documented closed read union",
+                    "Treat the runtime evidence as malformed.",
                 ));
             }
         }
+        canonical.insert(name.clone(), Value::Object(projected));
     }
-    if script
-        .get("last_deployed_from")
-        .is_some_and(|value| !value.is_string())
-    {
-        return Err(operation_error(
-            "workers.version_detail_script_invalid",
-            "version detail script last_deployed_from was malformed",
-            "Treat the exact script evidence as malformed.",
-        ));
-    }
-    Ok(())
+    Ok(Value::Object(canonical))
 }
 
-fn validate_runtime_projection(
+fn canonicalize_runtime_projection(
     runtime: &serde_json::Map<String, Value>,
-) -> Result<(), WorkerVersionOperationError> {
-    if runtime
-        .get("usage_model")
-        .is_some_and(|value| !matches!(value.as_str(), Some("bundled" | "unbound" | "standard")))
-        || runtime
-            .get("migration_tag")
-            .is_some_and(|value| !value.is_string())
-        || runtime
-            .get("exports")
-            .is_some_and(|value| !value.is_object())
-        || runtime
-            .get("limits")
-            .is_some_and(|value| !value.is_object())
-    {
-        return Err(operation_error(
-            "workers.version_detail_runtime_invalid",
-            "version detail script_runtime contained malformed documented fields",
-            "Treat the candidate as provider-unverified and do not deploy it.",
-        ));
+) -> Result<Value, WorkerVersionOperationError> {
+    let mut canonical = serde_json::Map::new();
+    canonical.insert(
+        "compatibility_date".to_string(),
+        json!(
+            runtime
+                .get("compatibility_date")
+                .and_then(Value::as_str)
+                .filter(|date| canonical_date(date))
+                .ok_or_else(|| operation_error(
+                    "workers.version_detail_compatibility_date_invalid",
+                    "version detail omitted a canonical compatibility date",
+                    "Treat the runtime evidence as incomplete.",
+                ))?
+        ),
+    );
+    canonical.insert(
+        "compatibility_flags".to_string(),
+        json!(canonical_flags(runtime.get("compatibility_flags"))?),
+    );
+    if let Some(exports) = runtime.get("exports") {
+        canonical.insert("exports".to_string(), canonicalize_exports(exports)?);
     }
-    Ok(())
+    if let Some(limits) = runtime.get("limits") {
+        let limits = limits
+            .as_object()
+            .filter(|limits| {
+                limits.keys().all(|key| key == "cpu_ms")
+                    && limits
+                        .get("cpu_ms")
+                        .is_none_or(|value| value.as_u64().is_some())
+            })
+            .ok_or_else(|| {
+                operation_error(
+                    "workers.version_detail_limits_invalid",
+                    "version detail limits was outside the closed cpu_ms shape",
+                    "Treat the runtime evidence as malformed.",
+                )
+            })?;
+        canonical.insert("limits".to_string(), Value::Object(limits.clone()));
+    }
+    if let Some(tag) = runtime.get("migration_tag") {
+        let tag = canonical_text(tag, 128).ok_or_else(|| {
+            operation_error(
+                "workers.version_detail_migration_tag_invalid",
+                "version detail migration_tag was not canonical",
+                "Treat the runtime evidence as malformed.",
+            )
+        })?;
+        canonical.insert("migration_tag".to_string(), json!(tag));
+    }
+    if let Some(model) = runtime.get("usage_model") {
+        let model = model
+            .as_str()
+            .filter(|model| matches!(*model, "bundled" | "unbound" | "standard"))
+            .ok_or_else(|| {
+                operation_error(
+                    "workers.version_detail_usage_model_invalid",
+                    "version detail usage_model was outside the documented enum",
+                    "Treat the runtime evidence as malformed.",
+                )
+            })?;
+        canonical.insert("usage_model".to_string(), json!(model));
+    }
+    Ok(Value::Object(canonical))
+}
+
+fn canonicalize_version_metadata_projection(
+    object: &serde_json::Map<String, Value>,
+) -> Result<Value, WorkerVersionOperationError> {
+    let mut canonical = serde_json::Map::new();
+    if let Some(number) = object.get("number") {
+        let number = number
+            .as_u64()
+            .filter(|number| *number > 0 && *number <= 9_007_199_254_740_991)
+            .ok_or_else(|| {
+                operation_error(
+                    "workers.version_detail_number_invalid",
+                    "version detail number was not a positive safe integer",
+                    "Treat the version metadata evidence as malformed.",
+                )
+            })?;
+        canonical.insert("number".to_string(), json!(number));
+    }
+    if let Some(metadata) = object.get("metadata") {
+        let metadata = metadata
+            .as_object()
+            .filter(|metadata| {
+                metadata.keys().all(|key| {
+                    matches!(
+                        key.as_str(),
+                        "author_email"
+                            | "author_id"
+                            | "created_on"
+                            | "hasPreview"
+                            | "modified_on"
+                            | "source"
+                    )
+                })
+            })
+            .ok_or_else(|| {
+                operation_error(
+                    "workers.version_detail_metadata_invalid",
+                    "version metadata was not a closed documented object",
+                    "Treat the version metadata evidence as malformed.",
+                )
+            })?;
+        let mut projected = serde_json::Map::new();
+        for field in ["author_email", "author_id", "created_on", "modified_on"] {
+            if let Some(value) = metadata.get(field) {
+                let value = canonical_text(value, 512).ok_or_else(|| {
+                    operation_error(
+                        "workers.version_detail_metadata_invalid",
+                        "version metadata contained a non-canonical string",
+                        "Treat the version metadata evidence as malformed.",
+                    )
+                })?;
+                projected.insert(field.to_string(), json!(value));
+            }
+        }
+        if let Some(value) = metadata.get("hasPreview") {
+            if !value.is_boolean() {
+                return Err(operation_error(
+                    "workers.version_detail_metadata_invalid",
+                    "version metadata hasPreview was not boolean",
+                    "Treat the version metadata evidence as malformed.",
+                ));
+            }
+            projected.insert("hasPreview".to_string(), value.clone());
+        }
+        if let Some(source) = metadata.get("source") {
+            let source = source
+                .as_str()
+                .filter(|source| {
+                    matches!(
+                        *source,
+                        "unknown"
+                            | "api"
+                            | "wrangler"
+                            | "terraform"
+                            | "dash"
+                            | "cf_cli"
+                            | "dash_template"
+                            | "integration"
+                            | "quick_editor"
+                            | "playground"
+                            | "workersci"
+                    )
+                })
+                .ok_or_else(|| {
+                    operation_error(
+                        "workers.version_detail_metadata_invalid",
+                        "version metadata source was outside the documented enum",
+                        "Treat the version metadata evidence as malformed.",
+                    )
+                })?;
+            projected.insert("source".to_string(), json!(source));
+        }
+        canonical.insert("metadata".to_string(), Value::Object(projected));
+    }
+    Ok(Value::Object(canonical))
 }
 
 pub(crate) fn prepare_worker_binding_expectation(
@@ -2055,10 +2470,7 @@ mod tests {
             proof(),
         )
         .expect_err("unknown provider field must fail closed");
-        assert_eq!(
-            error.code,
-            "workers.version_detail_binding_projection_invalid"
-        );
+        assert_eq!(error.code, "workers.version_binding_unknown_field");
         assert!(
             !serde_json::to_string(&error)
                 .expect("serialize error")
@@ -2140,6 +2552,106 @@ mod tests {
     }
 
     #[test]
+    fn version_detail_rejects_unresolved_provider_inheritance() {
+        for inherited in [
+            json!({"name":"DB","type":"inherit"}),
+            json!({"name":"DB","type":"inherit","version_id":"latest"}),
+            json!({
+                "name":"DB",
+                "type":"inherit",
+                "version_id":"11111111-1111-4111-8111-111111111111"
+            }),
+        ] {
+            let error = sanitize_version_detail(
+                json!({
+                    "id":"22222222-2222-4222-8222-222222222222",
+                    "resources":{
+                        "script":{"etag":"a".repeat(64)},
+                        "script_runtime":runtime(),
+                        "bindings":[inherited]
+                    }
+                }),
+                Some("22222222-2222-4222-8222-222222222222"),
+                proof(),
+            )
+            .expect_err("unresolved provider inheritance must fail closed");
+            assert_eq!(
+                error.code,
+                "workers.version_binding_provider_inherit_unresolved"
+            );
+        }
+    }
+
+    #[test]
+    fn version_detail_rejects_malformed_typed_provider_semantics() {
+        fn merge_json(target: &mut Value, overlay: Value) {
+            match (target, overlay) {
+                (Value::Object(target), Value::Object(overlay)) => {
+                    for (key, value) in overlay {
+                        if let Some(target_value) = target.get_mut(&key) {
+                            merge_json(target_value, value);
+                        } else {
+                            target.insert(key, value);
+                        }
+                    }
+                }
+                (target, overlay) => *target = overlay,
+            }
+        }
+
+        let cases = [
+            (
+                "number",
+                json!({"number":1.5}),
+                "workers.version_detail_number_invalid",
+            ),
+            (
+                "metadata",
+                json!({"metadata":{"future":true}}),
+                "workers.version_detail_metadata_invalid",
+            ),
+            (
+                "handlers",
+                json!({"resources":{"script":{"handlers":[7]}}}),
+                "workers.version_detail_script_invalid",
+            ),
+            (
+                "named_handlers",
+                json!({"resources":{"script":{"named_handlers":[{"name":"named","handlers":["fetch"],"future":true}]}}}),
+                "workers.version_detail_named_handlers_invalid",
+            ),
+            (
+                "limits",
+                json!({"resources":{"script_runtime":{"limits":{"cpu_ms":"7"}}}}),
+                "workers.version_detail_limits_invalid",
+            ),
+            (
+                "exports",
+                json!({"resources":{"script_runtime":{"exports":{"Object":{"type":"durable-object","state":"deleted","storage":"sqlite"}}}}}),
+                "workers.version_detail_exports_invalid",
+            ),
+        ];
+        for (label, overlay, expected_code) in cases {
+            let mut detail = json!({
+                "id":"11111111-1111-4111-8111-111111111111",
+                "resources":{
+                    "script":{"etag":"a".repeat(64)},
+                    "script_runtime":runtime(),
+                    "bindings":[]
+                }
+            });
+            merge_json(&mut detail, overlay);
+            let error = sanitize_version_detail(
+                detail,
+                Some("11111111-1111-4111-8111-111111111111"),
+                proof(),
+            )
+            .expect_err("malformed provider semantics must fail closed");
+            assert_eq!(error.code, expected_code, "{label}");
+        }
+    }
+
+    #[test]
     fn runtime_verification_detects_each_allowed_runtime_mismatch() {
         let detail = sanitize_version_detail(
             json!({
@@ -2203,7 +2715,6 @@ mod tests {
                             "messages":[],
                             "result":{
                                 "id":"11111111-1111-4111-8111-111111111111",
-                                "exports_reconciliation":{},
                                 "startup_time_ms":7,
                                 "resources":{
                                     "script":{"etag":"a".repeat(64)},
@@ -2238,13 +2749,54 @@ mod tests {
         assert_eq!(evidence.provider_proof.request_artifact_sha256.len(), 64);
         assert_eq!(evidence.provider_proof.response_artifact_sha256.len(), 64);
         assert_eq!(evidence.startup_time_ms, Some(7));
-        assert_eq!(
-            evidence
-                .exports_reconciliation_sha256
-                .as_deref()
-                .map(str::len),
-            Some(64)
+        assert_eq!(evidence.exports_reconciliation_sha256, None);
+    }
+
+    #[tokio::test]
+    async fn export_reconciliation_is_ambiguous_and_never_retried() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let router = Router::new().route(
+            "/accounts/acct-1/workers/scripts/worker-a/versions",
+            post({
+                let calls = calls.clone();
+                move || {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({
+                            "success":true,
+                            "errors":[],
+                            "messages":[],
+                            "result":{
+                                "id":"11111111-1111-4111-8111-111111111111",
+                                "exports_reconciliation":{},
+                                "resources":{
+                                    "script":{"etag":"a".repeat(64)},
+                                    "script_runtime":runtime(),
+                                    "bindings":[]
+                                }
+                            }
+                        }))
+                    }
+                }
+            }),
         );
+        let base = spawn_router(router).await;
+        let client = CloudflareClient::new(test_config(base)).expect("client");
+        let error = client
+            .upload_worker_version_once(
+                "acct-1",
+                "worker-a",
+                "multipart/form-data; boundary=fixture",
+                b"reviewed-multipart".to_vec(),
+            )
+            .await
+            .expect_err("exports reconciliation must be ambiguous");
+        assert_eq!(
+            error.code,
+            "workers.version_upload_exports_reconciliation_unexpected"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
