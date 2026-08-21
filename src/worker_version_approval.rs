@@ -64,6 +64,17 @@ pub(crate) struct WorkerVersionApprovalError {
     pub(crate) hint: &'static str,
     pub(crate) state: Option<&'static str>,
     pub(crate) local_mutation_performed: Option<bool>,
+    pub(crate) custody_capacity: Option<WorkerVersionCustodyCapacityEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct WorkerVersionCustodyCapacityEvidence {
+    pub(crate) root_entry_count: usize,
+    pub(crate) root_entry_limit: usize,
+    pub(crate) rotation_required: bool,
+    pub(crate) safe_to_rotate: bool,
+    pub(crate) blocking_authority: &'static str,
+    pub(crate) operator_contract: &'static str,
 }
 
 #[derive(Debug)]
@@ -265,7 +276,7 @@ fn prepare_worker_version_approval_at(
     );
     let root_guard = open_or_create_private_file(&root_handle, ROOT_GUARD_NAME)?;
     try_lock_exclusive(&root_guard, "workers.version_upload_approval_root_locked")?;
-    validate_root_namespace(root, root_identity)?;
+    validate_root_namespace(root, root_identity, true)?;
 
     for _ in 0..16 {
         let handle = random_handle()?;
@@ -338,7 +349,7 @@ fn load_worker_version_approval_at(
             .metadata()
             .map_err(|_| custody_error("approval root metadata is unavailable"))?,
     );
-    validate_root_namespace(root, root_identity)?;
+    validate_root_namespace(root, root_identity, false)?;
     let plan_dir = root.join(handle);
     let plan_dir_handle = open_private_directory_at(&root_handle, handle)?;
     let plan_identity = metadata_identity(
@@ -654,16 +665,29 @@ fn validate_candidate_bounds(
 fn validate_root_namespace(
     root: &Path,
     expected_identity: FileIdentity,
+    require_free_entry: bool,
+) -> Result<(), WorkerVersionApprovalError> {
+    validate_root_namespace_with_limit(
+        root,
+        expected_identity,
+        MAX_ROOT_ENTRIES,
+        require_free_entry,
+    )
+}
+
+fn validate_root_namespace_with_limit(
+    root: &Path,
+    expected_identity: FileIdentity,
+    limit: usize,
+    require_free_entry: bool,
 ) -> Result<(), WorkerVersionApprovalError> {
     let mut count = 0usize;
     for entry in
         fs::read_dir(root).map_err(|_| custody_error("approval root could not be enumerated"))?
     {
         count += 1;
-        if count > MAX_ROOT_ENTRIES {
-            return Err(custody_error(
-                "approval root exceeds its bounded namespace cap",
-            ));
+        if count > limit {
+            return Err(capacity_error(count, limit));
         }
         let entry = entry.map_err(|_| custody_error("approval root enumeration was incomplete"))?;
         let name = entry
@@ -685,6 +709,9 @@ fn validate_root_namespace(
         .map_err(|_| custody_error("approval root disappeared during inspection"))?;
     if !private_directory(&metadata) || metadata_identity(&metadata) != expected_identity {
         return Err(custody_error("approval root changed during inspection"));
+    }
+    if require_free_entry && count >= limit {
+        return Err(capacity_error(count, limit));
     }
     Ok(())
 }
@@ -835,6 +862,7 @@ fn open_private_root(root: &Path) -> Result<File, WorkerVersionApprovalError> {
             "approval root contains a symlink, alias, or noncanonical component",
         ));
     }
+    validate_canonical_ancestor_chain(root, "approval")?;
     let mut options = OpenOptions::new();
     options
         .read(true)
@@ -851,6 +879,28 @@ fn open_private_root(root: &Path) -> Result<File, WorkerVersionApprovalError> {
         ));
     }
     Ok(directory)
+}
+
+fn validate_canonical_ancestor_chain(
+    root: &Path,
+    label: &'static str,
+) -> Result<(), WorkerVersionApprovalError> {
+    let effective_uid = unsafe { libc::geteuid() };
+    for ancestor in root.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor)
+            .map_err(|_| custody_error("custody ancestor metadata is unavailable"))?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || (!matches!(metadata.uid(), 0) && metadata.uid() != effective_uid)
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(custody_error(match label {
+                "approval" => "approval root has an untrusted writable or non-directory ancestor",
+                _ => "custody root has an untrusted writable or non-directory ancestor",
+            }));
+        }
+    }
+    Ok(())
 }
 
 fn open_private_directory_at(
@@ -1092,6 +1142,7 @@ fn error(
         hint,
         state: None,
         local_mutation_performed: Some(false),
+        custody_capacity: None,
     }
 }
 fn state_error(
@@ -1106,6 +1157,25 @@ fn state_error(
         hint,
         state: Some(state),
         local_mutation_performed: Some(false),
+        custody_capacity: None,
+    }
+}
+
+fn capacity_error(count: usize, limit: usize) -> WorkerVersionApprovalError {
+    WorkerVersionApprovalError {
+        code: "workers.version_upload_approval_rotation_required",
+        message: "approval custody root reached its bounded namespace capacity",
+        hint: "Keep the incumbent root immutable. Rotate only after a bounded offline audit proves zero unexpired prepared, consumed-only, locked, or malformed namespaces; archive terminal evidence, create a fresh trusted root, update every process atomically, and retain the old root until its audit retention expires.",
+        state: Some("rotation_required"),
+        local_mutation_performed: Some(false),
+        custody_capacity: Some(WorkerVersionCustodyCapacityEvidence {
+            root_entry_count: count.min(limit.saturating_add(1)),
+            root_entry_limit: limit,
+            rotation_required: true,
+            safe_to_rotate: false,
+            blocking_authority: "offline audit required; any unexpired prepared, consumed-only, locked, or malformed namespace blocks rotation",
+            operator_contract: "preserve incumbent root; prove zero blocking authority; archive terminal evidence; create a new canonical trusted root; atomically update and restart all upload processes",
+        }),
     }
 }
 fn custody_error(message: &'static str) -> WorkerVersionApprovalError {
@@ -1120,7 +1190,7 @@ fn custody_error(message: &'static str) -> WorkerVersionApprovalError {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::CString;
+    use std::ffi::{CStr, CString, OsStr};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::os::unix::net::UnixListener;
@@ -1131,8 +1201,18 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn trusted_test_base() -> PathBuf {
+        let passwd = unsafe { libc::getpwuid(libc::geteuid()) };
+        assert!(!passwd.is_null(), "effective user has no passwd entry");
+        let home = unsafe { CStr::from_ptr((*passwd).pw_dir) };
+        PathBuf::from(OsStr::from_bytes(home.to_bytes())).join(".cloudflare-mcp-custody-tests")
+    }
+
     fn test_root(label: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
+        let base = trusted_test_base();
+        fs::create_dir_all(&base).unwrap();
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = base.join(format!(
             "cfmcp-version-approval-{label}-{}",
             std::process::id()
         ));
@@ -1140,6 +1220,51 @@ mod tests {
         fs::create_dir(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         path
+    }
+
+    #[test]
+    fn private_root_below_world_writable_ancestor_fails_closed() {
+        let parent = trusted_test_base().join(format!(
+            "cfmcp-untrusted-ancestor-parent-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&parent);
+        fs::create_dir_all(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o770)).unwrap();
+        let root = parent.join("approval-root");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let metadata = json!({"bindings":[]});
+        assert_eq!(
+            prepare_worker_version_approval_at(&root, &candidate(b"one", &metadata), 1_000)
+                .unwrap_err()
+                .code,
+            "workers.version_upload_approval_custody_malformed"
+        );
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn bounded_capacity_emits_fail_closed_rotation_contract() {
+        let root = test_root("capacity");
+        for digit in ['a', 'b'] {
+            let namespace = root.join(format!("{HANDLE_PREFIX}{}", digit.to_string().repeat(64)));
+            fs::create_dir(&namespace).unwrap();
+            fs::set_permissions(&namespace, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let identity = metadata_identity(&fs::symlink_metadata(&root).unwrap());
+        validate_root_namespace_with_limit(&root, identity, 2, false).unwrap();
+        let error = validate_root_namespace_with_limit(&root, identity, 2, true).unwrap_err();
+        assert_eq!(
+            error.code,
+            "workers.version_upload_approval_rotation_required"
+        );
+        let evidence = error.custody_capacity.unwrap();
+        assert_eq!(evidence.root_entry_count, 2);
+        assert_eq!(evidence.root_entry_limit, 2);
+        assert!(evidence.rotation_required);
+        assert!(!evidence.safe_to_rotate);
+        fs::remove_dir_all(root).unwrap();
     }
     fn candidate<'a>(body: &'a [u8], metadata: &'a Value) -> WorkerVersionApprovalCandidate<'a> {
         WorkerVersionApprovalCandidate {

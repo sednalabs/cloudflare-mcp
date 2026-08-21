@@ -13126,6 +13126,7 @@ fn worker_version_approval_error_result(error: WorkerVersionApprovalError) -> Ca
             "outcome_ambiguous": error.state == Some("locked"),
         },
         "approval_state": error.state,
+        "custody_capacity": error.custody_capacity,
         "local_mutation_performed": error.local_mutation_performed,
         "provider_calls": 0,
         "deployment_created": false,

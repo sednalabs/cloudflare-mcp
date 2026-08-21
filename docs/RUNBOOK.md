@@ -1086,11 +1086,22 @@ random-handle preparation lifecycle.
    `prepare:true`. This is an explicit local custody mutation, not a dry-run.
    Configure `CLOUDFLARE_MCP_WORKER_VERSION_APPROVAL_ROOT` as a pre-created,
    canonical, operator-owned mode-0700 directory shared by every upload
-   process. Preparation creates an exact private candidate under a
+   process. Every canonical ancestor must be a real directory owned by root or
+   the effective user and must not be group/world writable. Preparation creates an exact private candidate under a
    cryptographically random opaque handle. Review the lifecycle result and
    retain only `approval.approval_handle`; public output deliberately contains
    no deterministic candidate hash, candidate-derived size, private path, or
    receipt bytes. A handle expires after 15 minutes.
+
+   If preparation returns `workers.version_upload_approval_rotation_required`,
+   treat its bounded `custody_capacity` as a stop receipt; `safe_to_rotate` is
+   deliberately false. Under the root guard, a bounded offline audit must
+   prove zero unexpired prepared, consumed-only, locked, or malformed
+   namespaces. Any such authority blocks rotation. Preserve the incumbent root
+   immutable, archive terminal expired/rejected/retired evidence under the
+   private retention policy, create a fresh ancestor-safe mode-0700 root, then
+   atomically update and restart every upload process. Never split processes
+   across roots or use rotation to authorize or retry a provider request.
 4. Apply once with unchanged complete inputs, `prepare:false`, and the exact
    `approval_handle`. Apply reloads the private body and canonical metadata,
    binds every target/base/pre-state field byte-for-byte, and durably consumes

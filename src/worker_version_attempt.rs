@@ -608,8 +608,27 @@ fn open_private_root(root: &Path) -> Result<File, WorkerVersionAttemptError> {
             "attempt root contains a symlink, alias, or noncanonical component",
         ));
     }
+    validate_canonical_ancestor_chain(root)?;
     let directory = open_private_directory(root)?;
     Ok(directory)
+}
+
+fn validate_canonical_ancestor_chain(root: &Path) -> Result<(), WorkerVersionAttemptError> {
+    let effective_uid = unsafe { libc::geteuid() };
+    for ancestor in root.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor)
+            .map_err(|_| custody_error("attempt-root ancestor metadata is unavailable"))?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || (!matches!(metadata.uid(), 0) && metadata.uid() != effective_uid)
+            || metadata.mode() & 0o022 != 0
+        {
+            return Err(custody_error(
+                "attempt root has an untrusted writable or non-directory ancestor",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn open_private_directory(path: &Path) -> Result<File, WorkerVersionAttemptError> {
@@ -811,7 +830,7 @@ fn custody_error(message: &'static str) -> WorkerVersionAttemptError {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::CString;
+    use std::ffi::{CStr, CString, OsStr};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::symlink;
     use std::sync::{Arc, Barrier, mpsc};
@@ -820,8 +839,19 @@ mod tests {
 
     use super::*;
 
+    fn trusted_test_base() -> PathBuf {
+        let passwd = unsafe { libc::getpwuid(libc::geteuid()) };
+        assert!(!passwd.is_null(), "effective user has no passwd entry");
+        let home = unsafe { CStr::from_ptr((*passwd).pw_dir) };
+        PathBuf::from(OsStr::from_bytes(home.to_bytes())).join(".cloudflare-mcp-custody-tests")
+    }
+
     fn root(label: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
+        let base = trusted_test_base();
+        fs::create_dir_all(&base).expect("create custody test base");
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o700))
+            .expect("make custody test base private");
+        let path = base.join(format!(
             "cloudflare-mcp-worker-version-attempt-{label}-{}-{}",
             std::process::id(),
             sha256_fields(&[label, &format!("{:?}", std::thread::current().id())])
@@ -829,6 +859,29 @@ mod tests {
         fs::create_dir(&path).expect("create attempt test root");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).expect("private root");
         path
+    }
+
+    #[test]
+    fn private_attempt_root_below_world_writable_ancestor_fails_closed() {
+        let parent = trusted_test_base().join(format!(
+            "cfmcp-untrusted-attempt-ancestor-parent-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&parent);
+        fs::create_dir_all(&parent).expect("create untrusted-parent fixture");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o770))
+            .expect("make ancestor group writable");
+        let root = parent.join("attempt-root");
+        fs::create_dir(&root).expect("create final root fixture");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .expect("make final root private");
+        assert_eq!(
+            prepare_worker_version_dispatch_attempt_at(&root, &input())
+                .unwrap_err()
+                .code,
+            "workers.version_upload_attempt_custody_malformed"
+        );
+        fs::remove_dir_all(parent).expect("remove fixture");
     }
 
     fn input<'a>() -> WorkerVersionAttemptInput<'a> {
