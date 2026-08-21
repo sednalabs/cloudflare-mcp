@@ -21,6 +21,7 @@ const PREPARED_NAME: &str = "prepared.json";
 const DISPATCHED_NAME: &str = "dispatched.json";
 const TERMINAL_NAME: &str = "terminal.json";
 const MAX_RECEIPT_BYTES: u64 = 16 * 1024;
+const MAX_ATTEMPT_NAMESPACE_ENTRIES: usize = 3;
 
 #[derive(Debug, Clone)]
 pub(crate) struct WorkerVersionAttemptInput<'a> {
@@ -269,11 +270,22 @@ fn inspect_existing_attempt(
         Ok(directory) => directory,
         Err(error) => return error,
     };
-    drop(directory);
-    let names = match fs::read_dir(attempt_dir) {
+    let directory_identity = match directory.metadata() {
+        Ok(metadata) => metadata_identity(&metadata),
+        Err(_) => return custody_error("existing attempt namespace metadata is unavailable"),
+    };
+    let presence = match fs::read_dir(attempt_dir) {
         Ok(entries) => {
-            let mut names = Vec::new();
+            let mut entry_count = 0usize;
+            let mut unexpected_entry = false;
+            let mut presence = AttemptReceiptPresence::default();
             for entry in entries {
+                entry_count += 1;
+                if entry_count > MAX_ATTEMPT_NAMESPACE_ENTRIES {
+                    return custody_error(
+                        "existing attempt namespace exceeds its closed three-entry cap",
+                    );
+                }
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(_) => {
@@ -290,19 +302,30 @@ fn inspect_existing_attempt(
                         );
                     }
                 };
-                names.push(name);
+                match name.as_str() {
+                    PREPARED_NAME => presence.prepared = true,
+                    DISPATCHED_NAME => presence.dispatched = true,
+                    TERMINAL_NAME => presence.terminal = true,
+                    _ => unexpected_entry = true,
+                }
             }
-            names
+            if unexpected_entry {
+                return custody_error("existing attempt namespace contains an unexpected entry");
+            }
+            presence
         }
         Err(_) => return custody_error("existing attempt namespace could not be enumerated"),
     };
-    if names.iter().any(|name| {
-        !matches!(
-            name.as_str(),
-            PREPARED_NAME | DISPATCHED_NAME | TERMINAL_NAME
-        )
-    }) {
-        return custody_error("existing attempt namespace contains an unexpected entry");
+    let directory_identity_after = match directory.metadata() {
+        Ok(metadata) if private_directory(&metadata) => metadata_identity(&metadata),
+        _ => return custody_error("existing attempt namespace metadata changed"),
+    };
+    if directory_identity_after != directory_identity {
+        return custody_error("existing attempt namespace changed during enumeration");
+    }
+    drop(directory);
+    if !presence.prepared {
+        return custody_error("existing attempt namespace omits its prepared receipt");
     }
     let prepared = match read_receipt(attempt_dir, PREPARED_NAME) {
         Ok(receipt) => receipt,
@@ -320,7 +343,7 @@ fn inspect_existing_attempt(
         return custody_error("existing prepared receipt conflicts with the requested authority");
     }
     let mut state = "prepared";
-    if attempt_dir.join(DISPATCHED_NAME).exists() {
+    if presence.dispatched {
         let dispatched = match read_receipt(attempt_dir, DISPATCHED_NAME) {
             Ok(receipt) => receipt,
             Err(error) => return error,
@@ -329,7 +352,7 @@ fn inspect_existing_attempt(
             return error;
         }
         state = "dispatched";
-        if attempt_dir.join(TERMINAL_NAME).exists() {
+        if presence.terminal {
             let terminal = match read_receipt(attempt_dir, TERMINAL_NAME) {
                 Ok(receipt) => receipt,
                 Err(error) => return error,
@@ -359,7 +382,7 @@ fn inspect_existing_attempt(
             }
             state = "terminal";
         }
-    } else if attempt_dir.join(TERMINAL_NAME).exists() {
+    } else if presence.terminal {
         return custody_error("terminal receipt exists without dispatched authority");
     }
     WorkerVersionAttemptError {
@@ -373,6 +396,13 @@ fn inspect_existing_attempt(
             reconciliation_only: true,
         }),
     }
+}
+
+#[derive(Default)]
+struct AttemptReceiptPresence {
+    prepared: bool,
+    dispatched: bool,
+    terminal: bool,
 }
 
 fn validate_receipt_link(
@@ -439,21 +469,41 @@ fn read_receipt(directory: &Path, name: &str) -> Result<AttemptReceipt, WorkerVe
     let mut options = OpenOptions::new();
     options
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     let mut file = options
         .open(path)
         .map_err(|_| custody_error("attempt receipt is absent or cannot be opened safely"))?;
-    let metadata = file
+    let before = file
         .metadata()
         .map_err(|_| custody_error("attempt receipt metadata is unavailable"))?;
-    if !private_file(&metadata) || metadata.len() > MAX_RECEIPT_BYTES {
+    if !private_file(&before) || before.len() > MAX_RECEIPT_BYTES {
         return Err(custody_error(
             "attempt receipt is not one bounded private regular file",
         ));
     }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.read_to_end(&mut bytes)
+    let before_identity = metadata_identity(&before);
+    let mut bytes = Vec::with_capacity(before.len() as usize);
+    Read::by_ref(&mut file)
+        .take(MAX_RECEIPT_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(|_| custody_error("attempt receipt could not be read completely"))?;
+    if bytes.len() as u64 > MAX_RECEIPT_BYTES {
+        return Err(custody_error(
+            "attempt receipt exceeded its custody limit while being read",
+        ));
+    }
+    let after = file
+        .metadata()
+        .map_err(|_| custody_error("attempt receipt metadata is unavailable after read"))?;
+    if !private_file(&after)
+        || metadata_identity(&after) != before_identity
+        || after.len() != before.len()
+        || bytes.len() as u64 != after.len()
+    {
+        return Err(custody_error(
+            "attempt receipt changed or was incomplete while being read",
+        ));
+    }
     let receipt: AttemptReceipt = serde_json::from_slice(&bytes).map_err(|_| {
         custody_error("attempt receipt JSON is malformed or structurally unexpected")
     })?;
@@ -461,6 +511,19 @@ fn read_receipt(directory: &Path, name: &str) -> Result<AttemptReceipt, WorkerVe
         return Err(custody_error("attempt receipt is not exact canonical JSON"));
     }
     Ok(receipt)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn metadata_identity(metadata: &fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
 }
 
 fn canonical_receipt_bytes(receipt: &AttemptReceipt) -> Result<Vec<u8>, WorkerVersionAttemptError> {
@@ -594,8 +657,12 @@ fn custody_error(message: &'static str) -> WorkerVersionAttemptError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Barrier};
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::symlink;
+    use std::sync::{Arc, Barrier, mpsc};
     use std::thread;
+    use std::time::Duration;
 
     use super::*;
 
@@ -714,5 +781,81 @@ mod tests {
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
         assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
         fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn restored_fifo_special_file_fails_without_blocking() {
+        let fifo_root = root("fifo");
+        let attempt = prepare_worker_version_dispatch_attempt_at(&fifo_root, &input())
+            .expect("prepare FIFO fixture");
+        let fifo_path = attempt.attempt_dir.join(PREPARED_NAME);
+        drop(attempt);
+        fs::remove_file(&fifo_path).expect("remove prepared receipt");
+        let fifo_path_c =
+            CString::new(fifo_path.as_os_str().as_bytes()).expect("FIFO fixture path has no NUL");
+        assert_eq!(unsafe { libc::mkfifo(fifo_path_c.as_ptr(), 0o600) }, 0);
+
+        let (tx, rx) = mpsc::channel();
+        let fifo_root_for_thread = fifo_root.clone();
+        let handle = thread::spawn(move || {
+            let result =
+                prepare_worker_version_dispatch_attempt_at(&fifo_root_for_thread, &input())
+                    .expect_err("FIFO receipt must fail closed");
+            tx.send(result.code).expect("send FIFO result");
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .expect("FIFO inspection must never block"),
+            "workers.version_upload_attempt_custody_malformed"
+        );
+        handle.join().expect("join FIFO inspection");
+        fs::remove_dir_all(fifo_root).expect("remove FIFO test root");
+    }
+
+    #[test]
+    fn restored_namespace_is_bounded_before_classification() {
+        let root = root("namespace-cap");
+        let attempt = prepare_worker_version_dispatch_attempt_at(&root, &input())
+            .expect("prepare namespace fixture");
+        let attempt_dir = attempt.attempt_dir.clone();
+        drop(attempt);
+        for index in 0..4 {
+            fs::write(attempt_dir.join(format!("unexpected-{index}")), b"evidence")
+                .expect("write oversized namespace entry");
+        }
+        let result = prepare_worker_version_dispatch_attempt_at(&root, &input())
+            .expect_err("oversized namespace must fail closed");
+        assert_eq!(
+            result.code,
+            "workers.version_upload_attempt_custody_malformed"
+        );
+        assert_eq!(
+            result.message,
+            "existing attempt namespace exceeds its closed three-entry cap"
+        );
+        fs::remove_dir_all(root).expect("remove namespace test root");
+    }
+
+    #[test]
+    fn dangling_receipt_symlink_is_present_malformed_evidence() {
+        let root = root("dangling-symlink");
+        let mut attempt = prepare_worker_version_dispatch_attempt_at(&root, &input())
+            .expect("prepare dangling-symlink fixture");
+        attempt.consume_for_dispatch().expect("dispatch fixture");
+        let attempt_dir = attempt.attempt_dir.clone();
+        drop(attempt);
+        let dispatched_path = attempt_dir.join(DISPATCHED_NAME);
+        fs::remove_file(&dispatched_path).expect("remove dispatched receipt");
+        symlink("missing-dispatched-target", &dispatched_path)
+            .expect("create dangling receipt symlink");
+
+        let result = prepare_worker_version_dispatch_attempt_at(&root, &input())
+            .expect_err("dangling receipt symlink must fail closed");
+        assert_eq!(
+            result.code,
+            "workers.version_upload_attempt_custody_malformed"
+        );
+        assert!(result.evidence.is_none());
+        fs::remove_dir_all(root).expect("remove dangling-symlink test root");
     }
 }

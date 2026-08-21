@@ -1092,7 +1092,13 @@ not be deployed yet. It is intentionally separate from
    crash or response loss leaves prepared or dispatched evidence in place.
    Any retained, conflicting, malformed, or concurrently owned attempt is
    reconciliation-only across restart and can never authorize another POST.
-   Do not delete or repair an attempt namespace in place. The MCP then
+   Restored namespaces are a closed maximum of the three named receipts.
+   Receipt custody opens descriptor-first with nonblocking/no-follow flags,
+   verifies a private bounded regular file before reading, caps the descriptor
+   read, and revalidates that same descriptor afterward. FIFOs, sockets,
+   devices, oversized namespaces, dangling symlinks, and every other
+   physically present malformed receipt fail closed without being treated as
+   absence. Do not delete or repair an attempt namespace in place. The MCP then
    requires exactly one new candidate, exact candidate ID/ETag, exact allowed
    compatibility date/flags, response-to-readback script/runtime/version
    metadata projections, and a complete binding projection matching
