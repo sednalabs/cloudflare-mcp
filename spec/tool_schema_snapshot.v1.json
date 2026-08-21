@@ -5508,16 +5508,12 @@
           },
           "script_name": {
             "type": "string"
-          },
-          "upload_contract_sha256": {
-            "type": "string"
           }
         },
         "required": [
           "script_name",
           "base_version_id",
           "base_version_etag",
-          "upload_contract_sha256",
           "pre_upload_version_ids",
           "pre_upload_version_ids_sha256",
           "pre_upload_deployments",
@@ -5618,7 +5614,7 @@
       "name": "workers_upload_script"
     },
     {
-      "description": "Upload one disabled Worker version with strict exact-base binding inheritance, dry-run confirmation, pinned pre-state, non-retrying provider submission, exact candidate readback, and unchanged-deployment proof.",
+      "description": "Preview, privately prepare under a random opaque approval handle, or apply once to upload one disabled Worker version with exact-candidate custody, pinned pre-state, non-retrying provider submission, exact candidate readback, and unchanged-deployment proof.",
       "inputSchema": {
         "$defs": {
           "WorkerVersionBindingsInherit": {
@@ -6191,6 +6187,13 @@
               "null"
             ]
           },
+          "approval_handle": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "base_version_etag": {
             "type": "string"
           },
@@ -6199,13 +6202,6 @@
           },
           "bindings_inherit": {
             "$ref": "#/$defs/WorkerVersionBindingsInherit"
-          },
-          "confirmation_token": {
-            "default": null,
-            "type": [
-              "string",
-              "null"
-            ]
           },
           "content_type": {
             "default": null,
@@ -6247,6 +6243,10 @@
           },
           "pre_upload_version_snapshot_sha256": {
             "type": "string"
+          },
+          "prepare": {
+            "default": false,
+            "type": "boolean"
           },
           "reason": {
             "default": null,

@@ -252,6 +252,12 @@ impl CloudflareMcp {
     }
 
     fn call_requires_elicitation(&self, request: &CallToolRequestParams) -> bool {
+        // This tool owns a private random-handle approval lifecycle because its
+        // complete arguments may contain low-entropy secrets. Generic
+        // elicitation would hash and preview those arguments before dispatch.
+        if request.name.as_ref() == "workers_upload_version" {
+            return false;
+        }
         if !self.elicitation_policy.enabled {
             return false;
         }
@@ -1354,6 +1360,35 @@ mod tests {
                 )
             )
         );
+    }
+
+    #[test]
+    fn worker_version_private_approval_never_enters_argument_elicitation() {
+        let server = test_server_with_elicitation(
+            false,
+            ElicitationConfig {
+                enabled: true,
+                required_tools: vec!["workers_upload_version".to_string()],
+                apply_only: false,
+                timeout: None,
+                fail_open_unsupported_client: false,
+            },
+        );
+        let request = CallToolRequestParams::new("workers_upload_version").with_arguments(
+            serde_json::from_value(json!({
+                "script_name": "worker-a",
+                "prepare": true,
+                "metadata": {
+                    "bindings": [{
+                        "name": "SECRET",
+                        "type": "secret_text",
+                        "text": "low-entropy-private-value"
+                    }]
+                }
+            }))
+            .expect("args"),
+        );
+        assert!(!server.call_requires_elicitation(&request));
     }
 
     #[test]

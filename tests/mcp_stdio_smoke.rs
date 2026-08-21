@@ -17912,7 +17912,7 @@ fn workers_upload_script_requires_token_and_reads_back_through_stdio_boundary() 
 }
 
 #[test]
-fn workers_upload_version_dry_run_is_strict_digest_bound_and_provider_free() {
+fn workers_upload_version_preview_is_private_and_provider_free() {
     let (base_url, requests) = spawn_fake_worker_upload_api(0);
     let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
     let response = mcp.call_tool(
@@ -17948,36 +17948,24 @@ fn workers_upload_version_dry_run_is_strict_digest_bound_and_provider_free() {
     let content = structured_content(&response);
     assert_eq!(content["ok"], json!(true), "{content}");
     assert_eq!(content["planned"], json!(true));
-    assert_eq!(
-        content["request_query"]["bindings_inherit"],
-        json!("strict")
-    );
+    assert_eq!(content["status"], json!("preview_validated"));
     assert_eq!(content["deployment_created"], json!(false));
-    assert!(content["required_confirmation_token"].is_string());
-    assert!(content["upload"]["body_sha256"].is_string());
-    assert!(content["upload"]["metadata_sha256"].is_string());
-    assert!(content["upload"]["upload_contract_sha256"].is_string());
-    assert_eq!(content["request_evidence"]["status"], json!("digest_only"));
-    assert_eq!(
-        content["request_evidence"]["exact_request_bytes_retained"],
-        json!(false)
-    );
-    assert_eq!(
-        content["request_evidence"]["canonical_request_manifest_retained"],
-        json!(false)
-    );
-    assert_eq!(
-        content["request_evidence"]["attempt_authority_commits_upload_contract_digest"],
-        json!(false)
-    );
+    assert_eq!(content["local_mutation_performed"], json!(false));
+    assert_eq!(content["provider_calls"], json!(0));
+    assert_eq!(content["preparation_required"], json!(true));
     let outward = content.to_string();
     assert!(!outward.contains("private-fixture-value"));
     assert!(!outward.contains("script_content"));
+    assert!(!outward.contains("body_sha256"));
+    assert!(!outward.contains("metadata_sha256"));
+    assert!(!outward.contains("size_bytes"));
+    assert!(!outward.contains("upload_contract_sha256"));
+    assert!(!outward.contains("required_confirmation_token"));
     assert!(requests.lock().expect("request log lock").is_empty());
 }
 
 #[test]
-fn workers_upload_version_supported_sources_all_report_digest_only_evidence() {
+fn workers_upload_version_supported_sources_prepare_opaque_private_plans() {
     use std::os::unix::fs::PermissionsExt;
 
     let suffix = SystemTime::now()
@@ -18005,6 +17993,13 @@ fn workers_upload_version_supported_sources_all_report_digest_only_evidence() {
     );
     fs::write(artifact_root.join("candidate.multipart"), multipart)
         .expect("write multipart fixture");
+    let approval_root = std::env::temp_dir().join(format!(
+        "cloudflare-mcp-version-approval-source-matrix-{}-{suffix}",
+        std::process::id()
+    ));
+    fs::create_dir(&approval_root).expect("create approval root");
+    fs::set_permissions(&approval_root, fs::Permissions::from_mode(0o700))
+        .expect("make approval root private");
 
     let (base_url, requests) = spawn_fake_worker_upload_api(0);
     let mut mcp = McpStdioProcess::start_with_env(vec![
@@ -18012,6 +18007,10 @@ fn workers_upload_version_supported_sources_all_report_digest_only_evidence() {
         (
             "CLOUDFLARE_MCP_WORKER_UPLOAD_ROOT",
             artifact_root.to_string_lossy().to_string(),
+        ),
+        (
+            "CLOUDFLARE_MCP_WORKER_VERSION_APPROVAL_ROOT",
+            approval_root.to_string_lossy().to_string(),
         ),
     ]);
     let base = json!({
@@ -18028,7 +18027,7 @@ fn workers_upload_version_supported_sources_all_report_digest_only_evidence() {
             "compatibility_flags":[],
             "bindings":[]
         },
-        "dry_run":true
+        "prepare":true
     });
     let sources = [
         ("inline", json!({"script_content":"export default {}"})),
@@ -18045,7 +18044,7 @@ fn workers_upload_version_supported_sources_all_report_digest_only_evidence() {
             }),
         ),
     ];
-    let mut module_body_digests = Vec::new();
+    let mut handles = Vec::new();
     for (index, (label, source)) in sources.into_iter().enumerate() {
         let mut arguments = base.clone();
         arguments
@@ -18055,34 +18054,32 @@ fn workers_upload_version_supported_sources_all_report_digest_only_evidence() {
         let response = mcp.call_tool(10 + index as u64, "workers_upload_version", arguments);
         let content = structured_content(&response);
         assert_eq!(content["ok"], json!(true), "{label}: {content}");
-        assert_eq!(
-            content["request_evidence"]["status"],
-            json!("digest_only"),
+        assert_eq!(content["status"], json!("approval_prepared"));
+        let handle = content["approval"]["approval_handle"]
+            .as_str()
+            .expect("opaque approval handle");
+        assert!(handle.starts_with("wvpa-") && handle.len() == 69);
+        handles.push(handle.to_string());
+        let outward = content.to_string();
+        assert!(!outward.contains("body_sha256"), "{label}: {content}");
+        assert!(!outward.contains("metadata_sha256"), "{label}: {content}");
+        assert!(!outward.contains("size_bytes"), "{label}: {content}");
+        assert!(
+            !outward.contains("upload_contract_sha256"),
             "{label}: {content}"
         );
-        assert_eq!(
-            content["request_evidence"]["exact_request_bytes_retained"],
-            json!(false),
-            "{label}: {content}"
-        );
-        assert_eq!(
-            content["request_evidence"]["canonical_request_manifest_retained"],
-            json!(false),
-            "{label}: {content}"
-        );
-        if label != "multipart" {
-            module_body_digests.push(content["upload"]["body_sha256"].clone());
-        }
     }
-    assert!(
-        module_body_digests
-            .windows(2)
-            .all(|pair| pair[0] == pair[1]),
-        "inline, base64, and file sources with identical bytes must build one canonical request"
+    handles.sort();
+    handles.dedup();
+    assert_eq!(
+        handles.len(),
+        4,
+        "every preparation needs fresh random authority"
     );
     assert!(requests.lock().expect("request log lock").is_empty());
     mcp.terminate();
     fs::remove_dir_all(artifact_root).expect("remove artifact root");
+    fs::remove_dir_all(approval_root).expect("remove approval root");
 }
 
 #[test]
@@ -18147,6 +18144,12 @@ fn workers_upload_version_schema_and_deserialization_are_closed() {
     assert_eq!(schema["$defs"][inherit_name]["enum"], json!(["strict"]));
     assert_eq!(schema["properties"]["per_page"]["minimum"], json!(1));
     assert_eq!(schema["properties"]["per_page"]["maximum"], json!(100));
+    assert_eq!(schema["properties"]["prepare"]["type"], json!("boolean"));
+    assert_eq!(
+        schema["properties"]["approval_handle"]["type"],
+        json!(["string", "null"])
+    );
+    assert!(schema["properties"].get("confirmation_token").is_none());
     let metadata_ref = schema["properties"]["metadata"]["$ref"]
         .as_str()
         .expect("typed metadata ref");
@@ -18287,7 +18290,23 @@ fn workers_upload_version_schema_and_deserialization_are_closed() {
             json!("workers.version_upload_per_page_invalid"),
             "{content}"
         );
+        assert!(content["plan"].is_object(), "{content}");
+        assert!(content["audit"].is_object(), "{content}");
+        assert_eq!(content["local_mutation_performed"], json!(false));
+        assert_eq!(content["provider_calls"], json!(0));
     }
+    let mut invalid_phase = base_args;
+    invalid_phase["dry_run"] = json!(false);
+    let response = mcp.call_tool(9, "workers_upload_version", invalid_phase);
+    let content = structured_content(&response);
+    assert_eq!(
+        content["error"]["code"],
+        json!("workers.version_upload_phase_invalid")
+    );
+    assert!(content["plan"].is_object(), "{content}");
+    assert!(content["audit"].is_object(), "{content}");
+    assert_eq!(content["local_mutation_performed"], json!(false));
+    assert_eq!(content["provider_calls"], json!(0));
     assert!(requests.lock().expect("request log lock").is_empty());
 }
 
@@ -18352,6 +18371,66 @@ fn workers_upload_version_rejects_symlink_artifact_before_provider_access() {
 }
 
 #[test]
+fn workers_upload_version_oversized_private_artifact_error_withholds_exact_size() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "cloudflare-mcp-version-oversized-{}-{suffix}",
+        std::process::id()
+    ));
+    fs::create_dir(&directory).expect("create fixture directory");
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+        .expect("make fixture directory private");
+    let artifact = directory.join("candidate.js");
+    let file = fs::File::create(&artifact).expect("create oversized fixture");
+    let exact_private_size = 25 * 1024 * 1024 + 1;
+    file.set_len(exact_private_size)
+        .expect("make sparse oversized fixture");
+
+    let (base_url, requests) = spawn_fake_worker_upload_api(0);
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_WORKER_UPLOAD_ROOT",
+            directory.to_string_lossy().to_string(),
+        ),
+    ]);
+    let response = mcp.call_tool(
+        2,
+        "workers_upload_version",
+        json!({
+            "script_name":"worker-a",
+            "base_version_id":"11111111-1111-4111-8111-111111111111",
+            "base_version_etag":"a".repeat(64),
+            "pre_upload_version_snapshot_sha256":"b".repeat(64),
+            "pre_upload_deployment_snapshot_sha256":"c".repeat(64),
+            "bindings_inherit":"strict",
+            "main_module":"index.js",
+            "script_path":"candidate.js",
+            "metadata":{"main_module":"index.js","compatibility_date":"2026-07-10","compatibility_flags":[],"bindings":[]},
+            "dry_run":true
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["error"]["code"], json!("workers.upload_too_large"));
+    assert!(content["plan"].is_object(), "{content}");
+    assert!(content["audit"].is_object(), "{content}");
+    assert_eq!(content["local_mutation_performed"], json!(false));
+    assert_eq!(content["provider_calls"], json!(0));
+    let outward = content.to_string();
+    assert!(!outward.contains(&exact_private_size.to_string()));
+    assert!(!outward.contains("size_bytes"));
+    assert!(requests.lock().expect("request log lock").is_empty());
+    mcp.terminate();
+    fs::remove_dir_all(directory).expect("remove fixture directory");
+}
+
+#[test]
 fn workers_upload_version_stdio_applies_once_and_proves_disabled_candidate() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -18367,11 +18446,22 @@ fn workers_upload_version_stdio_applies_once_and_proves_disabled_candidate() {
     fs::create_dir(&attempt_root).expect("create attempt root");
     fs::set_permissions(&attempt_root, fs::Permissions::from_mode(0o700))
         .expect("make attempt root private");
+    let approval_root = std::env::temp_dir().join(format!(
+        "cloudflare-mcp-version-approval-{}-{suffix}",
+        std::process::id()
+    ));
+    fs::create_dir(&approval_root).expect("create approval root");
+    fs::set_permissions(&approval_root, fs::Permissions::from_mode(0o700))
+        .expect("make approval root private");
     let mut mcp = McpStdioProcess::start_with_env(vec![
         ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
         (
             "CLOUDFLARE_MCP_WORKER_VERSION_ATTEMPT_ROOT",
             attempt_root.to_str().expect("UTF-8 root").to_string(),
+        ),
+        (
+            "CLOUDFLARE_MCP_WORKER_VERSION_APPROVAL_ROOT",
+            approval_root.to_str().expect("UTF-8 root").to_string(),
         ),
     ]);
     let base_id = "11111111-1111-4111-8111-111111111111";
@@ -18427,37 +18517,37 @@ fn workers_upload_version_stdio_applies_once_and_proves_disabled_candidate() {
     assert_eq!(dry_run_content["planned"], json!(true));
     assert_eq!(requests.lock().expect("request log lock").len(), 5);
 
+    let mut prepare_args = upload_args.clone();
+    prepare_args["dry_run"] = json!(false);
+    prepare_args["prepare"] = json!(true);
+    let prepared = mcp.call_tool(4, "workers_upload_version", prepare_args);
+    let prepared_content = structured_content(&prepared);
+    assert_eq!(prepared_content["ok"], json!(true), "{prepared_content}");
+    assert_eq!(prepared_content["status"], json!("approval_prepared"));
+    assert_eq!(requests.lock().expect("request log lock").len(), 5);
+
     let mut apply_args = upload_args;
     apply_args["dry_run"] = json!(false);
-    apply_args["confirmation_token"] = dry_run_content["required_confirmation_token"].clone();
+    apply_args["approval_handle"] = prepared_content["approval"]["approval_handle"].clone();
     let replay_args = apply_args.clone();
-    let apply = mcp.call_tool(4, "workers_upload_version", apply_args);
+    let apply = mcp.call_tool(5, "workers_upload_version", apply_args);
     let apply_content = structured_content(&apply);
     assert_eq!(apply_content["ok"], json!(true), "{apply_content}");
     assert_eq!(
         apply_content["status"],
-        json!("candidate_created_digest_only")
+        json!("candidate_created_private_exact_candidate")
     );
     assert_eq!(
         apply_content["request_evidence"]["status"],
-        json!("digest_only")
+        json!("private_exact_candidate_consumed")
     );
     assert_eq!(
-        apply_content["request_evidence"]["exact_request_bytes_retained"],
+        apply_content["request_evidence"]["public_digest_disclosed"],
         json!(false)
     );
     assert_eq!(
-        apply_content["request_evidence"]["canonical_request_manifest_retained"],
+        apply_content["request_evidence"]["public_size_disclosed"],
         json!(false)
-    );
-    assert_eq!(
-        apply_content["request_evidence"]["attempt_authority_commits_upload_contract_digest"],
-        json!(true)
-    );
-    assert!(
-        apply_content["request_evidence"]["authenticated_request_artifact_sha256"]
-            .as_str()
-            .is_some_and(|value| value.len() == 64)
     );
     assert_eq!(
         apply_content["source_proof"]["status"],
@@ -18467,14 +18557,8 @@ fn workers_upload_version_stdio_applies_once_and_proves_disabled_candidate() {
         apply_content["provider_proof_scope"]["source_bytes"],
         json!(false)
     );
-    assert_eq!(
-        apply_content["upload_result"]["candidate_version_id"],
-        json!(candidate_id)
-    );
-    assert_eq!(
-        apply_content["post_upload_state"]["deployments"]["candidate_absent"],
-        json!(true)
-    );
+    assert_eq!(apply_content["candidate_version_id"], json!(candidate_id));
+    assert_eq!(apply_content["candidate_verified"], json!(true));
     assert_eq!(apply_content["deployment_created"], json!(false));
     assert_eq!(
         apply_content["dispatch_attempt_authority"]["state"],
@@ -18492,33 +18576,23 @@ fn workers_upload_version_stdio_applies_once_and_proves_disabled_candidate() {
             "provider_response_received": true,
         })
     );
-    assert_eq!(
-        apply_content["binding_verification"]["matched"],
-        json!(true)
-    );
-    assert_eq!(
-        apply_content["binding_verification"]["expected_binding_count"],
-        json!(2)
-    );
-    assert_eq!(
-        apply_content["binding_verification"]["observed_binding_count"],
-        json!(2)
-    );
+    assert_eq!(apply_content["binding_verification_matched"], json!(true));
     let outward = apply_content.to_string();
     assert!(!outward.contains("private-fixture-value"));
     assert!(!outward.contains("never-surface"));
+    assert!(!outward.contains("body_sha256"));
+    assert!(!outward.contains("metadata_sha256"));
+    assert!(!outward.contains("size_bytes"));
+    assert!(!outward.contains("upload_contract_sha256"));
 
-    let replay = mcp.call_tool(5, "workers_upload_version", replay_args);
+    let replay = mcp.call_tool(6, "workers_upload_version", replay_args);
     let replay_content = structured_content(&replay);
     assert_eq!(replay_content["ok"], json!(false), "{replay_content}");
     assert_eq!(
         replay_content["error"]["code"],
-        json!("workers.version_upload_attempt_reconciliation_required")
+        json!("workers.version_upload_approval_consumed")
     );
-    assert_eq!(
-        replay_content["dispatch_attempt_authority"]["state"],
-        json!("terminal")
-    );
+    assert_eq!(replay_content["approval_state"], json!("retired"));
 
     let requests = requests.lock().expect("request log lock");
     assert_eq!(requests.len(), 21);
@@ -18555,6 +18629,7 @@ fn workers_upload_version_stdio_applies_once_and_proves_disabled_candidate() {
     drop(requests);
     mcp.terminate();
     fs::remove_dir_all(attempt_root).expect("remove attempt root");
+    fs::remove_dir_all(approval_root).expect("remove approval root");
 }
 
 #[test]
@@ -18593,7 +18668,6 @@ fn workers_reconcile_version_upload_never_attributes_a_sole_new_candidate() {
             "script_name":"worker-a",
             "base_version_id":base_id,
             "base_version_etag":"a".repeat(64),
-            "upload_contract_sha256":"d".repeat(64),
             "pre_upload_version_ids":pre_upload_version_ids,
             "pre_upload_version_ids_sha256":pre_upload_version_ids_sha256,
             "pre_upload_deployments":pre_upload_deployments,
@@ -18613,6 +18687,7 @@ fn workers_reconcile_version_upload_never_attributes_a_sole_new_candidate() {
     assert_eq!(content["mutation_performed"], json!(false));
     assert_eq!(content["deployment_created"], json!(false));
     assert_eq!(content["retry_decision"], json!("do_not_retry"));
+    assert!(!content.to_string().contains("upload_contract_sha256"));
     let requests = requests.lock().expect("request log lock");
     assert_eq!(requests.len(), 10);
     assert!(

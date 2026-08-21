@@ -12,7 +12,7 @@ use mcp_toolkit_auth::upstream_oauth::OAuthClientAuthMethod;
 use mcp_toolkit_auth::{AuthConfig, AuthMode, AuthSecurityProfile, ClientAuthMethod};
 use url::Url;
 
-const DEFAULT_ELICITATION_REQUIRED_TOOLS: &str = "account_api_tokens,api_mutate,lock_first_publish,emergency_unpublish,replace_access_policies,apply_access_allowlist,portal_agent_request,cache_purge,cache_rules,r2_put_object,workers_upload_script,workers_upload_version,waf_ruleset_apply_change";
+const DEFAULT_ELICITATION_REQUIRED_TOOLS: &str = "account_api_tokens,api_mutate,lock_first_publish,emergency_unpublish,replace_access_policies,apply_access_allowlist,portal_agent_request,cache_purge,cache_rules,r2_put_object,workers_upload_script,waf_ruleset_apply_change";
 const MANDATORY_ELICITATION_REQUIRED_TOOLS: &[&str] = &["account_api_tokens", "api_mutate"];
 const DEFAULT_ELICITATION_TIMEOUT_MS: i64 = 30_000;
 const INSECURE_DEV_DELEGATION_SECRET: &str = "cloudflare-mcp-loopback-fixture";
@@ -646,6 +646,15 @@ fn add_mandatory_elicitation_tools(required_tools: &mut Vec<String>) {
 fn validate_elicitation_required_tools(required_tools: &[String]) -> Result<(), String> {
     if required_tools.is_empty() {
         return Ok(());
+    }
+    if required_tools
+        .iter()
+        .any(|tool| tool == "workers_upload_version")
+    {
+        return Err(
+            "workers_upload_version cannot use generic argument-based elicitation because its complete candidate may contain private low-entropy values; use its explicit private prepare/apply approval_handle lifecycle."
+                .to_string(),
+        );
     }
 
     let validation =
@@ -1619,7 +1628,6 @@ mod tests {
             "cache_rules",
             "r2_put_object",
             "workers_upload_script",
-            "workers_upload_version",
             "waf_ruleset_apply_change",
         ] {
             assert!(
@@ -1630,6 +1638,27 @@ mod tests {
                 "missing default elicitation gate for {tool}"
             );
         }
+        assert!(
+            !cfg.elicitation
+                .required_tools
+                .iter()
+                .any(|required| required == "workers_upload_version")
+        );
+    }
+
+    #[test]
+    fn rejects_worker_version_upload_in_generic_elicitation_policy() {
+        let err = with_env(
+            &[
+                ("CLOUDFLARE_MCP_AUTH_MODE", Some("off")),
+                (
+                    "CLOUDFLARE_MCP_ELICITATION_REQUIRED_TOOLS",
+                    Some("workers_upload_version"),
+                ),
+            ],
+            || load_config().expect_err("private approval tool must reject generic elicitation"),
+        );
+        assert!(err.contains("cannot use generic argument-based elicitation"));
     }
 
     #[test]

@@ -1047,6 +1047,10 @@ because the bundle owns its module graph.
 Use this ceremony when a reviewed candidate must exist in Cloudflare but must
 not be deployed yet. It is intentionally separate from
 `workers_upload_script`, and these tools contain no deployment-create path.
+`workers_upload_version` must not be placed in
+`CLOUDFLARE_MCP_ELICITATION_REQUIRED_TOOLS`: generic elicitation hashes and
+previews full arguments, while this tool's sole approval path is its private
+random-handle preparation lifecycle.
 
 1. Call `workers_capture_version_evidence` with the exact account, script,
    fixed `per_page`, and exact base version ID. Review the two stable complete
@@ -1076,14 +1080,29 @@ not be deployed yet. It is intentionally separate from
    The closed binding projection rejects unknown types or fields and normalizes
    only documented representation equivalence: deprecated D1 `id` to
    `database_id`, and an omitted AI Search instance namespace to `default`.
-   Review the body, normalized-metadata, and upload-contract SHA-256 values and
-   retain the confirmation token. Dry-run performs no provider call.
-3. Apply once with unchanged inputs and the exact confirmation token. The MCP
-   requires `CLOUDFLARE_MCP_WORKER_VERSION_ATTEMPT_ROOT` to be a pre-created,
+   Preview returns no candidate digest, size, or actionable token. It performs
+   no local mutation and no provider call.
+3. Repeat the complete byte-identical candidate with `dry_run:false` and
+   `prepare:true`. This is an explicit local custody mutation, not a dry-run.
+   Configure `CLOUDFLARE_MCP_WORKER_VERSION_APPROVAL_ROOT` as a pre-created,
+   canonical, operator-owned mode-0700 directory shared by every upload
+   process. Preparation creates an exact private candidate under a
+   cryptographically random opaque handle. Review the lifecycle result and
+   retain only `approval.approval_handle`; public output deliberately contains
+   no deterministic candidate hash, candidate-derived size, private path, or
+   receipt bytes. A handle expires after 15 minutes.
+4. Apply once with unchanged complete inputs, `prepare:false`, and the exact
+   `approval_handle`. Apply reloads the private body and canonical metadata,
+   binds every target/base/pre-state field byte-for-byte, and durably consumes
+   approval before any provider access. Absent, expired, consumed, retired,
+   conflicting, concurrent, malformed, noncanonical, symlink, FIFO, socket,
+   device, oversized, unexpected-entry, or root-drift evidence fails closed.
+   Physical presence is evidence; do not delete or repair a plan namespace.
+   The MCP also requires `CLOUDFLARE_MCP_WORKER_VERSION_ATTEMPT_ROOT` to be a pre-created,
    canonical, operator-owned mode-0700 directory shared by every MCP process
    that can upload Worker versions. It checks this permanent custody before
    provider preflight, re-captures the base and pre-state, then creates an
-   append-only `prepared.json` receipt beneath a confirmation-bound attempt
+   append-only `prepared.json` receipt beneath an approval-handle-bound attempt
    key. While the shared attempt guard remains held, it captures and matches
    that pinned provider state again so a differently confirmed concurrent
    attempt cannot dispatch from a stale snapshot. It then synchronizes the
@@ -1108,18 +1127,12 @@ not be deployed yet. It is intentionally separate from
    It also requires an
    unchanged sorted two-pass deployment projection with an explicit known
    `percentage` strategy and `candidate_absent:true`.
-   `candidate_created_digest_only` means a disabled candidate exists and the
+   `candidate_created_private_exact_candidate` means a disabled candidate exists and the
    provider-visible identity/runtime/binding/deployment projections match. It
-   deliberately does **not** claim request-byte custody: the canonical request
-   is constructed in memory, the durable attempt authority commits to the
-   upload-contract digest, and the result returns exact body/request digests
-   plus size. Neither the exact request bytes nor a reconstructable canonical
-   request manifest is retained across process exit.
-   Consequently there is no request-artifact create/write/fsync/readback
-   lifecycle to recover after a partial artifact write. Request construction
-   fails before attempt preparation or dispatch; after preparation, restart,
-   exact replay, conflicting replay, and response loss are governed only by
-   the append-only attempt receipts and digest commitments described above.
+   public result deliberately omits all deterministic candidate/request hashes
+   and candidate-derived sizes. Exact candidate bytes and canonical metadata
+   remain only in private approval custody; append-only attempt receipts govern
+   the separate provider-dispatch ambiguity boundary.
    `source_proof.status=source_provider_unverified` is intentional: Version
    Detail cannot authenticate the submitted module graph or source bytes. The
    result does not authorize or create a deployment and must never be described
@@ -1127,20 +1140,17 @@ not be deployed yet. It is intentionally separate from
    script-level logpush, tails, tags, observability and similar settings inputs,
    it does not claim a separate Script Settings before/after proof; that scope
    is reported as false rather than silently inferred.
-4. Preserve the returned request/response artifact SHA-256 values as
-   digest-only exchange evidence. They are computed over the exact in-memory
-   exchange and intentionally replace outward raw credential headers, response
-   bodies, module bytes, metadata values, and binding values. The digests are
-   not proof that the underlying request or response bytes were durably
-   retained.
+5. Preserve the opaque approval handle and lifecycle result privately. Public
+   results intentionally do not provide request/response digests or byte sizes
+   that could become confirmation oracles for low-entropy secret bindings.
 
 If the upload response is lost before or after provider visibility, rejected,
 malformed, oversized, unexpectedly encoded, or followed by
 failed/contradictory readback, never repeat the POST. The durable attempt state
 is authoritative even when provider inventory shows no new candidate.
 Call `workers_reconcile_version_upload` with the exact pinned pre-upload IDs,
-deployment projection and hashes, base ID/ETag, and dry-run upload-contract
-SHA-256. Reconciliation is read-only. Exactly one new version over the
+deployment projection and hashes plus the base ID/ETag. Do not supply or
+publish an upload-contract digest. Reconciliation is read-only. Exactly one new version over the
 predecessor set, a matching base, unchanged deployments, and a disabled
 candidate prove only a sole-new-candidate relationship. They do not attribute
 that candidate to the lost POST or prove its complete reviewed bytes and

@@ -63,6 +63,10 @@ not only in documentation:
 - Curated tool workflows are preserved for operations with product-specific
   safety policy.
 - Mutating tools support deterministic dry-run plans.
+- Worker version uploads use a separate explicit private preparation phase and
+  random opaque approval handle when deterministic public confirmation would
+  expose an oracle over secret-bearing metadata. They are excluded from the
+  generic argument-digest/preview elicitation path for the same reason.
 - Dangerous apply calls can require MCP elicitation approval.
 - Mutation responses include structured audit metadata with correlation IDs.
 - Publish flows evaluate policy gates before DNS mutation.

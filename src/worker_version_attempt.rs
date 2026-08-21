@@ -4,10 +4,13 @@
 //! attempt namespace is permanent evidence: once prepared, every later
 //! invocation must reconcile rather than reuse the reviewed provider POST.
 
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(test)]
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -27,7 +30,7 @@ const MAX_ATTEMPT_NAMESPACE_ENTRIES: usize = 3;
 pub(crate) struct WorkerVersionAttemptInput<'a> {
     pub(crate) account_id: &'a str,
     pub(crate) script_name: &'a str,
-    pub(crate) confirmation_token: &'a str,
+    pub(crate) approval_handle: &'a str,
     pub(crate) upload_contract_sha256: &'a str,
     pub(crate) base_version_id: &'a str,
     pub(crate) base_version_etag: &'a str,
@@ -37,8 +40,6 @@ pub(crate) struct WorkerVersionAttemptInput<'a> {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct WorkerVersionAttemptEvidence {
-    pub(crate) attempt_key_sha256: String,
-    pub(crate) authority_sha256: String,
     pub(crate) state: &'static str,
     pub(crate) reconciliation_only: bool,
 }
@@ -53,8 +54,14 @@ pub(crate) struct WorkerVersionAttemptError {
 
 #[derive(Debug)]
 pub(crate) struct WorkerVersionDispatchAttempt {
+    #[cfg(test)]
     attempt_dir: PathBuf,
+    root_path: PathBuf,
+    root_handle: File,
+    root_identity: FileIdentity,
+    attempt_name: String,
     attempt_dir_handle: File,
+    attempt_identity: FileIdentity,
     _root_guard: File,
     prepared: AttemptReceipt,
 }
@@ -78,7 +85,7 @@ impl WorkerVersionAttemptInput<'_> {
             "worker-version-dispatch-authority-v1",
             self.account_id,
             self.script_name,
-            self.confirmation_token,
+            self.approval_handle,
             self.upload_contract_sha256,
             self.base_version_id,
             self.base_version_etag,
@@ -92,7 +99,7 @@ impl WorkerVersionAttemptInput<'_> {
             "worker-version-dispatch-attempt-v1",
             self.account_id,
             self.script_name,
-            self.confirmation_token,
+            self.approval_handle,
         ])
     }
 }
@@ -100,8 +107,6 @@ impl WorkerVersionAttemptInput<'_> {
 impl WorkerVersionDispatchAttempt {
     pub(crate) fn evidence(&self, state: &'static str) -> WorkerVersionAttemptEvidence {
         WorkerVersionAttemptEvidence {
-            attempt_key_sha256: self.prepared.attempt_key_sha256.clone(),
-            authority_sha256: self.prepared.authority_sha256.clone(),
             state,
             reconciliation_only: state != "absent",
         }
@@ -111,6 +116,7 @@ impl WorkerVersionDispatchAttempt {
     pub(crate) fn consume_for_dispatch(
         &mut self,
     ) -> Result<WorkerVersionAttemptEvidence, WorkerVersionAttemptError> {
+        self.validate_namespace()?;
         let predecessor = receipt_sha256(&self.prepared)?;
         let dispatched = AttemptReceipt {
             version: 1,
@@ -122,12 +128,8 @@ impl WorkerVersionDispatchAttempt {
             terminal_outcome: None,
             response_artifact_sha256: None,
         };
-        write_new_receipt(
-            &self.attempt_dir,
-            &self.attempt_dir_handle,
-            DISPATCHED_NAME,
-            &dispatched,
-        )?;
+        write_new_receipt(&self.attempt_dir_handle, DISPATCHED_NAME, &dispatched)?;
+        self.validate_namespace()?;
         Ok(self.evidence("dispatched"))
     }
 
@@ -136,7 +138,8 @@ impl WorkerVersionDispatchAttempt {
         terminal_outcome: &'static str,
         response_artifact_sha256: Option<&str>,
     ) -> Result<WorkerVersionAttemptEvidence, WorkerVersionAttemptError> {
-        let dispatched = read_receipt(&self.attempt_dir, DISPATCHED_NAME)?;
+        self.validate_namespace()?;
+        let dispatched = read_receipt(&self.attempt_dir_handle, DISPATCHED_NAME)?;
         validate_receipt_link(&self.prepared, &dispatched, "dispatched")?;
         let predecessor = receipt_sha256(&dispatched)?;
         let terminal = AttemptReceipt {
@@ -149,13 +152,19 @@ impl WorkerVersionDispatchAttempt {
             terminal_outcome: Some(terminal_outcome.to_string()),
             response_artifact_sha256: response_artifact_sha256.map(str::to_string),
         };
-        write_new_receipt(
-            &self.attempt_dir,
-            &self.attempt_dir_handle,
-            TERMINAL_NAME,
-            &terminal,
-        )?;
+        write_new_receipt(&self.attempt_dir_handle, TERMINAL_NAME, &terminal)?;
+        self.validate_namespace()?;
         Ok(self.evidence("terminal"))
+    }
+
+    fn validate_namespace(&self) -> Result<(), WorkerVersionAttemptError> {
+        validate_root_identity(&self.root_path, &self.root_handle, self.root_identity)?;
+        validate_child_identity(
+            &self.root_handle,
+            &self.attempt_name,
+            &self.attempt_dir_handle,
+            self.attempt_identity,
+        )
     }
 }
 
@@ -173,22 +182,27 @@ pub(crate) fn preflight_worker_version_dispatch_attempt(
     input: &WorkerVersionAttemptInput<'_>,
 ) -> Result<(), WorkerVersionAttemptError> {
     let root = configured_attempt_root()?;
-    let _root = open_private_root(&root)?;
-    let guard = open_or_create_private_file(&root, GUARD_NAME)?;
+    let root_handle = open_private_root(&root)?;
+    let root_identity = metadata_identity(
+        &root_handle
+            .metadata()
+            .map_err(|_| custody_error("attempt-root descriptor metadata is unavailable"))?,
+    );
+    let guard = open_or_create_private_file(&root_handle, GUARD_NAME)?;
     try_lock_exclusive(&guard)?;
+    validate_root_identity(&root, &root_handle, root_identity)?;
     let attempt_key_sha256 = input.attempt_key_sha256();
     let authority_sha256 = input.authority_sha256();
-    let attempt_dir = root.join(&attempt_key_sha256);
-    match fs::symlink_metadata(&attempt_dir) {
-        Ok(_) => Err(inspect_existing_attempt(
+    match open_private_directory_at_optional(&root_handle, &attempt_key_sha256)? {
+        Some(attempt_dir) => Err(inspect_existing_attempt(
             &attempt_dir,
             &attempt_key_sha256,
             &authority_sha256,
         )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(custody_error(
-            "attempt namespace presence could not be established safely",
-        )),
+        None => {
+            validate_root_identity(&root, &root_handle, root_identity)?;
+            Ok(())
+        }
     }
 }
 
@@ -208,73 +222,85 @@ pub(crate) fn prepare_worker_version_dispatch_attempt_at(
     input: &WorkerVersionAttemptInput<'_>,
 ) -> Result<WorkerVersionDispatchAttempt, WorkerVersionAttemptError> {
     let root_handle = open_private_root(root)?;
-    let guard = open_or_create_private_file(root, GUARD_NAME)?;
+    let root_identity = metadata_identity(
+        &root_handle
+            .metadata()
+            .map_err(|_| custody_error("attempt-root descriptor metadata is unavailable"))?,
+    );
+    let guard = open_or_create_private_file(&root_handle, GUARD_NAME)?;
     try_lock_exclusive(&guard)?;
+    validate_root_identity(root, &root_handle, root_identity)?;
 
     let attempt_key_sha256 = input.attempt_key_sha256();
     let authority_sha256 = input.authority_sha256();
-    let attempt_dir = root.join(&attempt_key_sha256);
-    match fs::create_dir(&attempt_dir) {
-        Ok(()) => {
-            fs::set_permissions(&attempt_dir, fs::Permissions::from_mode(0o700)).map_err(|_| {
-                custody_error("new attempt directory permissions could not be fixed")
-            })?;
-            root_handle
-                .sync_all()
-                .map_err(|_| custody_error("attempt-root directory could not be synchronized"))?;
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+    let attempt_name = c_name(&attempt_key_sha256)?;
+    let created = unsafe { libc::mkdirat(root_handle.as_raw_fd(), attempt_name.as_ptr(), 0o700) };
+    if created == 0 {
+        root_handle
+            .sync_all()
+            .map_err(|_| custody_error("attempt-root directory could not be synchronized"))?;
+    } else {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::AlreadyExists {
+            let existing = open_private_directory_at(&root_handle, &attempt_key_sha256)?;
             return Err(inspect_existing_attempt(
-                &attempt_dir,
+                &existing,
                 &attempt_key_sha256,
                 &authority_sha256,
             ));
         }
-        Err(_) => {
-            return Err(custody_error(
-                "attempt directory could not be created exclusively",
-            ));
-        }
+        return Err(custody_error(
+            "attempt directory could not be created exclusively",
+        ));
     }
-    let attempt_dir_handle = open_private_directory(&attempt_dir)?;
+    validate_root_identity(root, &root_handle, root_identity)?;
+    let attempt_dir_handle = open_private_directory_at(&root_handle, &attempt_key_sha256)?;
+    let attempt_identity = metadata_identity(
+        &attempt_dir_handle
+            .metadata()
+            .map_err(|_| custody_error("attempt directory metadata is unavailable"))?,
+    );
     let prepared = AttemptReceipt {
         version: 1,
         operation: "workers_upload_version".to_string(),
-        attempt_key_sha256,
+        attempt_key_sha256: attempt_key_sha256.clone(),
         authority_sha256,
         state: "prepared".to_string(),
         predecessor_receipt_sha256: None,
         terminal_outcome: None,
         response_artifact_sha256: None,
     };
-    if let Err(err) = write_new_receipt(&attempt_dir, &attempt_dir_handle, PREPARED_NAME, &prepared)
-    {
+    if let Err(err) = write_new_receipt(&attempt_dir_handle, PREPARED_NAME, &prepared) {
         // The namespace remains permanent fail-closed evidence even when the
         // first receipt could not be completed.
         return Err(err);
     }
+    validate_root_identity(root, &root_handle, root_identity)?;
     Ok(WorkerVersionDispatchAttempt {
-        attempt_dir,
+        #[cfg(test)]
+        attempt_dir: root.join(&attempt_key_sha256),
+        root_path: root.to_path_buf(),
+        root_handle,
+        root_identity,
+        attempt_name: attempt_key_sha256,
         attempt_dir_handle,
+        attempt_identity,
         _root_guard: guard,
         prepared,
     })
 }
 
 fn inspect_existing_attempt(
-    attempt_dir: &Path,
+    attempt_dir: &File,
     expected_key: &str,
     expected_authority: &str,
 ) -> WorkerVersionAttemptError {
-    let directory = match open_private_directory(attempt_dir) {
-        Ok(directory) => directory,
-        Err(error) => return error,
-    };
-    let directory_identity = match directory.metadata() {
+    let directory_identity = match attempt_dir.metadata() {
         Ok(metadata) => metadata_identity(&metadata),
         Err(_) => return custody_error("existing attempt namespace metadata is unavailable"),
     };
-    let presence = match fs::read_dir(attempt_dir) {
+    let descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", attempt_dir.as_raw_fd()));
+    let presence = match fs::read_dir(descriptor_path) {
         Ok(entries) => {
             let mut entry_count = 0usize;
             let mut unexpected_entry = false;
@@ -316,14 +342,13 @@ fn inspect_existing_attempt(
         }
         Err(_) => return custody_error("existing attempt namespace could not be enumerated"),
     };
-    let directory_identity_after = match directory.metadata() {
+    let directory_identity_after = match attempt_dir.metadata() {
         Ok(metadata) if private_directory(&metadata) => metadata_identity(&metadata),
         _ => return custody_error("existing attempt namespace metadata changed"),
     };
     if directory_identity_after != directory_identity {
         return custody_error("existing attempt namespace changed during enumeration");
     }
-    drop(directory);
     if !presence.prepared {
         return custody_error("existing attempt namespace omits its prepared receipt");
     }
@@ -390,8 +415,6 @@ fn inspect_existing_attempt(
         message: "this reviewed Worker version dispatch attempt already has durable custody",
         hint: "Do not replay the provider POST. Use workers_reconcile_version_upload against the pinned pre-upload evidence.",
         evidence: Some(WorkerVersionAttemptEvidence {
-            attempt_key_sha256: expected_key.to_string(),
-            authority_sha256: expected_authority.to_string(),
             state,
             reconciliation_only: true,
         }),
@@ -433,29 +456,60 @@ fn validate_receipt_link(
 }
 
 fn write_new_receipt(
-    directory: &Path,
     directory_handle: &File,
     name: &str,
     receipt: &AttemptReceipt,
 ) -> Result<(), WorkerVersionAttemptError> {
     let bytes = canonical_receipt_bytes(receipt)?;
-    let path = directory.join(name);
-    let mut options = OpenOptions::new();
-    options
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    let mut file = options
-        .open(&path)
-        .map_err(|_| custody_error("attempt receipt could not be created exclusively"))?;
+    let name = c_name(name)?;
+    let fd = unsafe {
+        libc::openat(
+            directory_handle.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR
+                | libc::O_CREAT
+                | libc::O_EXCL
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC
+                | libc::O_NONBLOCK,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(custody_error(
+            "attempt receipt could not be created exclusively",
+        ));
+    }
+    let mut file = unsafe { File::from_raw_fd(fd) };
     file.write_all(&bytes)
         .and_then(|()| file.sync_all())
         .map_err(|_| custody_error("attempt receipt could not be durably synchronized"))?;
-    let readback = read_receipt(directory, name)?;
-    if &readback != receipt {
+    let before = file
+        .metadata()
+        .map_err(|_| custody_error("attempt receipt metadata is unavailable"))?;
+    if !private_file(&before) || before.len() != bytes.len() as u64 {
         return Err(custody_error(
-            "attempt receipt readback changed after creation",
+            "created attempt receipt is not one exact private regular file",
+        ));
+    }
+    use std::io::{Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| custody_error("attempt receipt could not be rewound for readback"))?;
+    let mut readback = Vec::with_capacity(bytes.len());
+    Read::by_ref(&mut file)
+        .take(bytes.len() as u64 + 1)
+        .read_to_end(&mut readback)
+        .map_err(|_| custody_error("attempt receipt could not be read back completely"))?;
+    let after = file
+        .metadata()
+        .map_err(|_| custody_error("attempt receipt metadata is unavailable after readback"))?;
+    if readback != bytes
+        || !private_file(&after)
+        || metadata_identity(&after) != metadata_identity(&before)
+        || after.len() != before.len()
+    {
+        return Err(custody_error(
+            "attempt receipt changed during same-descriptor readback",
         ));
     }
     directory_handle
@@ -464,15 +518,21 @@ fn write_new_receipt(
     Ok(())
 }
 
-fn read_receipt(directory: &Path, name: &str) -> Result<AttemptReceipt, WorkerVersionAttemptError> {
-    let path = directory.join(name);
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
-    let mut file = options
-        .open(path)
-        .map_err(|_| custody_error("attempt receipt is absent or cannot be opened safely"))?;
+fn read_receipt(directory: &File, name: &str) -> Result<AttemptReceipt, WorkerVersionAttemptError> {
+    let name = c_name(name)?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(custody_error(
+            "attempt receipt is absent or cannot be opened safely",
+        ));
+    }
+    let mut file = unsafe { File::from_raw_fd(fd) };
     let before = file
         .metadata()
         .map_err(|_| custody_error("attempt receipt metadata is unavailable"))?;
@@ -513,7 +573,7 @@ fn read_receipt(directory: &Path, name: &str) -> Result<AttemptReceipt, WorkerVe
     Ok(receipt)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileIdentity {
     device: u64,
     inode: u64,
@@ -571,18 +631,61 @@ fn open_private_directory(path: &Path) -> Result<File, WorkerVersionAttemptError
     Ok(directory)
 }
 
-fn open_or_create_private_file(root: &Path, name: &str) -> Result<File, WorkerVersionAttemptError> {
-    let path = root.join(name);
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    let file = options
-        .open(path)
-        .map_err(|_| custody_error("attempt-root guard could not be opened safely"))?;
+fn open_private_directory_at(parent: &File, name: &str) -> Result<File, WorkerVersionAttemptError> {
+    open_private_directory_at_optional(parent, name)?.ok_or_else(|| {
+        custody_error("attempt custody directory is absent or could not be opened safely")
+    })
+}
+
+fn open_private_directory_at_optional(
+    parent: &File,
+    name: &str,
+) -> Result<Option<File>, WorkerVersionAttemptError> {
+    let name = c_name(name)?;
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(custody_error(
+            "attempt namespace presence could not be established safely",
+        ));
+    }
+    let directory = unsafe { File::from_raw_fd(fd) };
+    let metadata = directory
+        .metadata()
+        .map_err(|_| custody_error("attempt custody directory metadata is unavailable"))?;
+    if !private_directory(&metadata) {
+        return Err(custody_error(
+            "attempt custody directory is not private and operator-owned",
+        ));
+    }
+    Ok(Some(directory))
+}
+
+fn open_or_create_private_file(root: &File, name: &str) -> Result<File, WorkerVersionAttemptError> {
+    let name = c_name(name)?;
+    let fd = unsafe {
+        libc::openat(
+            root.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(custody_error(
+            "attempt-root guard could not be opened safely",
+        ));
+    }
+    let file = unsafe { File::from_raw_fd(fd) };
     let metadata = file
         .metadata()
         .map_err(|_| custody_error("attempt-root guard metadata is unavailable"))?;
@@ -592,6 +695,57 @@ fn open_or_create_private_file(root: &Path, name: &str) -> Result<File, WorkerVe
         ));
     }
     Ok(file)
+}
+
+fn validate_root_identity(
+    root: &Path,
+    handle: &File,
+    expected: FileIdentity,
+) -> Result<(), WorkerVersionAttemptError> {
+    let descriptor = handle
+        .metadata()
+        .map_err(|_| custody_error("attempt-root descriptor metadata is unavailable"))?;
+    let path = fs::symlink_metadata(root)
+        .map_err(|_| custody_error("attempt-root pathname is unavailable"))?;
+    if !private_directory(&descriptor)
+        || !private_directory(&path)
+        || metadata_identity(&descriptor) != expected
+        || metadata_identity(&path) != expected
+    {
+        return Err(custody_error(
+            "attempt-root identity drifted during the operation",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_child_identity(
+    root: &File,
+    name: &str,
+    held: &File,
+    expected: FileIdentity,
+) -> Result<(), WorkerVersionAttemptError> {
+    let reachable = open_private_directory_at(root, name)?;
+    let reachable_metadata = reachable
+        .metadata()
+        .map_err(|_| custody_error("attempt namespace metadata is unavailable"))?;
+    let held_metadata = held
+        .metadata()
+        .map_err(|_| custody_error("held attempt namespace metadata is unavailable"))?;
+    if !private_directory(&reachable_metadata)
+        || !private_directory(&held_metadata)
+        || metadata_identity(&reachable_metadata) != expected
+        || metadata_identity(&held_metadata) != expected
+    {
+        return Err(custody_error(
+            "attempt namespace is no longer reachable from its configured root",
+        ));
+    }
+    Ok(())
+}
+
+fn c_name(name: &str) -> Result<CString, WorkerVersionAttemptError> {
+    CString::new(name).map_err(|_| custody_error("attempt namespace name contains an invalid byte"))
 }
 
 fn try_lock_exclusive(file: &File) -> Result<(), WorkerVersionAttemptError> {
@@ -681,7 +835,7 @@ mod tests {
         WorkerVersionAttemptInput {
             account_id: "account",
             script_name: "script",
-            confirmation_token: "confirmation",
+            approval_handle: "wvpa-approval",
             upload_contract_sha256: "1",
             base_version_id: "base",
             base_version_etag: "2",
@@ -743,7 +897,8 @@ mod tests {
         assert_eq!(replay.evidence.expect("evidence").state, "prepared");
 
         let prepared_path = attempt_dir.join(PREPARED_NAME);
-        let mut receipt = read_receipt(&attempt_dir, PREPARED_NAME).expect("read prepared");
+        let directory = open_private_directory(&attempt_dir).expect("open attempt directory");
+        let mut receipt = read_receipt(&directory, PREPARED_NAME).expect("read prepared");
         receipt.authority_sha256 = "f".repeat(64);
         fs::write(
             &prepared_path,
@@ -857,5 +1012,45 @@ mod tests {
         );
         assert!(result.evidence.is_none());
         fs::remove_dir_all(root).expect("remove dangling-symlink test root");
+    }
+
+    #[test]
+    fn configured_root_path_replacement_is_rejected_against_held_descriptor() {
+        let root = root("root-drift");
+        let held = open_private_root(&root).expect("open original root");
+        let identity = metadata_identity(&held.metadata().expect("root metadata"));
+        let displaced = root.with_extension("displaced");
+        fs::rename(&root, &displaced).expect("displace original root");
+        fs::create_dir(&root).expect("create replacement root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .expect("make replacement private");
+
+        let result = validate_root_identity(&root, &held, identity)
+            .expect_err("replacement root must fail closed");
+        assert_eq!(
+            result.code,
+            "workers.version_upload_attempt_custody_malformed"
+        );
+        fs::remove_dir_all(root).expect("remove replacement root");
+        fs::remove_dir_all(displaced).expect("remove displaced root");
+    }
+
+    #[test]
+    fn prepared_attempt_rejects_root_replacement_before_dispatch() {
+        let root = root("prepared-root-drift");
+        let mut attempt =
+            prepare_worker_version_dispatch_attempt_at(&root, &input()).expect("prepare attempt");
+        let displaced = root.with_extension("displaced");
+        fs::rename(&root, &displaced).expect("displace attempt root");
+        fs::create_dir(&root).expect("create replacement root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .expect("make replacement private");
+
+        assert_eq!(
+            attempt.consume_for_dispatch().unwrap_err().code,
+            "workers.version_upload_attempt_custody_malformed"
+        );
+        fs::remove_dir_all(root).expect("remove replacement root");
+        fs::remove_dir_all(displaced).expect("remove displaced root");
     }
 }

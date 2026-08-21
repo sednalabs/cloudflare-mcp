@@ -114,6 +114,10 @@ use crate::verification::{
 use crate::worker_upload::{
     WorkerUploadBody, WorkerUploadError, WorkerUploadInput, build_worker_upload,
 };
+use crate::worker_version_approval::{
+    WorkerVersionApprovalCandidate, WorkerVersionApprovalError, load_worker_version_approval,
+    prepare_worker_version_approval,
+};
 use crate::worker_version_attempt::{
     WorkerVersionAttemptError, WorkerVersionAttemptInput,
     preflight_worker_version_dispatch_attempt, prepare_worker_version_dispatch_attempt,
@@ -1015,7 +1019,9 @@ pub struct WorkersUploadVersionArgs {
     #[serde(default)]
     pub dry_run: bool,
     #[serde(default)]
-    pub confirmation_token: Option<String>,
+    pub prepare: bool,
+    #[serde(default)]
+    pub approval_handle: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -1027,7 +1033,6 @@ pub struct WorkersReconcileVersionUploadArgs {
     pub script_name: String,
     pub base_version_id: String,
     pub base_version_etag: String,
-    pub upload_contract_sha256: String,
     pub pre_upload_version_ids: Vec<String>,
     pub pre_upload_version_ids_sha256: String,
     pub pre_upload_deployments: Value,
@@ -8363,7 +8368,7 @@ impl CloudflareMcp {
 
     #[tool(
         name = "workers_upload_version",
-        description = "Upload one disabled Worker version with strict exact-base binding inheritance, dry-run confirmation, pinned pre-state, non-retrying provider submission, exact candidate readback, and unchanged-deployment proof."
+        description = "Preview, privately prepare under a random opaque approval handle, or apply once to upload one disabled Worker version with exact-candidate custody, pinned pre-state, non-retrying provider submission, exact candidate readback, and unchanged-deployment proof."
     )]
     async fn cloudflare_workers_upload_version(
         &self,
@@ -8372,46 +8377,84 @@ impl CloudflareMcp {
     ) -> Result<CallToolResult, crate::McpError> {
         let account_id = resolve_account_id(self, args.account_id.as_deref())?;
         let script_name = args.script_name.trim();
+        let phase = if args.dry_run && !args.prepare && args.approval_handle.is_none() {
+            "preview"
+        } else if !args.dry_run && args.prepare && args.approval_handle.is_none() {
+            "prepare"
+        } else if !args.dry_run && !args.prepare && args.approval_handle.is_some() {
+            "apply"
+        } else {
+            "invalid"
+        };
+        let plan =
+            plan_upload_worker_version(account_id, script_name, &args.base_version_id, phase);
+        let mut audit = MutationAuditSession::start(
+            Some(&parts),
+            "workers_upload_version",
+            json!({
+                "account_id": account_id,
+                "script_name": script_name,
+                "base_version_id": args.base_version_id,
+                "phase": phase,
+                "candidate_evidence": "private_only",
+                "reason": args.reason.as_deref().map(str::trim),
+            }),
+            args.dry_run,
+        );
+        audit.redact_public_approval_digest();
         if script_name.is_empty() || script_name != args.script_name {
-            return Ok(worker_version_operation_error_result(
-                "workers_upload_version",
-                WorkerVersionOperationError {
-                    code: "workers.version_target_invalid",
-                    message: "script_name must be a canonical non-empty string".to_string(),
-                    hint: "Use the exact script identity from authenticated inventory.",
-                    retryable: false,
-                    outcome_ambiguous: false,
-                    provider_request_lifecycle:
-                        crate::cloudflare::worker_versions::WorkerRequestLifecycle {
-                            request_prepared: false,
-                            dispatch_attempted: false,
-                            provider_response_received: false,
-                        },
-                    request_artifact_sha256: None,
-                    response_artifact_sha256: None,
-                    response_body_sha256: None,
-                    response_body_size_bytes: None,
-                    http_status: None,
-                },
+            return Ok(finalize_mutation_result(
+                worker_version_simple_error_result(
+                    "workers_upload_version",
+                    "workers.version_target_invalid",
+                    "script_name must be a canonical non-empty string",
+                    "Use the exact script identity from authenticated inventory.",
+                ),
+                &plan,
+                audit,
+                args.dry_run,
             ));
         }
         if !(1..=100).contains(&args.per_page) {
-            return Ok(worker_version_simple_error_result(
-                "workers_upload_version",
-                "workers.version_upload_per_page_invalid",
-                "per_page must be between 1 and 100",
-                "Use the same bounded page size for pre-state capture and upload readback.",
+            return Ok(finalize_mutation_result(
+                worker_version_simple_error_result(
+                    "workers_upload_version",
+                    "workers.version_upload_per_page_invalid",
+                    "per_page must be between 1 and 100",
+                    "Use the same bounded page size for pre-state capture and upload readback.",
+                ),
+                &plan,
+                audit,
+                args.dry_run,
+            ));
+        }
+        if phase == "invalid" {
+            return Ok(finalize_mutation_result(
+                worker_version_simple_error_result(
+                    "workers_upload_version",
+                    "workers.version_upload_phase_invalid",
+                    "choose exactly one preview, prepare, or apply phase",
+                    "Use dry_run=true for a side-effect-free preview, prepare=true to create private approval custody, or supply approval_handle for apply.",
+                ),
+                &plan,
+                audit,
+                args.dry_run,
             ));
         }
         if !is_lower_hex_sha256(&args.base_version_etag)
             || !is_lower_hex_sha256(&args.pre_upload_version_snapshot_sha256)
             || !is_lower_hex_sha256(&args.pre_upload_deployment_snapshot_sha256)
         {
-            return Ok(worker_version_simple_error_result(
-                "workers_upload_version",
-                "workers.version_upload_evidence_digest_invalid",
-                "base ETag and pre-upload snapshot pins must be 64-character lowercase hexadecimal values",
-                "Use the exact evidence returned by workers_capture_version_evidence.",
+            return Ok(finalize_mutation_result(
+                worker_version_simple_error_result(
+                    "workers_upload_version",
+                    "workers.version_upload_evidence_digest_invalid",
+                    "base ETag and pre-upload snapshot pins must be 64-character lowercase hexadecimal values",
+                    "Use the exact evidence returned by workers_capture_version_evidence.",
+                ),
+                &plan,
+                audit,
+                args.dry_run,
             ));
         }
         let typed_metadata = serde_json::to_value(&args.metadata)
@@ -8429,7 +8472,14 @@ impl CloudflareMcp {
             &args.base_version_id,
         ) {
             Ok(artifact) => artifact,
-            Err(error) => return Ok(worker_upload_error_result(error)),
+            Err(error) => {
+                return Ok(finalize_mutation_result(
+                    worker_version_upload_artifact_error_result(error),
+                    &plan,
+                    audit,
+                    args.dry_run,
+                ));
+            }
         };
         let canonical_binding_metadata = artifact.canonical_metadata.clone();
         let expected_compatibility_date = artifact
@@ -8450,109 +8500,95 @@ impl CloudflareMcp {
                     .to_string()
             })
             .collect::<Vec<_>>();
-        let upload_summary = json!(&artifact.summary);
         let upload_contract_sha256 = artifact.summary.upload_contract_sha256.clone();
-        let dry_run_request_evidence = json!({
-            "status": "digest_only",
-            "exact_request_bytes_retained": false,
-            "canonical_request_manifest_retained": false,
-            "attempt_authority_commits_upload_contract_digest": false,
-            "submitted_body_sha256": artifact.summary.body_sha256,
-            "submitted_body_size_bytes": artifact.summary.size_bytes,
-            "submitted_metadata_sha256": artifact.summary.metadata_sha256,
-            "upload_contract_sha256": artifact.summary.upload_contract_sha256,
-            "reason": "The canonical request is constructed in memory. Dry-run returns exact digests and size but does not retain request bytes or a reconstructable request manifest."
-        });
-        let operation = find_operation("worker-versions-upload-version").ok_or_else(|| {
-            crate::McpError::internal_error(
-                "missing Worker version upload operation catalog entry",
-                None,
-            )
-        })?;
-        let mut path_params = BTreeMap::new();
-        path_params.insert("account_id".to_string(), account_id.to_string());
-        path_params.insert("script_name".to_string(), script_name.to_string());
-        let rendered_path = render_path(
-            operation,
-            &path_params,
-            Some(account_id),
-            self.default_zone_id.as_deref(),
-        )
-        .map_err(|error| crate::McpError::invalid_params(format!("{error:?}"), None))?;
-        let confirmation_body = Some(json!({
-            "script_name": script_name,
-            "base_version_id": args.base_version_id,
-            "base_version_etag": args.base_version_etag,
-            "bindings_inherit": "strict",
-            "upload": upload_summary,
-            "pre_upload_version_snapshot_sha256": args.pre_upload_version_snapshot_sha256,
-            "pre_upload_deployment_snapshot_sha256": args.pre_upload_deployment_snapshot_sha256,
-            "per_page": args.per_page,
-        }));
-        let required_confirmation_token =
-            mutation_confirmation_token(operation, &rendered_path, &confirmation_body);
-        let plan = plan_upload_worker_version(
-            account_id,
-            script_name,
-            &args.base_version_id,
-            upload_summary.clone(),
-            &args.pre_upload_version_snapshot_sha256,
-            &args.pre_upload_deployment_snapshot_sha256,
-        );
-        let audit = MutationAuditSession::start(
-            Some(&parts),
-            "workers_upload_version",
-            json!({
-                "account_id": account_id,
-                "script_name": script_name,
-                "base_version_id": args.base_version_id,
-                "upload_contract_sha256": upload_contract_sha256,
-                "reason": args.reason.as_deref().map(str::trim),
-            }),
-            args.dry_run,
-        );
         if args.dry_run {
             return Ok(finalize_mutation_result(
                 CallToolResult::structured(json!({
                     "ok": true,
                     "planned": true,
+                    "status": "preview_validated",
                     "operation": "workers_upload_version",
-                    "account_id": account_id,
-                    "script_name": script_name,
-                    "request_path": rendered_path,
-                    "request_query": {"bindings_inherit":"strict"},
-                    "base_version_id": args.base_version_id,
-                    "base_version_etag": args.base_version_etag,
-                    "upload": upload_summary,
-                    "request_evidence": dry_run_request_evidence,
-                    "pre_upload_version_snapshot_sha256": args.pre_upload_version_snapshot_sha256,
-                    "pre_upload_deployment_snapshot_sha256": args.pre_upload_deployment_snapshot_sha256,
-                    "required_confirmation_token": required_confirmation_token,
+                    "preparation_required": true,
+                    "local_mutation_performed": false,
+                    "provider_calls": 0,
                     "deployment_created": false,
-                    "dry_run_note": "No provider request was dispatched and no Worker version or deployment was created.",
+                    "dry_run_note": "The complete candidate validated in memory. No approval custody or provider request was created.",
                 })),
                 &plan,
                 audit,
                 true,
             ));
         }
-        if args.confirmation_token.as_deref() != Some(required_confirmation_token.as_str()) {
+        let approval_candidate = WorkerVersionApprovalCandidate {
+            account_id,
+            script_name,
+            base_version_id: &args.base_version_id,
+            base_version_etag: &args.base_version_etag,
+            pre_upload_version_snapshot_sha256: &args.pre_upload_version_snapshot_sha256,
+            pre_upload_deployment_snapshot_sha256: &args.pre_upload_deployment_snapshot_sha256,
+            per_page: args.per_page,
+            content_type: &artifact.content_type,
+            canonical_metadata: &artifact.canonical_metadata,
+            body: &artifact.body,
+        };
+        if args.prepare {
+            let evidence = match prepare_worker_version_approval(&approval_candidate) {
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    return Ok(finalize_mutation_result(
+                        worker_version_approval_error_result(error),
+                        &plan,
+                        audit,
+                        false,
+                    ));
+                }
+            };
             return Ok(finalize_mutation_result(
-                worker_version_simple_error_result(
-                    "workers_upload_version",
-                    "workers.version_upload_confirmation_required",
-                    "Worker version upload requires the exact confirmation token returned by dry-run",
-                    "Repeat the same reviewed inputs and echo required_confirmation_token.",
-                ),
+                CallToolResult::structured(json!({
+                    "ok": true,
+                    "status": "approval_prepared",
+                    "approval": evidence,
+                    "local_mutation_performed": true,
+                    "provider_calls": 0,
+                    "deployment_created": false,
+                    "next_action": "Review this preparation result, then apply the complete byte-identical candidate with approval_handle before expiry.",
+                })),
                 &plan,
                 audit,
                 false,
             ));
         }
+        let approval_handle = args
+            .approval_handle
+            .as_deref()
+            .expect("apply phase has a handle");
+        let mut approval = match load_worker_version_approval(approval_handle, &approval_candidate)
+        {
+            Ok(approval) => approval,
+            Err(error) => {
+                return Ok(finalize_mutation_result(
+                    worker_version_approval_error_result(error),
+                    &plan,
+                    audit,
+                    false,
+                ));
+            }
+        };
+        let consumed_approval = match approval.consume() {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return Ok(finalize_mutation_result(
+                    worker_version_approval_error_result(error),
+                    &plan,
+                    audit,
+                    false,
+                ));
+            }
+        };
         let attempt_input = WorkerVersionAttemptInput {
             account_id,
             script_name,
-            confirmation_token: &required_confirmation_token,
+            approval_handle,
             upload_contract_sha256: &upload_contract_sha256,
             base_version_id: &args.base_version_id,
             base_version_etag: &args.base_version_etag,
@@ -8561,7 +8597,10 @@ impl CloudflareMcp {
         };
         if let Err(error) = preflight_worker_version_dispatch_attempt(&attempt_input) {
             return Ok(finalize_mutation_result(
-                worker_version_attempt_error_result(error),
+                worker_version_with_approval(
+                    worker_version_attempt_error_result(error),
+                    &consumed_approval,
+                ),
                 &plan,
                 audit,
                 false,
@@ -8581,7 +8620,10 @@ impl CloudflareMcp {
             Ok(evidence) => evidence,
             Err(error) => {
                 return Ok(finalize_mutation_result(
-                    worker_version_operation_error_result("workers_upload_version", error),
+                    worker_version_with_approval(
+                        worker_version_upload_operation_error_result(error),
+                        &consumed_approval,
+                    ),
                     &plan,
                     audit,
                     false,
@@ -8606,7 +8648,8 @@ impl CloudflareMcp {
                         "message": "authenticated pre-upload state did not match the pinned review evidence",
                         "hint": "Capture, review, and approve a fresh version/deployment snapshot; no upload was dispatched.",
                     },
-                    "pre_upload_state": pre_state,
+                    "approval": consumed_approval,
+                    "local_mutation_performed": true,
                     "deployment_created": false,
                     "provider_request_lifecycle": {
                         "request_prepared": false,
@@ -8628,8 +8671,9 @@ impl CloudflareMcp {
                             CallToolResult::structured_error(json!({
                                 "ok": false,
                                 "operation": "workers_upload_version",
-                                "error": error,
-                                "pre_upload_state": pre_state,
+                                "error": worker_version_operation_error_public_value(&error),
+                                "approval": consumed_approval,
+                                "local_mutation_performed": true,
                                 "deployment_created": false,
                                 "provider_request_lifecycle": {
                                     "request_prepared": false,
@@ -8650,7 +8694,10 @@ impl CloudflareMcp {
             Ok(attempt) => attempt,
             Err(error) => {
                 return Ok(finalize_mutation_result(
-                    worker_version_attempt_error_result(error),
+                    worker_version_with_approval(
+                        worker_version_attempt_error_result(error),
+                        &consumed_approval,
+                    ),
                     &plan,
                     audit,
                     false,
@@ -8679,11 +8726,13 @@ impl CloudflareMcp {
                             "code": "workers.version_upload_dispatch_pre_state_unavailable",
                             "message": "pinned pre-upload state could not be revalidated while the durable attempt guard was held",
                             "hint": "Do not replay this prepared attempt. Preserve its custody and reconcile the pinned provider state.",
-                            "cause": error,
+                            "cause": worker_version_operation_error_public_value(&error),
                             "retryable": false,
                             "outcome_ambiguous": false,
                         },
                         "dispatch_attempt_authority": dispatch_attempt.evidence("prepared"),
+                        "approval": consumed_approval,
+                        "local_mutation_performed": true,
                         "provider_request_lifecycle": {
                             "request_prepared": true,
                             "dispatch_attempted": false,
@@ -8721,7 +8770,8 @@ impl CloudflareMcp {
                         "outcome_ambiguous": false,
                     },
                     "dispatch_attempt_authority": dispatch_attempt.evidence("prepared"),
-                    "dispatch_pre_upload_state": dispatch_pre_state,
+                    "approval": consumed_approval,
+                    "local_mutation_performed": true,
                     "provider_request_lifecycle": {
                         "request_prepared": true,
                         "dispatch_attempted": false,
@@ -8735,11 +8785,71 @@ impl CloudflareMcp {
                 false,
             ));
         }
+        let retired_approval = match approval.retire() {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                return Ok(finalize_mutation_result(
+                    CallToolResult::structured_error(json!({
+                        "ok": false,
+                        "operation": "workers_upload_version",
+                        "status": "approval_retirement_failed",
+                        "error": {
+                            "code": error.code,
+                            "message": error.message,
+                            "hint": error.hint,
+                            "retryable": false,
+                            "outcome_ambiguous": false,
+                        },
+                        "approval": consumed_approval,
+                        "dispatch_attempt_authority": dispatch_attempt.evidence("prepared"),
+                        "provider_calls": null,
+                        "provider_reads_performed": true,
+                        "provider_mutation_performed": false,
+                        "local_mutation_performed": true,
+                        "deployment_created": false,
+                        "retry_decision": "do_not_retry; preserve both approval and dispatch-attempt custody",
+                    })),
+                    &plan,
+                    audit,
+                    false,
+                ));
+            }
+        };
+        if let Err(error) = approval.validate_for_provider_dispatch() {
+            return Ok(finalize_mutation_result(
+                CallToolResult::structured_error(json!({
+                    "ok": false,
+                    "operation": "workers_upload_version",
+                    "status": "approval_custody_unreachable_before_dispatch",
+                    "error": {
+                        "code": error.code,
+                        "message": error.message,
+                        "hint": error.hint,
+                        "retryable": false,
+                        "outcome_ambiguous": false,
+                    },
+                    "approval": retired_approval,
+                    "dispatch_attempt_authority": dispatch_attempt.evidence("prepared"),
+                    "provider_calls": null,
+                    "provider_reads_performed": true,
+                    "provider_mutation_performed": false,
+                    "local_mutation_performed": true,
+                    "deployment_created": false,
+                    "retry_decision": "do_not_retry; preserve detached custody for reconciliation",
+                })),
+                &plan,
+                audit,
+                false,
+            ));
+        }
         let dispatched_attempt = match dispatch_attempt.consume_for_dispatch() {
             Ok(evidence) => evidence,
             Err(error) => {
                 return Ok(finalize_mutation_result(
-                    worker_version_attempt_error_result(error),
+                    worker_version_with_approval(
+                        worker_version_attempt_error_result(error),
+                        &retired_approval,
+                    ),
                     &plan,
                     audit,
                     false,
@@ -8767,10 +8877,13 @@ impl CloudflareMcp {
                     Ok(evidence) => evidence,
                     Err(custody_error) => {
                         return Ok(finalize_mutation_result(
-                            worker_version_attempt_terminal_error_result(
-                                custody_error,
-                                &dispatched_attempt,
-                                provider_request_lifecycle.provider_response_received,
+                            worker_version_with_approval(
+                                worker_version_attempt_terminal_error_result(
+                                    custody_error,
+                                    &dispatched_attempt,
+                                    provider_request_lifecycle.provider_response_received,
+                                ),
+                                &retired_approval,
                             ),
                             &plan,
                             audit,
@@ -8782,9 +8895,9 @@ impl CloudflareMcp {
                     CallToolResult::structured_error(json!({
                         "ok": false,
                         "operation": "workers_upload_version",
-                        "error": error,
-                        "upload": upload_summary,
-                        "pre_upload_state": pre_state,
+                        "error": worker_version_operation_error_public_value(&error),
+                        "approval": retired_approval,
+                        "local_mutation_performed": true,
                         "dispatch_attempt_authority": terminal_attempt,
                         "provider_request_lifecycle": provider_request_lifecycle,
                         "deployment_created": false,
@@ -8803,7 +8916,14 @@ impl CloudflareMcp {
             Ok(evidence) => evidence,
             Err(error) => {
                 return Ok(finalize_mutation_result(
-                    worker_version_attempt_terminal_error_result(error, &dispatched_attempt, true),
+                    worker_version_with_approval(
+                        worker_version_attempt_terminal_error_result(
+                            error,
+                            &dispatched_attempt,
+                            true,
+                        ),
+                        &retired_approval,
+                    ),
                     &plan,
                     audit,
                     false,
@@ -8831,10 +8951,11 @@ impl CloudflareMcp {
                             "code": "workers.version_upload_post_readback_failed",
                             "message": "Worker version upload returned a candidate but exact post-upload proof failed",
                             "hint": "Do not upload again. Reconcile the returned candidate and unchanged deployment state.",
-                            "cause": error,
+                            "cause": worker_version_operation_error_public_value(&error),
                         },
-                        "upload_result": upload,
-                        "pre_upload_state": pre_state,
+                        "candidate_version_id": upload.candidate_version_id,
+                        "approval": retired_approval,
+                        "local_mutation_performed": true,
                         "dispatch_attempt_authority": terminal_attempt,
                         "provider_request_lifecycle": {
                             "request_prepared": true,
@@ -8912,12 +9033,12 @@ impl CloudflareMcp {
                         "message": "post-upload version or deployment evidence did not prove one disabled exact candidate",
                         "hint": "Do not upload again or deploy. Reconcile the exact provider state and evidence pins.",
                     },
-                    "upload_result": upload,
-                    "pre_upload_state": pre_state,
-                    "post_upload_state": post_state,
+                    "candidate_version_id": upload.candidate_version_id,
+                    "approval": retired_approval,
+                    "local_mutation_performed": true,
                     "dispatch_attempt_authority": terminal_attempt,
-                    "binding_verification": binding_verification,
-                    "runtime_verification": runtime_verification,
+                    "binding_verification_matched": bindings_match,
+                    "runtime_verification_matched": runtime_matches,
                     "provider_request_lifecycle": {
                         "request_prepared": true,
                         "dispatch_attempted": true,
@@ -8934,28 +9055,16 @@ impl CloudflareMcp {
         Ok(finalize_mutation_result(
             CallToolResult::structured(json!({
                 "ok": true,
-                "status": "candidate_created_digest_only",
+                "status": "candidate_created_private_exact_candidate",
                 "request_evidence": {
-                    "status": "digest_only",
-                    "exact_request_bytes_retained": false,
-                    "canonical_request_manifest_retained": false,
-                    "attempt_authority_commits_upload_contract_digest": true,
-                    "submitted_body_sha256": artifact.summary.body_sha256,
-                    "submitted_body_size_bytes": artifact.summary.size_bytes,
-                    "submitted_metadata_sha256": artifact.summary.metadata_sha256,
-                    "upload_contract_sha256": artifact.summary.upload_contract_sha256,
-                    "authenticated_request_artifact_sha256": upload.provider_proof.request_artifact_sha256,
-                    "reason": "The durable attempt receipt commits to the upload-contract digest, and the result returns exact body and authenticated-request digests. The canonical request bytes and a reconstructable request manifest are not retained."
+                    "status": "private_exact_candidate_consumed",
+                    "public_digest_disclosed": false,
+                    "public_size_disclosed": false,
+                    "reason": "Exact candidate bytes and metadata remain in private one-use approval custody."
                 },
                 "source_proof": {
                     "status": "source_provider_unverified",
-                    "submitted_body_sha256": artifact.summary.body_sha256,
-                    "submitted_body_size_bytes": artifact.summary.size_bytes,
-                    "submitted_metadata_sha256": artifact.summary.metadata_sha256,
-                    "upload_contract_sha256": artifact.summary.upload_contract_sha256,
-                    "provider_exports_reconciliation_sha256": upload.exports_reconciliation_sha256.clone(),
-                    "provider_startup_time_ms": upload.startup_time_ms,
-                    "reason": "Cloudflare Version Detail exposes an ETag and runtime/resource projections, not the submitted module graph or source bytes. Only request digests are retained; neither exact request bytes nor source-byte identity is claimed as provider-proven."
+                    "reason": "Provider version detail does not prove source bytes; private custody proves only the submitted candidate."
                 },
                 "provider_proof_scope": {
                     "candidate_id": true,
@@ -8969,15 +9078,13 @@ impl CloudflareMcp {
                     "source_bytes": false
                 },
                 "operation": "workers_upload_version",
-                "account_id": account_id,
-                "script_name": script_name,
-                "upload": upload_summary,
-                "upload_result": upload,
-                "pre_upload_state": pre_state,
-                "post_upload_state": post_state,
+                "candidate_version_id": upload.candidate_version_id,
+                "candidate_verified": true,
+                "approval": retired_approval,
+                "local_mutation_performed": true,
                 "dispatch_attempt_authority": terminal_attempt,
-                "binding_verification": binding_verification,
-                "runtime_verification": runtime_verification,
+                "binding_verification_matched": true,
+                "runtime_verification_matched": true,
                 "bindings_inherit": "strict",
                 "provider_request_lifecycle": {
                     "request_prepared": true,
@@ -9003,7 +9110,6 @@ impl CloudflareMcp {
     ) -> Result<CallToolResult, crate::McpError> {
         let account_id = resolve_account_id(self, args.account_id.as_deref())?;
         if !is_lower_hex_sha256(&args.base_version_etag)
-            || !is_lower_hex_sha256(&args.upload_contract_sha256)
             || !is_lower_hex_sha256(&args.pre_upload_version_ids_sha256)
             || !is_lower_hex_sha256(&args.pre_upload_deployment_snapshot_sha256)
         {
@@ -9116,7 +9222,6 @@ impl CloudflareMcp {
                     "hint": "Do not retry the upload; preserve the ambiguous evidence for operator reconciliation.",
                 },
                 "current_state": current,
-                "upload_contract_sha256": args.upload_contract_sha256,
                 "mutation_performed": false,
                 "deployment_created": false,
                 "retry_decision": "do_not_retry",
@@ -9159,7 +9264,6 @@ impl CloudflareMcp {
             "account_id": account_id,
             "script_name": args.script_name,
             "base_version_id": args.base_version_id,
-            "upload_contract_sha256": args.upload_contract_sha256,
             "candidate_version_id": candidate_id,
             "candidate_detail": candidate.detail,
             "current_state": candidate,
@@ -12945,6 +13049,35 @@ fn worker_upload_error_result(err: WorkerUploadError) -> CallToolResult {
     }))
 }
 
+fn worker_version_upload_artifact_error_result(err: WorkerUploadError) -> CallToolResult {
+    if err.code == "workers.upload_too_large" {
+        return CallToolResult::structured_error(json!({
+            "ok": false,
+            "operation": "workers_upload_version",
+            "error": {
+                "code": err.code,
+                "message": "Worker version candidate exceeds the private upload bound",
+                "hint": "Reduce the private candidate beneath the documented Worker upload limit without disclosing its exact size.",
+            },
+            "local_mutation_performed": false,
+            "provider_calls": 0,
+            "deployment_created": false,
+        }));
+    }
+    let mut result = worker_upload_error_result(err);
+    if let Some(payload) = result
+        .structured_content
+        .as_mut()
+        .and_then(Value::as_object_mut)
+    {
+        payload.insert("operation".to_string(), json!("workers_upload_version"));
+        payload.insert("local_mutation_performed".to_string(), json!(false));
+        payload.insert("provider_calls".to_string(), json!(0));
+        payload.insert("deployment_created".to_string(), json!(false));
+    }
+    result
+}
+
 fn worker_version_operation_error_result(
     operation: &'static str,
     error: WorkerVersionOperationError,
@@ -12955,6 +13088,63 @@ fn worker_version_operation_error_result(
         "error": error,
         "deployment_created": false,
     }))
+}
+
+fn worker_version_operation_error_public_value(error: &WorkerVersionOperationError) -> Value {
+    json!({
+        "code": error.code,
+        "message": error.message,
+        "hint": error.hint,
+        "retryable": error.retryable,
+        "outcome_ambiguous": error.outcome_ambiguous,
+        "provider_request_lifecycle": error.provider_request_lifecycle,
+        "http_status": error.http_status,
+    })
+}
+
+fn worker_version_upload_operation_error_result(
+    error: WorkerVersionOperationError,
+) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": "workers_upload_version",
+        "error": worker_version_operation_error_public_value(&error),
+        "deployment_created": false,
+    }))
+}
+
+fn worker_version_approval_error_result(error: WorkerVersionApprovalError) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": "workers_upload_version",
+        "status": "approval_not_authorized",
+        "error": {
+            "code": error.code,
+            "message": error.message,
+            "hint": error.hint,
+            "retryable": false,
+            "outcome_ambiguous": error.state == Some("locked"),
+        },
+        "approval_state": error.state,
+        "local_mutation_performed": error.local_mutation_performed,
+        "provider_calls": 0,
+        "deployment_created": false,
+    }))
+}
+
+fn worker_version_with_approval(
+    mut result: CallToolResult,
+    approval: &crate::worker_version_approval::WorkerVersionApprovalEvidence,
+) -> CallToolResult {
+    if let Some(payload) = result
+        .structured_content
+        .as_mut()
+        .and_then(Value::as_object_mut)
+    {
+        payload.insert("approval".to_string(), json!(approval));
+        payload.insert("local_mutation_performed".to_string(), json!(true));
+    }
+    result
 }
 
 fn worker_version_attempt_error_result(error: WorkerVersionAttemptError) -> CallToolResult {
@@ -13029,6 +13219,8 @@ fn worker_version_simple_error_result(
             "retryable": false,
             "outcome_ambiguous": false,
         },
+        "local_mutation_performed": false,
+        "provider_calls": 0,
         "deployment_created": false,
     }))
 }

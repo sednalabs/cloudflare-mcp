@@ -89,6 +89,9 @@ Behavior:
 - Approval prompts include a stable request digest and bounded argument preview.
 - Approval responses must echo the request digest to prevent approving a
   different request by accident.
+- `workers_upload_version` is deliberately excluded from this generic path:
+  its complete arguments may contain low-entropy private binding values, so it
+  uses only its create-only private random-handle prepare/apply lifecycle.
 
 This pattern is intended to become a reusable MCP Toolkit safety primitive.
 Cloudflare-specific dangerous-tool defaults remain local to this server.
