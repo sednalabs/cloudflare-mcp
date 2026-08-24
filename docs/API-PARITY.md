@@ -82,6 +82,13 @@ encode workflow-specific policy, dry-run shape, and readback validation.
   `body_normalized_from_json_string`.
 - invalid JSON strings remain strings. Do not apply those to endpoints that
   require object request bodies; rerun dry-run with a valid object body first.
+- `worker-script-patch-settings` keeps the normalized logical JSON body in the
+  confirmation digest, but its apply request encodes that object as Cloudflare's
+  required `multipart/form-data` field named `settings`. The dry-run request
+  plan reports `body_encoding=multipart_form_data` and
+  `multipart_json_field=settings`; the generated boundary is transport-only and
+  is never part of the confirmation contract. Prefer the curated
+  `patch_worker_settings` tool when authoritative settings readback is required.
 
 Denied-by-default categories include account deletion, billing/payment,
 registrar purchase/delete/transfer, API token/key management, membership/role

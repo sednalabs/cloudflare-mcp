@@ -8,6 +8,7 @@ mod pages;
 mod queues;
 mod workers_observability;
 
+pub(crate) use client::ApiRequestBody;
 pub use client::{
     AdapterError, AdapterErrorPayload, CloudflareClient, with_request_api_token_override,
 };

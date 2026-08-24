@@ -1073,6 +1073,14 @@ tools/call name=api_mutate arguments='{"operation_id":"<mutating-operation-id>",
 `api_mutate` apply calls require the dry-run confirmation token. Denied
 high-risk categories fail closed.
 
+For the catalog operation `worker-script-patch-settings`, review that dry-run
+reports `request_plan.body_encoding=multipart_form_data` and
+`request_plan.multipart_json_field=settings`. Apply remains bound to the same
+normalized logical JSON body and sends it as Cloudflare's required multipart
+`settings` part; the generated form boundary is transport-only. Prefer the
+curated `patch_worker_settings` workflow when the operation must finish with
+authoritative settings readback rather than provider-envelope evidence alone.
+
 ### Bot Management permission preflight and 403 recovery
 
 The zone Bot Management update operation requires the complete permission pair
