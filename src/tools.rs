@@ -35,8 +35,9 @@ use crate::cache::{
 };
 use crate::cloudflare::model::WorkerScript;
 use crate::cloudflare::{
-    AccessAppUpsertRequest, AccessPolicyWrite, BulkRedirectItemWrite, CacheRule, CacheRuleset,
-    DnsRecordUpsertRequest, PagesDeploymentTriggerRequest, with_request_api_token_override,
+    AccessAppUpsertRequest, AccessPolicyWrite, ApiRequestBody, BulkRedirectItemWrite, CacheRule,
+    CacheRuleset, DnsRecordUpsertRequest, PagesDeploymentTriggerRequest,
+    with_request_api_token_override,
 };
 use crate::d1_migration_bootstrap::{
     D1_BOOTSTRAP_LEASE_FAMILY, D1_BOOTSTRAP_OPERATION, D1BootstrapExecutionInput,
@@ -2852,6 +2853,10 @@ impl CloudflareMcp {
             }
         };
         let normalized_body = normalize_json_string_body(args.body.clone());
+        let multipart_json_field = normalized_body
+            .value
+            .as_ref()
+            .and_then(|_| generic_api_multipart_json_field(operation.operation_id.as_str()));
         let permission_preflight =
             mutation_permission_preflight(operation.operation_id.as_str(), &args.token_permissions);
         let required_token = mutation_confirmation_token(operation, &path, &normalized_body.value);
@@ -2908,6 +2913,12 @@ impl CloudflareMcp {
             "query": args.query.clone(),
             "body": normalized_body.value.clone(),
             "body_normalized_from_json_string": normalized_body.normalized,
+            "body_encoding": match multipart_json_field {
+                Some(_) => "multipart_form_data",
+                None if normalized_body.value.is_some() => "json",
+                None => "none",
+            },
+            "multipart_json_field": multipart_json_field,
             "headers": {
                 "authorization": "Bearer <redacted>",
                 "user-agent": "<configured>"
@@ -2977,15 +2988,15 @@ impl CloudflareMcp {
             }
             CallToolResult::structured_error(payload)
         } else {
+            let request_body = match (multipart_json_field, normalized_body.value.clone()) {
+                (Some(field_name), Some(value)) => {
+                    ApiRequestBody::MultipartJson { field_name, value }
+                }
+                (_, value) => ApiRequestBody::Json(value),
+            };
             match self
                 .cloudflare
-                .api_request(
-                    "cloudflare.api.mutate",
-                    method,
-                    &path,
-                    &query,
-                    normalized_body.value.clone(),
-                )
+                .api_request_with_body("cloudflare.api.mutate", method, &path, &query, request_body)
                 .await
             {
                 Ok(result) => CallToolResult::structured(json!({
@@ -13900,6 +13911,17 @@ fn classify_json_body(value: &serde_json::Value) -> &'static str {
     }
 }
 
+fn generic_api_multipart_json_field(operation_id: &str) -> Option<&'static str> {
+    match operation_id {
+        // Cloudflare's script-and-version settings endpoint accepts the logical
+        // JSON settings object as a multipart form field rather than as the
+        // request's top-level JSON body. Keep the confirmation digest bound to
+        // that logical object; this function selects only its wire encoding.
+        "worker-script-patch-settings" => Some("settings"),
+        _ => None,
+    }
+}
+
 struct NormalizedJsonBody {
     value: Option<Value>,
     normalized: bool,
@@ -14146,8 +14168,8 @@ mod tests {
         WafSecurityEventsSummaryArgs, WafTimeWindow, WorkersObservabilityListKeysArgs,
         WorkersObservabilityListValuesArgs, WorkersObservabilityQueryEventsArgs,
         WorkersObservabilityTimeframe, WorkersUploadScriptArgs, build_waf_security_events_query,
-        normalize_waf_group_by, normalize_waf_phases, query_mentions_waf,
-        waf_security_events_filter,
+        generic_api_multipart_json_field, normalize_waf_group_by, normalize_waf_phases,
+        query_mentions_waf, waf_security_events_filter,
     };
     use crate::cloudflare::CloudflareClient;
     use crate::cloudflare::model::WorkerScript;
@@ -19810,6 +19832,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn generic_api_multipart_encoding_is_narrowly_scoped_to_version_settings() {
+        assert_eq!(
+            generic_api_multipart_json_field("worker-script-patch-settings"),
+            Some("settings")
+        );
+        assert_eq!(
+            generic_api_multipart_json_field("worker-script-settings-patch-settings"),
+            None,
+            "the separate /script-settings operation requires application/json"
+        );
+        assert_eq!(generic_api_multipart_json_field("d1-create-database"), None);
+    }
+
     #[tokio::test]
     async fn api_mutate_normalizes_json_string_body_before_apply() {
         #[derive(Clone)]
@@ -19866,6 +19902,14 @@ mod tests {
         assert_eq!(
             dry_run_payload["request_plan"]["body"]["sql"],
             json!("UPDATE submissions SET status = ? WHERE id = ?")
+        );
+        assert_eq!(
+            dry_run_payload["request_plan"]["body_encoding"],
+            json!("json")
+        );
+        assert_eq!(
+            dry_run_payload["request_plan"]["multipart_json_field"],
+            Value::Null
         );
         let token = dry_run_payload["request_plan"]["required_confirmation_token"]
             .as_str()

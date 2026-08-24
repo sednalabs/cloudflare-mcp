@@ -489,6 +489,15 @@ enum D1EnvelopePolicy {
     RequireEmptyErrors,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum ApiRequestBody {
+    Json(Option<Value>),
+    MultipartJson {
+        field_name: &'static str,
+        value: Value,
+    },
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct CloudflareEnvelope<T> {
     pub(crate) success: bool,
@@ -3023,6 +3032,24 @@ impl CloudflareClient {
         query: &[(String, String)],
         payload: Option<Value>,
     ) -> Result<Value, AdapterError> {
+        self.api_request_with_body(
+            operation,
+            method,
+            path,
+            query,
+            ApiRequestBody::Json(payload),
+        )
+        .await
+    }
+
+    pub(crate) async fn api_request_with_body(
+        &self,
+        operation: &'static str,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(String, String)],
+        body: ApiRequestBody,
+    ) -> Result<Value, AdapterError> {
         let path = require_non_empty("path", path)?;
         let token = self.bearer_token()?;
         let url = self.endpoint(path);
@@ -3039,10 +3066,15 @@ impl CloudflareClient {
                     .query(query)
                     .bearer_auth(&token)
                     .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone());
-                if let Some(payload) = &payload {
-                    builder.json(payload)
-                } else {
-                    builder
+                match &body {
+                    ApiRequestBody::Json(Some(value)) => builder.json(value),
+                    ApiRequestBody::Json(None) => builder,
+                    ApiRequestBody::MultipartJson { field_name, value } => {
+                        let part = reqwest::multipart::Part::text(value.to_string())
+                            .mime_str("application/json")
+                            .expect("static JSON part mime type");
+                        builder.multipart(reqwest::multipart::Form::new().part(*field_name, part))
+                    }
                 }
             })
             .await?;

@@ -5182,6 +5182,79 @@ fn spawn_fake_worker_settings_api() -> (String, Arc<Mutex<Vec<Value>>>) {
     (format!("http://{addr}"), requests)
 }
 
+fn spawn_fake_generic_worker_settings_api() -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener =
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind generic Worker settings API");
+    let addr = listener
+        .local_addr()
+        .expect("generic Worker settings API addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        let mut stream = listener
+            .incoming()
+            .next()
+            .expect("generic Worker settings request")
+            .expect("generic Worker settings stream");
+        let (headers, body) = read_http_request(&mut stream);
+        let content_type = headers
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-type:")
+                    .map(str::trim)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        let body_text = String::from_utf8_lossy(&body).to_string();
+        requests_for_thread
+            .lock()
+            .expect("request log lock")
+            .push(json!({
+                "request_line": headers.lines().next().unwrap_or_default(),
+                "content_type": content_type,
+                "body_text": body_text,
+            }));
+
+        let multipart = content_type.starts_with("multipart/form-data;")
+            && body_text.contains("name=\"settings\"")
+            && body_text.contains(r#""compatibility_date":"2026-08-24""#);
+        let (status, response) = if multipart {
+            (
+                "200 OK",
+                json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": {"compatibility_date": "2026-08-24"},
+                }),
+            )
+        } else {
+            (
+                "415 Unsupported Media Type",
+                json!({
+                    "success": false,
+                    "errors": [{
+                        "code": 10001,
+                        "message": "Content-Type must be one of: multipart/form-data"
+                    }],
+                    "messages": [],
+                    "result": null,
+                }),
+            )
+        };
+        let response = serde_json::to_vec(&response).expect("serialize response");
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+            response.len()
+        )
+        .expect("write response headers");
+        stream.write_all(&response).expect("write response body");
+    });
+    (format!("http://{addr}"), requests)
+}
+
 fn spawn_fake_worker_upload_version_attestation_api() -> (String, Arc<Mutex<Vec<Value>>>) {
     spawn_fake_worker_upload_version_attestation_api_with_identity(false)
 }
@@ -18061,6 +18134,105 @@ fn patch_worker_settings_uses_object_schema_and_multipart_through_stdio_boundary
         requests[2]["content_type"]
             .as_str()
             .is_some_and(|value| value.starts_with("multipart/form-data;"))
+    );
+}
+
+#[test]
+fn api_mutate_worker_settings_uses_confirmation_bound_multipart_through_stdio() {
+    let (base_url, requests) = spawn_fake_generic_worker_settings_api();
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let body = json!({"compatibility_date": "2026-08-24"});
+
+    let dry_run = mcp.call_tool(
+        2,
+        "api_mutate",
+        json!({
+            "operation_id": "worker-script-patch-settings",
+            "path_params": {"account_id": "acct-1", "script_name": "worker-a"},
+            "body": body,
+            "dry_run": true,
+            "reason": "synthetic multipart regression"
+        }),
+    );
+    let dry_run_content = structured_content(&dry_run);
+    assert_eq!(dry_run_content["ok"], json!(true), "{dry_run_content}");
+    assert_eq!(
+        dry_run_content["request_plan"]["body_encoding"],
+        json!("multipart_form_data")
+    );
+    assert_eq!(
+        dry_run_content["request_plan"]["multipart_json_field"],
+        json!("settings")
+    );
+    let dry_run_rendered = dry_run_content.to_string();
+    assert!(!dry_run_rendered.contains("boundary="));
+    assert!(!dry_run_rendered.contains("Content-Disposition"));
+    assert_eq!(requests.lock().expect("request log lock").len(), 0);
+    let token = dry_run_content["request_plan"]["required_confirmation_token"]
+        .as_str()
+        .expect("confirmation token")
+        .to_string();
+
+    let changed_body = mcp.call_tool(
+        3,
+        "api_mutate",
+        json!({
+            "operation_id": "worker-script-patch-settings",
+            "path_params": {"account_id": "acct-1", "script_name": "worker-a"},
+            "body": {"compatibility_date": "2026-08-25"},
+            "dry_run": false,
+            "confirmation_token": token,
+            "reason": "synthetic confirmation mismatch"
+        }),
+    );
+    let changed_body_content = structured_content(&changed_body);
+    assert_eq!(changed_body_content["ok"], json!(false));
+    assert_eq!(
+        changed_body_content["error"]["code"],
+        json!("api_mutate.confirmation_required")
+    );
+    assert_eq!(requests.lock().expect("request log lock").len(), 0);
+    let token = dry_run_content["request_plan"]["required_confirmation_token"]
+        .as_str()
+        .expect("confirmation token")
+        .to_string();
+
+    let apply = mcp.call_tool(
+        4,
+        "api_mutate",
+        json!({
+            "operation_id": "worker-script-patch-settings",
+            "path_params": {"account_id": "acct-1", "script_name": "worker-a"},
+            "body": {"compatibility_date": "2026-08-24"},
+            "dry_run": false,
+            "confirmation_token": token,
+            "reason": "synthetic multipart regression"
+        }),
+    );
+    let content = structured_content(&apply);
+    assert_eq!(
+        content["ok"],
+        json!(true),
+        "{content}; requests={:?}",
+        requests.lock().expect("request log lock")
+    );
+    assert_eq!(content["result"]["compatibility_date"], json!("2026-08-24"));
+
+    let requests = requests.lock().expect("request log lock");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]["request_line"],
+        json!("PATCH /accounts/acct-1/workers/scripts/worker-a/settings HTTP/1.1")
+    );
+    assert!(
+        requests[0]["content_type"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("multipart/form-data;"))
+    );
+    assert!(
+        requests[0]["body_text"]
+            .as_str()
+            .is_some_and(|value| value.contains("name=\"settings\""))
     );
 }
 

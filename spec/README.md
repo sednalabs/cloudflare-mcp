@@ -99,6 +99,12 @@ Note on elicitation mode:
 - Apart from the explicit `api_mutate.token_permissions` field above,
   elicitation does not alter tool argument schemas; it changes pre-execution
   policy behavior.
+- Generic `worker-script-patch-settings` dry-runs expose
+  `request_plan.body_encoding=multipart_form_data` and
+  `multipart_json_field=settings`. Confirmation remains bound to the normalized
+  logical JSON body; apply changes only its HTTP representation to Cloudflare's
+  required multipart `settings` part. The curated `patch_worker_settings` tool
+  remains preferred when post-apply readback proof is required.
 
 Preserved curated tool families:
 - D1 read tools (`d1_list_databases`, `d1_get_database`, `d1_inspect_schema`, `d1_query_read_only`, `d1_validate_query`) are first-class contract tools and must remain present even when broad API parity is available.
