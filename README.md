@@ -1,58 +1,149 @@
 # cloudflare-mcp
 
 `cloudflare-mcp` is a self-hosted Model Context Protocol server for
-safety-sensitive Cloudflare operations. It gives agents and operator tools a
-structured way to inspect Cloudflare state, plan changes, require approval for
-dangerous apply calls, and verify readback after mutations.
+safety-sensitive Cloudflare operations. It is designed as an operator control
+plane: agents can inspect current Cloudflare state, build deterministic change
+plans, pass policy and approval gates, apply an exact mutation, and verify the
+result by readback.
 
 It is built as a reference implementation of the Rust MCP Toolkit: explicit
 tool inventory, Streamable HTTP and stdio transports, OAuth-aware auth surfaces,
-schema snapshot tests, guarded mutation plans, and optional human approval
-gates.
+schema snapshot tests, guarded mutation plans, optional human approval gates,
+and bounded audit metadata.
+
+This project is not an official Cloudflare product.
 
 ## What it does
 
-The server focuses on operational workflows where correctness and auditability
-matter more than raw endpoint breadth:
+The server focuses on operational workflows where correctness, control, and
+auditability matter more than exposing every upstream endpoint as a first-class
+tool:
 
 - Cloudflare Tunnel, DNS, and Access publish workflows.
-- Pages deployments and custom domains.
-- D1 database discovery, read-only queries, guarded writes, and migrations.
+- Pages deployments, rollback, and custom domains.
+- D1 database discovery, schema inspection, read-only queries, guarded row
+  writes, exact migration manifests, bootstrap/reconciliation, and destructive
+  lifecycle controls.
 - R2 object inspection, bounded reads/downloads, and writes.
-- Workers script upload with digest-based summaries and settings readback,
+- Workers script upload with digest-bound planning and settings readback,
   bindings discovery, and observability event queries.
 - Queues health, backlog, metrics, consumers, and DLQ readback.
 - Account billing usage and Cloudflare Analytics GraphQL attribution for
   usage-spike investigations.
-- WAF Rulesets and Security Events summaries for rule/activity investigations.
+- WAF Rulesets and Security Events investigation, plus typed plan/apply/readback
+  for Ruleset changes.
 - Cache controls, Bulk Redirects, Email Routing, and account API token
   management.
 - A guarded generic Cloudflare REST API v4 executor backed by a committed
   OpenAPI-derived catalog.
 
-Mutating tools are designed around dry-run planning, optional confirmation
-tokens, structured audit metadata, digest-based evidence for deployable
-artifacts, and readback verification.
+Mutating tools are designed around dry-run planning, confirmation tokens where
+appropriate, optional MCP elicitation approval, structured audit metadata,
+digest-based evidence for deployable artifacts, and post-apply readback.
 
-## Relationship to Cloudflare's official MCP server
+## How this differs from Cloudflare's official MCPs
 
-Cloudflare provides official managed MCP servers for broad Cloudflare API
-access, current docs, GraphQL analytics, observability, browser rendering, and
-other product-specific workflows. If you want general-purpose access to the full
-Cloudflare API with minimal model context, start with Cloudflare's Code Mode API
-MCP server.
+Cloudflare now provides two official MCP families:
 
-This project serves a different purpose. It is a self-hosted operator MCP
-server for workflows where local credential control, curated safety policy,
-dry-run/apply discipline, approval gates, and post-apply verification matter.
-It complements the official server rather than replacing it.
+1. the hosted **Code Mode API MCP** at `https://mcp.cloudflare.com/mcp`, which
+   exposes broad current Cloudflare API access through a very small tool surface;
+2. hosted **domain-specific MCPs** for product areas such as Workers Bindings,
+   Workers Builds, Observability, Browser Run, Audit Logs, DNS Analytics, Radar,
+   AI Gateway, AutoRAG, Logpush, DEX, CASB, containers, and other Cloudflare
+   surfaces.
 
-This project is not an official Cloudflare product.
+Those services and this repository overlap, but they optimize for different
+things.
+
+| Concern | `sednalabs/cloudflare-mcp` | Cloudflare Code Mode API MCP | Cloudflare domain MCPs |
+| --- | --- | --- | --- |
+| Primary role | Governed operator control plane | Broad API access plane | Curated product exploration/operations |
+| Hosting | Self-hosted Rust process | Cloudflare-hosted | Cloudflare-hosted |
+| Broad API reach | Committed OpenAPI-derived REST catalog plus curated tools | Current broad API coverage | Product-specific |
+| Agent interaction | Typed tools plus guarded generic `api_*` tools | `docs`, `search`, `execute`; agent-generated JavaScript searches and calls the API | Purpose-built typed tools |
+| Mutation discipline | Dry-run, confirmation, deny policy, optional approval, readback | Provider auth plus the logic generated by the calling agent | Product-specific |
+| Global read-only profile | Yes, enforced in tool discovery and dispatch | No equivalent repository-wide operator mode | Depends on the server/tool |
+| Local artifact access | Yes, when self-hosted near the working tree | No direct access to the caller's filesystem | No direct access to the caller's filesystem |
+| Credential custody | Can stay entirely on operator infrastructure | Managed MCP authorization is handled through Cloudflare's service | Managed MCP authorization is handled through Cloudflare's service |
+| API freshness | Catalog refresh is an explicit repository change | Cloudflare controls the current hosted implementation | Cloudflare controls each hosted implementation |
+
+The official Code Mode server is usually the best starting point when the task
+is "find and call whatever Cloudflare API exists now." Its upstream README
+advertises roughly 2,500 endpoints behind three Code Mode tools, avoiding the
+context cost of registering thousands of endpoint schemas. It can also disable
+Code Mode with `?codemode=false`, at which point individual API endpoint tools
+are exposed instead.
+
+`cloudflare-mcp` deliberately does **not** copy that execution model. Its generic
+REST fallback does not accept agent-generated JavaScript. An agent selects a
+known operation from the committed catalog, the server constructs the request,
+and mutating calls remain subject to local policy. High-risk generic operations
+can be denied entirely or redirected to a narrower curated workflow.
+
+That distinction is tangible in workflows such as:
+
+- D1 migration admission and reconciliation rather than unrestricted raw SQL
+  migration calls;
+- DNS publication only after the configured Access/publish preflight succeeds;
+- WAF changes as a typed plan followed by confirmation-bound apply and readback;
+- Worker upload with the approved artifact digest bound to the apply path;
+- Pages direct upload from a local build directory followed by deployment
+  readback;
+- emergency unpublish as a narrow idempotent operation rather than a generic DNS
+  edit.
+
+The official MCP family also has important capabilities this repository does not
+try to duplicate as curated tools. Examples include KV and Hyperdrive lifecycle
+management in Workers Bindings, Workers Builds logs, Browser Run, Radar, Audit
+Logs, Logpush, AI Gateway, AutoRAG, DEX, CASB, and sandbox containers. For those
+surfaces, use the matching official MCP unless there is a specific reason to
+encode a guarded local operator workflow here.
+
+The intended composition is therefore:
+
+> Use Cloudflare's official MCPs for current discovery, broad API reach,
+> documentation, and specialised product services. Use this server when the
+> final operation needs locally enforced policy, exact planning, approval,
+> artifact identity, or post-apply verification.
+
+See [docs/OFFICIAL_MCP_COMPARISON.md](docs/OFFICIAL_MCP_COMPARISON.md) for the
+full capability and trust-boundary comparison and
+[docs/AGENT_ROUTING.md](docs/AGENT_ROUTING.md) for task-by-task routing.
+
+## Project scope
+
+A local capability should normally have a clear reason to exist beyond endpoint
+coverage. There are two main reasons:
+
+- it adds a useful self-hosted operator workflow, such as local safety or
+  approval policy, plan/apply/readback, artifact binding, verification, recovery,
+  or a private credential/network boundary; or
+- it provides a meaningful real-world integration, conformance, or stress-test
+  case for a reusable Rust MCP Toolkit capability that can be proven here and
+  then upstreamed to the Toolkit.
+
+The second case means some overlap with Cloudflare's official MCPs can be
+deliberate. The Cloudflare integration supplies a realistic workload for Toolkit
+features such as large-catalog discovery, deferred loading, strict inventory,
+read-only filtering, auth, elicitation, error shaping, resources, and release
+provenance. Reusable mechanics should move into `mcp-toolkit-rs` once proven.
+
+We do not plan to mirror Cloudflare's managed MCP catalog simply for endpoint
+coverage. If an official MCP already handles a product well and a local
+implementation adds neither operator value nor useful Toolkit coverage, use the
+official MCP.
+
+The generic OpenAPI executor remains a useful local fallback, but API parity is
+not a reason to duplicate Cloudflare's own product-specific tools.
+
+See [docs/PROJECT_SCOPE.md](docs/PROJECT_SCOPE.md) for the project scope in more
+detail and [docs/CONFORMANCE_DOGFOOD.md](docs/CONFORMANCE_DOGFOOD.md) for the
+Toolkit stress-test role.
 
 ## Safety model
 
-`cloudflare-mcp` is private by default and keeps safety controls in the runtime,
-not only in documentation:
+`cloudflare-mcp` is private by default and keeps important safety controls in the
+runtime, not only in documentation:
 
 - Non-loopback bind requires MCP auth plus explicit HTTPS resource and audience
   URLs.
@@ -65,6 +156,11 @@ not only in documentation:
 - Mutation responses include structured audit metadata with correlation IDs.
 - Publish flows evaluate policy gates before DNS mutation.
 - Emergency unpublish is idempotent.
+- Generic REST mutations have deny-by-default high-risk categories and cannot
+  bypass curated workflows that intentionally own a dangerous lifecycle.
+
+These controls complement Cloudflare's own API-token/OAuth permissions; they do
+not replace provider-side least privilege.
 
 See [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md) for the longer version.
 
@@ -193,8 +289,7 @@ For agents that should use this guarded server beside Cloudflare's official
 managed MCP endpoints, start from
 [packaging/codex/cloudflare-managed-mcp.example.toml](packaging/codex/cloudflare-managed-mcp.example.toml).
 It keeps the local dry-run/apply/readback path separate from managed discovery
-surfaces such as Cloudflare Docs, Code Mode API, GraphQL, Observability, Audit
-Logs, DNS Analytics, and Browser Run.
+and specialist surfaces.
 
 ## MCP client usage
 
@@ -214,12 +309,14 @@ The server supports:
 Tool names intentionally omit a `cloudflare.` prefix. MCP clients already attach
 the server label, so short names keep prompts and traces easier to read.
 
-For OpenAI Responses API clients, GPT-5.4 and later support tool search; use
-`gpt-5.5` as the current flagship target for complex operator workflows. To
-defer this large MCP tool catalog, configure the MCP server with
+For OpenAI Responses API clients that support tool search, use deferred loading
+for this larger curated inventory. Configure the MCP server with
 `defer_loading: true` and include a `tool_search` tool. Non-hosted clients can
 call `find_tools` to produce a narrow `allowed_tools` list and optional MCP
-schemas before a follow-up call.
+schemas before a follow-up call. Model and product availability changes
+independently of this repository, so see
+[docs/CLIENT_COMPATIBILITY.md](docs/CLIENT_COMPATIBILITY.md) for capability-based
+client guidance rather than a model-version recommendation.
 
 ```json
 [
@@ -270,34 +367,45 @@ does not register one MCP tool per Cloudflare endpoint. Instead, clients search
 and inspect operations before invoking `api_read` or `api_mutate`.
 
 `api_mutate` is guarded: dry-run first, confirmation token for apply, high-risk
-categories denied by default, and optional human approval gates when
-elicitation is enabled.
+categories denied by default, and optional human approval gates when elicitation
+is enabled. This is intentionally a different trust and execution model from
+Cloudflare's hosted Code Mode `execute` tool.
 
 See [docs/API-PARITY.md](docs/API-PARITY.md).
 
 ## Documentation
 
+- [docs/README.md](docs/README.md): documentation index and guide to the right
+  level of detail.
 - [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md): build, run, client setup,
-  and first checks.
-- [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md): auth, read-only mode,
-  dry-run/apply, elicitation, and audit behavior.
-- [docs/TOOL_GUIDE.md](docs/TOOL_GUIDE.md): curated tool families and generic
-  API fallback guidance.
-- [docs/CLIENT-CONTRACT.md](docs/CLIENT-CONTRACT.md): exact MCP request and
-  tool argument contract.
+  composition with official MCPs, and first checks.
+- [docs/OFFICIAL_MCP_COMPARISON.md](docs/OFFICIAL_MCP_COMPARISON.md): detailed
+  comparison with Cloudflare's official Code Mode and product MCP servers.
+- [docs/AGENT_ROUTING.md](docs/AGENT_ROUTING.md): task-by-task decision rules for
+  this server, official Cloudflare MCPs, and Cloudflare-documented CLIs.
+- [docs/PROJECT_SCOPE.md](docs/PROJECT_SCOPE.md): public project and contribution
+  scope for deciding when a local curated tool belongs here.
+- [docs/CLIENT_COMPATIBILITY.md](docs/CLIENT_COMPATIBILITY.md): capability-based
+  client compatibility, deferred loading/tool search, and approval guidance.
+- [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md): auth, credential placement,
+  managed-vs-self-hosted trust boundaries, read-only mode, dry-run/apply,
+  elicitation, and audit behavior.
+- [docs/TOOL_GUIDE.md](docs/TOOL_GUIDE.md): concise workflow-to-tool map.
+- [docs/D1_MIGRATIONS.md](docs/D1_MIGRATIONS.md): focused D1 migration and
+  recovery concepts, with the exact contract and runbook kept separate.
+- [docs/CLIENT-CONTRACT.md](docs/CLIENT-CONTRACT.md): exact MCP request and tool
+  argument contract.
 - [docs/RUNBOOK.md](docs/RUNBOOK.md): operator rollout, verification, and
   rollback workflow.
-- [docs/AGENT_ROUTING.md](docs/AGENT_ROUTING.md): when to use this server,
-  Cloudflare's managed MCP servers, or Cloudflare-documented CLIs.
 - [docs/CONFORMANCE_DOGFOOD.md](docs/CONFORMANCE_DOGFOOD.md): how this server
-  dogfoods MCP Toolkit behavior such as strict inventory, tool search,
-  deferred loading, resources, error envelopes, and release provenance.
-- [docs/API-PARITY.md](docs/API-PARITY.md): OpenAPI catalog and generic
-  executor policy.
+  dogfoods MCP Toolkit behavior such as strict inventory, tool search, deferred
+  loading, resources, error envelopes, and release provenance.
+- [docs/API-PARITY.md](docs/API-PARITY.md): OpenAPI catalog, generic executor
+  policy, and its relationship to Cloudflare Code Mode.
 - [spec/README.md](spec/README.md): tool schema snapshot workflow.
 - [packaging/codex/cloudflare-managed-mcp.example.toml](packaging/codex/cloudflare-managed-mcp.example.toml):
-  example Codex MCP profile for enabling official Cloudflare managed MCPs
-  beside this guarded operator MCP.
+  example Codex MCP profile for enabling selected official Cloudflare managed
+  MCPs beside this guarded operator MCP.
 
 ## Development
 

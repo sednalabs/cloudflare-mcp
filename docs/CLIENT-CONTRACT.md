@@ -104,15 +104,19 @@ When `CLOUDFLARE_MCP_ELICITATION_ENABLED=1`:
 
 ## Deferred loading
 
-OpenAI Responses API clients can use tool search with GPT-5.4 and later; use
-`gpt-5.5` as the current flagship target for complex operator workflows. To
-defer this large MCP catalog, set `defer_loading: true` on the MCP tool
-definition and include `{ "type": "tool_search" }` in the same `tools` array.
-OpenAI hosted `tool_search` is a client-side Responses API feature: the server
-continues to expose the same strict inventory through `tools/list` when the
-client asks for it. Non-hosted clients can call `find_tools` to produce a
-narrow `openai_allowed_tools` list and optional MCP schemas, then use that list
-as the Responses `allowed_tools` value for a follow-up request.
+OpenAI Responses API clients that support MCP deferred loading and tool search
+can use those capabilities with this server. Support depends on the current
+client/model combination, so consult current OpenAI product documentation rather
+than treating a model name in this repository as a recommendation. To defer
+this large MCP catalog, set `defer_loading: true` on the MCP tool definition and
+include `{ "type": "tool_search" }` in the same `tools` array. OpenAI hosted
+`tool_search` is a client-side Responses API feature: the server continues to
+expose the same strict inventory through `tools/list` when the client asks for
+it. Non-hosted clients can call `find_tools` to produce a narrow
+`openai_allowed_tools` list and optional MCP schemas, then use that list as the
+Responses `allowed_tools` value for a follow-up request. See
+[CLIENT_COMPATIBILITY.md](CLIENT_COMPATIBILITY.md) for capability-based client
+guidance.
 
 ```json
 [

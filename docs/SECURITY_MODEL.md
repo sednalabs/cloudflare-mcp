@@ -9,12 +9,70 @@ controls in code paths that agents must use, not only in operator prose.
 There are two separate credential boundaries:
 
 - MCP bearer auth controls who can call this MCP server.
-- Cloudflare upstream credentials control what this server can do in
-  Cloudflare.
+- Cloudflare upstream credentials control what this server can do in Cloudflare.
 
 Do not pass an MCP bearer token through to Cloudflare as an API token. Use
-server-held Cloudflare credentials, request-header Cloudflare credentials, or
-the explicit mixed mode documented in [CLIENT-CONTRACT.md](CLIENT-CONTRACT.md).
+server-held Cloudflare credentials, request-header Cloudflare credentials, or the
+explicit mixed mode documented in [CLIENT-CONTRACT.md](CLIENT-CONTRACT.md).
+
+Cloudflare provider permissions remain authoritative for what the upstream API
+will accept. Local MCP policy can further restrict those permissions but cannot
+safely widen them.
+
+## Self-hosted versus managed Cloudflare MCP trust placement
+
+Cloudflare's official MCPs are managed services. When an operator authorizes one
+of those endpoints, Cloudflare hosts the MCP runtime and receives the bearer
+credential or OAuth authorization required by that service. This is usually the
+best fit for broad current API discovery and Cloudflare-maintained product
+surfaces.
+
+With this repository, the operator owns the MCP runtime. That changes where
+several security decisions live:
+
+- inbound MCP authentication can be controlled independently of the Cloudflare
+  provider credential;
+- Cloudflare API tokens, OAuth refresh grants, R2 credentials, and optional
+  service credentials can remain on operator infrastructure;
+- the server can be bound to loopback and launched through stdio with no network
+  listener at all;
+- a local read-only profile can hide and deny mutation even when the upstream
+  Cloudflare credential itself has write permission;
+- dangerous workflows can require local confirmation identity and MCP
+  elicitation before the request is sent to Cloudflare.
+
+This is not an assertion that self-hosting is inherently safer. Self-hosting
+also makes the operator responsible for patching, process isolation, secret
+storage, filesystem access, reverse-proxy configuration, and deployment
+hardening.
+
+Cloudflare's official Code Mode API MCP also has a different execution boundary:
+its `search` and `execute` tools run agent-generated JavaScript inside
+Cloudflare's isolated Worker-based Code Mode environment. This repository's
+generic `api_*` executor does not accept generated code. It selects a known
+operation from a committed catalog and constructs the HTTP request itself.
+That narrower execution model is intentional for operator workflows that need a
+locally reviewable admission boundary.
+
+See [OFFICIAL_MCP_COMPARISON.md](OFFICIAL_MCP_COMPARISON.md) for the broader
+capability comparison.
+
+## Local artifact boundary
+
+Some curated tools intentionally access local files or directories, including
+Pages direct-upload artifacts, Worker bundles/scripts, and migration material.
+That is a capability the hosted official MCPs do not have against an arbitrary
+caller filesystem.
+
+Treat local file access as part of the trust model:
+
+- run the server under a principal with only the filesystem access it needs;
+- do not expose the server to untrusted MCP callers merely because upstream
+  Cloudflare credentials are narrow;
+- prefer bounded, explicit artifact paths rather than treating the MCP process
+  as a general filesystem service;
+- keep secret files outside deployable source trees and use dedicated `*_FILE`
+  settings where supported.
 
 ## Bind and Host Safety
 
@@ -53,7 +111,8 @@ Expected behavior:
 - `health` and `/health` report `read_only_mode=true`.
 
 Use this for audit, discovery, and investigation sessions where mutation should
-be impossible.
+be impossible from this MCP even if the configured Cloudflare credential could
+write upstream.
 
 ## Dry-Run and Apply
 
@@ -105,8 +164,15 @@ committed OpenAPI-derived catalog.
 - Denied-by-default risk categories fail closed.
 - Read-only mode denies mutation.
 - Elicitation can be mandatory for generic mutations.
+- Curated workflows can reserve an operation so the generic executor cannot be
+  used to bypass the stronger lifecycle.
 
 Use curated tools first when `api_get_operation` reports a preferred tool.
+
+These controls are the principal security difference between this repository's
+generic executor and a broad managed API-access MCP: the final admission policy
+is part of the local runtime rather than being left entirely to agent-generated
+call logic and provider permissions.
 
 ## External Service Bridge
 
@@ -154,8 +220,8 @@ paths, and non-owner-only token files on Unix. Deployments that require
 encryption at rest should replace that storage boundary with their platform
 secret service. Cache filenames use one-way principal keys, and provider state
 and cached access tokens are isolated per authenticated MCP actor. Access
-tokens, refresh tokens, client secrets, authorization
-codes, and raw state are excluded from tool status and formatted debug output.
+tokens, refresh tokens, client secrets, authorization codes, and raw state are
+excluded from tool status and formatted debug output.
 
 ## Validation Expectations
 
@@ -170,3 +236,7 @@ CLOUDFLARE_MCP_AUTH_MODE=off cargo run -- --print-tools
 
 For tool schema changes, also update and re-check the schema snapshot as
 described in [../spec/README.md](../spec/README.md).
+
+For documentation-only changes, validate documentation structure and exact
+changed blobs. Do not run unrelated runtime tests solely to manufacture green
+CI evidence for prose-only edits.

@@ -4,6 +4,13 @@
 # Copy only the servers that match the operator's task. Do not enable every
 # managed endpoint by default: each one creates a separate authorization surface
 # and may request different Cloudflare permissions during OAuth.
+#
+# Routing rule:
+# - use official managed MCPs for current docs, broad API discovery, and product
+#   specialist surfaces;
+# - use the local cloudflare-mcp for final operations that require local
+#   dry-run/apply/readback policy, local artifact access, or local credential
+#   custody.
 
 [mcp_servers.cloudflare-mcp]
 # Local guarded operator path for dry-run/apply/readback workflows.
@@ -24,18 +31,17 @@ env_vars = [
 CLOUDFLARE_MCP_AUTH_MODE = "off"
 
 [mcp_servers.cloudflare-api]
-# Cloudflare Code Mode API MCP. Use for broad endpoint discovery and current
-# API reach, then move production-affecting guarded apply workflows back to the
-# local cloudflare-mcp when policy gates, confirmation tokens, or readback are
-# required.
+# Cloudflare Code Mode API MCP. Use for broad/current endpoint discovery and
+# one-off API access. Move a recurring production-affecting workflow back to the
+# local cloudflare-mcp when policy gates, confirmation tokens, artifact identity,
+# or readback are requirements.
 url = "https://mcp.cloudflare.com/mcp"
 startup_timeout_sec = 30.0
 tool_timeout_sec = 300.0
 
 [mcp_servers.cloudflare-docs]
-# Public documentation/search surface. This endpoint is safe to prefer for
-# current Cloudflare docs and Agents SDK questions before falling back to broad
-# web search.
+# Public documentation/search surface. Prefer this for current Cloudflare docs
+# before relying on a committed local API snapshot.
 url = "https://docs.mcp.cloudflare.com/mcp"
 startup_timeout_sec = 30.0
 tool_timeout_sec = 120.0
@@ -46,6 +52,8 @@ startup_timeout_sec = 30.0
 tool_timeout_sec = 120.0
 
 [mcp_servers.cloudflare-bindings]
+# Workers bindings and resource lifecycle, including official KV, R2 bucket, D1,
+# and Hyperdrive tools.
 url = "https://bindings.mcp.cloudflare.com/mcp"
 startup_timeout_sec = 30.0
 tool_timeout_sec = 300.0
@@ -57,6 +65,12 @@ tool_timeout_sec = 300.0
 
 [mcp_servers.cloudflare-observability]
 url = "https://observability.mcp.cloudflare.com/mcp"
+startup_timeout_sec = 30.0
+tool_timeout_sec = 300.0
+
+[mcp_servers.cloudflare-containers]
+# Managed sandbox development environments.
+url = "https://containers.mcp.cloudflare.com/mcp"
 startup_timeout_sec = 30.0
 tool_timeout_sec = 300.0
 
@@ -109,3 +123,10 @@ tool_timeout_sec = 300.0
 url = "https://graphql.mcp.cloudflare.com/mcp"
 startup_timeout_sec = 30.0
 tool_timeout_sec = 300.0
+
+[mcp_servers.cloudflare-blog]
+# Public Cloudflare Blog search/read surface. This is informational, not an
+# account-operator endpoint.
+url = "https://blog.mcp.cloudflare.com/mcp"
+startup_timeout_sec = 30.0
+tool_timeout_sec = 120.0

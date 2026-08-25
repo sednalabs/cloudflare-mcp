@@ -1,16 +1,46 @@
 # MCP Toolkit Conformance Dogfood
 
-`cloudflare-mcp` is the large-catalog dogfood server for Sedna MCP Toolkit
-behavior. It should stay broad enough to exercise discovery, deferred loading,
-strict inventory, resources, auth, policy, error shaping, and release
+`cloudflare-mcp` is a real-world integration, conformance, and stress-test server
+for the Rust MCP Toolkit. Its Cloudflare workload is deliberately large and
+varied enough to exercise discovery, deferred loading, strict inventory,
+resources, auth, policy, error shaping, mutation workflows, and release
 provenance under realistic agent pressure.
 
-This is not a claim that the server replaces Cloudflare's official managed MCPs
-for the freshest product coverage. Use official managed MCPs for current
-Cloudflare docs, Code Mode API exploration, GraphQL/product analytics, and
-product-specific discovery. Use this server to prove that Sedna's governed MCP
-surface remains searchable, defer-loadable, attestable, reproducible, and safe
-for operator workflows.
+That role is complementary to the server's operator purpose. It is not a claim
+that this repository should replace Cloudflare's official managed MCPs for the
+freshest product coverage.
+
+Use official Cloudflare MCPs for current documentation, broad Code Mode API
+exploration, and product-specific managed capabilities. Use this repository when
+a self-hosted operator workflow adds useful controls, or when a realistic
+Cloudflare integration provides a meaningful test bed for reusable Toolkit
+behavior.
+
+## Incubating Toolkit behavior here
+
+It is acceptable for this repository to implement functionality that overlaps
+with an official Cloudflare MCP when the implementation is deliberately being
+used to develop or stress-test a reusable MCP capability.
+
+Good incubation candidates have an explicit reusable question, for example:
+
+- can a large tool inventory remain searchable and defer-loadable without
+  weakening strict dispatch policy?
+- can read-only mode consistently affect discovery and direct invocation?
+- can elicitation approval bind the exact operation being approved?
+- can authentication, resources, error envelopes, and mutation evidence remain
+  consistent across stdio and Streamable HTTP?
+- can release provenance tie a built binary back to its source and tool
+  contract?
+
+The Cloudflare-specific integration provides the realistic workload; reusable
+mechanics should move to `mcp-toolkit-rs` once they are sufficiently proven.
+After upstreaming, keep the local integration only when it still provides useful
+operator behavior or ongoing conformance coverage. Toolkit incubation should be
+purposeful rather than a reason to mirror Cloudflare's product catalog.
+
+See [PROJECT_SCOPE.md](PROJECT_SCOPE.md) for the corresponding project-scope
+rule.
 
 ## Conformance Matrix
 
@@ -32,7 +62,7 @@ for operator workflows.
 
 ## Regression Policy
 
-When a toolkit behavior regresses in another Sedna MCP server, add the smallest
+When a Toolkit behavior regresses in another server, add the smallest
 fixture-backed case here if `cloudflare-mcp` can reproduce it through a real MCP
 boundary. Prefer stdio or Streamable HTTP JSON-RPC checks over direct handler
 tests when the failure involves transport, request context, schema extraction,
@@ -40,5 +70,5 @@ tool list visibility, deferred loading, or structured MCP errors.
 
 Keep these cases secret-free. Use fake Cloudflare API fixtures or deterministic
 dry-run planning unless live Cloudflare authorization is the behavior under
-test. If the root cause is in `mcp-toolkit-rs`, fix the toolkit crate and update
-the pinned revision here in the same tracked lane.
+test. If the root cause is in `mcp-toolkit-rs`, fix the Toolkit crate and update
+the pinned revision here as part of the same change when practical.
