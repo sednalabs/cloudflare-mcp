@@ -22,6 +22,8 @@ pub mod mutation;
 pub(crate) mod pages_deploy;
 pub mod policy;
 pub mod portal;
+#[allow(dead_code)] // staged low-level boundary; lifecycle consumers are intentionally out of scope
+pub(crate) mod private_file_custody;
 pub mod publish;
 pub mod resources;
 pub mod server;

@@ -330,11 +330,7 @@ struct D1BootstrapInitializerAttemptReceipt {
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct D1LeaseFileIdentity {
-    device: u64,
-    inode: u64,
-}
+type D1LeaseFileIdentity = crate::private_file_custody::UnixFileIdentity;
 
 impl D1MigrationLease {
     /// Record normal terminal completion without unlinking the active evidence.
@@ -1632,6 +1628,10 @@ fn d1_migration_lease_nonce(target_hash: &str, plan_sha256: &str) -> String {
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+    use crate::private_file_custody::{
+        file_identity as identity, private_directory as private_dir,
+        private_regular_file as private_file, safe_root_ancestor,
+    };
     use libc::{
         AT_FDCWD, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_PATH, O_RDONLY, O_RDWR,
     };
@@ -1683,7 +1683,6 @@ mod linux {
     }
 
     unsafe extern "C" {
-        fn geteuid() -> u32;
         fn mkdirat(dirfd: i32, pathname: *const std::ffi::c_char, mode: u32) -> i32;
         fn renameat2(
             olddirfd: i32,
@@ -1696,31 +1695,6 @@ mod linux {
         fn readdir(directory: *mut CDirectoryStream) -> *mut CDirectoryEntry;
         fn closedir(directory: *mut CDirectoryStream) -> i32;
         fn __errno_location() -> *mut i32;
-    }
-
-    fn current_effective_uid() -> u32 {
-        unsafe { geteuid() }
-    }
-
-    fn identity(metadata: &fs::Metadata) -> D1LeaseFileIdentity {
-        D1LeaseFileIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        }
-    }
-
-    fn private_file(metadata: &fs::Metadata) -> bool {
-        metadata.is_file()
-            && !metadata.file_type().is_symlink()
-            && metadata.uid() == current_effective_uid()
-            && metadata.mode() & 0o077 == 0
-    }
-
-    fn private_dir(metadata: &fs::Metadata) -> bool {
-        metadata.is_dir()
-            && !metadata.file_type().is_symlink()
-            && metadata.uid() == current_effective_uid()
-            && metadata.mode() & 0o077 == 0
     }
 
     fn c_string_path(path: &Path) -> Result<CString, &'static str> {
@@ -1833,7 +1807,7 @@ mod linux {
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
                 return Err("migration lease root has a non-directory or symlink ancestor");
             }
-            if metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0 {
+            if !safe_root_ancestor(&metadata) {
                 return Err("migration lease root has a writable non-sticky ancestor");
             }
         }
