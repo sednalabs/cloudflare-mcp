@@ -1746,12 +1746,22 @@
               "null"
             ]
           },
+          "approved_plan_sha256": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "database_id": {
             "type": "string"
           },
           "dry_run": {
             "default": false,
             "type": "boolean"
+          },
+          "execution_session_sha256": {
+            "type": "string"
           },
           "max_rows": {
             "default": null,
@@ -1773,7 +1783,8 @@
         },
         "required": [
           "database_id",
-          "sql"
+          "sql",
+          "execution_session_sha256"
         ],
         "type": "object"
       },

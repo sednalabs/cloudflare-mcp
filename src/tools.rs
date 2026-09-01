@@ -38,6 +38,10 @@ use crate::cloudflare::{
     AccessAppUpsertRequest, AccessPolicyWrite, BulkRedirectItemWrite, CacheRule, CacheRuleset,
     DnsRecordUpsertRequest, PagesDeploymentTriggerRequest, with_request_api_token_override,
 };
+use crate::d1_execute_write::{
+    D1_EXECUTE_WRITE_OPERATION, derive_d1_execute_write_plan, valid_lower_sha256,
+    validate_d1_execute_write_result,
+};
 use crate::d1_migration_bootstrap::{
     D1_BOOTSTRAP_LEASE_FAMILY, D1_BOOTSTRAP_OPERATION, D1BootstrapExecutionInput,
     d1_bootstrap_mutation_plan, d1_bootstrap_mutation_target,
@@ -51,7 +55,8 @@ use crate::d1_migration_bootstrap_recovery::{
     reconcile_bootstrap_migration_ledger,
 };
 use crate::d1_migration_lease::{
-    acquire_d1_migration_lease, acquire_d1_target_mutation_guard, d1_migration_lease_requirements,
+    D1ExecuteWriteLeaseAcquisition, acquire_d1_execute_write_lease, acquire_d1_migration_lease,
+    acquire_d1_target_mutation_guard, d1_migration_lease_requirements,
     preflight_d1_migration_target_custody,
 };
 use crate::d1_migration_manifest::{
@@ -913,6 +918,9 @@ pub struct D1ExecuteWriteArgs {
     pub account_id: Option<String>,
     pub database_id: String,
     pub sql: String,
+    pub execution_session_sha256: String,
+    #[serde(default)]
+    pub approved_plan_sha256: Option<String>,
     #[serde(default)]
     pub params: Vec<Value>,
     #[serde(default)]
@@ -4397,77 +4405,372 @@ impl CloudflareMcp {
     async fn cloudflare_d1_execute_write(
         &self,
         Parameters(args): Parameters<D1ExecuteWriteArgs>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, crate::McpError> {
-        if let Some(account_id) = args.account_id.as_deref()
-            && let Err(result) = normalize_d1_target(account_id, &args.database_id)
-        {
-            return Ok(result);
+        let D1ExecuteWriteArgs {
+            account_id: requested_account_id,
+            database_id: requested_database_id,
+            sql,
+            execution_session_sha256,
+            approved_plan_sha256,
+            params,
+            dry_run,
+            max_rows,
+        } = args;
+        let mutation_plan = MutationPlan::new(D1_EXECUTE_WRITE_OPERATION)
+            .step(
+                "validate_exact_dml_plan",
+                false,
+                json!({"execution_session_sha256": &execution_session_sha256}),
+            )
+            .step("submit_one_d1_dml_request", true, json!({}));
+        let audit = MutationAuditSession::start(
+            Some(&parts),
+            D1_EXECUTE_WRITE_OPERATION,
+            json!({
+                "database_id": &requested_database_id,
+                "execution_session_sha256": &execution_session_sha256,
+            }),
+            dry_run,
+        );
+        let zero_call_error = |result: CallToolResult| {
+            finalize_mutation_result(
+                d1_execute_write_error_result(result, "blocked", false, 0, 0, None, None, None),
+                &mutation_plan,
+                audit.clone(),
+                dry_run,
+            )
+        };
+
+        if !valid_lower_sha256(&execution_session_sha256) {
+            return Ok(zero_call_error(invalid_argument_result(
+                "d1.execute_write_session_invalid",
+                "execution_session_sha256 must be an exact lowercase SHA-256 digest",
+                "Allocate one opaque execution-session digest and reuse it only for exact replay of this plan.",
+            )));
         }
-        let resolved_account_id = resolve_account_id(self, args.account_id.as_deref())?;
-        let target = match normalize_d1_target(resolved_account_id, &args.database_id) {
+        if let Some(account_id) = requested_account_id.as_deref()
+            && let Err(result) = normalize_d1_target(account_id, &requested_database_id)
+        {
+            return Ok(zero_call_error(result));
+        }
+        let resolved_account_id = match resolve_account_id(self, requested_account_id.as_deref()) {
+            Ok(account_id) => account_id,
+            Err(_) => {
+                return Ok(zero_call_error(invalid_argument_result(
+                    "d1.invalid_target_identity",
+                    "account_id must be supplied or configured as a canonical identifier",
+                    "Use the exact account_id read from the intended Cloudflare resource.",
+                )));
+            }
+        };
+        let target = match normalize_d1_target(resolved_account_id, &requested_database_id) {
             Ok(target) => target,
-            Err(result) => return Ok(result),
+            Err(result) => return Ok(zero_call_error(result)),
         };
         let target_key_sha256 = target.target_key_sha256();
         let account_id = target.account_id.as_str();
         let database_id = target.database_id.as_str();
-        let statement_kind = match classify_d1_write_sql(&args.sql) {
+        let statement_kind = match classify_d1_write_sql(&sql) {
             Ok(kind) => kind,
-            Err(result) => return Ok(result),
+            Err(result) => return Ok(zero_call_error(result)),
         };
-        let max_rows = args.max_rows.unwrap_or(100).clamp(1, 1000);
-        let plan = json!({
-            "operation": "d1_execute_write",
-            "account_id": account_id,
-            "database_id": database_id,
-            "target_key_sha256": target_key_sha256,
-            "statement_kind": statement_kind,
-            "sql_sha256": sha256_hex(args.sql.trim()),
-            "dry_run": args.dry_run,
+        let max_rows = max_rows.unwrap_or(100).clamp(1, 1000);
+        let (execution_plan, plan_sha256) = derive_d1_execute_write_plan(
+            account_id,
+            database_id,
+            &target_key_sha256,
+            &execution_session_sha256,
+            statement_kind,
+            &sql,
+            &params,
+            max_rows,
+        );
+        let base = json!({
+            "operation": D1_EXECUTE_WRITE_OPERATION,
+            "execution_plan": &execution_plan,
+            "plan_sha256": &plan_sha256,
+            "automatic_retry_permitted": false,
         });
-        if args.dry_run {
-            return Ok(CallToolResult::structured(json!({
-                "ok": true,
-                "operation": "d1_execute_write",
-                "plan": plan,
-                "policy": {
-                    "d1_write_sql": true,
-                    "allowed_statement_kinds": D1_WRITE_ALLOWED_KINDS,
-                    "single_statement": true,
-                    "max_rows": max_rows,
-                },
-            })));
-        }
-        let guard =
-            match acquire_d1_target_mutation_guard("d1_execute_write", account_id, database_id) {
-                Ok(guard) => guard,
-                Err(result) => return Ok(result),
-            };
-        if let Err(result) = guard.revalidate() {
-            return Ok(result);
-        }
-        match self
-            .cloudflare
-            .execute_d1_database_write(account_id, database_id, &args.sql, &args.params)
-            .await
-        {
-            Ok(result) => {
-                let (result, truncated) = limit_d1_result_rows(result, max_rows);
-                Ok(CallToolResult::structured(json!({
+        if dry_run {
+            return Ok(finalize_mutation_result(
+                CallToolResult::structured(json!({
                     "ok": true,
-                    "operation": "d1_execute_write",
-                    "plan": plan,
+                    "operation": D1_EXECUTE_WRITE_OPERATION,
+                    "status": "planned",
+                    "execution_plan": execution_plan,
+                    "plan_sha256": plan_sha256,
+                    "provider_calls": 0,
+                    "provider_mutations": 0,
+                    "automatic_retry_permitted": false,
                     "policy": {
                         "d1_write_sql": true,
                         "allowed_statement_kinds": D1_WRITE_ALLOWED_KINDS,
                         "single_statement": true,
                         "max_rows": max_rows,
                     },
-                    "truncated": truncated,
-                    "result": result,
-                })))
+                })),
+                &mutation_plan,
+                audit,
+                true,
+            ));
+        }
+
+        let approved_plan_sha256 = match approved_plan_sha256 {
+            Some(value) if valid_lower_sha256(&value) => value,
+            _ => {
+                return Ok(zero_call_error(invalid_argument_result(
+                    "d1.execute_write_approved_plan_required",
+                    "live D1 write requires the exact lowercase plan_sha256 returned by dry-run",
+                    "Dry-run the identical SQL bytes and parameters, approve that digest, then submit it unchanged.",
+                )));
             }
-            Err(err) => Ok(adapter_error_result(err)),
+        };
+        if approved_plan_sha256 != plan_sha256 {
+            return Ok(zero_call_error(invalid_argument_result(
+                "d1.execute_write_plan_mismatch",
+                "approved_plan_sha256 does not match the exact SQL bytes, parameters, target, and session",
+                "Do not normalize or rebuild the statement after approval; repeat dry-run for the changed exact bytes.",
+            )));
+        }
+
+        let mut lease = match acquire_d1_execute_write_lease(
+            account_id,
+            database_id,
+            &approved_plan_sha256,
+            &execution_session_sha256,
+        ) {
+            Ok(D1ExecuteWriteLeaseAcquisition::ExactTerminalReplay(identity)) => {
+                return Ok(finalize_mutation_result(
+                    CallToolResult::structured(json!({
+                        "ok": true,
+                        "operation": D1_EXECUTE_WRITE_OPERATION,
+                        "status": "exact_terminal_replay",
+                        "execution_plan": execution_plan,
+                        "plan_sha256": plan_sha256,
+                        "provider_calls": 0,
+                        "provider_mutations": 0,
+                        "lease_retained": false,
+                        "custody": identity,
+                        "automatic_retry_permitted": false,
+                    })),
+                    &mutation_plan,
+                    audit,
+                    false,
+                ));
+            }
+            Ok(D1ExecuteWriteLeaseAcquisition::Acquired(lease)) => lease,
+            Err(result) => return Ok(zero_call_error(result)),
+        };
+        if let Err(result) = lease.revalidate() {
+            return Ok(finalize_mutation_result(
+                d1_execute_write_error_result(
+                    result,
+                    "reconciliation_required",
+                    true,
+                    0,
+                    0,
+                    Some(&base),
+                    Some(&lease.identity),
+                    None,
+                ),
+                &mutation_plan,
+                audit,
+                false,
+            ));
+        }
+
+        match self
+            .cloudflare
+            .execute_d1_dml_write(account_id, database_id, &sql, &params)
+            .await
+        {
+            Ok(write) => {
+                let outcome = match validate_d1_execute_write_result(statement_kind, &write.result)
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        lease.retain();
+                        let result = CallToolResult::structured_error(json!({
+                            "ok": false,
+                            "operation": D1_EXECUTE_WRITE_OPERATION,
+                            "status": "reconciliation_required",
+                            "execution_plan": execution_plan,
+                            "plan_sha256": plan_sha256,
+                            "provider_calls": 1,
+                            "provider_mutations": 1,
+                            "lease_retained": true,
+                            "custody": lease.identity,
+                            "response_body_sha256": write.response_body_sha256,
+                            "response_body_size_bytes": write.response_body_size_bytes,
+                            "provider_lifecycle": write.lifecycle,
+                            "automatic_retry_permitted": false,
+                            "error": error,
+                        }));
+                        return Ok(finalize_mutation_result(
+                            result,
+                            &mutation_plan,
+                            audit,
+                            false,
+                        ));
+                    }
+                };
+                let audit_record = match audit.finish_checked("success", None) {
+                    Ok(record) => record,
+                    Err(_) => {
+                        lease.retain();
+                        return Ok(CallToolResult::structured_error(json!({
+                            "ok": false,
+                            "operation": D1_EXECUTE_WRITE_OPERATION,
+                            "status": "reconciliation_required",
+                            "execution_plan": execution_plan,
+                            "plan_sha256": plan_sha256,
+                            "provider_calls": 1,
+                            "provider_mutations": 1,
+                            "lease_retained": true,
+                            "custody": lease.identity,
+                            "response_body_sha256": write.response_body_sha256,
+                            "response_body_size_bytes": write.response_body_size_bytes,
+                            "provider_lifecycle": write.lifecycle,
+                            "automatic_retry_permitted": false,
+                            "audit": {
+                                "finalized": false,
+                                "correlation": audit.correlation(),
+                            },
+                            "error": {
+                                "code": "d1.execute_write_audit_finalization_failed",
+                                "message": "the mutation audit record could not be finalized before custody retirement",
+                                "hint": "Retain custody and reconcile this provider attempt; do not replay it."
+                            }
+                        })));
+                    }
+                };
+                let (result, truncated) = limit_d1_result_rows(write.result, max_rows);
+                if let Err(result) = lease.release() {
+                    return Ok(finalize_mutation_result(
+                        d1_execute_write_error_result(
+                            result,
+                            "reconciliation_required",
+                            true,
+                            1,
+                            1,
+                            Some(&base),
+                            Some(&lease.identity),
+                            Some((
+                                &write.response_body_sha256,
+                                write.response_body_size_bytes,
+                                write.lifecycle,
+                            )),
+                        ),
+                        &mutation_plan,
+                        audit,
+                        false,
+                    ));
+                }
+                Ok(finalize_mutation_result_with_record(
+                    CallToolResult::structured(json!({
+                        "ok": true,
+                        "operation": D1_EXECUTE_WRITE_OPERATION,
+                        "status": "succeeded",
+                        "execution_plan": execution_plan,
+                        "plan_sha256": plan_sha256,
+                        "provider_calls": 1,
+                        "provider_mutations": 1,
+                        "lease_retained": false,
+                        "custody": lease.identity,
+                        "response_body_sha256": write.response_body_sha256,
+                        "response_body_size_bytes": write.response_body_size_bytes,
+                        "provider_lifecycle": write.lifecycle,
+                        "outcome": outcome,
+                        "truncated": truncated,
+                        "result": result,
+                        "automatic_retry_permitted": false,
+                    })),
+                    &mutation_plan,
+                    audit_record,
+                    false,
+                ))
+            }
+            Err(write_error) => {
+                let provider_calls = write_error.lifecycle.provider_calls();
+                let attempted = provider_calls == 1;
+                let provider_mutations = provider_calls;
+                let audit_record = match audit
+                    .finish_checked("error", Some(&write_error.error.code))
+                {
+                    Ok(record) => record,
+                    Err(_) => {
+                        lease.retain();
+                        return Ok(CallToolResult::structured_error(json!({
+                            "ok": false,
+                            "operation": D1_EXECUTE_WRITE_OPERATION,
+                            "status": "reconciliation_required",
+                            "execution_plan": execution_plan,
+                            "plan_sha256": plan_sha256,
+                            "provider_calls": provider_calls,
+                            "provider_mutations": provider_mutations,
+                            "lease_retained": true,
+                            "custody": lease.identity,
+                            "response_body_sha256": write_error.response_body_sha256,
+                            "response_body_size_bytes": write_error.response_body_size_bytes,
+                            "provider_lifecycle": write_error.lifecycle,
+                            "automatic_retry_permitted": false,
+                            "audit": {
+                                "finalized": false,
+                                "correlation": audit.correlation(),
+                            },
+                            "error": {
+                                "code": "d1.execute_write_audit_finalization_failed",
+                                "message": "the mutation audit record could not be finalized before custody retirement",
+                                "hint": "Retain custody and reconcile this attempt; do not replay it."
+                            }
+                        })));
+                    }
+                };
+                if !attempted {
+                    if let Err(result) = lease.abort_before_dispatch() {
+                        return Ok(finalize_mutation_result_with_record(
+                            d1_execute_write_error_result(
+                                result,
+                                "blocked",
+                                true,
+                                0,
+                                0,
+                                Some(&base),
+                                Some(&lease.identity),
+                                None,
+                            ),
+                            &mutation_plan,
+                            audit_record,
+                            false,
+                        ));
+                    }
+                } else {
+                    lease.retain();
+                }
+                Ok(finalize_mutation_result_with_record(
+                    CallToolResult::structured_error(json!({
+                        "ok": false,
+                        "operation": D1_EXECUTE_WRITE_OPERATION,
+                        "status": if attempted {"reconciliation_required"} else {"blocked"},
+                        "execution_plan": execution_plan,
+                        "plan_sha256": plan_sha256,
+                        "provider_calls": provider_calls,
+                        "provider_mutations": provider_mutations,
+                        "lease_retained": attempted,
+                        "custody": lease.identity,
+                        "response_body_sha256": write_error.response_body_sha256,
+                        "response_body_size_bytes": write_error.response_body_size_bytes,
+                        "provider_lifecycle": write_error.lifecycle,
+                        "provider_error": write_error.provider_error,
+                        "automatic_retry_permitted": false,
+                        "error": write_error.error,
+                    })),
+                    &mutation_plan,
+                    audit_record,
+                    false,
+                ))
+            }
         }
     }
 
@@ -14116,9 +14419,91 @@ fn portal_error_result_with_auth(
 }
 
 fn finalize_mutation_result(
-    mut result: CallToolResult,
+    result: CallToolResult,
     plan: &MutationPlan,
     audit: MutationAuditSession,
+    dry_run: bool,
+) -> CallToolResult {
+    let inferred_error = result
+        .structured_content
+        .as_ref()
+        .and_then(|payload| payload.get("ok"))
+        .and_then(serde_json::Value::as_bool)
+        .map(|ok| !ok)
+        .unwrap_or(false);
+    let is_error = result.is_error.unwrap_or(inferred_error);
+    let error_code = result
+        .structured_content
+        .as_ref()
+        .and_then(extract_error_code)
+        .or_else(|| is_error.then_some("unknown_error".to_string()));
+    let outcome = if is_error {
+        "error"
+    } else if dry_run {
+        "planned"
+    } else {
+        "success"
+    };
+    let audit_record = audit.finish(outcome, error_code.as_deref());
+    finalize_mutation_result_with_record(result, plan, audit_record, dry_run)
+}
+
+fn d1_execute_write_error_result(
+    result: CallToolResult,
+    status: &'static str,
+    lease_retained: bool,
+    provider_calls: usize,
+    provider_mutations: usize,
+    execution: Option<&Value>,
+    custody: Option<&crate::d1_migration_lease::D1MigrationLeaseIdentity>,
+    response: Option<(&str, usize, crate::cloudflare::client::D1DmlWriteLifecycle)>,
+) -> CallToolResult {
+    let source = result.structured_content.clone();
+    let error = d1_call_tool_error_value(result);
+    let mut payload = json!({
+        "ok": false,
+        "operation": D1_EXECUTE_WRITE_OPERATION,
+        "status": status,
+        "provider_calls": provider_calls,
+        "provider_mutations": provider_mutations,
+        "lease_retained": lease_retained,
+        "automatic_retry_permitted": false,
+        "error": error,
+    });
+    if let Some(object) = payload.as_object_mut() {
+        if let Some(source) = source.as_ref().and_then(Value::as_object) {
+            for key in [
+                "lease_retained",
+                "custody_status",
+                "lease",
+                "operator_handoff",
+            ] {
+                if let Some(value) = source.get(key) {
+                    object.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+        if let Some(execution) = execution.and_then(Value::as_object) {
+            for (key, value) in execution {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+        if let Some(custody) = custody {
+            object.insert("custody".to_string(), json!(custody));
+        }
+        if let Some((sha256, size_bytes, lifecycle)) = response {
+            object.insert("response_body_sha256".to_string(), json!(sha256));
+            object.insert("response_body_size_bytes".to_string(), json!(size_bytes));
+            object.insert("provider_lifecycle".to_string(), json!(lifecycle));
+        }
+    }
+    CallToolResult::structured_error(payload)
+}
+
+fn finalize_mutation_result_with_record(
+    mut result: CallToolResult,
+    plan: &MutationPlan,
+    audit_record: crate::mutation::MutationAuditRecord,
     dry_run: bool,
 ) -> CallToolResult {
     let inferred_error = result
@@ -14140,17 +14525,6 @@ fn finalize_mutation_result(
             "value": payload,
         });
     }
-
-    let error_code =
-        extract_error_code(&payload).or_else(|| is_error.then_some("unknown_error".to_string()));
-    let outcome = if is_error {
-        "error"
-    } else if dry_run {
-        "planned"
-    } else {
-        "success"
-    };
-    let audit_record = audit.finish(outcome, error_code.as_deref());
     emit_mutation_audit_log(&audit_record);
 
     if let Some(object) = payload.as_object_mut() {
@@ -15729,7 +16103,7 @@ mod tests {
         for (tool, provider_boundary) in [
             ("d1_rename_database", "shared_target_guard"),
             ("d1_delete_database", "shared_target_guard"),
-            ("d1_execute_write", "shared_target_guard"),
+            ("d1_execute_write", "durable_attempt_custody"),
             ("d1_bootstrap_migration_ledger", "durable_target_lease"),
             ("d1_apply_migration_manifest", "durable_target_lease"),
         ] {

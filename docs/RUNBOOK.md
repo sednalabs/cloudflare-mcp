@@ -77,6 +77,39 @@ release artifact bundle so agents can compare:
 - schema snapshot hash versus `spec/tool_schema_snapshot.v1.json`,
 - `/proc/<pid>/exe` hash for any already-running stdio process.
 
+## Exact-byte D1 row writes
+
+Use `d1_execute_write` only for one single-statement `INSERT`, `UPDATE`,
+`DELETE`, or `REPLACE`. It is not a migration or bulk-import substitute.
+
+1. Allocate a fresh opaque lowercase SHA-256 `execution_session_sha256` for
+   this intended operation. Never recycle a session across changed intent.
+2. Call `d1_execute_write` with `dry_run=true`, the exact SQL bytes and exact
+   parameters. Record the returned `plan_sha256`, SQL/parameter digests and
+   sizes, target digest, and audit correlation. Dry-run performs zero provider
+   calls and mutations.
+3. Approve that exact plan. Submit the identical target, session, SQL bytes,
+   parameters, and row cap with `dry_run=false` and
+   `approved_plan_sha256=<plan_sha256>`. Do not trim or reformat SQL after
+   approval.
+4. A normal terminal result reports one provider call, one provider mutation,
+   a complete response body SHA-256/size, HTTP/lifecycle evidence, released
+   custody, and `automatic_retry_permitted=false`. A primary-served zero-change
+   `UPDATE` or `DELETE` is a valid terminal outcome.
+5. If the response reports retained custody, response ambiguity, an HTTP or
+   authenticated provider failure, malformed/oversized/truncated/invalid
+   evidence, or audit-finalization failure, stop. Do not replay or create a new
+   session to work around the evidence. Preserve the exact response and custody
+   fields for the separately governed reconciliation path.
+6. Repeating a completed session with the identical plan returns
+   `exact_terminal_replay` with zero provider calls. The same session with any
+   changed plan conflicts before provider access.
+
+Token/config/request construction failures are pre-dispatch and count zero
+provider calls/mutations. Their custody is durably marked provider-free before
+another attempt is possible. No successful or ambiguous provider attempt is
+automatically retried.
+
 ## First-ledger bootstrap for an empty D1 target
 
 Use `d1_bootstrap_migration_ledger` only for a separately selected database

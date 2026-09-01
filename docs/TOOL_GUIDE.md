@@ -97,7 +97,7 @@ identity and one physical target guard namespace:
 | --- | --- |
 | `d1_rename_database` | shared permanent target guard |
 | `d1_delete_database` | shared permanent target guard |
-| `d1_execute_write` | shared permanent target guard |
+| `d1_execute_write` | durable per-session attempt custody under the shared permanent target guard |
 | `d1_bootstrap_migration_ledger` | durable lease under that target guard |
 | `d1_apply_migration_manifest` | durable lease under that target guard |
 | `d1_apply_migrations` live mode | denied/retired |
@@ -113,6 +113,16 @@ Guard failures retain the invoked curated tool name in `operation` and report
 zero provider calls and mutations, so the blocked caller remains traceable.
 Local reconcile/finalize/abort tools manipulate retained custody evidence only
 and are not provider D1 mutation surfaces.
+
+For `d1_execute_write`, allocate a fresh opaque lowercase SHA-256 execution
+session, call the exact statement with `dry_run=true`, and approve the returned
+`plan_sha256`. Do not trim, reformat, or reconstruct the SQL or parameters
+between dry-run and live apply. The live request dispatches those exact SQL
+bytes once. Treat `status=reconciliation_required` or `lease_retained=true` as
+a permanent stop for that provider attempt: preserve the response digest,
+size, HTTP/lifecycle evidence, audit correlation, and custody identity, and do
+not retry the session. Exact completed replay is read-only with zero provider
+calls; a changed plan under the same session fails closed.
 
 Canonical target guards also require the version-2 root activation marker. A
 new marker and the target's create-only

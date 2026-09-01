@@ -5103,8 +5103,14 @@ fn spawn_fake_d1_database_mutation_api(
                     "messages": [],
                     "result": [{
                         "success": true,
+                        "errors": [],
                         "results": [],
-                        "meta": {"changed_db": true, "changes": 1}
+                        "meta": {
+                            "served_by_primary": true,
+                            "changed_db": true,
+                            "changes": 1,
+                            "rows_written": 1
+                        }
                     }],
                 }),
                 _ => json!({
@@ -5122,6 +5128,87 @@ fn spawn_fake_d1_database_mutation_api(
             )
             .expect("write response headers");
             stream.write_all(&response).expect("write response body");
+        }
+    });
+    (format!("http://{addr}"), requests)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum D1WriteFault {
+    ZeroChange,
+    ResponseLoss,
+    HttpNonSuccess,
+    MalformedJson,
+    Oversized,
+    Truncated,
+    InvalidUtf8,
+}
+
+fn spawn_faulting_d1_write_api(fault: D1WriteFault) -> (String, Arc<Mutex<usize>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind faulting D1 write API");
+    let addr = listener.local_addr().expect("faulting D1 write API addr");
+    let requests = Arc::new(Mutex::new(0usize));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("faulting D1 write request");
+        let _ = read_http_request(&mut stream);
+        *requests_for_thread.lock().expect("fault request count") += 1;
+        match fault {
+            D1WriteFault::ZeroChange => {
+                let body = br#"{"success":true,"errors":[],"messages":[],"result":[{"success":true,"errors":[],"results":[],"meta":{"served_by_primary":true,"changed_db":false,"changes":0,"rows_written":0}}]}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                )
+                .expect("write zero-change headers");
+                stream.write_all(body).expect("write zero-change body");
+            }
+            D1WriteFault::ResponseLoss => {}
+            D1WriteFault::HttpNonSuccess => {
+                let body = br#"{"success":false,"errors":[{"code":9109,"message":"synthetic private provider text"}],"messages":[],"result":null}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 403 Forbidden\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                )
+                .expect("write HTTP error headers");
+                stream.write_all(body).expect("write HTTP error body");
+            }
+            D1WriteFault::MalformedJson => {
+                let body = b"{";
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                )
+                .expect("write malformed headers");
+                stream.write_all(body).expect("write malformed body");
+            }
+            D1WriteFault::Oversized => {
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 16777217\r\n\r\n"
+                )
+                .expect("write oversized headers");
+            }
+            D1WriteFault::Truncated => {
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{{}}"
+                )
+                .expect("write truncated response");
+            }
+            D1WriteFault::InvalidUtf8 => {
+                let body = [0xff, 0xfe];
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                )
+                .expect("write invalid UTF-8 headers");
+                stream.write_all(&body).expect("write invalid UTF-8 body");
+            }
         }
     });
     (format!("http://{addr}"), requests)
@@ -18049,7 +18136,7 @@ fn d1_delete_database_requires_token_and_deletes_through_stdio_boundary() {
 }
 
 #[test]
-fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
+fn d1_execute_write_proves_exact_plan_evidence_and_terminal_replay_through_stdio_boundary() {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     let (base_url, requests) = spawn_fake_d1_database_mutation_api(1);
@@ -18072,39 +18159,429 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
             lease_root.to_string_lossy().to_string(),
         ),
     ]);
-    let response = mcp.call_tool(
+    let session = "b".repeat(64);
+    let exact_sql = "  UPDATE example SET enabled = 1 WHERE id = 7  ";
+    let dry_run = mcp.call_tool(
         2,
         "d1_execute_write",
         json!({
             "database_id": "123e4567-e89b-42d3-a456-426614174000",
-            "sql": "UPDATE example SET enabled = 1 WHERE id = 7",
+            "sql": exact_sql,
+            "execution_session_sha256": session,
+            "dry_run": true
+        }),
+    );
+    let dry_run_content = structured_content(&dry_run);
+    assert_eq!(dry_run_content["ok"], json!(true), "{dry_run_content}");
+    assert_eq!(dry_run_content["status"], json!("planned"));
+    assert_eq!(dry_run_content["provider_calls"], json!(0));
+    assert_eq!(dry_run_content["provider_mutations"], json!(0));
+    assert_eq!(
+        dry_run_content["execution_plan"]["sql_sha256"],
+        json!(sha256_hex(exact_sql))
+    );
+    assert_eq!(
+        dry_run_content["execution_plan"]["sql_size_bytes"],
+        json!(exact_sql.len())
+    );
+    assert_eq!(requests.lock().expect("request log lock").len(), 0);
+    let approved_plan_sha256 = dry_run_content["plan_sha256"]
+        .as_str()
+        .expect("dry-run plan digest")
+        .to_string();
+
+    let response = mcp.call_tool(
+        3,
+        "d1_execute_write",
+        json!({
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "sql": exact_sql,
+            "execution_session_sha256": "b".repeat(64),
+            "approved_plan_sha256": approved_plan_sha256,
             "dry_run": false
         }),
     );
     let content = structured_content(&response);
     assert_eq!(content["ok"], json!(true), "{content}");
+    assert_eq!(content["status"], json!("succeeded"));
+    assert_eq!(content["provider_calls"], json!(1));
+    assert_eq!(content["provider_mutations"], json!(1));
+    assert_eq!(content["lease_retained"], json!(false));
+    assert_eq!(content["automatic_retry_permitted"], json!(false));
+    assert_eq!(content["outcome"]["changes"], json!(1));
+    assert_eq!(content["outcome"]["rows_written"], json!(1));
+    assert_eq!(content["provider_lifecycle"]["http_status"], json!(200));
+    assert!(content["response_body_sha256"].is_string());
+    assert!(content["response_body_size_bytes"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(content["audit"]["action"], json!("d1_execute_write"));
+    let target_key_sha256 = sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000");
     assert_eq!(
-        content["plan"]["database_id"],
+        content["execution_plan"]["database_id"],
         json!("123e4567-e89b-42d3-a456-426614174000")
     );
     assert_eq!(
-        content["plan"]["target_key_sha256"],
-        json!(sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000"))
+        content["execution_plan"]["target_key_sha256"],
+        json!(&target_key_sha256)
     );
-    let requests = requests.lock().expect("request log lock");
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0]["method"], json!("POST"));
+    let mut normalized = content.clone();
+    normalized["plan_sha256"] = json!("<plan-sha256>");
+    normalized["response_body_sha256"] = json!("<response-sha256>");
+    normalized["response_body_size_bytes"] = json!(0);
+    normalized["custody"]["nonce"] = json!("<nonce>");
+    normalized["custody"]["payload_sha256"] = json!("<lease-payload-sha256>");
+    normalized["audit"]["started_at_unix_ms"] = json!(0);
+    normalized["audit"]["completed_at_unix_ms"] = json!(0);
+    normalized["audit"]["correlation"]["correlation_id"] = json!("<correlation>");
     assert_eq!(
-        requests[0]["path"],
+        normalized,
+        json!({
+            "ok": true,
+            "operation": "d1_execute_write",
+            "status": "succeeded",
+            "dry_run": false,
+            "execution_plan": {
+                "version": 2,
+                "operation": "d1_execute_write",
+                "account_id": "acct-1",
+                "database_id": "123e4567-e89b-42d3-a456-426614174000",
+                "target_key_sha256": target_key_sha256,
+                "execution_session_sha256": "b".repeat(64),
+                "statement_kind": "UPDATE",
+                "sql_sha256": sha256_hex(exact_sql),
+                "sql_size_bytes": exact_sql.len(),
+                "params_sha256": sha256_hex("[]"),
+                "params_size_bytes": 2,
+                "max_rows": 100,
+            },
+            "plan_sha256": "<plan-sha256>",
+            "provider_calls": 1,
+            "provider_mutations": 1,
+            "lease_retained": false,
+            "custody": {
+                "target_key_sha256": sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000"),
+                "nonce": "<nonce>",
+                "payload_sha256": "<lease-payload-sha256>",
+            },
+            "response_body_sha256": "<response-sha256>",
+            "response_body_size_bytes": 0,
+            "provider_lifecycle": {
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 200,
+            },
+            "outcome": {
+                "statement_kind": "UPDATE",
+                "changed_db": true,
+                "changes": 1,
+                "rows_written": 1,
+                "zero_change": false,
+            },
+            "truncated": false,
+            "result": [{
+                "success": true,
+                "errors": [],
+                "results": [],
+                "meta": {
+                    "served_by_primary": true,
+                    "changed_db": true,
+                    "changes": 1,
+                    "rows_written": 1,
+                }
+            }],
+            "automatic_retry_permitted": false,
+            "plan": {
+                "operation": "d1_execute_write",
+                "steps": [
+                    {
+                        "ordinal": 1,
+                        "action": "validate_exact_dml_plan",
+                        "side_effect": false,
+                        "target": {"execution_session_sha256": "b".repeat(64)},
+                    },
+                    {
+                        "ordinal": 2,
+                        "action": "submit_one_d1_dml_request",
+                        "side_effect": true,
+                        "target": {},
+                    }
+                ],
+            },
+            "audit": {
+                "correlation": {
+                    "correlation_id": "<correlation>",
+                    "request_id": null,
+                    "session_id": null,
+                },
+                "actor": "unknown",
+                "action": "d1_execute_write",
+                "target": {
+                    "database_id": "123e4567-e89b-42d3-a456-426614174000",
+                    "execution_session_sha256": "b".repeat(64),
+                },
+                "started_at_unix_ms": 0,
+                "completed_at_unix_ms": 0,
+                "dry_run": false,
+                "outcome": "success",
+                "error_code": null,
+                "approval": null,
+            },
+        }),
+        "stdio whole-payload contract"
+    );
+    let request_log = requests.lock().expect("request log lock");
+    assert_eq!(request_log.len(), 1);
+    assert_eq!(request_log[0]["method"], json!("POST"));
+    assert_eq!(
+        request_log[0]["path"],
         json!("/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query")
     );
-    assert_eq!(
-        requests[0]["body"]["sql"],
-        json!("UPDATE example SET enabled = 1 WHERE id = 7")
+    assert_eq!(request_log[0]["body"]["sql"], json!(exact_sql));
+    drop(request_log);
+
+    let replay = mcp.call_tool(
+        4,
+        "d1_execute_write",
+        json!({
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "sql": exact_sql,
+            "execution_session_sha256": "b".repeat(64),
+            "approved_plan_sha256": content["plan_sha256"].clone(),
+            "dry_run": false
+        }),
     );
-    drop(requests);
+    let replay_content = structured_content(&replay);
+    assert_eq!(replay_content["ok"], json!(true), "{replay_content}");
+    assert_eq!(replay_content["status"], json!("exact_terminal_replay"));
+    assert_eq!(replay_content["provider_calls"], json!(0));
+    assert_eq!(replay_content["provider_mutations"], json!(0));
+    assert_eq!(requests.lock().expect("request log lock").len(), 1);
+
+    let changed_dry_run = mcp.call_tool(
+        5,
+        "d1_execute_write",
+        json!({
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "sql": "UPDATE example SET enabled = 0 WHERE id = 7",
+            "execution_session_sha256": "b".repeat(64),
+            "dry_run": true
+        }),
+    );
+    let changed_plan = structured_content(&changed_dry_run)["plan_sha256"]
+        .as_str()
+        .expect("changed dry-run plan")
+        .to_string();
+    let conflict = mcp.call_tool(
+        6,
+        "d1_execute_write",
+        json!({
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "sql": "UPDATE example SET enabled = 0 WHERE id = 7",
+            "execution_session_sha256": "b".repeat(64),
+            "approved_plan_sha256": changed_plan,
+            "dry_run": false
+        }),
+    );
+    let conflict_content = structured_content(&conflict);
+    assert_eq!(conflict_content["ok"], json!(false), "{conflict_content}");
+    assert_eq!(
+        conflict_content["error"]["code"],
+        json!("d1.execute_write_session_conflict")
+    );
+    assert_eq!(conflict_content["provider_calls"], json!(0));
+    assert_eq!(conflict_content["provider_mutations"], json!(0));
+    assert_eq!(requests.lock().expect("request log lock").len(), 1);
     mcp.terminate();
     fs::remove_dir_all(lease_root).expect("target guard cleanup");
+}
+
+#[test]
+fn d1_execute_write_accepts_primary_zero_change_update_through_stdio_boundary() {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    let (base_url, requests) = spawn_faulting_d1_write_api(D1WriteFault::ZeroChange);
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-d1-write-zero-change-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create private zero-change root");
+    #[cfg(unix)]
+    fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+        .expect("make zero-change root private");
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let mut arguments = json!({
+        "database_id": "123e4567-e89b-42d3-a456-426614174000",
+        "sql": "UPDATE example SET enabled = 1 WHERE id = -1",
+        "execution_session_sha256": "6".repeat(64),
+        "dry_run": true
+    });
+    let dry_run = mcp.call_tool(10, "d1_execute_write", arguments.clone());
+    arguments["dry_run"] = json!(false);
+    arguments["approved_plan_sha256"] = structured_content(&dry_run)["plan_sha256"].clone();
+    let response = mcp.call_tool(11, "d1_execute_write", arguments);
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(true), "{content}");
+    assert_eq!(content["status"], json!("succeeded"));
+    assert_eq!(content["outcome"]["zero_change"], json!(true));
+    assert_eq!(content["outcome"]["changed_db"], json!(false));
+    assert_eq!(content["provider_calls"], json!(1));
+    assert_eq!(content["provider_mutations"], json!(1));
+    assert_eq!(content["lease_retained"], json!(false));
+    assert_eq!(*requests.lock().expect("zero-change request count"), 1);
+    mcp.terminate();
+    fs::remove_dir_all(lease_root).expect("zero-change cleanup");
+}
+
+#[test]
+fn d1_execute_write_retains_one_attempt_across_provider_faults_through_stdio_boundary() {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    let cases = [
+        (D1WriteFault::ResponseLoss, "cloudflare.transport_error"),
+        (D1WriteFault::HttpNonSuccess, "cloudflare.http_forbidden"),
+        (
+            D1WriteFault::MalformedJson,
+            "cloudflare.d1.execute_write_malformed_envelope",
+        ),
+        (
+            D1WriteFault::Oversized,
+            "cloudflare.d1.execute_write_response_too_large",
+        ),
+        (D1WriteFault::Truncated, "cloudflare.response_read_failed"),
+        (
+            D1WriteFault::InvalidUtf8,
+            "cloudflare.d1.execute_write_malformed_utf8",
+        ),
+    ];
+    for (index, (fault, expected_code)) in cases.into_iter().enumerate() {
+        let (base_url, requests) = spawn_faulting_d1_write_api(fault);
+        let lease_root = PathBuf::from("/tmp").join(format!(
+            "cloudflare-mcp-d1-write-fault-{}-{index}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&lease_root);
+        fs::create_dir(&lease_root).expect("create private DML fault root");
+        #[cfg(unix)]
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+            .expect("make DML fault root private");
+        let mut mcp = McpStdioProcess::start_with_env(vec![
+            ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+            (
+                "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+                lease_root.to_string_lossy().to_string(),
+            ),
+        ]);
+        let session = format!("{index:x}").repeat(64);
+        let arguments = json!({
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "sql": "UPDATE example SET enabled = 1 WHERE id = 7",
+            "execution_session_sha256": session,
+            "dry_run": true
+        });
+        let dry_run = mcp.call_tool(20, "d1_execute_write", arguments.clone());
+        let plan = structured_content(&dry_run)["plan_sha256"]
+            .as_str()
+            .expect("fault-case dry-run plan")
+            .to_string();
+        let mut live_arguments = arguments;
+        live_arguments["dry_run"] = json!(false);
+        live_arguments["approved_plan_sha256"] = json!(plan);
+        let response = mcp.call_tool(21, "d1_execute_write", live_arguments);
+        let content = structured_content(&response);
+        assert_eq!(content["ok"], json!(false), "{fault:?}: {content}");
+        assert_eq!(
+            content["status"],
+            json!("reconciliation_required"),
+            "{fault:?}: {content}"
+        );
+        assert_eq!(content["error"]["code"], json!(expected_code), "{content}");
+        assert_eq!(content["provider_calls"], json!(1), "{content}");
+        assert_eq!(content["provider_mutations"], json!(1), "{content}");
+        assert_eq!(content["lease_retained"], json!(true), "{content}");
+        assert_eq!(
+            content["automatic_retry_permitted"],
+            json!(false),
+            "{content}"
+        );
+        assert_eq!(
+            content["provider_lifecycle"]["dispatch_stage"],
+            json!("attempted"),
+            "{content}"
+        );
+        assert_eq!(*requests.lock().expect("fault request count"), 1);
+        assert_private_regular_active_lease(&lease_root);
+        assert!(
+            !content
+                .to_string()
+                .contains("synthetic private provider text"),
+            "provider body text must not escape exact digest evidence"
+        );
+        mcp.terminate();
+        fs::remove_dir_all(lease_root).expect("DML fault cleanup");
+    }
+}
+
+#[test]
+fn d1_execute_write_predispatch_auth_failure_is_zero_call_and_not_terminal_replay() {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-d1-write-predispatch-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir(&lease_root).expect("create private DML predispatch root");
+    #[cfg(unix)]
+    fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+        .expect("make DML predispatch root private");
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_TOKEN", String::new()),
+        ("CLOUDFLARE_API_TOKEN", String::new()),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let arguments = json!({
+        "database_id": "123e4567-e89b-42d3-a456-426614174000",
+        "sql": "DELETE FROM example WHERE id = 7",
+        "execution_session_sha256": "f".repeat(64),
+        "dry_run": true
+    });
+    let dry_run = mcp.call_tool(30, "d1_execute_write", arguments.clone());
+    let plan = structured_content(&dry_run)["plan_sha256"]
+        .as_str()
+        .expect("predispatch dry-run plan")
+        .to_string();
+    let mut live_arguments = arguments.clone();
+    live_arguments["dry_run"] = json!(false);
+    live_arguments["approved_plan_sha256"] = json!(plan.clone());
+    let failure = mcp.call_tool(31, "d1_execute_write", live_arguments.clone());
+    let failure = structured_content(&failure);
+    assert_eq!(failure["ok"], json!(false), "{failure}");
+    assert_eq!(failure["status"], json!("blocked"), "{failure}");
+    assert_eq!(failure["provider_calls"], json!(0), "{failure}");
+    assert_eq!(failure["provider_mutations"], json!(0), "{failure}");
+    assert_eq!(failure["lease_retained"], json!(false), "{failure}");
+    assert_eq!(
+        failure["provider_lifecycle"]["dispatch_stage"],
+        json!("pre_dispatch"),
+        "{failure}"
+    );
+    let second = mcp.call_tool(32, "d1_execute_write", live_arguments);
+    let second = structured_content(&second);
+    assert_eq!(second["status"], json!("blocked"), "{second}");
+    assert_ne!(second["status"], json!("exact_terminal_replay"));
+    assert_eq!(second["provider_calls"], json!(0));
+    mcp.terminate();
+    fs::remove_dir_all(lease_root).expect("DML predispatch cleanup");
 }
 
 #[cfg(unix)]
@@ -18174,6 +18651,22 @@ fn curated_d1_guard_denials_are_pre_provider_and_caller_correlated() {
         .expect("delete confirmation token")
         .to_string();
 
+    let write_session = "7".repeat(64);
+    let write_dry_run = mcp.call_tool(
+        20,
+        "d1_execute_write",
+        json!({
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "sql": "UPDATE example SET enabled = 1 WHERE id = 7",
+            "execution_session_sha256": write_session,
+            "dry_run": true
+        }),
+    );
+    let write_plan_sha256 = structured_content(&write_dry_run)["plan_sha256"]
+        .as_str()
+        .expect("write dry-run plan")
+        .to_string();
+
     for (request_id, operation, arguments) in [
         (
             21,
@@ -18196,6 +18689,8 @@ fn curated_d1_guard_denials_are_pre_provider_and_caller_correlated() {
             json!({
                 "database_id": "123e4567-e89b-42d3-a456-426614174000",
                 "sql": "UPDATE example SET enabled = 1 WHERE id = 7",
+                "execution_session_sha256": "7".repeat(64),
+                "approved_plan_sha256": write_plan_sha256,
                 "dry_run": false
             }),
         ),
@@ -18204,9 +18699,14 @@ fn curated_d1_guard_denials_are_pre_provider_and_caller_correlated() {
         let content = structured_content(&response);
         assert_eq!(content["ok"], json!(false), "{operation}: {content}");
         assert_eq!(content["operation"], json!(operation), "{content}");
+        let expected_code = if operation == "d1_execute_write" {
+            "d1.migration_target_guard_locked"
+        } else {
+            "d1.target_guard_locked"
+        };
         assert_eq!(
             content["error"]["code"],
-            json!("d1.target_guard_locked"),
+            json!(expected_code),
             "{operation}: {content}"
         );
         assert_eq!(content["provider_calls"], json!(0), "{content}");
@@ -19631,6 +20131,7 @@ fn api_mutate_denies_existing_target_d1_schema_mutations_before_request_construc
             "account_id": "acct-1",
             "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "sql": "CREATE TABLE curated_write_guard(id INTEGER PRIMARY KEY)",
+            "execution_session_sha256": "9".repeat(64),
             "dry_run": true
         }),
     );
