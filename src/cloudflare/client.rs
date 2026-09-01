@@ -932,7 +932,13 @@ impl CloudflareClient {
         };
         let account_id = require_non_empty("account_id", account_id).map_err(pre_dispatch)?;
         let database_id = require_non_empty("database_id", database_id).map_err(pre_dispatch)?;
-        let sql = require_non_empty("sql", sql).map_err(pre_dispatch)?;
+        if sql.trim().is_empty() {
+            return Err(pre_dispatch(AdapterError::new(
+                "cloudflare.invalid_argument",
+                "sql must not be empty",
+                "Provide one non-empty DML statement; its exact bytes will be dispatched unchanged.",
+            )));
+        }
         let token = self.bearer_token().map_err(pre_dispatch)?;
         let url = self.endpoint(&format!(
             "/accounts/{}/d1/database/{}/query",
