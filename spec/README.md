@@ -93,10 +93,12 @@ Note on elicitation mode:
   `d1-delete-database`, `d1-export-database`, `d1-import-database`,
   `d1-query-database`, `d1-raw-database-query`,
   `d1-time-travel-restore`, `d1-update-database`, and
-  `d1-update-partial-database`. Query/raw SQL, rename and delete delegate to
-  their named curated tools. Export, import, restore and full metadata update
-  remain denied until a governed curated lifecycle exists. D1 create is not an
-  existing-target mutation; GET operations remain read-only catalog calls.
+  `d1-update-partial-database`. Query/raw SQL and delete delegate to their named
+  curated tools. Export, import, restore, full metadata update and partial
+  metadata update remain denied until a complete governed curated lifecycle
+  exists; the rename-only tool cannot safely represent every partial-update
+  field. D1 create is not an existing-target mutation; GET operations remain
+  read-only catalog calls.
 - Apart from the explicit `api_mutate.token_permissions` field above,
   elicitation does not alter tool argument schemas; it changes pre-execution
   policy behavior.

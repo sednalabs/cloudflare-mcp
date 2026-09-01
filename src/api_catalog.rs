@@ -616,6 +616,7 @@ impl ApiCatalogError {
                         | "d1-import-database"
                         | "d1-time-travel-restore"
                         | "d1-update-database"
+                        | "d1-update-partial-database"
                 ) =>
             {
                 "Use a governed curated lifecycle for this operation; generic api_mutate remains denied."
@@ -789,11 +790,11 @@ mod tests {
             let expected_preferred_tool = match operation_id {
                 "d1-query-database" | "d1-raw-database-query" => Some("d1_query_read_only"),
                 "d1-delete-database" => Some("d1_delete_database"),
-                "d1-update-partial-database" => Some("d1_rename_database"),
                 "d1-export-database"
                 | "d1-import-database"
                 | "d1-time-travel-restore"
-                | "d1-update-database" => None,
+                | "d1-update-database"
+                | "d1-update-partial-database" => None,
                 _ => unreachable!("closed inventory"),
             };
             assert_eq!(operation.preferred_tool.as_deref(), expected_preferred_tool);

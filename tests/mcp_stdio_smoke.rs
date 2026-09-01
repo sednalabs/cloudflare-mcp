@@ -61,6 +61,34 @@ fn manifest_target_path(lease_root: &Path) -> PathBuf {
     ))
 }
 
+#[cfg(unix)]
+fn lock_manifest_target_guard(lease_root: &Path) -> fs::File {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::create_dir(lease_root).expect("create private target guard root");
+    fs::set_permissions(lease_root, fs::Permissions::from_mode(0o700))
+        .expect("make target guard root private");
+    let target = manifest_target_path(lease_root);
+    fs::create_dir(&target).expect("create permanent target directory");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
+        .expect("make permanent target directory private");
+    let guard_path = target.join("guard.lock");
+    let guard = fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(guard_path)
+        .expect("open permanent target guard");
+    fs::set_permissions(
+        &target.join("guard.lock"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("make permanent target guard private");
+    guard.lock().expect("hold permanent target guard");
+    guard
+}
+
 fn assert_private_regular_active_lease(lease_root: &Path) -> PathBuf {
     let target = manifest_target_path(lease_root);
     let target_metadata = fs::symlink_metadata(&target).expect("manifest target metadata");
@@ -10653,8 +10681,8 @@ fn d1_reconcile_migration_manifest_stdio_wraps_semantic_validation_in_fixed_orde
             invalid_target,
             expected_d1_reconciliation_semantic_error(
                 "d1.invalid_target_identity",
-                "account_id must be a non-empty canonical identifier, not a dot path segment, and without surrounding whitespace",
-                "Use the exact account_id and database_id read from the intended Cloudflare resource.",
+                "account_id must be an exact 1..=256 byte ASCII identifier containing only letters, digits, '_' or '-'",
+                "Use the exact account_id and database_id returned by Cloudflare; whitespace, NUL, dot, path, percent-encoded and other equivalent aliases are rejected.",
             ),
         ),
         (
@@ -17786,6 +17814,96 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
     fs::remove_dir_all(lease_root).expect("target guard cleanup");
 }
 
+#[cfg(unix)]
+#[test]
+fn curated_d1_guard_denials_are_pre_provider_and_caller_correlated() {
+    let provider = TcpListener::bind("127.0.0.1:0").expect("bind no-call D1 provider witness");
+    provider
+        .set_nonblocking(true)
+        .expect("make D1 provider witness nonblocking");
+    let provider_url = format!(
+        "http://{}",
+        provider.local_addr().expect("D1 provider witness address")
+    );
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-d1-curated-guard-denial-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos()
+    ));
+    let held_guard = lock_manifest_target_guard(&lease_root);
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", provider_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+
+    let delete_dry_run = mcp.call_tool(
+        20,
+        "d1_delete_database",
+        json!({
+            "database_id": "db-1",
+            "dry_run": true,
+            "reason": "guard-denial regression"
+        }),
+    );
+    let delete_confirmation = structured_content(&delete_dry_run)["required_confirmation_token"]
+        .as_str()
+        .expect("delete confirmation token")
+        .to_string();
+
+    for (request_id, operation, arguments) in [
+        (
+            21,
+            "d1_rename_database",
+            json!({"database_id": "db-1", "name": "renamed-db", "dry_run": false}),
+        ),
+        (
+            22,
+            "d1_delete_database",
+            json!({
+                "database_id": "db-1",
+                "dry_run": false,
+                "confirmation_token": delete_confirmation,
+                "reason": "guard-denial regression"
+            }),
+        ),
+        (
+            23,
+            "d1_execute_write",
+            json!({
+                "database_id": "db-1",
+                "sql": "UPDATE example SET enabled = 1 WHERE id = 7",
+                "dry_run": false
+            }),
+        ),
+    ] {
+        let response = mcp.call_tool(request_id, operation, arguments);
+        let content = structured_content(&response);
+        assert_eq!(content["ok"], json!(false), "{operation}: {content}");
+        assert_eq!(content["operation"], json!(operation), "{content}");
+        assert_eq!(
+            content["error"]["code"],
+            json!("d1.target_guard_locked"),
+            "{operation}: {content}"
+        );
+        assert_eq!(content["provider_calls"], json!(0), "{content}");
+        assert_eq!(content["provider_mutations"], json!(0), "{content}");
+        assert!(
+            matches!(provider.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "{operation} guard denial must occur before any provider connection"
+        );
+    }
+
+    mcp.terminate();
+    drop(held_guard);
+    fs::remove_dir_all(lease_root).expect("target guard cleanup");
+}
+
 #[test]
 fn workers_upload_script_requires_token_and_reads_back_through_stdio_boundary() {
     let (base_url, requests) = spawn_fake_worker_upload_api(2);
@@ -19114,11 +19232,11 @@ fn api_mutate_denies_existing_target_d1_schema_mutations_before_request_construc
         let expected_preferred_tool = match operation_id {
             "d1-query-database" | "d1-raw-database-query" => Some("d1_query_read_only"),
             "d1-delete-database" => Some("d1_delete_database"),
-            "d1-update-partial-database" => Some("d1_rename_database"),
             "d1-export-database"
             | "d1-import-database"
             | "d1-time-travel-restore"
-            | "d1-update-database" => None,
+            | "d1-update-database"
+            | "d1-update-partial-database" => None,
             _ => unreachable!(),
         };
         assert_eq!(content["preferred_tool"], json!(expected_preferred_tool));

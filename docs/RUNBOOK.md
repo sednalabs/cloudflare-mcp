@@ -214,7 +214,10 @@ The name is retained for compatibility, but the directory is now the shared
 account/database target-guard root. Rename, delete and row-write acquire the
 same permanent `guard.lock` as bootstrap and manifest apply immediately before
 provider dispatch. A same-target contention or retained active/retiring lease
-is a stop condition; a different database target is independent.
+is a stop condition; a different database target is independent. A guard
+failure reports the invoked curated tool as its operation and zero provider
+calls/mutations; preserve that caller-correlated receipt when diagnosing the
+contention.
 
 Generic `api_mutate` is not a fallback for an existing D1 target. Delete,
 export, import, query/raw query, time-travel restore, full update and partial

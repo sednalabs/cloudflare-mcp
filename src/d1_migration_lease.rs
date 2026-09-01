@@ -144,6 +144,7 @@ pub(crate) struct D1MigrationLease {
 /// is atomic exclusion while the provider boundary is in flight.
 #[derive(Debug)]
 pub(crate) struct D1TargetMutationGuard {
+    operation: &'static str,
     #[cfg(target_os = "linux")]
     root_path: PathBuf,
     #[cfg(target_os = "linux")]
@@ -592,6 +593,7 @@ impl D1TargetMutationGuard {
             )
             .map_err(|message| {
                 d1_target_guard_error(
+                    self.operation,
                     "d1.target_guard_custody_changed",
                     message,
                     &self.target_key_sha256,
@@ -600,7 +602,12 @@ impl D1TargetMutationGuard {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            Err(d1_lease_platform_unsupported())
+            Err(d1_target_guard_error(
+                self.operation,
+                "d1.target_guard_platform_unsupported",
+                "permanent cross-process D1 mutation custody requires the Linux dirfd-bound guard implementation",
+                &self.target_key_sha256,
+            ))
         }
     }
 }
@@ -1606,6 +1613,7 @@ pub(crate) fn acquire_d1_migration_lease(
 }
 
 pub(crate) fn acquire_d1_target_mutation_guard(
+    operation: &'static str,
     account_id: &str,
     database_id: &str,
 ) -> Result<D1TargetMutationGuard, CallToolResult> {
@@ -1616,28 +1624,35 @@ pub(crate) fn acquire_d1_target_mutation_guard(
         .filter(|path| !path.as_os_str().is_empty())
         .ok_or_else(|| {
             d1_target_guard_error(
+                operation,
                 "d1.target_guard_root_unconfigured",
                 "live D1 mutation requires the configured shared target guard root",
                 &target.target_key_sha256(),
             )
         })?;
-    acquire_d1_target_mutation_guard_at(root, &target.account_id, &target.database_id)
+    acquire_d1_target_mutation_guard_at(root, operation, &target.account_id, &target.database_id)
 }
 
 pub(crate) fn acquire_d1_target_mutation_guard_at(
     root: PathBuf,
+    operation: &'static str,
     account_id: &str,
     database_id: &str,
 ) -> Result<D1TargetMutationGuard, CallToolResult> {
     let target = normalize_d1_target(account_id, database_id)?;
     #[cfg(target_os = "linux")]
     {
-        linux::acquire_d1_target_mutation_guard_at_linux(root, target)
+        linux::acquire_d1_target_mutation_guard_at_linux(root, operation, target)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (root, target);
-        Err(d1_lease_platform_unsupported())
+        let _ = root;
+        Err(d1_target_guard_error(
+            operation,
+            "d1.target_guard_platform_unsupported",
+            "permanent cross-process D1 mutation custody requires the Linux dirfd-bound guard implementation",
+            &target.target_key_sha256(),
+        ))
     }
 }
 
@@ -1711,13 +1726,14 @@ pub(crate) fn acquire_d1_migration_lease_at(
 }
 
 fn d1_target_guard_error(
+    operation: &'static str,
     code: &'static str,
     message: &'static str,
     target_key_sha256: &str,
 ) -> CallToolResult {
     CallToolResult::structured_error(json!({
         "ok": false,
-        "operation": "d1_target_mutation_guard",
+        "operation": operation,
         "status": "blocked",
         "provider_calls": 0,
         "provider_mutations": 0,
@@ -3548,17 +3564,29 @@ mod linux {
 
     pub(super) fn acquire_d1_target_mutation_guard_at_linux(
         root_path: PathBuf,
+        operation: &'static str,
         target_identity: D1TargetIdentity,
     ) -> Result<D1TargetMutationGuard, CallToolResult> {
         let target_hash = target_identity.target_key_sha256();
         validate_root_and_ancestors(&root_path).map_err(|message| {
-            d1_target_guard_error("d1.target_guard_root_unsafe", message, &target_hash)
+            d1_target_guard_error(
+                operation,
+                "d1.target_guard_root_unsafe",
+                message,
+                &target_hash,
+            )
         })?;
         let root_name = c_string_path(&root_path).map_err(|message| {
-            d1_target_guard_error("d1.target_guard_root_unsafe", message, &target_hash)
+            d1_target_guard_error(
+                operation,
+                "d1.target_guard_root_unsafe",
+                message,
+                &target_hash,
+            )
         })?;
         let root = open_directory_at(AT_FDCWD, &root_name).map_err(|_| {
             d1_target_guard_error(
+                operation,
                 "d1.target_guard_root_unsafe",
                 "configured target guard root could not be opened without following a symlink",
                 &target_hash,
@@ -3566,6 +3594,7 @@ mod linux {
         })?;
         let root_metadata = root.metadata().map_err(|_| {
             d1_target_guard_error(
+                operation,
                 "d1.target_guard_root_unsafe",
                 "configured target guard root metadata is unavailable",
                 &target_hash,
@@ -3573,6 +3602,7 @@ mod linux {
         })?;
         if !private_dir(&root_metadata) {
             return Err(d1_target_guard_error(
+                operation,
                 "d1.target_guard_root_unsafe",
                 "configured target guard root is not a private current-operator-owned directory",
                 &target_hash,
@@ -3580,21 +3610,32 @@ mod linux {
         }
         let root_identity = identity(&root_metadata);
         validate_root_path_binding(&root_path, &root, &root_identity).map_err(|message| {
-            d1_target_guard_error("d1.target_guard_root_unsafe", message, &target_hash)
+            d1_target_guard_error(
+                operation,
+                "d1.target_guard_root_unsafe",
+                message,
+                &target_hash,
+            )
         })?;
 
         let target_name = format!("d1-migration-target-{target_hash}");
         let (target, target_identity) =
             ensure_target_directory(&root, &target_name).map_err(|message| {
-                d1_target_guard_error("d1.target_guard_target_unsafe", message, &target_hash)
+                d1_target_guard_error(
+                    operation,
+                    "d1.target_guard_target_unsafe",
+                    message,
+                    &target_hash,
+                )
             })?;
         let (guard, guard_identity) = open_or_create_guard(&target).map_err(|message| {
-            d1_target_guard_error("d1.target_guard_unsafe", message, &target_hash)
+            d1_target_guard_error(operation, "d1.target_guard_unsafe", message, &target_hash)
         })?;
         match guard.try_lock() {
             Ok(()) => {}
             Err(fs::TryLockError::WouldBlock) => {
                 return Err(d1_target_guard_error(
+                    operation,
                     "d1.target_guard_locked",
                     "another MCP process holds the permanent account/database target guard",
                     &target_hash,
@@ -3602,6 +3643,7 @@ mod linux {
             }
             Err(fs::TryLockError::Error(_)) => {
                 return Err(d1_target_guard_error(
+                    operation,
                     "d1.target_guard_lock_failed",
                     "the permanent account/database target guard could not be locked",
                     &target_hash,
@@ -3619,7 +3661,12 @@ mod linux {
             &guard_identity,
         )
         .map_err(|message| {
-            d1_target_guard_error("d1.target_guard_custody_changed", message, &target_hash)
+            d1_target_guard_error(
+                operation,
+                "d1.target_guard_custody_changed",
+                message,
+                &target_hash,
+            )
         })?;
         maybe_pause_after_guard_for_test(&root_path);
         for (name, message) in [
@@ -3635,6 +3682,7 @@ mod linux {
             match entry_present(&target, name) {
                 Ok(true) => {
                     return Err(d1_target_guard_error(
+                        operation,
                         "d1.target_guard_retained_evidence_present",
                         message,
                         &target_hash,
@@ -3643,6 +3691,7 @@ mod linux {
                 Ok(false) => {}
                 Err(message) => {
                     return Err(d1_target_guard_error(
+                        operation,
                         "d1.target_guard_custody_changed",
                         message,
                         &target_hash,
@@ -3652,6 +3701,7 @@ mod linux {
         }
 
         Ok(D1TargetMutationGuard {
+            operation,
             root_path,
             root,
             root_identity,
@@ -3945,16 +3995,18 @@ mod tests {
         let mut migration =
             acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
                 .expect("migration owns shared target guard");
-        let blocked = acquire_d1_target_mutation_guard_at(root.clone(), "acct-1", "db-1")
-            .expect_err("curated mutation must not race migration")
-            .structured_content
-            .expect("structured contention error");
+        let blocked =
+            acquire_d1_target_mutation_guard_at(root.clone(), "d1_execute_write", "acct-1", "db-1")
+                .expect_err("curated mutation must not race migration")
+                .structured_content
+                .expect("structured contention error");
         assert_eq!(blocked["error"]["code"], json!("d1.target_guard_locked"));
         migration.release().expect("retire migration lease");
         drop(migration);
 
-        let guard = acquire_d1_target_mutation_guard_at(root.clone(), "acct-1", "db-1")
-            .expect("curated mutation owns shared target guard");
+        let guard =
+            acquire_d1_target_mutation_guard_at(root.clone(), "d1_execute_write", "acct-1", "db-1")
+                .expect("curated mutation owns shared target guard");
         let blocked = acquire_d1_migration_lease_at(
             root.clone(),
             "acct-1",
@@ -3977,10 +4029,20 @@ mod tests {
     #[test]
     fn shared_target_guard_allows_distinct_databases_concurrently() {
         let root = private_test_root("shared-target-guard-distinct-targets");
-        let first = acquire_d1_target_mutation_guard_at(root.clone(), "acct-1", "db-1")
-            .expect("first target guard");
-        let second = acquire_d1_target_mutation_guard_at(root.clone(), "acct-1", "db-2")
-            .expect("different target guard");
+        let first = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_rename_database",
+            "acct-1",
+            "db-1",
+        )
+        .expect("first target guard");
+        let second = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_delete_database",
+            "acct-1",
+            "db-2",
+        )
+        .expect("different target guard");
         assert_ne!(first.target_key_sha256, second.target_key_sha256);
         drop((first, second));
         fs::remove_dir_all(root).expect("test cleanup");
@@ -3990,13 +4052,24 @@ mod tests {
     #[test]
     fn shared_target_guard_blocks_a_second_curated_mutation_on_the_same_database() {
         let root = private_test_root("shared-target-guard-same-target");
-        let first = acquire_d1_target_mutation_guard_at(root.clone(), "acct-1", "db-1")
-            .expect("first curated mutation owns shared target guard");
-        let blocked = acquire_d1_target_mutation_guard_at(root.clone(), "acct-1", "db-1")
-            .expect_err("second same-target mutation must fail closed")
-            .structured_content
-            .expect("structured contention error");
+        let first = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_rename_database",
+            "acct-1",
+            "db-1",
+        )
+        .expect("first curated mutation owns shared target guard");
+        let blocked = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_delete_database",
+            "acct-1",
+            "db-1",
+        )
+        .expect_err("second same-target mutation must fail closed")
+        .structured_content
+        .expect("structured contention error");
         assert_eq!(blocked["error"]["code"], json!("d1.target_guard_locked"));
+        assert_eq!(blocked["operation"], json!("d1_delete_database"));
         drop(first);
         fs::remove_dir_all(root).expect("test cleanup");
     }

@@ -3878,7 +3878,11 @@ impl CloudflareMcp {
                 "dry_run_note": "No D1 database rename applied.",
             }))
         } else {
-            let guard = match acquire_d1_target_mutation_guard(account_id, database_id) {
+            let guard = match acquire_d1_target_mutation_guard(
+                "d1_rename_database",
+                account_id,
+                database_id,
+            ) {
                 Ok(guard) => guard,
                 Err(result) => return Ok(finalize_mutation_result(result, &plan, audit, false)),
             };
@@ -4004,7 +4008,11 @@ impl CloudflareMcp {
                 "request_plan": request_plan,
             }))
         } else {
-            let guard = match acquire_d1_target_mutation_guard(account_id, database_id) {
+            let guard = match acquire_d1_target_mutation_guard(
+                "d1_delete_database",
+                account_id,
+                database_id,
+            ) {
                 Ok(guard) => guard,
                 Err(result) => return Ok(finalize_mutation_result(result, &plan, audit, false)),
             };
@@ -4407,10 +4415,11 @@ impl CloudflareMcp {
                 },
             })));
         }
-        let guard = match acquire_d1_target_mutation_guard(account_id, database_id) {
-            Ok(guard) => guard,
-            Err(result) => return Ok(result),
-        };
+        let guard =
+            match acquire_d1_target_mutation_guard("d1_execute_write", account_id, database_id) {
+                Ok(guard) => guard,
+                Err(result) => return Ok(result),
+            };
         if let Err(result) = guard.revalidate() {
             return Ok(result);
         }
@@ -15777,7 +15786,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_find_operations_prefers_curated_d1_delete_and_rename_tools() {
+    async fn api_find_operations_prefers_only_complete_curated_d1_mutation_tools() {
         let server = test_server("http://127.0.0.1:9".to_string());
         let result = server
             .cloudflare_api_find_operations(Parameters(ApiFindOperationsArgs {
@@ -15800,7 +15809,7 @@ mod tests {
         }));
         assert!(results.iter().any(|result| {
             result["operation_id"] == json!("d1-update-partial-database")
-                && result["preferred_tool"] == json!("d1_rename_database")
+                && result["preferred_tool"].is_null()
         }));
     }
 
@@ -17279,8 +17288,8 @@ mod tests {
                 args(Some(" acct-1"), Some("bad-name"), Vec::new(), "bad family"),
                 expected_d1_reconciliation_semantic_error(
                     "d1.invalid_target_identity",
-                    "account_id must be a non-empty canonical identifier, not a dot path segment, and without surrounding whitespace",
-                    "Use the exact account_id and database_id read from the intended Cloudflare resource.",
+                    "account_id must be an exact 1..=256 byte ASCII identifier containing only letters, digits, '_' or '-'",
+                    "Use the exact account_id and database_id returned by Cloudflare; whitespace, NUL, dot, path, percent-encoded and other equivalent aliases are rejected.",
                 ),
             ),
             (

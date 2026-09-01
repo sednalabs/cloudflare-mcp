@@ -107,6 +107,8 @@ Canonical account and database components are exact ASCII path identifiers;
 whitespace, NUL, dot, slash, backslash, percent-encoded and other alias forms
 are rejected before target hashing or provider dispatch. Different database
 targets may proceed concurrently; the same account/database target cannot.
+Guard failures retain the invoked curated tool name in `operation` and report
+zero provider calls and mutations, so the blocked caller remains traceable.
 Local reconcile/finalize/abort tools manipulate retained custody evidence only
 and are not provider D1 mutation surfaces.
 
