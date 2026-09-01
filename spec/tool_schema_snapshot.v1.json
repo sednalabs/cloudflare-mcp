@@ -1783,8 +1783,8 @@
         },
         "required": [
           "database_id",
-          "execution_session_sha256",
-          "sql"
+          "sql",
+          "execution_session_sha256"
         ],
         "type": "object"
       },
