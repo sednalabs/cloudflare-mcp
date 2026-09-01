@@ -1,8 +1,9 @@
 //! Side-effect-free exact-byte planning and DML acknowledgement classification.
 //!
 //! This module deliberately owns no provider client, tool route, custody, or
-//! audit behavior. It also does not reuse migration-result semantics: an
-//! `UPDATE` or `DELETE` that matches no row is a valid terminal DML result.
+//! audit behavior. It also does not reuse migration-result semantics: a
+//! primary-served successful DML statement with exact zero mutation counts is
+//! a valid terminal unchanged result for every allowed statement kind.
 
 use serde::Serialize;
 use serde_json::Value;
@@ -58,7 +59,6 @@ pub(crate) enum D1WriteResultClassification {
     WriteNotServedByPrimary,
     WriteMetadataContradictory,
     WriteMetadataDidNotProveMutation,
-    ZeroChangeNotTerminalForStatementKind,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -192,17 +192,6 @@ pub(crate) fn classify_d1_execute_write_result(
         ));
     }
     let zero_change = !changed_db;
-    if zero_change
-        && !matches!(
-            statement_kind,
-            D1WriteStatementKind::Update | D1WriteStatementKind::Delete
-        )
-    {
-        return Err(ambiguous(
-            D1WriteResultClassification::ZeroChangeNotTerminalForStatementKind,
-            "only UPDATE or DELETE may terminate successfully with zero changed rows",
-        ));
-    }
     Ok(D1ExecuteWriteOutcome {
         statement_kind,
         changed_db,
@@ -381,26 +370,20 @@ mod tests {
     }
 
     #[test]
-    fn update_and_delete_zero_change_are_terminal() {
-        for statement_kind in [D1WriteStatementKind::Update, D1WriteStatementKind::Delete] {
+    fn every_allowed_dml_kind_accepts_conclusive_zero_change() {
+        for statement_kind in [
+            D1WriteStatementKind::Insert,
+            D1WriteStatementKind::Update,
+            D1WriteStatementKind::Delete,
+            D1WriteStatementKind::Replace,
+        ] {
             let outcome = classify_d1_execute_write_result(statement_kind, &result(false, 0, 0))
-                .expect("zero-change update/delete is terminal");
+                .expect("primary-served zero-change DML is terminal unchanged evidence");
+            assert_eq!(outcome.statement_kind, statement_kind);
             assert!(!outcome.changed_db);
             assert!(outcome.zero_change);
             assert_eq!(outcome.changes, 0);
             assert_eq!(outcome.rows_written, 0);
-        }
-    }
-
-    #[test]
-    fn insert_and_replace_zero_change_are_rejected() {
-        for statement_kind in [D1WriteStatementKind::Insert, D1WriteStatementKind::Replace] {
-            let error = classify_d1_execute_write_result(statement_kind, &result(false, 0, 0))
-                .expect_err("zero-change insert/replace is ambiguous");
-            assert_eq!(
-                error.classification,
-                D1WriteResultClassification::ZeroChangeNotTerminalForStatementKind
-            );
         }
     }
 
