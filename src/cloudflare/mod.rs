@@ -2,6 +2,8 @@ mod analytics_engine;
 pub(crate) mod bulk_redirects;
 mod capabilities;
 pub mod client;
+#[allow(dead_code)] // staged low-level boundary; lifecycle consumers are intentionally out of scope
+pub(crate) mod d1_import_upload;
 mod email_routing;
 pub mod model;
 mod pages;

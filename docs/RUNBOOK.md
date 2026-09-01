@@ -206,6 +206,30 @@ cannot reconcile or retire bootstrap-family custody.
 
 ## Exact-byte D1 migration manifests
 
+### Private SQL artifact and upload boundary
+
+The reusable private-artifact boundary is intentionally lower-level than any D1
+import workflow. It opens a local SQL artifact through held Linux descriptors,
+applies the migration custody root/ancestor/owner/mode/hardlink policy, including
+root-or-current-operator ownership for every external ancestor, hashes
+the exact stable descriptor bytes, and re-proves the descriptor-to-path binding
+before a later caller may upload those bytes.
+
+The upload adapter requires the exact account and database context that produced
+the D1 import-init response. It accepts only the corresponding canonical
+Cloudflare R2 account hostname over HTTPS, never follows redirects, and disables
+automatic HTTP retries. Errors
+and receipts omit the local path, SQL, presigned URL, account ID, and database
+ID. This boundary alone is not an operational import procedure and provides no
+admission, retry, ingest, poll, reconciliation, or terminal authority.
+
+The provider contract is documented by Cloudflare's
+[D1 import API](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/import/)
+and [R2 presigned URL guidance](https://developers.cloudflare.com/r2/api/s3/presigned-urls/).
+The presigned hostname binds the account, while the initiating D1 request
+context must independently bind the database; the URL alone is not database
+authority.
+
 Use `d1_apply_migration_manifest` for an approval-gated D1 migration family.
 Never pass the reserved exact family `migration-ledger-bootstrap-v1` to this
 generic tool or to generic reconciliation/finalization. Only the dedicated
