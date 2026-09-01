@@ -16531,7 +16531,7 @@ mod tests {
                         "accounts": [{
                             "d1AnalyticsAdaptiveGroups": [{
                                 "sum": {"rowsRead": 10, "rowsWritten": 4},
-                                "dimensions": {"date": "2026-06-02", "databaseId": "db-1"}
+                                "dimensions": {"date": "2026-06-02", "databaseId": "123e4567-e89b-42d3-a456-426614174000"}
                             }]
                         }]
                     }
@@ -17148,7 +17148,7 @@ mod tests {
                 "errors": [],
                 "messages": [],
                 "result": [{
-                    "uuid": "db-1",
+                    "uuid": "123e4567-e89b-42d3-a456-426614174000",
                     "name": "staff-db",
                     "created_at": "2026-05-01T00:00:00Z"
                 }],
@@ -17261,7 +17261,7 @@ mod tests {
         ) -> D1ReconcileMigrationManifestArgs {
             D1ReconcileMigrationManifestArgs {
                 account_id: account_id.map(str::to_string),
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 migration_family: migration_family.to_string(),
                 migrations_table: migrations_table.map(str::to_string),
                 manifest,
@@ -17372,7 +17372,7 @@ mod tests {
             .cloudflare_d1_apply_migration_manifest(
                 Parameters(D1ApplyMigrationManifestArgs {
                     account_id: Some(" acct-1".to_string()),
-                    database_id: "db-1".to_string(),
+                    database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                     migration_family: "audience".to_string(),
                     migrations_table: None,
                     manifest: vec![D1MigrationManifestEntry {
@@ -17399,8 +17399,16 @@ mod tests {
     async fn d1_manifest_rejects_dot_segments_before_provider_url_construction() {
         let sql = "CREATE TABLE t(id TEXT);".to_string();
         for (account_id, database_id, label) in [
-            (".", "db-1", "account current-directory segment"),
-            ("..", "db-1", "account parent-directory segment"),
+            (
+                ".",
+                "123e4567-e89b-42d3-a456-426614174000",
+                "account current-directory segment",
+            ),
+            (
+                "..",
+                "123e4567-e89b-42d3-a456-426614174000",
+                "account parent-directory segment",
+            ),
             ("acct-1", ".", "database current-directory segment"),
             ("acct-1", "..", "database parent-directory segment"),
         ] {
@@ -17444,12 +17452,22 @@ mod tests {
                 .expect("make lease root private");
         }
         let digest = "a".repeat(64);
-        let mut first =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "audience", &digest)
-                .expect("first family lease");
-        let second =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "control", &digest)
-                .expect_err("family must not split one target lease");
+        let mut first = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "audience",
+            &digest,
+        )
+        .expect("first family lease");
+        let second = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "control",
+            &digest,
+        )
+        .expect_err("family must not split one target lease");
         assert_eq!(
             second.structured_content.expect("structured error")["error"]["code"],
             json!("d1.migration_target_guard_locked")
@@ -17484,7 +17502,7 @@ mod tests {
         let mut lease = acquire_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "audience",
             &"a".repeat(64),
         )
@@ -17495,7 +17513,7 @@ mod tests {
         let payload = d1_manifest_contextualize_failure(
             prefix,
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "audience",
             "d1_migrations",
             &manifest,
@@ -17517,7 +17535,7 @@ mod tests {
         let payload = d1_manifest_contextualize_failure(
             d1_manifest_plan_mismatch_result(
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "audience",
                 "d1_migrations",
                 &manifest,
@@ -17525,7 +17543,7 @@ mod tests {
                 &computed,
             ),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "audience",
             "d1_migrations",
             &manifest,
@@ -17564,9 +17582,14 @@ mod tests {
         fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o770))
             .expect("make same-owner ancestor writable");
 
-        let error =
-            acquire_d1_migration_lease_at(root, "acct-1", "db-1", "audience", &"a".repeat(64))
-                .expect_err("same-owner writable non-sticky ancestor must fail closed");
+        let error = acquire_d1_migration_lease_at(
+            root,
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "audience",
+            &"a".repeat(64),
+        )
+        .expect_err("same-owner writable non-sticky ancestor must fail closed");
         assert_eq!(
             error.structured_content.expect("unsafe root error")["error"]["code"],
             json!("d1.migration_lease_root_unsafe")
@@ -17579,13 +17602,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn d1_manifest_target_rejects_aliases_and_preserves_replacement_lease() {
-        let error =
-            normalize_d1_target(" acct-1", "db-1").expect_err("account whitespace alias must fail");
+        let error = normalize_d1_target(" acct-1", "123e4567-e89b-42d3-a456-426614174000")
+            .expect_err("account whitespace alias must fail");
         assert_eq!(
             error.structured_content.expect("error")["error"]["code"],
             json!("d1.invalid_target_identity")
         );
-        let error = normalize_d1_target("acct-1", "db-1 ")
+        let error = normalize_d1_target("acct-1", "123e4567-e89b-42d3-a456-426614174000 ")
             .expect_err("database whitespace alias must fail");
         assert_eq!(
             error.structured_content.expect("error")["error"]["code"],
@@ -17598,9 +17621,14 @@ mod tests {
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
                 .expect("make lease root private");
         }
-        let mut first =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "first", &"a".repeat(64))
-                .expect("first lease");
+        let mut first = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "first",
+            &"a".repeat(64),
+        )
+        .expect("first lease");
         #[cfg(unix)]
         assert_eq!(
             std::os::unix::fs::MetadataExt::mode(
@@ -17623,7 +17651,7 @@ mod tests {
         let mut replacement = acquire_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "second",
             &"b".repeat(64),
         )
@@ -17665,7 +17693,10 @@ mod tests {
             bodies: Arc::new(Mutex::new(Vec::new())),
         };
         let router = Router::new()
-            .route("/accounts/acct-1/d1/database/db-1/query", post(query_d1))
+            .route(
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
+                post(query_d1),
+            )
             .with_state(state.clone());
         let server = test_server(spawn_router(router).await);
         let first_sql = "CREATE TABLE submissions(id TEXT);".to_string();
@@ -17688,7 +17719,7 @@ mod tests {
             .cloudflare_d1_apply_migration_manifest(
                 Parameters(D1ApplyMigrationManifestArgs {
                     account_id: None,
-                    database_id: "db-1".to_string(),
+                    database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                     migration_family: "newsletter-core".to_string(),
                     migrations_table: None,
                     manifest,
@@ -17778,7 +17809,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -17787,7 +17818,7 @@ mod tests {
         let result = server
             .cloudflare_d1_apply_migrations(Parameters(D1ApplyMigrationsArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 migrations_directory: dir.to_string_lossy().to_string(),
                 migrations_table: None,
                 dry_run: true,
@@ -17881,7 +17912,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -17890,7 +17921,7 @@ mod tests {
         let result = server
             .cloudflare_d1_apply_migrations(Parameters(D1ApplyMigrationsArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 migrations_directory: dir.to_string_lossy().to_string(),
                 migrations_table: Some("custom_migrations".to_string()),
                 dry_run: false,
@@ -17953,7 +17984,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -17962,7 +17993,7 @@ mod tests {
         let result = server
             .cloudflare_d1_apply_migrations(Parameters(D1ApplyMigrationsArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 migrations_directory: dir.to_string_lossy().to_string(),
                 migrations_table: None,
                 dry_run: false,
@@ -18008,7 +18039,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -18018,7 +18049,7 @@ mod tests {
         let result = server
             .cloudflare_d1_query_read_only(Parameters(D1QueryArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 sql: "INSERT INTO users VALUES (1)".to_string(),
                 params: Vec::new(),
                 max_rows: None,
@@ -18061,7 +18092,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -18071,7 +18102,7 @@ mod tests {
         let result = server
             .cloudflare_d1_query_read_only(Parameters(D1QueryArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 sql: "SELECT id FROM users WHERE id > ?".to_string(),
                 params: vec![json!(0)],
                 max_rows: Some(2),
@@ -18129,7 +18160,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -18138,7 +18169,7 @@ mod tests {
         let result = server
             .cloudflare_d1_query_read_only(Parameters(D1QueryArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 sql: "SELECT type, name, tbl_name, sql FROM sqlite_master".to_string(),
                 params: vec![],
                 max_rows: None,
@@ -18180,7 +18211,7 @@ mod tests {
         }
 
         let router = Router::new().route(
-            "/accounts/acct-1/d1/database/db-1/query",
+            "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
             axum::routing::post(query_d1),
         );
         let server = test_server(spawn_router(router).await);
@@ -18188,7 +18219,7 @@ mod tests {
         let result = server
             .cloudflare_d1_query_read_only(Parameters(D1QueryArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 sql: "SELECT id FROM submissions".to_string(),
                 params: vec![],
                 max_rows: None,
@@ -18216,7 +18247,7 @@ mod tests {
         }
 
         let router = Router::new().route(
-            "/accounts/acct-1/d1/database/db-1/query",
+            "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
             axum::routing::post(query_d1),
         );
         let server = test_server(spawn_router(router).await);
@@ -18224,7 +18255,7 @@ mod tests {
         let result = server
             .cloudflare_d1_query_read_only(Parameters(D1QueryArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 sql: "SELECT source_type FROM submissions".to_string(),
                 params: vec![],
                 max_rows: None,
@@ -18269,7 +18300,7 @@ mod tests {
         }
 
         let router = Router::new().route(
-            "/accounts/acct-1/d1/database/db-1/query",
+            "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
             axum::routing::post(query_d1),
         );
         let server = test_server(spawn_router(router).await);
@@ -18277,7 +18308,7 @@ mod tests {
         let result = server
             .cloudflare_d1_query_read_only(Parameters(D1QueryArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 sql: "SELECT id FROM missing_table".to_string(),
                 params: vec![],
                 max_rows: None,
@@ -18334,7 +18365,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -18343,7 +18374,7 @@ mod tests {
         let result = server
             .cloudflare_d1_validate_query(Parameters(D1ValidateQueryArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 sql: "SELECT id FROM missing_table".to_string(),
                 include_query_plan: true,
             }))
@@ -18415,7 +18446,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -18424,7 +18455,7 @@ mod tests {
         let missing_column = server
             .cloudflare_d1_validate_query(Parameters(D1ValidateQueryArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 sql: "SELECT missing_col FROM open_submissions".to_string(),
                 include_query_plan: false,
             }))
@@ -18445,7 +18476,7 @@ mod tests {
         let valid = server
             .cloudflare_d1_validate_query(Parameters(D1ValidateQueryArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 sql: "SELECT id FROM open_submissions".to_string(),
                 include_query_plan: true,
             }))
@@ -18513,7 +18544,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -18522,7 +18553,7 @@ mod tests {
         let result = server
             .cloudflare_d1_inspect_schema(Parameters(D1InspectSchemaArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 include_columns: true,
                 include_tables: Vec::new(),
                 include_table_pattern: None,
@@ -18623,7 +18654,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -18632,7 +18663,7 @@ mod tests {
         let result = server
             .cloudflare_d1_inspect_schema(Parameters(D1InspectSchemaArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 include_columns: true,
                 include_tables: Vec::new(),
                 include_table_pattern: None,
@@ -18756,7 +18787,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -18765,7 +18796,7 @@ mod tests {
         let result = server
             .cloudflare_d1_inspect_schema(Parameters(D1InspectSchemaArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 include_columns: true,
                 include_tables: Vec::new(),
                 include_table_pattern: None,
@@ -18864,7 +18895,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -18873,7 +18904,7 @@ mod tests {
         let result = server
             .cloudflare_d1_inspect_schema(Parameters(D1InspectSchemaArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 include_columns: true,
                 include_tables: Vec::new(),
                 include_table_pattern: None,
@@ -18967,7 +18998,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -18976,7 +19007,7 @@ mod tests {
         let result = server
             .cloudflare_d1_inspect_schema(Parameters(D1InspectSchemaArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 include_columns: true,
                 include_tables: vec!["Submissions".to_string()],
                 include_table_pattern: Some("submission_*".to_string()),
@@ -19051,7 +19082,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -19060,7 +19091,7 @@ mod tests {
         let result = server
             .cloudflare_d1_inspect_schema(Parameters(D1InspectSchemaArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 include_columns: false,
                 include_tables: Vec::new(),
                 include_table_pattern: None,
@@ -19128,7 +19159,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -19137,7 +19168,7 @@ mod tests {
         let result = server
             .cloudflare_d1_inspect_schema(Parameters(D1InspectSchemaArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 include_columns: true,
                 include_tables: Vec::new(),
                 include_table_pattern: None,
@@ -19185,7 +19216,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -19194,7 +19225,7 @@ mod tests {
         let result = server
             .cloudflare_d1_inspect_schema(Parameters(D1InspectSchemaArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 include_columns: false,
                 include_tables: Vec::new(),
                 include_table_pattern: None,
@@ -19398,7 +19429,7 @@ mod tests {
                 "success": true,
                 "errors": [],
                 "messages": [],
-                "result": [{"uuid": "db-1", "name": "staff"}],
+                "result": [{"uuid": "123e4567-e89b-42d3-a456-426614174000", "name": "staff"}],
                 "result_info": {"page": 1, "per_page": 100, "count": 1, "total_count": 1}
             }))
         }

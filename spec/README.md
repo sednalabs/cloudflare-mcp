@@ -108,14 +108,15 @@ Preserved curated tool families:
   `d1_inspect_schema` supports targeted `include_tables`/`include_table_pattern`
   filtering and must keep Cloudflare internal `_cf_*` objects out of
   application `column_errors`.
-- Existing-target identity is one strict account/database path-segment
-  grammar. Every curated provider mutation validates it before hashing,
-  planning or dispatch. Whitespace, NUL, dot, slash, backslash,
-  percent-encoded and other noncanonical aliases fail closed. Rename, delete
-  and row-write hold the same permanent account/database `guard.lock` used by
-  bootstrap and manifest leases. The legacy directory migration apply is
-  read-only/retired; local reconciliation finalizers do not send provider D1
-  mutations.
+- Existing-target identity uses the exact account identifier plus Cloudflare's
+  canonical lowercase hyphenated UUID `database_id`. Every curated provider
+  mutation validates both before hashing, planning or dispatch. Uppercase,
+  mixed-case, compact or braced database UUID aliases, plus whitespace, NUL,
+  dot, slash, backslash, percent-encoded and other noncanonical forms, fail
+  closed. Rename, delete and row-write hold the same permanent
+  account/database `guard.lock` used by bootstrap and manifest leases. The
+  legacy directory migration apply is read-only/retired; local reconciliation
+  finalizers do not send provider D1 mutations.
 - The first-ledger bootstrap (`d1_bootstrap_migration_ledger`) is a distinct
   mutating contract from manifest apply. Keep its exact empty-target dry-run
   digest, shared target custody, one-initializer maximum, no-retry ambiguity,

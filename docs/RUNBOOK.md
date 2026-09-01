@@ -223,8 +223,10 @@ Generic `api_mutate` is not a fallback for an existing D1 target. Delete,
 export, import, query/raw query, time-travel restore, full update and partial
 update are denied before request construction. Use the curated guarded tool
 where one exists; otherwise defer to a separately governed lifecycle. Always
-copy account and database IDs exactly from Cloudflare. Do not trim, encode or
-otherwise repair a rejected identity.
+copy account and database IDs exactly from Cloudflare. Existing D1 database IDs
+must be canonical lowercase hyphenated UUIDs; uppercase, mixed-case, compact or
+braced variants are aliases, not independent targets. Do not trim, recase,
+encode or otherwise repair a rejected identity.
 
 ### Private SQL artifact and upload boundary
 

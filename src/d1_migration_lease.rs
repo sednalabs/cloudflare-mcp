@@ -3992,25 +3992,38 @@ mod tests {
         let root = private_test_root("shared-target-guard-both-orders");
         let plan = "a".repeat(64);
 
-        let mut migration =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("migration owns shared target guard");
-        let blocked =
-            acquire_d1_target_mutation_guard_at(root.clone(), "d1_execute_write", "acct-1", "db-1")
-                .expect_err("curated mutation must not race migration")
-                .structured_content
-                .expect("structured contention error");
+        let mut migration = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("migration owns shared target guard");
+        let blocked = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_execute_write",
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect_err("curated mutation must not race migration")
+        .structured_content
+        .expect("structured contention error");
         assert_eq!(blocked["error"]["code"], json!("d1.target_guard_locked"));
         migration.release().expect("retire migration lease");
         drop(migration);
 
-        let guard =
-            acquire_d1_target_mutation_guard_at(root.clone(), "d1_execute_write", "acct-1", "db-1")
-                .expect("curated mutation owns shared target guard");
+        let guard = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_execute_write",
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect("curated mutation owns shared target guard");
         let blocked = acquire_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &"b".repeat(64),
         )
@@ -4033,14 +4046,14 @@ mod tests {
             root.clone(),
             "d1_rename_database",
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
         )
         .expect("first target guard");
         let second = acquire_d1_target_mutation_guard_at(
             root.clone(),
             "d1_delete_database",
             "acct-1",
-            "db-2",
+            "223e4567-e89b-42d3-a456-426614174000",
         )
         .expect("different target guard");
         assert_ne!(first.target_key_sha256, second.target_key_sha256);
@@ -4056,14 +4069,34 @@ mod tests {
             root.clone(),
             "d1_rename_database",
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
         )
         .expect("first curated mutation owns shared target guard");
+        let alias = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_delete_database",
+            "acct-1",
+            "123E4567-E89B-42D3-A456-426614174000",
+        )
+        .expect_err("case alias must fail before selecting another guard namespace")
+        .structured_content
+        .expect("structured alias error");
+        assert_eq!(
+            alias,
+            json!({
+                "ok": false,
+                "error": {
+                    "code": "d1.invalid_target_identity",
+                    "message": "database_id must be a canonical lowercase hyphenated UUID",
+                    "hint": "Use the exact lowercase database_id returned by Cloudflare; uppercase, mixed-case, compact, braced, whitespace, path and percent-encoded aliases are rejected."
+                }
+            })
+        );
         let blocked = acquire_d1_target_mutation_guard_at(
             root.clone(),
             "d1_delete_database",
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
         )
         .expect_err("second same-target mutation must fail closed")
         .structured_content
@@ -4234,7 +4267,13 @@ mod tests {
         linux::install_guard_pause_hook(root.clone(), entered_tx, resume_rx);
         let first_root = root.clone();
         let first = std::thread::spawn(move || {
-            acquire_d1_migration_lease_at(first_root, "acct-1", "db-1", "first", &"a".repeat(64))
+            acquire_d1_migration_lease_at(
+                first_root,
+                "acct-1",
+                "123e4567-e89b-42d3-a456-426614174000",
+                "first",
+                &"a".repeat(64),
+            )
         });
         entered_rx
             .recv_timeout(Duration::from_secs(5))
@@ -4243,7 +4282,7 @@ mod tests {
         let mut unrelated = acquire_d1_migration_lease_at(
             unrelated_root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "unrelated",
             &"c".repeat(64),
         )
@@ -4253,7 +4292,7 @@ mod tests {
         let contender = acquire_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "second",
             &"b".repeat(64),
         )
@@ -4272,9 +4311,14 @@ mod tests {
     #[test]
     fn failed_retirement_sync_restores_active_evidence_before_releasing_guard() {
         let root = private_test_root("release");
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "first", &"a".repeat(64))
-                .expect("owner lease");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "first",
+            &"a".repeat(64),
+        )
+        .expect("owner lease");
         let active = owner.active_path_for_test().expect("linux active path");
         let original = fs::read(&active).expect("original active evidence");
         linux::fail_next_directory_sync_for_test();
@@ -4300,7 +4344,7 @@ mod tests {
         let contender = acquire_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "second",
             &"b".repeat(64),
         )
@@ -4316,8 +4360,12 @@ mod tests {
     #[test]
     fn target_custody_preflight_is_read_only_when_absent_and_blocks_retained_active() {
         let root = private_test_root("preflight-existing-target");
-        preflight_d1_migration_target_custody_at(root.clone(), "acct-1", "db-1")
-            .expect("absent target is clear without creating custody");
+        preflight_d1_migration_target_custody_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect("absent target is clear without creating custody");
         assert_eq!(
             fs::read_dir(&root).expect("read untouched root").count(),
             0,
@@ -4327,7 +4375,7 @@ mod tests {
         let mut owner = acquire_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &"a".repeat(64),
         )
@@ -4335,8 +4383,12 @@ mod tests {
         owner.retain();
         drop(owner);
 
-        let error = preflight_d1_migration_target_custody_at(root.clone(), "acct-1", "db-1")
-            .expect_err("retained active evidence blocks before a provider read");
+        let error = preflight_d1_migration_target_custody_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect_err("retained active evidence blocks before a provider read");
         assert_eq!(
             error.structured_content.expect("preflight error")["error"]["code"],
             json!("d1.migration_target_lease_held")
@@ -4350,9 +4402,14 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let root = private_test_root("target-replacement");
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "first", &"a".repeat(64))
-                .expect("owner lease");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "first",
+            &"a".repeat(64),
+        )
+        .expect("owner lease");
         let target = owner
             .active_path_for_test()
             .expect("active path")
@@ -4392,9 +4449,14 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let root = private_test_root("abort-replacement");
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "first", &"a".repeat(64))
-                .expect("owner lease");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "first",
+            &"a".repeat(64),
+        )
+        .expect("owner lease");
         let active = owner.active_path_for_test().expect("active path");
         let displaced = active.with_extension("displaced");
         fs::rename(&active, &displaced).expect("displace owner active entry");
@@ -4446,7 +4508,7 @@ mod tests {
             let root = private_test_root(label);
             let target = root.join(format!(
                 "d1-migration-target-{}",
-                sha256_bytes_hex(b"acct-1\0db-1")
+                sha256_bytes_hex(b"acct-1\0123e4567-e89b-42d3-a456-426614174000")
             ));
             fs::create_dir(&target).expect("target directory");
             fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
@@ -4455,7 +4517,7 @@ mod tests {
             let error = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "first",
                 &"a".repeat(64),
             )
@@ -4471,7 +4533,7 @@ mod tests {
         let root = private_test_root("retiring");
         let target = root.join(format!(
             "d1-migration-target-{}",
-            sha256_bytes_hex(b"acct-1\0db-1")
+            sha256_bytes_hex(b"acct-1\0123e4567-e89b-42d3-a456-426614174000")
         ));
         fs::create_dir(&target).expect("target directory");
         fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
@@ -4483,9 +4545,14 @@ mod tests {
             fs::Permissions::from_mode(0o600),
         )
         .expect("private retiring evidence");
-        let error =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "first", &"a".repeat(64))
-                .expect_err("retiring entry must block a fresh owner");
+        let error = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "first",
+            &"a".repeat(64),
+        )
+        .expect_err("retiring entry must block a fresh owner");
         assert_eq!(
             error.structured_content.expect("retiring error")["error"]["code"],
             json!("d1.migration_target_retirement_unreconciled")
@@ -4503,7 +4570,7 @@ mod tests {
             let mut owner = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "first",
                 &"a".repeat(64),
             )
@@ -4557,7 +4624,7 @@ mod tests {
             let mut owner = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "first",
                 &"a".repeat(64),
             )
@@ -4606,7 +4673,7 @@ mod tests {
             let mut owner = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "first",
                 &"a".repeat(64),
             )
@@ -4652,9 +4719,14 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
 
         let root = private_test_root("release-idempotent");
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "first", &"a".repeat(64))
-                .expect("owner lease");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "first",
+            &"a".repeat(64),
+        )
+        .expect("owner lease");
         owner.release().expect("first release");
         let target = owner
             .active_path_for_test()
@@ -4713,7 +4785,7 @@ mod tests {
         let mut owner = acquire_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "migration-ledger-bootstrap-v1",
             &plan,
         )
@@ -4734,7 +4806,7 @@ mod tests {
         let retained = inspect_terminal_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "migration-ledger-bootstrap-v1",
             &plan,
             &identity.nonce,
@@ -4757,7 +4829,7 @@ mod tests {
         let mut owner = acquire_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "migration-ledger-bootstrap-v1",
             &plan,
         )
@@ -4772,7 +4844,7 @@ mod tests {
         let retained = inspect_terminal_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "migration-ledger-bootstrap-v1",
             &plan,
             &identity.nonce,
@@ -4795,9 +4867,14 @@ mod tests {
     fn retained_reconciliation_inspection_rebinds_exact_active_without_mutation() {
         let root = private_test_root("reconcile-exact");
         let plan = "a".repeat(64);
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("create retained evidence");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
         let identity = owner.identity.clone();
         let active = owner.active_path_for_test().expect("active path");
         let before = fs::read(&active).expect("active bytes");
@@ -4807,7 +4884,7 @@ mod tests {
         let retained = inspect_retained_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &identity.nonce,
@@ -4827,9 +4904,14 @@ mod tests {
     fn retained_reconciliation_accepts_exact_retiring_namespace_without_retiring_it() {
         let root = private_test_root("reconcile-retiring");
         let plan = "a".repeat(64);
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("create retained evidence");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
         let identity = owner.identity.clone();
         let active = owner.active_path_for_test().expect("active path");
         owner.retain();
@@ -4840,7 +4922,7 @@ mod tests {
         let retained = inspect_retained_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &identity.nonce,
@@ -4876,7 +4958,7 @@ mod tests {
             let mut owner = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
             )
@@ -4910,9 +4992,9 @@ mod tests {
                 _ => unreachable!(),
             }
             let database_id = if label == "cross-target" {
-                "db-2"
+                "223e4567-e89b-42d3-a456-426614174000"
             } else {
-                "db-1"
+                "123e4567-e89b-42d3-a456-426614174000"
             };
             let payload_sha256 = if label == "contradictory" {
                 "c".repeat(64)
@@ -4944,13 +5026,18 @@ mod tests {
     fn retained_reconciliation_stops_at_held_guard() {
         let root = private_test_root("reconcile-guard");
         let plan = "a".repeat(64);
-        let owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("held owner");
+        let owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("held owner");
         let error = inspect_retained_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &owner.identity.nonce,
@@ -4970,9 +5057,14 @@ mod tests {
     fn terminal_receipt_is_create_only_replayable_and_precedes_retirement() {
         let root = private_test_root("terminal-exact");
         let plan = "a".repeat(64);
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("create retained evidence");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
         let identity = owner.identity.clone();
         owner.retain();
         drop(owner);
@@ -4980,7 +5072,7 @@ mod tests {
         let mut retained = inspect_terminal_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &identity.nonce,
@@ -5015,7 +5107,7 @@ mod tests {
         let completed = inspect_terminal_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &identity.nonce,
@@ -5037,9 +5129,14 @@ mod tests {
     fn terminal_receipt_exclusive_create_race_attributes_only_the_creator() {
         let root = private_test_root("terminal-receipt-exclusive-create-race");
         let plan = "a".repeat(64);
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("create retained evidence");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
         let identity = owner.identity.clone();
         owner.retain();
         drop(owner);
@@ -5047,7 +5144,7 @@ mod tests {
             inspect_terminal_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
                 &identity.nonce,
@@ -5101,9 +5198,14 @@ mod tests {
     fn terminal_receipt_failures_distinguish_pre_create_from_post_create_mutation() {
         let root = private_test_root("terminal-receipt-failure-accounting");
         let plan = "a".repeat(64);
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("create retained evidence");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
         let identity = owner.identity.clone();
         let target = owner
             .active_path_for_test()
@@ -5117,7 +5219,7 @@ mod tests {
         let retained = inspect_terminal_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &identity.nonce,
@@ -5181,9 +5283,14 @@ mod tests {
     fn terminal_evidence_readback_rejects_an_altered_receipt_as_unknown_custody() {
         let root = private_test_root("terminal-readback-altered-receipt");
         let plan = "a".repeat(64);
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("create retained evidence");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
         let identity = owner.identity.clone();
         let target = owner
             .active_path_for_test()
@@ -5197,7 +5304,7 @@ mod tests {
         let retained = inspect_terminal_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &identity.nonce,
@@ -5231,9 +5338,14 @@ mod tests {
     fn terminal_evidence_readback_rechecks_receipt_after_preliminary_stable_read() {
         let root = private_test_root("terminal-readback-final-recheck");
         let plan = "a".repeat(64);
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("create retained evidence");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
         let identity = owner.identity.clone();
         let target = owner
             .active_path_for_test()
@@ -5247,7 +5359,7 @@ mod tests {
         let retained = inspect_terminal_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &identity.nonce,
@@ -5295,9 +5407,14 @@ mod tests {
     fn terminal_evidence_readback_rechecks_lease_namespace_after_final_receipt_read() {
         let root = private_test_root("terminal-readback-final-lease-recheck");
         let plan = "a".repeat(64);
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("create retained evidence");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
         let identity = owner.identity.clone();
         let target = owner
             .active_path_for_test()
@@ -5311,7 +5428,7 @@ mod tests {
         let retained = inspect_terminal_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &identity.nonce,
@@ -5360,7 +5477,7 @@ mod tests {
             let mut owner = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
             )
@@ -5378,7 +5495,7 @@ mod tests {
             let retained = inspect_terminal_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
                 &identity.nonce,
@@ -5446,9 +5563,14 @@ mod tests {
     fn target_directory_enumeration_fails_closed_at_total_entry_limit() {
         let root = private_test_root("terminal-enumeration-total-limit");
         let plan = "a".repeat(64);
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("create retained evidence");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
         let identity = owner.identity.clone();
         let target = owner
             .active_path_for_test()
@@ -5461,7 +5583,7 @@ mod tests {
         let retained = inspect_terminal_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &identity.nonce,
@@ -5517,7 +5639,7 @@ mod tests {
             let mut owner = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
             )
@@ -5534,7 +5656,7 @@ mod tests {
             let retained = inspect_terminal_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
                 &identity.nonce,
@@ -5618,7 +5740,7 @@ mod tests {
             let mut owner = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
             )
@@ -5636,7 +5758,7 @@ mod tests {
             let mut retained = inspect_terminal_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
                 &identity.nonce,
@@ -5687,9 +5809,14 @@ mod tests {
     fn canonical_historical_receipt_sibling_preserves_exact_current_replay() {
         let root = private_test_root("terminal-receipt-historical-sibling");
         let plan = "a".repeat(64);
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("create retained evidence");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
         let identity = owner.identity.clone();
         let target = owner
             .active_path_for_test()
@@ -5714,7 +5841,7 @@ mod tests {
         let mut retained = inspect_terminal_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &identity.nonce,
@@ -5751,7 +5878,7 @@ mod tests {
             let mut owner = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
             )
@@ -5777,7 +5904,7 @@ mod tests {
             let retained = inspect_terminal_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
                 &identity.nonce,
@@ -5814,7 +5941,7 @@ mod tests {
             let mut owner = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
             )
@@ -5832,7 +5959,7 @@ mod tests {
             let mut retained = inspect_terminal_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
                 &identity.nonce,
@@ -5897,9 +6024,14 @@ mod tests {
     fn terminal_retirement_sync_and_readback_failure_never_infers_retired_custody() {
         let root = private_test_root("terminal-sync-readback-failure");
         let plan = "a".repeat(64);
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("create retained evidence");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
         let identity = owner.identity.clone();
         let target = owner
             .active_path_for_test()
@@ -5913,7 +6045,7 @@ mod tests {
         let mut retained = inspect_terminal_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &identity.nonce,
@@ -5968,7 +6100,7 @@ mod tests {
             let mut owner = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
             )
@@ -5980,7 +6112,7 @@ mod tests {
             let retained = inspect_terminal_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
                 &identity.nonce,
@@ -6037,7 +6169,7 @@ mod tests {
             let mut owner = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
             )
@@ -6073,7 +6205,7 @@ mod tests {
             let mut retained = inspect_terminal_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
                 &identity.nonce,
@@ -6105,7 +6237,7 @@ mod tests {
             let retired = inspect_terminal_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
                 &identity.nonce,
@@ -6133,7 +6265,7 @@ mod tests {
             let mut owner = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
             )
@@ -6176,7 +6308,7 @@ mod tests {
             let retained = inspect_terminal_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
                 &identity.nonce,
@@ -6217,7 +6349,7 @@ mod tests {
             let mut owner = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
             )
@@ -6249,7 +6381,7 @@ mod tests {
             let retained = inspect_terminal_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
                 &identity.nonce,
@@ -6269,9 +6401,14 @@ mod tests {
     fn terminal_retirement_without_receipt_and_conflicting_replay_fail_closed() {
         let root = private_test_root("terminal-order");
         let plan = "a".repeat(64);
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("create retained evidence");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
         let identity = owner.identity.clone();
         owner.release().expect("install retirement before receipt");
         drop(owner);
@@ -6279,7 +6416,7 @@ mod tests {
         let retired = inspect_terminal_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &identity.nonce,
@@ -6300,16 +6437,21 @@ mod tests {
         fs::remove_dir_all(root).expect("test cleanup");
 
         let root = private_test_root("terminal-conflict");
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("create retained evidence");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
         let identity = owner.identity.clone();
         owner.retain();
         drop(owner);
         let retained = inspect_terminal_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &identity.nonce,
