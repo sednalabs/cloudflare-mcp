@@ -921,15 +921,19 @@ target. Each read makes one no-redirect HTTP attempt with no adapter retry. The
 request/response custody binding covers the exact target, query and query
 digest, plan digest, and 1,001-row/4 MiB caps. The raw provider body must reach
 EOF within the byte cap before the shared duplicate-key-rejecting JSON decoder
-accepts it under the 32-container nesting bound. One successful result set must
-include an explicitly present, typed, empty `errors` array and prove primary
-service plus `changed_db=false`, `changes=0`, and `rows_written=0`. Only then
-does the adapter normalize the fixed projection and construct a frame. Do not
-feed generic `d1_query_read_only` JSON into this boundary.
+accepts it under the 32-container nesting bound. Following Cloudflare's [D1
+Query API response
+contract](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/query/),
+the envelope must include an explicitly present, typed, empty `errors` array,
+while its one successful result set has only `meta`, `results`, and `success`.
+The result metadata must prove primary service plus `changed_db=false`,
+`changes=0`, and `rows_written=0`. Only then does the adapter normalize the
+fixed projection and construct a frame. Do not feed generic
+`d1_query_read_only` JSON into this boundary.
 
 Network ambiguity, redirects or non-success status, incomplete or oversized
 bodies, duplicate keys, excessive JSON nesting, missing/malformed/non-empty
-result-set errors, malformed envelopes, non-primary or mutating metadata,
+envelope errors, malformed envelopes, non-primary or mutating metadata,
 response-binding drift, identity reuse, a cap change, and the 1,001st row are
 terminal unavailable evidence for that attempt. A first-read failure stops
 before the second request; a second-read failure preserves the truthful

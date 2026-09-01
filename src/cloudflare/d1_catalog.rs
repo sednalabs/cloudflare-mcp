@@ -586,7 +586,6 @@ struct D1CatalogProviderResultSet {
     success: bool,
     results: Vec<D1CatalogProviderRow>,
     meta: D1CatalogProviderMetadata,
-    errors: Vec<D1CatalogProviderIssue>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -754,10 +753,10 @@ impl D1CatalogProviderBoundary for CloudflareClient {
                 lifecycle,
             ));
         }
-        if !result_set.success || !result_set.errors.is_empty() {
+        if !result_set.success {
             return Err(custody_error(
                 D1CatalogProviderCustodyClassification::ProviderQueryUnsuccessful,
-                "catalog provider result set did not prove one successful error-free query",
+                "catalog provider result set did not prove one successful query",
                 lifecycle,
             ));
         }
@@ -912,12 +911,12 @@ mod tests {
 
     fn exact_provider_body(
         outer_success_fields: &str,
+        envelope_errors_fragment: &str,
         inner_success_fields: &str,
-        result_errors_fragment: &str,
         metadata_fields: &str,
     ) -> String {
         format!(
-            r#"{{{outer_success_fields},"errors":[],"messages":[],"result":[{{{inner_success_fields}{result_errors_fragment},"results":[],"meta":{{{metadata_fields}}}}}]}}"#
+            r#"{{{outer_success_fields}{envelope_errors_fragment},"messages":[],"result":[{{{inner_success_fields},"results":[],"meta":{{{metadata_fields}}}}}]}}"#
         )
     }
 
@@ -958,7 +957,6 @@ mod tests {
             "messages": [],
             "result": [{
                 "success": true,
-                "errors": [],
                 "results": rows,
                 "meta": {
                     "served_by_primary": true,
@@ -1277,26 +1275,26 @@ mod tests {
         let mut bodies = vec![
             exact_provider_body(
                 r#""success":false,"success":true"#,
-                r#""success":true"#,
                 r#","errors":[]"#,
+                r#""success":true"#,
                 &clean_meta,
             ),
             exact_provider_body(
                 r#""success":true,"success":false"#,
-                r#""success":true"#,
                 r#","errors":[]"#,
+                r#""success":true"#,
                 &clean_meta,
             ),
             exact_provider_body(
                 r#""success":true"#,
+                r#","errors":[]"#,
                 r#""success":false,"success":true"#,
-                r#","errors":[]"#,
                 &clean_meta,
             ),
             exact_provider_body(
                 r#""success":true"#,
-                r#""success":true,"success":false"#,
                 r#","errors":[]"#,
+                r#""success":true,"success":false"#,
                 &clean_meta,
             ),
         ];
@@ -1312,8 +1310,8 @@ mod tests {
         ] {
             bodies.push(exact_provider_body(
                 r#""success":true"#,
-                r#""success":true"#,
                 r#","errors":[]"#,
+                r#""success":true"#,
                 metadata,
             ));
         }
@@ -1333,7 +1331,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn result_set_errors_must_be_present_typed_and_empty() {
+    async fn official_query_response_shape_succeeds_without_nested_errors() {
+        let body = exact_provider_body(
+            r#""success":true"#,
+            r#","errors":[]"#,
+            r#""success":true"#,
+            &primary_read_only_metadata(""),
+        );
+        let custody = raw_provider_result(body)
+            .await
+            .expect("official query response shape must retain custody");
+        assert_eq!(custody.receipt.complete_response_bodies, 2);
+    }
+
+    #[tokio::test]
+    async fn envelope_errors_must_be_present_typed_empty_and_duplicate_safe() {
         let metadata = primary_read_only_metadata("");
         for fragment in [
             "",
@@ -1343,8 +1355,8 @@ mod tests {
         ] {
             let body = exact_provider_body(
                 r#""success":true"#,
-                r#""success":true"#,
                 fragment,
+                r#""success":true"#,
                 &metadata,
             );
             let error = raw_provider_error(body).await;
@@ -1356,8 +1368,8 @@ mod tests {
 
         let body = exact_provider_body(
             r#""success":true"#,
-            r#""success":true"#,
             r#","errors":[{"code":7500,"message":"private fixture detail"}]"#,
+            r#""success":true"#,
             &metadata,
         );
         let error = raw_provider_error(body).await;
@@ -1370,6 +1382,25 @@ mod tests {
                 .expect("error")
                 .contains("private fixture detail")
         );
+
+        for fragment in [
+            r#","errors":[{"code":7500,"message":"first"}],"errors":[]"#,
+            r#","errors":[],"errors":[{"code":7500,"message":"second"}]"#,
+        ] {
+            let body = exact_provider_body(
+                r#""success":true"#,
+                fragment,
+                r#""success":true"#,
+                &metadata,
+            );
+            let error = raw_provider_error(body).await;
+            assert_eq!(
+                error.classification,
+                D1CatalogProviderCustodyClassification::ResponseDuplicateObjectKey
+            );
+            assert_eq!(error.provider_calls, 1);
+            assert_eq!(error.complete_response_bodies, 1);
+        }
     }
 
     #[tokio::test]
@@ -1377,8 +1408,8 @@ mod tests {
         let at_limit_nesting = D1_MIGRATION_JSON_MAX_CONTAINER_DEPTH - 4;
         let at_limit = exact_provider_body(
             r#""success":true"#,
-            r#""success":true"#,
             r#","errors":[]"#,
+            r#""success":true"#,
             &primary_read_only_metadata(&format!(
                 r#","bounded_extension":{}"#,
                 nested_array_json(at_limit_nesting)
@@ -1393,8 +1424,8 @@ mod tests {
 
         let over_limit = exact_provider_body(
             r#""success":true"#,
-            r#""success":true"#,
             r#","errors":[]"#,
+            r#""success":true"#,
             &primary_read_only_metadata(&format!(
                 r#","bounded_extension":{}"#,
                 nested_array_json(at_limit_nesting + 1)

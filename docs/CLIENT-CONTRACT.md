@@ -358,11 +358,14 @@ Cloudflare client. The adapter binds the canonical account/database target,
 fixed query and its digest, plan digest, and exact row/byte caps to the request
 and response. It reads the raw provider body to EOF under the 4 MiB cap before
 the same duplicate-key-rejecting, 32-container JSON decoder used by high-custody
-migration reads. It requires one successful result set with an explicitly
-present, typed, empty `errors` array and rejects duplicate authority keys,
-excessive nesting, missing or malformed errors, network ambiguity, partial or
-oversized bodies, non-2xx status, malformed types, response-binding drift,
-identity reuse, and the 1,001-row sentinel without a second attempt or retry.
+migration reads. In accordance with Cloudflare's [D1 Query API response
+contract](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/query/),
+it requires an explicitly present, typed, empty top-level `errors` array and one
+successful result set shaped as `{meta, results, success}`. It rejects duplicate
+authority keys, excessive nesting, missing or malformed envelope errors,
+network ambiguity, partial or oversized bodies, non-2xx status, malformed
+types, response-binding drift, identity reuse, and the 1,001-row sentinel
+without a second attempt or retry.
 
 Each observation must prove a complete body under the exact 4 MiB byte cap, a
 literal `results_truncated=false` under the exact 1,001-row provider cap, and
