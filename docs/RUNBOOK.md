@@ -230,10 +230,15 @@ encode or otherwise repair a rejected identity.
 
 `d1_execute_write` is not operationally approved for a migration-managed
 target until its public route consumes the catalog-backed reserved-relation
-authority boundary. The staged boundary itself is side-effect-free: it parses
-one exact DML target, derives one fixed full `sqlite_master` table/view/trigger
-query capped with a sentinel row, and requires two independently
+authority boundary. The staged version-2 boundary itself is side-effect-free:
+it parses one exact DML target, derives one fixed full `sqlite_master`
+table/view/trigger query with `LIMIT 1001`, and requires two independently
 primary-served read-only results to produce one identical catalog snapshot.
+Each integration evidence envelope must contain exactly the plan-bound
+`provider_row_cap=1001`, literal `results_truncated=false`, and the provider
+result. A 1000-row generic read cap cannot satisfy the contract; a returned
+1001st row is the bounded overflow sentinel. Missing, non-boolean, true, nested,
+or otherwise ambiguous truncation evidence is a stop condition.
 Every configured migration-ledger identity must be present exactly once with a
 supported trigger-free schema. The local graph then follows matching table
 `BEFORE`/`AFTER` and view `INSTEAD OF` trigger effects transitively, including
@@ -242,7 +247,15 @@ write edges from the same stable table definitions: INSERT/REPLACE into an
 `AUTOINCREMENT` table reaches reserved `sqlite_sequence`; foreign-key
 `CASCADE`, `SET NULL`, and `SET DEFAULT` actions write the child relation and
 may activate further trigger or foreign-key edges. `RESTRICT` and `NO ACTION`
-are constraint-only and do not add child write edges. A direct, quoted, or reachable
+are constraint-only and do not add child write edges. A table must have a
+parenthesized definition body, and the parser consumes the complete body closure
+and suffix. Only the closed `STRICT`/`WITHOUT ROWID` option grammar is admitted;
+CTAS, arbitrary tails, duplicate options, and unsupported suffixes stop. Each
+`REFERENCES` tail is likewise consumed completely under the narrow optional
+parent-column plus `ON DELETE`/`ON UPDATE` action grammar. `MATCH`,
+`DEFERRABLE`, unknown `ON` clauses, duplicate actions, and stray tokens are
+deliberately unsupported and stop rather than defaulting to `NO ACTION`. A
+direct, quoted, or reachable
 configured ledger, `sqlite_*`, or `_cf_*` relation is denied before any DML
 provider dispatch. Schema-qualified targets, unsafe views, orphan or malformed
 triggers, duplicate or non-TEXT catalog rows, malformed or unresolved foreign-key

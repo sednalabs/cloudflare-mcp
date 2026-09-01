@@ -21,6 +21,8 @@ use crate::d1_target::{D1TargetIdentity, normalize_d1_target};
 
 pub(crate) const D1_WRITE_CATALOG_AUTHORITY_OPERATION: &str = "d1_write_catalog_authority";
 pub(crate) const D1_WRITE_CATALOG_MAX_OBJECTS: usize = 1_000;
+pub(crate) const D1_WRITE_CATALOG_REQUIRED_PROVIDER_ROW_CAP: usize =
+    D1_WRITE_CATALOG_MAX_OBJECTS + 1;
 const D1_WRITE_SQL_MAX_BYTES: usize = 1024 * 1024;
 const D1_WRITE_CATALOG_SQL_MAX_BYTES: usize = 4 * 1024 * 1024;
 
@@ -40,6 +42,7 @@ pub(crate) struct D1WriteCatalogAuthorityPlan {
     pub(crate) catalog_query_sha256: String,
     pub(crate) catalog_query_size_bytes: usize,
     pub(crate) max_catalog_objects: usize,
+    pub(crate) required_provider_row_cap: usize,
     #[serde(skip)]
     target_relation: String,
     #[serde(skip)]
@@ -62,6 +65,7 @@ pub(crate) struct D1WriteCatalogAuthorityReceipt {
     pub(crate) catalog_trigger_count: usize,
     pub(crate) reachable_relation_count: usize,
     pub(crate) stable_primary_readbacks: u8,
+    pub(crate) provider_row_cap: usize,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -78,6 +82,8 @@ pub(crate) enum D1WriteAuthorityClassification {
     CatalogResponseMalformed,
     CatalogReadNotPrimary,
     CatalogReadReportedMutation,
+    CatalogReadTruncated,
+    CatalogReadCapInsufficient,
     CatalogObjectLimitExceeded,
     CatalogRowNonText,
     CatalogRowDuplicate,
@@ -213,7 +219,7 @@ pub(crate) fn derive_d1_write_catalog_authority_plan(
          WHERE type IN ('table', 'view', 'trigger') \
          ORDER BY type COLLATE BINARY, name COLLATE BINARY \
          LIMIT {}",
-        D1_WRITE_CATALOG_MAX_OBJECTS + 1
+        D1_WRITE_CATALOG_REQUIRED_PROVIDER_ROW_CAP
     );
     let reserved_relation_set_sha256 = hash_serialized(
         &configured_ledgers
@@ -222,7 +228,7 @@ pub(crate) fn derive_d1_write_catalog_authority_plan(
             .collect::<Vec<_>>(),
     );
     let plan = D1WriteCatalogAuthorityPlan {
-        version: 1,
+        version: 2,
         operation: D1_WRITE_CATALOG_AUTHORITY_OPERATION,
         account_id: target.account_id.clone(),
         database_id: target.database_id.clone(),
@@ -236,6 +242,7 @@ pub(crate) fn derive_d1_write_catalog_authority_plan(
         catalog_query_sha256: sha256_hex(catalog_query.as_bytes()),
         catalog_query_size_bytes: catalog_query.len(),
         max_catalog_objects: D1_WRITE_CATALOG_MAX_OBJECTS,
+        required_provider_row_cap: D1_WRITE_CATALOG_REQUIRED_PROVIDER_ROW_CAP,
         target_relation: parsed.target_relation,
         trigger_events: parsed.trigger_events,
         configured_ledgers,
@@ -249,8 +256,8 @@ pub(crate) fn authorize_d1_write_catalog(
     first_readback: &Value,
     second_readback: &Value,
 ) -> Result<D1WriteCatalogAuthorityReceipt, D1WriteAuthorityError> {
-    let first = parse_catalog_readback(first_readback)?;
-    let second = parse_catalog_readback(second_readback)?;
+    let first = parse_catalog_readback(plan, first_readback)?;
+    let second = parse_catalog_readback(plan, second_readback)?;
     if first.rows != second.rows {
         return Err(authority_error(
             D1WriteAuthorityClassification::CatalogReadbacksUnstable,
@@ -261,7 +268,7 @@ pub(crate) fn authorize_d1_write_catalog(
     let reachable_relation_count = prove_reachability(plan, &first)?;
     let catalog_snapshot_sha256 = hash_serialized(&first.rows);
     Ok(D1WriteCatalogAuthorityReceipt {
-        version: 1,
+        version: 2,
         operation: D1_WRITE_CATALOG_AUTHORITY_OPERATION,
         target_key_sha256: plan.target_key_sha256.clone(),
         statement_kind: plan.statement_kind,
@@ -273,6 +280,7 @@ pub(crate) fn authorize_d1_write_catalog(
         catalog_trigger_count: first.triggers_by_parent.values().map(Vec::len).sum(),
         reachable_relation_count,
         stable_primary_readbacks: 2,
+        provider_row_cap: plan.required_provider_row_cap,
     })
 }
 
@@ -309,13 +317,58 @@ fn normalize_configured_ledgers(
     Ok(normalized)
 }
 
-fn parse_catalog_readback(value: &Value) -> Result<CatalogSnapshot, D1WriteAuthorityError> {
-    let result_sets = value.as_array().ok_or_else(|| {
+fn parse_catalog_readback(
+    plan: &D1WriteCatalogAuthorityPlan,
+    value: &Value,
+) -> Result<CatalogSnapshot, D1WriteAuthorityError> {
+    let envelope = value.as_object().ok_or_else(|| {
         authority_error(
             D1WriteAuthorityClassification::CatalogResponseMalformed,
-            "catalog readback did not contain one D1 result-set array",
+            "catalog readback did not contain the exact completeness envelope",
         )
     })?;
+    if envelope.len() != 3
+        || !envelope.contains_key("provider_row_cap")
+        || !envelope.contains_key("results_truncated")
+        || !envelope.contains_key("result")
+    {
+        return Err(authority_error(
+            D1WriteAuthorityClassification::CatalogResponseMalformed,
+            "catalog readback did not contain the exact completeness envelope",
+        ));
+    }
+    if envelope.get("provider_row_cap").and_then(Value::as_u64)
+        != Some(plan.required_provider_row_cap as u64)
+    {
+        return Err(authority_error(
+            D1WriteAuthorityClassification::CatalogReadCapInsufficient,
+            "catalog readback did not prove the plan-bound provider row capacity",
+        ));
+    }
+    match envelope.get("results_truncated").and_then(Value::as_bool) {
+        Some(false) => {}
+        Some(true) => {
+            return Err(authority_error(
+                D1WriteAuthorityClassification::CatalogReadTruncated,
+                "catalog readback reported truncated authority evidence",
+            ));
+        }
+        None => {
+            return Err(authority_error(
+                D1WriteAuthorityClassification::CatalogResponseMalformed,
+                "catalog readback did not contain a literal non-truncation marker",
+            ));
+        }
+    }
+    let result_sets = envelope
+        .get("result")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            authority_error(
+                D1WriteAuthorityClassification::CatalogResponseMalformed,
+                "catalog readback did not contain one D1 result-set array",
+            )
+        })?;
     let [result_set] = result_sets.as_slice() else {
         return Err(authority_error(
             D1WriteAuthorityClassification::CatalogResponseMalformed,
@@ -328,6 +381,27 @@ fn parse_catalog_readback(value: &Value) -> Result<CatalogSnapshot, D1WriteAutho
             "catalog result set was not an object",
         )
     })?;
+    match result_set.get("results_truncated") {
+        Some(Value::Bool(true)) => {
+            return Err(authority_error(
+                D1WriteAuthorityClassification::CatalogReadTruncated,
+                "catalog readback reported truncated authority evidence",
+            ));
+        }
+        Some(_) | None if result_set.contains_key("original_result_count") => {
+            return Err(authority_error(
+                D1WriteAuthorityClassification::CatalogResponseMalformed,
+                "catalog result contained ambiguous row-limiter evidence",
+            ));
+        }
+        Some(_) => {
+            return Err(authority_error(
+                D1WriteAuthorityClassification::CatalogResponseMalformed,
+                "catalog result contained an unexpected truncation marker",
+            ));
+        }
+        None => {}
+    }
     if result_set.get("success").and_then(Value::as_bool) != Some(true) {
         return Err(authority_error(
             D1WriteAuthorityClassification::CatalogResponseMalformed,
@@ -587,12 +661,16 @@ fn validate_relation_schema(
         return Err(catalog_schema_malformed());
     }
     if kind == &RelationKind::View {
+        if !token_is_word(tokens.get(next), "as") || next + 1 >= tokens.len() {
+            return Err(catalog_schema_malformed());
+        }
         return Ok((false, Vec::new()));
     }
     let Some(SqlToken::Symbol('(')) = tokens.get(next) else {
-        return Ok((false, Vec::new()));
+        return Err(catalog_schema_malformed());
     };
-    let segments = table_definition_segments(&tokens, next)?;
+    let (segments, after_body) = table_definition_segments(&tokens, next)?;
+    validate_table_options(&tokens[after_body..])?;
     let autoincrement = segments.iter().any(|segment| {
         segment
             .iter()
@@ -619,7 +697,7 @@ fn validate_relation_schema(
 fn table_definition_segments(
     tokens: &[SqlToken],
     opening_parenthesis: usize,
-) -> Result<Vec<&[SqlToken]>, D1WriteAuthorityError> {
+) -> Result<(Vec<&[SqlToken]>, usize), D1WriteAuthorityError> {
     let mut segments = Vec::new();
     let mut depth = 1usize;
     let mut start = opening_parenthesis + 1;
@@ -635,7 +713,7 @@ fn table_definition_segments(
                         return Err(catalog_schema_malformed());
                     }
                     segments.push(&tokens[start..index]);
-                    return Ok(segments);
+                    return Ok((segments, index + 1));
                 }
             }
             SqlToken::Symbol(',') if depth == 1 => {
@@ -651,6 +729,39 @@ fn table_definition_segments(
     Err(catalog_schema_malformed())
 }
 
+fn validate_table_options(tokens: &[SqlToken]) -> Result<(), D1WriteAuthorityError> {
+    let mut cursor = 0usize;
+    let mut strict_seen = false;
+    let mut without_rowid_seen = false;
+    while cursor < tokens.len() {
+        if token_is_word(tokens.get(cursor), "strict") {
+            if strict_seen {
+                return Err(catalog_schema_malformed());
+            }
+            strict_seen = true;
+            cursor += 1;
+        } else if token_is_word(tokens.get(cursor), "without")
+            && token_is_word(tokens.get(cursor + 1), "rowid")
+        {
+            if without_rowid_seen {
+                return Err(catalog_schema_malformed());
+            }
+            without_rowid_seen = true;
+            cursor += 2;
+        } else {
+            return Err(catalog_schema_malformed());
+        }
+        if cursor == tokens.len() {
+            break;
+        }
+        if tokens.get(cursor) != Some(&SqlToken::Symbol(',')) || cursor + 1 == tokens.len() {
+            return Err(catalog_schema_malformed());
+        }
+        cursor += 1;
+    }
+    Ok(())
+}
+
 fn parse_foreign_key_definition(
     segment: &[SqlToken],
     reference_index: usize,
@@ -663,19 +774,21 @@ fn parse_foreign_key_definition(
     let mut on_update = ForeignKeyAction::NoAction;
     let mut delete_seen = false;
     let mut update_seen = false;
-    let mut cursor = next;
+    let mut cursor = if segment.get(next) == Some(&SqlToken::Symbol('(')) {
+        parse_identifier_list(segment, next)?
+    } else {
+        next
+    };
     while cursor < segment.len() {
         if !token_is_word(segment.get(cursor), "on") {
-            cursor += 1;
-            continue;
+            return Err(catalog_schema_malformed());
         }
         let (slot, seen) = if token_is_word(segment.get(cursor + 1), "delete") {
             (&mut on_delete, &mut delete_seen)
         } else if token_is_word(segment.get(cursor + 1), "update") {
             (&mut on_update, &mut update_seen)
         } else {
-            cursor += 1;
-            continue;
+            return Err(catalog_schema_malformed());
         };
         if *seen {
             return Err(catalog_schema_malformed());
@@ -690,6 +803,22 @@ fn parse_foreign_key_definition(
         on_delete,
         on_update,
     })
+}
+
+fn parse_identifier_list(
+    tokens: &[SqlToken],
+    opening_parenthesis: usize,
+) -> Result<usize, D1WriteAuthorityError> {
+    let mut cursor = opening_parenthesis + 1;
+    loop {
+        let (_, next) = relation_identifier(tokens, cursor)?;
+        cursor = next;
+        match tokens.get(cursor) {
+            Some(SqlToken::Symbol(',')) => cursor += 1,
+            Some(SqlToken::Symbol(')')) => return Ok(cursor + 1),
+            _ => return Err(catalog_schema_malformed()),
+        }
+    }
 }
 
 fn parse_foreign_key_action(
@@ -1359,17 +1488,21 @@ mod tests {
     }
 
     fn response(rows: Vec<Value>) -> Value {
-        json!([{
-            "success": true,
-            "errors": [],
-            "results": rows,
-            "meta": {
-                "served_by_primary": true,
-                "changed_db": false,
-                "changes": 0,
-                "rows_written": 0,
-            }
-        }])
+        json!({
+            "provider_row_cap": D1_WRITE_CATALOG_REQUIRED_PROVIDER_ROW_CAP,
+            "results_truncated": false,
+            "result": [{
+                "success": true,
+                "errors": [],
+                "results": rows,
+                "meta": {
+                    "served_by_primary": true,
+                    "changed_db": false,
+                    "changes": 0,
+                    "rows_written": 0,
+                }
+            }]
+        })
     }
 
     fn plan(sql: &str, ledgers: &[&str]) -> D1WriteCatalogAuthorityPlan {
@@ -1403,10 +1536,14 @@ mod tests {
             &["d1_migrations".to_string()],
         )
         .expect("baseline plan");
-        assert_eq!(baseline.version, 1);
+        assert_eq!(baseline.version, 2);
         assert_eq!(baseline.target_key_sha256, target().target_key_sha256());
         assert_eq!(baseline.reserved_relation_count, 1);
         assert_eq!(baseline.max_catalog_objects, D1_WRITE_CATALOG_MAX_OBJECTS);
+        assert_eq!(
+            baseline.required_provider_row_cap,
+            D1_WRITE_CATALOG_REQUIRED_PROVIDER_ROW_CAP
+        );
         assert!(query.contains("FROM sqlite_master"));
         assert!(query.contains("LIMIT 1001"));
         assert_eq!(baseline.catalog_query_sha256, sha256_hex(query.as_bytes()));
@@ -1553,6 +1690,45 @@ mod tests {
             assert_eq!(receipt.reachable_relation_count, 1);
             assert_eq!(receipt.catalog_object_count, 3);
             assert_eq!(receipt.catalog_trigger_count, 0);
+        }
+    }
+
+    #[test]
+    fn table_schema_body_and_suffix_are_fully_consumed() {
+        for sql in [
+            "CREATE TABLE \"audit\" AS SELECT 1 AS id",
+            "CREATE TABLE \"audit\"",
+            "CREATE TABLE \"audit\"(id INTEGER PRIMARY KEY) UNKNOWN",
+            "CREATE TABLE \"audit\"(id INTEGER PRIMARY KEY) AUTOINCREMENT",
+            "CREATE TABLE \"audit\"(id INTEGER PRIMARY KEY) STRICT STRICT",
+            "CREATE TABLE \"audit\"(id INTEGER PRIMARY KEY) WITHOUT ROWID STRICT",
+            "CREATE TABLE \"audit\"(id INTEGER PRIMARY KEY) STRICT,",
+            "CREATE TABLE \"audit\"(id INTEGER PRIMARY KEY) STRICT MALICIOUS;",
+        ] {
+            let catalog = response(vec![
+                ledger("d1_migrations"),
+                table("items"),
+                table_sql("audit", sql),
+            ]);
+            let plan = plan("UPDATE items SET value = ?", &["d1_migrations"]);
+            assert_eq!(
+                classification(&plan, &catalog, &catalog),
+                D1WriteAuthorityClassification::CatalogSchemaMalformed,
+                "{sql}"
+            );
+        }
+
+        for sql in [
+            "CREATE TABLE \"items\"(id INTEGER PRIMARY KEY, value TEXT)",
+            "CREATE TABLE \"items\"(id INTEGER PRIMARY KEY, value TEXT) STRICT",
+            "CREATE TABLE \"items\"(id INTEGER PRIMARY KEY, value TEXT) WITHOUT ROWID",
+            "CREATE TABLE \"items\"(id INTEGER PRIMARY KEY, value TEXT) STRICT, WITHOUT ROWID",
+            "CREATE TABLE \"items\"(id INTEGER PRIMARY KEY, value TEXT) WITHOUT ROWID, STRICT;",
+        ] {
+            let catalog = response(vec![ledger("d1_migrations"), table_sql("items", sql)]);
+            let plan = plan("UPDATE items SET value = ?", &["d1_migrations"]);
+            authorize_d1_write_catalog(&plan, &catalog, &catalog)
+                .expect("closed supported table option grammar");
         }
     }
 
@@ -1829,6 +2005,10 @@ mod tests {
         for child_sql in [
             "CREATE TABLE \"audit\"(parent_id INTEGER REFERENCES \"items\"(id) ON DELETE CASCADE ON DELETE SET NULL)",
             "CREATE TABLE \"audit\"(parent_id INTEGER REFERENCES \"items\"(id) ON DELETE UNKNOWN)",
+            "CREATE TABLE \"audit\"(parent_id INTEGER REFERENCES \"items\"(id) ON FOO CASCADE)",
+            "CREATE TABLE \"audit\"(parent_id INTEGER REFERENCES \"items\"(id) ON DELETE CASCADE STRAY)",
+            "CREATE TABLE \"audit\"(parent_id INTEGER REFERENCES \"items\"(id) MATCH simple)",
+            "CREATE TABLE \"audit\"(parent_id INTEGER REFERENCES \"items\"(id) DEFERRABLE)",
             "CREATE TABLE \"audit\"(parent_id INTEGER REFERENCES main.items(id) ON DELETE CASCADE)",
             "CREATE TABLE \"audit\"(parent_id INTEGER REFERENCES \"missing\"(id) ON DELETE CASCADE)",
         ] {
@@ -1962,31 +2142,31 @@ mod tests {
             D1WriteAuthorityClassification::CatalogResponseMalformed,
         ));
         let mut failed = valid.clone();
-        failed[0]["success"] = json!(false);
+        failed["result"][0]["success"] = json!(false);
         cases.push((
             failed,
             D1WriteAuthorityClassification::CatalogResponseMalformed,
         ));
         let mut errors = valid.clone();
-        errors[0]["errors"] = json!([{"message": "private provider detail"}]);
+        errors["result"][0]["errors"] = json!([{"message": "private provider detail"}]);
         cases.push((
             errors,
             D1WriteAuthorityClassification::CatalogResponseMalformed,
         ));
         let mut non_primary = valid.clone();
-        non_primary[0]["meta"]["served_by_primary"] = json!(false);
+        non_primary["result"][0]["meta"]["served_by_primary"] = json!(false);
         cases.push((
             non_primary,
             D1WriteAuthorityClassification::CatalogReadNotPrimary,
         ));
         let mut mutating = valid.clone();
-        mutating[0]["meta"]["changed_db"] = json!(true);
+        mutating["result"][0]["meta"]["changed_db"] = json!(true);
         cases.push((
             mutating,
             D1WriteAuthorityClassification::CatalogReadReportedMutation,
         ));
         let mut missing_count = valid.clone();
-        missing_count[0]["meta"]
+        missing_count["result"][0]["meta"]
             .as_object_mut()
             .expect("meta")
             .remove("changes");
@@ -2004,6 +2184,98 @@ mod tests {
             assert!(!serialized.contains("d1_migrations"));
             assert!(!serialized.contains("items"));
         }
+    }
+
+    #[test]
+    fn completeness_envelope_is_exact_and_cannot_use_the_generic_thousand_row_cap() {
+        let plan = plan("UPDATE items SET value = 1", &["d1_migrations"]);
+        let valid = response(safe_rows("d1_migrations"));
+
+        let mut truncated = valid.clone();
+        truncated["results_truncated"] = json!(true);
+        assert_eq!(
+            classification(&plan, &truncated, &truncated),
+            D1WriteAuthorityClassification::CatalogReadTruncated
+        );
+
+        let mut nested_truncated = valid.clone();
+        nested_truncated["result"][0]["results_truncated"] = json!(true);
+        nested_truncated["result"][0]["original_result_count"] = json!(1001);
+        assert_eq!(
+            classification(&plan, &nested_truncated, &nested_truncated),
+            D1WriteAuthorityClassification::CatalogReadTruncated
+        );
+
+        let mut non_boolean = valid.clone();
+        non_boolean["results_truncated"] = json!("false");
+        assert_eq!(
+            classification(&plan, &non_boolean, &non_boolean),
+            D1WriteAuthorityClassification::CatalogResponseMalformed
+        );
+
+        let mut missing = valid.clone();
+        missing
+            .as_object_mut()
+            .expect("envelope")
+            .remove("results_truncated");
+        assert_eq!(
+            classification(&plan, &missing, &missing),
+            D1WriteAuthorityClassification::CatalogResponseMalformed
+        );
+
+        let mut generic_cap = valid.clone();
+        generic_cap["provider_row_cap"] = json!(1000);
+        assert_eq!(
+            classification(&plan, &generic_cap, &generic_cap),
+            D1WriteAuthorityClassification::CatalogReadCapInsufficient
+        );
+
+        let mut extra = valid.clone();
+        extra["unexpected"] = json!(false);
+        assert_eq!(
+            classification(&plan, &extra, &extra),
+            D1WriteAuthorityClassification::CatalogResponseMalformed
+        );
+    }
+
+    #[test]
+    fn one_thousand_rows_are_complete_but_a_truncated_late_row_is_never_hidden() {
+        let plan = plan("UPDATE items SET value = 1", &["d1_migrations"]);
+        let mut rows = vec![ledger("d1_migrations"), table("items")];
+        for index in 0..(D1_WRITE_CATALOG_MAX_OBJECTS - rows.len()) {
+            rows.push(table(&format!("safe_{index}")));
+        }
+        assert_eq!(rows.len(), D1_WRITE_CATALOG_MAX_OBJECTS);
+        let complete = response(rows.clone());
+        let receipt = authorize_d1_write_catalog(&plan, &complete, &complete)
+            .expect("the full 1000-row catalog is below the sentinel");
+        assert_eq!(receipt.catalog_object_count, D1_WRITE_CATALOG_MAX_OBJECTS);
+        assert_eq!(
+            receipt.provider_row_cap,
+            D1_WRITE_CATALOG_REQUIRED_PROVIDER_ROW_CAP
+        );
+
+        rows.push(trigger(
+            "zz_late_reserved_write",
+            "items",
+            "CREATE TRIGGER \"zz_late_reserved_write\" AFTER UPDATE ON \"items\" BEGIN UPDATE \"d1_migrations\" SET name = name; END",
+        ));
+        assert_eq!(
+            rows.len(),
+            D1_WRITE_CATALOG_REQUIRED_PROVIDER_ROW_CAP,
+            "the generic cap would omit the late reserved-write trigger"
+        );
+        rows.truncate(D1_WRITE_CATALOG_MAX_OBJECTS);
+        let mut late_reserved_or_trigger_row_omitted = response(rows);
+        late_reserved_or_trigger_row_omitted["results_truncated"] = json!(true);
+        assert_eq!(
+            classification(
+                &plan,
+                &late_reserved_or_trigger_row_omitted,
+                &late_reserved_or_trigger_row_omitted,
+            ),
+            D1WriteAuthorityClassification::CatalogReadTruncated
+        );
     }
 
     #[test]
