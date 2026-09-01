@@ -1,8 +1,11 @@
-//! Durable, cross-process custody for exact-byte D1 migration applies.
+//! Durable, cross-process custody for every governed D1 target mutation.
 //!
 //! A target directory and its guard are permanent. `active.lease.json` is
 //! evidence, not garbage: later processes stop for reconciliation when it is
-//! present. This module deliberately owns no MCP registration or provider I/O.
+//! present. Migration, bootstrap, generic-write, and import coordinators share
+//! this one target namespace so no writer can race another through a parallel
+//! marker family. This module deliberately owns no MCP registration or provider
+//! I/O.
 
 #[cfg(test)]
 use std::collections::HashMap;
@@ -30,6 +33,10 @@ pub(crate) const D1_MANIFEST_LEASE_ROOT_ENV: &str = "CLOUDFLARE_MCP_D1_MIGRATION
 pub(crate) const D1_BOOTSTRAP_INITIALIZER_DISPATCH_PROTOCOL: &str =
     "bootstrap-initializer-attempt-marker-v1";
 static D1_MANIFEST_LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn d1_target_key_sha256(account_id: &str, database_id: &str) -> String {
+    sha256_bytes_hex(format!("{account_id}\0{database_id}").as_bytes())
+}
 
 // Kept test-only so production retirement has no injectable branch. Faults
 // are keyed by the exact lease nonce so a parallel retirement cannot consume
@@ -144,6 +151,27 @@ pub(crate) struct D1MigrationLeaseIdentity {
     pub(crate) payload_sha256: String,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum D1TargetWriter {
+    GenericWrite,
+    ImportAdmission,
+    ImportExecution,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct D1TargetLeaseBinding<'a> {
+    pub(crate) writer: D1TargetWriter,
+    pub(crate) execution_session_sha256: &'a str,
+    pub(crate) content_plan_sha256: &'a str,
+}
+
+#[derive(Debug)]
+pub(crate) enum D1TargetLeaseAcquisition {
+    Acquired(D1MigrationLease),
+    ExactTerminalReplay(D1MigrationLeaseIdentity),
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct D1RetainedMigrationLeaseIdentity {
     pub(crate) target_key_sha256: String,
@@ -164,6 +192,12 @@ struct D1RetainedMigrationLeasePayload {
     version: u8,
     #[serde(default)]
     initializer_dispatch_protocol: Option<String>,
+    #[serde(default)]
+    writer: Option<D1TargetWriter>,
+    #[serde(default)]
+    execution_session_sha256: Option<String>,
+    #[serde(default)]
+    content_plan_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -345,6 +379,20 @@ impl D1MigrationLease {
         }
     }
 
+    /// Durably retire an attempt that is proven not to have crossed its
+    /// provider dispatch boundary. Aborted receipts do not satisfy exact
+    /// terminal replay for a later invocation of the same session.
+    pub(crate) fn abort_before_dispatch(&mut self) -> Result<(), CallToolResult> {
+        #[cfg(target_os = "linux")]
+        {
+            self.retire_linux("aborted")
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(d1_lease_platform_unsupported())
+        }
+    }
+
     /// Preserve active evidence on every uncertain outcome.
     pub(crate) fn retain(&mut self) {
         #[cfg(target_os = "linux")]
@@ -441,6 +489,11 @@ impl D1MigrationLease {
 
     #[cfg(target_os = "linux")]
     fn release_linux(&mut self) -> Result<(), CallToolResult> {
+        self.retire_linux("retired")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn retire_linux(&mut self, terminal_prefix: &'static str) -> Result<(), CallToolResult> {
         if self.released {
             return Ok(());
         }
@@ -496,7 +549,7 @@ impl D1MigrationLease {
             }));
         }
 
-        let retired_name = format!("retired.{}.lease.json", self.identity.nonce);
+        let retired_name = format!("{terminal_prefix}.{}.lease.json", self.identity.nonce);
         rename_owned_lease_no_replace(
             &self.target,
             RETIRING_LEASE_NAME,
@@ -1542,6 +1595,68 @@ pub(crate) fn acquire_d1_migration_lease(
     acquire_d1_migration_lease_at(root, account_id, database_id, family, plan_sha256)
 }
 
+pub(crate) fn acquire_d1_target_lease(
+    account_id: &str,
+    database_id: &str,
+    approved_plan_sha256: Option<&str>,
+    binding: D1TargetLeaseBinding<'_>,
+) -> Result<D1TargetLeaseAcquisition, CallToolResult> {
+    let plan_sha256 = require_lower_sha256(
+        "approved_plan_sha256",
+        approved_plan_sha256.unwrap_or_default(),
+    )?;
+    require_lower_sha256("execution_session_sha256", binding.execution_session_sha256)?;
+    require_lower_sha256("content_plan_sha256", binding.content_plan_sha256)?;
+    let root = std::env::var(D1_MANIFEST_LEASE_ROOT_ENV)
+        .ok()
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| CallToolResult::structured_error(json!({
+            "ok": false,
+            "operation": "d1_target_mutation",
+            "error": {
+                "code": "d1.target_lease_root_unconfigured",
+                "message": "live D1 mutation requires the configured shared target lease root",
+                "hint": format!("Set {D1_MANIFEST_LEASE_ROOT_ENV} to the private directory shared by every MCP process that can write this D1 account/database target.")
+            }
+        })))?;
+    acquire_d1_target_lease_at(root, account_id, database_id, plan_sha256, binding)
+}
+
+fn require_lower_sha256<'a>(name: &'static str, value: &'a str) -> Result<&'a str, CallToolResult> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(value)
+    } else {
+        Err(invalid_argument_result(
+            "d1.target_lease_binding_invalid",
+            &format!("{name} must be an exact lowercase SHA-256 digest"),
+            "Use the exact digest returned by the matching dry-run plan.",
+        ))
+    }
+}
+
+pub(crate) fn acquire_d1_target_lease_at(
+    root: PathBuf,
+    account_id: &str,
+    database_id: &str,
+    plan_sha256: &str,
+    binding: D1TargetLeaseBinding<'_>,
+) -> Result<D1TargetLeaseAcquisition, CallToolResult> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::acquire_d1_target_lease_at_linux(root, account_id, database_id, plan_sha256, binding)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (root, account_id, database_id, plan_sha256, binding);
+        Err(d1_lease_platform_unsupported())
+    }
+}
+
 /// Read-only occupancy check for the permanent target namespace.  This runs
 /// before remote authority preflight so retained custody continues to block a
 /// fresh caller without any provider I/O.  It deliberately never creates the
@@ -2071,10 +2186,17 @@ mod linux {
         }
         let value: Value =
             serde_json::from_slice(&bytes).map_err(|_| "lease payload is no longer valid JSON")?;
-        if value["version"] != json!(2)
+        if !matches!(value["version"].as_u64(), Some(2 | 3))
             || value["target_key_sha256"] != json!(expected.target_key_sha256)
             || value["nonce"] != json!(expected.nonce)
             || value["approved_plan_sha256"].as_str().is_none()
+        {
+            return Err("lease payload no longer matches this invocation");
+        }
+        if value["version"] == json!(3)
+            && (value["writer"].as_str().is_none()
+                || value["execution_session_sha256"].as_str().is_none()
+                || value["content_plan_sha256"].as_str().is_none())
         {
             return Err("lease payload no longer matches this invocation");
         }
@@ -2119,6 +2241,186 @@ mod linux {
             .as_deref()
             .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
             .is_some_and(|value| value.is_object())
+    }
+
+    fn target_session_error(code: &'static str, message: &'static str) -> CallToolResult {
+        CallToolResult::structured_error(json!({
+            "ok": false,
+            "operation": "d1_target_mutation",
+            "status": "reconciliation_required",
+            "lease_retained": true,
+            "error": {
+                "code": code,
+                "message": message,
+                "hint": "Preserve the permanent target custody directory and reconcile the exact session evidence before another D1 mutation."
+            }
+        }))
+    }
+
+    fn classify_terminal_session_binding(
+        target: &fs::File,
+        target_key_sha256: &str,
+        plan_sha256: &str,
+        binding: &D1TargetLeaseBinding<'_>,
+    ) -> Result<Option<D1MigrationLeaseIdentity>, CallToolResult> {
+        let mut exact = None;
+        for raw_name in directory_entry_names(target).map_err(|_| {
+            target_session_error(
+                "d1.target_lease_namespace_unreadable",
+                "the permanent target custody namespace could not be enumerated",
+            )
+        })? {
+            if !raw_name.starts_with(b"retired.") || !raw_name.ends_with(b".lease.json") {
+                continue;
+            }
+            let name = String::from_utf8(raw_name).map_err(|_| {
+                target_session_error(
+                    "d1.target_lease_retired_evidence_malformed",
+                    "a retired target-lease filename is not valid UTF-8",
+                )
+            })?;
+            let nonce = name
+                .strip_prefix("retired.")
+                .and_then(|value| value.strip_suffix(".lease.json"))
+                .filter(|value| valid_retained_nonce(value))
+                .ok_or_else(|| {
+                    target_session_error(
+                        "d1.target_lease_retired_evidence_malformed",
+                        "a retired target-lease filename is not canonical",
+                    )
+                })?;
+            let named = open_named_entry(target, &name).map_err(|_| {
+                target_session_error(
+                    "d1.target_lease_retired_evidence_unreadable",
+                    "retired target-lease evidence could not be opened",
+                )
+            })?;
+            let metadata = named.metadata().map_err(|_| {
+                target_session_error(
+                    "d1.target_lease_retired_evidence_unreadable",
+                    "retired target-lease metadata is unavailable",
+                )
+            })?;
+            if !private_file(&metadata) || metadata.nlink() != 1 {
+                return Err(target_session_error(
+                    "d1.target_lease_retired_evidence_unsafe",
+                    "retired target-lease evidence is not one private unaliased regular file",
+                ));
+            }
+            let expected_identity = identity(&metadata);
+            let encoded_name = c_string_name(&name).map_err(|_| {
+                target_session_error(
+                    "d1.target_lease_retired_evidence_malformed",
+                    "a retired target-lease filename is not canonical",
+                )
+            })?;
+            let entry = open_at(
+                target.as_raw_fd(),
+                &encoded_name,
+                O_RDONLY | O_NOFOLLOW | O_CLOEXEC,
+                0,
+            )
+            .map_err(|_| {
+                target_session_error(
+                    "d1.target_lease_retired_evidence_unreadable",
+                    "retired target-lease evidence could not be rebound read-only",
+                )
+            })?;
+            let held_metadata = entry.metadata().map_err(|_| {
+                target_session_error(
+                    "d1.target_lease_retired_evidence_unreadable",
+                    "held retired target-lease metadata is unavailable",
+                )
+            })?;
+            if !private_file(&held_metadata)
+                || held_metadata.nlink() != 1
+                || identity(&held_metadata) != expected_identity
+            {
+                return Err(target_session_error(
+                    "d1.target_lease_retired_evidence_changed",
+                    "retired target-lease evidence changed while it was rebound",
+                ));
+            }
+            let bytes = read_held_file(&entry).map_err(|_| {
+                target_session_error(
+                    "d1.target_lease_retired_evidence_unreadable",
+                    "retired target-lease evidence could not be read exactly",
+                )
+            })?;
+            let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
+                target_session_error(
+                    "d1.target_lease_retired_evidence_malformed",
+                    "retired target-lease evidence is not valid JSON",
+                )
+            })?;
+            if serde_json::to_vec(&value).ok().as_deref() != Some(bytes.as_slice()) {
+                return Err(target_session_error(
+                    "d1.target_lease_retired_evidence_noncanonical",
+                    "retired target-lease evidence is not exact canonical JSON",
+                ));
+            }
+            let payload: D1RetainedMigrationLeasePayload =
+                serde_json::from_value(value).map_err(|_| {
+                    target_session_error(
+                        "d1.target_lease_retired_evidence_malformed",
+                        "retired target-lease evidence has an unexpected structure",
+                    )
+                })?;
+            if payload.target_key_sha256 != target_key_sha256 || payload.nonce != nonce {
+                return Err(target_session_error(
+                    "d1.target_lease_retired_evidence_conflict",
+                    "retired target-lease evidence contradicts its target or filename identity",
+                ));
+            }
+            if payload.version == 2 {
+                if payload.writer.is_some()
+                    || payload.execution_session_sha256.is_some()
+                    || payload.content_plan_sha256.is_some()
+                {
+                    return Err(target_session_error(
+                        "d1.target_lease_retired_evidence_conflict",
+                        "legacy retired target-lease evidence carries unexpected session authority",
+                    ));
+                }
+                continue;
+            }
+            if payload.version != 3
+                || payload.writer.is_none()
+                || payload.execution_session_sha256.is_none()
+                || payload.content_plan_sha256.is_none()
+            {
+                return Err(target_session_error(
+                    "d1.target_lease_retired_evidence_conflict",
+                    "retired target-lease session evidence is incomplete or uses an unsupported version",
+                ));
+            }
+            if payload.writer != Some(binding.writer)
+                || payload.execution_session_sha256.as_deref()
+                    != Some(binding.execution_session_sha256)
+            {
+                continue;
+            }
+            if payload.content_plan_sha256 != Some(binding.content_plan_sha256.to_string())
+                || payload.approved_plan_sha256 != plan_sha256
+            {
+                return Err(target_session_error(
+                    "d1.target_lease_session_conflict",
+                    "the execution session was already retired with different immutable content or approval",
+                ));
+            }
+            let identity = D1MigrationLeaseIdentity {
+                target_key_sha256: payload.target_key_sha256,
+                nonce: payload.nonce,
+                payload_sha256: sha256_bytes_hex(&bytes),
+            };
+            if exact.replace(identity).is_some() {
+                return Err(target_session_error(
+                    "d1.target_lease_duplicate_session_evidence",
+                    "more than one retired receipt claims the same execution session",
+                ));
+            }
+        }
+        Ok(exact)
     }
 
     pub(super) fn retained_entry_present(
@@ -3156,7 +3458,7 @@ mod linux {
         validate_root_path_binding(&root_path, &root, &root_identity)
             .map_err(|message| d1_lease_root_error("d1.migration_lease_root_unsafe", message))?;
 
-        let target_hash = sha256_bytes_hex(format!("{account_id}\0{database_id}").as_bytes());
+        let target_hash = d1_target_key_sha256(account_id, database_id);
         let target_name = format!("d1-migration-target-{target_hash}");
         let target_name_c = c_string_name(&target_name)
             .map_err(|message| d1_lease_root_error("d1.migration_lease_target_unsafe", message))?;
@@ -3421,6 +3723,46 @@ mod linux {
         family: &str,
         plan_sha256: &str,
     ) -> Result<D1MigrationLease, CallToolResult> {
+        match acquire_d1_lease_at_linux(
+            root_path,
+            account_id,
+            database_id,
+            family,
+            plan_sha256,
+            None,
+        )? {
+            D1TargetLeaseAcquisition::Acquired(lease) => Ok(lease),
+            D1TargetLeaseAcquisition::ExactTerminalReplay(_) => {
+                unreachable!("migration acquisitions do not carry session replay bindings")
+            }
+        }
+    }
+
+    pub(super) fn acquire_d1_target_lease_at_linux(
+        root_path: PathBuf,
+        account_id: &str,
+        database_id: &str,
+        plan_sha256: &str,
+        binding: D1TargetLeaseBinding<'_>,
+    ) -> Result<D1TargetLeaseAcquisition, CallToolResult> {
+        acquire_d1_lease_at_linux(
+            root_path,
+            account_id,
+            database_id,
+            "shared-d1-target-mutation-v1",
+            plan_sha256,
+            Some(binding),
+        )
+    }
+
+    fn acquire_d1_lease_at_linux(
+        root_path: PathBuf,
+        account_id: &str,
+        database_id: &str,
+        family: &str,
+        plan_sha256: &str,
+        binding: Option<D1TargetLeaseBinding<'_>>,
+    ) -> Result<D1TargetLeaseAcquisition, CallToolResult> {
         validate_root_and_ancestors(&root_path)
             .map_err(|message| d1_lease_root_error("d1.migration_lease_root_unsafe", message))?;
         let root_name = c_string_path(&root_path)
@@ -3482,12 +3824,23 @@ mod linux {
         )
         .map_err(|message| d1_lease_root_error("d1.migration_lease_custody_changed", message))?;
         maybe_pause_after_guard_for_test(&root_path);
+        if let Some(binding) = &binding
+            && let Some(replay) =
+                classify_terminal_session_binding(&target, &target_hash, plan_sha256, binding)?
+        {
+            return Ok(D1TargetLeaseAcquisition::ExactTerminalReplay(replay));
+        }
         let nonce = d1_migration_lease_nonce(&target_hash, plan_sha256);
         let bootstrap_initializer_dispatch_protocol = family == "migration-ledger-bootstrap-v1";
-        let mut payload = json!({"version": 2, "target_key_sha256": &target_hash, "nonce": &nonce, "approved_plan_sha256": plan_sha256, "migration_family": family, "created_at_unix_ms": now_unix_ms()});
+        let mut payload = json!({"version": if binding.is_some() { 3 } else { 2 }, "target_key_sha256": &target_hash, "nonce": &nonce, "approved_plan_sha256": plan_sha256, "migration_family": family, "created_at_unix_ms": now_unix_ms()});
         if bootstrap_initializer_dispatch_protocol {
             payload["initializer_dispatch_protocol"] =
                 json!(D1_BOOTSTRAP_INITIALIZER_DISPATCH_PROTOCOL);
+        }
+        if let Some(binding) = binding {
+            payload["writer"] = json!(binding.writer);
+            payload["execution_session_sha256"] = json!(binding.execution_session_sha256);
+            payload["content_plan_sha256"] = json!(binding.content_plan_sha256);
         }
         let encoded =
             serde_json::to_vec(&payload).expect("serializing lease payload is infallible");
@@ -3509,6 +3862,7 @@ mod linux {
             &encoded,
             bootstrap_initializer_dispatch_protocol,
         )
+        .map(D1TargetLeaseAcquisition::Acquired)
     }
 
     pub(super) fn sync_d1_lease_directory(directory: &fs::File) -> io::Result<()> {
@@ -3877,6 +4231,126 @@ mod tests {
         resume_tx.send(()).expect("resume first");
         let mut first = first.join().expect("first thread").expect("first lease");
         first.release().expect("retire first lease");
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_target_guard_binds_terminal_session_content_and_all_writer_orders() {
+        let root = private_test_root("shared-target-session");
+        let plan = "a".repeat(64);
+        let session = "b".repeat(64);
+        let content = "c".repeat(64);
+        let changed = "d".repeat(64);
+        let binding = || D1TargetLeaseBinding {
+            writer: D1TargetWriter::GenericWrite,
+            execution_session_sha256: &session,
+            content_plan_sha256: &content,
+        };
+
+        let mut target =
+            match acquire_d1_target_lease_at(root.clone(), "acct-1", "db-1", &plan, binding())
+                .expect("first target lease")
+            {
+                D1TargetLeaseAcquisition::Acquired(lease) => lease,
+                D1TargetLeaseAcquisition::ExactTerminalReplay(_) => panic!("no prior session"),
+            };
+        let blocked_migration = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "db-1",
+            "migration",
+            &"e".repeat(64),
+        )
+        .expect_err("target lease blocks migration writer");
+        assert_eq!(
+            blocked_migration
+                .structured_content
+                .expect("blocked migration")["error"]["code"],
+            json!("d1.migration_target_guard_locked")
+        );
+        target.release().expect("retire target session");
+
+        assert!(matches!(
+            acquire_d1_target_lease_at(root.clone(), "acct-1", "db-1", &plan, binding(),)
+                .expect("exact terminal replay"),
+            D1TargetLeaseAcquisition::ExactTerminalReplay(_)
+        ));
+        let conflict = acquire_d1_target_lease_at(
+            root.clone(),
+            "acct-1",
+            "db-1",
+            &plan,
+            D1TargetLeaseBinding {
+                writer: D1TargetWriter::GenericWrite,
+                execution_session_sha256: &session,
+                content_plan_sha256: &changed,
+            },
+        )
+        .expect_err("same session with changed content conflicts");
+        assert_eq!(
+            conflict.structured_content.expect("session conflict")["error"]["code"],
+            json!("d1.target_lease_session_conflict")
+        );
+
+        let mut migration = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "db-1",
+            "migration",
+            &"f".repeat(64),
+        )
+        .expect("migration lease after target retirement");
+        let blocked_target = acquire_d1_target_lease_at(
+            root.clone(),
+            "acct-1",
+            "db-1",
+            &"1".repeat(64),
+            D1TargetLeaseBinding {
+                writer: D1TargetWriter::ImportAdmission,
+                execution_session_sha256: &"2".repeat(64),
+                content_plan_sha256: &"3".repeat(64),
+            },
+        )
+        .expect_err("migration lease blocks admission writer");
+        assert_eq!(
+            blocked_target.structured_content.expect("blocked target")["error"]["code"],
+            json!("d1.migration_target_guard_locked")
+        );
+        migration.release().expect("retire migration");
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn predispatch_abort_does_not_create_terminal_session_replay() {
+        let root = private_test_root("shared-target-abort");
+        let plan = "a".repeat(64);
+        let session = "b".repeat(64);
+        let content = "c".repeat(64);
+        let binding = || D1TargetLeaseBinding {
+            writer: D1TargetWriter::ImportAdmission,
+            execution_session_sha256: &session,
+            content_plan_sha256: &content,
+        };
+        let mut first =
+            match acquire_d1_target_lease_at(root.clone(), "acct-1", "db-1", &plan, binding())
+                .expect("first target lease")
+            {
+                D1TargetLeaseAcquisition::Acquired(lease) => lease,
+                D1TargetLeaseAcquisition::ExactTerminalReplay(_) => panic!("no prior session"),
+            };
+        first.abort_before_dispatch().expect("durable abort");
+        let mut second =
+            match acquire_d1_target_lease_at(root.clone(), "acct-1", "db-1", &plan, binding())
+                .expect("aborted session can reacquire")
+            {
+                D1TargetLeaseAcquisition::Acquired(lease) => lease,
+                D1TargetLeaseAcquisition::ExactTerminalReplay(_) => {
+                    panic!("predispatch abort is not terminal success")
+                }
+            };
+        second.release().expect("terminal retirement");
         fs::remove_dir_all(root).expect("test cleanup");
     }
 

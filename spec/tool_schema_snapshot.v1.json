@@ -1516,6 +1516,48 @@
       "name": "d1_abort_bootstrap_migration_ledger"
     },
     {
+      "description": "Preview or persist one immutable provider-resident D1 database import admission under the shared account/database target lease.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "approved_request_sha256": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "content_plan_sha256": {
+            "type": "string"
+          },
+          "database_id": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "execution_session_sha256": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "database_id",
+          "content_plan_sha256",
+          "execution_session_sha256"
+        ],
+        "type": "object"
+      },
+      "name": "d1_admit_import_attempt"
+    },
+    {
       "description": "Apply a caller-supplied exact-byte D1 migration manifest under a target lease and approved dry-run plan.",
       "inputSchema": {
         "$defs": {
@@ -1735,11 +1777,18 @@
       "name": "d1_delete_database"
     },
     {
-      "description": "Execute one audited D1 row-write SQL statement with dry-run safety. Allows INSERT, UPDATE, DELETE, or REPLACE only.",
+      "description": "Execute one audited D1 row-write SQL statement under an immutable execution session and the shared target lease. Allows INSERT, UPDATE, DELETE, or REPLACE only.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
           "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "approved_plan_sha256": {
             "default": null,
             "type": [
               "string",
@@ -1752,6 +1801,13 @@
           "dry_run": {
             "default": false,
             "type": "boolean"
+          },
+          "execution_session_sha256": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "max_rows": {
             "default": null,
@@ -2341,6 +2397,41 @@
         "type": "object"
       },
       "name": "d1_query_read_only"
+    },
+    {
+      "description": "Read one exact provider-resident D1 import admission binding without mutation.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "content_plan_sha256": {
+            "type": "string"
+          },
+          "database_id": {
+            "type": "string"
+          },
+          "execution_session_sha256": {
+            "type": "string"
+          },
+          "request_sha256": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "database_id",
+          "request_sha256",
+          "content_plan_sha256",
+          "execution_session_sha256"
+        ],
+        "type": "object"
+      },
+      "name": "d1_read_import_admission"
     },
     {
       "description": "Read-only reconciliation of one exact retained migration-ledger bootstrap against two stable primary canonical empty-ledger proof windows.",

@@ -1195,6 +1195,8 @@ mod tests {
             "capabilities_check",
             "connector_control",
             "d1_apply_migrations",
+            "d1_admit_import_attempt",
+            "d1_read_import_admission",
             "d1_apply_migration_manifest",
             "d1_bootstrap_migration_ledger",
             "d1_reconcile_bootstrap_migration_ledger",

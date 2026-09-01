@@ -160,6 +160,15 @@ errors and receipts.
 This low-level boundary does not authorize import initialization, upload retry,
 ingest, polling, reconciliation, or any other lifecycle transition.
 
+Import admission authority is provider-resident and binds the exact
+account/database target, immutable content plan, and execution session. Its
+coordinator shares the same permanent target guard and active-evidence namespace
+as migrations, bootstrap, and generic writes; import-only check-then-act markers
+cannot exclude another writer. Admission is freshly re-read under that guard
+immediately before any future import initialization. Pre-dispatch failures may
+durably abort, but attempted provider mutations without exact readback retain
+the active blocker and are never replay authority.
+
 ## Hosted Upstream OAuth
 
 Inbound MCP authorization and Cloudflare provider authorization are separate
