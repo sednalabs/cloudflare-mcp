@@ -908,6 +908,27 @@ the `Rust Validation` workflow at `.github/workflows/rust-validation.yml`. Do
 not replace this check with a PR run, a branch-name inference, or a manually
 reconstructed commit identity.
 
+## Staged Stable D1 Catalog Evidence
+
+The internal catalog-evidence boundary is deliberately not an operator tool.
+It is a pure prerequisite for a later guarded composition path and performs no
+Cloudflare request or local/provider mutation.
+
+Its provider adapter must dispatch the fixed plan query twice. The two calls
+must use four distinct bounded dispatch/read identities and the canonical target
+returned by the D1 target normalizer. Do not feed generic `d1_query_read_only`
+JSON into this boundary. Normalize only the fixed projection after the provider
+read has proven a complete body, the exact 1,001-row and 4 MiB caps, successful
+primary service, and exact read-only metadata. Missing or non-boolean
+non-truncation evidence, a cap change, a 1,001st row, malformed/unknown payload
+fields, another target or plan, and changed row bytes between observations are
+terminal unavailable evidence for this proof attempt.
+
+This contract only establishes that two independent reads observed one stable
+catalog byte projection. Schema meaning and write reachability belong to the
+separate graph-authority boundary. Execution, custody, provider admission, and
+public routing must not infer authority from the catalog receipt alone.
+
 ## Safety Profiles
 
 ### Read-Only
