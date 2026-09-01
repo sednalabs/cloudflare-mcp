@@ -19,6 +19,7 @@ pub(crate) mod d1_migration_seed_rows;
 pub(crate) mod d1_migration_terminal;
 pub(crate) mod d1_migration_terminal_semantics;
 pub(crate) mod d1_target;
+pub(crate) mod d1_write_authority;
 pub mod dns_route;
 pub mod mutation;
 pub(crate) mod pages_deploy;

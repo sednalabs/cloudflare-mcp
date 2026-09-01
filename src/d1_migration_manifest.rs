@@ -745,7 +745,7 @@ fn legacy_wrangler_d1_migration_ledger_table_sql(table: &str) -> Option<String> 
     })
 }
 
-fn is_supported_d1_migration_ledger_table_sql(table_sql: &str, table: &str) -> bool {
+pub(crate) fn is_supported_d1_migration_ledger_table_sql(table_sql: &str, table: &str) -> bool {
     table_sql == expected_d1_migration_ledger_table_sql(table)
         || current_wrangler_d1_migration_ledger_table_sql(table).as_deref() == Some(table_sql)
         || legacy_wrangler_d1_migration_ledger_table_sql(table).as_deref() == Some(table_sql)

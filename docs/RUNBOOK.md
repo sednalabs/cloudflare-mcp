@@ -228,6 +228,26 @@ must be canonical lowercase hyphenated UUIDs; uppercase, mixed-case, compact or
 braced variants are aliases, not independent targets. Do not trim, recase,
 encode or otherwise repair a rejected identity.
 
+`d1_execute_write` is not operationally approved for a migration-managed
+target until its public route consumes the catalog-backed reserved-relation
+authority boundary. The staged boundary itself is side-effect-free: it parses
+one exact DML target, derives one fixed full `sqlite_master` table/view/trigger
+query capped with a sentinel row, and requires two independently
+primary-served read-only results to produce one identical catalog snapshot.
+Every configured migration-ledger identity must be present exactly once with a
+supported trigger-free schema. The local graph then follows matching table
+`BEFORE`/`AFTER` and view `INSTEAD OF` trigger effects transitively, including
+replace and upsert secondary trigger events. A direct, quoted, or reachable
+configured ledger, `sqlite_*`, or `_cf_*` relation is denied before any DML
+provider dispatch. Schema-qualified targets, unsafe views, orphan or malformed
+triggers, duplicate or non-TEXT catalog rows, ledger/schema drift, missing
+relations, sentinel overflow, non-primary evidence, readbacks that report a
+mutation, and disagreement between the two snapshots are stop conditions.
+The outward plan, receipt, and error vocabulary contains hashes, counts, and
+closed classifications rather than SQL or relation names. This proof does not
+provide dispatch custody, ambiguous-write recovery, or provider execution;
+those remain separate integration boundaries.
+
 ### Private SQL artifact and upload boundary
 
 The reusable private-artifact boundary is intentionally lower-level than any D1
