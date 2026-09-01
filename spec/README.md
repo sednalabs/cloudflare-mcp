@@ -88,14 +88,17 @@ Note on elicitation mode:
   and `Zone Settings Write` before the dry-run exposes a confirmation token.
   Missing or unverified permissions return guarded token inspection and repair
   calls instead of an interactive-login recommendation.
-- Generic `api_mutate` denies the exact `d1-query-database`,
-  `d1-raw-database-query`, `d1-import-database`, and
-  `d1-time-travel-restore` operations before request construction or provider
-  access. Query/raw SQL must use curated D1 policy surfaces; import and restore
-  require a separately governed curated lifecycle because they can replace
-  existing-target schema and data and have no preferred tool. Create, get,
-  list, export, and metadata operations retain their existing policy, while
-  delete retains its separate curated high-risk lifecycle.
+- Generic `api_mutate` denies the complete existing-target D1 mutation
+  inventory before request construction or provider access:
+  `d1-delete-database`, `d1-export-database`, `d1-import-database`,
+  `d1-query-database`, `d1-raw-database-query`,
+  `d1-time-travel-restore`, `d1-update-database`, and
+  `d1-update-partial-database`. Query/raw SQL and delete delegate to their named
+  curated tools. Export, import, restore, full metadata update and partial
+  metadata update remain denied until a complete governed curated lifecycle
+  exists; the rename-only tool cannot safely represent every partial-update
+  field. D1 create is not an existing-target mutation; GET operations remain
+  read-only catalog calls.
 - Apart from the explicit `api_mutate.token_permissions` field above,
   elicitation does not alter tool argument schemas; it changes pre-execution
   policy behavior.
@@ -105,6 +108,20 @@ Preserved curated tool families:
   `d1_inspect_schema` supports targeted `include_tables`/`include_table_pattern`
   filtering and must keep Cloudflare internal `_cf_*` objects out of
   application `column_errors`.
+- Existing-target identity uses the exact account identifier plus Cloudflare's
+  canonical lowercase hyphenated UUID `database_id`. Every curated provider
+  mutation validates both before hashing, planning or dispatch. Uppercase,
+  mixed-case, compact or braced database UUID aliases, plus whitespace, NUL,
+  dot, slash, backslash, percent-encoded and other noncanonical forms, fail
+  closed. Rename, delete and row-write hold the same permanent
+  account/database `guard.lock` used by bootstrap and manifest leases. The
+  legacy directory migration apply is read-only/retired; local reconciliation
+  finalizers do not send provider D1 mutations.
+  The version-2 identity contract activates only on a freshly provisioned
+  empty lease root: a bounded descriptor-relative audit under the permanent
+  root activation lock precedes creation of the exact activation marker. Any
+  unversioned canonical, alias, active, retiring, retired, terminal, malformed,
+  unreadable or over-limit entry blocks without deletion or migration.
 - The first-ledger bootstrap (`d1_bootstrap_migration_ledger`) is a distinct
   mutating contract from manifest apply. Keep its exact empty-target dry-run
   digest, shared target custody, one-initializer maximum, no-retry ambiguity,

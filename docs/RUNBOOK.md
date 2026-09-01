@@ -206,6 +206,28 @@ cannot reconcile or retire bootstrap-family custody.
 
 ## Exact-byte D1 migration manifests
 
+### Shared existing-target mutation guard
+
+Configure `CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT` for every MCP process that
+can run curated D1 rename, delete, row-write, bootstrap, or manifest mutation.
+The name is retained for compatibility, but the directory is now the shared
+account/database target-guard root. Rename, delete and row-write acquire the
+same permanent `guard.lock` as bootstrap and manifest apply immediately before
+provider dispatch. A same-target contention or retained active/retiring lease
+is a stop condition; a different database target is independent. A guard
+failure reports the invoked curated tool as its operation and zero provider
+calls/mutations; preserve that caller-correlated receipt when diagnosing the
+contention.
+
+Generic `api_mutate` is not a fallback for an existing D1 target. Delete,
+export, import, query/raw query, time-travel restore, full update and partial
+update are denied before request construction. Use the curated guarded tool
+where one exists; otherwise defer to a separately governed lifecycle. Always
+copy account and database IDs exactly from Cloudflare. Existing D1 database IDs
+must be canonical lowercase hyphenated UUIDs; uppercase, mixed-case, compact or
+braced variants are aliases, not independent targets. Do not trim, recase,
+encode or otherwise repair a rejected identity.
+
 ### Private SQL artifact and upload boundary
 
 The reusable private-artifact boundary is intentionally lower-level than any D1
@@ -260,6 +282,35 @@ redirect it into a replacement directory. It revalidates root, ancestors,
 directory, guard, identity and mode before every provider boundary. Do not use
 a shared writable directory or manually rename or remove any lease evidence by
 pathname.
+
+For the canonical UUID target-identity upgrade, do not reuse a root containing
+any predecessor custody. Stop every predecessor write-capable MCP process,
+preserve its old root without deleting or moving retained evidence, reconcile
+any active or retiring operation through its governed recovery path, and
+provision one new private empty `0700` root for all upgraded writers. On the
+first canonical target guard, the upgraded MCP holds
+`target-identity-v2.guard.lock`, exhaustively enumerates the root up to the
+finite custody limit, creates the target's exact create-only
+`target-identity-v2.<target-key-sha256>.receipt.json` registration, and creates
+the exact `target-identity-v2.activation.json` marker only after the root was
+proved empty before activation. After activation, every target must have its
+matching canonical registration. A stable bounded audit validates the marker,
+all registrations, all target directories, and every allowed custody entry;
+that audit is repeated at guard/lease revalidation, provider, persistence, and
+release boundaries.
+Canonical incumbent directories are intentionally rejected along with alias,
+active, retiring, retired, terminal, malformed, unreadable, symlink, and
+over-limit evidence: predecessor payloads contain only a target hash and cannot
+prove the UUID spelling that produced it. A failed activation does not clean up
+or migrate evidence. Do not manually create the marker, reuse the blocked root,
+or allow an older binary to open the activated root. Draining every predecessor
+writer before cutover is an independent deployment prerequisite, not a
+substitute for these runtime audits. This local activation has zero provider
+calls; it does not itself approve a D1 mutation.
+Rollback is also a whole-generation operation: drain every upgraded writer,
+preserve the activated root without manual edits, and return all writers
+together to the preserved predecessor root and predecessor binary generation.
+Never run mixed roots or binary generations during cutover or rollback.
 
 The exact-byte manifest boundary accepts at most 16 MiB of aggregate SQL and
 moves the supplied manifest into validation without cloning its SQL strings.

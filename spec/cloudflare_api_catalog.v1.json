@@ -10480,7 +10480,7 @@
       "summary": "Delete D1 Database",
       "deprecated": false,
       "scope": "account",
-      "risk": "high_risk",
+      "risk": "denied_by_default",
       "path_params": [
         "account_id",
         "database_id"
@@ -10498,7 +10498,7 @@
       "summary": "Export D1 Database as SQL",
       "deprecated": false,
       "scope": "account",
-      "risk": "mutating",
+      "risk": "denied_by_default",
       "path_params": [
         "account_id",
         "database_id"
@@ -10650,7 +10650,7 @@
       "summary": "Update D1 Database",
       "deprecated": false,
       "scope": "account",
-      "risk": "mutating",
+      "risk": "denied_by_default",
       "path_params": [
         "account_id",
         "database_id"
@@ -10668,7 +10668,7 @@
       "summary": "Update D1 Database partially",
       "deprecated": false,
       "scope": "account",
-      "risk": "mutating",
+      "risk": "denied_by_default",
       "path_params": [
         "account_id",
         "database_id"
@@ -10676,7 +10676,7 @@
       "query_params": [],
       "required_query_params": [],
       "has_request_body": true,
-      "preferred_tool": "d1_rename_database"
+      "preferred_tool": null
     },
     {
       "operation_id": "dcv-delegation-uuid-get",

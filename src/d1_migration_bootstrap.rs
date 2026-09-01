@@ -1839,7 +1839,12 @@ mod tests {
     #[test]
     fn plan_digest_binds_every_canonical_target_component_and_initializer() {
         let sql = d1_migrations_table_init_sql("d1_migrations");
-        let plan = d1_bootstrap_plan_sha256("acct-1", "db-1", "d1_migrations", &sql);
+        let plan = d1_bootstrap_plan_sha256(
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "d1_migrations",
+            &sql,
+        );
         assert!(d1_bootstrap_plan_matches(Some(&plan), &plan));
         assert!(!d1_bootstrap_plan_matches(
             Some(&plan.to_ascii_uppercase()),
@@ -1847,11 +1852,21 @@ mod tests {
         ));
         assert_ne!(
             plan,
-            d1_bootstrap_plan_sha256("acct-1", "db-2", "d1_migrations", &sql)
+            d1_bootstrap_plan_sha256(
+                "acct-1",
+                "223e4567-e89b-42d3-a456-426614174000",
+                "d1_migrations",
+                &sql
+            )
         );
         assert_ne!(
             plan,
-            d1_bootstrap_plan_sha256("acct-1", "db-1", "other_ledger", &sql)
+            d1_bootstrap_plan_sha256(
+                "acct-1",
+                "123e4567-e89b-42d3-a456-426614174000",
+                "other_ledger",
+                &sql
+            )
         );
     }
 }

@@ -140,6 +140,40 @@ contains the current template plus a read-only-only optional approval override.
 
 For `d1_bootstrap_migration_ledger` and `d1_apply_migration_manifest`, a live `approved_plan_sha256` is the exact lowercase 64-character `plan_sha256` returned by that tool's dry run. Case changes and surrounding whitespace are rejected so apply and retained recovery bind one canonical approval identity. The bootstrap plan is valid only for the same exact account, database, ledger-table identity, canonical initializer bytes, and primary-served empty schema observed by the live preflight. Manifest names may be current Wrangler relative POSIX paths such as `0001_init/migration.sql`, not only flat basenames. They must be canonical and are ordered with Wrangler's segment-wise leading-number comparison and lexical tie-breaking; absolute paths, backslashes, empty segments, `.`/`..`, and NUL are rejected.
 
+Every curated provider mutation for an existing D1 database requires the exact
+account identifier and a canonical lowercase hyphenated UUID `database_id`.
+Uppercase, mixed-case, compact, braced and other database UUID aliases fail
+before target hashing, planning, custody lookup or provider dispatch; callers
+must not normalize a rejected identifier themselves.
+
+The canonical target-identity contract has a one-way local custody activation
+boundary. Before either a migration lease or another existing-target mutation
+guard can be created, the configured lease root must contain the exact
+`target-identity-v2.activation.json` marker and one exact create-only
+`target-identity-v2.<target-key-sha256>.receipt.json` registration for the
+canonical target. An upgraded process may create the first registration and
+marker only while holding the permanent root activation guard and only after a
+bounded, descriptor-relative enumeration proves the root was empty before the
+guard was created. Any unversioned target directory or other entry blocks,
+including an otherwise canonical incumbent and active, retiring, retired,
+terminal, malformed, unreadable, or alias custody. The MCP never deletes,
+migrates, or blesses that evidence. This is necessary because predecessor
+lease payloads retain the derived target hash but cannot prove which UUID
+spelling produced it. Upgrade by stopping every predecessor writer, preserving
+and governing its old root separately, and configuring all upgraded writers to
+one newly provisioned private empty root. Never point a predecessor binary at
+an activated root. That complete predecessor drain is a separate deployment
+prerequisite; it does not replace runtime enforcement. Marker-present calls
+perform a stable bounded audit of the marker, every registration, and every
+registered target's complete allowed custody namespace. The same audit is
+revalidated at guard, lease, provider, persistence, and release boundaries, so
+an alias, malformed entry, unknown entry, contradictory lease state, or target
+without registration fails closed even if it appears after activation.
+Rollback is generation-wide: stop every upgraded writer, preserve the
+activated root without manual edits, and return all writers together to the
+preserved predecessor root and predecessor binary generation. Mixed roots or
+binary generations are unsupported during cutover or rollback.
+
 The exact family `migration-ledger-bootstrap-v1` is reserved to `d1_bootstrap_migration_ledger` and its dedicated reconcile, finalize, and abort tools. Generic manifest apply, read-only reconciliation, and terminal finalization reject that family before provider access, custody inspection or creation, receipt access, or local namespace mutation; similarly prefixed family labels are not reserved.
 
 Cloudflare D1 already enforces foreign keys and runs each query or migration in
@@ -169,7 +203,7 @@ prefix retain the existing version-1 plan digest.
 | `api_get_operation` | `operation_id` | none | Shows parameters, risk, call template, executor, and preferred curated tool when one exists. |
 | `api_prepare_call` | `operation_id` or enough search filters | `query`, `tag`, `method`, `scope`, `risk`, `include_deprecated`, `path_params`, `query_params`, `body`, `limit` | Resolves an operation and returns exact `api_read`/`api_mutate` arguments. Ambiguous searches return candidates instead of guessing; mutating operations are prepared as `dry_run=true`. Path parameters are derived from the URL template as well as catalog metadata, so stale catalog `path_params` cannot leave literal `{account_id}` placeholders in prepared paths. The returned `resolved_path_params` and `call.arguments.path_params` include configured account/zone defaults, making the prepared call self-contained. |
 | `api_read` | `operation_id` | `path_params`, `query`, `max_bytes` | Executes catalog `GET` operations only; uses configured account/zone defaults for matching path params. Path parameters are derived from the URL template as well as catalog metadata. |
-| `api_mutate` | `operation_id` | `path_params`, `query`, `body`, `dry_run`, `confirmation_token`, `reason`, `token_permissions` | Executes catalog `POST`/`PUT`/`PATCH`/`DELETE` operations through dry-run confirmation; high-risk and denied-by-default operations fail closed before request construction or provider access. `token_permissions` carries permission-group names from a fresh `account_api_tokens action=get` readback for operations with an explicit multi-permission preflight. The Bot Management zone update requires both `Bot Management Write` and `Zone Settings Write`; its dry-run withholds the confirmation token until both are reported, and returns guarded MCP token-repair calls when either is unverified or missing. The generic `worker-script-put-content` upload is denied; use `workers_upload_script` for its digest-bound upload, confirmation, and readback contract. Generic `d1-query-database`, `d1-raw-database-query`, `d1-import-database`, and `d1-time-travel-restore` calls are also denied because they can bypass curated existing-target D1 write and migration policy. Use curated D1 read, row-write, bootstrap, and migration-manifest tools where applicable; import and restore require a separately governed curated lifecycle rather than a nonexistent preferred tool. Create, get, list, export, and metadata operations retain their existing catalog policy, while delete retains its separate curated high-risk lifecycle. Valid escaped JSON-string `body` values are normalized into real JSON and reported with `body_normalized_from_json_string`. |
+| `api_mutate` | `operation_id` | `path_params`, `query`, `body`, `dry_run`, `confirmation_token`, `reason`, `token_permissions` | Executes catalog `POST`/`PUT`/`PATCH`/`DELETE` operations through dry-run confirmation; high-risk and denied-by-default operations fail closed before request construction or provider access. `token_permissions` carries permission-group names from a fresh `account_api_tokens action=get` readback for operations with an explicit multi-permission preflight. The Bot Management zone update requires both `Bot Management Write` and `Zone Settings Write`; its dry-run withholds the confirmation token until both are reported, and returns guarded MCP token-repair calls when either is unverified or missing. The generic `worker-script-put-content` upload is denied; use `workers_upload_script` for its digest-bound upload, confirmation, and readback contract. Every generic non-GET D1 operation whose path contains an existing `database_id` is denied: delete, export, import, query/raw query, time-travel restore, full update and partial update. Use curated D1 read, rename, delete, row-write, bootstrap, and migration-manifest tools only where their narrower contract applies; the rename-only tool is not a preferred substitute for the broader partial-update operation. Surfaces without a complete guarded curated lifecycle remain unavailable through `api_mutate`. D1 create is not an existing-target operation, and GET operations retain their read policy. Valid escaped JSON-string `body` values are normalized into real JSON and reported with `body_normalized_from_json_string`. |
 | `account_billing_usage` | none if default account configured | `account_id`, `mode`, `from`, `to`, `metric`, `max_bytes` | Read-only account usage helper for billing investigations. `mode=paygo` calls `/accounts/{account_id}/paygo-usage`; `mode=billable_usage` calls `/accounts/{account_id}/billable/usage` and requires `metric`. Use this for billable usage records before using analytics to explain attribution. |
 | `graphql_analytics_query` | `query` | `variables`, `max_bytes` | Runs a read-only Cloudflare Analytics GraphQL query against `/client/v4/graphql`. Mutations and subscriptions are rejected before HTTP. Use this for product analytics such as D1 `d1AnalyticsAdaptiveGroups` and `d1QueriesAdaptiveGroups`; Cloudflare documents GraphQL analytics as attribution/analytics data, not a billing-record replacement. When the MCP can distinguish likely authz cause classes, responses include `diagnostics.authz_classification` with a stable `code` and next-step guidance. |
 | `waf_ruleset_summary` | none if default zone or account configured | `account_id`, `zone_id`, `scope`, `phases`, `include_rules`, `include_raw`, `max_bytes` | Reads WAF Ruleset Engine entrypoints for custom rules, managed rules, and rate limiting rules. `scope=auto` prefers zone scope, then account scope. `phases` accepts aliases such as `custom`, `managed`, and `ratelimit`; defaults to `http_request_firewall_custom`, `http_request_firewall_managed`, and `http_ratelimit`. |

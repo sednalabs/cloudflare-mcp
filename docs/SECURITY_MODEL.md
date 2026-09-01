@@ -108,6 +108,17 @@ committed OpenAPI-derived catalog.
 
 Use curated tools first when `api_get_operation` reports a preferred tool.
 
+All generic D1 operations whose non-GET path contains an existing
+`{database_id}` are denied by default. This is a closed catalog inventory, not
+an operation-name prefix heuristic. Curated rename, delete and row-write calls
+normalize the exact account/database target and hold the same descriptor-bound
+`guard.lock` used by bootstrap and manifest leases across provider dispatch.
+The identity grammar rejects alternate path spellings rather than hashing or
+percent-encoding two aliases into separate custody namespaces. The ordinary
+guard is process-crash exclusion, not durable outcome evidence; migration and
+bootstrap continue to use their stronger retained-lease/reconciliation
+protocols.
+
 ## External Service Bridge
 
 The optional allowlisted external service bridge lets deployments call approved

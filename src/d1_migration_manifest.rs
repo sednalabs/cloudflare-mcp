@@ -18,12 +18,6 @@ use crate::tools::{
     invalid_argument_result, sha256_bytes_hex, sha256_hex,
 };
 
-#[derive(Debug, Clone)]
-pub(crate) struct D1ManifestTarget {
-    pub(crate) account_id: String,
-    pub(crate) database_id: String,
-}
-
 pub(crate) const D1_BOOTSTRAP_RESERVED_MIGRATION_FAMILY: &str = "migration-ledger-bootstrap-v1";
 pub(crate) const D1_FOREIGN_KEYS_ON_EXECUTION_TRANSFORM_V1: &str =
     "drop-leading-pragma-foreign-keys-on-v1";
@@ -395,34 +389,6 @@ impl<'a> D1ManifestReconciliationEvidence<'a> {
             unknown_ledger,
         }
     }
-}
-
-pub(crate) fn normalize_d1_manifest_target(
-    account_id: &str,
-    database_id: &str,
-) -> Result<D1ManifestTarget, CallToolResult> {
-    fn normalize(label: &'static str, value: &str) -> Result<String, CallToolResult> {
-        let trimmed = value.trim();
-        if trimmed.is_empty()
-            || trimmed != value
-            || matches!(trimmed, "." | "..")
-            || trimmed.len() > 256
-            || trimmed.contains('\0')
-        {
-            return Err(invalid_argument_result(
-                "d1.invalid_manifest_target_identity",
-                format!(
-                    "{label} must be a non-empty canonical identifier, not a dot path segment, and without surrounding whitespace"
-                ),
-                "Use the exact account_id and database_id read from the intended Cloudflare resource.",
-            ));
-        }
-        Ok(trimmed.to_string())
-    }
-    Ok(D1ManifestTarget {
-        account_id: normalize("account_id", account_id)?,
-        database_id: normalize("database_id", database_id)?,
-    })
 }
 
 pub(crate) fn normalize_d1_migration_family(value: &str) -> Result<String, CallToolResult> {

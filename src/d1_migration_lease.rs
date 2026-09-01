@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::d1_migration_terminal_semantics::valid_receipt_outcome_prefixes;
+use crate::d1_target::{D1TargetIdentity, normalize_d1_target};
 use crate::tools::{invalid_argument_result, sha256_bytes_hex};
 use crate::verification::now_unix_ms;
 
@@ -106,6 +107,12 @@ const ACTIVE_LEASE_NAME: &str = "active.lease.json";
 const RETIRING_LEASE_NAME: &str = "retiring.lease.json";
 #[cfg(target_os = "linux")]
 const GUARD_NAME: &str = "guard.lock";
+const TARGET_IDENTITY_ACTIVATION_GUARD_NAME: &str = "target-identity-v2.guard.lock";
+const TARGET_IDENTITY_ACTIVATION_MARKER_NAME: &str = "target-identity-v2.activation.json";
+const TARGET_IDENTITY_ACTIVATION_MARKER_BYTES: &[u8] = br#"{"root_audit":"registered_namespaces_v2","target_identity_contract":"lowercase_hyphenated_uuid_v1","version":2}"#;
+const TARGET_IDENTITY_REGISTRATION_PREFIX: &str = "target-identity-v2.";
+const TARGET_IDENTITY_REGISTRATION_SUFFIX: &str = ".receipt.json";
+const TARGET_IDENTITY_ROOT_ENTRY_LIMIT: usize = 4096;
 #[cfg(target_os = "linux")]
 const BOOTSTRAP_INITIALIZER_ATTEMPT_PREFIX: &str = "bootstrap-initializer-attempt.";
 
@@ -135,6 +142,32 @@ pub(crate) struct D1MigrationLease {
     released: bool,
     bootstrap_initializer_dispatch_protocol: bool,
     pub(crate) identity: D1MigrationLeaseIdentity,
+}
+
+/// Process-local handle for the permanent account/database guard shared by
+/// every existing-target D1 provider mutation. Unlike a migration lease this
+/// handle creates no operation-specific retained evidence; its only contract
+/// is atomic exclusion while the provider boundary is in flight.
+#[derive(Debug)]
+pub(crate) struct D1TargetMutationGuard {
+    operation: &'static str,
+    #[cfg(target_os = "linux")]
+    root_path: PathBuf,
+    #[cfg(target_os = "linux")]
+    root: fs::File,
+    #[cfg(target_os = "linux")]
+    root_identity: D1LeaseFileIdentity,
+    #[cfg(target_os = "linux")]
+    target_name: String,
+    #[cfg(target_os = "linux")]
+    target: fs::File,
+    #[cfg(target_os = "linux")]
+    target_identity: D1LeaseFileIdentity,
+    #[cfg(target_os = "linux")]
+    guard: fs::File,
+    #[cfg(target_os = "linux")]
+    guard_identity: D1LeaseFileIdentity,
+    pub(crate) target_key_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -546,6 +579,42 @@ impl D1MigrationLease {
             "error": {"code": "d1.migration_lease_revalidation_failed", "message": message,
                 "hint": "Do not issue provider SQL. Reconcile the permanent target custody evidence through the governed recovery path first."}
         }))
+    }
+}
+
+impl D1TargetMutationGuard {
+    /// Rebind the complete custody chain immediately before provider dispatch.
+    pub(crate) fn revalidate(&self) -> Result<(), CallToolResult> {
+        #[cfg(target_os = "linux")]
+        {
+            validate_d1_lease_custody(
+                &self.root_path,
+                &self.root,
+                &self.root_identity,
+                &self.target_name,
+                &self.target,
+                &self.target_identity,
+                &self.guard,
+                &self.guard_identity,
+            )
+            .map_err(|message| {
+                d1_target_guard_error(
+                    self.operation,
+                    "d1.target_guard_custody_changed",
+                    message,
+                    &self.target_key_sha256,
+                )
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(d1_target_guard_error(
+                self.operation,
+                "d1.target_guard_platform_unsupported",
+                "permanent cross-process D1 mutation custody requires the Linux dirfd-bound guard implementation",
+                &self.target_key_sha256,
+            ))
+        }
     }
 }
 
@@ -1507,7 +1576,40 @@ pub(crate) fn d1_migration_lease_requirements(
         "scope": "one permanent directory and guard per account/database target; family is evidence only and cannot split target serialization",
         "active_evidence": "active.lease.json and transient retiring.lease.json are never auto-reclaimed; malformed, symlink, non-regular, or otherwise present active/retiring evidence stops the next apply for governed reconciliation",
         "cross_host_limitation": "Cross-process serialization covers only hosts sharing the same configured operator-owned lease root. It is not a Cloudflare/provider-distributed lease.",
-        "platform_requirement": "Linux on a trusted filesystem supporting working renameat2 RENAME_NOREPLACE, directory fsync, and advisory file locks; unsupported platforms or filesystems fail closed before provider I/O. Cross-host or shared-filesystem semantics require separate proof; retained evidence requires the governed recovery path."
+        "platform_requirement": "Linux on a trusted filesystem supporting working renameat2 RENAME_NOREPLACE, directory fsync, and advisory file locks; unsupported platforms or filesystems fail closed before provider I/O. Cross-host or shared-filesystem semantics require separate proof; retained evidence requires the governed recovery path.",
+        "target_identity_activation": {
+            "contract_version": 2,
+            "target_identity_contract": "lowercase_hyphenated_uuid_v1",
+            "activation_marker": {
+                "required": true,
+                "filename": TARGET_IDENTITY_ACTIVATION_MARKER_NAME,
+                "version": 2,
+                "payload_sha256": sha256_bytes_hex(TARGET_IDENTITY_ACTIVATION_MARKER_BYTES),
+            },
+            "target_registration": {
+                "required_for_every_target": true,
+                "create_only": true,
+                "version": 1,
+                "filename_pattern": format!("{TARGET_IDENTITY_REGISTRATION_PREFIX}<target_key_sha256>{TARGET_IDENTITY_REGISTRATION_SUFFIX}"),
+            },
+            "first_activation": {
+                "requires_fresh_empty_root": true,
+                "bounded_root_entry_limit": TARGET_IDENTITY_ROOT_ENTRY_LIMIT,
+                "legacy_in_place_upgrade_allowed": false,
+            },
+            "operator_cutover": {
+                "predecessor_writer_drain_required": true,
+                "preserve_predecessor_root": true,
+                "predecessor_root_reuse_by_upgraded_writers_allowed": false,
+                "older_binary_on_activated_root_allowed": false,
+                "rollback": {
+                    "upgraded_writer_drain_required": true,
+                    "preserve_activated_root_without_manual_changes": true,
+                    "return_all_writers_as_one_predecessor_generation": true,
+                    "mixed_roots_or_binary_generations_allowed": false,
+                },
+            },
+        },
     })
 }
 
@@ -1517,6 +1619,7 @@ pub(crate) fn acquire_d1_migration_lease(
     family: &str,
     approved_plan_sha256: Option<&str>,
 ) -> Result<D1MigrationLease, CallToolResult> {
+    let target = normalize_d1_target(account_id, database_id)?;
     let plan_sha256 = approved_plan_sha256
         .filter(|value| {
             value.len() == 64
@@ -1539,7 +1642,57 @@ pub(crate) fn acquire_d1_migration_lease(
             "ok": false, "operation": "d1_apply_migration_manifest",
             "error": {"code": "d1.migration_lease_root_unconfigured", "message": "live migration apply requires a configured operator-owned shared lease root", "hint": format!("Set {D1_MANIFEST_LEASE_ROOT_ENV} to a pre-created private directory shared by all MCP processes that can target this D1 database.")}
         })))?;
-    acquire_d1_migration_lease_at(root, account_id, database_id, family, plan_sha256)
+    acquire_d1_migration_lease_at(
+        root,
+        &target.account_id,
+        &target.database_id,
+        family,
+        plan_sha256,
+    )
+}
+
+pub(crate) fn acquire_d1_target_mutation_guard(
+    operation: &'static str,
+    account_id: &str,
+    database_id: &str,
+) -> Result<D1TargetMutationGuard, CallToolResult> {
+    let target = normalize_d1_target(account_id, database_id)?;
+    let root = std::env::var(D1_MANIFEST_LEASE_ROOT_ENV)
+        .ok()
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| {
+            d1_target_guard_error(
+                operation,
+                "d1.target_guard_root_unconfigured",
+                "live D1 mutation requires the configured shared target guard root",
+                &target.target_key_sha256(),
+            )
+        })?;
+    acquire_d1_target_mutation_guard_at(root, operation, &target.account_id, &target.database_id)
+}
+
+pub(crate) fn acquire_d1_target_mutation_guard_at(
+    root: PathBuf,
+    operation: &'static str,
+    account_id: &str,
+    database_id: &str,
+) -> Result<D1TargetMutationGuard, CallToolResult> {
+    let target = normalize_d1_target(account_id, database_id)?;
+    #[cfg(target_os = "linux")]
+    {
+        linux::acquire_d1_target_mutation_guard_at_linux(root, operation, target)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = root;
+        Err(d1_target_guard_error(
+            operation,
+            "d1.target_guard_platform_unsupported",
+            "permanent cross-process D1 mutation custody requires the Linux dirfd-bound guard implementation",
+            &target.target_key_sha256(),
+        ))
+    }
 }
 
 /// Read-only occupancy check for the permanent target namespace.  This runs
@@ -1551,6 +1704,7 @@ pub(crate) fn preflight_d1_migration_target_custody(
     account_id: &str,
     database_id: &str,
 ) -> Result<(), CallToolResult> {
+    let target = normalize_d1_target(account_id, database_id)?;
     let root = std::env::var(D1_MANIFEST_LEASE_ROOT_ENV)
         .ok()
         .map(PathBuf::from)
@@ -1561,7 +1715,7 @@ pub(crate) fn preflight_d1_migration_target_custody(
                 "error": {"code": "d1.migration_lease_root_unconfigured", "message": "live migration apply requires a configured operator-owned shared lease root", "hint": format!("Set {D1_MANIFEST_LEASE_ROOT_ENV} to a pre-created private directory shared by all MCP processes that can target this D1 database.")}
             }))
         })?;
-    preflight_d1_migration_target_custody_at(root, account_id, database_id)
+    preflight_d1_migration_target_custody_at(root, &target.account_id, &target.database_id)
 }
 
 pub(crate) fn preflight_d1_migration_target_custody_at(
@@ -1569,9 +1723,14 @@ pub(crate) fn preflight_d1_migration_target_custody_at(
     account_id: &str,
     database_id: &str,
 ) -> Result<(), CallToolResult> {
+    let target = normalize_d1_target(account_id, database_id)?;
     #[cfg(target_os = "linux")]
     {
-        preflight_d1_migration_target_custody_at_linux(root, account_id, database_id)
+        preflight_d1_migration_target_custody_at_linux(
+            root,
+            &target.account_id,
+            &target.database_id,
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1587,15 +1746,79 @@ pub(crate) fn acquire_d1_migration_lease_at(
     family: &str,
     plan_sha256: &str,
 ) -> Result<D1MigrationLease, CallToolResult> {
+    let target = normalize_d1_target(account_id, database_id)?;
     #[cfg(target_os = "linux")]
     {
-        acquire_d1_migration_lease_at_linux(root, account_id, database_id, family, plan_sha256)
+        acquire_d1_migration_lease_at_linux(
+            root,
+            &target.account_id,
+            &target.database_id,
+            family,
+            plan_sha256,
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (root, account_id, database_id, family, plan_sha256);
         Err(d1_lease_platform_unsupported())
     }
+}
+
+fn d1_target_guard_error(
+    operation: &'static str,
+    code: &'static str,
+    message: &'static str,
+    target_key_sha256: &str,
+) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": operation,
+        "status": "blocked",
+        "provider_calls": 0,
+        "provider_mutations": 0,
+        "target_key_sha256": target_key_sha256,
+        "error": {
+            "code": code,
+            "message": message,
+            "hint": "Use the canonical target identity and wait for or reconcile the current target owner before another provider mutation."
+        }
+    }))
+}
+
+fn d1_target_identity_activation_error(
+    operation: &'static str,
+    message: &'static str,
+    target_key_sha256: &str,
+) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": operation,
+        "status": "blocked",
+        "provider_calls": 0,
+        "provider_mutations": 0,
+        "target_key_sha256": target_key_sha256,
+        "error": {
+            "code": "d1.target_guard_upgrade_activation_required",
+            "message": message,
+            "hint": "Stop predecessor writers, preserve and reconcile the old root separately, then configure every upgraded writer to one new private empty lease root. Do not create the activation marker manually."
+        }
+    }))
+}
+
+fn d1_migration_target_identity_activation_error(message: &'static str) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": "d1_apply_migration_manifest",
+        "status": "blocked",
+        "provider_calls": 0,
+        "provider_mutations": 0,
+        "lease_retained": null,
+        "error": {
+            "code": "d1.migration_lease_upgrade_activation_required",
+            "message": message,
+            "hint": "Stop predecessor writers, preserve and reconcile the old root separately, then configure every upgraded writer to one new private empty lease root. Do not create the activation marker manually."
+        }
+    }))
 }
 
 fn d1_lease_platform_unsupported() -> CallToolResult {
@@ -1635,6 +1858,7 @@ mod linux {
     use libc::{
         AT_FDCWD, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_PATH, O_RDONLY, O_RDWR,
     };
+    use std::collections::BTreeSet;
     use std::ffi::{CStr, CString, c_char};
     use std::io;
     use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
@@ -1643,9 +1867,39 @@ mod linux {
 
     const RENAME_NOREPLACE: u32 = 1;
     const MAX_LEASE_PAYLOAD_BYTES: u64 = 4096;
-    pub(super) const MAX_TARGET_CUSTODY_DIRECTORY_ENTRIES: usize = 4096;
+    pub(super) const MAX_TARGET_CUSTODY_DIRECTORY_ENTRIES: usize = TARGET_IDENTITY_ROOT_ENTRY_LIMIT;
     const TERMINAL_RECEIPT_PREFIX: &str = "terminal-reconciliation.";
     const TERMINAL_RECEIPT_SUFFIX: &str = ".receipt.json";
+
+    #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+    #[serde(deny_unknown_fields)]
+    struct TargetIdentityRegistrationReceipt {
+        version: u8,
+        target_identity_contract: String,
+        target_key_sha256: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct CustodyFileSnapshot {
+        name: String,
+        file_identity: D1LeaseFileIdentity,
+        payload_sha256: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TargetDirectorySnapshot {
+        target_key_sha256: String,
+        directory_identity: D1LeaseFileIdentity,
+        entries: Vec<CustodyFileSnapshot>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RootNamespaceSnapshot {
+        activation_guard_identity: D1LeaseFileIdentity,
+        activation_marker: Option<CustodyFileSnapshot>,
+        registrations: Vec<CustodyFileSnapshot>,
+        targets: Vec<TargetDirectorySnapshot>,
+    }
 
     pub(super) struct TerminalReceiptPersistenceFailure {
         pub(super) message: &'static str,
@@ -1892,11 +2146,12 @@ mod linux {
         Ok((target, identity(&metadata)))
     }
 
-    fn open_or_create_guard(
-        target: &fs::File,
+    fn open_or_create_private_lock(
+        directory: &fs::File,
+        lock_name: &str,
     ) -> Result<(fs::File, D1LeaseFileIdentity), &'static str> {
-        let name = c_string_name(GUARD_NAME)?;
-        let guard = match open_named_entry(target, GUARD_NAME) {
+        let name = c_string_name(lock_name)?;
+        let guard = match open_named_entry(directory, lock_name) {
             Ok(existing) => {
                 let existing_metadata = existing
                     .metadata()
@@ -1906,7 +2161,7 @@ mod linux {
                 }
                 let expected = identity(&existing_metadata);
                 let guard = open_at(
-                    target.as_raw_fd(),
+                    directory.as_raw_fd(),
                     &name,
                     O_RDWR | O_NOFOLLOW | O_CLOEXEC,
                     0,
@@ -1922,14 +2177,14 @@ mod linux {
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let guard = match open_at(
-                    target.as_raw_fd(),
+                    directory.as_raw_fd(),
                     &name,
                     O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
                     0o600,
                 ) {
                     Ok(guard) => guard,
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                        return open_or_create_guard(target);
+                        return open_or_create_private_lock(directory, lock_name);
                     }
                     Err(_) => return Err("permanent target guard could not be created"),
                 };
@@ -1937,8 +2192,8 @@ mod linux {
                     .set_permissions(fs::Permissions::from_mode(0o600))
                     .and_then(|()| guard.sync_all())
                     .map_err(|_| "permanent target guard could not be synchronized")?;
-                sync_d1_lease_directory(target)
-                    .map_err(|_| "target custody directory could not be synchronized")?;
+                sync_d1_lease_directory(directory)
+                    .map_err(|_| "custody directory could not be synchronized")?;
                 guard
             }
             Err(_) => return Err("permanent target guard could not be inspected"),
@@ -1950,9 +2205,496 @@ mod linux {
             return Err("permanent target guard is not a private regular file");
         }
         let expected = identity(&metadata);
-        validate_named_private_file(target, GUARD_NAME, &expected)
+        validate_named_private_file(directory, lock_name, &expected)
             .map_err(|_| "permanent target guard changed or is not a private regular file")?;
         Ok((guard, expected))
+    }
+
+    fn open_or_create_guard(
+        target: &fs::File,
+    ) -> Result<(fs::File, D1LeaseFileIdentity), &'static str> {
+        open_or_create_private_lock(target, GUARD_NAME)
+    }
+
+    fn validate_target_identity_activation_marker(root: &fs::File) -> Result<(), &'static str> {
+        let named = open_named_entry(root, TARGET_IDENTITY_ACTIVATION_MARKER_NAME)
+            .map_err(|_| "target-identity activation marker is absent or unavailable")?;
+        let metadata = named
+            .metadata()
+            .map_err(|_| "target-identity activation marker metadata is unavailable")?;
+        if !private_file(&metadata)
+            || metadata.nlink() != 1
+            || metadata.len() > MAX_LEASE_PAYLOAD_BYTES
+        {
+            return Err(
+                "target-identity activation marker is not one bounded private regular file",
+            );
+        }
+        let expected = identity(&metadata);
+        let name = c_string_name(TARGET_IDENTITY_ACTIVATION_MARKER_NAME)?;
+        let marker = open_at(
+            root.as_raw_fd(),
+            &name,
+            O_RDONLY | O_NOFOLLOW | O_CLOEXEC,
+            0,
+        )
+        .map_err(|_| "target-identity activation marker could not be rebound")?;
+        let held = marker
+            .metadata()
+            .map_err(|_| "held target-identity activation marker metadata is unavailable")?;
+        if !private_file(&held) || held.nlink() != 1 || identity(&held) != expected {
+            return Err("target-identity activation marker changed while it was rebound");
+        }
+        if read_held_file(&marker)? != TARGET_IDENTITY_ACTIVATION_MARKER_BYTES {
+            return Err("target-identity activation marker payload is not the exact contract");
+        }
+        validate_named_private_file(root, TARGET_IDENTITY_ACTIVATION_MARKER_NAME, &expected)
+            .map_err(|_| "target-identity activation marker changed after readback")
+    }
+
+    fn private_custody_file_snapshot(
+        directory: &fs::File,
+        name: &str,
+    ) -> Result<(CustodyFileSnapshot, Vec<u8>), &'static str> {
+        let (_file, file_identity, bytes) = open_retained_named_lease(directory, name)?;
+        Ok((
+            CustodyFileSnapshot {
+                name: name.to_string(),
+                file_identity,
+                payload_sha256: sha256_bytes_hex(&bytes),
+            },
+            bytes,
+        ))
+    }
+
+    fn target_identity_registration_name(target_key_sha256: &str) -> String {
+        format!(
+            "{TARGET_IDENTITY_REGISTRATION_PREFIX}{target_key_sha256}{TARGET_IDENTITY_REGISTRATION_SUFFIX}"
+        )
+    }
+
+    fn target_identity_registration_hash(name: &str) -> Option<&str> {
+        name.strip_prefix(TARGET_IDENTITY_REGISTRATION_PREFIX)
+            .and_then(|value| value.strip_suffix(TARGET_IDENTITY_REGISTRATION_SUFFIX))
+            .filter(|value| valid_lower_sha256(value))
+    }
+
+    fn canonical_target_identity_registration_bytes(
+        target_key_sha256: &str,
+    ) -> Result<Vec<u8>, &'static str> {
+        if !valid_lower_sha256(target_key_sha256) {
+            return Err("target-identity registration target hash is not canonical");
+        }
+        serde_json::to_vec(&TargetIdentityRegistrationReceipt {
+            version: 1,
+            target_identity_contract: "lowercase_hyphenated_uuid_v1".to_string(),
+            target_key_sha256: target_key_sha256.to_string(),
+        })
+        .map_err(|_| "target-identity registration could not be encoded")
+    }
+
+    fn validate_target_identity_registration(
+        root: &fs::File,
+        name: &str,
+        expected_target_key_sha256: &str,
+    ) -> Result<CustodyFileSnapshot, &'static str> {
+        let (snapshot, bytes) = private_custody_file_snapshot(root, name)?;
+        let receipt: TargetIdentityRegistrationReceipt = serde_json::from_slice(&bytes)
+            .map_err(|_| "target-identity registration is malformed or duplicate-keyed")?;
+        let canonical = canonical_target_identity_registration_bytes(expected_target_key_sha256)?;
+        if receipt.version != 1
+            || receipt.target_identity_contract != "lowercase_hyphenated_uuid_v1"
+            || receipt.target_key_sha256 != expected_target_key_sha256
+            || bytes != canonical
+        {
+            return Err("target-identity registration contradicts its canonical namespace");
+        }
+        Ok(snapshot)
+    }
+
+    fn create_or_validate_target_identity_registration(
+        root: &fs::File,
+        target_key_sha256: &str,
+    ) -> Result<(), &'static str> {
+        let name = target_identity_registration_name(target_key_sha256);
+        if entry_present(root, &name)? {
+            validate_target_identity_registration(root, &name, target_key_sha256)?;
+            return Ok(());
+        }
+        if directory_entry_names(root)?.len() >= MAX_TARGET_CUSTODY_DIRECTORY_ENTRIES {
+            return Err("lease root has no capacity for target-identity registration");
+        }
+        let bytes = canonical_target_identity_registration_bytes(target_key_sha256)?;
+        let name_c = c_string_name(&name)?;
+        let mut file = open_at(
+            root.as_raw_fd(),
+            &name_c,
+            O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+            0o600,
+        )
+        .map_err(|_| "target-identity registration could not be created without replacement")?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| "target-identity registration identity is unavailable")?;
+        if !private_file(&metadata) || metadata.nlink() != 1 {
+            return Err("target-identity registration is not one private regular file");
+        }
+        file.write_all(&bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|_| "target-identity registration could not be durably written")?;
+        sync_d1_lease_directory(root)
+            .map_err(|_| "target-identity registration directory could not be synchronized")?;
+        validate_target_identity_registration(root, &name, target_key_sha256)?;
+        Ok(())
+    }
+
+    fn retained_nonce_from_name<'a>(name: &'a str, prefix: &str, suffix: &str) -> Option<&'a str> {
+        name.strip_prefix(prefix)
+            .and_then(|value| value.strip_suffix(suffix))
+            .filter(|value| valid_retained_nonce(value))
+    }
+
+    fn target_custody_snapshot_once(
+        target: &fs::File,
+        expected_target_key_sha256: &str,
+    ) -> Result<Vec<CustodyFileSnapshot>, &'static str> {
+        let mut entries = Vec::new();
+        let mut guard_present = false;
+        let mut active_present = false;
+        let mut retiring_present = false;
+        let mut retained_lease_nonces = BTreeSet::new();
+        for raw_name in directory_entry_names(target)? {
+            let name = String::from_utf8(raw_name)
+                .map_err(|_| "target custody namespace contains a non-UTF-8 entry")?;
+            if name == GUARD_NAME {
+                if guard_present {
+                    return Err("target custody namespace contains duplicate guard authority");
+                }
+                let (snapshot, bytes) = private_custody_file_snapshot(target, &name)?;
+                if !bytes.is_empty() {
+                    return Err("permanent target guard contains unexpected payload bytes");
+                }
+                guard_present = true;
+                entries.push(snapshot);
+                continue;
+            }
+
+            let lease_nonce = if name == ACTIVE_LEASE_NAME {
+                active_present = true;
+                None
+            } else if name == RETIRING_LEASE_NAME {
+                retiring_present = true;
+                None
+            } else if let Some(nonce) = retained_nonce_from_name(&name, "retired.", ".lease.json") {
+                Some(nonce)
+            } else if let Some(nonce) =
+                retained_nonce_from_name(&name, "aborted-create.", ".lease.json")
+            {
+                Some(nonce)
+            } else {
+                None
+            };
+            if name == ACTIVE_LEASE_NAME || name == RETIRING_LEASE_NAME || lease_nonce.is_some() {
+                let (snapshot, bytes) = private_custody_file_snapshot(target, &name)?;
+                let payload = parse_retained_lease_payload(&bytes)?;
+                if payload.target_key_sha256 != expected_target_key_sha256
+                    || lease_nonce.is_some_and(|nonce| nonce != payload.nonce)
+                {
+                    return Err("retained lease entry contradicts its target or filename identity");
+                }
+                if !retained_lease_nonces.insert(payload.nonce) {
+                    return Err(
+                        "target custody namespace reuses one lease nonce across contradictory states",
+                    );
+                }
+                entries.push(snapshot);
+                continue;
+            }
+
+            if let Some(nonce) = retained_nonce_from_name(
+                &name,
+                BOOTSTRAP_INITIALIZER_ATTEMPT_PREFIX,
+                ".receipt.json",
+            ) {
+                let (snapshot, bytes) = private_custody_file_snapshot(target, &name)?;
+                let receipt: D1BootstrapInitializerAttemptReceipt = serde_json::from_slice(&bytes)
+                    .map_err(
+                        |_| "bootstrap initializer-attempt receipt is malformed or duplicate-keyed",
+                    )?;
+                if canonical_bootstrap_initializer_attempt_bytes(&receipt)? != bytes
+                    || receipt.target_key_sha256 != expected_target_key_sha256
+                    || receipt.lease_nonce != nonce
+                {
+                    return Err(
+                        "bootstrap initializer-attempt receipt contradicts its target or filename identity",
+                    );
+                }
+                entries.push(snapshot);
+                continue;
+            }
+
+            if let Some(nonce) =
+                retained_nonce_from_name(&name, TERMINAL_RECEIPT_PREFIX, TERMINAL_RECEIPT_SUFFIX)
+            {
+                let evidence = open_terminal_receipt(target, &name)?;
+                if evidence.target_key_sha256 != expected_target_key_sha256
+                    || evidence.lease_nonce != nonce
+                {
+                    return Err(
+                        "terminal reconciliation receipt contradicts its target or filename identity",
+                    );
+                }
+                entries.push(CustodyFileSnapshot {
+                    name,
+                    file_identity: evidence.file_identity,
+                    payload_sha256: evidence.payload_sha256,
+                });
+                continue;
+            }
+
+            return Err("target custody namespace contains an unclassifiable entry");
+        }
+        if !guard_present {
+            return Err("target custody namespace is missing its permanent guard");
+        }
+        if active_present && retiring_present {
+            return Err("target custody namespace contains conflicting active and retiring leases");
+        }
+        entries.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(entries)
+    }
+
+    fn target_directory_snapshot_once(
+        root: &fs::File,
+        target_name: &str,
+        target_key_sha256: &str,
+    ) -> Result<TargetDirectorySnapshot, &'static str> {
+        let target_name_c = c_string_name(target_name)?;
+        let target = open_directory_at(root.as_raw_fd(), &target_name_c)
+            .map_err(|_| "registered target custody directory is unavailable")?;
+        let metadata = target
+            .metadata()
+            .map_err(|_| "registered target custody directory metadata is unavailable")?;
+        if !private_dir(&metadata) {
+            return Err("registered target custody directory is not private");
+        }
+        let directory_identity = identity(&metadata);
+        let entries = target_custody_snapshot_once(&target, target_key_sha256)?;
+        validate_target_binding(root, target_name, &target, &directory_identity)?;
+        Ok(TargetDirectorySnapshot {
+            target_key_sha256: target_key_sha256.to_string(),
+            directory_identity,
+            entries,
+        })
+    }
+
+    fn stable_target_directory_snapshot(
+        root: &fs::File,
+        target_name: &str,
+        target_key_sha256: &str,
+    ) -> Result<TargetDirectorySnapshot, &'static str> {
+        let first = target_directory_snapshot_once(root, target_name, target_key_sha256)?;
+        let second = target_directory_snapshot_once(root, target_name, target_key_sha256)?;
+        if first != second {
+            return Err("target custody namespace changed during stable audit");
+        }
+        Ok(second)
+    }
+
+    fn root_namespace_snapshot_once(
+        root: &fs::File,
+        marker_required: bool,
+        targets_allowed: bool,
+    ) -> Result<RootNamespaceSnapshot, &'static str> {
+        let mut activation_guard_identity = None;
+        let mut activation_marker = None;
+        let mut registrations = Vec::new();
+        let mut registered_hashes = BTreeSet::new();
+        let mut target_names = Vec::new();
+
+        for raw_name in directory_entry_names(root)? {
+            let name = String::from_utf8(raw_name)
+                .map_err(|_| "lease root namespace contains a non-UTF-8 entry")?;
+            if name == TARGET_IDENTITY_ACTIVATION_GUARD_NAME {
+                let (snapshot, bytes) = private_custody_file_snapshot(root, &name)?;
+                if !bytes.is_empty() {
+                    return Err("target-identity activation guard contains unexpected bytes");
+                }
+                activation_guard_identity = Some(snapshot.file_identity);
+                continue;
+            }
+            if name == TARGET_IDENTITY_ACTIVATION_MARKER_NAME {
+                validate_target_identity_activation_marker(root)?;
+                let (snapshot, bytes) = private_custody_file_snapshot(root, &name)?;
+                if bytes != TARGET_IDENTITY_ACTIVATION_MARKER_BYTES {
+                    return Err("target-identity activation marker payload is not exact");
+                }
+                activation_marker = Some(snapshot);
+                continue;
+            }
+            if let Some(target_key_sha256) = target_identity_registration_hash(&name) {
+                let snapshot =
+                    validate_target_identity_registration(root, &name, target_key_sha256)?;
+                if !registered_hashes.insert(target_key_sha256.to_string()) {
+                    return Err("lease root contains duplicate target-identity registrations");
+                }
+                registrations.push(snapshot);
+                continue;
+            }
+            if let Some(target_key_sha256) = name
+                .strip_prefix("d1-migration-target-")
+                .filter(|value| valid_lower_sha256(value))
+            {
+                if !targets_allowed {
+                    return Err("target directory appeared before root activation completed");
+                }
+                let target_key_sha256 = target_key_sha256.to_string();
+                target_names.push((name, target_key_sha256));
+                continue;
+            }
+            return Err("lease root namespace contains an unclassifiable entry");
+        }
+
+        let activation_guard_identity = activation_guard_identity
+            .ok_or("lease root namespace is missing its activation guard")?;
+        if marker_required && activation_marker.is_none() {
+            return Err("lease root namespace is missing its activation marker");
+        }
+        if !marker_required && activation_marker.is_some() {
+            return Err("activation marker appeared during pre-activation audit");
+        }
+        let mut targets = Vec::new();
+        for (target_name, target_key_sha256) in target_names {
+            if !registered_hashes.contains(&target_key_sha256) {
+                return Err("target directory has no canonical target-identity registration");
+            }
+            targets.push(target_directory_snapshot_once(
+                root,
+                &target_name,
+                &target_key_sha256,
+            )?);
+        }
+        registrations.sort_by(|left, right| left.name.cmp(&right.name));
+        targets.sort_by(|left, right| left.target_key_sha256.cmp(&right.target_key_sha256));
+        Ok(RootNamespaceSnapshot {
+            activation_guard_identity,
+            activation_marker,
+            registrations,
+            targets,
+        })
+    }
+
+    fn validate_stable_root_namespace(
+        root: &fs::File,
+        marker_required: bool,
+        targets_allowed: bool,
+    ) -> Result<(), &'static str> {
+        let first = root_namespace_snapshot_once(root, marker_required, targets_allowed)?;
+        maybe_pause_root_namespace_audit_after_first_for_test(root);
+        let second = root_namespace_snapshot_once(root, marker_required, targets_allowed)?;
+        if first != second {
+            return Err("lease root namespace changed during stable activation audit");
+        }
+        Ok(())
+    }
+
+    fn open_and_lock_activation_guard(
+        root: &fs::File,
+    ) -> Result<(fs::File, D1LeaseFileIdentity), &'static str> {
+        let name = c_string_name(TARGET_IDENTITY_ACTIVATION_GUARD_NAME)?;
+        let named = open_named_entry(root, TARGET_IDENTITY_ACTIVATION_GUARD_NAME)
+            .map_err(|_| "target-identity activation guard is absent or unavailable")?;
+        let metadata = named
+            .metadata()
+            .map_err(|_| "target-identity activation guard metadata is unavailable")?;
+        if !private_file(&metadata) || metadata.nlink() != 1 {
+            return Err("target-identity activation guard is not one private regular file");
+        }
+        let expected = identity(&metadata);
+        let guard = open_at(root.as_raw_fd(), &name, O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0)
+            .map_err(|_| "target-identity activation guard could not be rebound")?;
+        let held = guard
+            .metadata()
+            .map_err(|_| "held target-identity activation guard metadata is unavailable")?;
+        if !private_file(&held) || held.nlink() != 1 || identity(&held) != expected {
+            return Err("target-identity activation guard changed while it was rebound");
+        }
+        guard
+            .lock()
+            .map_err(|_| "target-identity activation guard could not be locked")?;
+        validate_named_private_file(root, TARGET_IDENTITY_ACTIVATION_GUARD_NAME, &expected)
+            .map_err(|_| "target-identity activation guard changed after locking")?;
+        Ok((guard, expected))
+    }
+
+    fn validate_target_identity_root(root: &fs::File) -> Result<(), &'static str> {
+        let (_guard, _guard_identity) = open_and_lock_activation_guard(root)?;
+        validate_stable_root_namespace(root, true, true)
+    }
+
+    pub(super) fn ensure_target_identity_activation(
+        root: &fs::File,
+        target_key_sha256: &str,
+    ) -> Result<(), &'static str> {
+        let marker_present = entry_present(root, TARGET_IDENTITY_ACTIVATION_MARKER_NAME)?;
+        if marker_present {
+            validate_target_identity_activation_marker(root)?;
+        } else if !directory_entry_names(root)?.is_empty() {
+            return Err(
+                "unversioned root contains custody evidence; activate this contract only on a fresh empty root",
+            );
+        }
+
+        let (guard, guard_identity) =
+            open_or_create_private_lock(root, TARGET_IDENTITY_ACTIVATION_GUARD_NAME)?;
+        guard
+            .lock()
+            .map_err(|_| "target-identity activation guard could not be locked")?;
+        validate_named_private_file(root, TARGET_IDENTITY_ACTIVATION_GUARD_NAME, &guard_identity)
+            .map_err(|_| "target-identity activation guard changed after locking")?;
+
+        if marker_present || entry_present(root, TARGET_IDENTITY_ACTIVATION_MARKER_NAME)? {
+            validate_stable_root_namespace(root, true, true)?;
+            create_or_validate_target_identity_registration(root, target_key_sha256)?;
+            return validate_stable_root_namespace(root, true, true);
+        }
+
+        let entries = directory_entry_names(root)?;
+        if entries.len() != 1
+            || entries[0].as_slice() != TARGET_IDENTITY_ACTIVATION_GUARD_NAME.as_bytes()
+        {
+            return Err(
+                "unversioned root contains custody evidence; activate this contract only on a fresh empty root",
+            );
+        }
+
+        create_or_validate_target_identity_registration(root, target_key_sha256)?;
+        validate_stable_root_namespace(root, false, false)?;
+        maybe_pause_before_activation_marker_for_test(target_key_sha256);
+
+        let marker_name = c_string_name(TARGET_IDENTITY_ACTIVATION_MARKER_NAME)?;
+        let mut marker = open_at(
+            root.as_raw_fd(),
+            &marker_name,
+            O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+            0o600,
+        )
+        .map_err(
+            |_| "target-identity activation marker could not be created without replacement",
+        )?;
+        let metadata = marker
+            .metadata()
+            .map_err(|_| "target-identity activation marker identity is unavailable")?;
+        if !private_file(&metadata) || metadata.nlink() != 1 {
+            return Err("target-identity activation marker is not one private regular file");
+        }
+        marker
+            .write_all(TARGET_IDENTITY_ACTIVATION_MARKER_BYTES)
+            .and_then(|()| marker.sync_all())
+            .map_err(|_| "target-identity activation marker could not be durably written")?;
+        sync_d1_lease_directory(root)
+            .map_err(|_| "target-identity activation marker directory could not be synchronized")?;
+        validate_stable_root_namespace(root, true, true)
     }
 
     fn open_existing_guard(
@@ -2011,7 +2753,17 @@ mod linux {
         guard_identity: &D1LeaseFileIdentity,
     ) -> Result<(), &'static str> {
         validate_root_path_binding(root_path, root, root_identity)?;
+        validate_target_identity_root(root)?;
         validate_target_binding(root, target_name, target, target_identity)?;
+        let target_key_sha256 = target_name
+            .strip_prefix("d1-migration-target-")
+            .filter(|value| valid_lower_sha256(value))
+            .ok_or("held target custody namespace is not canonical")?;
+        let audited_target =
+            stable_target_directory_snapshot(root, target_name, target_key_sha256)?;
+        if audited_target.directory_identity != *target_identity {
+            return Err("audited target custody directory is not this invocation's directory");
+        }
         let held_guard = guard
             .metadata()
             .map_err(|_| "held permanent target guard metadata is unavailable")?;
@@ -3414,6 +4166,161 @@ mod linux {
         Ok(lease)
     }
 
+    pub(super) fn acquire_d1_target_mutation_guard_at_linux(
+        root_path: PathBuf,
+        operation: &'static str,
+        target_identity: D1TargetIdentity,
+    ) -> Result<D1TargetMutationGuard, CallToolResult> {
+        let target_hash = target_identity.target_key_sha256();
+        validate_root_and_ancestors(&root_path).map_err(|message| {
+            d1_target_guard_error(
+                operation,
+                "d1.target_guard_root_unsafe",
+                message,
+                &target_hash,
+            )
+        })?;
+        let root_name = c_string_path(&root_path).map_err(|message| {
+            d1_target_guard_error(
+                operation,
+                "d1.target_guard_root_unsafe",
+                message,
+                &target_hash,
+            )
+        })?;
+        let root = open_directory_at(AT_FDCWD, &root_name).map_err(|_| {
+            d1_target_guard_error(
+                operation,
+                "d1.target_guard_root_unsafe",
+                "configured target guard root could not be opened without following a symlink",
+                &target_hash,
+            )
+        })?;
+        let root_metadata = root.metadata().map_err(|_| {
+            d1_target_guard_error(
+                operation,
+                "d1.target_guard_root_unsafe",
+                "configured target guard root metadata is unavailable",
+                &target_hash,
+            )
+        })?;
+        if !private_dir(&root_metadata) {
+            return Err(d1_target_guard_error(
+                operation,
+                "d1.target_guard_root_unsafe",
+                "configured target guard root is not a private current-operator-owned directory",
+                &target_hash,
+            ));
+        }
+        let root_identity = identity(&root_metadata);
+        validate_root_path_binding(&root_path, &root, &root_identity).map_err(|message| {
+            d1_target_guard_error(
+                operation,
+                "d1.target_guard_root_unsafe",
+                message,
+                &target_hash,
+            )
+        })?;
+        ensure_target_identity_activation(&root, &target_hash).map_err(|message| {
+            d1_target_identity_activation_error(operation, message, &target_hash)
+        })?;
+
+        let target_name = format!("d1-migration-target-{target_hash}");
+        let (target, target_identity) =
+            ensure_target_directory(&root, &target_name).map_err(|message| {
+                d1_target_guard_error(
+                    operation,
+                    "d1.target_guard_target_unsafe",
+                    message,
+                    &target_hash,
+                )
+            })?;
+        let (guard, guard_identity) = open_or_create_guard(&target).map_err(|message| {
+            d1_target_guard_error(operation, "d1.target_guard_unsafe", message, &target_hash)
+        })?;
+        match guard.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(d1_target_guard_error(
+                    operation,
+                    "d1.target_guard_locked",
+                    "another MCP process holds the permanent account/database target guard",
+                    &target_hash,
+                ));
+            }
+            Err(fs::TryLockError::Error(_)) => {
+                return Err(d1_target_guard_error(
+                    operation,
+                    "d1.target_guard_lock_failed",
+                    "the permanent account/database target guard could not be locked",
+                    &target_hash,
+                ));
+            }
+        }
+        validate_d1_lease_custody(
+            &root_path,
+            &root,
+            &root_identity,
+            &target_name,
+            &target,
+            &target_identity,
+            &guard,
+            &guard_identity,
+        )
+        .map_err(|message| {
+            d1_target_guard_error(
+                operation,
+                "d1.target_guard_custody_changed",
+                message,
+                &target_hash,
+            )
+        })?;
+        maybe_pause_after_guard_for_test(&root_path);
+        for (name, message) in [
+            (
+                ACTIVE_LEASE_NAME,
+                "active retained D1 mutation evidence blocks a new target mutation",
+            ),
+            (
+                RETIRING_LEASE_NAME,
+                "retiring retained D1 mutation evidence blocks a new target mutation",
+            ),
+        ] {
+            match entry_present(&target, name) {
+                Ok(true) => {
+                    return Err(d1_target_guard_error(
+                        operation,
+                        "d1.target_guard_retained_evidence_present",
+                        message,
+                        &target_hash,
+                    ));
+                }
+                Ok(false) => {}
+                Err(message) => {
+                    return Err(d1_target_guard_error(
+                        operation,
+                        "d1.target_guard_custody_changed",
+                        message,
+                        &target_hash,
+                    ));
+                }
+            }
+        }
+
+        Ok(D1TargetMutationGuard {
+            operation,
+            root_path,
+            root,
+            root_identity,
+            target_name,
+            target,
+            target_identity,
+            guard,
+            guard_identity,
+            target_key_sha256: target_hash,
+        })
+    }
+
     pub(super) fn acquire_d1_migration_lease_at_linux(
         root_path: PathBuf,
         account_id: &str,
@@ -3446,8 +4353,10 @@ mod linux {
         let root_identity = identity(&root_metadata);
         validate_root_path_binding(&root_path, &root, &root_identity)
             .map_err(|message| d1_lease_root_error("d1.migration_lease_root_unsafe", message))?;
-
         let target_hash = sha256_bytes_hex(format!("{account_id}\0{database_id}").as_bytes());
+        ensure_target_identity_activation(&root, &target_hash)
+            .map_err(d1_migration_target_identity_activation_error)?;
+
         let target_name = format!("d1-migration-target-{target_hash}");
         let (target, target_identity) = ensure_target_directory(&root, &target_name)
             .map_err(|message| d1_lease_root_error("d1.migration_lease_target_unsafe", message))?;
@@ -3541,6 +4450,58 @@ mod linux {
     #[cfg(test)]
     static GUARD_PAUSE_HOOK: OnceLock<Mutex<Option<GuardPauseHook>>> = OnceLock::new();
     #[cfg(test)]
+    struct ActivationMarkerPauseHook {
+        target_key_sha256: String,
+        entered: mpsc::Sender<()>,
+        resume: mpsc::Receiver<()>,
+    }
+    #[cfg(test)]
+    static ACTIVATION_MARKER_PAUSE_HOOK: OnceLock<Mutex<Option<ActivationMarkerPauseHook>>> =
+        OnceLock::new();
+    #[cfg(test)]
+    struct RootNamespaceAuditPauseHook {
+        root_identity: D1LeaseFileIdentity,
+        entered: mpsc::Sender<()>,
+        resume: mpsc::Receiver<()>,
+    }
+    #[cfg(test)]
+    static ROOT_NAMESPACE_AUDIT_PAUSE_HOOK: OnceLock<Mutex<Option<RootNamespaceAuditPauseHook>>> =
+        OnceLock::new();
+    #[cfg(test)]
+    pub(super) fn install_activation_marker_pause_hook(
+        target_key_sha256: String,
+        entered: mpsc::Sender<()>,
+        resume: mpsc::Receiver<()>,
+    ) {
+        let mut hook = ACTIVATION_MARKER_PAUSE_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("activation marker pause hook lock");
+        *hook = Some(ActivationMarkerPauseHook {
+            target_key_sha256,
+            entered,
+            resume,
+        });
+    }
+    #[cfg(test)]
+    pub(super) fn install_root_namespace_audit_pause_hook(
+        root_path: &Path,
+        entered: mpsc::Sender<()>,
+        resume: mpsc::Receiver<()>,
+    ) {
+        let metadata =
+            fs::symlink_metadata(root_path).expect("root namespace audit pause hook root metadata");
+        let mut hook = ROOT_NAMESPACE_AUDIT_PAUSE_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("root namespace audit pause hook lock");
+        *hook = Some(RootNamespaceAuditPauseHook {
+            root_identity: identity(&metadata),
+            entered,
+            resume,
+        });
+    }
+    #[cfg(test)]
     pub(super) fn install_guard_pause_hook(
         root_path: PathBuf,
         entered: mpsc::Sender<()>,
@@ -3579,6 +4540,59 @@ mod linux {
     }
     #[cfg(not(test))]
     fn maybe_pause_after_guard_for_test(_root_path: &Path) {}
+    #[cfg(test)]
+    fn maybe_pause_before_activation_marker_for_test(target_key_sha256: &str) {
+        let hook = {
+            let mut hook = ACTIVATION_MARKER_PAUSE_HOOK
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .expect("activation marker pause hook lock");
+            if hook
+                .as_ref()
+                .is_some_and(|candidate| candidate.target_key_sha256 == target_key_sha256)
+            {
+                hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some(hook) = hook {
+            hook.entered
+                .send(())
+                .expect("activation marker test receiver");
+            hook.resume.recv().expect("activation marker test release");
+        }
+    }
+    #[cfg(not(test))]
+    fn maybe_pause_before_activation_marker_for_test(_target_key_sha256: &str) {}
+    #[cfg(test)]
+    fn maybe_pause_root_namespace_audit_after_first_for_test(root: &fs::File) {
+        let root_identity = root.metadata().ok().map(|metadata| identity(&metadata));
+        let hook = {
+            let mut hook = ROOT_NAMESPACE_AUDIT_PAUSE_HOOK
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .expect("root namespace audit pause hook lock");
+            if hook
+                .as_ref()
+                .is_some_and(|candidate| Some(candidate.root_identity.clone()) == root_identity)
+            {
+                hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some(hook) = hook {
+            hook.entered
+                .send(())
+                .expect("root namespace audit test receiver");
+            hook.resume
+                .recv()
+                .expect("root namespace audit test release");
+        }
+    }
+    #[cfg(not(test))]
+    fn maybe_pause_root_namespace_audit_after_first_for_test(_root: &fs::File) {}
 }
 
 #[cfg(target_os = "linux")]
@@ -3593,6 +4607,61 @@ use linux::{
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn migration_lease_requirements_expose_complete_activation_and_cutover_contract() {
+        let target_key_sha256 = sha256_bytes_hex(b"acct-1\0123e4567-e89b-42d3-a456-426614174000");
+        assert_eq!(
+            d1_migration_lease_requirements(
+                "acct-1",
+                "123e4567-e89b-42d3-a456-426614174000",
+                "newsletter-core",
+            ),
+            json!({
+                "required_for_live_apply": true,
+                "environment": D1_MANIFEST_LEASE_ROOT_ENV,
+                "target_key_sha256": target_key_sha256,
+                "migration_family": "newsletter-core",
+                "scope": "one permanent directory and guard per account/database target; family is evidence only and cannot split target serialization",
+                "active_evidence": "active.lease.json and transient retiring.lease.json are never auto-reclaimed; malformed, symlink, non-regular, or otherwise present active/retiring evidence stops the next apply for governed reconciliation",
+                "cross_host_limitation": "Cross-process serialization covers only hosts sharing the same configured operator-owned lease root. It is not a Cloudflare/provider-distributed lease.",
+                "platform_requirement": "Linux on a trusted filesystem supporting working renameat2 RENAME_NOREPLACE, directory fsync, and advisory file locks; unsupported platforms or filesystems fail closed before provider I/O. Cross-host or shared-filesystem semantics require separate proof; retained evidence requires the governed recovery path.",
+                "target_identity_activation": {
+                    "contract_version": 2,
+                    "target_identity_contract": "lowercase_hyphenated_uuid_v1",
+                    "activation_marker": {
+                        "required": true,
+                        "filename": "target-identity-v2.activation.json",
+                        "version": 2,
+                        "payload_sha256": sha256_bytes_hex(TARGET_IDENTITY_ACTIVATION_MARKER_BYTES),
+                    },
+                    "target_registration": {
+                        "required_for_every_target": true,
+                        "create_only": true,
+                        "version": 1,
+                        "filename_pattern": "target-identity-v2.<target_key_sha256>.receipt.json",
+                    },
+                    "first_activation": {
+                        "requires_fresh_empty_root": true,
+                        "bounded_root_entry_limit": 4096,
+                        "legacy_in_place_upgrade_allowed": false,
+                    },
+                    "operator_cutover": {
+                        "predecessor_writer_drain_required": true,
+                        "preserve_predecessor_root": true,
+                        "predecessor_root_reuse_by_upgraded_writers_allowed": false,
+                        "older_binary_on_activated_root_allowed": false,
+                        "rollback": {
+                            "upgraded_writer_drain_required": true,
+                            "preserve_activated_root_without_manual_changes": true,
+                            "return_all_writers_as_one_predecessor_generation": true,
+                            "mixed_roots_or_binary_generations_allowed": false,
+                        },
+                    },
+                },
+            })
+        );
+    }
 
     #[cfg(target_os = "linux")]
     fn terminal_receipt(
@@ -3673,7 +4742,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn private_test_root(label: &str) -> PathBuf {
+    fn private_unactivated_test_root(label: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
         let root = PathBuf::from("/tmp").join(format!(
@@ -3684,6 +4753,569 @@ mod tests {
         fs::create_dir(&root).expect("create private root");
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("private root");
         root
+    }
+
+    #[cfg(target_os = "linux")]
+    fn private_test_root(label: &str) -> PathBuf {
+        let root = private_unactivated_test_root(label);
+        let root_file = fs::File::open(&root).expect("open private test root");
+        let target_key_sha256 = sha256_bytes_hex(b"acct-1\0123e4567-e89b-42d3-a456-426614174000");
+        linux::ensure_target_identity_activation(&root_file, &target_key_sha256)
+            .expect("activate canonical target identity for existing custody tests");
+        root
+    }
+
+    #[cfg(target_os = "linux")]
+    fn install_unversioned_target_entry(
+        root: &Path,
+        account_id: &str,
+        database_id: &str,
+        entry_name: Option<&str>,
+        entry_bytes: &[u8],
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let target_hash = sha256_bytes_hex(format!("{account_id}\0{database_id}").as_bytes());
+        let target = root.join(format!("d1-migration-target-{target_hash}"));
+        fs::create_dir(&target).expect("create unversioned target directory");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
+            .expect("private unversioned target directory");
+        fs::write(target.join(GUARD_NAME), b"").expect("write legacy guard");
+        fs::set_permissions(target.join(GUARD_NAME), fs::Permissions::from_mode(0o600))
+            .expect("private legacy guard");
+        if let Some(entry_name) = entry_name {
+            fs::write(target.join(entry_name), entry_bytes).expect("write legacy evidence");
+            fs::set_permissions(target.join(entry_name), fs::Permissions::from_mode(0o600))
+                .expect("private legacy evidence");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_identity_upgrade_requires_a_fresh_root_for_every_unversioned_namespace() {
+        let canonical_database_id = "123e4567-e89b-42d3-a456-426614174000";
+        let alias_database_id = "123E4567-E89B-42D3-A456-426614174000";
+        let nonce = "a".repeat(64);
+        let cases = vec![
+            (
+                "alias-active",
+                alias_database_id,
+                Some(ACTIVE_LEASE_NAME.to_string()),
+            ),
+            (
+                "alias-retiring",
+                alias_database_id,
+                Some(RETIRING_LEASE_NAME.to_string()),
+            ),
+            (
+                "alias-retired",
+                alias_database_id,
+                Some(format!("retired.{nonce}.lease.json")),
+            ),
+            (
+                "alias-terminal",
+                alias_database_id,
+                Some(format!("terminal-reconciliation.{nonce}.receipt.json")),
+            ),
+            ("canonical-incumbent", canonical_database_id, None),
+        ];
+
+        for (label, database_id, entry_name) in cases {
+            let root = private_unactivated_test_root(label);
+            install_unversioned_target_entry(
+                &root,
+                "acct-1",
+                database_id,
+                entry_name.as_deref(),
+                br#"{"malformed":"legacy payload lacks canonical target authority"}"#,
+            );
+            let error = acquire_d1_target_mutation_guard_at(
+                root.clone(),
+                "d1_execute_write",
+                "acct-1",
+                canonical_database_id,
+            )
+            .expect_err("unversioned custody must block canonical target activation")
+            .structured_content
+            .expect("structured activation failure");
+            assert_eq!(
+                error["error"]["code"],
+                json!("d1.target_guard_upgrade_activation_required"),
+                "{label} must not become an invisible sibling namespace"
+            );
+            assert!(
+                !root.join(TARGET_IDENTITY_ACTIVATION_MARKER_NAME).exists(),
+                "failed activation must not mint a marker"
+            );
+            assert!(
+                !root.join(TARGET_IDENTITY_ACTIVATION_GUARD_NAME).exists(),
+                "pre-existing custody must be rejected without altering its root"
+            );
+            fs::remove_dir_all(root).expect("test cleanup");
+        }
+
+        let root = private_unactivated_test_root("alias-active-migration-lease");
+        install_unversioned_target_entry(
+            &root,
+            "acct-1",
+            alias_database_id,
+            Some(ACTIVE_LEASE_NAME),
+            b"malformed predecessor payload",
+        );
+        let error = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            canonical_database_id,
+            "newsletter-core",
+            &"b".repeat(64),
+        )
+        .expect_err("migration lease must share the upgrade activation gate")
+        .structured_content
+        .expect("structured migration activation failure");
+        assert_eq!(
+            error["error"]["code"],
+            json!("d1.migration_lease_upgrade_activation_required")
+        );
+        assert_eq!(error["provider_calls"], json!(0));
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_identity_upgrade_blocks_malformed_root_and_marker_evidence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let database_id = "123e4567-e89b-42d3-a456-426614174000";
+        for label in ["unexpected-root-entry", "malformed-marker"] {
+            let root = private_unactivated_test_root(label);
+            let entry = if label == "malformed-marker" {
+                TARGET_IDENTITY_ACTIVATION_MARKER_NAME
+            } else {
+                "unclassifiable-custody"
+            };
+            fs::write(root.join(entry), b"not the activation contract")
+                .expect("write malformed root evidence");
+            fs::set_permissions(root.join(entry), fs::Permissions::from_mode(0o600))
+                .expect("private malformed root evidence");
+            let error = acquire_d1_target_mutation_guard_at(
+                root.clone(),
+                "d1_execute_write",
+                "acct-1",
+                database_id,
+            )
+            .expect_err("malformed upgrade evidence must fail closed")
+            .structured_content
+            .expect("structured activation failure");
+            assert_eq!(
+                error["error"]["code"],
+                json!("d1.target_guard_upgrade_activation_required"),
+                "{label} must block"
+            );
+            fs::remove_dir_all(root).expect("test cleanup");
+        }
+
+        let root = private_unactivated_test_root("over-limit-root");
+        for index in 0..linux::MAX_TARGET_CUSTODY_DIRECTORY_ENTRIES {
+            fs::write(root.join(format!("legacy-{index}")), b"").expect("write legacy root entry");
+        }
+        let error = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_execute_write",
+            "acct-1",
+            database_id,
+        )
+        .expect_err("an over-limit root must fail closed without partial activation")
+        .structured_content
+        .expect("structured over-limit activation failure");
+        assert_eq!(
+            error["error"]["code"],
+            json!("d1.target_guard_upgrade_activation_required")
+        );
+        assert!(!root.join(TARGET_IDENTITY_ACTIVATION_MARKER_NAME).exists());
+        assert!(!root.join(TARGET_IDENTITY_ACTIVATION_GUARD_NAME).exists());
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn clean_root_activation_reuses_one_canonical_namespace_for_the_same_provider_target() {
+        let root = private_unactivated_test_root("clean-upgrade");
+        let database_id = "123e4567-e89b-42d3-a456-426614174000";
+        let first = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_execute_write",
+            "acct-1",
+            database_id,
+        )
+        .expect("fresh root activates before the first canonical target guard");
+        assert_eq!(
+            fs::read(root.join(TARGET_IDENTITY_ACTIVATION_MARKER_NAME))
+                .expect("read activation marker"),
+            TARGET_IDENTITY_ACTIVATION_MARKER_BYTES
+        );
+        let target_key = first.target_key_sha256.clone();
+        drop(first);
+
+        let second = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_rename_database",
+            "acct-1",
+            database_id,
+        )
+        .expect("the same canonical provider target reuses its namespace after activation");
+        assert_eq!(second.target_key_sha256, target_key);
+        let target_directories = fs::read_dir(&root)
+            .expect("enumerate activated root")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("d1-migration-target-")
+            })
+            .count();
+        assert_eq!(
+            target_directories, 1,
+            "one provider target has one namespace"
+        );
+        drop(second);
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn valid_marker_never_fast_paths_past_a_stale_unregistered_target() {
+        let root = private_test_root("valid-marker-stale-entry");
+        install_unversioned_target_entry(
+            &root,
+            "acct-1",
+            "123E4567-E89B-42D3-A456-426614174000",
+            None,
+            b"",
+        );
+        let error = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_execute_write",
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect_err("valid marker cannot authorize an unregistered sibling namespace")
+        .structured_content
+        .expect("structured stale-entry failure");
+        assert_eq!(
+            error["error"]["code"],
+            json!("d1.target_guard_upgrade_activation_required")
+        );
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stable_root_audit_rejects_target_entry_change_between_passes() {
+        let root = private_test_root("root-entry-change-between-passes");
+        let account_id = "acct-1";
+        let database_id = "123e4567-e89b-42d3-a456-426614174000";
+        let initial = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_execute_write",
+            account_id,
+            database_id,
+        )
+        .expect("create the canonical target custody directory");
+        let target_key_sha256 = initial.target_key_sha256.clone();
+        drop(initial);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        linux::install_root_namespace_audit_pause_hook(&root, entered_tx, resume_rx);
+        let thread_root = root.clone();
+        let audited = std::thread::spawn(move || {
+            acquire_d1_target_mutation_guard_at(
+                thread_root,
+                "d1_rename_database",
+                account_id,
+                database_id,
+            )
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("root audit completed its first namespace pass");
+
+        let nonce = "b".repeat(64);
+        let active = root
+            .join(format!("d1-migration-target-{target_key_sha256}"))
+            .join(ACTIVE_LEASE_NAME);
+        let payload = serde_json::to_vec(&json!({
+            "approved_plan_sha256": "a".repeat(64),
+            "created_at_unix_ms": 1,
+            "migration_family": "newsletter-core",
+            "nonce": nonce,
+            "target_key_sha256": target_key_sha256,
+            "version": 2,
+        }))
+        .expect("canonical synthetic retained lease payload");
+        write_private_test_file(&active, &payload);
+        resume_tx
+            .send(())
+            .expect("resume the second root audit pass");
+
+        let error = audited
+            .join()
+            .expect("root audit thread")
+            .expect_err("an entry change between root audit passes must fail closed")
+            .structured_content
+            .expect("structured root audit failure");
+        assert_eq!(
+            error["error"]["code"],
+            json!("d1.target_guard_upgrade_activation_required")
+        );
+        assert_eq!(
+            error["error"]["message"],
+            json!("lease root namespace changed during stable activation audit")
+        );
+        assert_eq!(error["provider_calls"], json!(0));
+        assert_eq!(error["provider_mutations"], json!(0));
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn concurrent_first_activation_poison_remains_unusable_after_marker_creation() {
+        let root = private_unactivated_test_root("poisoned-first-activation");
+        let account_id = "acct-poison";
+        let database_id = "123e4567-e89b-42d3-a456-426614174099";
+        let target_key_sha256 = sha256_bytes_hex(format!("{account_id}\0{database_id}").as_bytes());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        linux::install_activation_marker_pause_hook(target_key_sha256, entered_tx, resume_rx);
+        let thread_root = root.clone();
+        let first = std::thread::spawn(move || {
+            acquire_d1_target_mutation_guard_at(
+                thread_root,
+                "d1_execute_write",
+                account_id,
+                database_id,
+            )
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("activation reached final pre-marker boundary");
+        install_unversioned_target_entry(
+            &root,
+            "acct-poison",
+            "123E4567-E89B-42D3-A456-426614174099",
+            None,
+            b"",
+        );
+        resume_tx.send(()).expect("resume poisoned activation");
+        let first_error = first
+            .join()
+            .expect("activation thread")
+            .expect_err("concurrent alias must poison first activation")
+            .structured_content
+            .expect("structured poisoned activation failure");
+        assert_eq!(
+            first_error["error"]["code"],
+            json!("d1.target_guard_upgrade_activation_required")
+        );
+        assert!(
+            root.join(TARGET_IDENTITY_ACTIVATION_MARKER_NAME).is_file(),
+            "the failure occurs after marker creation and must remain fail-closed"
+        );
+        let later = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_rename_database",
+            "acct-poison",
+            "123e4567-e89b-42d3-a456-426614174099",
+        )
+        .expect_err("a poisoned marker must never become a later fast path")
+        .structured_content
+        .expect("structured persistent poison failure");
+        assert_eq!(
+            later["error"]["code"],
+            json!("d1.target_guard_upgrade_activation_required")
+        );
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn post_activation_legacy_insertion_blocks_guard_revalidation_and_lease_release() {
+        let root = private_test_root("post-activation-guard-insertion");
+        let guard = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_execute_write",
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect("canonical guard before legacy insertion");
+        install_unversioned_target_entry(
+            &root,
+            "acct-1",
+            "123E4567-E89B-42D3-A456-426614174000",
+            None,
+            b"",
+        );
+        let error = guard
+            .revalidate()
+            .expect_err("later alias insertion must fail the pre-provider revalidation")
+            .structured_content
+            .expect("structured guard revalidation failure");
+        assert_eq!(
+            error["error"]["code"],
+            json!("d1.target_guard_custody_changed")
+        );
+        drop(guard);
+        fs::remove_dir_all(root).expect("test cleanup");
+
+        let root = private_test_root("post-activation-lease-insertion");
+        let mut lease = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &"a".repeat(64),
+        )
+        .expect("canonical lease before legacy insertion");
+        install_unversioned_target_entry(
+            &root,
+            "acct-1",
+            "123E4567-E89B-42D3-A456-426614174000",
+            None,
+            b"",
+        );
+        let error = lease
+            .release()
+            .expect_err("later alias insertion must block retirement persistence")
+            .structured_content
+            .expect("structured lease persistence failure");
+        assert_eq!(
+            error["error"]["code"],
+            json!("d1.migration_lease_release_failed")
+        );
+        lease.retain();
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_target_guard_blocks_migration_and_curated_mutation_in_both_orders() {
+        let root = private_test_root("shared-target-guard-both-orders");
+        let plan = "a".repeat(64);
+
+        let mut migration = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("migration owns shared target guard");
+        let blocked = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_execute_write",
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect_err("curated mutation must not race migration")
+        .structured_content
+        .expect("structured contention error");
+        assert_eq!(blocked["error"]["code"], json!("d1.target_guard_locked"));
+        migration.release().expect("retire migration lease");
+        drop(migration);
+
+        let guard = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_execute_write",
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect("curated mutation owns shared target guard");
+        let blocked = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &"b".repeat(64),
+        )
+        .expect_err("migration must not race curated mutation")
+        .structured_content
+        .expect("structured contention error");
+        assert_eq!(
+            blocked["error"]["code"],
+            json!("d1.migration_target_guard_locked")
+        );
+        drop(guard);
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_target_guard_allows_distinct_databases_concurrently() {
+        let root = private_test_root("shared-target-guard-distinct-targets");
+        let first = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_rename_database",
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect("first target guard");
+        let second = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_delete_database",
+            "acct-1",
+            "223e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect("different target guard");
+        assert_ne!(first.target_key_sha256, second.target_key_sha256);
+        drop((first, second));
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_target_guard_blocks_a_second_curated_mutation_on_the_same_database() {
+        let root = private_test_root("shared-target-guard-same-target");
+        let first = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_rename_database",
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect("first curated mutation owns shared target guard");
+        let alias = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_delete_database",
+            "acct-1",
+            "123E4567-E89B-42D3-A456-426614174000",
+        )
+        .expect_err("case alias must fail before selecting another guard namespace")
+        .structured_content
+        .expect("structured alias error");
+        assert_eq!(
+            alias,
+            json!({
+                "ok": false,
+                "error": {
+                    "code": "d1.invalid_target_identity",
+                    "message": "database_id must be a canonical lowercase hyphenated UUID",
+                    "hint": "Use the exact lowercase database_id returned by Cloudflare; uppercase, mixed-case, compact, braced, whitespace, path and percent-encoded aliases are rejected."
+                }
+            })
+        );
+        let blocked = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_delete_database",
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect_err("second same-target mutation must fail closed")
+        .structured_content
+        .expect("structured contention error");
+        assert_eq!(blocked["error"]["code"], json!("d1.target_guard_locked"));
+        assert_eq!(blocked["operation"], json!("d1_delete_database"));
+        drop(first);
+        fs::remove_dir_all(root).expect("test cleanup");
     }
 
     #[cfg(target_os = "linux")]
@@ -3846,7 +5478,13 @@ mod tests {
         linux::install_guard_pause_hook(root.clone(), entered_tx, resume_rx);
         let first_root = root.clone();
         let first = std::thread::spawn(move || {
-            acquire_d1_migration_lease_at(first_root, "acct-1", "db-1", "first", &"a".repeat(64))
+            acquire_d1_migration_lease_at(
+                first_root,
+                "acct-1",
+                "123e4567-e89b-42d3-a456-426614174000",
+                "first",
+                &"a".repeat(64),
+            )
         });
         entered_rx
             .recv_timeout(Duration::from_secs(5))
@@ -3855,7 +5493,7 @@ mod tests {
         let mut unrelated = acquire_d1_migration_lease_at(
             unrelated_root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "unrelated",
             &"c".repeat(64),
         )
@@ -3865,7 +5503,7 @@ mod tests {
         let contender = acquire_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "second",
             &"b".repeat(64),
         )
@@ -3884,9 +5522,14 @@ mod tests {
     #[test]
     fn failed_retirement_sync_restores_active_evidence_before_releasing_guard() {
         let root = private_test_root("release");
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "first", &"a".repeat(64))
-                .expect("owner lease");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "first",
+            &"a".repeat(64),
+        )
+        .expect("owner lease");
         let active = owner.active_path_for_test().expect("linux active path");
         let original = fs::read(&active).expect("original active evidence");
         linux::fail_next_directory_sync_for_test();
@@ -3912,7 +5555,7 @@ mod tests {
         let contender = acquire_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "second",
             &"b".repeat(64),
         )
@@ -3927,9 +5570,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn target_custody_preflight_is_read_only_when_absent_and_blocks_retained_active() {
-        let root = private_test_root("preflight-existing-target");
-        preflight_d1_migration_target_custody_at(root.clone(), "acct-1", "db-1")
-            .expect("absent target is clear without creating custody");
+        let root = private_unactivated_test_root("preflight-existing-target");
+        preflight_d1_migration_target_custody_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect("absent target is clear without creating custody");
         assert_eq!(
             fs::read_dir(&root).expect("read untouched root").count(),
             0,
@@ -3939,7 +5586,7 @@ mod tests {
         let mut owner = acquire_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &"a".repeat(64),
         )
@@ -3947,8 +5594,12 @@ mod tests {
         owner.retain();
         drop(owner);
 
-        let error = preflight_d1_migration_target_custody_at(root.clone(), "acct-1", "db-1")
-            .expect_err("retained active evidence blocks before a provider read");
+        let error = preflight_d1_migration_target_custody_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect_err("retained active evidence blocks before a provider read");
         assert_eq!(
             error.structured_content.expect("preflight error")["error"]["code"],
             json!("d1.migration_target_lease_held")
@@ -3962,9 +5613,14 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let root = private_test_root("target-replacement");
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "first", &"a".repeat(64))
-                .expect("owner lease");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "first",
+            &"a".repeat(64),
+        )
+        .expect("owner lease");
         let target = owner
             .active_path_for_test()
             .expect("active path")
@@ -4004,9 +5660,14 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let root = private_test_root("abort-replacement");
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "first", &"a".repeat(64))
-                .expect("owner lease");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "first",
+            &"a".repeat(64),
+        )
+        .expect("owner lease");
         let active = owner.active_path_for_test().expect("active path");
         let displaced = active.with_extension("displaced");
         fs::rename(&active, &displaced).expect("displace owner active entry");
@@ -4058,7 +5719,7 @@ mod tests {
             let root = private_test_root(label);
             let target = root.join(format!(
                 "d1-migration-target-{}",
-                sha256_bytes_hex(b"acct-1\0db-1")
+                sha256_bytes_hex(b"acct-1\0123e4567-e89b-42d3-a456-426614174000")
             ));
             fs::create_dir(&target).expect("target directory");
             fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
@@ -4067,15 +5728,15 @@ mod tests {
             let error = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "first",
                 &"a".repeat(64),
             )
             .expect_err("hostile active entry must fail closed");
             assert_eq!(
                 error.structured_content.expect("active error")["error"]["code"],
-                json!("d1.migration_target_lease_unreconciled"),
-                "{label} active entry must stop before lease ownership or provider I/O"
+                json!("d1.migration_lease_upgrade_activation_required"),
+                "{label} active entry must fail the activated root audit before lease ownership or provider I/O"
             );
             fs::remove_dir_all(root).expect("test cleanup");
         }
@@ -4083,7 +5744,7 @@ mod tests {
         let root = private_test_root("retiring");
         let target = root.join(format!(
             "d1-migration-target-{}",
-            sha256_bytes_hex(b"acct-1\0db-1")
+            sha256_bytes_hex(b"acct-1\0123e4567-e89b-42d3-a456-426614174000")
         ));
         fs::create_dir(&target).expect("target directory");
         fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
@@ -4095,12 +5756,17 @@ mod tests {
             fs::Permissions::from_mode(0o600),
         )
         .expect("private retiring evidence");
-        let error =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "first", &"a".repeat(64))
-                .expect_err("retiring entry must block a fresh owner");
+        let error = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "first",
+            &"a".repeat(64),
+        )
+        .expect_err("retiring entry must block a fresh owner");
         assert_eq!(
             error.structured_content.expect("retiring error")["error"]["code"],
-            json!("d1.migration_target_retirement_unreconciled")
+            json!("d1.migration_lease_upgrade_activation_required")
         );
         fs::remove_dir_all(root).expect("test cleanup");
     }
@@ -4115,7 +5781,7 @@ mod tests {
             let mut owner = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "first",
                 &"a".repeat(64),
             )
@@ -4169,7 +5835,7 @@ mod tests {
             let mut owner = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "first",
                 &"a".repeat(64),
             )
@@ -4218,7 +5884,7 @@ mod tests {
             let mut owner = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "first",
                 &"a".repeat(64),
             )
@@ -4264,9 +5930,14 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
 
         let root = private_test_root("release-idempotent");
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "first", &"a".repeat(64))
-                .expect("owner lease");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "first",
+            &"a".repeat(64),
+        )
+        .expect("owner lease");
         owner.release().expect("first release");
         let target = owner
             .active_path_for_test()
@@ -4325,7 +5996,7 @@ mod tests {
         let mut owner = acquire_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "migration-ledger-bootstrap-v1",
             &plan,
         )
@@ -4346,7 +6017,7 @@ mod tests {
         let retained = inspect_terminal_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "migration-ledger-bootstrap-v1",
             &plan,
             &identity.nonce,
@@ -4369,7 +6040,7 @@ mod tests {
         let mut owner = acquire_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "migration-ledger-bootstrap-v1",
             &plan,
         )
@@ -4384,7 +6055,7 @@ mod tests {
         let retained = inspect_terminal_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "migration-ledger-bootstrap-v1",
             &plan,
             &identity.nonce,
@@ -4407,9 +6078,14 @@ mod tests {
     fn retained_reconciliation_inspection_rebinds_exact_active_without_mutation() {
         let root = private_test_root("reconcile-exact");
         let plan = "a".repeat(64);
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("create retained evidence");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
         let identity = owner.identity.clone();
         let active = owner.active_path_for_test().expect("active path");
         let before = fs::read(&active).expect("active bytes");
@@ -4419,7 +6095,7 @@ mod tests {
         let retained = inspect_retained_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &identity.nonce,
@@ -4439,9 +6115,14 @@ mod tests {
     fn retained_reconciliation_accepts_exact_retiring_namespace_without_retiring_it() {
         let root = private_test_root("reconcile-retiring");
         let plan = "a".repeat(64);
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("create retained evidence");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
         let identity = owner.identity.clone();
         let active = owner.active_path_for_test().expect("active path");
         owner.retain();
@@ -4452,7 +6133,7 @@ mod tests {
         let retained = inspect_retained_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &identity.nonce,
@@ -4488,7 +6169,7 @@ mod tests {
             let mut owner = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
             )
@@ -4522,9 +6203,9 @@ mod tests {
                 _ => unreachable!(),
             }
             let database_id = if label == "cross-target" {
-                "db-2"
+                "223e4567-e89b-42d3-a456-426614174000"
             } else {
-                "db-1"
+                "123e4567-e89b-42d3-a456-426614174000"
             };
             let payload_sha256 = if label == "contradictory" {
                 "c".repeat(64)
@@ -4556,13 +6237,18 @@ mod tests {
     fn retained_reconciliation_stops_at_held_guard() {
         let root = private_test_root("reconcile-guard");
         let plan = "a".repeat(64);
-        let owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("held owner");
+        let owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("held owner");
         let error = inspect_retained_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &owner.identity.nonce,
@@ -4582,9 +6268,14 @@ mod tests {
     fn terminal_receipt_is_create_only_replayable_and_precedes_retirement() {
         let root = private_test_root("terminal-exact");
         let plan = "a".repeat(64);
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("create retained evidence");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
         let identity = owner.identity.clone();
         owner.retain();
         drop(owner);
@@ -4592,7 +6283,7 @@ mod tests {
         let mut retained = inspect_terminal_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &identity.nonce,
@@ -4627,7 +6318,7 @@ mod tests {
         let completed = inspect_terminal_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &identity.nonce,
@@ -4649,9 +6340,14 @@ mod tests {
     fn terminal_receipt_exclusive_create_race_attributes_only_the_creator() {
         let root = private_test_root("terminal-receipt-exclusive-create-race");
         let plan = "a".repeat(64);
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("create retained evidence");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
         let identity = owner.identity.clone();
         owner.retain();
         drop(owner);
@@ -4659,7 +6355,7 @@ mod tests {
             inspect_terminal_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
                 &identity.nonce,
@@ -4713,9 +6409,14 @@ mod tests {
     fn terminal_receipt_failures_distinguish_pre_create_from_post_create_mutation() {
         let root = private_test_root("terminal-receipt-failure-accounting");
         let plan = "a".repeat(64);
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("create retained evidence");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
         let identity = owner.identity.clone();
         let target = owner
             .active_path_for_test()
@@ -4729,7 +6430,7 @@ mod tests {
         let retained = inspect_terminal_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &identity.nonce,
@@ -4793,9 +6494,14 @@ mod tests {
     fn terminal_evidence_readback_rejects_an_altered_receipt_as_unknown_custody() {
         let root = private_test_root("terminal-readback-altered-receipt");
         let plan = "a".repeat(64);
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("create retained evidence");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
         let identity = owner.identity.clone();
         let target = owner
             .active_path_for_test()
@@ -4809,7 +6515,7 @@ mod tests {
         let retained = inspect_terminal_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &identity.nonce,
@@ -4843,9 +6549,14 @@ mod tests {
     fn terminal_evidence_readback_rechecks_receipt_after_preliminary_stable_read() {
         let root = private_test_root("terminal-readback-final-recheck");
         let plan = "a".repeat(64);
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("create retained evidence");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
         let identity = owner.identity.clone();
         let target = owner
             .active_path_for_test()
@@ -4859,7 +6570,7 @@ mod tests {
         let retained = inspect_terminal_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &identity.nonce,
@@ -4907,9 +6618,14 @@ mod tests {
     fn terminal_evidence_readback_rechecks_lease_namespace_after_final_receipt_read() {
         let root = private_test_root("terminal-readback-final-lease-recheck");
         let plan = "a".repeat(64);
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("create retained evidence");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
         let identity = owner.identity.clone();
         let target = owner
             .active_path_for_test()
@@ -4923,7 +6639,7 @@ mod tests {
         let retained = inspect_terminal_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &identity.nonce,
@@ -4972,7 +6688,7 @@ mod tests {
             let mut owner = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
             )
@@ -4990,7 +6706,7 @@ mod tests {
             let retained = inspect_terminal_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
                 &identity.nonce,
@@ -5058,9 +6774,14 @@ mod tests {
     fn target_directory_enumeration_fails_closed_at_total_entry_limit() {
         let root = private_test_root("terminal-enumeration-total-limit");
         let plan = "a".repeat(64);
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("create retained evidence");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
         let identity = owner.identity.clone();
         let target = owner
             .active_path_for_test()
@@ -5073,7 +6794,7 @@ mod tests {
         let retained = inspect_terminal_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &identity.nonce,
@@ -5112,6 +6833,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn terminal_receipt_creation_respects_exact_total_directory_capacity_boundary() {
+        use std::os::unix::fs::PermissionsExt;
+
         for (label, entries_before_persist, should_create) in [
             (
                 "one-slot",
@@ -5129,7 +6852,7 @@ mod tests {
             let mut owner = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
             )
@@ -5146,7 +6869,7 @@ mod tests {
             let retained = inspect_terminal_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
                 &identity.nonce,
@@ -5160,9 +6883,21 @@ mod tests {
                 existing_entries, 2,
                 "permanent guard and retained lease consume two entries"
             );
+            let mut retained_payload: Value = serde_json::from_slice(
+                &fs::read(target.join(ACTIVE_LEASE_NAME)).expect("read retained payload"),
+            )
+            .expect("decode retained payload");
             for index in existing_entries..entries_before_persist {
-                fs::write(target.join(format!("capacity-evidence-{index}.json")), b"")
-                    .expect("fill exact target directory capacity");
+                let nonce = sha256_bytes_hex(format!("capacity-evidence-{index}").as_bytes());
+                retained_payload["nonce"] = json!(nonce);
+                let path = target.join(format!("retired.{nonce}.lease.json"));
+                fs::write(
+                    &path,
+                    serde_json::to_vec(&retained_payload).expect("encode retained payload"),
+                )
+                .expect("fill exact target directory capacity");
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                    .expect("private retained capacity evidence");
             }
             assert_eq!(
                 fs::read_dir(&target)
@@ -5230,7 +6965,7 @@ mod tests {
             let mut owner = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
             )
@@ -5248,7 +6983,7 @@ mod tests {
             let mut retained = inspect_terminal_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
                 &identity.nonce,
@@ -5299,9 +7034,14 @@ mod tests {
     fn canonical_historical_receipt_sibling_preserves_exact_current_replay() {
         let root = private_test_root("terminal-receipt-historical-sibling");
         let plan = "a".repeat(64);
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("create retained evidence");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
         let identity = owner.identity.clone();
         let target = owner
             .active_path_for_test()
@@ -5326,7 +7066,7 @@ mod tests {
         let mut retained = inspect_terminal_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &identity.nonce,
@@ -5363,7 +7103,7 @@ mod tests {
             let mut owner = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
             )
@@ -5389,7 +7129,7 @@ mod tests {
             let retained = inspect_terminal_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
                 &identity.nonce,
@@ -5426,7 +7166,7 @@ mod tests {
             let mut owner = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
             )
@@ -5444,7 +7184,7 @@ mod tests {
             let mut retained = inspect_terminal_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
                 &identity.nonce,
@@ -5509,9 +7249,14 @@ mod tests {
     fn terminal_retirement_sync_and_readback_failure_never_infers_retired_custody() {
         let root = private_test_root("terminal-sync-readback-failure");
         let plan = "a".repeat(64);
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("create retained evidence");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
         let identity = owner.identity.clone();
         let target = owner
             .active_path_for_test()
@@ -5525,7 +7270,7 @@ mod tests {
         let mut retained = inspect_terminal_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &identity.nonce,
@@ -5580,7 +7325,7 @@ mod tests {
             let mut owner = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
             )
@@ -5592,7 +7337,7 @@ mod tests {
             let retained = inspect_terminal_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
                 &identity.nonce,
@@ -5649,7 +7394,7 @@ mod tests {
             let mut owner = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
             )
@@ -5685,7 +7430,7 @@ mod tests {
             let mut retained = inspect_terminal_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
                 &identity.nonce,
@@ -5717,7 +7462,7 @@ mod tests {
             let retired = inspect_terminal_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
                 &identity.nonce,
@@ -5745,7 +7490,7 @@ mod tests {
             let mut owner = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
             )
@@ -5785,24 +7530,20 @@ mod tests {
             fs::write(&receipt_path, bytes).expect("install invalid v1 receipt");
             fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600))
                 .expect("private invalid v1 receipt");
-            let retained = inspect_terminal_d1_migration_lease_at(
+            let error = inspect_terminal_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
                 &identity.nonce,
                 &identity.payload_sha256,
             )
-            .expect("retained lease remains inspectable");
-            assert!(
-                retained
-                    .compatible_terminal_receipt_state(
-                        &terminal_receipt(&identity, &plan),
-                        Some(&legacy),
-                    )
-                    .is_err(),
-                "{variant} v1 receipt must fail closed"
+            .expect_err("invalid receipt must fail the activated root audit");
+            assert_eq!(
+                error.structured_content.expect("inspection error")["error"]["code"],
+                json!("d1.migration_reconciliation_custody_changed"),
+                "{variant} v1 receipt must fail closed during custody inspection"
             );
             fs::remove_dir_all(root).expect("test cleanup");
         }
@@ -5829,7 +7570,7 @@ mod tests {
             let mut owner = acquire_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
             )
@@ -5858,19 +7599,20 @@ mod tests {
             fs::write(&receipt_path, bytes).expect("install restored receipt payload");
             fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600))
                 .expect("private restored receipt");
-            let retained = inspect_terminal_d1_migration_lease_at(
+            let error = inspect_terminal_d1_migration_lease_at(
                 root.clone(),
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "newsletter-core",
                 &plan,
                 &identity.nonce,
                 &identity.payload_sha256,
             )
-            .expect("retained lease remains inspectable");
-            assert!(
-                retained.terminal_receipt_state(&expected).is_err(),
-                "{label} restored receipt must fail closed"
+            .expect_err("invalid restored receipt must fail the activated root audit");
+            assert_eq!(
+                error.structured_content.expect("inspection error")["error"]["code"],
+                json!("d1.migration_reconciliation_custody_changed"),
+                "{label} restored receipt must fail closed during custody inspection"
             );
             fs::remove_dir_all(root).expect("test cleanup");
         }
@@ -5881,9 +7623,14 @@ mod tests {
     fn terminal_retirement_without_receipt_and_conflicting_replay_fail_closed() {
         let root = private_test_root("terminal-order");
         let plan = "a".repeat(64);
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("create retained evidence");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
         let identity = owner.identity.clone();
         owner.release().expect("install retirement before receipt");
         drop(owner);
@@ -5891,7 +7638,7 @@ mod tests {
         let retired = inspect_terminal_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &identity.nonce,
@@ -5912,16 +7659,21 @@ mod tests {
         fs::remove_dir_all(root).expect("test cleanup");
 
         let root = private_test_root("terminal-conflict");
-        let mut owner =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "newsletter-core", &plan)
-                .expect("create retained evidence");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained evidence");
         let identity = owner.identity.clone();
         owner.retain();
         drop(owner);
         let retained = inspect_terminal_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "newsletter-core",
             &plan,
             &identity.nonce,
