@@ -62,10 +62,10 @@ fn manifest_target_path(lease_root: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn lock_manifest_target_guard(lease_root: &Path) -> fs::File {
+fn install_activated_manifest_root(lease_root: &Path) {
     use std::os::unix::fs::PermissionsExt;
 
-    fs::create_dir(lease_root).expect("create private target guard root");
+    fs::create_dir_all(lease_root).expect("create private target guard root");
     fs::set_permissions(lease_root, fs::Permissions::from_mode(0o700))
         .expect("make target guard root private");
     let activation_guard = lease_root.join("target-identity-v2.guard.lock");
@@ -93,6 +93,13 @@ fn lock_manifest_target_guard(lease_root: &Path) -> fs::File {
     .expect("write activated-root target registration");
     fs::set_permissions(&registration, fs::Permissions::from_mode(0o600))
         .expect("make activated-root target registration private");
+}
+
+#[cfg(unix)]
+fn lock_manifest_target_guard(lease_root: &Path) -> fs::File {
+    use std::os::unix::fs::PermissionsExt;
+
+    install_activated_manifest_root(lease_root);
     let target = manifest_target_path(lease_root);
     fs::create_dir(&target).expect("create permanent target directory");
     fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
@@ -223,6 +230,8 @@ fn create_retained_reconciliation_fixture(
         ledger: Vec<Value>,
     }
 
+    #[cfg(unix)]
+    install_activated_manifest_root(lease_root);
     let target = manifest_target_path(lease_root);
     fs::create_dir(&target).expect("create retained target");
     #[cfg(unix)]
@@ -7479,7 +7488,7 @@ fn d1_bootstrap_zero_dispatch_abort_retires_only_exact_marker_aware_custody() {
     assert_eq!(malformed["ok"], json!(false), "{malformed}");
     assert_eq!(
         malformed["error"]["code"],
-        json!("d1.bootstrap_abort_dispatch_not_absent")
+        json!("d1.migration_reconciliation_custody_changed")
     );
     fs::remove_file(&marker).expect("remove malformed test fixture");
 
@@ -14716,7 +14725,7 @@ fn d1_terminal_restored_v1_v2_semantic_contradictions_fail_read_only_in_every_na
                 let content = structured_content(&rejected);
                 assert_eq!(content["ok"], false, "{content}");
                 assert_eq!(
-                    content["error"]["code"], "d1.migration_terminal_evidence_invalid",
+                    content["error"]["code"], "d1.migration_reconciliation_custody_changed",
                     "v{receipt_version} {namespace} {outcome} {original_prefix_length}->{current_prefix_length}"
                 );
                 assert_eq!(content["provider_calls"], 0, "{content}");
@@ -14792,10 +14801,11 @@ fn d1_finalize_migration_reconciliation_stdio_distinguishes_verified_retained_an
             "ok": false,
             "operation": "d1_finalize_migration_reconciliation",
             "dry_run": true,
+            "read_only": true,
             "status": "reconciliation_required",
             "retry_decision": "do_not_retry_same_attempt",
             "lease_retained": null,
-            "custody_status": "retained_evidence_unverified",
+            "custody_status": "inspection_failed",
             "receipt_persisted": null,
             "provider_calls": 0,
             "provider_read_lifecycle": [],
@@ -14803,9 +14813,9 @@ fn d1_finalize_migration_reconciliation_stdio_distinguishes_verified_retained_an
             "provider_mutations": 0,
             "local_namespace_mutations": 0,
             "error": {
-                "code": "d1.migration_terminal_evidence_invalid",
+                "code": "d1.migration_reconciliation_custody_changed",
                 "message": "terminal reconciliation receipt is malformed, duplicate-keyed, or structurally unexpected",
-                "hint": "Preserve the exact target custody directory and reconcile its receipt and lease namespaces before another terminal attempt."
+                "hint": "Retain the exact custody evidence and resolve this boundary before any provider read or migration retry."
             }
         }),
     );
@@ -14991,7 +15001,7 @@ fn d1_finalize_migration_reconciliation_stdio_does_not_claim_retention_after_cus
             "local_namespace_mutations": 0,
             "error": {
                 "code": "d1.migration_reconciliation_lease_changed",
-                "message": "retained lease payload digest changed",
+                "message": "retained lease payload is malformed, duplicate-keyed, or structurally unexpected",
                 "hint": "Retain the exact custody evidence and resolve this boundary before any provider read or migration retry."
             }
         }),
@@ -16594,7 +16604,7 @@ fn d1_reconcile_migration_manifest_stdio_preserves_identical_reads_after_second_
             "local_namespace_mutations": 0,
             "error": {
                 "code": "d1.migration_reconciliation_lease_changed",
-                "message": "retained lease payload digest changed",
+                "message": "retained lease payload is malformed, duplicate-keyed, or structurally unexpected",
                 "hint": "Retain the exact custody evidence and resolve this boundary before any provider read or migration retry.",
             },
         }),
@@ -17213,7 +17223,7 @@ fn d1_reconcile_migration_manifest_stdio_preserves_second_transport_invocation_w
                 "custody_cause".to_string(),
                 json!({
                     "code": "d1.migration_reconciliation_lease_changed",
-                    "message": "retained lease payload digest changed",
+                    "message": "retained lease payload is malformed, duplicate-keyed, or structurally unexpected",
                     "hint": "Retain the exact custody evidence and resolve this boundary before any provider read or migration retry.",
                 }),
             );
