@@ -341,6 +341,36 @@ equal to or greater than the dispatched SQL byte length is impossible evidence
 and is omitted while the allowlisted provider code/category, complete-body
 digest, custody, and no-retry semantics remain unchanged.
 
+## Staged D1 catalog evidence contract
+
+The crate contains a side-effect-free, non-routed catalog evidence boundary for
+future guarded D1 write composition. It derives one immutable, target-bound
+`sqlite_schema` projection rather than accepting caller SQL or a generic
+provider envelope. A future provider-custody adapter must normalize two physical
+observations into the exact versioned projection payload and must bind each
+observation to the same canonical target and rederived plan using four distinct
+preallocated dispatch/read identities. The pure verifier cannot authenticate
+that a frame came from a physical provider dispatch or that the response reached
+EOF. It must consume frames only from that successor adapter after the adapter
+has retained those lifecycle facts.
+
+Each observation must prove a complete body under the exact 4 MiB byte cap, a
+literal `results_truncated=false` under the exact 1,001-row provider cap, and
+typed successful primary read-only metadata (`changed_db=false`, `changes=0`,
+and `rows_written=0`). The 1,001st row is a completeness sentinel, not catalog
+content. Projection rows expose only object type plus uppercase hexadecimal
+bytes for object name, parent name, and nullable definition text. They must be
+strictly ordered exactly as the fixed query specifies. The two payloads must
+deserialize to equal typed row vectors. The snapshot digest covers canonical
+JSON reserialization of that typed vector; equality of the original provider
+JSON bytes is neither required nor claimed.
+
+The resulting receipt contains only target/plan/query/snapshot and observation
+pair digests, counts, caps, and body sizes. It does not parse or authorize DDL,
+triggers, foreign keys, implicit writes, DML, provider dispatch/EOF authority,
+custody, or any mutation. No public MCP tool currently exposes this staged
+contract.
+
 ## Structured payload details for complex tools
 
 For `effect_assertion_id=schema_create_objects_additive_seed_rows_v1` or its
