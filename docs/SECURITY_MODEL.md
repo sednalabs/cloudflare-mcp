@@ -139,7 +139,8 @@ systems, secret files should be regular owner-only files.
 ## Private D1 SQL Artifact Transport
 
 Private SQL upload preparation uses the same Unix custody policy as retained D1
-migration evidence: a current-operator-owned private root, safe external
+migration evidence: a current-operator-owned private root, root- or
+current-operator-owned safe external
 ancestors, descriptor-relative traversal without symlink following, private
 single-link regular files, and stable device/inode/size/content readback. A held
 descriptor is revalidated against the complete pathname immediately before its
@@ -152,8 +153,9 @@ not independently identify a D1 database, so the adapter accepts it only inside
 the exact account/database context of the init response. It separately requires
 an HTTPS R2 hostname whose canonical account label equals that exact Cloudflare
 account, rejects ambiguous authorities and encoded hostnames, and uses a
-dedicated no-redirect client. SQL bytes, local paths, presigned URLs, account
-identifiers, and database identifiers are absent from errors and receipts.
+dedicated no-redirect, no-automatic-retry client. SQL bytes, local paths,
+presigned URLs, account identifiers, and database identifiers are absent from
+errors and receipts.
 
 This low-level boundary does not authorize import initialization, upload retry,
 ingest, polling, reconciliation, or any other lifecycle transition.

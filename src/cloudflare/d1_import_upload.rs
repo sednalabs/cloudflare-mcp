@@ -142,6 +142,7 @@ impl D1ImportUploadTransport {
         let http = reqwest::Client::builder()
             .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .map_err(|_| D1ImportUploadError::ClientUnavailable)?;
         Ok(Self { http, user_agent })
@@ -294,17 +295,45 @@ fn r2_account_label(host: &str) -> Result<&str, D1ImportUploadTargetError> {
     if labels.len() < 4 || labels[labels.len() - 3..] != ["r2", "cloudflarestorage", "com"] {
         return Err(D1ImportUploadTargetError::HostUntrusted);
     }
-    let mut account_index = labels.len() - 4;
-    if matches!(labels[account_index], "eu" | "fedramp" | "us") {
-        account_index = account_index
-            .checked_sub(1)
-            .ok_or(D1ImportUploadTargetError::HostUntrusted)?;
+    let prefix = &labels[..labels.len() - 3];
+    match prefix {
+        [account] if canonical_account_id(account) => Ok(account),
+        [bucket, account] if valid_bucket_label(bucket) && canonical_account_id(account) => {
+            Ok(account)
+        }
+        [account, jurisdiction]
+            if canonical_account_id(account) && valid_r2_jurisdiction(jurisdiction) =>
+        {
+            Ok(account)
+        }
+        [bucket, account, jurisdiction]
+            if valid_bucket_label(bucket)
+                && canonical_account_id(account)
+                && valid_r2_jurisdiction(jurisdiction) =>
+        {
+            Ok(account)
+        }
+        _ => Err(D1ImportUploadTargetError::HostUntrusted),
     }
-    let account = labels[account_index];
-    if !canonical_account_id(account) {
-        return Err(D1ImportUploadTargetError::HostUntrusted);
-    }
-    Ok(account)
+}
+
+fn valid_bucket_label(label: &str) -> bool {
+    (3..=63).contains(&label.len())
+        && label
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && label
+            .bytes()
+            .next_back()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn valid_r2_jurisdiction(label: &str) -> bool {
+    matches!(label, "eu" | "fedramp" | "us")
 }
 
 #[cfg(test)]
@@ -383,6 +412,7 @@ mod tests {
         for url in [
             format!("https://{ACCOUNT}.r2.cloudflarestorage.com/object?signature=x"),
             format!("https://bucket.{ACCOUNT}.r2.cloudflarestorage.com/object?signature=x"),
+            format!("https://{ACCOUNT}.us.r2.cloudflarestorage.com/object?signature=x"),
             format!("https://bucket.{ACCOUNT}.eu.r2.cloudflarestorage.com/object?signature=x"),
         ] {
             let target =
@@ -439,6 +469,12 @@ mod tests {
             format!("https://evil.example/{ACCOUNT}?signature=x"),
             format!("https://{ACCOUNT}.r2.cloudflarestorage.com./object?signature=x"),
             format!("https://xn--evil.{ACCOUNT}.r2.cloudflarestorage.com/object?signature=x"),
+            format!("https://extra.bucket.{ACCOUNT}.r2.cloudflarestorage.com/object?signature=x"),
+            format!("https://ab.{ACCOUNT}.r2.cloudflarestorage.com/object?signature=x"),
+            format!(
+                "https://{}.{ACCOUNT}.r2.cloudflarestorage.com/object?signature=x",
+                "a".repeat(64)
+            ),
             format!("https://%30{ACCOUNT}.r2.cloudflarestorage.com/object?signature=x"),
             format!("https://\u{ff45}vil.{ACCOUNT}.r2.cloudflarestorage.com/object?signature=x"),
             format!("https://user@{ACCOUNT}.r2.cloudflarestorage.com/object?signature=x"),

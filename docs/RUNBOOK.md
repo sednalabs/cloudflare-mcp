@@ -210,13 +210,15 @@ cannot reconcile or retire bootstrap-family custody.
 
 The reusable private-artifact boundary is intentionally lower-level than any D1
 import workflow. It opens a local SQL artifact through held Linux descriptors,
-applies the migration custody root/ancestor/owner/mode/hardlink policy, hashes
+applies the migration custody root/ancestor/owner/mode/hardlink policy, including
+root-or-current-operator ownership for every external ancestor, hashes
 the exact stable descriptor bytes, and re-proves the descriptor-to-path binding
 before a later caller may upload those bytes.
 
 The upload adapter requires the exact account and database context that produced
 the D1 import-init response. It accepts only the corresponding canonical
-Cloudflare R2 account hostname over HTTPS and never follows redirects. Errors
+Cloudflare R2 account hostname over HTTPS, never follows redirects, and disables
+automatic HTTP retries. Errors
 and receipts omit the local path, SQL, presigned URL, account ID, and database
 ID. This boundary alone is not an operational import procedure and provides no
 admission, retry, ingest, poll, reconciliation, or terminal authority.

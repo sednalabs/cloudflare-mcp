@@ -179,6 +179,10 @@ mod linux {
         uid == current_effective_uid()
     }
 
+    fn trusted_ancestor_owner(uid: u32) -> bool {
+        uid == 0 || private_owner(uid)
+    }
+
     fn private_mode(mode: u32) -> bool {
         mode & 0o077 == 0
     }
@@ -200,6 +204,7 @@ mod linux {
     pub(crate) fn safe_root_ancestor(metadata: &Metadata) -> bool {
         metadata.is_dir()
             && !metadata.file_type().is_symlink()
+            && trusted_ancestor_owner(metadata.uid())
             && (metadata.mode() & 0o022 == 0 || metadata.mode() & 0o1000 != 0)
     }
 
@@ -627,6 +632,13 @@ mod linux {
         #[test]
         fn ownership_and_device_inode_policy_reject_mismatch() {
             assert!(!private_owner(current_effective_uid().wrapping_add(1)));
+            assert!(trusted_ancestor_owner(0));
+            assert!(trusted_ancestor_owner(current_effective_uid()));
+            let foreign_uid = [1, 2, u32::MAX]
+                .into_iter()
+                .find(|uid| *uid != 0 && *uid != current_effective_uid())
+                .expect("foreign uid fixture");
+            assert!(!trusted_ancestor_owner(foreign_uid));
             let expected = UnixFileIdentity {
                 device: 1,
                 inode: 2,
