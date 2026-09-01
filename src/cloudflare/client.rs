@@ -3812,12 +3812,12 @@ fn validate_strict_d1_migration_manifest_envelope(
 
 const DUPLICATE_JSON_OBJECT_KEY_MARKER: &str = "duplicate JSON object key";
 const JSON_NESTING_DEPTH_EXCEEDED_MARKER: &str = "JSON nesting depth exceeded";
-const D1_MIGRATION_JSON_MAX_CONTAINER_DEPTH: usize = 32;
+pub(super) const D1_MIGRATION_JSON_MAX_CONTAINER_DEPTH: usize = 32;
 
 struct DuplicateSafeJsonValue(Value);
 
 #[derive(Debug)]
-enum DuplicateSafeJsonError {
+pub(super) enum DuplicateSafeJsonError {
     DuplicateObjectKey,
     NestingDepthExceeded,
     Malformed(serde_json::Error),
@@ -4058,7 +4058,7 @@ fn d1_migration_provider_error_location(
     })
 }
 
-fn decode_json_rejecting_duplicate_object_keys(
+pub(super) fn decode_json_rejecting_duplicate_object_keys(
     body: &str,
 ) -> Result<Value, DuplicateSafeJsonError> {
     let mut deserializer = serde_json::Deserializer::from_str(body);

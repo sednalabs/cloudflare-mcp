@@ -920,19 +920,27 @@ I/O, then dispatches the fixed plan query twice for the canonical normalized
 target. Each read makes one no-redirect HTTP attempt with no adapter retry. The
 request/response custody binding covers the exact target, query and query
 digest, plan digest, and 1,001-row/4 MiB caps. The raw provider body must reach
-EOF within the byte cap before strict decoding; one successful result set must
-prove primary service plus `changed_db=false`, `changes=0`, and
-`rows_written=0`. Only then does the adapter normalize the fixed projection and
-construct a frame. Do not feed generic `d1_query_read_only` JSON into this
-boundary.
+EOF within the byte cap before the shared duplicate-key-rejecting JSON decoder
+accepts it under the 32-container nesting bound. One successful result set must
+include an explicitly present, typed, empty `errors` array and prove primary
+service plus `changed_db=false`, `changes=0`, and `rows_written=0`. Only then
+does the adapter normalize the fixed projection and construct a frame. Do not
+feed generic `d1_query_read_only` JSON into this boundary.
 
 Network ambiguity, redirects or non-success status, incomplete or oversized
-bodies, malformed envelopes, non-primary or mutating metadata, response-binding
-drift, identity reuse, a cap change, and the 1,001st row are terminal unavailable
-evidence for that attempt. A first-read failure stops before the second request;
-a second-read failure preserves the truthful aggregate count and does not retry.
-Errors and the aggregate custody receipt omit provider bodies, request content,
-and private dispatch/read identities.
+bodies, duplicate keys, excessive JSON nesting, missing/malformed/non-empty
+result-set errors, malformed envelopes, non-primary or mutating metadata,
+response-binding drift, identity reuse, a cap change, and the 1,001st row are
+terminal unavailable evidence for that attempt. A first-read failure stops
+before the second request; a second-read failure preserves the truthful
+aggregate count and does not retry.
+
+The success receipt binds each body completed at EOF by SHA-256 and byte size,
+but retains neither body bytes nor private dispatch/read identities. Treat that
+digest as comparison evidence only: without separately authorized exact bytes
+it cannot replay the decode, and it never independently authenticates provider
+origin or EOF outside the trusted HTTP adapter lifecycle. Errors remain
+content-free and omit request/provider bodies and private identities.
 
 This contract only establishes that two adapter-issued frames contain one
 stable canonical typed catalog projection. Schema meaning and write

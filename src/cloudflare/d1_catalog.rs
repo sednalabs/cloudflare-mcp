@@ -15,7 +15,9 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::client::CloudflareClient;
+use super::client::{
+    CloudflareClient, DuplicateSafeJsonError, decode_json_rejecting_duplicate_object_keys,
+};
 use crate::d1_catalog_evidence::{
     D1CatalogEvidencePlan, D1CatalogObservationFrame, derive_d1_catalog_evidence_plan,
 };
@@ -40,6 +42,8 @@ pub(crate) enum D1CatalogProviderCustodyClassification {
     HttpStatusUnavailable,
     ResponseBodyIncomplete,
     ResponseBodyLimitExceeded,
+    ResponseDuplicateObjectKey,
+    ResponseNestingLimitExceeded,
     ResponseMalformed,
     ProviderQueryUnsuccessful,
     ProviderNotPrimary,
@@ -72,6 +76,7 @@ pub(crate) struct D1CatalogProviderCustodyReceipt {
     pub(crate) provider_row_cap: usize,
     pub(crate) provider_byte_cap: usize,
     pub(crate) provider_row_counts: [usize; 2],
+    pub(crate) provider_response_body_sha256: [String; 2],
     pub(crate) provider_response_body_sizes: [usize; 2],
     pub(crate) projection_body_sizes: [usize; 2],
 }
@@ -164,6 +169,7 @@ impl D1CatalogProviderReadLifecycle {
 struct D1CatalogProviderObservation {
     binding: D1CatalogProviderRequestBinding,
     lifecycle: D1CatalogProviderReadLifecycle,
+    provider_response_body_sha256: String,
     provider_response_body_size: usize,
     provider_row_count: usize,
     primary_read_only: bool,
@@ -403,6 +409,10 @@ where
         provider_row_cap: derived_plan.provider_row_cap,
         provider_byte_cap: derived_plan.provider_byte_cap,
         provider_row_counts: [first.provider_row_count, second.provider_row_count],
+        provider_response_body_sha256: [
+            first.provider_response_body_sha256.clone(),
+            second.provider_response_body_sha256.clone(),
+        ],
         provider_response_body_sizes: [
             first.provider_response_body_size,
             second.provider_response_body_size,
@@ -478,6 +488,13 @@ fn canonical_observation_identity(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
 }
 
+fn canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
 fn validate_provider_observation(
     observation: &D1CatalogProviderObservation,
     request: &D1CatalogProviderRequestBinding,
@@ -522,6 +539,13 @@ fn validate_provider_observation(
             observation.lifecycle,
         ));
     }
+    if !canonical_sha256(&observation.provider_response_body_sha256) {
+        return Err(custody_error(
+            D1CatalogProviderCustodyClassification::ResponseBindingMismatch,
+            "catalog provider response did not retain one canonical complete-body digest",
+            observation.lifecycle,
+        ));
+    }
     if observation.provider_row_count >= plan.provider_row_cap {
         return Err(custody_error(
             D1CatalogProviderCustodyClassification::ProviderResultTruncated,
@@ -562,7 +586,6 @@ struct D1CatalogProviderResultSet {
     success: bool,
     results: Vec<D1CatalogProviderRow>,
     meta: D1CatalogProviderMetadata,
-    #[serde(default)]
     errors: Vec<D1CatalogProviderIssue>,
 }
 
@@ -676,6 +699,7 @@ impl D1CatalogProviderBoundary for CloudflareClient {
             body.extend_from_slice(&chunk);
         }
         let lifecycle = D1CatalogProviderReadLifecycle::body_complete(status_code);
+        let provider_response_body_sha256 = format!("{:x}", Sha256::digest(&body));
         if !status.is_success() {
             return Err(custody_error(
                 D1CatalogProviderCustodyClassification::HttpStatusUnavailable,
@@ -684,13 +708,38 @@ impl D1CatalogProviderBoundary for CloudflareClient {
             ));
         }
 
-        let envelope: D1CatalogProviderEnvelope = serde_json::from_slice(&body).map_err(|_| {
+        let body = std::str::from_utf8(&body).map_err(|_| {
             custody_error(
                 D1CatalogProviderCustodyClassification::ResponseMalformed,
-                "catalog provider response was not the exact bounded envelope",
+                "catalog provider response was not valid bounded JSON evidence",
                 lifecycle,
             )
         })?;
+        let envelope = decode_json_rejecting_duplicate_object_keys(body).map_err(|error| {
+            let (classification, message) = match error {
+                DuplicateSafeJsonError::DuplicateObjectKey => (
+                    D1CatalogProviderCustodyClassification::ResponseDuplicateObjectKey,
+                    "catalog provider response contained a duplicate JSON object key",
+                ),
+                DuplicateSafeJsonError::NestingDepthExceeded => (
+                    D1CatalogProviderCustodyClassification::ResponseNestingLimitExceeded,
+                    "catalog provider response exceeded the shared JSON nesting limit",
+                ),
+                DuplicateSafeJsonError::Malformed(_) => (
+                    D1CatalogProviderCustodyClassification::ResponseMalformed,
+                    "catalog provider response was not valid bounded JSON evidence",
+                ),
+            };
+            custody_error(classification, message, lifecycle)
+        })?;
+        let envelope: D1CatalogProviderEnvelope =
+            serde_json::from_value(envelope).map_err(|_| {
+                custody_error(
+                    D1CatalogProviderCustodyClassification::ResponseMalformed,
+                    "catalog provider response was not the exact bounded envelope",
+                    lifecycle,
+                )
+            })?;
         let [result_set] = envelope.result.as_slice() else {
             return Err(custody_error(
                 D1CatalogProviderCustodyClassification::ResponseMalformed,
@@ -760,6 +809,7 @@ impl D1CatalogProviderBoundary for CloudflareClient {
         Ok(D1CatalogProviderObservation {
             binding: request.clone(),
             lifecycle,
+            provider_response_body_sha256,
             provider_response_body_size: body.len(),
             provider_row_count: result_set.results.len(),
             primary_read_only: true,
@@ -801,6 +851,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+    use crate::cloudflare::client::D1_MIGRATION_JSON_MAX_CONTAINER_DEPTH;
     use crate::config::{ApiTokenSource, CloudflareApiConfig};
     use crate::d1_catalog_evidence::prove_d1_catalog_evidence;
     use crate::d1_target::normalize_d1_target;
@@ -837,6 +888,67 @@ mod tests {
             let _ = axum::serve(listener, router).await;
         });
         format!("http://{address}")
+    }
+
+    async fn spawn_raw_provider_body(body: String) -> String {
+        async fn response(State(body): State<String>) -> Response {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .expect("raw provider response")
+        }
+
+        spawn_router(
+            Router::new()
+                .route(
+                    &format!("/accounts/acct-1/d1/database/{DATABASE_ID}/query"),
+                    post(response),
+                )
+                .with_state(body),
+        )
+        .await
+    }
+
+    fn exact_provider_body(
+        outer_success_fields: &str,
+        inner_success_fields: &str,
+        result_errors_fragment: &str,
+        metadata_fields: &str,
+    ) -> String {
+        format!(
+            r#"{{{outer_success_fields},"errors":[],"messages":[],"result":[{{{inner_success_fields}{result_errors_fragment},"results":[],"meta":{{{metadata_fields}}}}}]}}"#
+        )
+    }
+
+    fn primary_read_only_metadata(extra: &str) -> String {
+        format!(
+            r#""served_by_primary":true,"changed_db":false,"changes":0,"rows_written":0{extra}"#
+        )
+    }
+
+    async fn raw_provider_result(
+        body: String,
+    ) -> Result<D1CatalogProviderCustody, D1CatalogProviderCustodyError> {
+        let target = target();
+        let (plan, plan_sha256) = derive_d1_catalog_evidence_plan(&target).expect("plan");
+        let base = spawn_raw_provider_body(body).await;
+        let client = CloudflareClient::new(test_config(base)).expect("client");
+        collect_d1_catalog_provider_custody(&client, &target, &plan, &plan_sha256).await
+    }
+
+    async fn raw_provider_error(body: String) -> D1CatalogProviderCustodyError {
+        raw_provider_result(body)
+            .await
+            .expect_err("raw provider fixture must fail closed")
+    }
+
+    fn nested_array_json(container_depth: usize) -> String {
+        format!(
+            "{}0{}",
+            "[".repeat(container_depth),
+            "]".repeat(container_depth)
+        )
     }
 
     fn provider_envelope(rows: Vec<Value>) -> Value {
@@ -937,6 +1049,22 @@ mod tests {
         assert_eq!(custody_receipt.preallocated_dispatch_identities, 2);
         assert_eq!(custody_receipt.preallocated_read_identities, 2);
         assert_eq!(custody_receipt.provider_row_counts, [1, 1]);
+        assert_eq!(
+            custody_receipt.provider_response_body_sha256[0],
+            custody_receipt.provider_response_body_sha256[1]
+        );
+        assert!(
+            custody_receipt
+                .provider_response_body_sha256
+                .iter()
+                .all(|digest| canonical_sha256(digest))
+        );
+        assert!(
+            custody_receipt
+                .provider_response_body_sizes
+                .iter()
+                .all(|size| *size > 0)
+        );
         assert_eq!(evidence.stable_primary_observations, 2);
         let receipt_json = serde_json::to_value(custody_receipt).expect("receipt");
         assert!(receipt_json.get("dispatch_id").is_none());
@@ -1001,9 +1129,11 @@ mod tests {
                 rows: Vec::new(),
             })
             .expect("projection");
+            let provider_response_body_sha256 = format!("{:x}", Sha256::digest(&projection_body));
             Ok(D1CatalogProviderObservation {
                 binding,
                 lifecycle: D1CatalogProviderReadLifecycle::body_complete(200),
+                provider_response_body_sha256,
                 provider_response_body_size: projection_body.len(),
                 provider_row_count: 0,
                 primary_read_only: true,
@@ -1139,6 +1269,148 @@ mod tests {
             assert!(!error_json.contains("served_by_primary"));
             assert!(!error_json.contains("dispatch-first"));
         }
+    }
+
+    #[tokio::test]
+    async fn top_level_and_nested_duplicate_authority_keys_fail_closed_in_both_orders() {
+        let clean_meta = primary_read_only_metadata("");
+        let mut bodies = vec![
+            exact_provider_body(
+                r#""success":false,"success":true"#,
+                r#""success":true"#,
+                r#","errors":[]"#,
+                &clean_meta,
+            ),
+            exact_provider_body(
+                r#""success":true,"success":false"#,
+                r#""success":true"#,
+                r#","errors":[]"#,
+                &clean_meta,
+            ),
+            exact_provider_body(
+                r#""success":true"#,
+                r#""success":false,"success":true"#,
+                r#","errors":[]"#,
+                &clean_meta,
+            ),
+            exact_provider_body(
+                r#""success":true"#,
+                r#""success":true,"success":false"#,
+                r#","errors":[]"#,
+                &clean_meta,
+            ),
+        ];
+        for metadata in [
+            r#""served_by_primary":false,"served_by_primary":true,"changed_db":false,"changes":0,"rows_written":0"#,
+            r#""served_by_primary":true,"served_by_primary":false,"changed_db":false,"changes":0,"rows_written":0"#,
+            r#""served_by_primary":true,"changed_db":true,"changed_db":false,"changes":0,"rows_written":0"#,
+            r#""served_by_primary":true,"changed_db":false,"changed_db":true,"changes":0,"rows_written":0"#,
+            r#""served_by_primary":true,"changed_db":false,"changes":1,"changes":0,"rows_written":0"#,
+            r#""served_by_primary":true,"changed_db":false,"changes":0,"changes":1,"rows_written":0"#,
+            r#""served_by_primary":true,"changed_db":false,"changes":0,"rows_written":1,"rows_written":0"#,
+            r#""served_by_primary":true,"changed_db":false,"changes":0,"rows_written":0,"rows_written":1"#,
+        ] {
+            bodies.push(exact_provider_body(
+                r#""success":true"#,
+                r#""success":true"#,
+                r#","errors":[]"#,
+                metadata,
+            ));
+        }
+
+        for body in bodies {
+            let error = raw_provider_error(body).await;
+            assert_eq!(
+                error.classification,
+                D1CatalogProviderCustodyClassification::ResponseDuplicateObjectKey
+            );
+            assert_eq!(error.provider_calls, 1);
+            assert_eq!(error.complete_response_bodies, 1);
+            let error_json = serde_json::to_string(&error).expect("error");
+            assert!(!error_json.contains("served_by_primary"));
+            assert!(!error_json.contains("rows_written"));
+        }
+    }
+
+    #[tokio::test]
+    async fn result_set_errors_must_be_present_typed_and_empty() {
+        let metadata = primary_read_only_metadata("");
+        for fragment in [
+            "",
+            r#","errors":null"#,
+            r#","errors":{}"#,
+            r#","errors":"empty""#,
+        ] {
+            let body = exact_provider_body(
+                r#""success":true"#,
+                r#""success":true"#,
+                fragment,
+                &metadata,
+            );
+            let error = raw_provider_error(body).await;
+            assert_eq!(
+                error.classification,
+                D1CatalogProviderCustodyClassification::ResponseMalformed
+            );
+        }
+
+        let body = exact_provider_body(
+            r#""success":true"#,
+            r#""success":true"#,
+            r#","errors":[{"code":7500,"message":"private fixture detail"}]"#,
+            &metadata,
+        );
+        let error = raw_provider_error(body).await;
+        assert_eq!(
+            error.classification,
+            D1CatalogProviderCustodyClassification::ProviderQueryUnsuccessful
+        );
+        assert!(
+            !serde_json::to_string(&error)
+                .expect("error")
+                .contains("private fixture detail")
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_json_depth_limit_accepts_the_limit_and_rejects_one_more() {
+        let at_limit_nesting = D1_MIGRATION_JSON_MAX_CONTAINER_DEPTH - 4;
+        let at_limit = exact_provider_body(
+            r#""success":true"#,
+            r#""success":true"#,
+            r#","errors":[]"#,
+            &primary_read_only_metadata(&format!(
+                r#","bounded_extension":{}"#,
+                nested_array_json(at_limit_nesting)
+            )),
+        );
+        decode_json_rejecting_duplicate_object_keys(&at_limit)
+            .expect("provider envelope at the shared limit must decode");
+        let custody = raw_provider_result(at_limit)
+            .await
+            .expect("provider envelope at the shared limit must retain custody");
+        assert_eq!(custody.receipt.complete_response_bodies, 2);
+
+        let over_limit = exact_provider_body(
+            r#""success":true"#,
+            r#""success":true"#,
+            r#","errors":[]"#,
+            &primary_read_only_metadata(&format!(
+                r#","bounded_extension":{}"#,
+                nested_array_json(at_limit_nesting + 1)
+            )),
+        );
+        assert!(matches!(
+            decode_json_rejecting_duplicate_object_keys(&over_limit),
+            Err(DuplicateSafeJsonError::NestingDepthExceeded)
+        ));
+        let error = raw_provider_error(over_limit).await;
+        assert_eq!(
+            error.classification,
+            D1CatalogProviderCustodyClassification::ResponseNestingLimitExceeded
+        );
+        assert_eq!(error.provider_calls, 1);
+        assert_eq!(error.complete_response_bodies, 1);
     }
 
     #[tokio::test]

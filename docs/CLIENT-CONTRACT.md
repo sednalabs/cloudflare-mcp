@@ -357,10 +357,12 @@ Each provider read is exactly one POST through the existing no-redirect
 Cloudflare client. The adapter binds the canonical account/database target,
 fixed query and its digest, plan digest, and exact row/byte caps to the request
 and response. It reads the raw provider body to EOF under the 4 MiB cap before
-strict envelope decoding, requires one successful result set with empty error
-evidence, and rejects network ambiguity, partial or oversized bodies, non-2xx
-status, malformed types, response-binding drift, identity reuse, and the
-1,001-row sentinel without a second attempt or retry.
+the same duplicate-key-rejecting, 32-container JSON decoder used by high-custody
+migration reads. It requires one successful result set with an explicitly
+present, typed, empty `errors` array and rejects duplicate authority keys,
+excessive nesting, missing or malformed errors, network ambiguity, partial or
+oversized bodies, non-2xx status, malformed types, response-binding drift,
+identity reuse, and the 1,001-row sentinel without a second attempt or retry.
 
 Each observation must prove a complete body under the exact 4 MiB byte cap, a
 literal `results_truncated=false` under the exact 1,001-row provider cap, and
@@ -373,11 +375,15 @@ deserialize to equal typed row vectors. The snapshot digest covers canonical
 JSON reserialization of that typed vector; equality of the original provider
 JSON bytes is neither required nor claimed.
 
-The adapter receipt contains only target/plan/query digests and aggregate
-counts, caps, and body sizes; raw request or response content and private
-dispatch/read identities are omitted. Its owned result exposes two borrowed
-frames for the pure verifier only after both complete primary read-only reads
-pass custody checks. The verifier receipt contains only
+The adapter receipt contains only target/plan/query digests, the SHA-256 and
+size of each body completed at EOF, and aggregate counts and caps; raw request
+or response content and private dispatch/read identities are omitted. The
+adapter does not retain raw provider bodies. Its completed-body digest permits
+comparison only when separately authorized bytes are available; it cannot by
+itself reauthenticate provider origin or prove EOF independently of the trusted
+HTTP adapter lifecycle that issued the receipt. The owned result exposes two
+borrowed frames for the pure verifier only after both complete primary read-only
+reads pass custody checks. The verifier receipt contains only
 target/plan/query/snapshot and observation-pair digests, counts, caps, and body
 sizes. Neither receipt parses or authorizes DDL, triggers, foreign keys,
 implicit writes, DML, provider admission, custody outside these exact reads, or
