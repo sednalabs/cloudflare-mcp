@@ -18214,13 +18214,120 @@ fn d1_execute_write_proves_exact_plan_evidence_and_terminal_replay_through_stdio
     assert!(content["response_body_sha256"].is_string());
     assert!(content["response_body_size_bytes"].as_u64().unwrap_or(0) > 0);
     assert_eq!(content["audit"]["action"], json!("d1_execute_write"));
+    let target_key_sha256 = sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000");
     assert_eq!(
         content["execution_plan"]["database_id"],
         json!("123e4567-e89b-42d3-a456-426614174000")
     );
     assert_eq!(
         content["execution_plan"]["target_key_sha256"],
-        json!(sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000"))
+        json!(&target_key_sha256)
+    );
+    let mut normalized = content.clone();
+    normalized["plan_sha256"] = json!("<plan-sha256>");
+    normalized["response_body_sha256"] = json!("<response-sha256>");
+    normalized["response_body_size_bytes"] = json!(0);
+    normalized["custody"]["nonce"] = json!("<nonce>");
+    normalized["custody"]["payload_sha256"] = json!("<lease-payload-sha256>");
+    normalized["audit"]["started_at_unix_ms"] = json!(0);
+    normalized["audit"]["completed_at_unix_ms"] = json!(0);
+    normalized["audit"]["correlation"]["correlation_id"] = json!("<correlation>");
+    assert_eq!(
+        normalized,
+        json!({
+            "ok": true,
+            "operation": "d1_execute_write",
+            "status": "succeeded",
+            "dry_run": false,
+            "execution_plan": {
+                "version": 2,
+                "operation": "d1_execute_write",
+                "account_id": "acct-1",
+                "database_id": "123e4567-e89b-42d3-a456-426614174000",
+                "target_key_sha256": target_key_sha256,
+                "execution_session_sha256": "b".repeat(64),
+                "statement_kind": "UPDATE",
+                "sql_sha256": sha256_hex(exact_sql),
+                "sql_size_bytes": exact_sql.len(),
+                "params_sha256": sha256_hex("[]"),
+                "params_size_bytes": 2,
+                "max_rows": 100,
+            },
+            "plan_sha256": "<plan-sha256>",
+            "provider_calls": 1,
+            "provider_mutations": 1,
+            "lease_retained": false,
+            "custody": {
+                "target_key_sha256": sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000"),
+                "nonce": "<nonce>",
+                "payload_sha256": "<lease-payload-sha256>",
+            },
+            "response_body_sha256": "<response-sha256>",
+            "response_body_size_bytes": 0,
+            "provider_lifecycle": {
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 200,
+            },
+            "outcome": {
+                "statement_kind": "UPDATE",
+                "changed_db": true,
+                "changes": 1,
+                "rows_written": 1,
+                "zero_change": false,
+            },
+            "truncated": false,
+            "result": [{
+                "success": true,
+                "errors": [],
+                "results": [],
+                "meta": {
+                    "served_by_primary": true,
+                    "changed_db": true,
+                    "changes": 1,
+                    "rows_written": 1,
+                }
+            }],
+            "automatic_retry_permitted": false,
+            "plan": {
+                "operation": "d1_execute_write",
+                "steps": [
+                    {
+                        "ordinal": 1,
+                        "action": "validate_exact_dml_plan",
+                        "side_effect": false,
+                        "target": {"execution_session_sha256": "b".repeat(64)},
+                    },
+                    {
+                        "ordinal": 2,
+                        "action": "submit_one_d1_dml_request",
+                        "side_effect": true,
+                        "target": {},
+                    }
+                ],
+            },
+            "audit": {
+                "correlation": {
+                    "correlation_id": "<correlation>",
+                    "request_id": null,
+                    "session_id": null,
+                },
+                "actor": "unknown",
+                "action": "d1_execute_write",
+                "target": {
+                    "database_id": "123e4567-e89b-42d3-a456-426614174000",
+                    "execution_session_sha256": "b".repeat(64),
+                },
+                "started_at_unix_ms": 0,
+                "completed_at_unix_ms": 0,
+                "dry_run": false,
+                "outcome": "success",
+                "error_code": null,
+                "approval": null,
+            },
+        }),
+        "stdio whole-payload contract"
     );
     let request_log = requests.lock().expect("request log lock");
     assert_eq!(request_log.len(), 1);
