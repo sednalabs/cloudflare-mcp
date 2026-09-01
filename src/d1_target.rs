@@ -75,6 +75,18 @@ mod tests {
     #[test]
     fn canonical_target_identity_rejects_alias_pairs() {
         const DATABASE_ID: &str = "123e4567-e89b-42d3-a456-426614174000";
+        fn assert_invalid_database_id(alias: &str) {
+            let result = normalize_d1_target("acct-1", alias)
+                .expect_err("database alias must fail closed")
+                .structured_content
+                .expect("structured error");
+            assert_eq!(result["error"]["code"], json!("d1.invalid_target_identity"));
+            assert_eq!(
+                result["error"]["message"],
+                json!("database_id must be a canonical lowercase hyphenated UUID")
+            );
+        }
+
         let account_aliases = [
             ("acct-1", " acct-1"),
             ("acct-1", "acct-1 "),
@@ -98,7 +110,6 @@ mod tests {
         for alias in [
             "123E4567-E89B-42D3-A456-426614174000",
             "123e4567-e89b-42D3-a456-426614174000",
-            "123e4567e89b42d3a456426614174000",
             "{123e4567-e89b-42d3-a456-426614174000}",
             "123e4567-e89b-42d3-a456-42661417400g",
             " 123e4567-e89b-42d3-a456-426614174000",
@@ -106,16 +117,9 @@ mod tests {
             "123e4567-e89b-42d3-a456-426614174000/other",
             "123e4567-e89b-42d3-a456-426614174000\0ignored",
         ] {
-            let result = normalize_d1_target("acct-1", alias)
-                .expect_err("database alias must fail closed")
-                .structured_content
-                .expect("structured error");
-            assert_eq!(result["error"]["code"], json!("d1.invalid_target_identity"));
-            assert_eq!(
-                result["error"]["message"],
-                json!("database_id must be a canonical lowercase hyphenated UUID")
-            );
+            assert_invalid_database_id(alias);
         }
+        assert_invalid_database_id(&DATABASE_ID.replace('-', ""));
     }
 
     #[test]
