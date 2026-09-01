@@ -107,16 +107,12 @@ const ACTIVE_LEASE_NAME: &str = "active.lease.json";
 const RETIRING_LEASE_NAME: &str = "retiring.lease.json";
 #[cfg(target_os = "linux")]
 const GUARD_NAME: &str = "guard.lock";
-#[cfg(target_os = "linux")]
 const TARGET_IDENTITY_ACTIVATION_GUARD_NAME: &str = "target-identity-v2.guard.lock";
-#[cfg(target_os = "linux")]
 const TARGET_IDENTITY_ACTIVATION_MARKER_NAME: &str = "target-identity-v2.activation.json";
-#[cfg(target_os = "linux")]
 const TARGET_IDENTITY_ACTIVATION_MARKER_BYTES: &[u8] = br#"{"root_audit":"registered_namespaces_v2","target_identity_contract":"lowercase_hyphenated_uuid_v1","version":2}"#;
-#[cfg(target_os = "linux")]
 const TARGET_IDENTITY_REGISTRATION_PREFIX: &str = "target-identity-v2.";
-#[cfg(target_os = "linux")]
 const TARGET_IDENTITY_REGISTRATION_SUFFIX: &str = ".receipt.json";
+const TARGET_IDENTITY_ROOT_ENTRY_LIMIT: usize = 4096;
 #[cfg(target_os = "linux")]
 const BOOTSTRAP_INITIALIZER_ATTEMPT_PREFIX: &str = "bootstrap-initializer-attempt.";
 
@@ -1580,7 +1576,40 @@ pub(crate) fn d1_migration_lease_requirements(
         "scope": "one permanent directory and guard per account/database target; family is evidence only and cannot split target serialization",
         "active_evidence": "active.lease.json and transient retiring.lease.json are never auto-reclaimed; malformed, symlink, non-regular, or otherwise present active/retiring evidence stops the next apply for governed reconciliation",
         "cross_host_limitation": "Cross-process serialization covers only hosts sharing the same configured operator-owned lease root. It is not a Cloudflare/provider-distributed lease.",
-        "platform_requirement": "Linux on a trusted filesystem supporting working renameat2 RENAME_NOREPLACE, directory fsync, and advisory file locks; unsupported platforms or filesystems fail closed before provider I/O. Cross-host or shared-filesystem semantics require separate proof; retained evidence requires the governed recovery path."
+        "platform_requirement": "Linux on a trusted filesystem supporting working renameat2 RENAME_NOREPLACE, directory fsync, and advisory file locks; unsupported platforms or filesystems fail closed before provider I/O. Cross-host or shared-filesystem semantics require separate proof; retained evidence requires the governed recovery path.",
+        "target_identity_activation": {
+            "contract_version": 2,
+            "target_identity_contract": "lowercase_hyphenated_uuid_v1",
+            "activation_marker": {
+                "required": true,
+                "filename": TARGET_IDENTITY_ACTIVATION_MARKER_NAME,
+                "version": 2,
+                "payload_sha256": sha256_bytes_hex(TARGET_IDENTITY_ACTIVATION_MARKER_BYTES),
+            },
+            "target_registration": {
+                "required_for_every_target": true,
+                "create_only": true,
+                "version": 1,
+                "filename_pattern": format!("{TARGET_IDENTITY_REGISTRATION_PREFIX}<target_key_sha256>{TARGET_IDENTITY_REGISTRATION_SUFFIX}"),
+            },
+            "first_activation": {
+                "requires_fresh_empty_root": true,
+                "bounded_root_entry_limit": TARGET_IDENTITY_ROOT_ENTRY_LIMIT,
+                "legacy_in_place_upgrade_allowed": false,
+            },
+            "operator_cutover": {
+                "predecessor_writer_drain_required": true,
+                "preserve_predecessor_root": true,
+                "predecessor_root_reuse_by_upgraded_writers_allowed": false,
+                "older_binary_on_activated_root_allowed": false,
+                "rollback": {
+                    "upgraded_writer_drain_required": true,
+                    "preserve_activated_root_without_manual_changes": true,
+                    "return_all_writers_as_one_predecessor_generation": true,
+                    "mixed_roots_or_binary_generations_allowed": false,
+                },
+            },
+        },
     })
 }
 
@@ -1838,7 +1867,7 @@ mod linux {
 
     const RENAME_NOREPLACE: u32 = 1;
     const MAX_LEASE_PAYLOAD_BYTES: u64 = 4096;
-    pub(super) const MAX_TARGET_CUSTODY_DIRECTORY_ENTRIES: usize = 4096;
+    pub(super) const MAX_TARGET_CUSTODY_DIRECTORY_ENTRIES: usize = TARGET_IDENTITY_ROOT_ENTRY_LIMIT;
     const TERMINAL_RECEIPT_PREFIX: &str = "terminal-reconciliation.";
     const TERMINAL_RECEIPT_SUFFIX: &str = ".receipt.json";
 
@@ -2561,21 +2590,9 @@ mod linux {
         targets_allowed: bool,
     ) -> Result<(), &'static str> {
         let first = root_namespace_snapshot_once(root, marker_required, targets_allowed)?;
+        maybe_pause_root_namespace_audit_after_first_for_test(root);
         let second = root_namespace_snapshot_once(root, marker_required, targets_allowed)?;
-        let same_root_authority = first.activation_guard_identity
-            == second.activation_guard_identity
-            && first.activation_marker == second.activation_marker
-            && first.registrations == second.registrations
-            && first.targets.len() == second.targets.len()
-            && first
-                .targets
-                .iter()
-                .zip(&second.targets)
-                .all(|(left, right)| {
-                    left.target_key_sha256 == right.target_key_sha256
-                        && left.directory_identity == right.directory_identity
-                });
-        if !same_root_authority {
+        if first != second {
             return Err("lease root namespace changed during stable activation audit");
         }
         Ok(())
@@ -4442,6 +4459,15 @@ mod linux {
     static ACTIVATION_MARKER_PAUSE_HOOK: OnceLock<Mutex<Option<ActivationMarkerPauseHook>>> =
         OnceLock::new();
     #[cfg(test)]
+    struct RootNamespaceAuditPauseHook {
+        root_identity: D1LeaseFileIdentity,
+        entered: mpsc::Sender<()>,
+        resume: mpsc::Receiver<()>,
+    }
+    #[cfg(test)]
+    static ROOT_NAMESPACE_AUDIT_PAUSE_HOOK: OnceLock<Mutex<Option<RootNamespaceAuditPauseHook>>> =
+        OnceLock::new();
+    #[cfg(test)]
     pub(super) fn install_activation_marker_pause_hook(
         target_key_sha256: String,
         entered: mpsc::Sender<()>,
@@ -4453,6 +4479,24 @@ mod linux {
             .expect("activation marker pause hook lock");
         *hook = Some(ActivationMarkerPauseHook {
             target_key_sha256,
+            entered,
+            resume,
+        });
+    }
+    #[cfg(test)]
+    pub(super) fn install_root_namespace_audit_pause_hook(
+        root_path: &Path,
+        entered: mpsc::Sender<()>,
+        resume: mpsc::Receiver<()>,
+    ) {
+        let metadata =
+            fs::symlink_metadata(root_path).expect("root namespace audit pause hook root metadata");
+        let mut hook = ROOT_NAMESPACE_AUDIT_PAUSE_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("root namespace audit pause hook lock");
+        *hook = Some(RootNamespaceAuditPauseHook {
+            root_identity: identity(&metadata),
             entered,
             resume,
         });
@@ -4521,6 +4565,34 @@ mod linux {
     }
     #[cfg(not(test))]
     fn maybe_pause_before_activation_marker_for_test(_target_key_sha256: &str) {}
+    #[cfg(test)]
+    fn maybe_pause_root_namespace_audit_after_first_for_test(root: &fs::File) {
+        let root_identity = root.metadata().ok().map(|metadata| identity(&metadata));
+        let hook = {
+            let mut hook = ROOT_NAMESPACE_AUDIT_PAUSE_HOOK
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .expect("root namespace audit pause hook lock");
+            if hook
+                .as_ref()
+                .is_some_and(|candidate| Some(candidate.root_identity.clone()) == root_identity)
+            {
+                hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some(hook) = hook {
+            hook.entered
+                .send(())
+                .expect("root namespace audit test receiver");
+            hook.resume
+                .recv()
+                .expect("root namespace audit test release");
+        }
+    }
+    #[cfg(not(test))]
+    fn maybe_pause_root_namespace_audit_after_first_for_test(_root: &fs::File) {}
 }
 
 #[cfg(target_os = "linux")]
@@ -4535,6 +4607,61 @@ use linux::{
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn migration_lease_requirements_expose_complete_activation_and_cutover_contract() {
+        let target_key_sha256 = sha256_bytes_hex(b"acct-1\0123e4567-e89b-42d3-a456-426614174000");
+        assert_eq!(
+            d1_migration_lease_requirements(
+                "acct-1",
+                "123e4567-e89b-42d3-a456-426614174000",
+                "newsletter-core",
+            ),
+            json!({
+                "required_for_live_apply": true,
+                "environment": D1_MANIFEST_LEASE_ROOT_ENV,
+                "target_key_sha256": target_key_sha256,
+                "migration_family": "newsletter-core",
+                "scope": "one permanent directory and guard per account/database target; family is evidence only and cannot split target serialization",
+                "active_evidence": "active.lease.json and transient retiring.lease.json are never auto-reclaimed; malformed, symlink, non-regular, or otherwise present active/retiring evidence stops the next apply for governed reconciliation",
+                "cross_host_limitation": "Cross-process serialization covers only hosts sharing the same configured operator-owned lease root. It is not a Cloudflare/provider-distributed lease.",
+                "platform_requirement": "Linux on a trusted filesystem supporting working renameat2 RENAME_NOREPLACE, directory fsync, and advisory file locks; unsupported platforms or filesystems fail closed before provider I/O. Cross-host or shared-filesystem semantics require separate proof; retained evidence requires the governed recovery path.",
+                "target_identity_activation": {
+                    "contract_version": 2,
+                    "target_identity_contract": "lowercase_hyphenated_uuid_v1",
+                    "activation_marker": {
+                        "required": true,
+                        "filename": "target-identity-v2.activation.json",
+                        "version": 2,
+                        "payload_sha256": sha256_bytes_hex(TARGET_IDENTITY_ACTIVATION_MARKER_BYTES),
+                    },
+                    "target_registration": {
+                        "required_for_every_target": true,
+                        "create_only": true,
+                        "version": 1,
+                        "filename_pattern": "target-identity-v2.<target_key_sha256>.receipt.json",
+                    },
+                    "first_activation": {
+                        "requires_fresh_empty_root": true,
+                        "bounded_root_entry_limit": 4096,
+                        "legacy_in_place_upgrade_allowed": false,
+                    },
+                    "operator_cutover": {
+                        "predecessor_writer_drain_required": true,
+                        "preserve_predecessor_root": true,
+                        "predecessor_root_reuse_by_upgraded_writers_allowed": false,
+                        "older_binary_on_activated_root_allowed": false,
+                        "rollback": {
+                            "upgraded_writer_drain_required": true,
+                            "preserve_activated_root_without_manual_changes": true,
+                            "return_all_writers_as_one_predecessor_generation": true,
+                            "mixed_roots_or_binary_generations_allowed": false,
+                        },
+                    },
+                },
+            })
+        );
+    }
 
     #[cfg(target_os = "linux")]
     fn terminal_receipt(
@@ -4879,6 +5006,75 @@ mod tests {
             error["error"]["code"],
             json!("d1.target_guard_upgrade_activation_required")
         );
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stable_root_audit_rejects_target_entry_change_between_passes() {
+        let root = private_test_root("root-entry-change-between-passes");
+        let account_id = "acct-1";
+        let database_id = "123e4567-e89b-42d3-a456-426614174000";
+        let initial = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_execute_write",
+            account_id,
+            database_id,
+        )
+        .expect("create the canonical target custody directory");
+        let target_key_sha256 = initial.target_key_sha256.clone();
+        drop(initial);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        linux::install_root_namespace_audit_pause_hook(&root, entered_tx, resume_rx);
+        let thread_root = root.clone();
+        let audited = std::thread::spawn(move || {
+            acquire_d1_target_mutation_guard_at(
+                thread_root,
+                "d1_rename_database",
+                account_id,
+                database_id,
+            )
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("root audit completed its first namespace pass");
+
+        let nonce = "b".repeat(64);
+        let active = root
+            .join(format!("d1-migration-target-{target_key_sha256}"))
+            .join(ACTIVE_LEASE_NAME);
+        let payload = serde_json::to_vec(&json!({
+            "approved_plan_sha256": "a".repeat(64),
+            "created_at_unix_ms": 1,
+            "migration_family": "newsletter-core",
+            "nonce": nonce,
+            "target_key_sha256": target_key_sha256,
+            "version": 2,
+        }))
+        .expect("canonical synthetic retained lease payload");
+        write_private_test_file(&active, &payload);
+        resume_tx
+            .send(())
+            .expect("resume the second root audit pass");
+
+        let error = audited
+            .join()
+            .expect("root audit thread")
+            .expect_err("an entry change between root audit passes must fail closed")
+            .structured_content
+            .expect("structured root audit failure");
+        assert_eq!(
+            error["error"]["code"],
+            json!("d1.target_guard_upgrade_activation_required")
+        );
+        assert_eq!(
+            error["error"]["message"],
+            json!("lease root namespace changed during stable activation audit")
+        );
+        assert_eq!(error["provider_calls"], json!(0));
+        assert_eq!(error["provider_mutations"], json!(0));
         fs::remove_dir_all(root).expect("test cleanup");
     }
 

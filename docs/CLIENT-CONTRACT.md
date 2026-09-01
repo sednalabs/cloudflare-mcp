@@ -169,6 +169,10 @@ registered target's complete allowed custody namespace. The same audit is
 revalidated at guard, lease, provider, persistence, and release boundaries, so
 an alias, malformed entry, unknown entry, contradictory lease state, or target
 without registration fails closed even if it appears after activation.
+Rollback is generation-wide: stop every upgraded writer, preserve the
+activated root without manual edits, and return all writers together to the
+preserved predecessor root and predecessor binary generation. Mixed roots or
+binary generations are unsupported during cutover or rollback.
 
 The exact family `migration-ledger-bootstrap-v1` is reserved to `d1_bootstrap_migration_ledger` and its dedicated reconcile, finalize, and abort tools. Generic manifest apply, read-only reconciliation, and terminal finalization reject that family before provider access, custody inspection or creation, receipt access, or local namespace mutation; similarly prefixed family labels are not reserved.
 

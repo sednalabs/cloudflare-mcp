@@ -307,6 +307,10 @@ or allow an older binary to open the activated root. Draining every predecessor
 writer before cutover is an independent deployment prerequisite, not a
 substitute for these runtime audits. This local activation has zero provider
 calls; it does not itself approve a D1 mutation.
+Rollback is also a whole-generation operation: drain every upgraded writer,
+preserve the activated root without manual edits, and return all writers
+together to the preserved predecessor root and predecessor binary generation.
+Never run mixed roots or binary generations during cutover or rollback.
 
 The exact-byte manifest boundary accepts at most 16 MiB of aggregate SQL and
 moves the supplied manifest into validation without cloning its SQL strings.

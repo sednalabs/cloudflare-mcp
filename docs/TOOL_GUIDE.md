@@ -131,6 +131,10 @@ registered target, and allowed custody entry, and repeat that invariant at
 guard, provider, persistence, and release boundaries. Unknown, malformed,
 alias, unregistered, or contradictory evidence therefore blocks rather than
 coexisting with an apparently valid marker.
+Rollback is generation-wide: stop every upgraded writer, preserve the
+activated root without manual edits, and return all writers together to the
+preserved predecessor root and predecessor binary generation. Never split
+writers across old/new roots or binary generations.
 
 Use `d1_bootstrap_migration_ledger` only before the first migration on a
 separately selected, genuinely empty D1 database. Its dry run binds the exact
