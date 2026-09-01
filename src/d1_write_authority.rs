@@ -3,8 +3,9 @@
 //! This is a pre-provider boundary only. It derives one fixed bounded catalog
 //! query and admits a DML statement only after two independently primary-served
 //! readbacks prove the same complete table/view/trigger graph. The graph is
-//! parsed locally so direct, quoted, view-mediated, and trigger-mediated writes
-//! cannot reach SQLite, Cloudflare, or configured migration-ledger relations.
+//! parsed locally so direct, quoted, view-mediated, trigger-mediated, and
+//! SQLite-implicit writes cannot reach SQLite, Cloudflare, or configured
+//! migration-ledger relations.
 //! Provider dispatch, mutation custody, recovery, and public tool routing are
 //! deliberately owned by later boundaries.
 
@@ -110,6 +111,15 @@ enum TriggerTiming {
     InsteadOf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForeignKeyAction {
+    NoAction,
+    Restrict,
+    SetNull,
+    SetDefault,
+    Cascade,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SqlToken {
     Word(String),
@@ -144,6 +154,15 @@ struct Relation {
     kind: RelationKind,
     exact_name: String,
     sql: String,
+    autoincrement: bool,
+    foreign_keys: Vec<ForeignKeyDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForeignKeyDefinition {
+    parent_relation: String,
+    on_delete: ForeignKeyAction,
+    on_update: ForeignKeyAction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +177,7 @@ struct CatalogSnapshot {
     rows: Vec<CatalogRow>,
     relations: BTreeMap<String, Relation>,
     triggers_by_parent: BTreeMap<String, Vec<Trigger>>,
+    implicit_writes_by_parent: BTreeMap<(String, TriggerEvent), Vec<(String, TriggerEvent)>>,
 }
 
 pub(crate) fn derive_d1_write_catalog_authority_plan(
@@ -433,8 +453,9 @@ fn build_catalog_snapshot(rows: Vec<CatalogRow>) -> Result<CatalogSnapshot, D1Wr
                 } else {
                     RelationKind::View
                 };
-                validate_relation_schema(&row.sql, &row.name, &kind)
-                    .map_err(|_| catalog_schema_malformed())?;
+                let (autoincrement, foreign_keys) =
+                    validate_relation_schema(&row.sql, &row.name, &kind)
+                        .map_err(|_| catalog_schema_malformed())?;
                 if relations
                     .insert(
                         ascii_identity(&row.name),
@@ -442,6 +463,8 @@ fn build_catalog_snapshot(rows: Vec<CatalogRow>) -> Result<CatalogSnapshot, D1Wr
                             kind,
                             exact_name: row.name.clone(),
                             sql: row.sql.clone(),
+                            autoincrement,
+                            foreign_keys,
                         },
                     )
                     .is_some()
@@ -473,11 +496,58 @@ fn build_catalog_snapshot(rows: Vec<CatalogRow>) -> Result<CatalogSnapshot, D1Wr
         }
         triggers_by_parent.entry(parent).or_default().push(trigger);
     }
+    let mut implicit_writes_by_parent: BTreeMap<
+        (String, TriggerEvent),
+        Vec<(String, TriggerEvent)>,
+    > = BTreeMap::new();
+    for (child_identity, relation) in &relations {
+        for foreign_key in &relation.foreign_keys {
+            let parent = relations
+                .get(&foreign_key.parent_relation)
+                .ok_or_else(catalog_schema_malformed)?;
+            if parent.kind != RelationKind::Table {
+                return Err(catalog_schema_malformed());
+            }
+            if let Some(child_event) = foreign_key
+                .on_delete
+                .child_write_event(TriggerEvent::Delete)
+            {
+                implicit_writes_by_parent
+                    .entry((foreign_key.parent_relation.clone(), TriggerEvent::Delete))
+                    .or_default()
+                    .push((child_identity.clone(), child_event));
+            }
+            if let Some(child_event) = foreign_key
+                .on_update
+                .child_write_event(TriggerEvent::Update)
+            {
+                implicit_writes_by_parent
+                    .entry((foreign_key.parent_relation.clone(), TriggerEvent::Update))
+                    .or_default()
+                    .push((child_identity.clone(), child_event));
+            }
+        }
+    }
+    for effects in implicit_writes_by_parent.values_mut() {
+        effects.sort();
+        effects.dedup();
+    }
     Ok(CatalogSnapshot {
         rows,
         relations,
         triggers_by_parent,
+        implicit_writes_by_parent,
     })
+}
+
+impl ForeignKeyAction {
+    fn child_write_event(self, parent_event: TriggerEvent) -> Option<TriggerEvent> {
+        match (self, parent_event) {
+            (Self::Cascade, TriggerEvent::Delete) => Some(TriggerEvent::Delete),
+            (Self::Cascade | Self::SetNull | Self::SetDefault, _) => Some(TriggerEvent::Update),
+            (Self::NoAction | Self::Restrict, _) => None,
+        }
+    }
 }
 
 fn validate_catalog_text(value: &str) -> Result<(), D1WriteAuthorityError> {
@@ -496,7 +566,7 @@ fn validate_relation_schema(
     sql: &str,
     expected_name: &str,
     kind: &RelationKind,
-) -> Result<(), D1WriteAuthorityError> {
+) -> Result<(bool, Vec<ForeignKeyDefinition>), D1WriteAuthorityError> {
     let tokens = one_statement_tokens(sql)?;
     let mut cursor = 0usize;
     require_word(&tokens, &mut cursor, "create")?;
@@ -516,7 +586,128 @@ fn validate_relation_schema(
     if tokens.get(next) == Some(&SqlToken::Symbol('.')) {
         return Err(catalog_schema_malformed());
     }
-    Ok(())
+    if kind == &RelationKind::View {
+        return Ok((false, Vec::new()));
+    }
+    let Some(SqlToken::Symbol('(')) = tokens.get(next) else {
+        return Ok((false, Vec::new()));
+    };
+    let segments = table_definition_segments(&tokens, next)?;
+    let autoincrement = segments.iter().any(|segment| {
+        segment
+            .iter()
+            .any(|token| token_is_word(Some(token), "autoincrement"))
+    });
+    let mut foreign_keys = Vec::new();
+    for segment in segments {
+        let references = segment
+            .iter()
+            .enumerate()
+            .filter_map(|(index, token)| token_is_word(Some(token), "references").then_some(index))
+            .collect::<Vec<_>>();
+        if references.len() > 1 {
+            return Err(catalog_schema_malformed());
+        }
+        let Some(reference_index) = references.first().copied() else {
+            continue;
+        };
+        foreign_keys.push(parse_foreign_key_definition(segment, reference_index)?);
+    }
+    Ok((autoincrement, foreign_keys))
+}
+
+fn table_definition_segments(
+    tokens: &[SqlToken],
+    opening_parenthesis: usize,
+) -> Result<Vec<&[SqlToken]>, D1WriteAuthorityError> {
+    let mut segments = Vec::new();
+    let mut depth = 1usize;
+    let mut start = opening_parenthesis + 1;
+    for (index, token) in tokens.iter().enumerate().skip(opening_parenthesis + 1) {
+        match token {
+            SqlToken::Symbol('(') => {
+                depth = depth.checked_add(1).ok_or_else(catalog_schema_malformed)?;
+            }
+            SqlToken::Symbol(')') => {
+                depth = depth.checked_sub(1).ok_or_else(catalog_schema_malformed)?;
+                if depth == 0 {
+                    if start == index {
+                        return Err(catalog_schema_malformed());
+                    }
+                    segments.push(&tokens[start..index]);
+                    return Ok(segments);
+                }
+            }
+            SqlToken::Symbol(',') if depth == 1 => {
+                if start == index {
+                    return Err(catalog_schema_malformed());
+                }
+                segments.push(&tokens[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    Err(catalog_schema_malformed())
+}
+
+fn parse_foreign_key_definition(
+    segment: &[SqlToken],
+    reference_index: usize,
+) -> Result<ForeignKeyDefinition, D1WriteAuthorityError> {
+    let (parent_relation, next) = relation_identifier(segment, reference_index + 1)?;
+    if segment.get(next) == Some(&SqlToken::Symbol('.')) {
+        return Err(catalog_schema_malformed());
+    }
+    let mut on_delete = ForeignKeyAction::NoAction;
+    let mut on_update = ForeignKeyAction::NoAction;
+    let mut delete_seen = false;
+    let mut update_seen = false;
+    let mut cursor = next;
+    while cursor < segment.len() {
+        if !token_is_word(segment.get(cursor), "on") {
+            cursor += 1;
+            continue;
+        }
+        let (slot, seen) = if token_is_word(segment.get(cursor + 1), "delete") {
+            (&mut on_delete, &mut delete_seen)
+        } else if token_is_word(segment.get(cursor + 1), "update") {
+            (&mut on_update, &mut update_seen)
+        } else {
+            cursor += 1;
+            continue;
+        };
+        if *seen {
+            return Err(catalog_schema_malformed());
+        }
+        *seen = true;
+        let (action, consumed) = parse_foreign_key_action(&segment[cursor + 2..])?;
+        *slot = action;
+        cursor += 2 + consumed;
+    }
+    Ok(ForeignKeyDefinition {
+        parent_relation,
+        on_delete,
+        on_update,
+    })
+}
+
+fn parse_foreign_key_action(
+    tokens: &[SqlToken],
+) -> Result<(ForeignKeyAction, usize), D1WriteAuthorityError> {
+    if token_is_word(tokens.first(), "cascade") {
+        Ok((ForeignKeyAction::Cascade, 1))
+    } else if token_is_word(tokens.first(), "restrict") {
+        Ok((ForeignKeyAction::Restrict, 1))
+    } else if token_is_word(tokens.first(), "no") && token_is_word(tokens.get(1), "action") {
+        Ok((ForeignKeyAction::NoAction, 2))
+    } else if token_is_word(tokens.first(), "set") && token_is_word(tokens.get(1), "null") {
+        Ok((ForeignKeyAction::SetNull, 2))
+    } else if token_is_word(tokens.first(), "set") && token_is_word(tokens.get(1), "default") {
+        Ok((ForeignKeyAction::SetDefault, 2))
+    } else {
+        Err(catalog_schema_malformed())
+    }
 }
 
 fn parse_trigger(row: &CatalogRow) -> Result<Trigger, D1WriteAuthorityError> {
@@ -707,6 +898,12 @@ fn prove_reachability(
                 "a direct or trigger-mediated DML target was absent from the stable catalog",
             )
         })?;
+        if relation.autoincrement && event == TriggerEvent::Insert {
+            return Err(authority_error(
+                D1WriteAuthorityClassification::ReservedRelationReachable,
+                "catalog-proven DML reachability entered a reserved relation",
+            ));
+        }
         let matching = snapshot
             .triggers_by_parent
             .get(&relation_name)
@@ -725,6 +922,14 @@ fn prove_reachability(
                 for nested_event in &effect.trigger_events {
                     queue.push_back((effect.target_relation.clone(), *nested_event));
                 }
+            }
+        }
+        if let Some(implicit_writes) = snapshot
+            .implicit_writes_by_parent
+            .get(&(relation_name.clone(), event))
+        {
+            for (child_relation, child_event) in implicit_writes {
+                queue.push_back((child_relation.clone(), *child_event));
             }
         }
     }
@@ -1128,6 +1333,10 @@ mod tests {
         )
     }
 
+    fn table_sql(name: &str, sql: &str) -> Value {
+        row("table", name, name, sql)
+    }
+
     fn view(name: &str) -> Value {
         row(
             "view",
@@ -1486,6 +1695,155 @@ mod tests {
         );
         authorize_d1_write_catalog(&plan, &catalog, &catalog)
             .expect("unrelated event and literal are not write edges");
+    }
+
+    #[test]
+    fn autoincrement_insert_and_replace_reach_sqlite_sequence() {
+        let catalog = response(vec![
+            ledger("d1_migrations"),
+            table_sql(
+                "items",
+                "CREATE TABLE \"items\"(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT)",
+            ),
+            table_sql("sqlite_sequence", "CREATE TABLE sqlite_sequence(name,seq)"),
+        ]);
+        for sql in [
+            "INSERT INTO items(value) VALUES (?)",
+            "REPLACE INTO items(id, value) VALUES (?, ?)",
+        ] {
+            let plan = plan(sql, &["d1_migrations"]);
+            assert_eq!(
+                classification(&plan, &catalog, &catalog),
+                D1WriteAuthorityClassification::ReservedRelationReachable,
+                "{sql}"
+            );
+        }
+
+        let update = plan(
+            "UPDATE items SET value = ? WHERE id = ?",
+            &["d1_migrations"],
+        );
+        authorize_d1_write_catalog(&update, &catalog, &catalog)
+            .expect("updates do not mutate sqlite_sequence");
+
+        let quoted_keyword = response(vec![
+            ledger("d1_migrations"),
+            table_sql(
+                "items",
+                "CREATE TABLE \"items\"(id INTEGER PRIMARY KEY, \"AUTOINCREMENT\" TEXT)",
+            ),
+        ]);
+        let insert = plan(
+            "INSERT INTO items(id, \"AUTOINCREMENT\") VALUES (?, ?)",
+            &["d1_migrations"],
+        );
+        authorize_d1_write_catalog(&insert, &quoted_keyword, &quoted_keyword)
+            .expect("a quoted identifier is not the AUTOINCREMENT keyword");
+    }
+
+    #[test]
+    fn mutating_foreign_key_actions_reach_reserved_children() {
+        let cases = [
+            ("DELETE FROM items WHERE id = ?", "ON DELETE CASCADE"),
+            ("DELETE FROM items WHERE id = ?", "ON DELETE SET NULL"),
+            ("DELETE FROM items WHERE id = ?", "ON DELETE SET DEFAULT"),
+            ("UPDATE items SET id = ? WHERE id = ?", "ON UPDATE CASCADE"),
+            ("UPDATE items SET id = ? WHERE id = ?", "ON UPDATE SET NULL"),
+            (
+                "UPDATE items SET id = ? WHERE id = ?",
+                "ON UPDATE SET DEFAULT",
+            ),
+        ];
+        for (sql, action) in cases {
+            let catalog = response(vec![
+                ledger("d1_migrations"),
+                table("items"),
+                table_sql(
+                    "_cf_child",
+                    &format!(
+                        "CREATE TABLE \"_cf_child\"(id INTEGER PRIMARY KEY, parent_id INTEGER DEFAULT 1 REFERENCES \"items\"(id) {action})"
+                    ),
+                ),
+            ]);
+            let plan = plan(sql, &["d1_migrations"]);
+            assert_eq!(
+                classification(&plan, &catalog, &catalog),
+                D1WriteAuthorityClassification::ReservedRelationReachable,
+                "{action}"
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_key_cascade_enters_explicit_trigger_graph() {
+        let catalog = response(vec![
+            ledger("d1_migrations"),
+            table("items"),
+            table_sql(
+                "audit",
+                "CREATE TABLE \"audit\"(id INTEGER PRIMARY KEY, parent_id INTEGER, FOREIGN KEY(parent_id) REFERENCES \"items\"(id) ON DELETE CASCADE)",
+            ),
+            trigger(
+                "audit_delete_ledger",
+                "audit",
+                "CREATE TRIGGER \"audit_delete_ledger\" AFTER DELETE ON \"audit\" BEGIN UPDATE \"d1_migrations\" SET name = name; END",
+            ),
+        ]);
+        let plan = plan("DELETE FROM items WHERE id = ?", &["d1_migrations"]);
+        assert_eq!(
+            classification(&plan, &catalog, &catalog),
+            D1WriteAuthorityClassification::ReservedRelationReachable
+        );
+    }
+
+    #[test]
+    fn restrict_and_no_action_foreign_keys_create_no_write_edge() {
+        for action in [
+            "ON DELETE RESTRICT ON UPDATE RESTRICT",
+            "ON DELETE NO ACTION ON UPDATE NO ACTION",
+            "",
+        ] {
+            let catalog = response(vec![
+                ledger("d1_migrations"),
+                table("items"),
+                table_sql(
+                    "_cf_child",
+                    &format!(
+                        "CREATE TABLE \"_cf_child\"(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES \"items\"(id) {action})"
+                    ),
+                ),
+            ]);
+            for sql in [
+                "DELETE FROM items WHERE id = ?",
+                "UPDATE items SET id = ? WHERE id = ?",
+            ] {
+                let plan = plan(sql, &["d1_migrations"]);
+                authorize_d1_write_catalog(&plan, &catalog, &catalog)
+                    .expect("constraint-only foreign-key action has no child write edge");
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_or_unresolved_foreign_key_authority_fails_closed() {
+        for child_sql in [
+            "CREATE TABLE \"audit\"(parent_id INTEGER REFERENCES \"items\"(id) ON DELETE CASCADE ON DELETE SET NULL)",
+            "CREATE TABLE \"audit\"(parent_id INTEGER REFERENCES \"items\"(id) ON DELETE UNKNOWN)",
+            "CREATE TABLE \"audit\"(parent_id INTEGER REFERENCES main.items(id) ON DELETE CASCADE)",
+            "CREATE TABLE \"audit\"(parent_id INTEGER REFERENCES \"missing\"(id) ON DELETE CASCADE)",
+        ] {
+            let catalog = response(vec![
+                ledger("d1_migrations"),
+                table("items"),
+                table_sql("audit", child_sql),
+            ]);
+            let plan = plan("DELETE FROM items WHERE id = ?", &["d1_migrations"]);
+            assert_eq!(
+                classification(&plan, &catalog, &catalog),
+                D1WriteAuthorityClassification::CatalogSchemaMalformed,
+                "{child_sql}"
+            );
+        }
     }
 
     #[test]

@@ -237,10 +237,16 @@ primary-served read-only results to produce one identical catalog snapshot.
 Every configured migration-ledger identity must be present exactly once with a
 supported trigger-free schema. The local graph then follows matching table
 `BEFORE`/`AFTER` and view `INSTEAD OF` trigger effects transitively, including
-replace and upsert secondary trigger events. A direct, quoted, or reachable
+replace and upsert secondary trigger events. It also derives SQLite's implicit
+write edges from the same stable table definitions: INSERT/REPLACE into an
+`AUTOINCREMENT` table reaches reserved `sqlite_sequence`; foreign-key
+`CASCADE`, `SET NULL`, and `SET DEFAULT` actions write the child relation and
+may activate further trigger or foreign-key edges. `RESTRICT` and `NO ACTION`
+are constraint-only and do not add child write edges. A direct, quoted, or reachable
 configured ledger, `sqlite_*`, or `_cf_*` relation is denied before any DML
 provider dispatch. Schema-qualified targets, unsafe views, orphan or malformed
-triggers, duplicate or non-TEXT catalog rows, ledger/schema drift, missing
+triggers, duplicate or non-TEXT catalog rows, malformed or unresolved foreign-key
+authority, ledger/schema drift, missing
 relations, sentinel overflow, non-primary evidence, readbacks that report a
 mutation, and disagreement between the two snapshots are stop conditions.
 The outward plan, receipt, and error vocabulary contains hashes, counts, and
