@@ -114,6 +114,16 @@ zero provider calls and mutations, so the blocked caller remains traceable.
 Local reconcile/finalize/abort tools manipulate retained custody evidence only
 and are not provider D1 mutation surfaces.
 
+Canonical target guards also require the version-2 root activation marker. A
+new marker is minted only under the permanent root activation lock after a
+bounded descriptor-relative audit proves a freshly provisioned root has no
+other entry. An old nonempty root is never upgraded in place: even canonical
+directories and retired or terminal evidence block because the predecessor
+payload proves only a target hash, not the UUID spelling used to derive it.
+Stop all predecessor writers, retain and reconcile the old root separately,
+then configure every upgraded writer to one new private empty root. Never
+manually create the marker or point an older binary at an activated root.
+
 Use `d1_bootstrap_migration_ledger` only before the first migration on a
 separately selected, genuinely empty D1 database. Its dry run binds the exact
 account, database, ledger table, canonical initializer, and two matching

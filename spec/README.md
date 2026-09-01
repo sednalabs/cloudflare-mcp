@@ -117,6 +117,11 @@ Preserved curated tool families:
   account/database `guard.lock` used by bootstrap and manifest leases. The
   legacy directory migration apply is read-only/retired; local reconciliation
   finalizers do not send provider D1 mutations.
+  The version-2 identity contract activates only on a freshly provisioned
+  empty lease root: a bounded descriptor-relative audit under the permanent
+  root activation lock precedes creation of the exact activation marker. Any
+  unversioned canonical, alias, active, retiring, retired, terminal, malformed,
+  unreadable or over-limit entry blocks without deletion or migration.
 - The first-ledger bootstrap (`d1_bootstrap_migration_ledger`) is a distinct
   mutating contract from manifest apply. Keep its exact empty-target dry-run
   digest, shared target custody, one-initializer maximum, no-retry ambiguity,

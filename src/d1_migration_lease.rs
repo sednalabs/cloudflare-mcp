@@ -108,6 +108,12 @@ const RETIRING_LEASE_NAME: &str = "retiring.lease.json";
 #[cfg(target_os = "linux")]
 const GUARD_NAME: &str = "guard.lock";
 #[cfg(target_os = "linux")]
+const TARGET_IDENTITY_ACTIVATION_GUARD_NAME: &str = "target-identity-v2.guard.lock";
+#[cfg(target_os = "linux")]
+const TARGET_IDENTITY_ACTIVATION_MARKER_NAME: &str = "target-identity-v2.activation.json";
+#[cfg(target_os = "linux")]
+const TARGET_IDENTITY_ACTIVATION_MARKER_BYTES: &[u8] = br#"{"root_audit":"empty_before_activation_v1","target_identity_contract":"lowercase_hyphenated_uuid_v1","version":1}"#;
+#[cfg(target_os = "linux")]
 const BOOTSTRAP_INITIALIZER_ATTEMPT_PREFIX: &str = "bootstrap-initializer-attempt.";
 
 #[derive(Debug)]
@@ -1746,6 +1752,42 @@ fn d1_target_guard_error(
     }))
 }
 
+fn d1_target_identity_activation_error(
+    operation: &'static str,
+    message: &'static str,
+    target_key_sha256: &str,
+) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": operation,
+        "status": "blocked",
+        "provider_calls": 0,
+        "provider_mutations": 0,
+        "target_key_sha256": target_key_sha256,
+        "error": {
+            "code": "d1.target_guard_upgrade_activation_required",
+            "message": message,
+            "hint": "Stop predecessor writers, preserve and reconcile the old root separately, then configure every upgraded writer to one new private empty lease root. Do not create the activation marker manually."
+        }
+    }))
+}
+
+fn d1_migration_target_identity_activation_error(message: &'static str) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": "d1_apply_migration_manifest",
+        "status": "blocked",
+        "provider_calls": 0,
+        "provider_mutations": 0,
+        "lease_retained": null,
+        "error": {
+            "code": "d1.migration_lease_upgrade_activation_required",
+            "message": message,
+            "hint": "Stop predecessor writers, preserve and reconcile the old root separately, then configure every upgraded writer to one new private empty lease root. Do not create the activation marker manually."
+        }
+    }))
+}
+
 fn d1_lease_platform_unsupported() -> CallToolResult {
     CallToolResult::structured_error(json!({
         "ok": false, "operation": "d1_apply_migration_manifest", "status": "reconciliation_required", "lease_retained": false,
@@ -2040,11 +2082,12 @@ mod linux {
         Ok((target, identity(&metadata)))
     }
 
-    fn open_or_create_guard(
-        target: &fs::File,
+    fn open_or_create_private_lock(
+        directory: &fs::File,
+        lock_name: &str,
     ) -> Result<(fs::File, D1LeaseFileIdentity), &'static str> {
-        let name = c_string_name(GUARD_NAME)?;
-        let guard = match open_named_entry(target, GUARD_NAME) {
+        let name = c_string_name(lock_name)?;
+        let guard = match open_named_entry(directory, lock_name) {
             Ok(existing) => {
                 let existing_metadata = existing
                     .metadata()
@@ -2054,7 +2097,7 @@ mod linux {
                 }
                 let expected = identity(&existing_metadata);
                 let guard = open_at(
-                    target.as_raw_fd(),
+                    directory.as_raw_fd(),
                     &name,
                     O_RDWR | O_NOFOLLOW | O_CLOEXEC,
                     0,
@@ -2070,14 +2113,14 @@ mod linux {
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let guard = match open_at(
-                    target.as_raw_fd(),
+                    directory.as_raw_fd(),
                     &name,
                     O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
                     0o600,
                 ) {
                     Ok(guard) => guard,
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                        return open_or_create_guard(target);
+                        return open_or_create_private_lock(directory, lock_name);
                     }
                     Err(_) => return Err("permanent target guard could not be created"),
                 };
@@ -2085,8 +2128,8 @@ mod linux {
                     .set_permissions(fs::Permissions::from_mode(0o600))
                     .and_then(|()| guard.sync_all())
                     .map_err(|_| "permanent target guard could not be synchronized")?;
-                sync_d1_lease_directory(target)
-                    .map_err(|_| "target custody directory could not be synchronized")?;
+                sync_d1_lease_directory(directory)
+                    .map_err(|_| "custody directory could not be synchronized")?;
                 guard
             }
             Err(_) => return Err("permanent target guard could not be inspected"),
@@ -2098,9 +2141,119 @@ mod linux {
             return Err("permanent target guard is not a private regular file");
         }
         let expected = identity(&metadata);
-        validate_named_private_file(target, GUARD_NAME, &expected)
+        validate_named_private_file(directory, lock_name, &expected)
             .map_err(|_| "permanent target guard changed or is not a private regular file")?;
         Ok((guard, expected))
+    }
+
+    fn open_or_create_guard(
+        target: &fs::File,
+    ) -> Result<(fs::File, D1LeaseFileIdentity), &'static str> {
+        open_or_create_private_lock(target, GUARD_NAME)
+    }
+
+    fn validate_target_identity_activation_marker(root: &fs::File) -> Result<(), &'static str> {
+        let named = open_named_entry(root, TARGET_IDENTITY_ACTIVATION_MARKER_NAME)
+            .map_err(|_| "target-identity activation marker is absent or unavailable")?;
+        let metadata = named
+            .metadata()
+            .map_err(|_| "target-identity activation marker metadata is unavailable")?;
+        if !private_file(&metadata)
+            || metadata.nlink() != 1
+            || metadata.len() > MAX_LEASE_PAYLOAD_BYTES
+        {
+            return Err(
+                "target-identity activation marker is not one bounded private regular file",
+            );
+        }
+        let expected = identity(&metadata);
+        let name = c_string_name(TARGET_IDENTITY_ACTIVATION_MARKER_NAME)?;
+        let marker = open_at(
+            root.as_raw_fd(),
+            &name,
+            O_RDONLY | O_NOFOLLOW | O_CLOEXEC,
+            0,
+        )
+        .map_err(|_| "target-identity activation marker could not be rebound")?;
+        let held = marker
+            .metadata()
+            .map_err(|_| "held target-identity activation marker metadata is unavailable")?;
+        if !private_file(&held) || held.nlink() != 1 || identity(&held) != expected {
+            return Err("target-identity activation marker changed while it was rebound");
+        }
+        if read_held_file(&marker)? != TARGET_IDENTITY_ACTIVATION_MARKER_BYTES {
+            return Err("target-identity activation marker payload is not the exact contract");
+        }
+        validate_named_private_file(root, TARGET_IDENTITY_ACTIVATION_MARKER_NAME, &expected)
+            .map_err(|_| "target-identity activation marker changed after readback")
+    }
+
+    pub(super) fn ensure_target_identity_activation(root: &fs::File) -> Result<(), &'static str> {
+        let marker_present = entry_present(root, TARGET_IDENTITY_ACTIVATION_MARKER_NAME)?;
+        if marker_present {
+            validate_target_identity_activation_marker(root)?;
+        } else if !directory_entry_names(root)?.is_empty() {
+            return Err(
+                "unversioned root contains custody evidence; activate this contract only on a fresh empty root",
+            );
+        }
+
+        let (guard, guard_identity) =
+            open_or_create_private_lock(root, TARGET_IDENTITY_ACTIVATION_GUARD_NAME)?;
+        guard
+            .lock()
+            .map_err(|_| "target-identity activation guard could not be locked")?;
+        validate_named_private_file(root, TARGET_IDENTITY_ACTIVATION_GUARD_NAME, &guard_identity)
+            .map_err(|_| "target-identity activation guard changed after locking")?;
+
+        if marker_present || entry_present(root, TARGET_IDENTITY_ACTIVATION_MARKER_NAME)? {
+            return validate_target_identity_activation_marker(root);
+        }
+
+        let entries = directory_entry_names(root)?;
+        if entries.len() != 1
+            || entries[0].as_slice() != TARGET_IDENTITY_ACTIVATION_GUARD_NAME.as_bytes()
+        {
+            return Err(
+                "unversioned root contains custody evidence; activate this contract only on a fresh empty root",
+            );
+        }
+
+        let marker_name = c_string_name(TARGET_IDENTITY_ACTIVATION_MARKER_NAME)?;
+        let mut marker = open_at(
+            root.as_raw_fd(),
+            &marker_name,
+            O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+            0o600,
+        )
+        .map_err(
+            |_| "target-identity activation marker could not be created without replacement",
+        )?;
+        let metadata = marker
+            .metadata()
+            .map_err(|_| "target-identity activation marker identity is unavailable")?;
+        if !private_file(&metadata) || metadata.nlink() != 1 {
+            return Err("target-identity activation marker is not one private regular file");
+        }
+        marker
+            .write_all(TARGET_IDENTITY_ACTIVATION_MARKER_BYTES)
+            .and_then(|()| marker.sync_all())
+            .map_err(|_| "target-identity activation marker could not be durably written")?;
+        sync_d1_lease_directory(root)
+            .map_err(|_| "target-identity activation marker directory could not be synchronized")?;
+        validate_target_identity_activation_marker(root)?;
+        let final_entries = directory_entry_names(root)?;
+        if final_entries.len() != 2
+            || !final_entries
+                .iter()
+                .any(|name| name.as_slice() == TARGET_IDENTITY_ACTIVATION_GUARD_NAME.as_bytes())
+            || !final_entries
+                .iter()
+                .any(|name| name.as_slice() == TARGET_IDENTITY_ACTIVATION_MARKER_NAME.as_bytes())
+        {
+            return Err("target-identity activation root changed during the bounded audit");
+        }
+        Ok(())
     }
 
     fn open_existing_guard(
@@ -3617,6 +3770,9 @@ mod linux {
                 &target_hash,
             )
         })?;
+        ensure_target_identity_activation(&root).map_err(|message| {
+            d1_target_identity_activation_error(operation, message, &target_hash)
+        })?;
 
         let target_name = format!("d1-migration-target-{target_hash}");
         let (target, target_identity) =
@@ -3746,6 +3902,8 @@ mod linux {
         let root_identity = identity(&root_metadata);
         validate_root_path_binding(&root_path, &root, &root_identity)
             .map_err(|message| d1_lease_root_error("d1.migration_lease_root_unsafe", message))?;
+        ensure_target_identity_activation(&root)
+            .map_err(d1_migration_target_identity_activation_error)?;
 
         let target_hash = sha256_bytes_hex(format!("{account_id}\0{database_id}").as_bytes());
         let target_name = format!("d1-migration-target-{target_hash}");
@@ -3973,7 +4131,7 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn private_test_root(label: &str) -> PathBuf {
+    fn private_unactivated_test_root(label: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
         let root = PathBuf::from("/tmp").join(format!(
@@ -3984,6 +4142,232 @@ mod tests {
         fs::create_dir(&root).expect("create private root");
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("private root");
         root
+    }
+
+    #[cfg(target_os = "linux")]
+    fn private_test_root(label: &str) -> PathBuf {
+        let root = private_unactivated_test_root(label);
+        let root_file = fs::File::open(&root).expect("open private test root");
+        linux::ensure_target_identity_activation(&root_file)
+            .expect("activate canonical target identity for existing custody tests");
+        root
+    }
+
+    #[cfg(target_os = "linux")]
+    fn install_unversioned_target_entry(
+        root: &Path,
+        account_id: &str,
+        database_id: &str,
+        entry_name: Option<&str>,
+        entry_bytes: &[u8],
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let target_hash = sha256_bytes_hex(format!("{account_id}\0{database_id}").as_bytes());
+        let target = root.join(format!("d1-migration-target-{target_hash}"));
+        fs::create_dir(&target).expect("create unversioned target directory");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
+            .expect("private unversioned target directory");
+        fs::write(target.join(GUARD_NAME), b"").expect("write legacy guard");
+        fs::set_permissions(target.join(GUARD_NAME), fs::Permissions::from_mode(0o600))
+            .expect("private legacy guard");
+        if let Some(entry_name) = entry_name {
+            fs::write(target.join(entry_name), entry_bytes).expect("write legacy evidence");
+            fs::set_permissions(target.join(entry_name), fs::Permissions::from_mode(0o600))
+                .expect("private legacy evidence");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_identity_upgrade_requires_a_fresh_root_for_every_unversioned_namespace() {
+        let canonical_database_id = "123e4567-e89b-42d3-a456-426614174000";
+        let alias_database_id = "123E4567-E89B-42D3-A456-426614174000";
+        let nonce = "a".repeat(64);
+        let cases = vec![
+            (
+                "alias-active",
+                alias_database_id,
+                Some(ACTIVE_LEASE_NAME.to_string()),
+            ),
+            (
+                "alias-retiring",
+                alias_database_id,
+                Some(RETIRING_LEASE_NAME.to_string()),
+            ),
+            (
+                "alias-retired",
+                alias_database_id,
+                Some(format!("retired.{nonce}.lease.json")),
+            ),
+            (
+                "alias-terminal",
+                alias_database_id,
+                Some(format!("terminal-reconciliation.{nonce}.receipt.json")),
+            ),
+            ("canonical-incumbent", canonical_database_id, None),
+        ];
+
+        for (label, database_id, entry_name) in cases {
+            let root = private_unactivated_test_root(label);
+            install_unversioned_target_entry(
+                &root,
+                "acct-1",
+                database_id,
+                entry_name.as_deref(),
+                br#"{"malformed":"legacy payload lacks canonical target authority"}"#,
+            );
+            let error = acquire_d1_target_mutation_guard_at(
+                root.clone(),
+                "d1_execute_write",
+                "acct-1",
+                canonical_database_id,
+            )
+            .expect_err("unversioned custody must block canonical target activation")
+            .structured_content
+            .expect("structured activation failure");
+            assert_eq!(
+                error["error"]["code"],
+                json!("d1.target_guard_upgrade_activation_required"),
+                "{label} must not become an invisible sibling namespace"
+            );
+            assert!(
+                !root.join(TARGET_IDENTITY_ACTIVATION_MARKER_NAME).exists(),
+                "failed activation must not mint a marker"
+            );
+            assert!(
+                !root.join(TARGET_IDENTITY_ACTIVATION_GUARD_NAME).exists(),
+                "pre-existing custody must be rejected without altering its root"
+            );
+            fs::remove_dir_all(root).expect("test cleanup");
+        }
+
+        let root = private_unactivated_test_root("alias-active-migration-lease");
+        install_unversioned_target_entry(
+            &root,
+            "acct-1",
+            alias_database_id,
+            Some(ACTIVE_LEASE_NAME),
+            b"malformed predecessor payload",
+        );
+        let error = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            canonical_database_id,
+            "newsletter-core",
+            &"b".repeat(64),
+        )
+        .expect_err("migration lease must share the upgrade activation gate")
+        .structured_content
+        .expect("structured migration activation failure");
+        assert_eq!(
+            error["error"]["code"],
+            json!("d1.migration_lease_upgrade_activation_required")
+        );
+        assert_eq!(error["provider_calls"], json!(0));
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_identity_upgrade_blocks_malformed_root_and_marker_evidence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let database_id = "123e4567-e89b-42d3-a456-426614174000";
+        for label in ["unexpected-root-entry", "malformed-marker"] {
+            let root = private_unactivated_test_root(label);
+            let entry = if label == "malformed-marker" {
+                TARGET_IDENTITY_ACTIVATION_MARKER_NAME
+            } else {
+                "unclassifiable-custody"
+            };
+            fs::write(root.join(entry), b"not the activation contract")
+                .expect("write malformed root evidence");
+            fs::set_permissions(root.join(entry), fs::Permissions::from_mode(0o600))
+                .expect("private malformed root evidence");
+            let error = acquire_d1_target_mutation_guard_at(
+                root.clone(),
+                "d1_execute_write",
+                "acct-1",
+                database_id,
+            )
+            .expect_err("malformed upgrade evidence must fail closed")
+            .structured_content
+            .expect("structured activation failure");
+            assert_eq!(
+                error["error"]["code"],
+                json!("d1.target_guard_upgrade_activation_required"),
+                "{label} must block"
+            );
+            fs::remove_dir_all(root).expect("test cleanup");
+        }
+
+        let root = private_unactivated_test_root("over-limit-root");
+        for index in 0..linux::MAX_TARGET_CUSTODY_DIRECTORY_ENTRIES {
+            fs::write(root.join(format!("legacy-{index}")), b"").expect("write legacy root entry");
+        }
+        let error = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_execute_write",
+            "acct-1",
+            database_id,
+        )
+        .expect_err("an over-limit root must fail closed without partial activation")
+        .structured_content
+        .expect("structured over-limit activation failure");
+        assert_eq!(
+            error["error"]["code"],
+            json!("d1.target_guard_upgrade_activation_required")
+        );
+        assert!(!root.join(TARGET_IDENTITY_ACTIVATION_MARKER_NAME).exists());
+        assert!(!root.join(TARGET_IDENTITY_ACTIVATION_GUARD_NAME).exists());
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn clean_root_activation_reuses_one_canonical_namespace_for_the_same_provider_target() {
+        let root = private_unactivated_test_root("clean-upgrade");
+        let database_id = "123e4567-e89b-42d3-a456-426614174000";
+        let first = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_execute_write",
+            "acct-1",
+            database_id,
+        )
+        .expect("fresh root activates before the first canonical target guard");
+        assert_eq!(
+            fs::read(root.join(TARGET_IDENTITY_ACTIVATION_MARKER_NAME))
+                .expect("read activation marker"),
+            TARGET_IDENTITY_ACTIVATION_MARKER_BYTES
+        );
+        let target_key = first.target_key_sha256.clone();
+        drop(first);
+
+        let second = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_rename_database",
+            "acct-1",
+            database_id,
+        )
+        .expect("the same canonical provider target reuses its namespace after activation");
+        assert_eq!(second.target_key_sha256, target_key);
+        let target_directories = fs::read_dir(&root)
+            .expect("enumerate activated root")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("d1-migration-target-")
+            })
+            .count();
+        assert_eq!(
+            target_directories, 1,
+            "one provider target has one namespace"
+        );
+        drop(second);
+        fs::remove_dir_all(root).expect("test cleanup");
     }
 
     #[cfg(target_os = "linux")]
@@ -4359,7 +4743,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn target_custody_preflight_is_read_only_when_absent_and_blocks_retained_active() {
-        let root = private_test_root("preflight-existing-target");
+        let root = private_unactivated_test_root("preflight-existing-target");
         preflight_d1_migration_target_custody_at(
             root.clone(),
             "acct-1",

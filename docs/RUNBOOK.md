@@ -283,6 +283,23 @@ directory, guard, identity and mode before every provider boundary. Do not use
 a shared writable directory or manually rename or remove any lease evidence by
 pathname.
 
+For the canonical UUID target-identity upgrade, do not reuse a root containing
+any predecessor custody. Stop every predecessor write-capable MCP process,
+preserve its old root without deleting or moving retained evidence, reconcile
+any active or retiring operation through its governed recovery path, and
+provision one new private empty `0700` root for all upgraded writers. On the
+first canonical target guard, the upgraded MCP holds
+`target-identity-v2.guard.lock`, exhaustively enumerates the root up to the
+finite custody limit, and creates the exact
+`target-identity-v2.activation.json` marker only when no other entry exists.
+Canonical incumbent directories are intentionally rejected along with alias,
+active, retiring, retired, terminal, malformed, unreadable, symlink, and
+over-limit evidence: predecessor payloads contain only a target hash and cannot
+prove the UUID spelling that produced it. A failed activation does not clean up
+or migrate evidence. Do not manually create the marker, reuse the blocked root,
+or allow an older binary to open the activated root. This local activation has
+zero provider calls; it does not itself approve a D1 mutation.
+
 The exact-byte manifest boundary accepts at most 16 MiB of aggregate SQL and
 moves the supplied manifest into validation without cloning its SQL strings.
 Split a larger migration family before review rather than increasing this

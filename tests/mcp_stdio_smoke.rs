@@ -68,6 +68,14 @@ fn lock_manifest_target_guard(lease_root: &Path) -> fs::File {
     fs::create_dir(lease_root).expect("create private target guard root");
     fs::set_permissions(lease_root, fs::Permissions::from_mode(0o700))
         .expect("make target guard root private");
+    let activation_marker = lease_root.join("target-identity-v2.activation.json");
+    fs::write(
+        &activation_marker,
+        br#"{"root_audit":"empty_before_activation_v1","target_identity_contract":"lowercase_hyphenated_uuid_v1","version":1}"#,
+    )
+    .expect("write activated-root fixture marker");
+    fs::set_permissions(&activation_marker, fs::Permissions::from_mode(0o600))
+        .expect("make activated-root fixture marker private");
     let target = manifest_target_path(lease_root);
     fs::create_dir(&target).expect("create permanent target directory");
     fs::set_permissions(&target, fs::Permissions::from_mode(0o700))

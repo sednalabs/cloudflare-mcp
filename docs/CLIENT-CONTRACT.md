@@ -146,6 +146,22 @@ Uppercase, mixed-case, compact, braced and other database UUID aliases fail
 before target hashing, planning, custody lookup or provider dispatch; callers
 must not normalize a rejected identifier themselves.
 
+The canonical target-identity contract has a one-way local custody activation
+boundary. Before either a migration lease or another existing-target mutation
+guard can be created, the configured lease root must contain the exact
+`target-identity-v2.activation.json` marker. An upgraded process may create
+that marker only while holding the permanent root activation guard and only
+after a bounded, descriptor-relative enumeration proves the root was empty
+apart from that guard. Any unversioned target directory or other entry blocks,
+including an otherwise canonical incumbent and active, retiring, retired,
+terminal, malformed, unreadable, or alias custody. The MCP never deletes,
+migrates, or blesses that evidence. This is necessary because predecessor
+lease payloads retain the derived target hash but cannot prove which UUID
+spelling produced it. Upgrade by stopping every predecessor writer, preserving
+and governing its old root separately, and configuring all upgraded writers to
+one newly provisioned private empty root. Never point a predecessor binary at
+an activated root.
+
 The exact family `migration-ledger-bootstrap-v1` is reserved to `d1_bootstrap_migration_ledger` and its dedicated reconcile, finalize, and abort tools. Generic manifest apply, read-only reconciliation, and terminal finalization reject that family before provider access, custody inspection or creation, receipt access, or local namespace mutation; similarly prefixed family labels are not reserved.
 
 Cloudflare D1 already enforces foreign keys and runs each query or migration in
