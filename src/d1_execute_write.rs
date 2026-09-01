@@ -2,8 +2,12 @@
 //!
 //! This module deliberately owns no provider client, tool route, custody, or
 //! audit behavior. It also does not reuse migration-result semantics: a
-//! primary-served successful DML statement with exact zero mutation counts is
-//! a valid terminal unchanged result for every allowed statement kind.
+//! primary-served successful DML statement with `changed_db=false` and zero
+//! counters is a valid terminal unchanged result for every allowed statement
+//! kind. Cloudflare documents `changes` as a rough SQLite-derived indication
+//! and its Query API permits `changed_db=true` with zero counters, so those
+//! counters are retained as typed provider metrics rather than promoted into
+//! exact row-effect authority.
 
 use serde::Serialize;
 use serde_json::Value;
@@ -58,7 +62,6 @@ pub(crate) enum D1WriteResultClassification {
     MissingOrMalformedWriteMetadata,
     WriteNotServedByPrimary,
     WriteMetadataContradictory,
-    WriteMetadataDidNotProveMutation,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -183,12 +186,6 @@ pub(crate) fn classify_d1_execute_write_result(
         return Err(ambiguous(
             D1WriteResultClassification::WriteMetadataContradictory,
             "changed_db=false contradicted nonzero mutation counts",
-        ));
-    }
-    if changed_db && (changes == 0 || rows_written == 0) {
-        return Err(ambiguous(
-            D1WriteResultClassification::WriteMetadataDidNotProveMutation,
-            "changed_db=true did not carry positive mutation counts",
         ));
     }
     let zero_change = !changed_db;
@@ -388,19 +385,25 @@ mod tests {
     }
 
     #[test]
-    fn positive_mutation_is_terminal_for_every_dml_kind() {
+    fn changed_acknowledgement_is_terminal_for_every_dml_kind() {
         for statement_kind in [
             D1WriteStatementKind::Insert,
             D1WriteStatementKind::Update,
             D1WriteStatementKind::Delete,
             D1WriteStatementKind::Replace,
         ] {
-            let outcome = classify_d1_execute_write_result(statement_kind, &result(true, 2, 1))
-                .expect("positive mutation is terminal");
-            assert!(outcome.changed_db);
-            assert!(!outcome.zero_change);
-            assert_eq!(outcome.changes, 2);
-            assert_eq!(outcome.rows_written, 1);
+            for (changes, rows_written) in [(0, 0), (0, 1), (1, 0), (2, 1)] {
+                let outcome = classify_d1_execute_write_result(
+                    statement_kind,
+                    &result(true, changes, rows_written),
+                )
+                .expect("changed_db=true is the terminal provider acknowledgement");
+                assert_eq!(outcome.statement_kind, statement_kind);
+                assert!(outcome.changed_db);
+                assert!(!outcome.zero_change);
+                assert_eq!(outcome.changes, changes);
+                assert_eq!(outcome.rows_written, rows_written);
+            }
         }
     }
 
@@ -517,12 +520,6 @@ mod tests {
             assert_eq!(
                 classification(&value),
                 D1WriteResultClassification::WriteMetadataContradictory
-            );
-        }
-        for value in [result(true, 0, 1), result(true, 1, 0), result(true, 0, 0)] {
-            assert_eq!(
-                classification(&value),
-                D1WriteResultClassification::WriteMetadataDidNotProveMutation
             );
         }
     }
