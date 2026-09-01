@@ -1,11 +1,13 @@
 //! Side-effect-free, exact D1 catalog observation evidence.
 //!
-//! This module owns one immutable catalog query/projection and the proof that
-//! two independently dispatched, primary-served, complete observations of that
-//! projection describe one stable snapshot for one canonical D1 target. It
-//! deliberately does not interpret DDL, triggers, foreign keys, or a write
-//! graph, and it has no provider client, public tool route, custody, or mutation
-//! capability.
+//! This module owns one immutable catalog query/projection and verifies that two
+//! adapter-issued frames claim distinct, primary-served, complete observations
+//! whose canonical typed projections describe one stable snapshot for one
+//! canonical D1 target. It cannot authenticate provider dispatch or response
+//! EOF; that custody belongs to the successor adapter that constructs the
+//! frames. It deliberately does not interpret DDL, triggers, foreign keys, or a
+//! write graph, and it has no provider client, public tool route, custody, or
+//! mutation capability.
 
 use std::collections::BTreeSet;
 
@@ -48,22 +50,57 @@ pub(crate) struct D1CatalogEvidencePlan {
     pub(crate) provider_byte_cap: usize,
 }
 
-/// Normalized evidence supplied by a future provider adapter.
+/// Normalized evidence supplied only by a future provider-custody adapter.
 ///
 /// The adapter must allocate these identities before each physical request and
 /// must set `body_complete` only after reading the complete bounded body. The
 /// exact response body contains only the narrow projection payload below, not a
-/// general Cloudflare envelope.
+/// general Cloudflare envelope. This frame and its constructor do not
+/// authenticate that dispatch or EOF; they preserve the adapter's claims for
+/// deterministic verification.
 pub(crate) struct D1CatalogObservationFrame<'a> {
-    pub(crate) target: &'a D1TargetIdentity,
-    pub(crate) query_plan_sha256: &'a str,
-    pub(crate) dispatch_id: &'a str,
-    pub(crate) read_id: &'a str,
-    pub(crate) provider_row_cap: usize,
-    pub(crate) provider_byte_cap: usize,
-    pub(crate) body_complete: bool,
-    pub(crate) body_size_bytes: usize,
-    pub(crate) body: &'a [u8],
+    target: &'a D1TargetIdentity,
+    query_plan_sha256: &'a str,
+    dispatch_id: &'a str,
+    read_id: &'a str,
+    provider_row_cap: usize,
+    provider_byte_cap: usize,
+    body_complete: bool,
+    body_size_bytes: usize,
+    body: &'a [u8],
+}
+
+impl<'a> D1CatalogObservationFrame<'a> {
+    /// Construct one normalized frame after the successor adapter has retained
+    /// the corresponding provider-dispatch and complete-body evidence.
+    ///
+    /// Construction is intentionally crate-private and performs no provider or
+    /// custody authentication. `prove_d1_catalog_evidence` validates every
+    /// supplied field against the exact rederived plan.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_adapter_observation(
+        target: &'a D1TargetIdentity,
+        query_plan_sha256: &'a str,
+        dispatch_id: &'a str,
+        read_id: &'a str,
+        provider_row_cap: usize,
+        provider_byte_cap: usize,
+        body_complete: bool,
+        body_size_bytes: usize,
+        body: &'a [u8],
+    ) -> Self {
+        Self {
+            target,
+            query_plan_sha256,
+            dispatch_id,
+            read_id,
+            provider_row_cap,
+            provider_byte_cap,
+            body_complete,
+            body_size_bytes,
+            body,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -490,17 +527,17 @@ mod tests {
         read_id: &'a str,
         body: &'a [u8],
     ) -> D1CatalogObservationFrame<'a> {
-        D1CatalogObservationFrame {
+        D1CatalogObservationFrame::from_adapter_observation(
             target,
-            query_plan_sha256: plan_sha256,
+            plan_sha256,
             dispatch_id,
             read_id,
-            provider_row_cap: D1_CATALOG_PROVIDER_ROW_CAP,
-            provider_byte_cap: D1_CATALOG_PROVIDER_BYTE_CAP,
-            body_complete: true,
-            body_size_bytes: body.len(),
+            D1_CATALOG_PROVIDER_ROW_CAP,
+            D1_CATALOG_PROVIDER_BYTE_CAP,
+            true,
+            body.len(),
             body,
-        }
+        )
     }
 
     fn prove(
