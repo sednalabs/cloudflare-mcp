@@ -17,6 +17,7 @@ pub(crate) mod d1_migration_reconciliation;
 pub(crate) mod d1_migration_seed_rows;
 pub(crate) mod d1_migration_terminal;
 pub(crate) mod d1_migration_terminal_semantics;
+pub(crate) mod d1_sql_file_import;
 pub mod dns_route;
 pub mod mutation;
 pub(crate) mod pages_deploy;

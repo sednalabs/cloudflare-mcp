@@ -17,7 +17,8 @@ matter more than raw endpoint breadth:
 
 - Cloudflare Tunnel, DNS, and Access publish workflows.
 - Pages deployments and custom domains.
-- D1 database discovery, read-only queries, guarded writes, and migrations.
+- D1 database discovery, read-only queries, guarded writes and migrations, plus
+  approval-bound local SQL-file imports with durable reconciliation custody.
 - R2 object inspection, bounded reads/downloads, and writes.
 - Workers script upload with digest-based summaries and settings readback,
   bindings discovery, and observability event queries.

@@ -609,9 +609,10 @@ impl ApiCatalogError {
             Self::MethodMismatch { .. } => {
                 "Use api_read for GET operations and api_mutate for POST/PUT/PATCH/DELETE operations."
             }
-            Self::DeniedByDefault(id)
-                if matches!(id.as_str(), "d1-import-database" | "d1-time-travel-restore") =>
-            {
+            Self::DeniedByDefault(id) if id == "d1-import-database" => {
+                "Use d1_import_sql_file with its guarded admission and custody lifecycle; generic api_mutate remains denied."
+            }
+            Self::DeniedByDefault(id) if id == "d1-time-travel-restore" => {
                 "Use a governed curated lifecycle for this operation; generic api_mutate remains denied."
             }
             Self::DeniedByDefault(_) => {
@@ -765,7 +766,8 @@ mod tests {
             assert!(!operation_allowed_by_default(operation));
             let expected_preferred_tool = match operation_id {
                 "d1-query-database" | "d1-raw-database-query" => Some("d1_query_read_only"),
-                "d1-import-database" | "d1-time-travel-restore" => None,
+                "d1-import-database" => Some("d1_import_sql_file"),
+                "d1-time-travel-restore" => None,
                 _ => unreachable!(),
             };
             assert_eq!(operation.preferred_tool.as_deref(), expected_preferred_tool);

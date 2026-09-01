@@ -120,6 +120,26 @@ pub struct CloudflareClient {
     migration_write_http: reqwest::Client,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct D1ImportResult {
+    #[serde(default)]
+    pub(crate) at_bookmark: Option<String>,
+    #[serde(default)]
+    pub(crate) error: Option<String>,
+    #[serde(default)]
+    pub(crate) filename: Option<String>,
+    #[serde(default)]
+    pub(crate) result: Option<Value>,
+    #[serde(default)]
+    pub(crate) status: Option<String>,
+    #[serde(default)]
+    pub(crate) success: Option<bool>,
+    #[serde(rename = "type", default)]
+    pub(crate) result_type: Option<String>,
+    #[serde(default)]
+    pub(crate) upload_url: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct R2Object {
     pub bucket_name: String,
@@ -827,6 +847,170 @@ impl CloudflareClient {
             params,
         )
         .await
+    }
+
+    pub(crate) async fn begin_d1_sql_import(
+        &self,
+        account_id: &str,
+        database_id: &str,
+        etag: &str,
+    ) -> Result<D1ImportResult, AdapterError> {
+        self.d1_sql_import_action(
+            "cloudflare.d1.import.init",
+            account_id,
+            database_id,
+            json!({"action": "init", "etag": etag}),
+            RetryPolicy::NonIdempotent,
+        )
+        .await
+    }
+
+    pub(crate) async fn ingest_d1_sql_import(
+        &self,
+        account_id: &str,
+        database_id: &str,
+        etag: &str,
+        filename: &str,
+    ) -> Result<D1ImportResult, AdapterError> {
+        self.d1_sql_import_action(
+            "cloudflare.d1.import.ingest",
+            account_id,
+            database_id,
+            json!({"action": "ingest", "etag": etag, "filename": filename}),
+            RetryPolicy::NonIdempotent,
+        )
+        .await
+    }
+
+    pub(crate) async fn poll_d1_sql_import(
+        &self,
+        account_id: &str,
+        database_id: &str,
+        current_bookmark: &str,
+    ) -> Result<D1ImportResult, AdapterError> {
+        self.d1_sql_import_action(
+            "cloudflare.d1.import.poll",
+            account_id,
+            database_id,
+            json!({"action": "poll", "current_bookmark": current_bookmark}),
+            RetryPolicy::Idempotent,
+        )
+        .await
+    }
+
+    async fn d1_sql_import_action(
+        &self,
+        operation: &'static str,
+        account_id: &str,
+        database_id: &str,
+        body: Value,
+        retry_policy: RetryPolicy,
+    ) -> Result<D1ImportResult, AdapterError> {
+        let account_id = require_non_empty("account_id", account_id)?;
+        let database_id = require_non_empty("database_id", database_id)?;
+        let token = self.bearer_token()?;
+        let url = self.endpoint(&format!(
+            "/accounts/{}/d1/database/{}/import",
+            path_segment(account_id),
+            path_segment(database_id),
+        ));
+        let envelope = self
+            .send_d1_migration_manifest_envelope(operation, retry_policy, || {
+                self.migration_write_http
+                    .post(url.clone())
+                    .bearer_auth(&token)
+                    .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone())
+                    .header(reqwest::header::ACCEPT_ENCODING, "identity")
+                    .json(&body)
+            })
+            .await?;
+        if !envelope.success || !envelope.errors.is_empty() {
+            return Err(AdapterError::new(
+                "cloudflare.d1.import_rejected",
+                "Cloudflare rejected the D1 import lifecycle request",
+                "Retain local custody and reconcile the exact import attempt before another provider mutation.",
+            ));
+        }
+        let result = envelope.result.ok_or_else(|| {
+            AdapterError::new(
+                "cloudflare.d1.import_empty_result",
+                "Cloudflare returned success without a D1 import result",
+                "Retain local custody and reconcile the exact import attempt before another provider mutation.",
+            )
+        })?;
+        serde_json::from_value(result).map_err(|_| {
+            AdapterError::new(
+                "cloudflare.d1.import_malformed_result",
+                "Cloudflare returned a malformed D1 import result",
+                "Retain local custody and reconcile the exact import attempt before another provider mutation.",
+            )
+        })
+    }
+
+    pub(crate) async fn upload_d1_sql_import(
+        &self,
+        upload_url: &str,
+        bytes: Vec<u8>,
+    ) -> Result<String, AdapterError> {
+        let url = Url::parse(upload_url).map_err(|_| {
+            AdapterError::new(
+                "cloudflare.d1.import_upload_url_invalid",
+                "Cloudflare returned an invalid D1 import upload URL",
+                "Retain local custody and reconcile; do not disclose or replay the upload URL.",
+            )
+        })?;
+        let production_url = url.scheme() == "https"
+            && url
+                .host_str()
+                .is_some_and(|host| host.ends_with(".r2.cloudflarestorage.com"));
+        let test_url = url.scheme() == "http"
+            && matches!(url.host_str(), Some("127.0.0.1") | Some("localhost"))
+            && (self.cfg.api_base_url.starts_with("http://127.0.0.1")
+                || self.cfg.api_base_url.starts_with("http://localhost"));
+        if !production_url && !test_url {
+            return Err(AdapterError::new(
+                "cloudflare.d1.import_upload_url_untrusted",
+                "Cloudflare returned a D1 import upload URL outside the trusted R2 host boundary",
+                "Retain local custody and reconcile; never send SQL bytes to an untrusted host.",
+            ));
+        }
+        let response = self
+            .migration_write_http
+            .put(url)
+            .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone())
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|error| {
+                AdapterError::new(
+                    "cloudflare.d1.import_upload_ambiguous",
+                    format!("D1 import upload outcome is ambiguous: {error}"),
+                    "Retain local custody and reconcile; do not replay the upload automatically.",
+                )
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(AdapterError::new(
+                "cloudflare.d1.import_upload_failed",
+                format!("D1 import upload returned HTTP {}", status.as_u16()),
+                "Retain local custody and reconcile before another upload attempt.",
+            )
+            .with_status(Some(status.as_u16())));
+        }
+        response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.trim_matches('"').to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                AdapterError::new(
+                    "cloudflare.d1.import_upload_etag_missing",
+                    "D1 import upload succeeded without a usable ETag",
+                    "Retain local custody and reconcile before another upload attempt.",
+                )
+            })
     }
 
     /// Query a D1 migration ledger without discarding contradictory outer

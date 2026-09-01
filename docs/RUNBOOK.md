@@ -204,6 +204,57 @@ object and zero ledger rows. This proves current convergence, not which caller
 created it. General manifest reconciliation remains a separate authority and
 cannot reconcile or retire bootstrap-family custody.
 
+## Guarded local SQL-file D1 imports
+
+Use the four-stage import surface only for SQL files already held in a private
+operator directory. Configure `CLOUDFLARE_MCP_D1_IMPORT_INPUT_ROOT` and
+`CLOUDFLARE_MCP_D1_IMPORT_CUSTODY_ROOT` as absolute, owner-held directories
+with mode `0700` or stricter. Input files must resolve beneath the input root,
+must not be symlinks, and must be owner-held, single-link regular files with
+mode `0600` or stricter. Import receipts contain hashes and state only; paths,
+SQL, upload URLs, filenames, resource names, and provider messages are never
+returned.
+
+Every process that can write the target must share the same configured import
+custody root; an unconfigured legacy process is outside this local
+serialization boundary.
+
+The fixed application schema owns
+`mcp_d1_import_attempt_admissions`; the MCP never creates, replaces, deletes,
+or migrates that relation. Generic D1 writes, migration manifests, and the
+bootstrap migrations-table selector reject it. Live generic/manifest/bootstrap
+writes also stop while import `handoff.json` or `active.json` custody is
+present for the same target.
+
+Run the lifecycle in this order:
+
+1. Call `d1_admit_sql_file_import_attempt` with `dry_run=true`. It performs two
+   stable inventory reads and returns content-free inventory and request
+   digests. A live admission requires the exact request digest, persists local
+   handoff custody before its single provider write, and succeeds only after
+   exact admission readback.
+2. Call `d1_import_sql_file` with `dry_run=true` and no binding fields to hash
+   the exact file, then again with all four admission binding digests to obtain
+   the execution `plan_sha256`.
+3. A live import requires that exact plan and matching retained handoff. It
+   creates active custody before retiring the handoff, then performs the
+   documented Cloudflare
+   [D1 import lifecycle](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/import/):
+   init, unauthenticated trusted-R2 upload, ingest, and
+   bounded poll lifecycle. Upload ETag must equal the source MD5. Any ambiguous
+   provider outcome retains custody and forbids automatic replay.
+4. Use `d1_reconcile_sql_file_import` only with the exact approved execution
+   plan. It may resume an already-ingested attempt by polling, or return an
+   exact local terminal receipt with zero provider calls. Earlier ambiguous
+   stages remain `reconciliation_required`; stage-preserving recovery is a
+   separate follow-up boundary.
+
+`d1_read_sql_file_import_attempt_admission` is the read-only exact-binding
+check. Admission and import are distinct effects: neither a dry run nor an
+admission row authorizes upload or ingest. Keep the existing migration custody
+root configured too; live import fails closed unless other migration custody
+can be proven absent.
+
 ## Exact-byte D1 migration manifests
 
 Use `d1_apply_migration_manifest` for an approval-gated D1 migration family.
