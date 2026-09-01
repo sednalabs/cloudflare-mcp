@@ -38,6 +38,10 @@ use crate::cloudflare::{
     AccessAppUpsertRequest, AccessPolicyWrite, BulkRedirectItemWrite, CacheRule, CacheRuleset,
     DnsRecordUpsertRequest, PagesDeploymentTriggerRequest, with_request_api_token_override,
 };
+use crate::d1_import_admission::{
+    D1AdmitImportAttemptArgs, D1ReadImportAdmissionArgs, admit_import_attempt,
+    read_import_admission, sql_mentions_import_admission,
+};
 use crate::d1_migration_bootstrap::{
     D1_BOOTSTRAP_LEASE_FAMILY, D1_BOOTSTRAP_OPERATION, D1BootstrapExecutionInput,
     d1_bootstrap_mutation_plan, d1_bootstrap_mutation_target,
@@ -51,7 +55,8 @@ use crate::d1_migration_bootstrap_recovery::{
     reconcile_bootstrap_migration_ledger,
 };
 use crate::d1_migration_lease::{
-    acquire_d1_migration_lease, d1_migration_lease_requirements,
+    D1TargetLeaseAcquisition, D1TargetLeaseBinding, D1TargetWriter, acquire_d1_migration_lease,
+    acquire_d1_target_lease, d1_migration_lease_requirements,
     preflight_d1_migration_target_custody,
 };
 use crate::d1_migration_manifest::{
@@ -918,6 +923,10 @@ pub struct D1ExecuteWriteArgs {
     pub dry_run: bool,
     #[serde(default)]
     pub max_rows: Option<usize>,
+    #[serde(default)]
+    pub approved_plan_sha256: Option<String>,
+    #[serde(default)]
+    pub execution_session_sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -4323,25 +4332,85 @@ impl CloudflareMcp {
     }
 
     #[tool(
+        name = "d1_admit_import_attempt",
+        description = "Preview or persist one immutable provider-resident D1 database import admission under the shared account/database target lease."
+    )]
+    async fn cloudflare_d1_admit_import_attempt(
+        &self,
+        Parameters(args): Parameters<D1AdmitImportAttemptArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        Ok(admit_import_attempt(&self.cloudflare, account_id, &args).await)
+    }
+
+    #[tool(
+        name = "d1_read_import_admission",
+        description = "Read one exact provider-resident D1 import admission binding without mutation."
+    )]
+    async fn cloudflare_d1_read_import_admission(
+        &self,
+        Parameters(args): Parameters<D1ReadImportAdmissionArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        Ok(read_import_admission(&self.cloudflare, account_id, &args).await)
+    }
+
+    #[tool(
         name = "d1_execute_write",
-        description = "Execute one audited D1 row-write SQL statement with dry-run safety. Allows INSERT, UPDATE, DELETE, or REPLACE only."
+        description = "Execute one audited D1 row-write SQL statement under an immutable execution session and the shared target lease. Allows INSERT, UPDATE, DELETE, or REPLACE only."
     )]
     async fn cloudflare_d1_execute_write(
         &self,
         Parameters(args): Parameters<D1ExecuteWriteArgs>,
     ) -> Result<CallToolResult, crate::McpError> {
         let account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        if sql_mentions_import_admission(&args.sql) {
+            return Ok(CallToolResult::structured_error(json!({
+                "ok": false,
+                "operation": "d1_execute_write",
+                "provider_calls": 0,
+                "provider_mutations": 0,
+                "error": {
+                    "code": "d1.import_admission_relation_reserved",
+                    "message": "the import admission relation is reserved to the guarded admission coordinator",
+                    "hint": "Use d1_admit_import_attempt; generic writes cannot create or mutate admission authority."
+                }
+            })));
+        }
         let statement_kind = match classify_d1_write_sql(&args.sql) {
             Ok(kind) => kind,
             Err(result) => return Ok(result),
         };
         let max_rows = args.max_rows.unwrap_or(100).clamp(1, 1000);
+        let params_json = serde_json::to_string(&args.params)
+            .expect("serializing D1 write parameters is infallible");
+        let params_sha256 = sha256_hex(&params_json);
+        let content_plan_json = serde_json::to_string(&json!({
+            "contract": "d1-execute-write-content-v1",
+            "account_id": account_id,
+            "database_id": &args.database_id,
+            "statement_kind": statement_kind,
+            "sql_sha256": sha256_hex(args.sql.trim()),
+            "params_sha256": params_sha256,
+        }))
+        .expect("serializing D1 write content plan is infallible");
+        let content_plan_sha256 = sha256_hex(&content_plan_json);
+        let plan_json = serde_json::to_string(&json!({
+            "contract": "d1-execute-write-plan-v1",
+            "content_plan_sha256": content_plan_sha256,
+            "max_rows": max_rows,
+        }))
+        .expect("serializing D1 write plan is infallible");
+        let plan_sha256 = sha256_hex(&plan_json);
         let plan = json!({
             "operation": "d1_execute_write",
             "account_id": account_id,
             "database_id": &args.database_id,
             "statement_kind": statement_kind,
             "sql_sha256": sha256_hex(args.sql.trim()),
+            "params_sha256": params_sha256,
+            "content_plan_sha256": content_plan_sha256,
+            "plan_sha256": plan_sha256,
             "dry_run": args.dry_run,
         });
         if args.dry_run {
@@ -4357,17 +4426,98 @@ impl CloudflareMcp {
                 },
             })));
         }
+        if args.approved_plan_sha256.as_deref() != Some(plan_sha256.as_str()) {
+            return Ok(invalid_argument_result(
+                "d1.execute_write_plan_mismatch",
+                "live D1 write requires the exact plan_sha256 returned by dry run",
+                "Repeat dry run and use its exact lowercase plan_sha256 with a fresh execution session.",
+            ));
+        }
+        let execution_session_sha256 = match args.execution_session_sha256.as_deref() {
+            Some(value) => value,
+            None => {
+                return Ok(invalid_argument_result(
+                    "d1.execute_write_session_required",
+                    "live D1 write requires an immutable execution_session_sha256",
+                    "Preallocate one fresh lowercase SHA-256 session identity and keep it fixed for this exact content plan.",
+                ));
+            }
+        };
+        let mut lease = match acquire_d1_target_lease(
+            account_id,
+            &args.database_id,
+            args.approved_plan_sha256.as_deref(),
+            D1TargetLeaseBinding {
+                writer: D1TargetWriter::GenericWrite,
+                execution_session_sha256,
+                content_plan_sha256: &content_plan_sha256,
+            },
+        ) {
+            Ok(D1TargetLeaseAcquisition::Acquired(lease)) => lease,
+            Ok(D1TargetLeaseAcquisition::ExactTerminalReplay(identity)) => {
+                return Ok(CallToolResult::structured(json!({
+                    "ok": true,
+                    "operation": "d1_execute_write",
+                    "status": "exact_terminal_replay",
+                    "provider_calls": 0,
+                    "provider_mutations": 0,
+                    "plan": plan,
+                    "lease": identity,
+                })));
+            }
+            Err(result) => return Ok(result),
+        };
+        if let Err(result) = lease.revalidate() {
+            return Ok(result);
+        }
         match self
             .cloudflare
-            .execute_d1_database_write(account_id, &args.database_id, &args.sql, &args.params)
+            .execute_d1_migration_manifest_write(
+                account_id,
+                &args.database_id,
+                &args.sql,
+                &args.params,
+            )
             .await
         {
-            Ok(result) => {
-                let (result, truncated) = limit_d1_result_rows(result, max_rows);
+            Ok(write) => {
+                if let Err(provider_evidence) = validate_d1_manifest_write_result(&write.result) {
+                    lease.retain();
+                    return Ok(CallToolResult::structured_error(json!({
+                        "ok": false,
+                        "operation": "d1_execute_write",
+                        "status": "reconciliation_required",
+                        "retry_decision": "do_not_retry_same_attempt",
+                        "lease_retained": true,
+                        "provider_calls": 1,
+                        "provider_mutations": 1,
+                        "plan": plan,
+                        "lease": lease.identity,
+                        "provider_lifecycle": write.lifecycle,
+                        "response_evidence": {
+                            "body_sha256": write.response_body_sha256,
+                            "body_size_bytes": write.response_body_size_bytes,
+                        },
+                        "provider_evidence": provider_evidence,
+                    })));
+                }
+                let (result, truncated) = limit_d1_result_rows(write.result, max_rows);
+                if let Err(result) = lease.release() {
+                    return Ok(result);
+                }
                 Ok(CallToolResult::structured(json!({
                     "ok": true,
                     "operation": "d1_execute_write",
+                    "status": "applied",
+                    "provider_calls": 1,
+                    "provider_mutations": 1,
                     "plan": plan,
+                    "lease": lease.identity,
+                    "provider_lifecycle": write.lifecycle,
+                    "response_evidence": {
+                        "body_sha256": write.response_body_sha256,
+                        "body_size_bytes": write.response_body_size_bytes,
+                    },
                     "policy": {
                         "d1_write_sql": true,
                         "allowed_statement_kinds": D1_WRITE_ALLOWED_KINDS,
@@ -4378,7 +4528,44 @@ impl CloudflareMcp {
                     "result": result,
                 })))
             }
-            Err(err) => Ok(adapter_error_result(err)),
+            Err(err) if err.lifecycle.dispatch_stage == "pre_dispatch" => {
+                if let Err(result) = lease.abort_before_dispatch() {
+                    return Ok(result);
+                }
+                Ok(CallToolResult::structured_error(json!({
+                    "ok": false,
+                    "operation": "d1_execute_write",
+                    "status": "not_dispatched",
+                    "lease_retained": false,
+                    "provider_calls": 0,
+                    "provider_mutations": 0,
+                    "plan": plan,
+                    "lease": lease.identity,
+                    "provider_lifecycle": err.lifecycle,
+                    "error": err.error,
+                })))
+            }
+            Err(err) => {
+                lease.retain();
+                Ok(CallToolResult::structured_error(json!({
+                    "ok": false,
+                    "operation": "d1_execute_write",
+                    "status": "reconciliation_required",
+                    "retry_decision": "do_not_retry_same_attempt",
+                    "lease_retained": true,
+                    "provider_calls": err.lifecycle.provider_calls(),
+                    "provider_mutations": err.lifecycle.provider_calls(),
+                    "plan": plan,
+                    "lease": lease.identity,
+                    "provider_lifecycle": err.lifecycle,
+                    "response_evidence": {
+                        "body_sha256": err.response_body_sha256,
+                        "body_size_bytes": err.response_body_size_bytes,
+                    },
+                    "provider_error": err.provider_error,
+                    "error": err.error,
+                })))
+            }
         }
     }
 
@@ -5018,6 +5205,22 @@ impl CloudflareMcp {
             Ok(manifest) => manifest,
             Err(result) => return Ok(result),
         };
+        if manifest
+            .iter()
+            .any(|entry| sql_mentions_import_admission(&entry.sql))
+        {
+            return Ok(CallToolResult::structured_error(json!({
+                "ok": false,
+                "operation": "d1_apply_migration_manifest",
+                "provider_calls": 0,
+                "provider_mutations": 0,
+                "error": {
+                    "code": "d1.import_admission_relation_reserved",
+                    "message": "migration manifests cannot create or mutate the import admission relation",
+                    "hint": "Provision the fixed admission schema through its owning application release; only d1_admit_import_attempt may write admission rows."
+                }
+            })));
+        }
         let execution_plan = match derive_d1_manifest_execution_plan(&manifest) {
             Ok(plan) => plan,
             Err(result) => return Ok(contextualize_d1_manifest_semantic_error(result, dry_run)),
@@ -13302,7 +13505,10 @@ fn normalize_d1_bootstrap_migrations_table(value: Option<&str>) -> Result<String
     }
     let table = normalize_d1_migrations_table(value)?;
     let lower = table.to_ascii_lowercase();
-    if lower.starts_with("sqlite_") || lower.starts_with("_cf_") {
+    if lower.starts_with("sqlite_")
+        || lower.starts_with("_cf_")
+        || lower == crate::d1_import_admission::D1_IMPORT_ADMISSION_TABLE
+    {
         return Err(invalid_argument_result(
             "d1.bootstrap_reserved_migrations_table",
             "bootstrap migrations_table must not use a SQLite or Cloudflare-reserved identifier family",
@@ -15578,6 +15784,7 @@ mod tests {
             "d1_get_database",
             "d1_inspect_schema",
             "d1_query_read_only",
+            "d1_read_import_admission",
             "d1_reconcile_migration_manifest",
         ] {
             assert!(allowed.iter().any(|candidate| candidate == tool), "{tool}");
@@ -15622,7 +15829,7 @@ mod tests {
         let server = test_server("http://127.0.0.1:9".to_string());
         let result = server
             .cloudflare_find_tools(Parameters(FindToolsArgs {
-                query: Some("d1 database".to_string()),
+                query: Some("d1".to_string()),
                 group: Some("d1".to_string()),
                 read_only: Some(false),
                 limit: Some(20),
@@ -15638,6 +15845,7 @@ mod tests {
             "d1_rename_database",
             "d1_delete_database",
             "d1_execute_write",
+            "d1_admit_import_attempt",
             "d1_apply_migration_manifest",
         ] {
             assert!(allowed.iter().any(|candidate| candidate == tool), "{tool}");

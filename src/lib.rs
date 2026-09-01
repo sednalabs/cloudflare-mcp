@@ -8,6 +8,7 @@ pub(crate) mod api_permissions;
 pub mod cache;
 pub mod cloudflare;
 pub mod config;
+pub(crate) mod d1_import_admission;
 pub(crate) mod d1_migration_additive;
 pub(crate) mod d1_migration_bootstrap;
 pub(crate) mod d1_migration_bootstrap_recovery;

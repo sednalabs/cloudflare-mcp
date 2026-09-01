@@ -71,6 +71,8 @@ Use curated D1 tools instead of generic API calls for database workflows:
 - `d1_validate_query`
 - `d1_query_read_only`
 - `d1_execute_write`
+- `d1_admit_import_attempt`
+- `d1_read_import_admission`
 - `d1_apply_migrations` (dry-run inspection only; live mutation is retired)
 - `d1_bootstrap_migration_ledger`
 - `d1_reconcile_bootstrap_migration_ledger`
@@ -89,6 +91,15 @@ directory-backed `d1_apply_migrations` tool refuses live mutation.
 The exact family `migration-ledger-bootstrap-v1` belongs only to the dedicated
 bootstrap apply/reconcile/finalize/abort lifecycle. All three generic manifest
 tools reject it before provider, custody, receipt, or namespace activity.
+
+Every live existing-target writer shares the permanent account/database target
+lease. `d1_execute_write` therefore requires the exact dry-run `plan_sha256`
+and a fresh immutable `execution_session_sha256`; a successful terminal replay
+never repeats provider SQL, while changed content under the same session is a
+conflict. `d1_admit_import_attempt` uses the same guard to persist one exact
+provider row binding the target, content plan, and execution session. The
+read-only admission tool is inspection only: import initialization must still
+perform a fresh exact admission read while holding that same target lease.
 
 Use `d1_bootstrap_migration_ledger` only before the first migration on a
 separately selected, genuinely empty D1 database. Its dry run binds the exact

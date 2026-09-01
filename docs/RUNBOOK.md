@@ -85,7 +85,7 @@ ledger to an existing application database, repair a partial initialization,
 or bypass `d1_apply_migration_manifest`.
 
 1. Configure `CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT` to the same trusted,
-   private Linux custody root used by manifest apply.
+   private Linux custody root used by every existing-target D1 writer.
 2. Call the bootstrap with `dry_run=true` and the exact account, database, and
    optional canonical ledger-table identifier. Confirm that the response
    reports two provider reads, zero mutations, `target_inventory.state=empty`,
@@ -205,6 +205,32 @@ created it. General manifest reconciliation remains a separate authority and
 cannot reconcile or retire bootstrap-family custody.
 
 ## Exact-byte D1 migration manifests
+
+### Shared D1 target mutation custody and import admission
+
+`CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT` retains its historical environment
+name, but its permanent account/database target directories now serialize all
+governed existing-target writes: exact-byte migrations, first-ledger bootstrap,
+generic `d1_execute_write`, and import admission/execution coordinators. Do not
+configure different roots for different MCP processes or writer classes.
+
+For a generic row write, dry run first. Live execution requires the returned
+`plan_sha256` plus one preallocated lowercase `execution_session_sha256`. The
+session is permanently bound to the exact SQL/parameter content plan. A
+successful response retires the lease and exact replay returns without provider
+SQL; changed content or approval under that session conflicts. Failure proven
+before dispatch creates durable abort evidence and permits a later reacquire.
+Any attempted provider request without exact success retains active evidence and
+requires reconciliation; never replay it automatically.
+
+`d1_admit_import_attempt` similarly previews an immutable request, then writes
+one provider-resident admission row under the same target guard. The admission
+schema is fixed and reserved from generic writes and migration manifests. Exact
+readback is required after write. A future SQL-file import coordinator must
+acquire the same target lease for its execution session and freshly re-read the
+exact admission immediately before initialization; a prior read, local marker,
+or approval digest is not initialization authority. Import transport, terminal
+recovery, and retained-custody reconciliation remain separate lifecycle gates.
 
 ### Private SQL artifact and upload boundary
 
