@@ -79,6 +79,10 @@ Use curated D1 tools instead of generic API calls for database workflows:
 - `d1_apply_migration_manifest`
 - `d1_reconcile_migration_manifest`
 - `d1_finalize_migration_reconciliation`
+- `d1_admit_sql_file_import_attempt`
+- `d1_read_sql_file_import_attempt_admission`
+- `d1_import_sql_file`
+- `d1_reconcile_sql_file_import`
 - `d1_rename_database`
 - `d1_delete_database`
 
@@ -86,6 +90,10 @@ Read/query tools use restricted SQL checks. Write and migration tools preserve
 dry-run discipline and fail closed on unsafe or ambiguous state. Use
 `d1_apply_migration_manifest` for every live migration; the legacy
 directory-backed `d1_apply_migrations` tool refuses live mutation.
+Large local SQL-file imports use the dedicated admit/import/reconcile lifecycle;
+the generic write and migration tools cannot mutate its reserved admission
+relation. Every process that can write the target must share the configured
+import custody root or remain outside this local serialization boundary.
 The exact family `migration-ledger-bootstrap-v1` belongs only to the dedicated
 bootstrap apply/reconcile/finalize/abort lifecycle. All three generic manifest
 tools reject it before provider, custody, receipt, or namespace activity.

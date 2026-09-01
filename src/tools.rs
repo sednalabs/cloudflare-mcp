@@ -74,6 +74,12 @@ use crate::d1_migration_terminal::{
     D1FinalizeMigrationReconciliationArgs, contextualize_terminal_semantic_error,
     finalize_d1_migration_reconciliation,
 };
+use crate::d1_sql_file_import::{
+    D1AdmitSqlFileImportAttemptArgs, D1ImportSqlFileArgs, D1ReadSqlFileImportAttemptAdmissionArgs,
+    D1ReconcileSqlFileImportArgs, admit_sql_file_import_attempt, import_sql_file,
+    preflight_import_target_custody, read_sql_file_import_attempt_admission,
+    reconcile_sql_file_import, sql_mentions_reserved_import_admission,
+};
 use crate::dns_route::{
     DnsRouteConflict, DnsRouteVerificationState, plan_dns_route_reconciliation, verify_dns_route,
 };
@@ -4323,6 +4329,54 @@ impl CloudflareMcp {
     }
 
     #[tool(
+        name = "d1_admit_sql_file_import_attempt",
+        description = "Dry-run and admit one exact local-file D1 import attempt under stable inventory and durable local handoff custody."
+    )]
+    async fn cloudflare_d1_admit_sql_file_import_attempt(
+        &self,
+        Parameters(args): Parameters<D1AdmitSqlFileImportAttemptArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        Ok(admit_sql_file_import_attempt(&self.cloudflare, account_id, &args).await)
+    }
+
+    #[tool(
+        name = "d1_read_sql_file_import_attempt_admission",
+        description = "Read back one exact D1 import admission binding without mutation."
+    )]
+    async fn cloudflare_d1_read_sql_file_import_attempt_admission(
+        &self,
+        Parameters(args): Parameters<D1ReadSqlFileImportAttemptAdmissionArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        Ok(read_sql_file_import_attempt_admission(&self.cloudflare, account_id, &args).await)
+    }
+
+    #[tool(
+        name = "d1_import_sql_file",
+        description = "Preview or execute one approved local SQL-file D1 import with durable custody and no automatic provider-mutation replay."
+    )]
+    async fn cloudflare_d1_import_sql_file(
+        &self,
+        Parameters(args): Parameters<D1ImportSqlFileArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        Ok(import_sql_file(&self.cloudflare, account_id, &args).await)
+    }
+
+    #[tool(
+        name = "d1_reconcile_sql_file_import",
+        description = "Resume only the safe poll stage of one retained D1 SQL-file import or read back its exact terminal receipt."
+    )]
+    async fn cloudflare_d1_reconcile_sql_file_import(
+        &self,
+        Parameters(args): Parameters<D1ReconcileSqlFileImportArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        Ok(reconcile_sql_file_import(&self.cloudflare, account_id, &args).await)
+    }
+
+    #[tool(
         name = "d1_execute_write",
         description = "Execute one audited D1 row-write SQL statement with dry-run safety. Allows INSERT, UPDATE, DELETE, or REPLACE only."
     )]
@@ -4331,6 +4385,18 @@ impl CloudflareMcp {
         Parameters(args): Parameters<D1ExecuteWriteArgs>,
     ) -> Result<CallToolResult, crate::McpError> {
         let account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        if sql_mentions_reserved_import_admission(&args.sql) {
+            return Ok(CallToolResult::structured_error(json!({
+                "ok": false,
+                "operation": "d1_execute_write",
+                "provider_calls": 0,
+                "error": {
+                    "code": "d1.import_admission_relation_reserved",
+                    "message": "the D1 import admission relation is reserved to the guarded import coordinator",
+                    "hint": "Use d1_admit_sql_file_import_attempt; generic D1 writes may not create or mutate import admission authority."
+                }
+            })));
+        }
         let statement_kind = match classify_d1_write_sql(&args.sql) {
             Ok(kind) => kind,
             Err(result) => return Ok(result),
@@ -4356,6 +4422,11 @@ impl CloudflareMcp {
                     "max_rows": max_rows,
                 },
             })));
+        }
+        if let Err(result) =
+            preflight_import_target_custody(account_id, &args.database_id, "d1_execute_write")
+        {
+            return Ok(result);
         }
         match self
             .cloudflare
@@ -4626,6 +4697,15 @@ impl CloudflareMcp {
             dry_run,
             approved_plan_sha256,
         };
+        if !dry_run
+            && let Err(result) = preflight_import_target_custody(
+                &input.account_id,
+                &input.database_id,
+                D1_BOOTSTRAP_OPERATION,
+            )
+        {
+            return Ok(zero_call_error(result));
+        }
         let mutation_target = d1_bootstrap_mutation_target(&input);
         let mutation_plan = d1_bootstrap_mutation_plan(&input);
         let mut audit = MutationAuditSession::start(
@@ -5018,6 +5098,30 @@ impl CloudflareMcp {
             Ok(manifest) => manifest,
             Err(result) => return Ok(result),
         };
+        if manifest
+            .iter()
+            .any(|entry| sql_mentions_reserved_import_admission(&entry.sql))
+        {
+            return Ok(CallToolResult::structured_error(json!({
+                "ok": false,
+                "operation": "d1_apply_migration_manifest",
+                "provider_calls": 0,
+                "error": {
+                    "code": "d1.import_admission_relation_reserved",
+                    "message": "migration manifests may not create or mutate the guarded D1 import admission relation",
+                    "hint": "Provision that fixed relation in the application schema; only d1_admit_sql_file_import_attempt may write its rows."
+                }
+            })));
+        }
+        if !dry_run
+            && let Err(result) = preflight_import_target_custody(
+                account_id,
+                database_id,
+                "d1_apply_migration_manifest",
+            )
+        {
+            return Ok(result);
+        }
         let execution_plan = match derive_d1_manifest_execution_plan(&manifest) {
             Ok(plan) => plan,
             Err(result) => return Ok(contextualize_d1_manifest_semantic_error(result, dry_run)),
@@ -13302,7 +13406,10 @@ fn normalize_d1_bootstrap_migrations_table(value: Option<&str>) -> Result<String
     }
     let table = normalize_d1_migrations_table(value)?;
     let lower = table.to_ascii_lowercase();
-    if lower.starts_with("sqlite_") || lower.starts_with("_cf_") {
+    if lower.starts_with("sqlite_")
+        || lower.starts_with("_cf_")
+        || lower == crate::d1_sql_file_import::D1_IMPORT_ADMISSION_TABLE
+    {
         return Err(invalid_argument_result(
             "d1.bootstrap_reserved_migrations_table",
             "bootstrap migrations_table must not use a SQLite or Cloudflare-reserved identifier family",

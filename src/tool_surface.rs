@@ -142,6 +142,18 @@ fn tool_capabilities() -> Vec<ToolCapability> {
         cap("d1_execute_write")
             .with_group("d1")
             .with_read_only(false),
+        cap("d1_admit_sql_file_import_attempt")
+            .with_group("d1")
+            .with_read_only(false),
+        cap("d1_read_sql_file_import_attempt_admission")
+            .with_group("d1")
+            .with_read_only(true),
+        cap("d1_import_sql_file")
+            .with_group("d1")
+            .with_read_only(false),
+        cap("d1_reconcile_sql_file_import")
+            .with_group("d1")
+            .with_read_only(true),
         cap("d1_apply_migrations")
             .with_group("d1")
             .with_read_only(true),

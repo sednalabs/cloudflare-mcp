@@ -340,6 +340,8 @@ impl McpStdioProcess {
         command
             .arg("--stdio")
             .env_remove("CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT")
+            .env_remove("CLOUDFLARE_MCP_D1_IMPORT_INPUT_ROOT")
+            .env_remove("CLOUDFLARE_MCP_D1_IMPORT_CUSTODY_ROOT")
             .env("RUST_LOG", "off")
             .env("CLOUDFLARE_MCP_AUTH_MODE", "off")
             .env("CLOUDFLARE_API_TOKEN", fixture_material("cf-api"))
@@ -723,7 +725,116 @@ fn spawn_fake_d1_migrations_api(
             stream.write_all(&response).expect("write response body");
         }
     });
-    (format!("http://{addr}"), requests)
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only fake provider
+}
+
+fn spawn_fake_d1_sql_import_api(expected_requests: usize) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake D1 import API"); // DevSkim: ignore DS162092 -- loopback-only fake provider
+    let addr = listener.local_addr().expect("fake D1 import address");
+    let base_url = format!("http://{addr}"); // DevSkim: ignore DS137138 -- loopback-only fake provider
+    let upload_url = format!("{base_url}/private-upload");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        let mut admission_row: Option<Vec<Value>> = None;
+        let mut upload_etag: Option<String> = None;
+        for stream in listener.incoming().take(expected_requests) {
+            let mut stream = stream.expect("fake D1 import stream");
+            let (headers, body) = read_http_request(&mut stream);
+            let request_line = headers.lines().next().unwrap_or_default();
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or_default();
+            let path = parts.next().unwrap_or_default();
+            requests_for_thread
+                .lock()
+                .expect("import request log")
+                .push(format!("{method} {path}"));
+            if method == "PUT" && path == "/private-upload" {
+                let etag = upload_etag.as_deref().expect("init supplied upload etag");
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nconnection: close\r\netag: \"{etag}\"\r\ncontent-length: 0\r\n\r\n"
+                )
+                .expect("write import upload response");
+                continue;
+            }
+            let response = if method == "GET" && path == "/accounts/acct-1/d1/database/db-1" {
+                json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": {"uuid": "db-1", "name": "fixture-import-db"}
+                })
+            } else if method == "POST" && path == "/accounts/acct-1/d1/database/db-1/query" {
+                let request: Value = serde_json::from_slice(&body).expect("D1 query body");
+                let sql = request["sql"].as_str().unwrap_or_default();
+                if sql.starts_with("SELECT request_sha256") {
+                    let rows = admission_row
+                        .as_ref()
+                        .map(|params| {
+                            vec![json!({
+                                "request_sha256": params[0],
+                                "target_key_sha256": params[1],
+                                "inventory_sha256": params[2],
+                                "import_plan_sha256": params[3],
+                                "execution_session_sha256": params[4],
+                            })]
+                        })
+                        .unwrap_or_default();
+                    json!({
+                        "success": true, "errors": [], "messages": [],
+                        "result": [{"success": true, "errors": [], "results": rows, "meta": {"served_by_primary": true}}]
+                    })
+                } else if sql.starts_with("INSERT INTO mcp_d1_import_attempt_admissions") {
+                    admission_row = Some(
+                        request["params"]
+                            .as_array()
+                            .expect("admission params")
+                            .clone(),
+                    );
+                    json!({
+                        "success": true, "errors": [], "messages": [],
+                        "result": [{"success": true, "errors": [], "results": [], "meta": {"served_by_primary": true, "changed_db": true, "changes": 1, "rows_written": 1}}]
+                    })
+                } else {
+                    panic!("unexpected import admission SQL: {sql}");
+                }
+            } else if method == "POST" && path == "/accounts/acct-1/d1/database/db-1/import" {
+                let request: Value = serde_json::from_slice(&body).expect("D1 import body");
+                match request["action"].as_str().expect("import action") {
+                    "init" => {
+                        upload_etag = request["etag"].as_str().map(str::to_string);
+                        json!({
+                            "success": true, "errors": [], "messages": [],
+                            "result": {"success": true, "type": "import", "filename": "fixture.sql", "upload_url": upload_url}
+                        })
+                    }
+                    "ingest" => json!({
+                        "success": true, "errors": [], "messages": [],
+                        "result": {"success": true, "type": "import", "at_bookmark": "bookmark-1"}
+                    }),
+                    "poll" => json!({
+                        "success": true, "errors": [], "messages": [],
+                        "result": {"success": true, "type": "import", "status": "complete", "at_bookmark": "bookmark-1", "result": {"final_bookmark": "bookmark-2", "num_queries": 1}}
+                    }),
+                    action => panic!("unexpected D1 import action: {action}"),
+                }
+            } else {
+                panic!("unexpected D1 import request: {method} {path}");
+            };
+            let response = serde_json::to_vec(&response).expect("serialize D1 import response");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                response.len()
+            )
+            .expect("write D1 import response headers");
+            stream
+                .write_all(&response)
+                .expect("write D1 import response body");
+        }
+    });
+    (base_url, requests)
 }
 
 fn is_manifest_ledger_authority_sql(sql: &str) -> bool {
@@ -18999,7 +19110,8 @@ fn api_mutate_denies_existing_target_d1_schema_mutations_before_request_construc
         assert_eq!(content["api_operation"]["risk"], json!("denied_by_default"));
         let expected_preferred_tool = match operation_id {
             "d1-query-database" | "d1-raw-database-query" => Some("d1_query_read_only"),
-            "d1-import-database" | "d1-time-travel-restore" => None,
+            "d1-import-database" => Some("d1_import_sql_file"),
+            "d1-time-travel-restore" => None,
             _ => unreachable!(),
         };
         assert_eq!(content["preferred_tool"], json!(expected_preferred_tool));
@@ -19037,6 +19149,10 @@ fn api_mutate_denies_existing_target_d1_schema_mutations_before_request_construc
     for expected in [
         "d1_query_read_only",
         "d1_execute_write",
+        "d1_admit_sql_file_import_attempt",
+        "d1_read_sql_file_import_attempt_admission",
+        "d1_import_sql_file",
+        "d1_reconcile_sql_file_import",
         "d1_bootstrap_migration_ledger",
         "d1_apply_migration_manifest",
         "d1_reconcile_migration_manifest",
@@ -19090,6 +19206,324 @@ fn api_mutate_denies_existing_target_d1_schema_mutations_before_request_construc
         "denied existing-target D1 operations and curated policy checks make zero provider connections"
     );
     mcp.terminate();
+}
+
+#[test]
+fn d1_sql_file_import_content_preview_reaches_stdio_without_provider_or_private_output() {
+    let provider = TcpListener::bind("127.0.0.1:0").expect("bind no-call import provider witness"); // DevSkim: ignore DS162092 -- loopback-only no-provider-call witness
+    provider
+        .set_nonblocking(true)
+        .expect("make import provider witness nonblocking");
+    let provider_url = format!(
+        // DevSkim: ignore DS137138 -- loopback-only no-provider-call witness
+        "http://{}",
+        provider
+            .local_addr()
+            .expect("import provider witness address")
+    );
+    let root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-sql-import-content-preview-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos()
+    ));
+    fs::create_dir(&root).expect("create import fixture root");
+    let input_root = root.join("input");
+    let custody_root = root.join("custody");
+    fs::create_dir_all(&input_root).expect("create import input root");
+    fs::create_dir(&custody_root).expect("create import custody root");
+    let input = input_root.join("candidate.sql");
+    let sql = "CREATE TABLE example(id INTEGER PRIMARY KEY);\n";
+    fs::write(&input, sql).expect("write private import fixture");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("secure root");
+        fs::set_permissions(&input_root, fs::Permissions::from_mode(0o700))
+            .expect("secure input root");
+        fs::set_permissions(&custody_root, fs::Permissions::from_mode(0o700))
+            .expect("secure custody root");
+        fs::set_permissions(&input, fs::Permissions::from_mode(0o600)).expect("secure input file");
+    }
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", provider_url),
+        (
+            "CLOUDFLARE_MCP_D1_IMPORT_INPUT_ROOT",
+            input_root.display().to_string(),
+        ),
+        (
+            "CLOUDFLARE_MCP_D1_IMPORT_CUSTODY_ROOT",
+            custody_root.display().to_string(),
+        ),
+    ]);
+    let response = mcp.call_tool(
+        27,
+        "d1_import_sql_file",
+        json!({
+            "account_id": "acct-1",
+            "database_id": "db-1",
+            "input_path": input.display().to_string(),
+            "dry_run": true
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(true), "{content}");
+    assert_eq!(
+        content["status"],
+        json!("content_plan_previewed"),
+        "{content}"
+    );
+    assert_eq!(content["provider_mutations"], json!(0), "{content}");
+    assert_eq!(
+        content["file_sha256"].as_str().map(str::len),
+        Some(64),
+        "{content}"
+    );
+    assert_eq!(
+        content["import_plan_sha256"].as_str().map(str::len),
+        Some(64),
+        "{content}"
+    );
+    let rendered = content.to_string();
+    assert!(
+        !rendered.contains(&input.display().to_string()),
+        "{content}"
+    );
+    assert!(!rendered.contains(sql.trim()), "{content}");
+    let generic = mcp.call_tool(
+        28,
+        "d1_execute_write",
+        json!({
+            "account_id": "acct-1",
+            "database_id": "db-1",
+            "sql": "INSERT INTO mcp_d1_import_attempt_admissions VALUES (1)",
+            "dry_run": true
+        }),
+    );
+    assert_eq!(
+        structured_content(&generic)["error"]["code"],
+        json!("d1.import_admission_relation_reserved")
+    );
+    let reserved_sql = "CREATE TABLE mcp_d1_import_attempt_admissions(request_sha256 TEXT PRIMARY KEY) WITHOUT ROWID;";
+    let manifest = mcp.call_tool(
+        29,
+        "d1_apply_migration_manifest",
+        json!({
+            "account_id": "acct-1",
+            "database_id": "db-1",
+            "migration_family": "fixture-family",
+            "manifest": [{
+                "name": "0001_reserved.sql",
+                "size_bytes": reserved_sql.len(),
+                "sql_sha256": sha256_hex(reserved_sql),
+                "sql": reserved_sql
+            }],
+            "dry_run": true
+        }),
+    );
+    assert_eq!(
+        structured_content(&manifest)["error"]["code"],
+        json!("d1.import_admission_relation_reserved")
+    );
+    let bootstrap = mcp.call_tool(
+        30,
+        "d1_bootstrap_migration_ledger",
+        json!({
+            "account_id": "acct-1",
+            "database_id": "db-1",
+            "migrations_table": "mcp_d1_import_attempt_admissions",
+            "dry_run": true
+        }),
+    );
+    assert_eq!(
+        structured_content(&bootstrap)["error"]["code"],
+        json!("d1.bootstrap_reserved_migrations_table")
+    );
+    assert!(
+        matches!(provider.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "content-only preview must make zero provider connections"
+    );
+    mcp.terminate();
+    fs::remove_dir_all(root).expect("remove import content-preview fixture");
+}
+
+#[test]
+fn d1_sql_file_import_live_stdio_converges_once_and_replays_from_terminal_custody() {
+    let (base_url, requests) = spawn_fake_d1_sql_import_api(12);
+    let root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-sql-import-live-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos()
+    ));
+    fs::create_dir(&root).expect("create live import root");
+    let input_root = root.join("input");
+    let custody_root = root.join("custody");
+    let migration_root = root.join("migration-custody");
+    for path in [&input_root, &custody_root, &migration_root] {
+        fs::create_dir(path).expect("create private import directory");
+    }
+    let input = input_root.join("candidate.sql");
+    fs::write(&input, "CREATE TABLE example(id INTEGER PRIMARY KEY);\n")
+        .expect("write live import fixture");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&root, &input_root, &custody_root, &migration_root] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .expect("secure live import directory");
+        }
+        fs::set_permissions(&input, fs::Permissions::from_mode(0o600))
+            .expect("secure live import input");
+    }
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_IMPORT_INPUT_ROOT",
+            input_root.display().to_string(),
+        ),
+        (
+            "CLOUDFLARE_MCP_D1_IMPORT_CUSTODY_ROOT",
+            custody_root.display().to_string(),
+        ),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            migration_root.display().to_string(),
+        ),
+    ]);
+    let import_plan = "c".repeat(64);
+    let execution_session = "d".repeat(64);
+    let admission_preview = mcp.call_tool(
+        31,
+        "d1_admit_sql_file_import_attempt",
+        json!({
+            "account_id": "acct-1", "database_id": "db-1",
+            "import_plan_sha256": import_plan,
+            "execution_session_sha256": execution_session,
+            "dry_run": true
+        }),
+    );
+    let admission_preview = structured_content(&admission_preview).clone();
+    assert_eq!(admission_preview["status"], json!("previewed"));
+    let request_sha256 = admission_preview["request_sha256"]
+        .as_str()
+        .expect("request digest")
+        .to_string();
+    let inventory_sha256 = admission_preview["inventory_sha256"]
+        .as_str()
+        .expect("inventory digest")
+        .to_string();
+    let admission = mcp.call_tool(
+        32,
+        "d1_admit_sql_file_import_attempt",
+        json!({
+            "account_id": "acct-1", "database_id": "db-1",
+            "import_plan_sha256": import_plan,
+            "execution_session_sha256": execution_session,
+            "inventory_sha256": inventory_sha256,
+            "approved_request_sha256": request_sha256,
+            "dry_run": false
+        }),
+    );
+    let admission = structured_content(&admission);
+    assert_eq!(admission["ok"], json!(true), "{admission}");
+    assert_eq!(admission["status"], json!("admitted"), "{admission}");
+    let readback = mcp.call_tool(
+        33,
+        "d1_read_sql_file_import_attempt_admission",
+        json!({
+            "account_id": "acct-1", "database_id": "db-1",
+            "request_sha256": request_sha256,
+            "inventory_sha256": inventory_sha256,
+            "import_plan_sha256": import_plan,
+            "execution_session_sha256": execution_session
+        }),
+    );
+    assert_eq!(
+        structured_content(&readback)["status"],
+        json!("admitted_exact")
+    );
+    let content_preview = mcp.call_tool(
+        34,
+        "d1_import_sql_file",
+        json!({
+            "account_id": "acct-1", "database_id": "db-1",
+            "input_path": input.display().to_string(), "dry_run": true
+        }),
+    );
+    assert_eq!(
+        structured_content(&content_preview)["status"],
+        json!("content_plan_previewed")
+    );
+    let bound_preview = mcp.call_tool(
+        35,
+        "d1_import_sql_file",
+        json!({
+            "account_id": "acct-1", "database_id": "db-1",
+            "input_path": input.display().to_string(), "dry_run": true,
+            "admission_request_sha256": request_sha256,
+            "inventory_sha256": inventory_sha256,
+            "import_plan_sha256": import_plan,
+            "execution_session_sha256": execution_session
+        }),
+    );
+    let bound_preview = structured_content(&bound_preview).clone();
+    assert_eq!(bound_preview["status"], json!("previewed"));
+    let plan_sha256 = bound_preview["plan_sha256"]
+        .as_str()
+        .expect("execution plan digest")
+        .to_string();
+    let live = mcp.call_tool(
+        36,
+        "d1_import_sql_file",
+        json!({
+            "account_id": "acct-1", "database_id": "db-1",
+            "input_path": input.display().to_string(), "dry_run": false,
+            "approved_plan_sha256": plan_sha256,
+            "admission_request_sha256": request_sha256,
+            "inventory_sha256": inventory_sha256,
+            "import_plan_sha256": import_plan,
+            "execution_session_sha256": execution_session
+        }),
+    );
+    let live = structured_content(&live);
+    assert_eq!(live["ok"], json!(true), "{live}");
+    assert_eq!(live["status"], json!("complete"), "{live}");
+    assert_eq!(live["exact_replay"], json!(false), "{live}");
+    let rendered_live = live.to_string();
+    for forbidden in [
+        input.display().to_string(),
+        "CREATE TABLE example".to_string(),
+        "fixture.sql".to_string(),
+        "private-upload".to_string(),
+    ] {
+        assert!(!rendered_live.contains(&forbidden), "{live}");
+    }
+    let requests_after_live = requests.lock().expect("import request log").len();
+    assert_eq!(requests_after_live, 12);
+    let replay = mcp.call_tool(
+        37,
+        "d1_reconcile_sql_file_import",
+        json!({
+            "account_id": "acct-1", "database_id": "db-1",
+            "approved_plan_sha256": plan_sha256
+        }),
+    );
+    let replay = structured_content(&replay);
+    assert_eq!(replay["status"], json!("complete"), "{replay}");
+    assert_eq!(replay["exact_replay"], json!(true), "{replay}");
+    assert_eq!(replay["provider_calls"], json!(0), "{replay}");
+    assert_eq!(
+        requests.lock().expect("import request log").len(),
+        requests_after_live,
+        "terminal replay must not call the provider"
+    );
+    mcp.terminate();
+    fs::remove_dir_all(root).expect("remove live import fixture");
 }
 
 #[test]

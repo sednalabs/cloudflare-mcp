@@ -171,6 +171,15 @@ Preserved curated tool families:
   read-only reconcilable under the unchanged assertion grammars and cannot
   authorize fresh execution. Identity-only manifests preserve the predecessor
   version-1 plan digest.
+- Guarded SQL-file import is a four-tool contract:
+  `d1_admit_sql_file_import_attempt`,
+  `d1_read_sql_file_import_attempt_admission`, `d1_import_sql_file`, and
+  `d1_reconcile_sql_file_import`. Preserve its exact dry-run/admission/import
+  binding, content-free receipts, handoff-before-provider custody, active-before-
+  handoff-retirement transition, fixed admission-relation reservation, and
+  ambiguity-to-reconciliation behavior in the schema snapshot and real stdio
+  tests. The current reconciliation contract resumes only the already-ingested
+  poll stage; earlier stage recovery remains separately governed.
   `schema_create_objects_additive_v1` is the separate closed additive
   assertion: it retains the extended CREATE proof, adds one bounded unqualified
   ADD COLUMN transition and semantic `PRAGMA foreign_keys = ON` intent per

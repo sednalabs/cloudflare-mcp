@@ -1516,6 +1516,55 @@
       "name": "d1_abort_bootstrap_migration_ledger"
     },
     {
+      "description": "Dry-run and admit one exact local-file D1 import attempt under stable inventory and durable local handoff custody.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "approved_request_sha256": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "database_id": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "execution_session_sha256": {
+            "type": "string"
+          },
+          "import_plan_sha256": {
+            "type": "string"
+          },
+          "inventory_sha256": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "database_id",
+          "import_plan_sha256",
+          "execution_session_sha256"
+        ],
+        "type": "object"
+      },
+      "name": "d1_admit_sql_file_import_attempt"
+    },
+    {
       "description": "Apply a caller-supplied exact-byte D1 migration manifest under a target lease and approved dry-run plan.",
       "inputSchema": {
         "$defs": {
@@ -2219,6 +2268,72 @@
       "name": "d1_get_database"
     },
     {
+      "description": "Preview or execute one approved local SQL-file D1 import with durable custody and no automatic provider-mutation replay.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "admission_request_sha256": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "approved_plan_sha256": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "database_id": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          },
+          "execution_session_sha256": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "import_plan_sha256": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "input_path": {
+            "type": "string"
+          },
+          "inventory_sha256": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "database_id",
+          "input_path"
+        ],
+        "type": "object"
+      },
+      "name": "d1_import_sql_file"
+    },
+    {
       "description": "Inspect D1 application tables, indexes, views, and columns using read-only SQLite catalog queries; supports targeted include filters and skips Cloudflare internal _cf_* objects.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2341,6 +2456,45 @@
         "type": "object"
       },
       "name": "d1_query_read_only"
+    },
+    {
+      "description": "Read back one exact D1 import admission binding without mutation.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "database_id": {
+            "type": "string"
+          },
+          "execution_session_sha256": {
+            "type": "string"
+          },
+          "import_plan_sha256": {
+            "type": "string"
+          },
+          "inventory_sha256": {
+            "type": "string"
+          },
+          "request_sha256": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "database_id",
+          "request_sha256",
+          "inventory_sha256",
+          "import_plan_sha256",
+          "execution_session_sha256"
+        ],
+        "type": "object"
+      },
+      "name": "d1_read_sql_file_import_attempt_admission"
     },
     {
       "description": "Read-only reconciliation of one exact retained migration-ledger bootstrap against two stable primary canonical empty-ledger proof windows.",
@@ -2671,6 +2825,33 @@
         "type": "object"
       },
       "name": "d1_reconcile_migration_manifest"
+    },
+    {
+      "description": "Resume only the safe poll stage of one retained D1 SQL-file import or read back its exact terminal receipt.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "approved_plan_sha256": {
+            "type": "string"
+          },
+          "database_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "database_id",
+          "approved_plan_sha256"
+        ],
+        "type": "object"
+      },
+      "name": "d1_reconcile_sql_file_import"
     },
     {
       "description": "Rename a Cloudflare D1 database through the curated partial-update endpoint. Supports dry-run planning.",
