@@ -964,9 +964,9 @@ impl CloudflareClient {
                 .host_str()
                 .is_some_and(|host| host.ends_with(".r2.cloudflarestorage.com"));
         let test_url = url.scheme() == "http"
-            && matches!(url.host_str(), Some("127.0.0.1") | Some("localhost"))
-            && (self.cfg.api_base_url.starts_with("http://127.0.0.1")
-                || self.cfg.api_base_url.starts_with("http://localhost"));
+            && matches!(url.host_str(), Some("127.0.0.1") | Some("localhost")) // DevSkim: ignore DS162092 -- loopback is permitted only when the configured API base is also loopback
+            && (self.cfg.api_base_url.starts_with("http://127.0.0.1") // DevSkim: ignore DS162092 -- loopback-only fake-provider contract test
+                || self.cfg.api_base_url.starts_with("http://localhost")); // DevSkim: ignore DS162092 -- loopback-only fake-provider contract test
         if !production_url && !test_url {
             return Err(AdapterError::new(
                 "cloudflare.d1.import_upload_url_untrusted",

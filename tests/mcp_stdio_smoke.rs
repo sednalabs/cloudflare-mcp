@@ -725,13 +725,13 @@ fn spawn_fake_d1_migrations_api(
             stream.write_all(&response).expect("write response body");
         }
     });
-    (format!("http://{addr}"), requests)
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only fake provider
 }
 
 fn spawn_fake_d1_sql_import_api(expected_requests: usize) -> (String, Arc<Mutex<Vec<String>>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake D1 import API");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake D1 import API"); // DevSkim: ignore DS162092 -- loopback-only fake provider
     let addr = listener.local_addr().expect("fake D1 import address");
-    let base_url = format!("http://{addr}");
+    let base_url = format!("http://{addr}"); // DevSkim: ignore DS137138 -- loopback-only fake provider
     let upload_url = format!("{base_url}/private-upload");
     let requests = Arc::new(Mutex::new(Vec::new()));
     let requests_for_thread = requests.clone();
@@ -19210,11 +19210,12 @@ fn api_mutate_denies_existing_target_d1_schema_mutations_before_request_construc
 
 #[test]
 fn d1_sql_file_import_content_preview_reaches_stdio_without_provider_or_private_output() {
-    let provider = TcpListener::bind("127.0.0.1:0").expect("bind no-call import provider witness");
+    let provider = TcpListener::bind("127.0.0.1:0").expect("bind no-call import provider witness"); // DevSkim: ignore DS162092 -- loopback-only no-provider-call witness
     provider
         .set_nonblocking(true)
         .expect("make import provider witness nonblocking");
     let provider_url = format!(
+        // DevSkim: ignore DS137138 -- loopback-only no-provider-call witness
         "http://{}",
         provider
             .local_addr()

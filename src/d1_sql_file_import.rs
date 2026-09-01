@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use md5::Md5;
+use md5::Md5; // DevSkim: ignore DS126858 -- Cloudflare D1 import requires MD5 only as its transport ETag; SHA-256 binds approval and custody
 use rmcp::model::CallToolResult;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -95,7 +95,7 @@ struct ActiveImport {
     import_plan_sha256: String,
     execution_session_sha256: String,
     file_sha256: String,
-    file_md5: String,
+    protocol_etag: String,
     content_plan_sha256: String,
     execution_plan_sha256: String,
     stage: ImportStage,
@@ -132,7 +132,7 @@ struct TerminalImport {
 struct ImportFile {
     bytes: Vec<u8>,
     sha256: String,
-    md5: String,
+    protocol_etag: String,
 }
 
 struct CustodyGuard {
@@ -530,7 +530,7 @@ pub(crate) async fn import_sql_file(
         import_plan_sha256: handoff.import_plan_sha256.clone(),
         execution_session_sha256: handoff.execution_session_sha256.clone(),
         file_sha256: file.sha256.clone(),
-        file_md5: file.md5.clone(),
+        protocol_etag: file.protocol_etag.clone(),
         content_plan_sha256: content_plan.clone(),
         execution_plan_sha256: plan_sha256.clone(),
         stage: ImportStage::BeforeInit,
@@ -551,7 +551,7 @@ pub(crate) async fn import_sql_file(
         return result;
     }
     let init = match client
-        .begin_d1_sql_import(account_id, &args.database_id, &file.md5)
+        .begin_d1_sql_import(account_id, &args.database_id, &file.protocol_etag)
         .await
     {
         Ok(value) => value,
@@ -582,10 +582,10 @@ pub(crate) async fn import_sql_file(
             );
         }
     };
-    if uploaded_etag != file.md5 {
+    if uploaded_etag != file.protocol_etag {
         return reconciliation_required(
             "d1.import_upload_etag_mismatch",
-            "D1 import upload ETag does not match the source MD5",
+            "D1 import upload ETag does not match the source protocol checksum",
             2,
         );
     }
@@ -594,7 +594,12 @@ pub(crate) async fn import_sql_file(
         return result;
     }
     let ingest = match client
-        .ingest_d1_sql_import(account_id, &args.database_id, &file.md5, &filename)
+        .ingest_d1_sql_import(
+            account_id,
+            &args.database_id,
+            &file.protocol_etag,
+            &filename,
+        )
         .await
     {
         Ok(value) => value,
@@ -1139,8 +1144,12 @@ fn inspect_import_file(input_path: &str) -> Result<ImportFile, CallToolResult> {
         ));
     }
     let sha256 = sha256_bytes(&bytes);
-    let md5 = format!("{:x}", Md5::digest(&bytes));
-    Ok(ImportFile { bytes, sha256, md5 })
+    let protocol_etag = format!("{:x}", Md5::digest(&bytes)); // DevSkim: ignore DS126858 -- required Cloudflare transport ETag, never authority or a security digest
+    Ok(ImportFile {
+        bytes,
+        sha256,
+        protocol_etag,
+    })
 }
 
 fn open_custody(account_id: &str, database_id: &str) -> Result<CustodyGuard, CallToolResult> {
