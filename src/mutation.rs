@@ -21,6 +21,14 @@ const MAX_ERROR_CODE_CHARS: usize = 80;
 
 static CORRELATION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_AUDIT_FINALIZATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MutationAuditFinalizeError;
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct MutationPlanStep {
     pub ordinal: u8,
@@ -171,9 +179,34 @@ impl MutationAuditSession {
         }
     }
 
+    /// Build the complete audit record before an external-effect owner retires
+    /// its ambiguity custody. The production projection is typed and
+    /// in-memory; the fallible boundary lets callers preserve custody if a
+    /// future audit sink or serializer can no longer complete.
+    pub(crate) fn finish_checked(
+        &self,
+        outcome: &'static str,
+        error_code: Option<&str>,
+    ) -> Result<MutationAuditRecord, MutationAuditFinalizeError> {
+        #[cfg(test)]
+        if FAIL_NEXT_AUDIT_FINALIZATION.with(|fail| fail.replace(false)) {
+            return Err(MutationAuditFinalizeError);
+        }
+        Ok(self.clone().finish(outcome, error_code))
+    }
+
+    pub(crate) fn correlation(&self) -> &MutationAuditCorrelation {
+        &self.correlation
+    }
+
     pub fn set_target(&mut self, target: Value) {
         self.target = target;
     }
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_mutation_audit_finalization_for_test() {
+    FAIL_NEXT_AUDIT_FINALIZATION.with(|fail| fail.set(true));
 }
 
 pub fn emit_mutation_audit_log(record: &MutationAuditRecord) {
@@ -602,7 +635,10 @@ mod tests {
     use mcp_toolkit_auth::AuthContext;
     use serde_json::json;
 
-    use super::{MutationApprovalAudit, MutationAuditSession, plan_apply_access_allowlist};
+    use super::{
+        MutationApprovalAudit, MutationAuditSession,
+        fail_next_mutation_audit_finalization_for_test, plan_apply_access_allowlist,
+    };
     use crate::policy::AllowlistMutationMode;
 
     fn test_parts() -> Parts {
@@ -697,5 +733,24 @@ mod tests {
         assert_eq!(approval.request_digest, "expected-digest-value");
         assert!(approval.client_supports_elicitation);
         assert!(!approval.fail_open_unsupported_client);
+    }
+
+    #[test]
+    fn checked_audit_finalization_exposes_a_fail_closed_boundary() {
+        let session = MutationAuditSession::start(
+            None,
+            "d1_execute_write",
+            json!({"target_key_sha256": "a".repeat(64)}),
+            false,
+        );
+        fail_next_mutation_audit_finalization_for_test();
+        assert!(
+            session.finish_checked("success", None).is_err(),
+            "a caller can retain provider-attempt custody instead of retiring it without audit"
+        );
+        assert!(
+            session.finish_checked("success", None).is_ok(),
+            "the deterministic test fault is one-shot"
+        );
     }
 }

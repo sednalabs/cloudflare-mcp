@@ -177,6 +177,12 @@ pub(crate) struct D1MigrationLeaseIdentity {
     pub(crate) payload_sha256: String,
 }
 
+#[derive(Debug)]
+pub(crate) enum D1ExecuteWriteLeaseAcquisition {
+    Acquired(D1MigrationLease),
+    ExactTerminalReplay(D1MigrationLeaseIdentity),
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct D1RetainedMigrationLeaseIdentity {
     pub(crate) target_key_sha256: String,
@@ -378,6 +384,19 @@ impl D1MigrationLease {
         }
     }
 
+    /// Retire an attempt that provably stopped before provider dispatch.
+    /// Aborted evidence remains durable but never authorizes terminal replay.
+    pub(crate) fn abort_before_dispatch(&mut self) -> Result<(), CallToolResult> {
+        #[cfg(target_os = "linux")]
+        {
+            self.retire_linux("aborted-create")
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(d1_lease_platform_unsupported())
+        }
+    }
+
     /// Preserve active evidence on every uncertain outcome.
     pub(crate) fn retain(&mut self) {
         #[cfg(target_os = "linux")]
@@ -474,6 +493,11 @@ impl D1MigrationLease {
 
     #[cfg(target_os = "linux")]
     fn release_linux(&mut self) -> Result<(), CallToolResult> {
+        self.retire_linux("retired")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn retire_linux(&mut self, terminal_prefix: &'static str) -> Result<(), CallToolResult> {
         if self.released {
             return Ok(());
         }
@@ -529,7 +553,7 @@ impl D1MigrationLease {
             }));
         }
 
-        let retired_name = format!("retired.{}.lease.json", self.identity.nonce);
+        let retired_name = format!("{terminal_prefix}.{}.lease.json", self.identity.nonce);
         rename_owned_lease_no_replace(
             &self.target,
             RETIRING_LEASE_NAME,
@@ -1649,6 +1673,67 @@ pub(crate) fn acquire_d1_migration_lease(
         family,
         plan_sha256,
     )
+}
+
+const D1_EXECUTE_WRITE_LEASE_FAMILY_PREFIX: &str = "d1-execute-write-v1:";
+
+pub(crate) fn acquire_d1_execute_write_lease(
+    account_id: &str,
+    database_id: &str,
+    approved_plan_sha256: &str,
+    execution_session_sha256: &str,
+) -> Result<D1ExecuteWriteLeaseAcquisition, CallToolResult> {
+    let target = normalize_d1_target(account_id, database_id)?;
+    for (name, value) in [
+        ("approved_plan_sha256", approved_plan_sha256),
+        ("execution_session_sha256", execution_session_sha256),
+    ] {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(invalid_argument_result(
+                "d1.execute_write_custody_identity_invalid",
+                &format!("{name} must be an exact lowercase SHA-256 digest"),
+                "Use the execution session and plan digest from the matching dry-run request.",
+            ));
+        }
+    }
+    let root = std::env::var(D1_MANIFEST_LEASE_ROOT_ENV)
+        .ok()
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| {
+            CallToolResult::structured_error(json!({
+                "ok": false,
+                "operation": "d1_execute_write",
+                "status": "blocked",
+                "lease_retained": null,
+                "provider_calls": 0,
+                "provider_mutations": 0,
+                "error": {
+                    "code": "d1.execute_write_lease_root_unconfigured",
+                    "message": "live D1 write requires the configured operator-owned shared lease root",
+                    "hint": format!("Set {D1_MANIFEST_LEASE_ROOT_ENV} to the activated private root shared by every MCP process that can write this D1 target.")
+                }
+            }))
+        })?;
+    #[cfg(target_os = "linux")]
+    {
+        linux::acquire_d1_execute_write_lease_at_linux(
+            root,
+            &target.account_id,
+            &target.database_id,
+            approved_plan_sha256,
+            execution_session_sha256,
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = root;
+        Err(d1_lease_platform_unsupported())
+    }
 }
 
 pub(crate) fn acquire_d1_target_mutation_guard(
@@ -4328,6 +4413,140 @@ mod linux {
         family: &str,
         plan_sha256: &str,
     ) -> Result<D1MigrationLease, CallToolResult> {
+        match acquire_d1_lease_at_linux(
+            root_path,
+            account_id,
+            database_id,
+            family,
+            plan_sha256,
+            None,
+        )? {
+            D1ExecuteWriteLeaseAcquisition::Acquired(lease) => Ok(lease),
+            D1ExecuteWriteLeaseAcquisition::ExactTerminalReplay(_) => {
+                unreachable!("migration acquisitions do not request DML replay classification")
+            }
+        }
+    }
+
+    fn d1_execute_write_session_error(
+        code: &'static str,
+        message: &'static str,
+        target_key_sha256: &str,
+    ) -> CallToolResult {
+        CallToolResult::structured_error(json!({
+            "ok": false,
+            "operation": "d1_execute_write",
+            "status": "reconciliation_required",
+            "retry_decision": "do_not_retry_same_attempt",
+            "lease_retained": true,
+            "provider_calls": 0,
+            "provider_mutations": 0,
+            "lease": {"target_key_sha256": target_key_sha256},
+            "error": {
+                "code": code,
+                "message": message,
+                "hint": "Preserve the target custody directory and reconcile the exact DML session before another write."
+            }
+        }))
+    }
+
+    fn classify_terminal_d1_execute_write_session(
+        target: &fs::File,
+        target_key_sha256: &str,
+        expected_family: &str,
+        approved_plan_sha256: &str,
+    ) -> Result<Option<D1MigrationLeaseIdentity>, CallToolResult> {
+        let mut exact = None;
+        for raw_name in directory_entry_names(target).map_err(|_| {
+            d1_execute_write_session_error(
+                "d1.execute_write_custody_unreadable",
+                "the target custody namespace could not be enumerated for DML replay",
+                target_key_sha256,
+            )
+        })? {
+            let Ok(name) = String::from_utf8(raw_name) else {
+                return Err(d1_execute_write_session_error(
+                    "d1.execute_write_custody_malformed",
+                    "the target custody namespace contains a non-UTF-8 entry",
+                    target_key_sha256,
+                ));
+            };
+            let Some(nonce) = retained_nonce_from_name(&name, "retired.", ".lease.json") else {
+                continue;
+            };
+            let (_, _, bytes) = open_retained_named_lease(target, &name).map_err(|message| {
+                d1_execute_write_session_error(
+                    "d1.execute_write_custody_unreadable",
+                    message,
+                    target_key_sha256,
+                )
+            })?;
+            let payload = parse_retained_lease_payload(&bytes).map_err(|message| {
+                d1_execute_write_session_error(
+                    "d1.execute_write_custody_malformed",
+                    message,
+                    target_key_sha256,
+                )
+            })?;
+            if payload.target_key_sha256 != target_key_sha256 || payload.nonce != nonce {
+                return Err(d1_execute_write_session_error(
+                    "d1.execute_write_custody_conflict",
+                    "retired DML evidence contradicts its target or filename identity",
+                    target_key_sha256,
+                ));
+            }
+            if payload.migration_family != expected_family {
+                continue;
+            }
+            if payload.approved_plan_sha256 != approved_plan_sha256 {
+                return Err(d1_execute_write_session_error(
+                    "d1.execute_write_session_conflict",
+                    "the execution session already completed with a different exact-byte plan",
+                    target_key_sha256,
+                ));
+            }
+            let identity = D1MigrationLeaseIdentity {
+                target_key_sha256: payload.target_key_sha256,
+                nonce: payload.nonce,
+                payload_sha256: sha256_bytes_hex(&bytes),
+            };
+            if exact.replace(identity).is_some() {
+                return Err(d1_execute_write_session_error(
+                    "d1.execute_write_duplicate_terminal_evidence",
+                    "more than one terminal receipt claims the same DML execution session",
+                    target_key_sha256,
+                ));
+            }
+        }
+        Ok(exact)
+    }
+
+    pub(super) fn acquire_d1_execute_write_lease_at_linux(
+        root_path: PathBuf,
+        account_id: &str,
+        database_id: &str,
+        plan_sha256: &str,
+        execution_session_sha256: &str,
+    ) -> Result<D1ExecuteWriteLeaseAcquisition, CallToolResult> {
+        let family = format!("{D1_EXECUTE_WRITE_LEASE_FAMILY_PREFIX}{execution_session_sha256}");
+        acquire_d1_lease_at_linux(
+            root_path,
+            account_id,
+            database_id,
+            &family,
+            plan_sha256,
+            Some(execution_session_sha256),
+        )
+    }
+
+    fn acquire_d1_lease_at_linux(
+        root_path: PathBuf,
+        account_id: &str,
+        database_id: &str,
+        family: &str,
+        plan_sha256: &str,
+        replay_session_sha256: Option<&str>,
+    ) -> Result<D1ExecuteWriteLeaseAcquisition, CallToolResult> {
         validate_root_and_ancestors(&root_path)
             .map_err(|message| d1_lease_root_error("d1.migration_lease_root_unsafe", message))?;
         let root_name = c_string_path(&root_path)
@@ -4391,6 +4610,44 @@ mod linux {
         )
         .map_err(|message| d1_lease_root_error("d1.migration_lease_custody_changed", message))?;
         maybe_pause_after_guard_for_test(&root_path);
+        if replay_session_sha256.is_some() {
+            for (name, message) in [
+                (
+                    ACTIVE_LEASE_NAME,
+                    "active retained D1 mutation evidence blocks replay classification",
+                ),
+                (
+                    RETIRING_LEASE_NAME,
+                    "retiring retained D1 mutation evidence blocks replay classification",
+                ),
+            ] {
+                match entry_present(&target, name) {
+                    Ok(true) => {
+                        return Err(d1_execute_write_session_error(
+                            "d1.execute_write_retained_evidence_present",
+                            message,
+                            &target_hash,
+                        ));
+                    }
+                    Ok(false) => {}
+                    Err(message) => {
+                        return Err(d1_execute_write_session_error(
+                            "d1.execute_write_custody_changed",
+                            message,
+                            &target_hash,
+                        ));
+                    }
+                }
+            }
+            if let Some(replay) = classify_terminal_d1_execute_write_session(
+                &target,
+                &target_hash,
+                family,
+                plan_sha256,
+            )? {
+                return Ok(D1ExecuteWriteLeaseAcquisition::ExactTerminalReplay(replay));
+            }
+        }
         let nonce = d1_migration_lease_nonce(&target_hash, plan_sha256);
         let bootstrap_initializer_dispatch_protocol = family == "migration-ledger-bootstrap-v1";
         let mut payload = json!({"version": 2, "target_key_sha256": &target_hash, "nonce": &nonce, "approved_plan_sha256": plan_sha256, "migration_family": family, "created_at_unix_ms": now_unix_ms()});
@@ -4418,6 +4675,7 @@ mod linux {
             &encoded,
             bootstrap_initializer_dispatch_protocol,
         )
+        .map(D1ExecuteWriteLeaseAcquisition::Acquired)
     }
 
     pub(super) fn sync_d1_lease_directory(directory: &fs::File) -> io::Result<()> {
@@ -4763,6 +5021,111 @@ mod tests {
         linux::ensure_target_identity_activation(&root_file, &target_key_sha256)
             .expect("activate canonical target identity for existing custody tests");
         root
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn d1_execute_write_session_replays_only_the_exact_retired_plan() {
+        let root = private_test_root("dml-exact-replay");
+        let account_id = "acct-1";
+        let database_id = "123e4567-e89b-42d3-a456-426614174000";
+        let plan = "a".repeat(64);
+        let session = "b".repeat(64);
+        let mut owner = match linux::acquire_d1_execute_write_lease_at_linux(
+            root.clone(),
+            account_id,
+            database_id,
+            &plan,
+            &session,
+        )
+        .expect("first DML attempt")
+        {
+            D1ExecuteWriteLeaseAcquisition::Acquired(owner) => owner,
+            D1ExecuteWriteLeaseAcquisition::ExactTerminalReplay(_) => {
+                panic!("first DML attempt cannot be a replay")
+            }
+        };
+        let identity = owner.identity.clone();
+        owner.release().expect("terminal retirement");
+        drop(owner);
+
+        let replay = linux::acquire_d1_execute_write_lease_at_linux(
+            root.clone(),
+            account_id,
+            database_id,
+            &plan,
+            &session,
+        )
+        .expect("exact terminal replay");
+        match replay {
+            D1ExecuteWriteLeaseAcquisition::ExactTerminalReplay(replay_identity) => {
+                assert_eq!(replay_identity.nonce, identity.nonce);
+                assert_eq!(replay_identity.payload_sha256, identity.payload_sha256);
+            }
+            D1ExecuteWriteLeaseAcquisition::Acquired(_) => {
+                panic!("exact terminal replay must not acquire another attempt")
+            }
+        }
+
+        let conflict = linux::acquire_d1_execute_write_lease_at_linux(
+            root.clone(),
+            account_id,
+            database_id,
+            &"c".repeat(64),
+            &session,
+        )
+        .expect_err("changed plan must conflict with the completed session")
+        .structured_content
+        .expect("structured plan conflict");
+        assert_eq!(
+            conflict["error"]["code"],
+            json!("d1.execute_write_session_conflict")
+        );
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn d1_execute_write_predispatch_abort_does_not_claim_terminal_replay() {
+        let root = private_test_root("dml-predispatch-abort");
+        let account_id = "acct-1";
+        let database_id = "123e4567-e89b-42d3-a456-426614174000";
+        let plan = "d".repeat(64);
+        let session = "e".repeat(64);
+        let mut owner = match linux::acquire_d1_execute_write_lease_at_linux(
+            root.clone(),
+            account_id,
+            database_id,
+            &plan,
+            &session,
+        )
+        .expect("first DML attempt")
+        {
+            D1ExecuteWriteLeaseAcquisition::Acquired(owner) => owner,
+            D1ExecuteWriteLeaseAcquisition::ExactTerminalReplay(_) => unreachable!(),
+        };
+        owner
+            .abort_before_dispatch()
+            .expect("durable pre-dispatch abort");
+        drop(owner);
+
+        let second = linux::acquire_d1_execute_write_lease_at_linux(
+            root.clone(),
+            account_id,
+            database_id,
+            &plan,
+            &session,
+        )
+        .expect("aborted attempt permits a new provider-free attempt");
+        match second {
+            D1ExecuteWriteLeaseAcquisition::Acquired(mut owner) => {
+                owner.abort_before_dispatch().expect("second cleanup abort")
+            }
+            D1ExecuteWriteLeaseAcquisition::ExactTerminalReplay(_) => {
+                panic!("pre-dispatch abort must not become terminal replay evidence")
+            }
+        }
+        fs::remove_dir_all(root).expect("test cleanup");
     }
 
     #[cfg(target_os = "linux")]

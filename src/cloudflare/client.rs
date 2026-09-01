@@ -276,6 +276,90 @@ pub(crate) struct D1MigrationManifestWriteError {
     pub(crate) lifecycle: D1MigrationManifestWriteLifecycle,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct D1DmlWrite {
+    pub(crate) result: Value,
+    pub(crate) response_body_sha256: String,
+    pub(crate) response_body_size_bytes: usize,
+    pub(crate) lifecycle: D1DmlWriteLifecycle,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct D1DmlWriteError {
+    pub(crate) error: AdapterErrorPayload,
+    pub(crate) provider_error: Option<D1MigrationProviderError>,
+    pub(crate) response_body_sha256: Option<String>,
+    pub(crate) response_body_size_bytes: Option<usize>,
+    pub(crate) lifecycle: D1DmlWriteLifecycle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct D1DmlWriteLifecycle {
+    pub(crate) dispatch_stage: &'static str,
+    pub(crate) response_stage: &'static str,
+    pub(crate) body_stage: &'static str,
+    pub(crate) http_status: Option<u16>,
+}
+
+impl D1DmlWriteLifecycle {
+    const fn pre_dispatch() -> Self {
+        Self {
+            dispatch_stage: "pre_dispatch",
+            response_stage: "not_received",
+            body_stage: "not_read",
+            http_status: None,
+        }
+    }
+
+    const fn attempted_without_response() -> Self {
+        Self {
+            dispatch_stage: "attempted",
+            response_stage: "not_received",
+            body_stage: "not_read",
+            http_status: None,
+        }
+    }
+
+    const fn response_received(http_status: u16) -> Self {
+        Self {
+            dispatch_stage: "attempted",
+            response_stage: "received",
+            body_stage: "not_read",
+            http_status: Some(http_status),
+        }
+    }
+
+    const fn body_partially_read(http_status: u16) -> Self {
+        Self {
+            dispatch_stage: "attempted",
+            response_stage: "received",
+            body_stage: "partially_read",
+            http_status: Some(http_status),
+        }
+    }
+
+    fn body_read_failed(http_status: u16, bytes_read: usize) -> Self {
+        if bytes_read == 0 {
+            Self::response_received(http_status)
+        } else {
+            Self::body_partially_read(http_status)
+        }
+    }
+
+    const fn body_completely_read(http_status: u16) -> Self {
+        Self {
+            dispatch_stage: "attempted",
+            response_stage: "received",
+            body_stage: "completely_read",
+            http_status: Some(http_status),
+        }
+    }
+
+    pub(crate) fn provider_calls(self) -> usize {
+        usize::from(self.dispatch_stage == "attempted")
+    }
+}
+
 pub(crate) fn d1_migration_reconciliation_only_cause(error: &AdapterErrorPayload) -> Value {
     json!({
         "code": error.code,
@@ -827,6 +911,204 @@ impl CloudflareClient {
             params,
         )
         .await
+    }
+
+    /// Submit exactly one generic DML statement through the bounded,
+    /// no-redirect, non-idempotent write boundary. The caller owns semantic
+    /// validation and must retain custody for every attempted ambiguous result.
+    pub(crate) async fn execute_d1_dml_write(
+        &self,
+        account_id: &str,
+        database_id: &str,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<D1DmlWrite, D1DmlWriteError> {
+        let pre_dispatch = |error: AdapterError| D1DmlWriteError {
+            error: error.payload(),
+            provider_error: None,
+            response_body_sha256: None,
+            response_body_size_bytes: None,
+            lifecycle: D1DmlWriteLifecycle::pre_dispatch(),
+        };
+        let account_id = require_non_empty("account_id", account_id).map_err(pre_dispatch)?;
+        let database_id = require_non_empty("database_id", database_id).map_err(pre_dispatch)?;
+        let sql = require_non_empty("sql", sql).map_err(pre_dispatch)?;
+        let token = self.bearer_token().map_err(pre_dispatch)?;
+        let url = self.endpoint(&format!(
+            "/accounts/{}/d1/database/{}/query",
+            path_segment(account_id),
+            path_segment(database_id),
+        ));
+        let mut body = Map::new();
+        body.insert("sql".to_string(), Value::String(sql.to_string()));
+        if !params.is_empty() {
+            body.insert("params".to_string(), Value::Array(params.to_vec()));
+        }
+        let request = self
+            .migration_write_http
+            .post(url)
+            .bearer_auth(&token)
+            .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone())
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .json(&Value::Object(body))
+            .build()
+            .map_err(|error| {
+                pre_dispatch(AdapterError::new(
+                    "cloudflare.request_build_failed",
+                    format!("cloudflare.d1.execute_write request build failed: {error}"),
+                    "Correct the request configuration; no provider request was dispatched.",
+                ))
+            })?;
+        let response = self
+            .migration_write_http
+            .execute(request)
+            .await
+            .map_err(|error| {
+                let code = if error.is_timeout() {
+                    "cloudflare.timeout"
+                } else {
+                    "cloudflare.transport_error"
+                };
+                D1DmlWriteError {
+                    error: AdapterError::new(
+                        code,
+                        format!("cloudflare.d1.execute_write request failed: {error}"),
+                        "Treat the DML outcome as ambiguous; retain custody and do not replay the attempt.",
+                    )
+                    .with_retryable(false)
+                    .payload(),
+                    provider_error: None,
+                    response_body_sha256: None,
+                    response_body_size_bytes: None,
+                    lifecycle: D1DmlWriteLifecycle::attempted_without_response(),
+                }
+            })?;
+        let status = response.status();
+        let status_code = status.as_u16();
+        let identity_encoded = response
+            .headers()
+            .get_all(reqwest::header::CONTENT_ENCODING)
+            .iter()
+            .all(|value| {
+                value.to_str().ok().is_some_and(|value| {
+                    value
+                        .split(',')
+                        .all(|encoding| encoding.trim().eq_ignore_ascii_case("identity"))
+                })
+            });
+        if !identity_encoded {
+            return Err(D1DmlWriteError {
+                error: AdapterError::new(
+                    "cloudflare.d1.execute_write_unsupported_content_encoding",
+                    "Cloudflare DML response used a non-identity content encoding",
+                    "Treat the DML outcome as ambiguous; retain custody and do not replay the attempt.",
+                )
+                .with_status(Some(status_code))
+                .payload(),
+                provider_error: None,
+                response_body_sha256: None,
+                response_body_size_bytes: None,
+                lifecycle: D1DmlWriteLifecycle::response_received(status_code),
+            });
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > D1_MIGRATION_RESPONSE_MAX_BYTES as u64)
+        {
+            return Err(D1DmlWriteError {
+                error: AdapterError::new(
+                    "cloudflare.d1.execute_write_response_too_large",
+                    "Cloudflare DML response exceeded the exact-evidence byte limit",
+                    "Treat the DML outcome as ambiguous; retain custody and do not replay the attempt.",
+                )
+                .with_status(Some(status_code))
+                .payload(),
+                provider_error: None,
+                response_body_sha256: None,
+                response_body_size_bytes: response.content_length().map(|length| {
+                    usize::try_from(length).unwrap_or(usize::MAX)
+                }),
+                lifecycle: D1DmlWriteLifecycle::response_received(status_code),
+            });
+        }
+        let initial_capacity = response
+            .content_length()
+            .map(|length| cmp::min(length as usize, D1_MIGRATION_RESPONSE_MAX_BYTES))
+            .unwrap_or(0);
+        let mut bytes = Vec::with_capacity(initial_capacity);
+        let mut hasher = Sha256::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| D1DmlWriteError {
+                error: AdapterError::new(
+                    "cloudflare.response_read_failed",
+                    format!("failed reading Cloudflare DML response body: {error}"),
+                    "Treat the DML outcome as ambiguous; retain custody and do not replay the attempt.",
+                )
+                .with_status(Some(status_code))
+                .with_retryable(false)
+                .payload(),
+                provider_error: None,
+                response_body_sha256: None,
+                response_body_size_bytes: Some(bytes.len()),
+                lifecycle: D1DmlWriteLifecycle::body_read_failed(status_code, bytes.len()),
+            })?;
+            let observed_size = bytes.len().saturating_add(chunk.len());
+            if observed_size > D1_MIGRATION_RESPONSE_MAX_BYTES {
+                return Err(D1DmlWriteError {
+                    error: AdapterError::new(
+                        "cloudflare.d1.execute_write_response_too_large",
+                        "Cloudflare DML response exceeded the exact-evidence byte limit",
+                        "Treat the DML outcome as ambiguous; retain custody and do not replay the attempt.",
+                    )
+                    .with_status(Some(status_code))
+                    .payload(),
+                    provider_error: None,
+                    response_body_sha256: None,
+                    response_body_size_bytes: Some(observed_size),
+                    lifecycle: D1DmlWriteLifecycle::body_partially_read(status_code),
+                });
+            }
+            hasher.update(&chunk);
+            bytes.extend_from_slice(&chunk);
+        }
+        let response_body_size_bytes = bytes.len();
+        let response_body_sha256 = format!("{:x}", hasher.finalize());
+        let evidence_error =
+            |error: AdapterError, provider_error: Option<D1MigrationProviderError>| {
+                D1DmlWriteError {
+                    error: error.with_retryable(false).payload(),
+                    provider_error,
+                    response_body_sha256: Some(response_body_sha256.clone()),
+                    response_body_size_bytes: Some(response_body_size_bytes),
+                    lifecycle: D1DmlWriteLifecycle::body_completely_read(status_code),
+                }
+            };
+        let body = std::str::from_utf8(&bytes).map_err(|error| {
+            evidence_error(
+                AdapterError::new(
+                    "cloudflare.d1.execute_write_malformed_utf8",
+                    format!("Cloudflare DML response was not valid UTF-8: {error}"),
+                    "Treat the DML outcome as ambiguous; retain custody and do not replay the attempt.",
+                )
+                .with_status(Some(status_code)),
+                None,
+            )
+        })?;
+        if !status.is_success() {
+            return Err(evidence_error(
+                d1_dml_write_http_status_error(status),
+                classify_d1_migration_provider_error(body, sql.len()),
+            ));
+        }
+        let envelope = decode_strict_d1_dml_envelope(body)
+            .map_err(|error| evidence_error(error.with_status(Some(status_code)), None))?;
+        Ok(D1DmlWrite {
+            result: envelope.result.unwrap_or(Value::Null),
+            response_body_sha256,
+            response_body_size_bytes,
+            lifecycle: D1DmlWriteLifecycle::body_completely_read(status_code),
+        })
     }
 
     /// Query a D1 migration ledger without discarding contradictory outer
@@ -3810,6 +4092,72 @@ fn validate_strict_d1_migration_manifest_envelope(
     })
 }
 
+fn decode_strict_d1_dml_envelope(body: &str) -> Result<CloudflareEnvelope<Value>, AdapterError> {
+    let value = decode_json_rejecting_duplicate_object_keys(body).map_err(|error| match error {
+        DuplicateSafeJsonError::DuplicateObjectKey => AdapterError::new(
+            "cloudflare.d1.execute_write_duplicate_object_key",
+            "Cloudflare DML response contained a duplicate JSON object key",
+            "Treat the DML outcome as ambiguous; retain custody and do not replay the attempt.",
+        ),
+        DuplicateSafeJsonError::NestingDepthExceeded => AdapterError::new(
+            "cloudflare.d1.execute_write_malformed_envelope",
+            "Cloudflare DML response exceeded the JSON nesting limit",
+            "Treat the DML outcome as ambiguous; retain custody and do not replay the attempt.",
+        ),
+        DuplicateSafeJsonError::Malformed(error) => AdapterError::new(
+            "cloudflare.d1.execute_write_malformed_envelope",
+            format!("failed decoding strict D1 DML envelope: {error}"),
+            "Treat the DML outcome as ambiguous; retain custody and do not replay the attempt.",
+        ),
+    })?;
+    let envelope: StrictD1MigrationManifestEnvelope<Value> = serde_json::from_value(value)
+        .map_err(|error| {
+            AdapterError::new(
+                "cloudflare.d1.execute_write_malformed_envelope",
+                format!("failed decoding strict D1 DML envelope: {error}"),
+                "Treat the DML outcome as ambiguous; retain custody and do not replay the attempt.",
+            )
+        })?;
+    let errors = match envelope.errors {
+        Some(Value::Array(errors)) if errors.is_empty() => Vec::new(),
+        Some(Value::Array(_)) => {
+            return Err(AdapterError::new(
+                "cloudflare.d1.execute_write_contradictory_envelope",
+                "Cloudflare DML envelope reported a non-empty errors array",
+                "Treat the DML outcome as ambiguous; retain custody and do not replay the attempt.",
+            ));
+        }
+        Some(Value::Null) | None => {
+            return Err(AdapterError::new(
+                "cloudflare.d1.execute_write_malformed_envelope",
+                "Cloudflare DML envelope omitted errors or supplied null",
+                "Treat the DML outcome as ambiguous; retain custody and do not replay the attempt.",
+            ));
+        }
+        Some(_) => {
+            return Err(AdapterError::new(
+                "cloudflare.d1.execute_write_malformed_envelope",
+                "Cloudflare DML envelope errors field was not an array",
+                "Treat the DML outcome as ambiguous; retain custody and do not replay the attempt.",
+            ));
+        }
+    };
+    if !envelope.success {
+        return Err(AdapterError::new(
+            "cloudflare.d1.execute_write_unsuccessful_envelope",
+            "Cloudflare DML envelope did not report success",
+            "Treat the DML outcome as ambiguous; retain custody and do not replay the attempt.",
+        ));
+    }
+    Ok(CloudflareEnvelope {
+        success: true,
+        result: envelope.result,
+        errors,
+        messages: Vec::new(),
+        result_info: None,
+    })
+}
+
 const DUPLICATE_JSON_OBJECT_KEY_MARKER: &str = "duplicate JSON object key";
 const JSON_NESTING_DEPTH_EXCEEDED_MARKER: &str = "JSON nesting depth exceeded";
 const D1_MIGRATION_JSON_MAX_CONTAINER_DEPTH: usize = 32;
@@ -4702,6 +5050,45 @@ fn d1_migration_manifest_write_http_status_error(status: StatusCode) -> AdapterE
         code,
         format!(
             "Cloudflare D1 migration-manifest write returned HTTP status {}",
+            status.as_u16()
+        ),
+        hint,
+    )
+    .with_retryable(false)
+    .with_status(Some(status.as_u16()))
+}
+
+fn d1_dml_write_http_status_error(status: StatusCode) -> AdapterError {
+    let (code, hint) = match status {
+        StatusCode::UNAUTHORIZED => (
+            "cloudflare.http_unauthorized",
+            "Verify the configured token, then reconcile the retained DML attempt; do not replay it.",
+        ),
+        StatusCode::FORBIDDEN => (
+            "cloudflare.http_forbidden",
+            "Verify D1 write scope, then reconcile the retained DML attempt; do not replay it.",
+        ),
+        StatusCode::NOT_FOUND => (
+            "cloudflare.http_not_found",
+            "Verify the retained target identity, then reconcile the DML attempt; do not replay it.",
+        ),
+        StatusCode::TOO_MANY_REQUESTS => (
+            "cloudflare.http_rate_limited",
+            "Retain custody and reconcile instead of replaying the DML attempt.",
+        ),
+        _ if status.is_server_error() => (
+            "cloudflare.http_server_error",
+            "Retain custody and reconcile instead of replaying the DML attempt.",
+        ),
+        _ => (
+            "cloudflare.http_error",
+            "Retain custody and reconcile instead of replaying the DML attempt.",
+        ),
+    };
+    AdapterError::new(
+        code,
+        format!(
+            "Cloudflare D1 DML write returned HTTP status {}",
             status.as_u16()
         ),
         hint,
