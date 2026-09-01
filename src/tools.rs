@@ -4692,8 +4692,8 @@ impl CloudflareMcp {
                 ))
             }
             Err(write_error) => {
-                let attempted = write_error.lifecycle.dispatch_stage == "attempted";
-                let provider_calls = usize::from(attempted);
+                let provider_calls = write_error.lifecycle.provider_calls();
+                let attempted = provider_calls == 1;
                 let provider_mutations = provider_calls;
                 let audit_record = match audit
                     .finish_checked("error", Some(&write_error.error.code))

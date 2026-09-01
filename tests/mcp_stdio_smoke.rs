@@ -18222,15 +18222,15 @@ fn d1_execute_write_proves_exact_plan_evidence_and_terminal_replay_through_stdio
         content["execution_plan"]["target_key_sha256"],
         json!(sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000"))
     );
-    let requests = requests.lock().expect("request log lock");
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0]["method"], json!("POST"));
+    let request_log = requests.lock().expect("request log lock");
+    assert_eq!(request_log.len(), 1);
+    assert_eq!(request_log[0]["method"], json!("POST"));
     assert_eq!(
-        requests[0]["path"],
+        request_log[0]["path"],
         json!("/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query")
     );
-    assert_eq!(requests[0]["body"]["sql"], json!(exact_sql));
-    drop(requests);
+    assert_eq!(request_log[0]["body"]["sql"], json!(exact_sql));
+    drop(request_log);
 
     let replay = mcp.call_tool(
         4,
