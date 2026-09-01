@@ -610,7 +610,13 @@ impl ApiCatalogError {
                 "Use api_read for GET operations and api_mutate for POST/PUT/PATCH/DELETE operations."
             }
             Self::DeniedByDefault(id)
-                if matches!(id.as_str(), "d1-import-database" | "d1-time-travel-restore") =>
+                if matches!(
+                    id.as_str(),
+                    "d1-export-database"
+                        | "d1-import-database"
+                        | "d1-time-travel-restore"
+                        | "d1-update-database"
+                ) =>
             {
                 "Use a governed curated lifecycle for this operation; generic api_mutate remains denied."
             }
@@ -753,20 +759,42 @@ mod tests {
     }
 
     #[test]
-    fn generic_existing_target_d1_schema_mutations_are_exactly_denied_by_default() {
-        for operation_id in [
+    fn generic_existing_target_d1_mutator_inventory_is_closed_and_denied_by_default() {
+        let discovered = catalog()
+            .operations
+            .iter()
+            .filter(|operation| {
+                operation.tag == "D1"
+                    && !operation.method.eq_ignore_ascii_case("GET")
+                    && operation.path.contains("{database_id}")
+            })
+            .map(|operation| operation.operation_id.as_str())
+            .collect::<Vec<_>>();
+        let expected = vec![
+            "d1-delete-database",
+            "d1-export-database",
+            "d1-import-database",
             "d1-query-database",
             "d1-raw-database-query",
-            "d1-import-database",
             "d1-time-travel-restore",
-        ] {
+            "d1-update-database",
+            "d1-update-partial-database",
+        ];
+        assert_eq!(discovered, expected);
+
+        for operation_id in expected {
             let operation = find_operation(operation_id).expect("existing-target D1 operation");
             assert_eq!(operation.risk, ApiRisk::DeniedByDefault);
             assert!(!operation_allowed_by_default(operation));
             let expected_preferred_tool = match operation_id {
                 "d1-query-database" | "d1-raw-database-query" => Some("d1_query_read_only"),
-                "d1-import-database" | "d1-time-travel-restore" => None,
-                _ => unreachable!(),
+                "d1-delete-database" => Some("d1_delete_database"),
+                "d1-update-partial-database" => Some("d1_rename_database"),
+                "d1-export-database"
+                | "d1-import-database"
+                | "d1-time-travel-restore"
+                | "d1-update-database" => None,
+                _ => unreachable!("closed inventory"),
             };
             assert_eq!(operation.preferred_tool.as_deref(), expected_preferred_tool);
         }
@@ -775,10 +803,7 @@ mod tests {
             ("d1-create-database", ApiRisk::Mutating),
             ("d1-get-database", ApiRisk::Read),
             ("d1-list-databases", ApiRisk::Read),
-            ("d1-export-database", ApiRisk::Mutating),
-            ("d1-update-database", ApiRisk::Mutating),
-            ("d1-update-partial-database", ApiRisk::Mutating),
-            ("d1-delete-database", ApiRisk::HighRisk),
+            ("d1-time-travel-get-bookmark", ApiRisk::Read),
         ] {
             let unrelated = find_operation(operation_id).expect("unrelated D1 operation");
             assert_eq!(unrelated.risk, expected_risk, "{operation_id}");

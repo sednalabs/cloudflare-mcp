@@ -90,6 +90,26 @@ The exact family `migration-ledger-bootstrap-v1` belongs only to the dedicated
 bootstrap apply/reconcile/finalize/abort lifecycle. All three generic manifest
 tools reject it before provider, custody, receipt, or namespace activity.
 
+Every existing-target provider mutation uses one canonical account/database
+identity and one physical target guard namespace:
+
+| Provider mutation surface | Coverage |
+| --- | --- |
+| `d1_rename_database` | shared permanent target guard |
+| `d1_delete_database` | shared permanent target guard |
+| `d1_execute_write` | shared permanent target guard |
+| `d1_bootstrap_migration_ledger` | durable lease under that target guard |
+| `d1_apply_migration_manifest` | durable lease under that target guard |
+| `d1_apply_migrations` live mode | denied/retired |
+| generic existing-target D1 POST/PUT/PATCH/DELETE | denied before request construction; use a guarded curated lifecycle |
+
+Canonical account and database components are exact ASCII path identifiers;
+whitespace, NUL, dot, slash, backslash, percent-encoded and other alias forms
+are rejected before target hashing or provider dispatch. Different database
+targets may proceed concurrently; the same account/database target cannot.
+Local reconcile/finalize/abort tools manipulate retained custody evidence only
+and are not provider D1 mutation surfaces.
+
 Use `d1_bootstrap_migration_ledger` only before the first migration on a
 separately selected, genuinely empty D1 database. Its dry run binds the exact
 account, database, ledger table, canonical initializer, and two matching

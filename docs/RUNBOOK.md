@@ -206,6 +206,23 @@ cannot reconcile or retire bootstrap-family custody.
 
 ## Exact-byte D1 migration manifests
 
+### Shared existing-target mutation guard
+
+Configure `CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT` for every MCP process that
+can run curated D1 rename, delete, row-write, bootstrap, or manifest mutation.
+The name is retained for compatibility, but the directory is now the shared
+account/database target-guard root. Rename, delete and row-write acquire the
+same permanent `guard.lock` as bootstrap and manifest apply immediately before
+provider dispatch. A same-target contention or retained active/retiring lease
+is a stop condition; a different database target is independent.
+
+Generic `api_mutate` is not a fallback for an existing D1 target. Delete,
+export, import, query/raw query, time-travel restore, full update and partial
+update are denied before request construction. Use the curated guarded tool
+where one exists; otherwise defer to a separately governed lifecycle. Always
+copy account and database IDs exactly from Cloudflare. Do not trim, encode or
+otherwise repair a rejected identity.
+
 ### Private SQL artifact and upload boundary
 
 The reusable private-artifact boundary is intentionally lower-level than any D1

@@ -51,7 +51,7 @@ use crate::d1_migration_bootstrap_recovery::{
     reconcile_bootstrap_migration_ledger,
 };
 use crate::d1_migration_lease::{
-    acquire_d1_migration_lease, d1_migration_lease_requirements,
+    acquire_d1_migration_lease, acquire_d1_target_mutation_guard, d1_migration_lease_requirements,
     preflight_d1_migration_target_custody,
 };
 use crate::d1_migration_manifest::{
@@ -61,8 +61,8 @@ use crate::d1_migration_manifest::{
     d1_manifest_plan_mismatch_result, d1_manifest_plan_sha256,
     d1_manifest_reconciliation_custody_lost_result, d1_manifest_reconciliation_required_result,
     d1_manifest_summaries, d1_manifest_unknown_ledger_result, d1_migration_execution_provider_sql,
-    d1_migrations_table_init_sql, derive_d1_manifest_execution_plan, normalize_d1_manifest_target,
-    normalize_d1_migration_family, parse_d1_migration_ledger, read_stable_d1_migration_ledger,
+    d1_migrations_table_init_sql, derive_d1_manifest_execution_plan, normalize_d1_migration_family,
+    parse_d1_migration_ledger, read_stable_d1_migration_ledger,
     read_stable_d1_migration_ledger_authority, validate_d1_manifest_write_result,
     validate_d1_migration_manifest, validate_generic_d1_migration_family,
 };
@@ -74,6 +74,7 @@ use crate::d1_migration_terminal::{
     D1FinalizeMigrationReconciliationArgs, contextualize_terminal_semantic_error,
     finalize_d1_migration_reconciliation,
 };
+use crate::d1_target::normalize_d1_target;
 use crate::dns_route::{
     DnsRouteConflict, DnsRouteVerificationState, plan_dns_route_reconciliation, verify_dns_route,
 };
@@ -3816,7 +3817,18 @@ impl CloudflareMcp {
         &self,
         Parameters(args): Parameters<D1RenameDatabaseArgs>,
     ) -> Result<CallToolResult, crate::McpError> {
-        let account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        if let Some(account_id) = args.account_id.as_deref()
+            && let Err(result) = normalize_d1_target(account_id, &args.database_id)
+        {
+            return Ok(result);
+        }
+        let resolved_account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        let target = match normalize_d1_target(resolved_account_id, &args.database_id) {
+            Ok(target) => target,
+            Err(result) => return Ok(result),
+        };
+        let account_id = target.account_id.as_str();
+        let database_id = target.database_id.as_str();
         let name = args.name.trim();
         if name.is_empty() {
             return Ok(invalid_argument_result(
@@ -3831,7 +3843,7 @@ impl CloudflareMcp {
                 false,
                 json!({
                     "account_id": account_id,
-                    "database_id": &args.database_id,
+                    "database_id": database_id,
                     "new_name": name,
                 }),
             )
@@ -3849,7 +3861,7 @@ impl CloudflareMcp {
             "d1_rename_database",
             json!({
                 "account_id": account_id,
-                "database_id": &args.database_id,
+                "database_id": database_id,
                 "new_name": name,
             }),
             args.dry_run,
@@ -3861,21 +3873,28 @@ impl CloudflareMcp {
                 "operation": "d1_rename_database",
                 "planned": true,
                 "account_id": account_id,
-                "database_id": &args.database_id,
+                "database_id": database_id,
                 "new_name": name,
                 "dry_run_note": "No D1 database rename applied.",
             }))
         } else {
+            let guard = match acquire_d1_target_mutation_guard(account_id, database_id) {
+                Ok(guard) => guard,
+                Err(result) => return Ok(finalize_mutation_result(result, &plan, audit, false)),
+            };
+            if let Err(result) = guard.revalidate() {
+                return Ok(finalize_mutation_result(result, &plan, audit, false));
+            }
             match self
                 .cloudflare
-                .rename_d1_database(account_id, &args.database_id, name)
+                .rename_d1_database(account_id, database_id, name)
                 .await
             {
                 Ok(database) => CallToolResult::structured(json!({
                     "ok": true,
                     "operation": "d1_rename_database",
                     "account_id": account_id,
-                    "database_id": &args.database_id,
+                    "database_id": database_id,
                     "new_name": name,
                     "database": database,
                 })),
@@ -3894,11 +3913,22 @@ impl CloudflareMcp {
         &self,
         Parameters(args): Parameters<D1DeleteDatabaseArgs>,
     ) -> Result<CallToolResult, crate::McpError> {
-        let account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        if let Some(account_id) = args.account_id.as_deref()
+            && let Err(result) = normalize_d1_target(account_id, &args.database_id)
+        {
+            return Ok(result);
+        }
+        let resolved_account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        let target = match normalize_d1_target(resolved_account_id, &args.database_id) {
+            Ok(target) => target,
+            Err(result) => return Ok(result),
+        };
+        let account_id = target.account_id.as_str();
+        let database_id = target.database_id.as_str();
         let operation = find_operation("d1-delete-database").expect("D1 delete catalog operation");
         let path_params = BTreeMap::from([
             ("account_id".to_string(), account_id.to_string()),
-            ("database_id".to_string(), args.database_id.clone()),
+            ("database_id".to_string(), database_id.to_string()),
         ]);
         let path = match render_path(
             operation,
@@ -3916,7 +3946,7 @@ impl CloudflareMcp {
                 false,
                 json!({
                     "account_id": account_id,
-                    "database_id": &args.database_id,
+                    "database_id": database_id,
                     "reason": args.reason.clone(),
                 }),
             )
@@ -3933,7 +3963,7 @@ impl CloudflareMcp {
             "d1_delete_database",
             json!({
                 "account_id": account_id,
-                "database_id": &args.database_id,
+                "database_id": database_id,
                 "reason": args.reason.clone(),
             }),
             args.dry_run,
@@ -3956,7 +3986,7 @@ impl CloudflareMcp {
                 "operation": "d1_delete_database",
                 "planned": true,
                 "account_id": account_id,
-                "database_id": &args.database_id,
+                "database_id": database_id,
                 "request_plan": request_plan,
                 "required_confirmation_token": required_token,
                 "dry_run_note": "No D1 database delete applied.",
@@ -3974,16 +4004,23 @@ impl CloudflareMcp {
                 "request_plan": request_plan,
             }))
         } else {
+            let guard = match acquire_d1_target_mutation_guard(account_id, database_id) {
+                Ok(guard) => guard,
+                Err(result) => return Ok(finalize_mutation_result(result, &plan, audit, false)),
+            };
+            if let Err(result) = guard.revalidate() {
+                return Ok(finalize_mutation_result(result, &plan, audit, false));
+            }
             match self
                 .cloudflare
-                .delete_d1_database(account_id, &args.database_id)
+                .delete_d1_database(account_id, database_id)
                 .await
             {
                 Ok(result) => CallToolResult::structured(json!({
                     "ok": true,
                     "operation": "d1_delete_database",
                     "account_id": account_id,
-                    "database_id": &args.database_id,
+                    "database_id": database_id,
                     "result": result,
                 })),
                 Err(err) => adapter_error_result(err),
@@ -4330,7 +4367,19 @@ impl CloudflareMcp {
         &self,
         Parameters(args): Parameters<D1ExecuteWriteArgs>,
     ) -> Result<CallToolResult, crate::McpError> {
-        let account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        if let Some(account_id) = args.account_id.as_deref()
+            && let Err(result) = normalize_d1_target(account_id, &args.database_id)
+        {
+            return Ok(result);
+        }
+        let resolved_account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        let target = match normalize_d1_target(resolved_account_id, &args.database_id) {
+            Ok(target) => target,
+            Err(result) => return Ok(result),
+        };
+        let target_key_sha256 = target.target_key_sha256();
+        let account_id = target.account_id.as_str();
+        let database_id = target.database_id.as_str();
         let statement_kind = match classify_d1_write_sql(&args.sql) {
             Ok(kind) => kind,
             Err(result) => return Ok(result),
@@ -4339,7 +4388,8 @@ impl CloudflareMcp {
         let plan = json!({
             "operation": "d1_execute_write",
             "account_id": account_id,
-            "database_id": &args.database_id,
+            "database_id": database_id,
+            "target_key_sha256": target_key_sha256,
             "statement_kind": statement_kind,
             "sql_sha256": sha256_hex(args.sql.trim()),
             "dry_run": args.dry_run,
@@ -4357,9 +4407,16 @@ impl CloudflareMcp {
                 },
             })));
         }
+        let guard = match acquire_d1_target_mutation_guard(account_id, database_id) {
+            Ok(guard) => guard,
+            Err(result) => return Ok(result),
+        };
+        if let Err(result) = guard.revalidate() {
+            return Ok(result);
+        }
         match self
             .cloudflare
-            .execute_d1_database_write(account_id, &args.database_id, &args.sql, &args.params)
+            .execute_d1_database_write(account_id, database_id, &args.sql, &args.params)
             .await
         {
             Ok(result) => {
@@ -4604,13 +4661,12 @@ impl CloudflareMcp {
         };
 
         if let Some(account_id) = requested_account_id.as_deref() {
-            if let Err(result) = normalize_d1_manifest_target(account_id, &requested_database_id) {
+            if let Err(result) = normalize_d1_target(account_id, &requested_database_id) {
                 return Ok(zero_call_error(result));
             }
         }
         let resolved_account_id = resolve_account_id(self, requested_account_id.as_deref())?;
-        let target = match normalize_d1_manifest_target(resolved_account_id, &requested_database_id)
-        {
+        let target = match normalize_d1_target(resolved_account_id, &requested_database_id) {
             Ok(target) => target,
             Err(result) => return Ok(zero_call_error(result)),
         };
@@ -4678,7 +4734,7 @@ impl CloudflareMcp {
             }))
         };
         if let Some(account_id) = requested_account_id.as_deref() {
-            if let Err(result) = normalize_d1_manifest_target(account_id, &requested_database_id) {
+            if let Err(result) = normalize_d1_target(account_id, &requested_database_id) {
                 return Ok(zero_call_error(result));
             }
         }
@@ -4686,14 +4742,13 @@ impl CloudflareMcp {
             Ok(account_id) => account_id,
             Err(_) => {
                 return Ok(zero_call_error(invalid_argument_result(
-                    "d1.invalid_manifest_target_identity",
+                    "d1.invalid_target_identity",
                     "account_id must be supplied or configured as a canonical identifier",
                     "Use the exact account_id read from the intended Cloudflare resource.",
                 )));
             }
         };
-        let target = match normalize_d1_manifest_target(resolved_account_id, &requested_database_id)
-        {
+        let target = match normalize_d1_target(resolved_account_id, &requested_database_id) {
             Ok(target) => target,
             Err(result) => return Ok(zero_call_error(result)),
         };
@@ -4755,7 +4810,7 @@ impl CloudflareMcp {
             }))
         };
         if let Some(account_id) = requested_account_id.as_deref() {
-            if let Err(result) = normalize_d1_manifest_target(account_id, &requested_database_id) {
+            if let Err(result) = normalize_d1_target(account_id, &requested_database_id) {
                 return Ok(zero_call_error(result));
             }
         }
@@ -4763,14 +4818,13 @@ impl CloudflareMcp {
             Ok(account_id) => account_id,
             Err(_) => {
                 return Ok(zero_call_error(invalid_argument_result(
-                    "d1.invalid_manifest_target_identity",
+                    "d1.invalid_target_identity",
                     "account_id must be supplied or configured as a canonical identifier",
                     "Use the exact account_id read from the intended Cloudflare resource.",
                 )));
             }
         };
-        let target = match normalize_d1_manifest_target(resolved_account_id, &requested_database_id)
-        {
+        let target = match normalize_d1_target(resolved_account_id, &requested_database_id) {
             Ok(target) => target,
             Err(result) => return Ok(zero_call_error(result)),
         };
@@ -4878,7 +4932,7 @@ impl CloudflareMcp {
             }))
         };
         if let Some(account_id) = requested_account_id.as_deref() {
-            if let Err(result) = normalize_d1_manifest_target(account_id, &requested_database_id) {
+            if let Err(result) = normalize_d1_target(account_id, &requested_database_id) {
                 return Ok(zero_call_error(result));
             }
         }
@@ -4886,14 +4940,13 @@ impl CloudflareMcp {
             Ok(account_id) => account_id,
             Err(_) => {
                 return Ok(zero_call_error(invalid_argument_result(
-                    "d1.invalid_manifest_target_identity",
+                    "d1.invalid_target_identity",
                     "account_id must be supplied or configured as a canonical identifier",
                     "Use the exact account_id read from the intended Cloudflare resource.",
                 )));
             }
         };
-        let target = match normalize_d1_manifest_target(resolved_account_id, &requested_database_id)
-        {
+        let target = match normalize_d1_target(resolved_account_id, &requested_database_id) {
             Ok(target) => target,
             Err(result) => return Ok(zero_call_error(result)),
         };
@@ -4981,15 +5034,12 @@ impl CloudflareMcp {
         // supplied account alias must not be silently trimmed before it is
         // bound into the reviewed plan and lease key.
         if let Some(requested_account_id) = requested_account_id.as_deref() {
-            if let Err(result) =
-                normalize_d1_manifest_target(requested_account_id, &requested_database_id)
-            {
+            if let Err(result) = normalize_d1_target(requested_account_id, &requested_database_id) {
                 return Ok(result);
             }
         }
         let resolved_account_id = resolve_account_id(self, requested_account_id.as_deref())?;
-        let target = match normalize_d1_manifest_target(resolved_account_id, &requested_database_id)
-        {
+        let target = match normalize_d1_target(resolved_account_id, &requested_database_id) {
             Ok(target) => target,
             Err(result) => return Ok(result),
         };
@@ -5699,9 +5749,7 @@ impl CloudflareMcp {
             state_expectations,
         } = args;
         if let Some(requested_account_id) = requested_account_id.as_deref() {
-            if let Err(result) =
-                normalize_d1_manifest_target(requested_account_id, &requested_database_id)
-            {
+            if let Err(result) = normalize_d1_target(requested_account_id, &requested_database_id) {
                 return Ok(contextualize_d1_reconciliation_semantic_error(result));
             }
         }
@@ -5710,15 +5758,14 @@ impl CloudflareMcp {
             Err(_) => {
                 return Ok(contextualize_d1_reconciliation_semantic_error(
                     invalid_argument_result(
-                        "d1.invalid_manifest_target_identity",
+                        "d1.invalid_target_identity",
                         "account_id must be supplied or configured as a canonical identifier",
                         "Use the exact account_id read from the intended Cloudflare resource.",
                     ),
                 ));
             }
         };
-        let target = match normalize_d1_manifest_target(resolved_account_id, &requested_database_id)
-        {
+        let target = match normalize_d1_target(resolved_account_id, &requested_database_id) {
             Ok(target) => target,
             Err(result) => {
                 return Ok(contextualize_d1_reconciliation_semantic_error(result));
@@ -5794,9 +5841,7 @@ impl CloudflareMcp {
             approved_terminal_plan_sha256,
         } = args;
         if let Some(requested_account_id) = requested_account_id.as_deref() {
-            if let Err(result) =
-                normalize_d1_manifest_target(requested_account_id, &requested_database_id)
-            {
+            if let Err(result) = normalize_d1_target(requested_account_id, &requested_database_id) {
                 return Ok(contextualize_terminal_semantic_error(result));
             }
         }
@@ -5805,15 +5850,14 @@ impl CloudflareMcp {
             Err(_) => {
                 return Ok(contextualize_terminal_semantic_error(
                     invalid_argument_result(
-                        "d1.invalid_manifest_target_identity",
+                        "d1.invalid_target_identity",
                         "account_id must be supplied or configured as a canonical identifier",
                         "Use the exact account_id read from the intended Cloudflare resource.",
                     ),
                 ));
             }
         };
-        let target = match normalize_d1_manifest_target(resolved_account_id, &requested_database_id)
-        {
+        let target = match normalize_d1_target(resolved_account_id, &requested_database_id) {
             Ok(target) => target,
             Err(result) => return Ok(contextualize_terminal_semantic_error(result)),
         };
@@ -14157,8 +14201,9 @@ mod tests {
     use crate::d1_migration_manifest::{
         D1ManifestReconciliationEvidence, classify_d1_manifest_ledger,
         d1_manifest_contextualize_failure, d1_manifest_plan_mismatch_result,
-        normalize_d1_manifest_target, parse_d1_migration_ledger, validate_d1_migration_manifest,
+        parse_d1_migration_ledger, validate_d1_migration_manifest,
     };
+    use crate::d1_target::normalize_d1_target;
     use crate::mutation::MutationApprovalAudit;
     use crate::portal::PortalAgentClient;
 
@@ -15622,7 +15667,7 @@ mod tests {
         let server = test_server("http://127.0.0.1:9".to_string());
         let result = server
             .cloudflare_find_tools(Parameters(FindToolsArgs {
-                query: Some("d1 database".to_string()),
+                query: Some("d1".to_string()),
                 group: Some("d1".to_string()),
                 read_only: Some(false),
                 limit: Some(20),
@@ -15634,14 +15679,43 @@ mod tests {
         let allowed = payload["openai_allowed_tools"]
             .as_array()
             .expect("allowed tools");
-        for tool in [
-            "d1_rename_database",
+        let mut actual = allowed.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+        actual.sort_unstable();
+        let mut expected = vec![
+            "d1_abort_bootstrap_migration_ledger",
+            "d1_apply_migration_manifest",
+            "d1_bootstrap_migration_ledger",
             "d1_delete_database",
             "d1_execute_write",
-            "d1_apply_migration_manifest",
+            "d1_finalize_bootstrap_migration_ledger",
+            "d1_finalize_migration_reconciliation",
+            "d1_rename_database",
+        ];
+        expected.sort_unstable();
+        assert_eq!(actual, expected, "closed curated D1 mutation inventory");
+
+        for (tool, provider_boundary) in [
+            ("d1_rename_database", "shared_target_guard"),
+            ("d1_delete_database", "shared_target_guard"),
+            ("d1_execute_write", "shared_target_guard"),
+            ("d1_bootstrap_migration_ledger", "durable_target_lease"),
+            ("d1_apply_migration_manifest", "durable_target_lease"),
         ] {
-            assert!(allowed.iter().any(|candidate| candidate == tool), "{tool}");
+            assert!(
+                allowed.iter().any(|candidate| candidate == tool),
+                "{tool} must retain {provider_boundary} coverage"
+            );
             assert!(payload["schemas"][tool].is_object(), "{tool} schema");
+        }
+        for local_only in [
+            "d1_finalize_bootstrap_migration_ledger",
+            "d1_abort_bootstrap_migration_ledger",
+            "d1_finalize_migration_reconciliation",
+        ] {
+            assert!(
+                allowed.iter().any(|candidate| candidate == local_only),
+                "{local_only} is local custody finalization, not a provider D1 mutation"
+            );
         }
         assert!(
             !allowed
@@ -17204,7 +17278,7 @@ mod tests {
                 "target precedes every later invalid field",
                 args(Some(" acct-1"), Some("bad-name"), Vec::new(), "bad family"),
                 expected_d1_reconciliation_semantic_error(
-                    "d1.invalid_manifest_target_identity",
+                    "d1.invalid_target_identity",
                     "account_id must be a non-empty canonical identifier, not a dot path segment, and without surrounding whitespace",
                     "Use the exact account_id and database_id read from the intended Cloudflare resource.",
                 ),
@@ -17275,7 +17349,7 @@ mod tests {
                 .structured_content
                 .expect("structured missing-account error"),
             expected_d1_reconciliation_semantic_error(
-                "d1.invalid_manifest_target_identity",
+                "d1.invalid_target_identity",
                 "account_id must be supplied or configured as a canonical identifier",
                 "Use the exact account_id read from the intended Cloudflare resource.",
             ),
@@ -17308,7 +17382,7 @@ mod tests {
             .expect("MCP result");
         assert_eq!(
             result.structured_content.expect("error")["error"]["code"],
-            json!("d1.invalid_manifest_target_identity")
+            json!("d1.invalid_target_identity")
         );
     }
 
@@ -17344,7 +17418,7 @@ mod tests {
                 .expect("MCP result");
             assert_eq!(
                 result.structured_content.expect("error")["error"]["code"],
-                json!("d1.invalid_manifest_target_identity"),
+                json!("d1.invalid_target_identity"),
                 "{label} must be rejected before the URL parser sees it"
             );
         }
@@ -17496,17 +17570,17 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn d1_manifest_target_rejects_aliases_and_preserves_replacement_lease() {
-        let error = normalize_d1_manifest_target(" acct-1", "db-1")
-            .expect_err("account whitespace alias must fail");
+        let error =
+            normalize_d1_target(" acct-1", "db-1").expect_err("account whitespace alias must fail");
         assert_eq!(
             error.structured_content.expect("error")["error"]["code"],
-            json!("d1.invalid_manifest_target_identity")
+            json!("d1.invalid_target_identity")
         );
-        let error = normalize_d1_manifest_target("acct-1", "db-1 ")
+        let error = normalize_d1_target("acct-1", "db-1 ")
             .expect_err("database whitespace alias must fail");
         assert_eq!(
             error.structured_content.expect("error")["error"]["code"],
-            json!("d1.invalid_manifest_target_identity")
+            json!("d1.invalid_target_identity")
         );
         let root = d1_migration_test_dir("d1-manifest-lease-replacement");
         #[cfg(unix)]

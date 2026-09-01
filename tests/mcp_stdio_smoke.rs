@@ -4977,6 +4977,16 @@ fn spawn_fake_d1_database_mutation_api(
                     "messages": [],
                     "result": {"id": "db-1", "deleted": true},
                 }),
+                ("POST", "/accounts/acct-1/d1/database/db-1/query") => json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": [{
+                        "success": true,
+                        "results": [],
+                        "meta": {"changed_db": true, "changes": 1}
+                    }],
+                }),
                 _ => json!({
                     "success": false,
                     "errors": [{"code": 7000, "message": format!("unexpected request: {method} {path}")}],
@@ -10642,7 +10652,7 @@ fn d1_reconcile_migration_manifest_stdio_wraps_semantic_validation_in_fixed_orde
             "target precedes every later invalid field",
             invalid_target,
             expected_d1_reconciliation_semantic_error(
-                "d1.invalid_manifest_target_identity",
+                "d1.invalid_target_identity",
                 "account_id must be a non-empty canonical identifier, not a dot path segment, and without surrounding whitespace",
                 "Use the exact account_id and database_id read from the intended Cloudflare resource.",
             ),
@@ -10736,7 +10746,7 @@ fn d1_reconcile_migration_manifest_stdio_wraps_semantic_validation_in_fixed_orde
     assert_eq!(
         structured_content(&response),
         &expected_d1_reconciliation_semantic_error(
-            "d1.invalid_manifest_target_identity",
+            "d1.invalid_target_identity",
             "account_id must be supplied or configured as a canonical identifier",
             "Use the exact account_id read from the intended Cloudflare resource.",
         ),
@@ -17607,8 +17617,28 @@ fn d1_apply_migration_manifest_partial_multi_statement_response_loss_stays_unkno
 
 #[test]
 fn d1_rename_database_uses_patch_through_stdio_boundary() {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     let (base_url, requests) = spawn_fake_d1_database_mutation_api(1);
-    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-d1-rename-guard-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos()
+    ));
+    fs::create_dir(&lease_root).expect("create private target guard root");
+    #[cfg(unix)]
+    fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+        .expect("make target guard root private");
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
     let response = mcp.call_tool(
         2,
         "d1_rename_database",
@@ -17629,12 +17659,34 @@ fn d1_rename_database_uses_patch_through_stdio_boundary() {
         json!("/accounts/acct-1/d1/database/db-1")
     );
     assert_eq!(requests[0]["body"]["name"], json!("renamed-db"));
+    mcp.terminate();
+    fs::remove_dir_all(lease_root).expect("target guard cleanup");
 }
 
 #[test]
 fn d1_delete_database_requires_token_and_deletes_through_stdio_boundary() {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     let (base_url, requests) = spawn_fake_d1_database_mutation_api(1);
-    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-d1-delete-guard-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos()
+    ));
+    fs::create_dir(&lease_root).expect("create private target guard root");
+    #[cfg(unix)]
+    fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+        .expect("make target guard root private");
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
     let dry_run = mcp.call_tool(
         2,
         "d1_delete_database",
@@ -17674,6 +17726,64 @@ fn d1_delete_database_requires_token_and_deletes_through_stdio_boundary() {
         json!("/accounts/acct-1/d1/database/db-1")
     );
     assert_eq!(requests[0]["body"], Value::Null);
+    mcp.terminate();
+    fs::remove_dir_all(lease_root).expect("target guard cleanup");
+}
+
+#[test]
+fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    let (base_url, requests) = spawn_fake_d1_database_mutation_api(1);
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-d1-write-guard-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos()
+    ));
+    fs::create_dir(&lease_root).expect("create private target guard root");
+    #[cfg(unix)]
+    fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+        .expect("make target guard root private");
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let response = mcp.call_tool(
+        2,
+        "d1_execute_write",
+        json!({
+            "database_id": "db-1",
+            "sql": "UPDATE example SET enabled = 1 WHERE id = 7",
+            "dry_run": false
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(true), "{content}");
+    assert_eq!(content["plan"]["database_id"], json!("db-1"));
+    assert_eq!(
+        content["plan"]["target_key_sha256"],
+        json!(sha256_hex("acct-1\0db-1"))
+    );
+    let requests = requests.lock().expect("request log lock");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["method"], json!("POST"));
+    assert_eq!(
+        requests[0]["path"],
+        json!("/accounts/acct-1/d1/database/db-1/query")
+    );
+    assert_eq!(
+        requests[0]["body"]["sql"],
+        json!("UPDATE example SET enabled = 1 WHERE id = 7")
+    );
+    drop(requests);
+    mcp.terminate();
+    fs::remove_dir_all(lease_root).expect("target guard cleanup");
 }
 
 #[test]
@@ -18960,10 +19070,14 @@ fn api_mutate_denies_existing_target_d1_schema_mutations_before_request_construc
         McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", provider_url)]);
 
     for (index, operation_id) in [
+        "d1-delete-database",
+        "d1-export-database",
+        "d1-import-database",
         "d1-query-database",
         "d1-raw-database-query",
-        "d1-import-database",
         "d1-time-travel-restore",
+        "d1-update-database",
+        "d1-update-partial-database",
     ]
     .into_iter()
     .enumerate()
@@ -18999,7 +19113,12 @@ fn api_mutate_denies_existing_target_d1_schema_mutations_before_request_construc
         assert_eq!(content["api_operation"]["risk"], json!("denied_by_default"));
         let expected_preferred_tool = match operation_id {
             "d1-query-database" | "d1-raw-database-query" => Some("d1_query_read_only"),
-            "d1-import-database" | "d1-time-travel-restore" => None,
+            "d1-delete-database" => Some("d1_delete_database"),
+            "d1-update-partial-database" => Some("d1_rename_database"),
+            "d1-export-database"
+            | "d1-import-database"
+            | "d1-time-travel-restore"
+            | "d1-update-database" => None,
             _ => unreachable!(),
         };
         assert_eq!(content["preferred_tool"], json!(expected_preferred_tool));
@@ -19023,7 +19142,7 @@ fn api_mutate_denies_existing_target_d1_schema_mutations_before_request_construc
     }
 
     let discovery = mcp.call_tool(
-        24,
+        40,
         "find_tools",
         json!({"group": "d1", "limit": 100, "include_schema": true}),
     );
@@ -19056,7 +19175,7 @@ fn api_mutate_denies_existing_target_d1_schema_mutations_before_request_construc
     }
 
     let curated_read = mcp.call_tool(
-        25,
+        41,
         "d1_query_read_only",
         json!({
             "account_id": "acct-1",
@@ -19070,7 +19189,7 @@ fn api_mutate_denies_existing_target_d1_schema_mutations_before_request_construc
         "curated read tool remains callable and guarded"
     );
     let curated_write = mcp.call_tool(
-        26,
+        42,
         "d1_execute_write",
         json!({
             "account_id": "acct-1",
