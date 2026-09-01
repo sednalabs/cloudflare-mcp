@@ -116,7 +116,7 @@ impl AdapterError {
 pub struct CloudflareClient {
     pub(crate) cfg: CloudflareApiConfig,
     pub(crate) http: reqwest::Client,
-    reconciliation_http: reqwest::Client,
+    pub(super) reconciliation_http: reqwest::Client,
     migration_write_http: reqwest::Client,
 }
 

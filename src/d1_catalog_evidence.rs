@@ -4,8 +4,8 @@
 //! adapter-issued frames claim distinct, primary-served, complete observations
 //! whose canonical typed projections describe one stable snapshot for one
 //! canonical D1 target. It cannot authenticate provider dispatch or response
-//! EOF; that custody belongs to the successor adapter that constructs the
-//! frames. It deliberately does not interpret DDL, triggers, foreign keys, or a
+//! EOF; that custody belongs to the internal provider adapter that constructs
+//! the frames. It deliberately does not interpret DDL, triggers, foreign keys, or a
 //! write graph, and it has no provider client, public tool route, custody, or
 //! mutation capability.
 
@@ -50,7 +50,7 @@ pub(crate) struct D1CatalogEvidencePlan {
     pub(crate) provider_byte_cap: usize,
 }
 
-/// Normalized evidence supplied only by a future provider-custody adapter.
+/// Normalized evidence supplied only by the internal provider-custody adapter.
 ///
 /// The adapter must allocate these identities before each physical request and
 /// must set `body_complete` only after reading the complete bounded body. The
@@ -71,7 +71,7 @@ pub(crate) struct D1CatalogObservationFrame<'a> {
 }
 
 impl<'a> D1CatalogObservationFrame<'a> {
-    /// Construct one normalized frame after the successor adapter has retained
+    /// Construct one normalized frame after the provider adapter has retained
     /// the corresponding provider-dispatch and complete-body evidence.
     ///
     /// Construction is intentionally crate-private and performs no provider or

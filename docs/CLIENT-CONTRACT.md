@@ -346,13 +346,21 @@ digest, custody, and no-retry semantics remain unchanged.
 The crate contains a side-effect-free, non-routed catalog evidence boundary for
 future guarded D1 write composition. It derives one immutable, target-bound
 `sqlite_schema` projection rather than accepting caller SQL or a generic
-provider envelope. A future provider-custody adapter must normalize two physical
-observations into the exact versioned projection payload and must bind each
-observation to the same canonical target and rederived plan using four distinct
-preallocated dispatch/read identities. The pure verifier cannot authenticate
-that a frame came from a physical provider dispatch or that the response reached
-EOF. It must consume frames only from that successor adapter after the adapter
-has retained those lifecycle facts.
+provider envelope. Its internal provider-custody adapter normalizes two physical
+observations into the exact versioned projection payload and binds each one to
+the same canonical target and rederived plan using four distinct dispatch/read
+identities preallocated before either request. The pure verifier cannot
+authenticate physical dispatch or response EOF by itself and accepts frames
+constructed only from this retained adapter custody.
+
+Each provider read is exactly one POST through the existing no-redirect
+Cloudflare client. The adapter binds the canonical account/database target,
+fixed query and its digest, plan digest, and exact row/byte caps to the request
+and response. It reads the raw provider body to EOF under the 4 MiB cap before
+strict envelope decoding, requires one successful result set with empty error
+evidence, and rejects network ambiguity, partial or oversized bodies, non-2xx
+status, malformed types, response-binding drift, identity reuse, and the
+1,001-row sentinel without a second attempt or retry.
 
 Each observation must prove a complete body under the exact 4 MiB byte cap, a
 literal `results_truncated=false` under the exact 1,001-row provider cap, and
@@ -365,11 +373,15 @@ deserialize to equal typed row vectors. The snapshot digest covers canonical
 JSON reserialization of that typed vector; equality of the original provider
 JSON bytes is neither required nor claimed.
 
-The resulting receipt contains only target/plan/query/snapshot and observation
-pair digests, counts, caps, and body sizes. It does not parse or authorize DDL,
-triggers, foreign keys, implicit writes, DML, provider dispatch/EOF authority,
-custody, or any mutation. No public MCP tool currently exposes this staged
-contract.
+The adapter receipt contains only target/plan/query digests and aggregate
+counts, caps, and body sizes; raw request or response content and private
+dispatch/read identities are omitted. Its owned result exposes two borrowed
+frames for the pure verifier only after both complete primary read-only reads
+pass custody checks. The verifier receipt contains only
+target/plan/query/snapshot and observation-pair digests, counts, caps, and body
+sizes. Neither receipt parses or authorizes DDL, triggers, foreign keys,
+implicit writes, DML, provider admission, custody outside these exact reads, or
+any mutation. No public MCP tool currently exposes this staged contract.
 
 ## Structured payload details for complex tools
 
