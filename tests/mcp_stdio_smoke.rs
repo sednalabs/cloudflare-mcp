@@ -68,14 +68,31 @@ fn lock_manifest_target_guard(lease_root: &Path) -> fs::File {
     fs::create_dir(lease_root).expect("create private target guard root");
     fs::set_permissions(lease_root, fs::Permissions::from_mode(0o700))
         .expect("make target guard root private");
+    let activation_guard = lease_root.join("target-identity-v2.guard.lock");
+    fs::write(&activation_guard, b"").expect("write activated-root guard fixture");
+    fs::set_permissions(&activation_guard, fs::Permissions::from_mode(0o600))
+        .expect("make activated-root guard fixture private");
     let activation_marker = lease_root.join("target-identity-v2.activation.json");
     fs::write(
         &activation_marker,
-        br#"{"root_audit":"empty_before_activation_v1","target_identity_contract":"lowercase_hyphenated_uuid_v1","version":1}"#,
+        br#"{"root_audit":"registered_namespaces_v2","target_identity_contract":"lowercase_hyphenated_uuid_v1","version":2}"#,
     )
     .expect("write activated-root fixture marker");
     fs::set_permissions(&activation_marker, fs::Permissions::from_mode(0o600))
         .expect("make activated-root fixture marker private");
+    let target_key_sha256 = sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000");
+    let registration = lease_root.join(format!(
+        "target-identity-v2.{target_key_sha256}.receipt.json"
+    ));
+    fs::write(
+        &registration,
+        format!(
+            "{{\"version\":1,\"target_identity_contract\":\"lowercase_hyphenated_uuid_v1\",\"target_key_sha256\":\"{target_key_sha256}\"}}"
+        ),
+    )
+    .expect("write activated-root target registration");
+    fs::set_permissions(&registration, fs::Permissions::from_mode(0o600))
+        .expect("make activated-root target registration private");
     let target = manifest_target_path(lease_root);
     fs::create_dir(&target).expect("create permanent target directory");
     fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
@@ -9619,6 +9636,203 @@ fn d1_apply_migration_manifest_live_rechecks_plan_and_stably_reads_back_before_r
             .expect("apply SQL")
             .contains(first_sql)
     );
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[cfg(unix)]
+#[test]
+fn d1_apply_migration_manifest_preserves_prelease_provider_calls_when_activation_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (base_url, requests) = spawn_fake_manifest_apply_api();
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-manifest-activation-provider-count-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create lease root");
+    fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+        .expect("make lease root private");
+
+    let legacy_target_hash = sha256_hex("acct-1\0123E4567-E89B-42D3-A456-426614174000");
+    let legacy_target = lease_root.join(format!("d1-migration-target-{legacy_target_hash}"));
+    fs::create_dir(&legacy_target).expect("install legacy alias target");
+    fs::set_permissions(&legacy_target, fs::Permissions::from_mode(0o700))
+        .expect("make legacy alias target private");
+
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let first_sql = "CREATE TABLE submissions(id TEXT);";
+    let second_sql = "ALTER TABLE submissions ADD COLUMN status TEXT;";
+    let manifest = json!([
+        {"name": "0001_initial.sql", "size_bytes": first_sql.len(), "sql_sha256": sha256_hex(first_sql), "sql": first_sql},
+        {"name": "0002_second.sql", "size_bytes": second_sql.len(), "sql_sha256": sha256_hex(second_sql), "sql": second_sql}
+    ]);
+    let dry = mcp.call_tool(
+        1850,
+        "d1_apply_migration_manifest",
+        json!({
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "migration_family": "newsletter-core",
+            "dry_run": true,
+            "manifest": manifest.clone(),
+        }),
+    );
+    let plan = structured_content(&dry)["plan_sha256"]
+        .as_str()
+        .expect("plan digest")
+        .to_string();
+    let live = mcp.call_tool(
+        1851,
+        "d1_apply_migration_manifest",
+        json!({
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "migration_family": "newsletter-core",
+            "manifest": manifest,
+            "approved_plan_sha256": plan.clone(),
+        }),
+    );
+    let content = structured_content(&live);
+    let text_payload: Value = serde_json::from_str(
+        live["result"]["content"][0]["text"]
+            .as_str()
+            .expect("activation failure text payload"),
+    )
+    .expect("decode activation failure text payload");
+    assert_eq!(
+        text_payload,
+        json!({
+            "error": {
+                "code": "d1.migration_lease_upgrade_activation_required",
+                "hint": "Stop predecessor writers, preserve and reconcile the old root separately, then configure every upgraded writer to one new private empty lease root. Do not create the activation marker manually.",
+                "message": "unversioned root contains custody evidence; activate this contract only on a fresh empty root",
+            },
+            "lease_retained": null,
+            "ok": false,
+            "operation": "d1_apply_migration_manifest",
+            "provider_calls": 2,
+            "provider_mutations": 0,
+            "status": "blocked",
+        }),
+        "the text payload must preserve the same physical provider-call count"
+    );
+    let mut normalized = content.clone();
+    let audit = normalized["audit"]
+        .as_object_mut()
+        .expect("activation failure audit");
+    let started = audit["started_at_unix_ms"]
+        .as_u64()
+        .expect("audit start time");
+    let completed = audit["completed_at_unix_ms"]
+        .as_u64()
+        .expect("audit completion time");
+    assert!(completed >= started);
+    audit.insert("started_at_unix_ms".to_string(), json!(0));
+    audit.insert("completed_at_unix_ms".to_string(), json!(0));
+    let correlation = audit["correlation"]
+        .as_object_mut()
+        .expect("audit correlation");
+    assert!(
+        correlation["correlation_id"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("cfmcp-")),
+        "{content}"
+    );
+    correlation.insert("correlation_id".to_string(), json!("<dynamic>"));
+
+    let target_key_sha256 = sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000");
+    let expected_target = json!({
+        "computed_plan_sha256": null,
+        "execution_manifest": [
+            {
+                "executed_size_bytes": 34,
+                "executed_sql_sha256": sha256_hex(first_sql),
+                "provider_statement_sha256": "958a306391e71977329fb06f900a7a53d37288ac61a894a6d6f05ce85031a30b",
+                "source_name": "0001_initial.sql",
+                "source_sql_sha256": sha256_hex(first_sql),
+                "transform_id": "identity-v1",
+                "transform_version": 1,
+            },
+            {
+                "executed_size_bytes": 47,
+                "executed_sql_sha256": sha256_hex(second_sql),
+                "provider_statement_sha256": "1e18e5eb9bd93d0b6b10c0082cc3f28102c632abdef3c92f6895817518896d3f",
+                "source_name": "0002_second.sql",
+                "source_sql_sha256": sha256_hex(second_sql),
+                "transform_id": "identity-v1",
+                "transform_version": 1,
+            }
+        ],
+        "manifest": [
+            {"name": "0001_initial.sql", "size_bytes": 34, "sql_sha256": sha256_hex(first_sql)},
+            {"name": "0002_second.sql", "size_bytes": 47, "sql_sha256": sha256_hex(second_sql)},
+        ],
+        "migration_family": "newsletter-core",
+        "migrations_table": "d1_migrations",
+        "supplied_plan_sha256": plan,
+        "target_key_sha256": target_key_sha256,
+    });
+    assert_eq!(
+        normalized,
+        json!({
+            "audit": {
+                "action": "d1_apply_migration_manifest",
+                "actor": "unknown",
+                "approval": null,
+                "completed_at_unix_ms": 0,
+                "correlation": {
+                    "correlation_id": "<dynamic>",
+                    "request_id": null,
+                    "session_id": null,
+                },
+                "dry_run": false,
+                "error_code": "d1.migration_lease_upgrade_activation_required",
+                "outcome": "error",
+                "started_at_unix_ms": 0,
+                "target": expected_target.clone(),
+            },
+            "dry_run": false,
+            "error": {
+                "code": "d1.migration_lease_upgrade_activation_required",
+                "hint": "Stop predecessor writers, preserve and reconcile the old root separately, then configure every upgraded writer to one new private empty lease root. Do not create the activation marker manually.",
+                "message": "unversioned root contains custody evidence; activate this contract only on a fresh empty root",
+            },
+            "lease_retained": null,
+            "ok": false,
+            "operation": "d1_apply_migration_manifest",
+            "plan": {
+                "operation": "d1_apply_migration_manifest",
+                "steps": [
+                    {"action": "validate_exact_manifest", "ordinal": 1, "side_effect": false, "target": expected_target.clone()},
+                    {"action": "read_stable_migration_ledger", "ordinal": 2, "side_effect": false, "target": expected_target},
+                    {"action": "preflight_existing_migration_target_custody", "ordinal": 3, "side_effect": false, "target": {"target": "account_database"}},
+                    {"action": "preflight_reserved_migration_ledger_authority", "ordinal": 4, "side_effect": false, "target": {"migrations_table": "d1_migrations"}},
+                ],
+            },
+            "provider_calls": 2,
+            "provider_mutations": 0,
+            "status": "blocked",
+        }),
+        "the full activation-failure payload must preserve its two physical pre-lease provider reads"
+    );
+    let observed = requests.lock().expect("request log").clone();
+    assert_eq!(
+        observed.len(),
+        3,
+        "one dry read plus two live authority reads"
+    );
+    assert!(
+        observed.iter().all(|request| !request["sql"]
+            .as_str()
+            .is_some_and(|sql| sql.contains("INSERT INTO \"d1_migrations\""))),
+        "activation failure must not issue a provider mutation"
+    );
+    mcp.terminate();
     let _ = fs::remove_dir_all(lease_root);
 }
 

@@ -8,7 +8,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::CallToolResult;
+use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::tool;
 use rmcp::tool_router;
 use schemars::JsonSchema;
@@ -1494,6 +1494,29 @@ fn missing_upstream_oauth_principal_result() -> CallToolResult {
             "hint": "Reconnect through the configured MCP authentication surface and retry."
         }
     }))
+}
+
+fn preserve_observed_provider_calls(
+    mut result: CallToolResult,
+    observed_provider_calls: u64,
+) -> CallToolResult {
+    let mut updated = false;
+    if let Some(Value::Object(content)) = result.structured_content.as_mut() {
+        let incumbent = content
+            .get("provider_calls")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if incumbent < observed_provider_calls {
+            content.insert("provider_calls".to_string(), json!(observed_provider_calls));
+            updated = true;
+        }
+    }
+    if updated {
+        if let Some(payload) = result.structured_content.as_ref() {
+            result.content = vec![ContentBlock::text(payload.to_string())];
+        }
+    }
+    result
 }
 
 #[tool_router(router = tool_router_cloudflare, vis = "pub")]
@@ -5233,10 +5256,10 @@ impl CloudflareMcp {
             args.approved_plan_sha256.as_deref(),
         ) {
             Ok(lease) => lease,
-            Err(result) => finish_manifest!(result),
+            Err(result) => finish_manifest!(preserve_observed_provider_calls(result, 2)),
         };
         if let Err(result) = lease.revalidate() {
-            finish_manifest!(result);
+            finish_manifest!(preserve_observed_provider_calls(result, 2));
         }
 
         let ledger = match read_stable_d1_migration_ledger(

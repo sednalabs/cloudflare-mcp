@@ -290,15 +290,23 @@ any active or retiring operation through its governed recovery path, and
 provision one new private empty `0700` root for all upgraded writers. On the
 first canonical target guard, the upgraded MCP holds
 `target-identity-v2.guard.lock`, exhaustively enumerates the root up to the
-finite custody limit, and creates the exact
-`target-identity-v2.activation.json` marker only when no other entry exists.
+finite custody limit, creates the target's exact create-only
+`target-identity-v2.<target-key-sha256>.receipt.json` registration, and creates
+the exact `target-identity-v2.activation.json` marker only after the root was
+proved empty before activation. After activation, every target must have its
+matching canonical registration. A stable bounded audit validates the marker,
+all registrations, all target directories, and every allowed custody entry;
+that audit is repeated at guard/lease revalidation, provider, persistence, and
+release boundaries.
 Canonical incumbent directories are intentionally rejected along with alias,
 active, retiring, retired, terminal, malformed, unreadable, symlink, and
 over-limit evidence: predecessor payloads contain only a target hash and cannot
 prove the UUID spelling that produced it. A failed activation does not clean up
 or migrate evidence. Do not manually create the marker, reuse the blocked root,
-or allow an older binary to open the activated root. This local activation has
-zero provider calls; it does not itself approve a D1 mutation.
+or allow an older binary to open the activated root. Draining every predecessor
+writer before cutover is an independent deployment prerequisite, not a
+substitute for these runtime audits. This local activation has zero provider
+calls; it does not itself approve a D1 mutation.
 
 The exact-byte manifest boundary accepts at most 16 MiB of aggregate SQL and
 moves the supplied manifest into validation without cloning its SQL strings.
