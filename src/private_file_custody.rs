@@ -100,7 +100,7 @@ impl std::error::Error for PrivateFileCustodyError {}
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
-    use libc::{O_CLOEXEC, O_DIRECTORY, O_NOFOLLOW, O_RDONLY};
+    use libc::{O_CLOEXEC, O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK, O_RDONLY};
     use std::ffi::{CString, OsStr, OsString};
     use std::fs::{self, File, Metadata, OpenOptions};
     use std::io;
@@ -260,7 +260,7 @@ mod linux {
     }
 
     fn open_regular(parent: &File, name: &OsStr) -> io::Result<File> {
-        open_at(parent, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        open_at(parent, name, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
     }
 
     fn classify_file_metadata(metadata: &Metadata) -> Result<(), PrivateFileCustodyError> {
@@ -508,10 +508,14 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::ffi::CString;
         use std::fs::Permissions;
         use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::{PermissionsExt, symlink};
-        use std::time::{SystemTime, UNIX_EPOCH};
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
         struct Fixture {
             base: PathBuf,
@@ -547,6 +551,24 @@ mod linux {
             fn drop(&mut self) {
                 let _ = fs::remove_dir_all(&self.base);
             }
+        }
+
+        fn replace_with_fifo(path: &Path) {
+            let path = CString::new(path.as_os_str().as_bytes()).expect("FIFO path");
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        }
+
+        fn bounded_custody_error(
+            operation: impl FnOnce() -> Result<(), PrivateFileCustodyError> + Send + 'static,
+        ) -> PrivateFileCustodyError {
+            let (sender, receiver) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = sender.send(operation());
+            });
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("custody operation must not block")
+                .expect_err("custody operation must fail closed")
         }
 
         #[test]
@@ -626,6 +648,35 @@ mod linux {
                 TrustedSqlArtifact::open(&hardlink_fixture.root, &hardlink_fixture.input)
                     .expect_err("hardlink ambiguity must fail"),
                 PrivateFileCustodyError::InputHardlinkAmbiguous
+            );
+        }
+
+        #[test]
+        fn fifo_candidates_fail_without_blocking_initial_or_revalidation_open() {
+            let initial = Fixture::new("initial-fifo");
+            fs::remove_file(&initial.input).expect("remove regular input");
+            replace_with_fifo(&initial.input);
+            let root = initial.root.clone();
+            let input = initial.input.clone();
+            assert_eq!(
+                bounded_custody_error(move || {
+                    TrustedSqlArtifact::open(&root, &input).map(|_| ())
+                }),
+                PrivateFileCustodyError::InputNotRegular
+            );
+
+            let revalidation = Fixture::new("revalidation-fifo");
+            let artifact = TrustedSqlArtifact::open(&revalidation.root, &revalidation.input)
+                .expect("open regular artifact");
+            fs::rename(
+                &revalidation.input,
+                revalidation.input.with_extension("old"),
+            )
+            .expect("displace regular input");
+            replace_with_fifo(&revalidation.input);
+            assert_eq!(
+                bounded_custody_error(move || artifact.read_for_upload().map(|_| ())),
+                PrivateFileCustodyError::InputNotRegular
             );
         }
 

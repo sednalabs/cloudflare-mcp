@@ -479,7 +479,7 @@ mod tests {
             format!("https://\u{ff45}vil.{ACCOUNT}.r2.cloudflarestorage.com/object?signature=x"),
             format!("https://user@{ACCOUNT}.r2.cloudflarestorage.com/object?signature=x"),
             format!("https://{ACCOUNT}.r2.cloudflarestorage.com:444/object?signature=x"),
-            format!("http://{ACCOUNT}.r2.cloudflarestorage.com/object?signature=x"),
+            format!("http://{ACCOUNT}.r2.cloudflarestorage.com/object?signature=x"), // DevSkim: ignore DS137138 -- parser-only rejection fixture; no request is sent
             format!("https://{ACCOUNT}.r2.cloudflarestorage.com/object"),
         ]
         .into_iter()
