@@ -11,6 +11,8 @@ use crate::d1_execute_write::D1WriteStatementKind;
 use crate::d1_reserved_relation_graph::D1WriteOperationForm;
 
 const MAX_SQL_BYTES: usize = 1024 * 1024;
+const MAX_SQL_TOKENS: usize = 65_536;
+const MAX_PARENTHESIS_DEPTH: usize = 256;
 const MAX_RELATION_BYTES: usize = 255;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,8 +27,10 @@ pub(crate) struct D1ClassifiedDml {
 pub(crate) enum D1DmlClassifierClassification {
     Empty,
     TooLarge,
+    TokenLimitExceeded,
     MultipleStatements,
     CommentOrQuotedIdentityUnsupported,
+    LexicalStructureUnsupported,
     UnsupportedStatement,
     TargetMissing,
     TargetInvalid,
@@ -74,96 +78,117 @@ pub(crate) fn classify_d1_dml(sql: &str) -> Result<D1ClassifiedDml, D1DmlClassif
             "exactly one D1 DML statement is required",
         ));
     }
-    let tokens = body.split_whitespace().collect::<Vec<_>>();
-    let first = tokens
-        .first()
-        .map(|value| value.to_ascii_uppercase())
-        .ok_or_else(|| error(D1DmlClassifierClassification::Empty, "D1 DML SQL was empty"))?;
-    let (kind, form, relation_index) = match first.as_str() {
-        "INSERT" => {
-            if upper(&tokens, 1) == Some("OR")
-                && upper(&tokens, 2) == Some("REPLACE")
-                && upper(&tokens, 3) == Some("INTO")
-            {
-                (
+    let tokens = tokenize_sql(body)?;
+    validate_parentheses(&tokens)?;
+    let (kind, form, relation_index) = if word_is(body, &tokens, 0, b"INSERT") {
+        if word_is(body, &tokens, 1, b"OR") {
+            if word_is(body, &tokens, 2, b"REPLACE") && word_is(body, &tokens, 3, b"INTO") {
+                Ok((
                     D1WriteStatementKind::Insert,
                     D1WriteOperationForm::InsertOrReplace,
                     4,
-                )
-            } else if upper(&tokens, 1) == Some("INTO") {
-                let form = if contains_upsert_do_update(body) {
-                    D1WriteOperationForm::UpsertDoUpdate
-                } else {
-                    D1WriteOperationForm::Insert
-                };
-                (D1WriteStatementKind::Insert, form, 2)
+                ))
             } else {
-                return Err(error(
+                Err(error(
                     D1DmlClassifierClassification::CompoundFormUnsupported,
                     "INSERT form was outside the closed D1 DML contract",
-                ));
+                ))
             }
+        } else if word_is(body, &tokens, 1, b"INTO") {
+            classify_insert_form(body, &tokens).map(|form| (D1WriteStatementKind::Insert, form, 2))
+        } else {
+            Err(error(
+                D1DmlClassifierClassification::CompoundFormUnsupported,
+                "INSERT form was outside the closed D1 DML contract",
+            ))
         }
-        "REPLACE" if upper(&tokens, 1) == Some("INTO") => (
-            D1WriteStatementKind::Replace,
-            D1WriteOperationForm::Replace,
-            2,
-        ),
-        "UPDATE" => {
-            if upper(&tokens, 1) == Some("OR") && upper(&tokens, 2) == Some("REPLACE") {
-                (
+    } else if word_is(body, &tokens, 0, b"REPLACE") {
+        if word_is(body, &tokens, 1, b"INTO") {
+            Ok((
+                D1WriteStatementKind::Replace,
+                D1WriteOperationForm::Replace,
+                2,
+            ))
+        } else {
+            Err(error(
+                D1DmlClassifierClassification::CompoundFormUnsupported,
+                "DML form was outside the closed contract",
+            ))
+        }
+    } else if word_is(body, &tokens, 0, b"UPDATE") {
+        if word_is(body, &tokens, 1, b"OR") {
+            if word_is(body, &tokens, 2, b"REPLACE") {
+                Ok((
                     D1WriteStatementKind::Update,
                     D1WriteOperationForm::UpdateOrReplace,
                     3,
-                )
+                ))
             } else {
-                (
-                    D1WriteStatementKind::Update,
-                    D1WriteOperationForm::Update,
-                    1,
-                )
+                Err(error(
+                    D1DmlClassifierClassification::CompoundFormUnsupported,
+                    "UPDATE conflict form was outside the closed D1 DML contract",
+                ))
             }
+        } else {
+            Ok((
+                D1WriteStatementKind::Update,
+                D1WriteOperationForm::Update,
+                1,
+            ))
         }
-        "DELETE" if upper(&tokens, 1) == Some("FROM") => (
-            D1WriteStatementKind::Delete,
-            D1WriteOperationForm::Delete,
-            2,
-        ),
-        "DELETE" | "REPLACE" => {
-            return Err(error(
+    } else if word_is(body, &tokens, 0, b"DELETE") {
+        if word_is(body, &tokens, 1, b"FROM") {
+            Ok((
+                D1WriteStatementKind::Delete,
+                D1WriteOperationForm::Delete,
+                2,
+            ))
+        } else {
+            Err(error(
                 D1DmlClassifierClassification::CompoundFormUnsupported,
                 "DML form was outside the closed contract",
-            ));
+            ))
         }
-        _ => {
-            return Err(error(
-                D1DmlClassifierClassification::UnsupportedStatement,
-                "D1 write SQL must be one supported INSERT, UPDATE, DELETE, or REPLACE form",
-            ));
-        }
-    };
+    } else {
+        Err(error(
+            D1DmlClassifierClassification::UnsupportedStatement,
+            "D1 write SQL must be one supported INSERT, UPDATE, DELETE, or REPLACE form",
+        ))
+    }?;
     let raw = tokens.get(relation_index).ok_or_else(|| {
         error(
             D1DmlClassifierClassification::TargetMissing,
             "D1 DML target relation was absent",
         )
     })?;
-    if raw.contains('(')
-        && !matches!(
-            kind,
-            D1WriteStatementKind::Insert | D1WriteStatementKind::Replace
-        )
-    {
+    if raw.kind != D1SqlTokenKind::Word {
         return Err(error(
             D1DmlClassifierClassification::TargetInvalid,
-            "D1 DML target relation used unsupported attached syntax",
+            "D1 DML target was not one canonical lowercase unqualified relation",
         ));
     }
-    let relation = raw.split_once('(').map_or(*raw, |(relation, _)| relation);
+    let relation = std::str::from_utf8(&body.as_bytes()[raw.start..raw.end]).map_err(|_| {
+        error(
+            D1DmlClassifierClassification::TargetInvalid,
+            "D1 DML target was not one canonical lowercase unqualified relation",
+        )
+    })?;
     if !valid_relation(relation) {
         return Err(error(
             D1DmlClassifierClassification::TargetInvalid,
             "D1 DML target was not one canonical lowercase unqualified relation",
+        ));
+    }
+    if symbol_is(&tokens, relation_index + 1, b'.')
+        || (symbol_is(&tokens, relation_index + 1, b'(')
+            && !matches!(
+                kind,
+                D1WriteStatementKind::Insert | D1WriteStatementKind::Replace
+            ))
+    {
+        return Err(error(
+            D1DmlClassifierClassification::TargetInvalid,
+            "D1 DML target relation used unsupported attached syntax",
         ));
     }
     Ok(D1ClassifiedDml {
@@ -173,23 +198,199 @@ pub(crate) fn classify_d1_dml(sql: &str) -> Result<D1ClassifiedDml, D1DmlClassif
     })
 }
 
-fn upper<'a>(tokens: &'a [&str], index: usize) -> Option<&'static str> {
-    match tokens
-        .get(index)
-        .map(|value| value.to_ascii_uppercase())?
-        .as_str()
-    {
-        "OR" => Some("OR"),
-        "REPLACE" => Some("REPLACE"),
-        "INTO" => Some("INTO"),
-        "FROM" => Some("FROM"),
-        _ => None,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum D1SqlTokenKind {
+    Word,
+    StringLiteral,
+    Symbol(u8),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct D1SqlToken {
+    kind: D1SqlTokenKind,
+    start: usize,
+    end: usize,
+}
+
+fn tokenize_sql(sql: &str) -> Result<Vec<D1SqlToken>, D1DmlClassifierError> {
+    let bytes = sql.as_bytes();
+    let mut tokens = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let kind = if bytes[index] == b'\'' {
+            index += 1;
+            let mut closed = false;
+            while index < bytes.len() {
+                if bytes[index] == b'\'' {
+                    if bytes.get(index + 1) == Some(&b'\'') {
+                        index += 2;
+                    } else {
+                        index += 1;
+                        closed = true;
+                        break;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            if !closed {
+                return Err(error(
+                    D1DmlClassifierClassification::LexicalStructureUnsupported,
+                    "D1 DML SQL contained an unterminated string literal",
+                ));
+            }
+            D1SqlTokenKind::StringLiteral
+        } else if bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_' {
+            index += 1;
+            while index < bytes.len()
+                && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+            {
+                index += 1;
+            }
+            D1SqlTokenKind::Word
+        } else if bytes[index].is_ascii_punctuation() {
+            index += 1;
+            D1SqlTokenKind::Symbol(bytes[start])
+        } else {
+            return Err(error(
+                D1DmlClassifierClassification::LexicalStructureUnsupported,
+                "D1 DML SQL contained unsupported non-ASCII syntax outside a string literal",
+            ));
+        };
+        if tokens.len() == MAX_SQL_TOKENS {
+            return Err(error(
+                D1DmlClassifierClassification::TokenLimitExceeded,
+                "D1 DML SQL exceeded the exact lexical token cap",
+            ));
+        }
+        tokens.push(D1SqlToken {
+            kind,
+            start,
+            end: index,
+        });
+    }
+    if tokens.is_empty() {
+        return Err(error(
+            D1DmlClassifierClassification::Empty,
+            "D1 DML SQL was empty",
+        ));
+    }
+    Ok(tokens)
+}
+
+fn validate_parentheses(tokens: &[D1SqlToken]) -> Result<(), D1DmlClassifierError> {
+    let mut depth = 0usize;
+    for token in tokens {
+        match token.kind {
+            D1SqlTokenKind::Symbol(b'(') => {
+                depth = depth.checked_add(1).ok_or_else(|| {
+                    error(
+                        D1DmlClassifierClassification::LexicalStructureUnsupported,
+                        "D1 DML SQL parenthesis depth was invalid",
+                    )
+                })?;
+                if depth > MAX_PARENTHESIS_DEPTH {
+                    return Err(error(
+                        D1DmlClassifierClassification::LexicalStructureUnsupported,
+                        "D1 DML SQL exceeded the exact parenthesis-depth cap",
+                    ));
+                }
+            }
+            D1SqlTokenKind::Symbol(b')') => {
+                depth = depth.checked_sub(1).ok_or_else(|| {
+                    error(
+                        D1DmlClassifierClassification::LexicalStructureUnsupported,
+                        "D1 DML SQL contained an unmatched closing parenthesis",
+                    )
+                })?;
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return Err(error(
+            D1DmlClassifierClassification::LexicalStructureUnsupported,
+            "D1 DML SQL contained an unmatched opening parenthesis",
+        ));
+    }
+    Ok(())
+}
+
+fn classify_insert_form(
+    sql: &str,
+    tokens: &[D1SqlToken],
+) -> Result<D1WriteOperationForm, D1DmlClassifierError> {
+    let mut depth = 0usize;
+    let mut conflict = None;
+    let mut action = None;
+    let mut ambiguous = false;
+    for (index, token) in tokens.iter().enumerate() {
+        match token.kind {
+            D1SqlTokenKind::Symbol(b'(') => depth += 1,
+            D1SqlTokenKind::Symbol(b')') => depth -= 1,
+            D1SqlTokenKind::Word if depth == 0 => {
+                if word_is(sql, tokens, index, b"ON")
+                    && word_is(sql, tokens, index + 1, b"CONFLICT")
+                {
+                    if conflict.replace(index).is_some() {
+                        ambiguous = true;
+                    }
+                }
+                if word_is(sql, tokens, index, b"DO")
+                    && (word_is(sql, tokens, index + 1, b"UPDATE")
+                        || word_is(sql, tokens, index + 1, b"NOTHING"))
+                {
+                    if action.replace(index).is_some() {
+                        ambiguous = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    match (conflict, action, ambiguous) {
+        (None, None, false) => Ok(D1WriteOperationForm::Insert),
+        (Some(conflict), Some(action), false) if action > conflict => {
+            if word_is(sql, tokens, action + 1, b"NOTHING") {
+                return Err(error(
+                    D1DmlClassifierClassification::CompoundFormUnsupported,
+                    "ON CONFLICT DO NOTHING is outside the closed D1 DML contract",
+                ));
+            }
+            if !word_is(sql, tokens, action + 1, b"UPDATE")
+                || !word_is(sql, tokens, action + 2, b"SET")
+                || tokens.get(action + 3).is_none()
+            {
+                return Err(error(
+                    D1DmlClassifierClassification::CompoundFormUnsupported,
+                    "ON CONFLICT DO UPDATE was truncated or outside the closed D1 DML contract",
+                ));
+            }
+            Ok(D1WriteOperationForm::UpsertDoUpdate)
+        }
+        _ => Err(error(
+            D1DmlClassifierClassification::CompoundFormUnsupported,
+            "ON CONFLICT action was absent, duplicated, reordered, or ambiguous",
+        )),
     }
 }
 
-fn contains_upsert_do_update(sql: &str) -> bool {
-    let upper = sql.to_ascii_uppercase();
-    upper.contains(" ON CONFLICT") && upper.contains(" DO UPDATE")
+fn word_is(sql: &str, tokens: &[D1SqlToken], index: usize, expected: &[u8]) -> bool {
+    tokens.get(index).is_some_and(|token| {
+        token.kind == D1SqlTokenKind::Word
+            && sql.as_bytes()[token.start..token.end].eq_ignore_ascii_case(expected)
+    })
+}
+
+fn symbol_is(tokens: &[D1SqlToken], index: usize, expected: u8) -> bool {
+    tokens
+        .get(index)
+        .is_some_and(|token| token.kind == D1SqlTokenKind::Symbol(expected))
 }
 
 fn valid_relation(value: &str) -> bool {
@@ -258,6 +459,104 @@ mod tests {
             assert_eq!(classified.form, form);
             assert_eq!(classified.relation, relation);
         }
+    }
+
+    #[test]
+    fn lexical_upsert_exposes_update_primitive_for_reserved_on_update_cascade() {
+        use crate::d1_reserved_relation_graph::{
+            D1RelationWriteOperation, required_relation_write_operations,
+        };
+
+        let sql = "iNsErT\tInTo parents(id) VALUES (?)\n  oN\r\nCoNfLiCt(id)\tDo\nUpDaTe\tSeT id=?";
+        let classified = classify_d1_dml(sql).expect("lexical UPSERT");
+        assert_eq!(classified.statement_kind, D1WriteStatementKind::Insert);
+        assert_eq!(classified.form, D1WriteOperationForm::UpsertDoUpdate);
+        assert_eq!(classified.relation, "parents");
+        assert_eq!(
+            required_relation_write_operations(classified.form).expect("closed primitive set"),
+            &[
+                D1RelationWriteOperation::Insert,
+                D1RelationWriteOperation::Update,
+            ],
+            "the update primitive must reach reserved-relation graph authority, including ON UPDATE CASCADE edges"
+        );
+    }
+
+    #[test]
+    fn keyword_like_string_content_does_not_create_compound_authority() {
+        let classified = classify_d1_dml(
+            "INSERT INTO reserved_child(note) VALUES ('ON CONFLICT DO UPDATE SET parent_id=1, ON UPDATE CASCADE')",
+        )
+        .expect("string content is not SQL keyword authority");
+        assert_eq!(classified.form, D1WriteOperationForm::Insert);
+        assert_eq!(classified.relation, "reserved_child");
+    }
+
+    #[test]
+    fn comments_remain_outside_the_closed_classifier_contract() {
+        for sql in [
+            "INSERT INTO stories(id) VALUES (?) ON/* bounded */CONFLICT(id) DO UPDATE SET id=?",
+            "INSERT INTO stories(id) VALUES (?) ON CONFLICT(id) -- action\nDO UPDATE SET id=?",
+            "INSERT INTO stories(id) VALUES ('comment -- marker')",
+        ] {
+            assert_eq!(
+                classify_d1_dml(sql)
+                    .expect_err("comments remain unsupported")
+                    .classification,
+                D1DmlClassifierClassification::CommentOrQuotedIdentityUnsupported,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_ambiguous_and_do_nothing_compounds_fail_closed() {
+        for sql in [
+            "INSERT INTO stories(id) VALUES (?) ON CONFLICT(id)",
+            "INSERT INTO stories(id) VALUES (?) ON CONFLICT(id) DO",
+            "INSERT INTO stories(id) VALUES (?) ON CONFLICT(id) DO UPDATE",
+            "INSERT INTO stories(id) VALUES (?) ON CONFLICT(id) DO UPDATE SET",
+            "INSERT INTO stories(id) VALUES (?) ON CONFLICT(id) DO NOTHING",
+            "INSERT INTO stories(id) VALUES (?) DO UPDATE SET id=?",
+            "INSERT INTO stories(id) VALUES (?) ON CONFLICT(id) DO UPDATE SET id=? ON CONFLICT(id) DO UPDATE SET id=?",
+            "INSERT OR IGNORE INTO stories(id) VALUES (?)",
+        ] {
+            assert_eq!(
+                classify_d1_dml(sql)
+                    .expect_err("unsupported compound must deny")
+                    .classification,
+                D1DmlClassifierClassification::CompoundFormUnsupported,
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_or_excessive_lexical_structure_fails_closed() {
+        for sql in [
+            "INSERT INTO stories(id VALUES (?)",
+            "INSERT INTO stories(id)) VALUES (?)",
+            "INSERT INTO stories(note) VALUES ('unterminated)",
+        ] {
+            assert_eq!(
+                classify_d1_dml(sql)
+                    .expect_err("malformed lexical structure must deny")
+                    .classification,
+                D1DmlClassifierClassification::LexicalStructureUnsupported,
+                "{sql}"
+            );
+        }
+
+        let token_exhaustion = format!(
+            "INSERT INTO stories(id) VALUES ({})",
+            "?,".repeat(MAX_SQL_TOKENS)
+        );
+        assert_eq!(
+            classify_d1_dml(&token_exhaustion)
+                .expect_err("bounded token stream must deny exhaustion")
+                .classification,
+            D1DmlClassifierClassification::TokenLimitExceeded
+        );
     }
 
     #[test]

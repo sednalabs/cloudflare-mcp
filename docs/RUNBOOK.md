@@ -96,6 +96,15 @@ composition digest. A live call must repeat every byte and identity and supply
 that digest. It recomputes catalog/graph/composition authority under the shared
 target guard, then durably installs one Prepared -> DispatchReserved
 compare-and-exchange before the only DML provider request.
+The pre-provider classifier uses a capped lexical token stream. An UPSERT must
+contain one balanced top-level `ON CONFLICT ... DO UPDATE SET` action; tabs,
+newlines, repeated ASCII whitespace, and keyword case are equivalent. String
+literals cannot create keyword authority. Comments remain unsupported, and
+`DO NOTHING`, truncated or duplicate actions, unbalanced/deep parentheses,
+token exhaustion, and unknown conflict forms stop before any catalog read.
+This exact `UpsertDoUpdate` form exposes both INSERT and UPDATE primitives to
+the reserved-relation graph, including UPDATE edges that cascade into a
+configured reserved relation.
 Fresh dry-run and live observation identities are expected to differ. The
 composition validates both complete observation receipts but hashes their
 stable catalog-authority projection, so an unchanged normalized snapshot and

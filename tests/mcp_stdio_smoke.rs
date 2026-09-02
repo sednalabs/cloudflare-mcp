@@ -18236,6 +18236,74 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
 
 #[cfg(unix)]
 #[test]
+fn d1_execute_write_compound_classifier_denials_are_pre_provider() {
+    let provider = TcpListener::bind("127.0.0.1:0").expect("bind no-call D1 provider witness");
+    provider
+        .set_nonblocking(true)
+        .expect("make D1 provider witness nonblocking");
+    let provider_url = format!(
+        "http://{}",
+        provider.local_addr().expect("D1 provider witness address")
+    );
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", provider_url),
+        (
+            "CLOUDFLARE_MCP_D1_RESERVED_RELATIONS",
+            "protected".to_string(),
+        ),
+    ]);
+
+    for (request_id, sql) in [
+        (
+            16,
+            "INSERT INTO example(id) VALUES (?) ON CONFLICT(id) DO NOTHING",
+        ),
+        (
+            17,
+            "INSERT INTO example(id) VALUES (?) ON\nCONFLICT(id) DO\tUPDATE",
+        ),
+        (
+            18,
+            "INSERT INTO example(id) VALUES (?) ON/* unsupported */CONFLICT(id) DO UPDATE SET id=?",
+        ),
+        (
+            19,
+            "INSERT INTO example(id) VALUES (?) ON CONFLICT(id) DO UPDATE SET",
+        ),
+    ] {
+        let response = mcp.call_tool(
+            request_id,
+            "d1_execute_write",
+            json!({
+                "database_id": "123e4567-e89b-42d3-a456-426614174000",
+                "sql": sql,
+                "operation_id": format!("operation-classifier-{request_id}"),
+                "execution_attempt_id": format!("attempt-classifier-{request_id}"),
+                "provider_request_id": format!("provider-classifier-{request_id}"),
+                "dry_run": true
+            }),
+        );
+        let content = structured_content(&response);
+        assert_eq!(content["ok"], json!(false), "{sql}: {content}");
+        assert_eq!(content["status"], json!("blocked"), "{content}");
+        assert_eq!(
+            content["error"]["code"],
+            json!("d1.execute_write_classifier_denied"),
+            "{sql}: {content}"
+        );
+        assert_eq!(content["provider_calls"], json!(0), "{content}");
+        assert_eq!(content["provider_mutations"], json!(0), "{content}");
+        assert!(
+            matches!(provider.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "compound classifier denial must occur before any provider connection: {sql}"
+        );
+    }
+
+    mcp.terminate();
+}
+
+#[cfg(unix)]
+#[test]
 fn curated_d1_guard_denials_are_pre_provider_and_caller_correlated() {
     let provider = TcpListener::bind("127.0.0.1:0").expect("bind no-call D1 provider witness");
     provider
