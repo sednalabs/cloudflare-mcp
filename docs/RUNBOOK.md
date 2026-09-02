@@ -102,6 +102,11 @@ newlines, repeated ASCII whitespace, and keyword case are equivalent. String
 literals cannot create keyword authority. Comments remain unsupported, and
 `DO NOTHING`, truncated or duplicate actions, unbalanced/deep parentheses,
 token exhaustion, and unknown conflict forms stop before any catalog read.
+Only plain `INSERT` may carry that UPSERT action. `INSERT OR REPLACE` and
+`REPLACE` fail closed on every top-level conflict/action suffix so an UPDATE
+effect cannot be omitted from the primitive product. Unquoted relations start
+with lowercase ASCII and retain lowercase ASCII, digits, `_`, and `$` as one
+exact identity; for example, `safe$protected` never degrades to `safe`.
 This exact `UpsertDoUpdate` form exposes both INSERT and UPDATE primitives to
 the reserved-relation graph, including UPDATE edges that cascade into a
 configured reserved relation.

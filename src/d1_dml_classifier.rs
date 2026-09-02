@@ -83,6 +83,7 @@ pub(crate) fn classify_d1_dml(sql: &str) -> Result<D1ClassifiedDml, D1DmlClassif
     let (kind, form, relation_index) = if word_is(body, &tokens, 0, b"INSERT") {
         if word_is(body, &tokens, 1, b"OR") {
             if word_is(body, &tokens, 2, b"REPLACE") && word_is(body, &tokens, 3, b"INTO") {
+                reject_wrapper_compound_suffix(body, &tokens)?;
                 Ok((
                     D1WriteStatementKind::Insert,
                     D1WriteOperationForm::InsertOrReplace,
@@ -104,6 +105,7 @@ pub(crate) fn classify_d1_dml(sql: &str) -> Result<D1ClassifiedDml, D1DmlClassif
         }
     } else if word_is(body, &tokens, 0, b"REPLACE") {
         if word_is(body, &tokens, 1, b"INTO") {
+            reject_wrapper_compound_suffix(body, &tokens)?;
             Ok((
                 D1WriteStatementKind::Replace,
                 D1WriteOperationForm::Replace,
@@ -248,7 +250,9 @@ fn tokenize_sql(sql: &str) -> Result<Vec<D1SqlToken>, D1DmlClassifierError> {
         } else if bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_' {
             index += 1;
             while index < bytes.len()
-                && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+                && (bytes[index].is_ascii_alphanumeric()
+                    || bytes[index] == b'_'
+                    || bytes[index] == b'$')
             {
                 index += 1;
             }
@@ -380,6 +384,20 @@ fn classify_insert_form(
     }
 }
 
+fn reject_wrapper_compound_suffix(
+    sql: &str,
+    tokens: &[D1SqlToken],
+) -> Result<(), D1DmlClassifierError> {
+    match classify_insert_form(sql, tokens)? {
+        D1WriteOperationForm::Insert => Ok(()),
+        D1WriteOperationForm::UpsertDoUpdate => Err(error(
+            D1DmlClassifierClassification::CompoundFormUnsupported,
+            "replacement wrappers cannot carry an ON CONFLICT action in the closed D1 DML contract",
+        )),
+        _ => unreachable!("insert compound recognizer returns only insert or upsert"),
+    }
+}
+
 fn word_is(sql: &str, tokens: &[D1SqlToken], index: usize, expected: &[u8]) -> bool {
     tokens.get(index).is_some_and(|token| {
         token.kind == D1SqlTokenKind::Word
@@ -400,9 +418,9 @@ fn valid_relation(value: &str) -> bool {
         && !value.contains('.')
         && value.to_ascii_lowercase() == value
         && bytes[0].is_ascii_lowercase()
-        && bytes
-            .iter()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+        && bytes.iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(*byte, b'_' | b'$')
+        })
 }
 
 fn error(
@@ -479,6 +497,95 @@ mod tests {
                 D1RelationWriteOperation::Update,
             ],
             "the update primitive must reach reserved-relation graph authority, including ON UPDATE CASCADE edges"
+        );
+    }
+
+    #[test]
+    fn replacement_wrappers_reject_every_compound_suffix_product() {
+        let suffixes = [
+            "ON CONFLICT(id) DO UPDATE SET id=?",
+            "ON CONFLICT(id) DO NOTHING",
+            "ON CONFLICT(id)",
+            "ON CONFLICT(id) DO",
+            "ON CONFLICT(id) DO UPDATE",
+            "ON CONFLICT(id) DO UPDATE SET",
+            "DO UPDATE SET id=?",
+            "DO NOTHING",
+            "DO UPDATE SET id=? ON CONFLICT(id)",
+            "ON CONFLICT(id) DO UPDATE SET id=? ON CONFLICT(id) DO UPDATE SET id=?",
+            "ON CONFLICT(id) DO UPDATE SET id=? ON CONFLICT(id) DO NOTHING",
+        ];
+        for wrapper in [
+            "INSERT OR REPLACE INTO parents(id) VALUES (?)",
+            "REPLACE INTO parents(id) VALUES (?)",
+        ] {
+            for suffix in suffixes {
+                let sql = format!("{wrapper} {suffix}");
+                assert_eq!(
+                    classify_d1_dml(&sql)
+                        .expect_err("replacement wrapper compound suffix must deny")
+                        .classification,
+                    D1DmlClassifierClassification::CompoundFormUnsupported,
+                    "{sql}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dollar_is_an_exact_unquoted_relation_continuation_across_write_forms() {
+        let cases = [
+            (
+                "INSERT INTO safe$protected(id) VALUES ($id)",
+                D1WriteOperationForm::Insert,
+            ),
+            (
+                "INSERT OR REPLACE INTO safe$protected(id) VALUES (?)",
+                D1WriteOperationForm::InsertOrReplace,
+            ),
+            (
+                "REPLACE INTO safe$protected(id) VALUES (?)",
+                D1WriteOperationForm::Replace,
+            ),
+            (
+                "UPDATE safe$protected SET id=?",
+                D1WriteOperationForm::Update,
+            ),
+            (
+                "UPDATE OR REPLACE safe$protected SET id=?",
+                D1WriteOperationForm::UpdateOrReplace,
+            ),
+            (
+                "DELETE FROM safe$protected WHERE id=?",
+                D1WriteOperationForm::Delete,
+            ),
+        ];
+        for (sql, form) in cases {
+            let classified = classify_d1_dml(sql).expect(sql);
+            assert_eq!(classified.relation, "safe$protected", "{sql}");
+            assert_eq!(classified.form, form, "{sql}");
+        }
+
+        for sql in [
+            "UPDATE $safe SET id=?",
+            "INSERT INTO $safe(id) VALUES (?)",
+            "DELETE FROM $safe WHERE id=?",
+            "UPDATE main.safe$protected SET id=?",
+            "UPDATE safe$protected.extra SET id=?",
+        ] {
+            assert_eq!(
+                classify_d1_dml(sql)
+                    .expect_err("dollar cannot begin a closed relation identity")
+                    .classification,
+                D1DmlClassifierClassification::TargetInvalid,
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            classify_d1_dml("UPDATE \"safe$protected\" SET id=?")
+                .expect_err("quoted dollar-bearing relation remains unsupported")
+                .classification,
+            D1DmlClassifierClassification::CommentOrQuotedIdentityUnsupported
         );
     }
 

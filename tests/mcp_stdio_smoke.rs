@@ -18268,6 +18268,40 @@ fn d1_execute_write_compound_classifier_denials_are_pre_provider() {
             19,
             "INSERT INTO example(id) VALUES (?) ON CONFLICT(id) DO UPDATE SET",
         ),
+        (
+            20,
+            "INSERT OR REPLACE INTO example(id) VALUES (?) ON CONFLICT(id) DO UPDATE SET id=?",
+        ),
+        (
+            21,
+            "INSERT OR REPLACE INTO example(id) VALUES (?) ON CONFLICT(id) DO NOTHING",
+        ),
+        (
+            22,
+            "INSERT OR REPLACE INTO example(id) VALUES (?) ON CONFLICT(id) DO",
+        ),
+        (
+            23,
+            "INSERT OR REPLACE INTO example(id) VALUES (?) ON CONFLICT(id) DO UPDATE SET id=? ON CONFLICT(id) DO UPDATE SET id=?",
+        ),
+        (
+            24,
+            "INSERT OR REPLACE INTO example(id) VALUES (?) DO UPDATE SET id=?",
+        ),
+        (
+            25,
+            "REPLACE INTO example(id) VALUES (?) ON CONFLICT(id) DO UPDATE SET id=?",
+        ),
+        (
+            26,
+            "REPLACE INTO example(id) VALUES (?) ON CONFLICT(id) DO NOTHING",
+        ),
+        (27, "REPLACE INTO example(id) VALUES (?) ON CONFLICT(id) DO"),
+        (
+            28,
+            "REPLACE INTO example(id) VALUES (?) ON CONFLICT(id) DO UPDATE SET id=? ON CONFLICT(id) DO UPDATE SET id=?",
+        ),
+        (29, "REPLACE INTO example(id) VALUES (?) DO UPDATE SET id=?"),
     ] {
         let response = mcp.call_tool(
             request_id,

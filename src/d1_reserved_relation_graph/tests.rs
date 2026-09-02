@@ -5,6 +5,7 @@ use crate::d1_catalog_evidence::{
     D1_CATALOG_PROVIDER_BYTE_CAP, D1_CATALOG_PROVIDER_ROW_CAP, D1CatalogObservationFrame,
     D1CatalogProjectionRow, derive_d1_catalog_evidence_plan, prove_d1_catalog_product,
 };
+use crate::d1_dml_classifier::classify_d1_dml;
 use crate::d1_target::{D1TargetIdentity, normalize_d1_target};
 
 const DATABASE_ID: &str = "123e4567-e89b-42d3-a456-426614174000";
@@ -796,6 +797,29 @@ fn compound_write_forms_expand_to_every_required_primitive() {
         &["reserved_child".to_string()],
     )
     .expect("operation-specific graph");
+    assert_eq!(
+        product.decision_for("parents", Update),
+        Some(D1ReservedRelationDecision::DenyReservedReachable),
+        "the UPDATE side of an upsert reaches the reserved child through ON UPDATE CASCADE"
+    );
+    for wrapper in [
+        "INSERT OR REPLACE INTO parents(id) VALUES (?)",
+        "REPLACE INTO parents(id) VALUES (?)",
+    ] {
+        for suffix in [
+            "ON CONFLICT(id) DO UPDATE SET id=?",
+            "ON CONFLICT(id) DO NOTHING",
+            "ON CONFLICT(id)",
+            "ON CONFLICT(id) DO UPDATE SET id=? ON CONFLICT(id) DO UPDATE SET id=?",
+            "DO UPDATE SET id=?",
+        ] {
+            let sql = format!("{wrapper} {suffix}");
+            assert!(
+                classify_d1_dml(&sql).is_err(),
+                "a replacement wrapper must not omit UPDATE authority for the reserved ON UPDATE CASCADE edge: {sql}"
+            );
+        }
+    }
     for form in [Replace, InsertOrReplace, UpsertDoUpdate] {
         let decisions = required_relation_write_operations(form)
             .expect("supported form")
@@ -856,6 +880,65 @@ fn compound_write_forms_expand_to_every_required_primitive() {
             D1ReservedRelationDecision::DenyReservedReachable,
         ]
     );
+}
+
+#[test]
+fn dollar_bearing_relations_keep_exact_reserved_and_near_collision_identity() {
+    use D1RelationWriteOperation::{Delete, Insert, Update};
+
+    let catalog = verified(vec![
+        table(1, "safe", Some("CREATE TABLE safe(id)")),
+        table(2, "safe$protected", Some("CREATE TABLE safe$protected(id)")),
+        table(3, "protected", Some("CREATE TABLE protected(id)")),
+    ]);
+    let exact_reserved =
+        derive_d1_reserved_relation_graph(&catalog, &["safe$protected".to_string()])
+            .expect("dollar-bearing reserved identity");
+
+    for sql in [
+        "INSERT INTO safe$protected(id) VALUES (?)",
+        "INSERT OR REPLACE INTO safe$protected(id) VALUES (?)",
+        "REPLACE INTO safe$protected(id) VALUES (?)",
+        "UPDATE safe$protected SET id=?",
+        "UPDATE OR REPLACE safe$protected SET id=?",
+        "DELETE FROM safe$protected WHERE id=?",
+    ] {
+        let classified = classify_d1_dml(sql).expect(sql);
+        assert_eq!(classified.relation, "safe$protected", "{sql}");
+        for operation in
+            required_relation_write_operations(classified.form).expect("closed operation product")
+        {
+            assert_eq!(
+                exact_reserved.decision_for(&classified.relation, *operation),
+                Some(D1ReservedRelationDecision::DenyReservedReachable),
+                "{sql}"
+            );
+        }
+    }
+    for relation in ["safe", "protected"] {
+        for operation in [Insert, Update, Delete] {
+            assert_eq!(
+                exact_reserved.decision_for(relation, operation),
+                Some(D1ReservedRelationDecision::Allow),
+                "near-collision relation must remain distinct: {relation}"
+            );
+        }
+    }
+
+    let near_collision_reserved =
+        derive_d1_reserved_relation_graph(&catalog, &["safe".to_string()])
+            .expect("near-collision reserved identity");
+    for operation in [Insert, Update, Delete] {
+        assert_eq!(
+            near_collision_reserved.decision_for("safe", operation),
+            Some(D1ReservedRelationDecision::DenyReservedReachable)
+        );
+        assert_eq!(
+            near_collision_reserved.decision_for("safe$protected", operation),
+            Some(D1ReservedRelationDecision::Allow),
+            "a dollar-bearing allowed relation must not collapse onto its reserved prefix"
+        );
+    }
 }
 
 #[test]
