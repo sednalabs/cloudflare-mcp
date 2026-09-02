@@ -24,6 +24,7 @@ use crate::cloudflare::model::{
     WorkerScript, WorkerSettings, ZoneIdentity,
 };
 use crate::config::{ApiTokenSource, CloudflareApiConfig};
+use crate::d1_opaque_identity::valid_d1_opaque_identity;
 use mcp_toolkit_observability::sanitize_error_message;
 
 #[derive(Debug, Clone, Serialize)]
@@ -945,16 +946,11 @@ impl CloudflareClient {
         };
         let account_id = require_non_empty("account_id", account_id).map_err(pre_dispatch)?;
         let database_id = require_non_empty("database_id", database_id).map_err(pre_dispatch)?;
-        if !(16..=128).contains(&provider_request_id.len())
-            || !provider_request_id
-                .as_bytes()
-                .iter()
-                .all(|byte| matches!(*byte, 0x21..=0x7e))
-        {
+        if !valid_d1_opaque_identity(provider_request_id) {
             return Err(pre_dispatch(AdapterError::new(
                 "cloudflare.invalid_argument",
                 "provider_request_id was not one bounded opaque HTTP identity",
-                "Use the exact preallocated printable ASCII identity already bound into attempt custody.",
+                "Use the exact 16..=128-byte [A-Za-z0-9._:-] identity already bound into attempt custody.",
             )));
         }
         if sql.trim().is_empty() {
@@ -5192,7 +5188,7 @@ mod tests {
 
     use super::{
         AdapterError, CloudflareApiError, CloudflareClient, D1_MIGRATION_JSON_MAX_CONTAINER_DEPTH,
-        D1_MIGRATION_RESPONSE_MAX_BYTES, D1MigrationManifestWriteLifecycle,
+        D1_MIGRATION_RESPONSE_MAX_BYTES, D1DmlWriteLifecycle, D1MigrationManifestWriteLifecycle,
         D1MigrationProviderError, D1MigrationProviderErrorLocation,
         D1MigrationReconciliationReadLifecycle, DuplicateSafeJsonError,
         classify_d1_migration_provider_error, decode_json_rejecting_duplicate_object_keys,
@@ -6303,6 +6299,97 @@ mod tests {
             duplicate.code,
             "cloudflare.d1.execute_write_duplicate_object_key"
         );
+    }
+
+    #[tokio::test]
+    async fn d1_dml_provider_adapter_rejects_noncanonical_request_id_before_dispatch() {
+        let client = CloudflareClient::new(test_config("http://127.0.0.1:9".to_string())) // DevSkim: ignore DS137138 -- reserved non-routable local test endpoint
+            .expect("D1 DML adapter client");
+        let invalid = [
+            "operation!fixture-0001".to_string(),
+            "operation/fixture-0001".to_string(),
+            "operation@fixture-0001".to_string(),
+            "A".repeat(15),
+            "z".repeat(129),
+        ];
+
+        for provider_request_id in invalid {
+            let error = client
+                .execute_d1_dml_write(
+                    "acct-1",
+                    "123e4567-e89b-42d3-a456-426614174000",
+                    &provider_request_id,
+                    "UPDATE example SET enabled = 1",
+                    &[],
+                )
+                .await
+                .expect_err("invalid provider request identity must fail before dispatch");
+            assert_eq!(error.error.code, "cloudflare.invalid_argument");
+            assert_eq!(error.lifecycle, D1DmlWriteLifecycle::pre_dispatch());
+            assert_eq!(error.lifecycle.provider_calls(), 0);
+            assert_eq!(error.lifecycle.provider_mutations(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn d1_dml_provider_adapter_accepts_canonical_request_id_boundaries() {
+        let observed = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed_for_route = observed.clone();
+        let router = Router::new().route(
+            "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
+            post(move |headers: HeaderMap| {
+                let observed = observed_for_route.clone();
+                async move {
+                    observed.lock().expect("request identity log").push(
+                        headers
+                            .get("x-client-request-id")
+                            .and_then(|value| value.to_str().ok())
+                            .expect("canonical provider request header")
+                            .to_string(),
+                    );
+                    Json(json!({
+                        "success": true,
+                        "errors": [],
+                        "messages": [],
+                        "result": [{
+                            "success": true,
+                            "errors": [],
+                            "results": [],
+                            "meta": {
+                                "served_by_primary": true,
+                                "changed_db": false,
+                                "changes": 0,
+                                "rows_written": 0
+                            }
+                        }]
+                    }))
+                }
+            }),
+        );
+        let client = CloudflareClient::new(test_config(spawn_router(router).await))
+            .expect("D1 DML adapter client");
+        let canonical = [
+            "A".repeat(16),
+            "z".repeat(128),
+            "Az09._:-Az09._:-".to_string(),
+        ];
+
+        for provider_request_id in &canonical {
+            let write = client
+                .execute_d1_dml_write(
+                    "acct-1",
+                    "123e4567-e89b-42d3-a456-426614174000",
+                    provider_request_id,
+                    "UPDATE example SET enabled = 1",
+                    &[],
+                )
+                .await
+                .expect("canonical provider request identity");
+            assert_eq!(write.lifecycle.provider_calls(), 1);
+            assert_eq!(write.lifecycle.provider_mutations(), 1);
+        }
+
+        assert_eq!(*observed.lock().expect("request identity log"), canonical);
     }
 
     #[test]

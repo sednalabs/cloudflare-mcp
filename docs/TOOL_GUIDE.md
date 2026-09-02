@@ -124,8 +124,9 @@ are added by the graph derivation.
 
 1. Allocate three pairwise-distinct opaque identities of 16-128 ASCII bytes
    containing only letters, digits, `.`, `_`, `:`, or `-`: operation,
-   execution attempt, and provider request. The public schema and early
-   preflight enforce the same custody grammar and reject unknown arguments.
+   execution attempt, and provider request. The public schema, early preflight,
+   durable custody, and final provider adapter enforce the same grammar; the
+   public schema also rejects unknown arguments.
    Never put recipient data, SQL, relation names, or credentials in these
    identities.
 2. Call `d1_execute_write` with `dry_run=true`. It performs exactly two

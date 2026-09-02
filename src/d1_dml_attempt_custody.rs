@@ -24,14 +24,13 @@ use sha2::{Digest, Sha256};
 use crate::d1_exact_plan_composition::{
     D1_EXACT_PLAN_COMPOSITION_OPERATION, D1ExactPlanCompositionProduct,
 };
+use crate::d1_opaque_identity::valid_d1_opaque_identity;
 use crate::d1_target::{D1TargetIdentity, normalize_d1_target};
 
 pub(crate) const D1_DML_ATTEMPT_CUSTODY_OPERATION: &str = "d1_dml_attempt_custody";
 
 const CUSTODY_VERSION: u8 = 1;
 const REQUIRED_COMPOSITION_VERSION: u8 = 1;
-const MAX_OPAQUE_IDENTITY_BYTES: usize = 128;
-const MIN_OPAQUE_IDENTITY_BYTES: usize = 16;
 pub(crate) const D1_DML_ATTEMPT_STATE_BYTE_CAP: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy)]
@@ -538,10 +537,7 @@ fn derive_attempt_binding(
         identities.execution_attempt_id,
         identities.provider_request_id,
     ];
-    if opaque
-        .iter()
-        .any(|value| !valid_d1_dml_opaque_identity(value))
-    {
+    if opaque.iter().any(|value| !valid_d1_opaque_identity(value)) {
         return Err(custody_error(
             D1DmlAttemptCustodyClassification::OpaqueIdentityInvalid,
             "preallocated attempt identities were not exact bounded opaque identifiers",
@@ -858,13 +854,6 @@ fn all_state_digests_are_valid(state: &D1DmlAttemptState) -> bool {
     ]
     .into_iter()
     .all(|value| valid_sha256(value))
-}
-
-pub(crate) fn valid_d1_dml_opaque_identity(value: &str) -> bool {
-    (MIN_OPAQUE_IDENTITY_BYTES..=MAX_OPAQUE_IDENTITY_BYTES).contains(&value.len())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
 }
 
 fn valid_sha256(value: &str) -> bool {

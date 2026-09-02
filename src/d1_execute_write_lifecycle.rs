@@ -16,7 +16,7 @@ use crate::d1_dml_attempt_custody::{
     D1DmlAttemptAmbiguity, D1DmlAttemptIdentities, D1DmlAttemptPhase,
     D1DmlProviderTerminalAssertion, D1DmlProviderTerminalClassification, prepare_d1_dml_attempt,
     prepare_d1_dml_dispatch_reservation_cas, record_d1_dml_attempt_ambiguity,
-    record_d1_dml_provider_terminal_assertion, valid_d1_dml_opaque_identity,
+    record_d1_dml_provider_terminal_assertion,
 };
 use crate::d1_dml_classifier::classify_d1_dml;
 use crate::d1_exact_plan_composition::compose_d1_exact_write_plan;
@@ -24,6 +24,7 @@ use crate::d1_execute_write::{
     D1_EXECUTE_WRITE_OPERATION, classify_d1_execute_write_result, derive_d1_execute_write_plan,
 };
 use crate::d1_migration_lease::{D1TargetMutationGuard, acquire_d1_target_mutation_guard};
+use crate::d1_opaque_identity::valid_d1_opaque_identity;
 use crate::d1_reserved_relation_graph::derive_d1_reserved_relation_graph;
 use crate::d1_target::D1TargetIdentity;
 use crate::mutation::{MutationAuditSession, MutationPlan, emit_mutation_audit_log};
@@ -354,7 +355,7 @@ fn validate_opaque_identities(
     ];
     if identities
         .iter()
-        .any(|value| !valid_d1_dml_opaque_identity(value))
+        .any(|value| !valid_d1_opaque_identity(value))
     {
         return Err((
             "d1.execute_write_opaque_identity_invalid",
