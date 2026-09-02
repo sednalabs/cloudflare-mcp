@@ -136,7 +136,7 @@ fn empty_dml_custody_authorization(target_key_sha256: &str) -> Value {
 }
 
 #[cfg(unix)]
-fn install_activated_manifest_root(lease_root: &Path) {
+fn install_activated_manifest_root_without_dml_layout(lease_root: &Path) {
     use std::os::unix::fs::PermissionsExt;
 
     fs::create_dir_all(lease_root).expect("create private target guard root");
@@ -169,13 +169,22 @@ fn install_activated_manifest_root(lease_root: &Path) {
         .expect("make activated-root target registration private");
 
     let target = manifest_target_path(lease_root);
-    fs::create_dir_all(&target).expect("create complete-audit target fixture");
+    fs::create_dir_all(&target).expect("create target fixture");
     fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
-        .expect("make complete-audit target fixture private");
+        .expect("make target fixture private");
     let target_guard = target.join("guard.lock");
-    fs::write(&target_guard, b"").expect("write complete-audit target guard");
+    fs::write(&target_guard, b"").expect("write target guard");
     fs::set_permissions(&target_guard, fs::Permissions::from_mode(0o600))
-        .expect("make complete-audit target guard private");
+        .expect("make target guard private");
+}
+
+#[cfg(unix)]
+fn install_activated_manifest_root(lease_root: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    install_activated_manifest_root_without_dml_layout(lease_root);
+    let target = manifest_target_path(lease_root);
+    let target_key_sha256 = sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000");
     let layout = target.join("dml-custody-v1");
     for directory in [
         layout.clone(),
@@ -524,7 +533,7 @@ impl McpStdioProcess {
                     && metadata.permissions().mode() & 0o777 == 0o700
             }) && fs::read_dir(root).is_ok_and(|mut entries| entries.next().is_none())
             {
-                install_activated_manifest_root(root);
+                install_activated_manifest_root_without_dml_layout(root);
             }
         }
         let exe = env!("CARGO_BIN_EXE_cloudflare-mcp");
@@ -7265,6 +7274,12 @@ fn d1_bootstrap_migration_ledger_dry_run_and_live_prove_one_initializer_only() {
     );
     assert_eq!(dry["response_evidence"].as_array().map(Vec::len), Some(2));
     let plan = dry["plan_sha256"].as_str().expect("bootstrap plan");
+    assert!(
+        !manifest_target_path(&lease_root)
+            .join("dml-custody-v1")
+            .exists(),
+        "dry-run and invalid bootstrap requests must not provision local DML custody"
+    );
 
     let live = mcp.call_tool(
         34,
@@ -7279,6 +7294,22 @@ fn d1_bootstrap_migration_ledger_dry_run_and_live_prove_one_initializer_only() {
     assert_eq!(live["status"], json!("applied_proven"));
     assert_eq!(live["provider_calls"], json!(7));
     assert_eq!(live["provider_mutations"], json!(1));
+    assert_eq!(
+        live["plan"]["steps"][3]["action"],
+        json!("ensure_d1_dml_custody_layout")
+    );
+    assert_eq!(
+        live["plan"]["steps"][3]["target"]["provider_dispatch_authority"],
+        json!("none")
+    );
+    assert_eq!(
+        live["plan"]["steps"][4]["action"],
+        json!("authorize_complete_d1_dml_custody")
+    );
+    assert_eq!(
+        live["plan"]["steps"][5]["action"],
+        json!("persist_initializer_attempt_authority")
+    );
     assert_eq!(
         live["provider_read_lifecycle"].as_array().map(Vec::len),
         Some(6),
@@ -7311,6 +7342,12 @@ fn d1_bootstrap_migration_ledger_dry_run_and_live_prove_one_initializer_only() {
     assert_eq!(
         live["post_write"]["target_inventory"]["state"],
         json!("canonical_ledger_only")
+    );
+    assert!(
+        manifest_target_path(&lease_root)
+            .join("dml-custody-v1/layout.json")
+            .is_file(),
+        "first live bootstrap must install the fixed layout before authority"
     );
     assert_released_manifest_target_custody(&lease_root);
 
@@ -9991,6 +10028,12 @@ fn d1_apply_migration_manifest_live_rechecks_plan_and_stably_reads_back_before_r
         dry_content["execution_manifest"][1]["executed_sql_sha256"],
         sha256_hex(executed_second_sql)
     );
+    assert!(
+        !manifest_target_path(&lease_root)
+            .join("dml-custody-v1")
+            .exists(),
+        "manifest dry run must not provision local DML custody"
+    );
     let live = mcp.call_tool(
         5,
         "d1_apply_migration_manifest",
@@ -10013,6 +10056,28 @@ fn d1_apply_migration_manifest_live_rechecks_plan_and_stably_reads_back_before_r
     assert_eq!(
         content["applied_migrations"][0]["sql_sha256"],
         json!(sha256_hex(&second_sql))
+    );
+    assert_eq!(
+        content["plan"]["steps"][4]["action"],
+        json!("ensure_d1_dml_custody_layout")
+    );
+    assert_eq!(
+        content["plan"]["steps"][4]["target"]["effect_scope"],
+        json!("local_custody_only")
+    );
+    assert_eq!(
+        content["plan"]["steps"][5]["action"],
+        json!("authorize_complete_d1_dml_custody")
+    );
+    assert_eq!(
+        content["plan"]["steps"][6]["action"],
+        json!("bind_exact_reviewed_plan")
+    );
+    assert!(
+        manifest_target_path(&lease_root)
+            .join("dml-custody-v1/layout.json")
+            .is_file(),
+        "first live manifest must install the fixed layout before authority"
     );
     assert_released_manifest_target_custody(&lease_root);
     let requests = requests.lock().expect("requests lock").clone();
@@ -10213,6 +10278,15 @@ fn d1_apply_migration_manifest_preserves_prelease_provider_calls_when_activation
                     {"action": "read_stable_migration_ledger", "ordinal": 2, "side_effect": false, "target": expected_target},
                     {"action": "preflight_existing_migration_target_custody", "ordinal": 3, "side_effect": false, "target": {"target": "account_database"}},
                     {"action": "preflight_reserved_migration_ledger_authority", "ordinal": 4, "side_effect": false, "target": {"migrations_table": "d1_migrations"}},
+                    {"action": "ensure_d1_dml_custody_layout", "ordinal": 5, "side_effect": true, "target": {
+                        "effect_scope": "local_custody_only",
+                        "provider_dispatch_authority": "none",
+                        "target_key_sha256": target_key_sha256,
+                    }},
+                    {"action": "authorize_complete_d1_dml_custody", "ordinal": 6, "side_effect": false, "target": {
+                        "binding": "migration_lease_payload",
+                        "target_key_sha256": target_key_sha256,
+                    }},
                 ],
             },
             "provider_calls": 2,
@@ -11569,8 +11643,8 @@ fn generic_manifest_tools_reject_the_reserved_bootstrap_family_before_any_effect
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
         target_entries,
-        std::collections::BTreeSet::from(["dml-custody-v1".to_string(), "guard.lock".to_string(),]),
-        "reserved-family rejection leaves only the preinstalled inert audit custody"
+        std::collections::BTreeSet::from(["guard.lock".to_string()]),
+        "reserved-family rejection leaves only the preinstalled permanent target guard"
     );
 
     mcp.terminate();
@@ -18341,7 +18415,7 @@ fn d1_rename_database_uses_patch_through_stdio_boundary() {
             .as_nanos()
     ));
     #[cfg(unix)]
-    install_activated_manifest_root(&lease_root);
+    install_activated_manifest_root_without_dml_layout(&lease_root);
     let mut mcp = McpStdioProcess::start_with_env(vec![
         ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
         (
@@ -18363,15 +18437,33 @@ fn d1_rename_database_uses_patch_through_stdio_boundary() {
     assert_eq!(content["database"]["name"], json!("renamed-db"));
     assert_eq!(
         content["plan"]["steps"][1]["action"],
-        json!("authorize_complete_d1_dml_custody")
+        json!("ensure_d1_dml_custody_layout")
+    );
+    assert_eq!(
+        content["plan"]["steps"][1]["target"]["effect_scope"],
+        json!("local_custody_only")
+    );
+    assert_eq!(
+        content["plan"]["steps"][1]["target"]["provider_dispatch_authority"],
+        json!("none")
     );
     assert_eq!(
         content["plan"]["steps"][2]["action"],
+        json!("authorize_complete_d1_dml_custody")
+    );
+    assert_eq!(
+        content["plan"]["steps"][3]["action"],
         json!("apply_d1_database_patch")
     );
     assert_eq!(
-        content["plan"]["steps"][1]["target"]["target_key_sha256"],
+        content["plan"]["steps"][2]["target"]["target_key_sha256"],
         json!(sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000"))
+    );
+    assert!(
+        manifest_target_path(&lease_root)
+            .join("dml-custody-v1/layout.json")
+            .is_file(),
+        "fresh rename must install the fixed layout before authorization"
     );
     let requests = requests.lock().expect("request log lock");
     assert_eq!(requests.len(), 1);
@@ -18397,7 +18489,7 @@ fn d1_delete_database_requires_token_and_deletes_through_stdio_boundary() {
             .as_nanos()
     ));
     #[cfg(unix)]
-    install_activated_manifest_root(&lease_root);
+    install_activated_manifest_root_without_dml_layout(&lease_root);
     let mut mcp = McpStdioProcess::start_with_env(vec![
         ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
         (
@@ -18438,11 +18530,25 @@ fn d1_delete_database_requires_token_and_deletes_through_stdio_boundary() {
     assert_eq!(content["result"]["deleted"], json!(true));
     assert_eq!(
         content["plan"]["steps"][1]["action"],
-        json!("authorize_complete_d1_dml_custody")
+        json!("ensure_d1_dml_custody_layout")
+    );
+    assert_eq!(
+        content["plan"]["steps"][1]["target"]["provider_dispatch_authority"],
+        json!("none")
     );
     assert_eq!(
         content["plan"]["steps"][2]["action"],
+        json!("authorize_complete_d1_dml_custody")
+    );
+    assert_eq!(
+        content["plan"]["steps"][3]["action"],
         json!("apply_d1_database_delete")
+    );
+    assert!(
+        manifest_target_path(&lease_root)
+            .join("dml-custody-v1/layout.json")
+            .is_file(),
+        "fresh delete must install the fixed layout before authorization"
     );
     let requests = requests.lock().expect("request log lock");
     assert_eq!(requests.len(), 1);

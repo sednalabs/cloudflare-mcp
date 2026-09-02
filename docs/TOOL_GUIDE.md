@@ -169,16 +169,21 @@ are added by the graph derivation.
    The fixed layout marker remains under its separate layout-snapshot cap;
    variable leaf artifacts are the globally budgeted graph. Target-wide
    authority accepts only the clean fixed-budget projection of this proof.
-   Migration lease acquisition persists its exact target/layout/budget/audit
-   identity in `active.lease.json`; retained recovery, terminal receipt,
-   restoration, and retirement re-audit it at their last owned boundary.
+   Fresh migration lease acquisition first installs or validates the fixed
+   empty layout under its held permanent target guard, then persists the exact
+   target/layout/budget/audit identity in `active.lease.json`; retained
+   recovery, terminal receipt, restoration, and retirement re-audit it at
+   their last owned boundary without creating or repairing layout evidence.
    Terminal receipts inherit the binding through `lease_payload_sha256`.
-   Curated database rename/delete bind the same aggregate identity into the
-   live mutation plan and require exact fresh re-audit immediately before the
-   provider request. Absent, changed, unstable, over-budget, malformed,
-   partial, orphaned, or otherwise reconciliation-required custody stops before
-   provider mutation. The audit still neither performs nor independently
-   authorizes a provider request, and ordinary DML remains affected-leaf scoped.
+   Fresh curated database rename/delete record
+   `ensure_d1_dml_custody_layout` as a local-custody-only step before binding
+   the same aggregate identity into the live mutation plan, then require exact
+   fresh re-audit immediately before the provider request. An existing hostile
+   or partial layout is never repaired. Absent retained/recovery layout,
+   changed, unstable, over-budget, malformed, partial, orphaned, or otherwise
+   reconciliation-required custody stops before provider mutation. The local
+   ensure step and the audit still confer no provider authority, and ordinary
+   DML remains affected-leaf scoped.
    A scratch name binds the record digest, exact incumbent-state digest, and
    canonical successor-state digest. An affected leaf may contain zero or one
    rederived-valid scratch for a record; duplicate successors, a wrong or stale

@@ -3928,6 +3928,9 @@ impl CloudflareMcp {
                 Ok(guard) => guard,
                 Err(result) => return Ok(finalize_mutation_result(result, &plan, audit, false)),
             };
+            if let Err(result) = guard.ensure_target_wide_d1_dml_custody_layout() {
+                return Ok(finalize_mutation_result(result, &plan, audit, false));
+            }
             let dml_custody_authorization = match guard.authorize_target_wide_d1_dml_custody() {
                 Ok(authorization) => authorization,
                 Err(result) => {
@@ -4067,6 +4070,9 @@ impl CloudflareMcp {
                 Ok(guard) => guard,
                 Err(result) => return Ok(finalize_mutation_result(result, &plan, audit, false)),
             };
+            if let Err(result) = guard.ensure_target_wide_d1_dml_custody_layout() {
+                return Ok(finalize_mutation_result(result, &plan, audit, false));
+            }
             let dml_custody_authorization = match guard.authorize_target_wide_d1_dml_custody() {
                 Ok(authorization) => authorization,
                 Err(result) => {
@@ -5270,6 +5276,26 @@ impl CloudflareMcp {
         {
             finish_manifest!(result);
         }
+
+        let target_key_sha256 = sha256_bytes_hex(format!("{account_id}\0{database_id}").as_bytes());
+        mutation_plan = mutation_plan
+            .step(
+                "ensure_d1_dml_custody_layout",
+                true,
+                json!({
+                    "target_key_sha256": target_key_sha256,
+                    "effect_scope": "local_custody_only",
+                    "provider_dispatch_authority": "none",
+                }),
+            )
+            .step(
+                "authorize_complete_d1_dml_custody",
+                false,
+                json!({
+                    "target_key_sha256": target_key_sha256,
+                    "binding": "migration_lease_payload",
+                }),
+            );
 
         let mut lease = match acquire_d1_migration_lease(
             account_id,
@@ -14150,14 +14176,27 @@ fn bind_complete_d1_dml_custody_before_side_effect(
         .iter()
         .position(|step| step.side_effect)
         .unwrap_or(plan.steps.len());
-    plan.steps.insert(
-        insertion,
-        MutationPlanStep {
-            ordinal: 0,
-            action: "authorize_complete_d1_dml_custody",
-            side_effect: false,
-            target: json!(authorization),
-        },
+    plan.steps.splice(
+        insertion..insertion,
+        [
+            MutationPlanStep {
+                ordinal: 0,
+                action: "ensure_d1_dml_custody_layout",
+                side_effect: true,
+                target: json!({
+                    "target_key_sha256": authorization.target_key_sha256,
+                    "layout_sha256": authorization.layout_sha256,
+                    "effect_scope": "local_custody_only",
+                    "provider_dispatch_authority": "none",
+                }),
+            },
+            MutationPlanStep {
+                ordinal: 0,
+                action: "authorize_complete_d1_dml_custody",
+                side_effect: false,
+                target: json!(authorization),
+            },
+        ],
     );
     for (index, step) in plan.steps.iter_mut().enumerate() {
         step.ordinal = (index.saturating_add(1)).min(u8::MAX as usize) as u8;

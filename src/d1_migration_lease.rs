@@ -670,6 +670,36 @@ impl D1TargetMutationGuard {
         }
     }
 
+    /// Install the fixed empty layout only for a fresh target-wide operation.
+    /// Retained/recovery callers deliberately do not use this path: absence in
+    /// those workflows is evidence loss and must remain fail-closed.
+    pub(crate) fn ensure_target_wide_d1_dml_custody_layout(&self) -> Result<(), CallToolResult> {
+        self.revalidate()?;
+        #[cfg(target_os = "linux")]
+        {
+            linux::ensure_d1_dml_custody_layout(&self.target, &self.target_key_sha256).map_err(
+                |message| {
+                    d1_target_guard_error(
+                        self.operation,
+                        "d1.target_wide_dml_custody_layout_unavailable",
+                        message,
+                        &self.target_key_sha256,
+                    )
+                },
+            )?;
+            self.revalidate()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(d1_target_guard_error(
+                self.operation,
+                "d1.target_guard_platform_unsupported",
+                "target-wide DML custody layout requires Linux dirfd-bound storage",
+                &self.target_key_sha256,
+            ))
+        }
+    }
+
     /// Separately owned target-wide audit for restore, activation, and other
     /// destructive-boundary workflows. The live path deliberately uses only
     /// affected-leaf audits.
@@ -2006,6 +2036,9 @@ pub(crate) fn d1_migration_lease_requirements(
             "layout_sha256": crate::d1_dml_custody_layout::D1_DML_CUSTODY_LAYOUT_SHA256,
             "audit_budget_version": crate::d1_dml_custody_layout::D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_VERSION,
             "audit_budget_sha256": crate::d1_dml_custody_layout::D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_SHA256,
+            "fresh_layout_provisioning": "under_held_target_guard_before_authorization",
+            "fresh_layout_provider_dispatch_authority": "none",
+            "retained_or_recovery_absence": "reconciliation_required_without_creation",
             "binding": "the exact clean complete-audit identity is persisted in the lease payload and therefore inherited by every terminal receipt through lease_payload_sha256",
             "last_boundary_revalidation": true,
             "provider_dispatch_authority_from_audit": false,
@@ -4953,6 +4986,9 @@ mod linux {
         )
         .map_err(|message| d1_lease_root_error("d1.migration_lease_custody_changed", message))?;
         maybe_pause_after_guard_for_test(&root_path);
+        ensure_d1_dml_custody_layout(&target, &target_hash).map_err(|message| {
+            d1_migration_dml_custody_error("d1.migration_dml_custody_layout_unavailable", message)
+        })?;
         let dml_custody_authorization = authorize_target_wide_d1_dml_custody(&target, &target_hash)
             .map_err(|message| {
                 d1_migration_dml_custody_error("d1.migration_dml_custody_unproven", message)
@@ -7179,6 +7215,102 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn fresh_target_wide_layout_provisioning_rejects_hostile_evidence_without_repair() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = private_unactivated_test_root("target-wide-hostile-layout");
+        let guard = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_delete_database",
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect("acquire fresh target guard");
+        let layout = root.join(&guard.target_name).join("dml-custody-v1");
+        fs::create_dir(&layout).expect("install hostile layout directory");
+        fs::set_permissions(&layout, fs::Permissions::from_mode(0o700))
+            .expect("make hostile layout private");
+        let marker = layout.join("layout.json");
+        fs::write(&marker, b"{\"version\":1}\n").expect("install hostile marker");
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o600))
+            .expect("make hostile marker private");
+
+        let error = guard
+            .ensure_target_wide_d1_dml_custody_layout()
+            .expect_err("hostile layout must not be repaired")
+            .structured_content
+            .expect("structured hostile-layout error");
+        assert_eq!(error["operation"], json!("d1_delete_database"));
+        assert_eq!(
+            error["error"]["code"],
+            json!("d1.target_guard_custody_changed")
+        );
+        assert_eq!(error["provider_mutations"], json!(0));
+        assert_eq!(
+            fs::read(&marker).expect("read unchanged hostile marker"),
+            b"{\"version\":1}\n",
+            "fresh provisioning must not replace or repair existing evidence"
+        );
+        assert!(
+            !root
+                .join(&guard.target_name)
+                .join(ACTIVE_LEASE_NAME)
+                .exists()
+        );
+        drop(guard);
+        fs::remove_dir_all(root).expect("hostile-layout cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_reconciliation_does_not_recreate_an_absent_dml_layout() {
+        let root = private_test_root("retained-absent-dml-layout");
+        let plan = "a".repeat(64);
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("create retained fixture authority");
+        let nonce = owner.identity.nonce.clone();
+        let payload_sha256 = owner.identity.payload_sha256.clone();
+        let target = owner
+            .active_path_for_test()
+            .expect("retained active path")
+            .parent()
+            .expect("retained target directory")
+            .to_path_buf();
+        owner.retain();
+        fs::remove_dir_all(target.join("dml-custody-v1")).expect("simulate restored layout loss");
+
+        let error = inspect_retained_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+            &nonce,
+            &payload_sha256,
+        )
+        .expect_err("retained reconciliation must fail closed on absent layout")
+        .structured_content
+        .expect("structured retained-layout error");
+        assert_eq!(
+            error["error"]["code"],
+            json!("d1.migration_reconciliation_lease_changed")
+        );
+        assert_eq!(error["provider_calls"], json!(0));
+        assert!(
+            !target.join("dml-custody-v1").exists(),
+            "read-only retained inspection must not recreate custody"
+        );
+        fs::remove_dir_all(root).expect("retained-layout cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn complete_dml_audit_enforces_each_global_budget_at_the_exact_boundary() {
         use crate::d1_dml_identity_claimant::D1DmlIdentityNamespace;
 
@@ -7880,6 +8012,9 @@ mod tests {
                     "layout_sha256": crate::d1_dml_custody_layout::D1_DML_CUSTODY_LAYOUT_SHA256,
                     "audit_budget_version": crate::d1_dml_custody_layout::D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_VERSION,
                     "audit_budget_sha256": crate::d1_dml_custody_layout::D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_SHA256,
+                    "fresh_layout_provisioning": "under_held_target_guard_before_authorization",
+                    "fresh_layout_provider_dispatch_authority": "none",
+                    "retained_or_recovery_absence": "reconciliation_required_without_creation",
                     "binding": "the exact clean complete-audit identity is persisted in the lease payload and therefore inherited by every terminal receipt through lease_payload_sha256",
                     "last_boundary_revalidation": true,
                     "provider_dispatch_authority_from_audit": false,

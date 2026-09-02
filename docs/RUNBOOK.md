@@ -119,15 +119,20 @@ set counts and always declares
 `provider_dispatch_authority=none`. Target-wide authority accepts only a clean
 fixed-budget projection of that receipt: no Pending claimant, CAS scratch,
 partial/orphan/unmatched set, unmatched attempt, malformed artifact, or
-nonfixed layout/budget identity. Migration lease acquisition runs that proof
-before creating `active.lease.json`, persists the exact audit identity in the
-lease payload, and re-runs it at provider, receipt-persistence, restoration,
-and retirement boundaries. Because terminal receipts bind
-`lease_payload_sha256`, they also bind the exact complete-audit identity.
-Curated database rename and delete add the same identity to their live
-mutation plan and require an exact fresh re-audit immediately before the
-provider call. Missing, changed, unstable, over-budget, or merely
-reconciliation-required evidence stops with zero provider mutations. The
+nonfixed layout/budget identity. Fresh migration lease acquisition first
+installs or validates the fixed empty layout under the already-held permanent
+target guard, then runs that proof before creating `active.lease.json`. It
+persists the exact audit identity in the lease payload and re-runs it at
+provider, receipt-persistence, restoration, and retirement boundaries. Because
+terminal receipts bind `lease_payload_sha256`, they also bind the exact
+complete-audit identity.
+Curated database rename and delete use the same fresh-only layout step, add it
+before the audit identity in their live mutation plan, and require an exact
+fresh re-audit immediately before the provider call. The layout step is local
+custody maintenance and declares no provider-dispatch authority. Retained and
+recovery workflows never install or repair a missing layout: missing, changed,
+unstable, over-budget, or merely reconciliation-required evidence stops with
+zero provider mutations. The
 audit alone still performs or authorizes no provider dispatch. The
 complete pass has a fixed, versioned DML-specific global budget: at most 16,384
 canonical leaves, 65,536 physical leaf artifacts, and 268,435,456 total
@@ -349,16 +354,21 @@ failure reports the invoked curated tool as its operation and zero provider
 calls/mutations; preserve that caller-correlated receipt when diagnosing the
 contention.
 
-Before rename, delete, migration activation, retained-evidence reconciliation,
-terminal receipt persistence, rollback restoration, or retirement, the target
-must already contain the exact `dml-custody-v1` layout and its stable complete
-audit must be clean. An absent layout is not an empty/default state. The live
-rename/delete plan exposes `authorize_complete_d1_dml_custody` with only the
-aggregate target/layout/budget/audit identity. Migration lease bytes carry the
-same identity; recovery rejects legacy, malformed, or changed lease bytes and
-re-audits current physical custody under the held guard. Do not copy an audit
-digest between targets or runs. Ordinary `d1_execute_write` remains leaf-scoped
-and does not pay for or inherit this target-wide authority gate.
+Fresh rename, delete, manifest, and bootstrap acquisition may create only the
+fixed empty `dml-custody-v1` layout, under the already-held permanent target
+guard and before any complete-audit authorization. Their live plans record
+`ensure_d1_dml_custody_layout` as `local_custody_only` with
+`provider_dispatch_authority=none`, followed by
+`authorize_complete_d1_dml_custody`. An existing layout must validate exactly;
+these paths do not replace, flatten, or repair hostile or partial evidence.
+Retained-evidence reconciliation, terminal receipt persistence, rollback
+restoration, and retirement require the layout to remain present and exact;
+absence is evidence loss, not an empty/default state, and those paths create
+nothing. Migration lease bytes carry the exact audit identity; recovery rejects
+legacy, malformed, absent, or changed custody and re-audits current physical
+custody under the held guard. Do not copy an audit digest between targets or
+runs. Ordinary `d1_execute_write` remains leaf-scoped and does not pay for or
+inherit this target-wide authority gate.
 
 Generic `api_mutate` is not a fallback for an existing D1 target. Delete,
 export, import, query/raw query, time-travel restore, full update and partial
