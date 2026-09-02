@@ -246,7 +246,12 @@ impl D1TargetWideExecutionEvidence {
 mod tests {
     use super::*;
 
+    fn synthetic_target_key_sha256() -> String {
+        sha256_bytes_hex(b"synthetic D1 target identity")
+    }
+
     fn delete_plan(reason: &str) -> D1TargetWideIntendedPlan {
+        let target_key_sha256 = synthetic_target_key_sha256();
         d1_target_wide_intended_plan(
             "d1_delete_database",
             "validate_d1_database_delete",
@@ -255,7 +260,7 @@ mod tests {
                 "database_id": "123e4567-e89b-42d3-a456-426614174000",
                 "reason": reason,
             }),
-            "dbeab59836ebd924d37dc2c8eeaff10030f958c7991abe56352a2cc849efd737", // DevSkim: ignore DS173237 -- synthetic public target digest, not a credential
+            &target_key_sha256,
             "apply_d1_database_delete",
             json!({
                 "method": "DELETE",
@@ -268,7 +273,7 @@ mod tests {
     fn delete_consent_binds_every_static_plan_layer() {
         let baseline = delete_plan("retire synthetic fixture");
         let baseline_token = baseline.confirmation_token();
-        let target_key_sha256 = "dbeab59836ebd924d37dc2c8eeaff10030f958c7991abe56352a2cc849efd737"; // DevSkim: ignore DS173237 -- synthetic public target digest, not a credential
+        let target_key_sha256 = synthetic_target_key_sha256();
         assert_eq!(
             serde_json::to_value(&baseline.plan).expect("serialize intended plan"),
             json!({
