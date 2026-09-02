@@ -19188,10 +19188,8 @@ fn curated_d1_guard_denials_are_pre_provider_and_caller_correlated() {
     provider
         .set_nonblocking(true)
         .expect("make D1 provider witness nonblocking");
-    let provider_url = format!(
-        "http://{}",
-        provider.local_addr().expect("D1 provider witness address")
-    );
+    let provider_address = provider.local_addr().expect("D1 provider witness address");
+    let provider_url = format!("http://{provider_address}"); // DevSkim: ignore DS137138 -- loopback-only no-call test witness
     let lease_root = PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-d1-curated-guard-denial-{}-{}",
         std::process::id(),
