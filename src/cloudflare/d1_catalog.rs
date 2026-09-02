@@ -23,7 +23,7 @@ use crate::d1_catalog_evidence::{
 };
 use crate::d1_target::D1TargetIdentity;
 
-const D1_CATALOG_PROVIDER_CUSTODY_VERSION: u8 = 2;
+const D1_CATALOG_PROVIDER_CUSTODY_VERSION: u8 = 3;
 const D1_CATALOG_PROVIDER_CUSTODY_OPERATION: &str = "d1_catalog_provider_custody";
 
 static D1_CATALOG_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -615,18 +615,39 @@ struct D1CatalogProviderMetadata {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct D1CatalogProviderRow {
+    schema_rowid: i64,
+    fact_order: u8,
     fact_kind: String,
+    relation_type_storage_class: String,
+    relation_type_value_hex: String,
     relation_type: String,
+    relation_name_storage_class: String,
     relation_name_hex: String,
+    owner_name_storage_class: String,
     owner_name_hex: String,
-    parent_name_hex: String,
-    foreign_key_id: i64,
-    foreign_key_seq: i64,
-    on_update: String,
-    on_delete: String,
-    conservative_blocker: String,
+    schema_sql_storage_class: String,
     table_sql_token_source_is_null: u8,
     table_sql_token_source_hex: String,
+    foreign_key_id_storage_class: String,
+    foreign_key_id_value_hex: String,
+    foreign_key_id: i64,
+    foreign_key_seq_storage_class: String,
+    foreign_key_seq_value_hex: String,
+    foreign_key_seq: i64,
+    parent_name_storage_class: String,
+    parent_name_hex: String,
+    from_column_storage_class: String,
+    from_column_hex: String,
+    to_column_storage_class: String,
+    to_column_is_null: u8,
+    to_column_hex: String,
+    on_update_storage_class: String,
+    on_update_hex: String,
+    on_delete_storage_class: String,
+    on_delete_hex: String,
+    match_storage_class: String,
+    match_hex: String,
+    conservative_blocker: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1003,18 +1024,39 @@ mod tests {
                 .collect::<String>()
         };
         json!({
+            "schema_rowid": 1,
+            "fact_order": 0,
             "fact_kind": "relation",
+            "relation_type_storage_class": "text",
+            "relation_type_value_hex": hex("table"),
             "relation_type": "table",
+            "relation_name_storage_class": "text",
             "relation_name_hex": hex(name),
-            "owner_name_hex": "",
-            "parent_name_hex": "",
-            "foreign_key_id": -1,
-            "foreign_key_seq": -1,
-            "on_update": "",
-            "on_delete": "",
-            "conservative_blocker": "",
+            "owner_name_storage_class": "text",
+            "owner_name_hex": hex(name),
+            "schema_sql_storage_class": "text",
             "table_sql_token_source_is_null": 0,
-            "table_sql_token_source_hex": hex("CREATE TABLE item (id INTEGER)")
+            "table_sql_token_source_hex": hex("CREATE TABLE item (id INTEGER)"),
+            "foreign_key_id_storage_class": "not_applicable",
+            "foreign_key_id_value_hex": "",
+            "foreign_key_id": -1,
+            "foreign_key_seq_storage_class": "not_applicable",
+            "foreign_key_seq_value_hex": "",
+            "foreign_key_seq": -1,
+            "parent_name_storage_class": "not_applicable",
+            "parent_name_hex": "",
+            "from_column_storage_class": "not_applicable",
+            "from_column_hex": "",
+            "to_column_storage_class": "not_applicable",
+            "to_column_is_null": 1,
+            "to_column_hex": "",
+            "on_update_storage_class": "not_applicable",
+            "on_update_hex": "",
+            "on_delete_storage_class": "not_applicable",
+            "on_delete_hex": "",
+            "match_storage_class": "not_applicable",
+            "match_hex": "",
+            "conservative_blocker": ""
         })
     }
 
@@ -1073,8 +1115,8 @@ mod tests {
 
         assert_eq!(bodies.lock().expect("bodies").len(), 2);
         assert_eq!(custody_receipt.provider_calls, 2);
-        assert_eq!(custody_receipt.version, 2);
-        assert_eq!(custody_receipt.projection_version, 2);
+        assert_eq!(custody_receipt.version, 3);
+        assert_eq!(custody_receipt.projection_version, 3);
         assert_eq!(custody_receipt.complete_response_bodies, 2);
         assert_eq!(custody_receipt.primary_read_only_observations, 2);
         assert_eq!(custody_receipt.preallocated_dispatch_identities, 2);

@@ -951,13 +951,23 @@ origin or EOF outside the trusted HTTP adapter lifecycle. Errors remain
 content-free and omit request/provider bodies and private identities.
 
 This contract only establishes that two adapter-issued frames contain one
-stable canonical typed version-2 catalog projection. The fixed query obtains
-relation type/name and trigger ownership from `sqlite_schema`, and foreign-key
-child/parent/id/sequence/update/delete facts from the
-`pragma_foreign_key_list()` table-valued function. It retains SQL bytes only for
-table relations as a later AUTOINCREMENT token source. View SQL and trigger
-bodies are excluded. Unresolved parents or owners and structurally unproven
-view/trigger write semantics remain explicit conservative blockers.
+stable canonical typed version-3 catalog projection. The fixed query first
+enumerates every physical `sqlite_schema` row with rowid, storage classes, and
+exact hex bytes for type/name/owner. It does not filter malformed type rows or
+erase TEXT/BLOB/integer distinctions with an unmarked cast. Only unique,
+printable-ASCII TEXT table names whose catalog fields are structurally valid may
+reach the `pragma_foreign_key_list()` table-valued function; all other schema
+rows remain ordered explicit blockers.
+
+Foreign-key facts contain child/parent, native typed id/sequence, `from`, `to`,
+update/delete actions, and match mode with their exact storage classes and bytes.
+Treat `to=NULL` and an empty TEXT target as different evidence. Composite
+constraints require contiguous sequence cardinality and stable shared
+parent/action/match facts. The projection retains SQL bytes only for valid table
+relations as a later AUTOINCREMENT token source. View SQL and trigger bodies are
+excluded. Unresolved parents or owners, malformed or aliased catalog rows, and
+structurally unproven view/trigger write semantics remain conservative blockers.
+The row sentinel covers schema and foreign-key/blocker facts together.
 
 The internal opaque verifier product may be handed only to later pure
 consumers. Its aggregate-safe receipt counts fact families and blockers but
