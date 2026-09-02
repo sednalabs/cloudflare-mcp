@@ -243,7 +243,7 @@ pub(crate) struct D1CatalogEvidencePlan {
     pub(crate) database_id: String,
     pub(crate) target_key_sha256: String,
     pub(crate) projection_version: u8,
-    pub(crate) projection_fields: [&'static str; 33],
+    pub(crate) projection_fields: &'static [&'static str],
     pub(crate) query: &'static str,
     pub(crate) query_sha256: String,
     pub(crate) query_size_bytes: usize,
@@ -455,7 +455,7 @@ pub(crate) fn derive_d1_catalog_evidence_plan(
         database_id: target.database_id.clone(),
         target_key_sha256: target.target_key_sha256(),
         projection_version: D1_CATALOG_PROJECTION_VERSION,
-        projection_fields: [
+        projection_fields: &[
             "schema_rowid",
             "fact_order",
             "fact_kind",
