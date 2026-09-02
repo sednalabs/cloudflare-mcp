@@ -74,7 +74,7 @@ fn provider(
 ) -> D1DmlProviderTerminalInput<'static> {
     D1DmlProviderTerminalInput {
         classification,
-        evidence_sha256: "c7f5d535682bd811b78a9e24713c7d3d5ceb4d7f610e029bf1e8e6b716e1728a",
+        evidence_sha256: "c7f5d535682bd811b78a9e24713c7d3d5ceb4d7f610e029bf1e8e6b716e1728a", // DevSkim: ignore DS173237 -- synthetic SHA-256 fixture, not a credential
     }
 }
 
@@ -83,8 +83,8 @@ fn readback(
 ) -> D1DmlReadbackTerminalInput<'static> {
     D1DmlReadbackTerminalInput {
         classification,
-        readback_plan_sha256: "6228db33999b0b4c59b8cfcfa2770b1e32e9a7c46bf7bbaf52d0faed35df4740",
-        evidence_sha256: "8093454f4277a9c50ce2cd7c931e650c3639b88e00d2dfb0034e8a2117c49d2a",
+        readback_plan_sha256: "6228db33999b0b4c59b8cfcfa2770b1e32e9a7c46bf7bbaf52d0faed35df4740", // DevSkim: ignore DS173237 -- synthetic SHA-256 fixture, not a credential
+        evidence_sha256: "8093454f4277a9c50ce2cd7c931e650c3639b88e00d2dfb0034e8a2117c49d2a", // DevSkim: ignore DS173237 -- synthetic SHA-256 fixture, not a credential
     }
 }
 
