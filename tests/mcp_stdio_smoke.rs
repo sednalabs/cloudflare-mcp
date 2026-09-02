@@ -5107,7 +5107,6 @@ fn spawn_fake_d1_database_mutation_api(
                         "messages": [],
                         "result": [{
                             "success": true,
-                            "errors": [],
                             "results": [d1_catalog_relation_row("example", 1), d1_catalog_relation_row("protected", 2)],
                             "meta": {"served_by_primary": true, "changed_db": false, "changes": 0, "rows_written": 0}
                         }],
