@@ -7266,10 +7266,12 @@ mod tests {
     fn retained_reconciliation_does_not_recreate_an_absent_dml_layout() {
         let root = private_test_root("retained-absent-dml-layout");
         let plan = "a".repeat(64);
+        let account_id = format!("acct-{}", std::process::id());
+        let database_id = format!("123e4567-e89b-42d3-a456-{:012x}", std::process::id());
         let mut owner = acquire_d1_migration_lease_at(
             root.clone(),
-            "acct-1",
-            "123e4567-e89b-42d3-a456-426614174000",
+            &account_id,
+            &database_id,
             "newsletter-core",
             &plan,
         )
@@ -7287,8 +7289,8 @@ mod tests {
 
         let error = inspect_retained_d1_migration_lease_at(
             root.clone(),
-            "acct-1",
-            "123e4567-e89b-42d3-a456-426614174000",
+            &account_id,
+            &database_id,
             "newsletter-core",
             &plan,
             &nonce,
