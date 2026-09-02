@@ -1027,6 +1027,26 @@ admission, mutation, deployment, or live effect. Do not treat a graph receipt as
 write authority; later composition must bind an exact classified DML operation
 and relation to the opaque graph product.
 
+The internal exact-plan composer is the next pure boundary. Supply only the
+verified canonical target, exact version-2 DML plan plus its canonical digest,
+the already classified exact lowercase relation and closed compound form, the
+opaque version-5 catalog product, and the opaque version-3 graph product. Never
+substitute caller JSON, a generic query response, or a serialized receipt for
+either opaque product. The statement kind and form must agree. The composer
+uses the graph module's exact primitive order and requires every primitive to
+have a present `Allow` decision; missing, denied, duplicated, reordered,
+unsupported, malformed, version-drifted, or cross-product-contradictory
+evidence denies the complete composition.
+
+The serializable receipt is aggregate-only and digest-binds the plan, target,
+catalog, graph, classified relation/form, effective primitive set, and selected
+decisions. It exposes none of those private names or bytes. This module does
+not parse SQL, issue provider requests, admit or execute D1 writes, expose a
+tool route, hold custody, or authorize dispatch. A later reviewed route may
+consume the opaque product only after its exact classifier has bound the SQL
+bytes to the supplied relation and compound form; a composition receipt by
+itself is never execution authority.
+
 ## Safety Profiles
 
 ### Read-Only

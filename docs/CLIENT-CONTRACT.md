@@ -482,6 +482,29 @@ mutation, deployment, or authorization. A later separately reviewed composer
 must bind an exact DML target and operation to this product before provider
 dispatch.
 
+The following internal pure composition stage accepts only the verified
+canonical target, the exact version-2 DML plan and its canonical digest, the
+opaque version-5 catalog product, and the opaque version-3 graph product. The
+classified relation must already be one exact lowercase bounded ASCII SQLite
+identity, and the classified operation form must agree with the plan's closed
+statement kind. The composer rebinds the target across all three products,
+checks the catalog/graph aggregate relationship, expands the operation form by
+the graph module's closed contract, and requires an explicit `Allow` decision
+for every effective primitive in its defined order. Missing, denied,
+duplicated, reordered, unsupported, malformed, version-drifted, or
+contradictory evidence fails closed.
+
+Only the aggregate-safe composition receipt is serializable. It binds the
+exact plan, target, catalog receipt/snapshot, graph receipt/graph/decision,
+classified relation, classified form, ordered primitive set, and selected
+decision evidence by SHA-256 plus primitive/allow counts. It contains no SQL,
+parameters, relation, account, or database identity. The opaque product retains
+the exact classified plan and relation for a later consumer. This stage does
+not parse SQL or create classifier authority: its relation and compound form
+must come from the separately reviewed exact classifier. It exposes no public
+tool, provider call, D1 execution, mutation admission, custody, deployment, or
+configuration effect, and the receipt alone never authorizes dispatch.
+
 ## Structured payload details for complex tools
 
 For `effect_assertion_id=schema_create_objects_additive_seed_rows_v1` or its
