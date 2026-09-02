@@ -38,6 +38,7 @@ use crate::cloudflare::{
     AccessAppUpsertRequest, AccessPolicyWrite, BulkRedirectItemWrite, CacheRule, CacheRuleset,
     DnsRecordUpsertRequest, PagesDeploymentTriggerRequest, with_request_api_token_override,
 };
+use crate::d1_execute_write_lifecycle::{D1ExecuteWriteLifecycleInput, execute_d1_write_lifecycle};
 use crate::d1_migration_bootstrap::{
     D1_BOOTSTRAP_LEASE_FAMILY, D1_BOOTSTRAP_OPERATION, D1BootstrapExecutionInput,
     d1_bootstrap_mutation_plan, d1_bootstrap_mutation_target,
@@ -913,6 +914,15 @@ pub struct D1ExecuteWriteArgs {
     pub account_id: Option<String>,
     pub database_id: String,
     pub sql: String,
+    /// Preallocated opaque operation identity. It is hashed before receipts.
+    pub operation_id: String,
+    /// Preallocated opaque single-attempt identity. It is hashed before receipts.
+    pub execution_attempt_id: String,
+    /// Preallocated opaque provider-request identity. It is hashed before receipts.
+    pub provider_request_id: String,
+    /// Exact composition digest returned by dry-run; required for live execution.
+    #[serde(default)]
+    pub approved_composition_sha256: Option<String>,
     #[serde(default)]
     pub params: Vec<Value>,
     #[serde(default)]
@@ -4392,11 +4402,12 @@ impl CloudflareMcp {
 
     #[tool(
         name = "d1_execute_write",
-        description = "Execute one audited D1 row-write SQL statement with dry-run safety. Allows INSERT, UPDATE, DELETE, or REPLACE only."
+        description = "Plan or reserve and dispatch one exact audited D1 row-write. Dry-run performs two stable primary catalog reads and returns the exact composition digest required for live execution. Live execution durably reserves one preallocated attempt before one provider request; replay or ambiguity never redispatches."
     )]
     async fn cloudflare_d1_execute_write(
         &self,
         Parameters(args): Parameters<D1ExecuteWriteArgs>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, crate::McpError> {
         if let Some(account_id) = args.account_id.as_deref()
             && let Err(result) = normalize_d1_target(account_id, &args.database_id)
@@ -4408,67 +4419,23 @@ impl CloudflareMcp {
             Ok(target) => target,
             Err(result) => return Ok(result),
         };
-        let target_key_sha256 = target.target_key_sha256();
-        let account_id = target.account_id.as_str();
-        let database_id = target.database_id.as_str();
-        let statement_kind = match classify_d1_write_sql(&args.sql) {
-            Ok(kind) => kind,
-            Err(result) => return Ok(result),
-        };
         let max_rows = args.max_rows.unwrap_or(100).clamp(1, 1000);
-        let plan = json!({
-            "operation": "d1_execute_write",
-            "account_id": account_id,
-            "database_id": database_id,
-            "target_key_sha256": target_key_sha256,
-            "statement_kind": statement_kind,
-            "sql_sha256": sha256_hex(args.sql.trim()),
-            "dry_run": args.dry_run,
-        });
-        if args.dry_run {
-            return Ok(CallToolResult::structured(json!({
-                "ok": true,
-                "operation": "d1_execute_write",
-                "plan": plan,
-                "policy": {
-                    "d1_write_sql": true,
-                    "allowed_statement_kinds": D1_WRITE_ALLOWED_KINDS,
-                    "single_statement": true,
-                    "max_rows": max_rows,
-                },
-            })));
-        }
-        let guard =
-            match acquire_d1_target_mutation_guard("d1_execute_write", account_id, database_id) {
-                Ok(guard) => guard,
-                Err(result) => return Ok(result),
-            };
-        if let Err(result) = guard.revalidate() {
-            return Ok(result);
-        }
-        match self
-            .cloudflare
-            .execute_d1_database_write(account_id, database_id, &args.sql, &args.params)
-            .await
-        {
-            Ok(result) => {
-                let (result, truncated) = limit_d1_result_rows(result, max_rows);
-                Ok(CallToolResult::structured(json!({
-                    "ok": true,
-                    "operation": "d1_execute_write",
-                    "plan": plan,
-                    "policy": {
-                        "d1_write_sql": true,
-                        "allowed_statement_kinds": D1_WRITE_ALLOWED_KINDS,
-                        "single_statement": true,
-                        "max_rows": max_rows,
-                    },
-                    "truncated": truncated,
-                    "result": result,
-                })))
-            }
-            Err(err) => Ok(adapter_error_result(err)),
-        }
+        Ok(execute_d1_write_lifecycle(
+            &self.cloudflare,
+            &target,
+            D1ExecuteWriteLifecycleInput {
+                sql: &args.sql,
+                params: &args.params,
+                operation_id: &args.operation_id,
+                execution_attempt_id: &args.execution_attempt_id,
+                provider_request_id: &args.provider_request_id,
+                approved_composition_sha256: args.approved_composition_sha256.as_deref(),
+                dry_run: args.dry_run,
+                max_rows,
+            },
+            Some(&parts),
+        )
+        .await)
     }
 
     #[tool(
@@ -12988,7 +12955,6 @@ fn queue_consumer_dlq_name(consumer: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
-const D1_WRITE_ALLOWED_KINDS: &[&str] = &["INSERT", "UPDATE", "DELETE", "REPLACE"];
 const DEFAULT_D1_MIGRATIONS_TABLE: &str = "d1_migrations";
 pub(crate) const MAX_D1_MIGRATION_BYTES: u64 = 5 * 1024 * 1024;
 pub(crate) const MAX_D1_MIGRATION_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
@@ -13000,53 +12966,6 @@ struct D1MigrationFile {
     path: PathBuf,
     size_bytes: u64,
     sql_sha256: String,
-}
-
-fn classify_d1_write_sql(sql: &str) -> Result<&'static str, CallToolResult> {
-    let trimmed = sql.trim();
-    if trimmed.is_empty() {
-        return Err(d1_write_policy_result(
-            "EMPTY_SQL",
-            "SQL must not be empty.",
-        ));
-    }
-    if trimmed.trim_end_matches(';').contains(';') {
-        return Err(d1_write_policy_result(
-            "MULTI_STATEMENT",
-            "Submit exactly one D1 write statement.",
-        ));
-    }
-    let first = trimmed
-        .split(|ch: char| ch.is_whitespace() || ch == '(')
-        .next()
-        .unwrap_or("")
-        .to_ascii_uppercase();
-    match first.as_str() {
-        "INSERT" => Ok("INSERT"),
-        "UPDATE" => Ok("UPDATE"),
-        "DELETE" => Ok("DELETE"),
-        "REPLACE" => Ok("REPLACE"),
-        _ => Err(d1_write_policy_result(
-            "UNSUPPORTED_STATEMENT",
-            "D1 write SQL must start with INSERT, UPDATE, DELETE, or REPLACE.",
-        )),
-    }
-}
-
-fn d1_write_policy_result(code: &'static str, message: &'static str) -> CallToolResult {
-    CallToolResult::structured_error(json!({
-        "ok": false,
-        "error": {
-            "code": "d1.write_policy_denied",
-            "message": message,
-            "hint": "Submit exactly one row-write D1 SQL statement, or use d1_query_read_only for reads.",
-            "classifier_code": code,
-        },
-        "policy": {
-            "d1_write_sql": true,
-            "allowed_statement_kinds": D1_WRITE_ALLOWED_KINDS,
-        },
-    }))
 }
 
 pub(crate) fn sha256_hex(value: &str) -> String {

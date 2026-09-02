@@ -290,6 +290,40 @@ pub(crate) fn prepare_d1_dml_attempt(
     }
 }
 
+/// Inspect one physically present canonical state without caller identities.
+/// This is namespace-audit evidence only: it validates the closed state
+/// product but cannot authorize a transition or provider request.
+pub(crate) fn inspect_d1_dml_attempt_state(
+    bytes: &[u8],
+) -> Result<D1DmlAttemptCustodyProduct, D1DmlAttemptCustodyError> {
+    if bytes.is_empty() {
+        return Err(custody_error(
+            D1DmlAttemptCustodyClassification::RestoredStateRequired,
+            "one physically present attempt state artifact was required",
+        ));
+    }
+    if bytes.len() > D1_DML_ATTEMPT_STATE_BYTE_CAP {
+        return Err(custody_error(
+            D1DmlAttemptCustodyClassification::RestoredStateTooLarge,
+            "attempt state artifact exceeded the exact byte cap",
+        ));
+    }
+    let state = serde_json::from_slice::<D1DmlAttemptState>(bytes).map_err(|_| {
+        custody_error(
+            D1DmlAttemptCustodyClassification::RestoredStateMalformed,
+            "attempt state artifact was malformed or outside the closed schema",
+        )
+    })?;
+    if canonical_state_bytes(&state)? != bytes {
+        return Err(custody_error(
+            D1DmlAttemptCustodyClassification::RestoredStateNonCanonical,
+            "attempt state artifact was not exact canonical JSON",
+        ));
+    }
+    validate_state(&state)?;
+    product(state, D1DmlAttemptTransition::ExactReplay, None, true)
+}
+
 /// Prepare the exact successor for a later atomic compare-and-exchange. This
 /// pure proposal is deliberately non-authorizing: only the separately reviewed
 /// durable adapter may compare the exact prior bytes, install the successor

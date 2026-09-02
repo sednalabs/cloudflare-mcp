@@ -114,6 +114,42 @@ zero provider calls and mutations, so the blocked caller remains traceable.
 Local reconcile/finalize/abort tools manipulate retained custody evidence only
 and are not provider D1 mutation surfaces.
 
+### Execute one exact D1 row write
+
+Configure `CLOUDFLARE_MCP_D1_RESERVED_RELATIONS` as a comma-separated set of
+canonical lowercase relation roots selected by the operator. The value is
+server authority: callers cannot weaken or replace it. Every configured root
+must exist in the stable structured catalog; automatic SQLite reserved roots
+are added by the graph derivation.
+
+1. Allocate three pairwise-distinct opaque identities of 16-128 printable
+   ASCII bytes: operation, execution attempt, and provider request. Never put
+   recipient data, SQL, relation names, or credentials in these identities.
+2. Call `d1_execute_write` with `dry_run=true`. It performs exactly two
+   read-only primary catalog observations, classifies the exact SQL bytes,
+   derives all direct and indirect write primitives, and returns the exact
+   `composition_sha256`. No DML provider call or local attempt state is made.
+3. Approve that digest, then repeat the exact target, SQL bytes, params,
+   identities, and row cap with `dry_run=false` and
+   `approved_composition_sha256`. Live execution recomputes the two-read
+   authority under the permanent target guard. Any drift blocks with zero DML
+   provider calls.
+4. Require the receipt to show a create-once Prepared state followed by one
+   exact atomic `DispatchReserved` installation before the single DML request.
+   A provider acknowledgement reports three total provider calls (two catalog
+   reads and one mutation), one provider mutation, exact body digest/size and
+   lifecycle, and `automatic_retry_permitted=false`. Zero-change metadata is a
+   valid provider acknowledgement.
+5. Do not treat provider acknowledgement as terminal effect authority. Preserve
+   custody and use the separately governed effect-specific recovery path. An
+   ambiguous response, custody error, or replay never permits redispatch of the
+   same attempt or provider request identity.
+
+Local validation must use synthetic fixtures and a mock provider, never a live
+D1 database. Durable state is stored below the same operator-owned migration
+lease root and inherits its Linux, private-directory, target-identity
+activation, advisory-lock, directory-sync, and trusted-filesystem requirements.
+
 Canonical target guards also require the version-2 root activation marker. A
 new marker and the target's create-only
 `target-identity-v2.<target-key-sha256>.receipt.json` registration are minted

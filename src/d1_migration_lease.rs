@@ -616,6 +616,121 @@ impl D1TargetMutationGuard {
             ))
         }
     }
+
+    /// Read one exact DML-attempt state through the held target directory.
+    /// The opaque attempt binding is used only as a bounded filename digest.
+    pub(crate) fn read_d1_dml_attempt_state(
+        &self,
+        attempt_binding_sha256: &str,
+    ) -> Result<Option<Vec<u8>>, CallToolResult> {
+        self.revalidate()?;
+        #[cfg(target_os = "linux")]
+        {
+            linux::read_d1_dml_attempt_state(&self.target, attempt_binding_sha256)
+                .map_err(|message| d1_dml_attempt_store_error(&self.target_key_sha256, message))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = attempt_binding_sha256;
+            Err(d1_dml_attempt_store_error(
+                &self.target_key_sha256,
+                "durable DML attempt custody requires Linux dirfd-bound storage",
+            ))
+        }
+    }
+
+    /// Install the first canonical Prepared state exactly once.
+    pub(crate) fn create_d1_dml_attempt_state(
+        &self,
+        attempt_binding_sha256: &str,
+        state: &[u8],
+    ) -> Result<(), CallToolResult> {
+        self.revalidate()?;
+        self.validate_d1_dml_attempt_state(attempt_binding_sha256, state)?;
+        #[cfg(target_os = "linux")]
+        {
+            linux::create_d1_dml_attempt_state(&self.target, attempt_binding_sha256, state)
+                .map_err(|message| d1_dml_attempt_store_error(&self.target_key_sha256, message))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (attempt_binding_sha256, state);
+            Err(d1_dml_attempt_store_error(
+                &self.target_key_sha256,
+                "durable DML attempt custody requires Linux dirfd-bound storage",
+            ))
+        }
+    }
+
+    /// Atomically replace exact incumbent bytes with one canonical successor.
+    pub(crate) fn compare_exchange_d1_dml_attempt_state(
+        &self,
+        attempt_binding_sha256: &str,
+        expected: &[u8],
+        successor: &[u8],
+    ) -> Result<(), CallToolResult> {
+        self.revalidate()?;
+        self.validate_d1_dml_attempt_state(attempt_binding_sha256, expected)?;
+        self.validate_d1_dml_attempt_state(attempt_binding_sha256, successor)?;
+        #[cfg(target_os = "linux")]
+        {
+            linux::compare_exchange_d1_dml_attempt_state(
+                &self.target,
+                attempt_binding_sha256,
+                expected,
+                successor,
+            )
+            .map_err(|message| d1_dml_attempt_store_error(&self.target_key_sha256, message))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (attempt_binding_sha256, expected, successor);
+            Err(d1_dml_attempt_store_error(
+                &self.target_key_sha256,
+                "durable DML attempt custody requires Linux dirfd-bound storage",
+            ))
+        }
+    }
+
+    fn validate_d1_dml_attempt_state(
+        &self,
+        attempt_binding_sha256: &str,
+        state: &[u8],
+    ) -> Result<(), CallToolResult> {
+        let product =
+            crate::d1_dml_attempt_custody::inspect_d1_dml_attempt_state(state).map_err(|_| {
+                d1_dml_attempt_store_error(
+                    &self.target_key_sha256,
+                    "DML attempt state was malformed or contradicted the closed custody product",
+                )
+            })?;
+        if product.receipt().target_key_sha256 != self.target_key_sha256
+            || product.receipt().attempt_binding_sha256 != attempt_binding_sha256
+        {
+            return Err(d1_dml_attempt_store_error(
+                &self.target_key_sha256,
+                "DML attempt state contradicted its target or filename binding",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn d1_dml_attempt_store_error(target_key_sha256: &str, message: &'static str) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": "d1_execute_write",
+        "status": "reconciliation_required",
+        "provider_calls": 0,
+        "provider_mutations": 0,
+        "custody": {"target_key_sha256": target_key_sha256, "retained": true},
+        "automatic_retry_permitted": false,
+        "error": {
+            "code": "d1.execute_write_custody_unproven",
+            "message": message,
+            "hint": "Do not issue or replay a provider write; inspect the durable target custody namespace."
+        }
+    }))
 }
 
 impl D1RetainedMigrationLease {
@@ -1857,6 +1972,7 @@ mod linux {
     };
     use libc::{
         AT_FDCWD, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_PATH, O_RDONLY, O_RDWR,
+        O_WRONLY,
     };
     use std::collections::BTreeSet;
     use std::ffi::{CStr, CString, c_char};
@@ -2375,6 +2491,22 @@ mod linux {
                     return Err("permanent target guard contains unexpected payload bytes");
                 }
                 guard_present = true;
+                entries.push(snapshot);
+                continue;
+            }
+
+            if let Some(binding) = name
+                .strip_prefix("dml-attempt.")
+                .and_then(|value| value.strip_suffix(".state.json"))
+            {
+                let (snapshot, bytes) = private_custody_file_snapshot(target, &name)?;
+                let product = crate::d1_dml_attempt_custody::inspect_d1_dml_attempt_state(&bytes)
+                    .map_err(|_| "DML attempt state was malformed or contradictory")?;
+                if product.receipt().target_key_sha256 != expected_target_key_sha256
+                    || product.receipt().attempt_binding_sha256 != binding
+                {
+                    return Err("DML attempt state contradicted its target or filename binding");
+                }
                 entries.push(snapshot);
                 continue;
             }
@@ -4428,6 +4560,141 @@ mod linux {
         directory.sync_all()
     }
 
+    fn d1_dml_attempt_name(binding: &str) -> Result<String, &'static str> {
+        if binding.len() != 64
+            || !binding
+                .as_bytes()
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || matches!(*byte, b'a'..=b'f'))
+        {
+            return Err("DML attempt binding was not canonical SHA-256");
+        }
+        Ok(format!("dml-attempt.{binding}.state.json"))
+    }
+
+    fn read_private_dml_state(
+        target: &fs::File,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>, &'static str> {
+        let named = match open_named_entry(target, name) {
+            Ok(named) => named,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err("DML attempt state could not be inspected"),
+        };
+        let metadata = named
+            .metadata()
+            .map_err(|_| "DML attempt state metadata was unavailable")?;
+        if !private_file(&metadata)
+            || metadata.nlink() != 1
+            || metadata.len() == 0
+            || metadata.len() > crate::d1_dml_attempt_custody::D1_DML_ATTEMPT_STATE_BYTE_CAP as u64
+        {
+            return Err("DML attempt state was not one bounded private regular file");
+        }
+        let expected = identity(&metadata);
+        let name_c = c_string_name(name)?;
+        let state = open_at(
+            target.as_raw_fd(),
+            &name_c,
+            O_RDONLY | O_NOFOLLOW | O_CLOEXEC,
+            0,
+        )
+        .map_err(|_| "DML attempt state could not be opened")?;
+        let held = state
+            .metadata()
+            .map_err(|_| "held DML attempt state metadata was unavailable")?;
+        if !private_file(&held) || held.nlink() != 1 || identity(&held) != expected {
+            return Err("DML attempt state changed while it was rebound");
+        }
+        let bytes = read_held_file(&state)?;
+        validate_named_private_file(target, name, &expected)
+            .map_err(|_| "DML attempt state changed during readback")?;
+        Ok(Some(bytes))
+    }
+
+    fn create_private_dml_state(
+        target: &fs::File,
+        name: &str,
+        state: &[u8],
+    ) -> Result<(), &'static str> {
+        if state.is_empty()
+            || state.len() > crate::d1_dml_attempt_custody::D1_DML_ATTEMPT_STATE_BYTE_CAP
+        {
+            return Err("DML attempt successor exceeded its canonical byte bounds");
+        }
+        let name_c = c_string_name(name)?;
+        let mut file = open_at(
+            target.as_raw_fd(),
+            &name_c,
+            O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+            0o600,
+        )
+        .map_err(|_| "DML attempt state could not be created exclusively")?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .and_then(|()| file.write_all(state))
+            .and_then(|()| file.sync_all())
+            .map_err(|_| "DML attempt state could not be written and synchronized")?;
+        sync_d1_lease_directory(target)
+            .map_err(|_| "DML attempt custody directory could not be synchronized")?;
+        match read_private_dml_state(target, name)? {
+            Some(readback) if readback == state => Ok(()),
+            _ => Err("DML attempt state did not survive exact readback"),
+        }
+    }
+
+    pub(super) fn read_d1_dml_attempt_state(
+        target: &fs::File,
+        binding: &str,
+    ) -> Result<Option<Vec<u8>>, &'static str> {
+        read_private_dml_state(target, &d1_dml_attempt_name(binding)?)
+    }
+
+    pub(super) fn create_d1_dml_attempt_state(
+        target: &fs::File,
+        binding: &str,
+        state: &[u8],
+    ) -> Result<(), &'static str> {
+        create_private_dml_state(target, &d1_dml_attempt_name(binding)?, state)
+    }
+
+    pub(super) fn compare_exchange_d1_dml_attempt_state(
+        target: &fs::File,
+        binding: &str,
+        expected: &[u8],
+        successor: &[u8],
+    ) -> Result<(), &'static str> {
+        let name = d1_dml_attempt_name(binding)?;
+        match read_private_dml_state(target, &name)? {
+            Some(incumbent) if incumbent == expected => {}
+            Some(_) => {
+                return Err("DML attempt compare-and-exchange found conflicting incumbent bytes");
+            }
+            None => return Err("DML attempt compare-and-exchange found no incumbent state"),
+        }
+        let successor_sha256 = sha256_bytes_hex(successor);
+        let temporary = format!(".dml-next.{binding}.{successor_sha256}");
+        create_private_dml_state(target, &temporary, successor)?;
+        let source = c_string_name(&temporary)?;
+        let destination = c_string_name(&name)?;
+        let renamed = unsafe {
+            libc::renameat(
+                target.as_raw_fd(),
+                source.as_ptr(),
+                target.as_raw_fd(),
+                destination.as_ptr(),
+            )
+        };
+        if renamed != 0 {
+            return Err("DML attempt compare-and-exchange successor could not be installed");
+        }
+        sync_d1_lease_directory(target)
+            .map_err(|_| "DML attempt compare-and-exchange directory sync failed")?;
+        match read_private_dml_state(target, &name)? {
+            Some(readback) if readback == successor => Ok(()),
+            _ => Err("DML attempt compare-and-exchange readback contradicted successor bytes"),
+        }
+    }
+
     #[cfg(test)]
     use std::{
         cell::Cell,
@@ -4607,6 +4874,49 @@ use linux::{
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dml_attempt_state_is_exclusive_and_exact_compare_exchange() {
+        let root = private_test_root("dml-attempt-cas");
+        let guard = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_execute_write",
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect("acquire target guard");
+        let binding = "a".repeat(64);
+        let prepared = br#"{"phase":"prepared"}"#;
+        let reserved = br#"{"phase":"dispatch_reserved"}"#;
+        assert_eq!(
+            linux::read_d1_dml_attempt_state(&guard.target, &binding).expect("read absence"),
+            None
+        );
+        linux::create_d1_dml_attempt_state(&guard.target, &binding, prepared)
+            .expect("create prepared state");
+        assert!(
+            linux::create_d1_dml_attempt_state(&guard.target, &binding, prepared).is_err(),
+            "initial state must be create-once"
+        );
+        linux::compare_exchange_d1_dml_attempt_state(&guard.target, &binding, prepared, reserved)
+            .expect("install exact successor");
+        assert_eq!(
+            linux::read_d1_dml_attempt_state(&guard.target, &binding).expect("read successor"),
+            Some(reserved.to_vec())
+        );
+        assert!(
+            linux::compare_exchange_d1_dml_attempt_state(
+                &guard.target,
+                &binding,
+                prepared,
+                b"conflict",
+            )
+            .is_err(),
+            "stale expected bytes must fail closed"
+        );
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
 
     #[test]
     fn migration_lease_requirements_expose_complete_activation_and_cutover_contract() {

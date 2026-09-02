@@ -1735,12 +1735,20 @@
       "name": "d1_delete_database"
     },
     {
-      "description": "Execute one audited D1 row-write SQL statement with dry-run safety. Allows INSERT, UPDATE, DELETE, or REPLACE only.",
+      "description": "Plan or reserve and dispatch one exact audited D1 row-write. Dry-run performs two stable primary catalog reads and returns the exact composition digest required for live execution. Live execution durably reserves one preallocated attempt before one provider request; replay or ambiguity never redispatches.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
           "account_id": {
             "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "approved_composition_sha256": {
+            "default": null,
+            "description": "Exact composition digest returned by dry-run; required for live execution.",
             "type": [
               "string",
               "null"
@@ -1753,6 +1761,10 @@
             "default": false,
             "type": "boolean"
           },
+          "execution_attempt_id": {
+            "description": "Preallocated opaque single-attempt identity. It is hashed before receipts.",
+            "type": "string"
+          },
           "max_rows": {
             "default": null,
             "format": "uint",
@@ -1762,10 +1774,18 @@
               "null"
             ]
           },
+          "operation_id": {
+            "description": "Preallocated opaque operation identity. It is hashed before receipts.",
+            "type": "string"
+          },
           "params": {
             "default": [],
             "items": true,
             "type": "array"
+          },
+          "provider_request_id": {
+            "description": "Preallocated opaque provider-request identity. It is hashed before receipts.",
+            "type": "string"
           },
           "sql": {
             "type": "string"
@@ -1773,6 +1793,9 @@
         },
         "required": [
           "database_id",
+          "execution_attempt_id",
+          "operation_id",
+          "provider_request_id",
           "sql"
         ],
         "type": "object"

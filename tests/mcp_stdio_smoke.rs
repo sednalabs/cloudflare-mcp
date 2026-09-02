@@ -5097,16 +5097,41 @@ fn spawn_fake_d1_database_mutation_api(
                 (
                     "POST",
                     "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
-                ) => json!({
-                    "success": true,
-                    "errors": [],
-                    "messages": [],
-                    "result": [{
+                ) if body_json["sql"]
+                    .as_str()
+                    .is_some_and(|sql| sql.contains("schema_rows")) =>
+                {
+                    json!({
                         "success": true,
-                        "results": [],
-                        "meta": {"changed_db": true, "changes": 1}
-                    }],
-                }),
+                        "errors": [],
+                        "messages": [],
+                        "result": [{
+                            "success": true,
+                            "errors": [],
+                            "results": [d1_catalog_relation_row("example", 1, 0), d1_catalog_relation_row("protected", 2, 1)],
+                            "meta": {"served_by_primary": true, "changed_db": false, "changes": 0, "rows_written": 0}
+                        }],
+                    })
+                }
+                (
+                    "POST",
+                    "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
+                ) => {
+                    let zero_change = body_json["sql"]
+                        .as_str()
+                        .is_some_and(|sql| sql.contains("id = 8"));
+                    json!({
+                        "success": true,
+                        "errors": [],
+                        "messages": [],
+                        "result": [{
+                            "success": true,
+                            "errors": [],
+                            "results": [],
+                            "meta": {"served_by_primary": true, "changed_db": !zero_change, "changes": usize::from(!zero_change), "rows_written": usize::from(!zero_change)}
+                        }],
+                    })
+                }
                 _ => json!({
                     "success": false,
                     "errors": [{"code": 7000, "message": format!("unexpected request: {method} {path}")}],
@@ -5125,6 +5150,33 @@ fn spawn_fake_d1_database_mutation_api(
         }
     });
     (format!("http://{addr}"), requests)
+}
+
+fn d1_catalog_relation_row(name: &str, schema_rowid: i64, fact_order: i64) -> Value {
+    let hex = |value: &str| {
+        value
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<String>()
+    };
+    json!({
+        "schema_rowid": schema_rowid, "fact_order": fact_order, "fact_kind": "relation",
+        "relation_type_storage_class": "text", "relation_type_value_hex": hex("table"), "relation_type": "table",
+        "relation_name_storage_class": "text", "relation_name_hex": hex(name),
+        "owner_name_storage_class": "text", "owner_name_hex": hex(name),
+        "schema_sql_storage_class": "text", "table_sql_token_source_is_null": 0,
+        "table_sql_token_source_hex": hex(&format!("CREATE TABLE {name} (id INTEGER)")),
+        "table_virtual_token_hit": 0, "table_replace_token_hit": 0,
+        "foreign_key_id_storage_class": "not_applicable", "foreign_key_id_value_hex": "", "foreign_key_id": -1,
+        "foreign_key_seq_storage_class": "not_applicable", "foreign_key_seq_value_hex": "", "foreign_key_seq": -1,
+        "parent_name_storage_class": "not_applicable", "parent_name_hex": "",
+        "from_column_storage_class": "not_applicable", "from_column_hex": "",
+        "to_column_storage_class": "not_applicable", "to_column_is_null": 1, "to_column_hex": "",
+        "on_update_storage_class": "not_applicable", "on_update_hex": "",
+        "on_delete_storage_class": "not_applicable", "on_delete_hex": "",
+        "match_storage_class": "not_applicable", "match_hex": "", "conservative_blocker": ""
+    })
 }
 
 fn spawn_fake_worker_upload_api(expected_requests: usize) -> (String, Arc<Mutex<Vec<Value>>>) {
@@ -18052,7 +18104,7 @@ fn d1_delete_database_requires_token_and_deletes_through_stdio_boundary() {
 fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    let (base_url, requests) = spawn_fake_d1_database_mutation_api(1);
+    let (base_url, requests) = spawn_fake_d1_database_mutation_api(12);
     let lease_root = PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-d1-write-guard-{}-{}",
         std::process::id(),
@@ -18071,35 +18123,107 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
             "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
             lease_root.to_string_lossy().to_string(),
         ),
+        (
+            "CLOUDFLARE_MCP_D1_RESERVED_RELATIONS",
+            "protected".to_string(),
+        ),
     ]);
-    let response = mcp.call_tool(
-        2,
-        "d1_execute_write",
-        json!({
-            "database_id": "123e4567-e89b-42d3-a456-426614174000",
-            "sql": "UPDATE example SET enabled = 1 WHERE id = 7",
-            "dry_run": false
-        }),
-    );
+    let exact_args = json!({
+        "database_id": "123e4567-e89b-42d3-a456-426614174000",
+        "sql": "UPDATE example SET enabled = 1 WHERE id = 7",
+        "operation_id": "operation-fixture-0001",
+        "execution_attempt_id": "attempt-fixture-0001",
+        "provider_request_id": "provider-fixture-0001"
+    });
+    let mut dry_args = exact_args.clone();
+    dry_args["dry_run"] = json!(true);
+    let dry = mcp.call_tool(2, "d1_execute_write", dry_args);
+    let approved = structured_content(&dry)["approved_composition_sha256_required"]
+        .as_str()
+        .expect("composition approval")
+        .to_string();
+    let mut live_args = exact_args;
+    live_args["dry_run"] = json!(false);
+    live_args["approved_composition_sha256"] = json!(approved);
+    let replay_args = live_args.clone();
+    let response = mcp.call_tool(3, "d1_execute_write", live_args);
     let content = structured_content(&response);
     assert_eq!(content["ok"], json!(true), "{content}");
     assert_eq!(
-        content["plan"]["database_id"],
+        content["evidence"]["execution_plan"]["database_id"],
         json!("123e4567-e89b-42d3-a456-426614174000")
     );
     assert_eq!(
-        content["plan"]["target_key_sha256"],
+        content["evidence"]["execution_plan"]["target_key_sha256"],
         json!(sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000"))
     );
-    let requests = requests.lock().expect("request log lock");
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0]["method"], json!("POST"));
     assert_eq!(
-        requests[0]["path"],
+        content["status"],
+        json!("provider_acknowledged_reconciliation_required")
+    );
+    assert_eq!(content["provider_calls"], json!(3));
+    assert_eq!(content["provider_mutations"], json!(1));
+    assert_eq!(content["outcome"]["zero_change"], json!(false));
+    assert_eq!(content["automatic_retry_permitted"], json!(false));
+
+    let replay = mcp.call_tool(4, "d1_execute_write", replay_args);
+    let replay = structured_content(&replay);
+    assert_eq!(replay["ok"], json!(false), "{replay}");
+    assert_eq!(replay["status"], json!("reconciliation_required"));
+    assert_eq!(replay["provider_calls"], json!(2));
+    assert_eq!(replay["provider_mutations"], json!(0));
+
+    let zero_args = json!({
+        "database_id": "123e4567-e89b-42d3-a456-426614174000",
+        "sql": "UPDATE example SET enabled = 1 WHERE id = 8",
+        "operation_id": "operation-fixture-0002",
+        "execution_attempt_id": "attempt-fixture-0002",
+        "provider_request_id": "provider-fixture-0002"
+    });
+    let mut zero_dry_args = zero_args.clone();
+    zero_dry_args["dry_run"] = json!(true);
+    let zero_dry = mcp.call_tool(5, "d1_execute_write", zero_dry_args);
+    let zero_approved = structured_content(&zero_dry)["approved_composition_sha256_required"]
+        .as_str()
+        .expect("zero-change composition approval")
+        .to_string();
+    let mut zero_live_args = zero_args;
+    zero_live_args["dry_run"] = json!(false);
+    zero_live_args["approved_composition_sha256"] = json!(zero_approved);
+    let zero = mcp.call_tool(6, "d1_execute_write", zero_live_args);
+    let zero = structured_content(&zero);
+    assert_eq!(zero["ok"], json!(true), "{zero}");
+    assert_eq!(zero["outcome"]["zero_change"], json!(true));
+    assert_eq!(zero["outcome"]["changed_db"], json!(false));
+    assert_eq!(zero["provider_calls"], json!(3));
+    assert_eq!(zero["provider_mutations"], json!(1));
+    assert_eq!(zero["automatic_retry_permitted"], json!(false));
+
+    let requests = requests.lock().expect("request log lock");
+    assert_eq!(requests.len(), 12);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request["body"]["sql"]
+                == json!("UPDATE example SET enabled = 1 WHERE id = 7"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request["body"]["sql"]
+                == json!("UPDATE example SET enabled = 1 WHERE id = 8"))
+            .count(),
+        1
+    );
+    assert_eq!(requests[4]["method"], json!("POST"));
+    assert_eq!(
+        requests[4]["path"],
         json!("/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query")
     );
     assert_eq!(
-        requests[0]["body"]["sql"],
+        requests[4]["body"]["sql"],
         json!("UPDATE example SET enabled = 1 WHERE id = 7")
     );
     drop(requests);
@@ -18132,6 +18256,10 @@ fn curated_d1_guard_denials_are_pre_provider_and_caller_correlated() {
         (
             "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
             lease_root.to_string_lossy().to_string(),
+        ),
+        (
+            "CLOUDFLARE_MCP_D1_RESERVED_RELATIONS",
+            "protected".to_string(),
         ),
     ]);
 
@@ -18196,6 +18324,10 @@ fn curated_d1_guard_denials_are_pre_provider_and_caller_correlated() {
             json!({
                 "database_id": "123e4567-e89b-42d3-a456-426614174000",
                 "sql": "UPDATE example SET enabled = 1 WHERE id = 7",
+                "operation_id": "operation-guard-fixture",
+                "execution_attempt_id": "attempt-guard-fixture",
+                "provider_request_id": "provider-guard-fixture",
+                "approved_composition_sha256": "0".repeat(64),
                 "dry_run": false
             }),
         ),
@@ -19631,12 +19763,15 @@ fn api_mutate_denies_existing_target_d1_schema_mutations_before_request_construc
             "account_id": "acct-1",
             "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "sql": "CREATE TABLE curated_write_guard(id INTEGER PRIMARY KEY)",
+            "operation_id": "operation-policy-fixture",
+            "execution_attempt_id": "attempt-policy-fixture",
+            "provider_request_id": "provider-policy-fixture",
             "dry_run": true
         }),
     );
     assert_eq!(
         structured_content(&curated_write)["error"]["code"],
-        json!("d1.write_policy_denied"),
+        json!("d1.execute_write_classifier_denied"),
         "curated write tool remains callable and guarded"
     );
 

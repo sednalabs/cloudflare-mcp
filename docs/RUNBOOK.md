@@ -81,6 +81,29 @@ release artifact bundle so agents can compare:
 - schema snapshot hash versus `spec/tool_schema_snapshot.v1.json`,
 - `/proc/<pid>/exe` hash for any already-running stdio process.
 
+## Exact D1 row-write lifecycle
+
+Before exposing `d1_execute_write`, configure both the shared private
+`CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT` and the comma-separated canonical
+lowercase `CLOUDFLARE_MCP_D1_RESERVED_RELATIONS`. The latter is operator
+authority and must include every protected application root; callers cannot
+override it.
+
+Dry-run the exact target, SQL bytes, parameters, row cap, and three
+pairwise-distinct opaque operation/attempt/provider-request identities. The dry
+run performs two read-only primary catalog observations and returns the exact
+composition digest. A live call must repeat every byte and identity and supply
+that digest. It recomputes catalog/graph/composition authority under the shared
+target guard, then durably installs one Prepared -> DispatchReserved
+compare-and-exchange before the only DML provider request.
+
+Never replay an incumbent attempt. A provider acknowledgement, including a
+valid zero-change acknowledgement, remains retained for effect-specific
+readback and terminal finalization. Transport loss, response ambiguity,
+provider rejection, storage drift, or exact replay is reconciliation-only and
+keeps `automatic_retry_permitted=false`. Validate this lifecycle only with
+synthetic local files and mock provider endpoints; do not use a live D1 target.
+
 ## First-ledger bootstrap for an empty D1 target
 
 Use `d1_bootstrap_migration_ledger` only for a separately selected database
