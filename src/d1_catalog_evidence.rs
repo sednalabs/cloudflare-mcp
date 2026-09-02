@@ -8,9 +8,9 @@
 //! trigger-owner, and complete foreign-key facts including from/to/match. Only
 //! structurally canonical TEXT child identities reach the foreign-key PRAGMA.
 //! It retains table SQL bytes and permits only bounded later ASCII token
-//! classification for AUTOINCREMENT and virtual-table evidence. It emits
-//! explicit conservative blockers where structured metadata cannot prove later
-//! write semantics. It cannot
+//! classification for AUTOINCREMENT, virtual-table, and schema-level REPLACE
+//! evidence. It emits explicit conservative blockers where structured metadata
+//! cannot prove later write semantics. It cannot
 //! authenticate provider dispatch or response EOF; that custody belongs to the
 //! internal provider adapter that constructs the frames. It deliberately does
 //! not parse schema SQL, trigger bodies, or views and does not build or traverse
@@ -30,8 +30,8 @@ pub(crate) const D1_CATALOG_PROVIDER_ROW_CAP: usize = D1_CATALOG_MAX_ROWS + 1;
 pub(crate) const D1_CATALOG_PROVIDER_BYTE_CAP: usize = 4 * 1024 * 1024;
 pub(crate) const D1_CATALOG_TABLE_SQL_TOKEN_SOURCE_BYTE_CAP: usize = 64 * 1024;
 
-const D1_CATALOG_PROJECTION_VERSION: u8 = 4;
-const D1_CATALOG_EVIDENCE_VERSION: u8 = 4;
+const D1_CATALOG_PROJECTION_VERSION: u8 = 5;
+const D1_CATALOG_EVIDENCE_VERSION: u8 = 5;
 const D1_CATALOG_QUERY: &str = r#"WITH
 schema_raw AS (
   SELECT rowid AS schema_rowid,
@@ -110,6 +110,10 @@ schema_facts AS (
         AND length(CAST(raw_sql AS BLOB)) <= 65536
         AND instr(lower(raw_sql), 'virtual') != 0
       THEN 1 ELSE 0 END AS table_virtual_token_hit,
+    CASE WHEN structural_blocker = '' AND raw_type = 'table' AND sql_storage_class = 'text'
+        AND length(CAST(raw_sql AS BLOB)) <= 65536
+        AND instr(lower(raw_sql), 'replace') != 0
+      THEN 1 ELSE 0 END AS table_replace_token_hit,
     'not_applicable' AS foreign_key_id_storage_class, '' AS foreign_key_id_value_hex,
     -1 AS foreign_key_id,
     'not_applicable' AS foreign_key_seq_storage_class, '' AS foreign_key_seq_value_hex,
@@ -132,6 +136,9 @@ schema_facts AS (
       WHEN raw_type = 'table' AND sql_storage_class = 'text'
           AND instr(lower(raw_sql), 'virtual') != 0
         THEN 'table_virtual_semantics_unproven'
+      WHEN raw_type = 'table' AND sql_storage_class = 'text'
+          AND instr(lower(raw_sql), 'replace') != 0
+        THEN 'table_replace_semantics_unproven'
       ELSE ''
     END AS conservative_blocker
   FROM schema_classified
@@ -199,6 +206,7 @@ foreign_key_facts AS (
     'not_applicable' AS schema_sql_storage_class,
     1 AS table_sql_token_source_is_null, '' AS table_sql_token_source_hex,
     0 AS table_virtual_token_hit,
+    0 AS table_replace_token_hit,
     id_storage_class AS foreign_key_id_storage_class,
     id_value_hex AS foreign_key_id_value_hex,
     CASE WHEN id_storage_class = 'integer' THEN raw_id ELSE -1 END AS foreign_key_id,
@@ -236,7 +244,7 @@ ORDER BY schema_rowid, fact_order, fact_kind COLLATE BINARY,
   relation_name_hex COLLATE BINARY, owner_name_storage_class COLLATE BINARY,
   owner_name_hex COLLATE BINARY, schema_sql_storage_class COLLATE BINARY,
   table_sql_token_source_is_null, table_sql_token_source_hex COLLATE BINARY,
-  table_virtual_token_hit,
+  table_virtual_token_hit, table_replace_token_hit,
   foreign_key_id_storage_class COLLATE BINARY, foreign_key_id_value_hex COLLATE BINARY,
   foreign_key_id, foreign_key_seq_storage_class COLLATE BINARY,
   foreign_key_seq_value_hex COLLATE BINARY, foreign_key_seq,
@@ -431,6 +439,7 @@ pub(crate) struct D1CatalogProjectionRow {
     pub(crate) table_sql_token_source_is_null: u8,
     pub(crate) table_sql_token_source_hex: String,
     pub(crate) table_virtual_token_hit: u8,
+    pub(crate) table_replace_token_hit: u8,
     pub(crate) foreign_key_id_storage_class: String,
     pub(crate) foreign_key_id_value_hex: String,
     pub(crate) foreign_key_id: i64,
@@ -485,6 +494,7 @@ pub(crate) fn derive_d1_catalog_evidence_plan(
             "table_sql_token_source_is_null",
             "table_sql_token_source_hex",
             "table_virtual_token_hit",
+            "table_replace_token_hit",
             "foreign_key_id_storage_class",
             "foreign_key_id_value_hex",
             "foreign_key_id",
@@ -759,6 +769,7 @@ fn validate_projection_rows(rows: &[D1CatalogProjectionRow]) -> Result<(), D1Cat
             || !matches!(row.table_sql_token_source_is_null, 0 | 1)
             || !canonical_upper_hex(&row.table_sql_token_source_hex, true)
             || !matches!(row.table_virtual_token_hit, 0 | 1)
+            || !matches!(row.table_replace_token_hit, 0 | 1)
             || !storage_hex_pair(
                 &row.foreign_key_id_storage_class,
                 &row.foreign_key_id_value_hex,
@@ -876,6 +887,7 @@ fn validate_structured_relationships(
             || row.table_sql_token_source_is_null != 1
             || !row.table_sql_token_source_hex.is_empty()
             || row.table_virtual_token_hit != 0
+            || row.table_replace_token_hit != 0
             || !foreign_key_storage_markers_applicable(row)
         {
             return Err(contradictory_facts());
@@ -988,6 +1000,9 @@ fn validate_schema_fact(
     let virtual_token_hit = token_source
         .as_ref()
         .is_some_and(|source| contains_ascii_token(source, b"VIRTUAL"));
+    let replace_token_hit = token_source
+        .as_ref()
+        .is_some_and(|source| contains_ascii_token(source, b"REPLACE"));
     let expected_blocker = if !structural_blocker.is_empty() {
         structural_blocker
     } else {
@@ -999,6 +1014,7 @@ fn validate_schema_fact(
             }
             Some("table") if token_source_oversized => "table_sql_token_source_oversized",
             Some("table") if virtual_token_hit => "table_virtual_semantics_unproven",
+            Some("table") if replace_token_hit => "table_replace_semantics_unproven",
             _ => "",
         }
     };
@@ -1009,7 +1025,8 @@ fn validate_schema_fact(
         && row.conservative_blocker == expected_blocker
         && row.table_sql_token_source_is_null == u8::from(!token_available)
         && (token_available || row.table_sql_token_source_hex.is_empty())
-        && row.table_virtual_token_hit == u8::from(virtual_token_hit && !token_source_oversized))
+        && row.table_virtual_token_hit == u8::from(virtual_token_hit && !token_source_oversized)
+        && row.table_replace_token_hit == u8::from(replace_token_hit && !token_source_oversized))
 }
 
 fn contains_ascii_token(source: &[u8], token: &[u8]) -> bool {
@@ -1400,12 +1417,16 @@ mod tests {
             .is_some_and(|source| source.len() > D1_CATALOG_TABLE_SQL_TOKEN_SOURCE_BYTE_CAP);
         let virtual_token_hit =
             definition.is_some_and(|source| contains_ascii_token(source.as_bytes(), b"VIRTUAL"));
+        let replace_token_hit =
+            definition.is_some_and(|source| contains_ascii_token(source.as_bytes(), b"REPLACE"));
         let blocker = if definition.is_none() {
             "table_sql_token_source_unavailable"
         } else if oversized {
             "table_sql_token_source_oversized"
         } else if virtual_token_hit {
             "table_virtual_semantics_unproven"
+        } else if replace_token_hit {
+            "table_replace_semantics_unproven"
         } else {
             ""
         };
@@ -1424,6 +1445,7 @@ mod tests {
             "table_sql_token_source_is_null": u8::from(definition.is_none()),
             "table_sql_token_source_hex": definition.map(hex).unwrap_or_default(),
             "table_virtual_token_hit": u8::from(virtual_token_hit && !oversized),
+            "table_replace_token_hit": u8::from(replace_token_hit && !oversized),
             "conservative_blocker": blocker,
         });
         value
@@ -1449,6 +1471,7 @@ mod tests {
             "table_sql_token_source_is_null": 1,
             "table_sql_token_source_hex": "",
             "table_virtual_token_hit": 0,
+            "table_replace_token_hit": 0,
             "conservative_blocker": "view_write_semantics_unproven",
         });
         value
@@ -1474,6 +1497,7 @@ mod tests {
             "table_sql_token_source_is_null": 1,
             "table_sql_token_source_hex": "",
             "table_virtual_token_hit": 0,
+            "table_replace_token_hit": 0,
             "conservative_blocker": if owner_resolved { "trigger_effects_unproven" } else { "schema_owner_unresolved" },
         });
         value
@@ -1511,6 +1535,7 @@ mod tests {
             "table_sql_token_source_is_null": 1,
             "table_sql_token_source_hex": "",
             "table_virtual_token_hit": 0,
+            "table_replace_token_hit": 0,
             "foreign_key_id_storage_class": "integer",
             "foreign_key_id_value_hex": hex(&id.to_string()),
             "foreign_key_id": id,
@@ -1560,6 +1585,7 @@ mod tests {
             "table_sql_token_source_is_null": 1,
             "table_sql_token_source_hex": "",
             "table_virtual_token_hit": 0,
+            "table_replace_token_hit": 0,
             "conservative_blocker": blocker,
         });
         value
@@ -1617,7 +1643,7 @@ mod tests {
 
     fn payload(rows: Vec<Value>) -> Vec<u8> {
         serde_json::to_vec(&json!({
-            "version": 4,
+            "version": 5,
             "results_truncated": false,
             "meta": {
                 "query_succeeded": true,
@@ -1675,8 +1701,8 @@ mod tests {
     fn plan_is_exact_fixed_projection_for_one_canonical_target() {
         let target = target();
         let (plan, plan_sha256) = derive_d1_catalog_evidence_plan(&target).expect("plan");
-        assert_eq!(plan.version, 4);
-        assert_eq!(plan.projection_version, 4);
+        assert_eq!(plan.version, 5);
+        assert_eq!(plan.projection_version, 5);
         assert_eq!(
             plan.projection_fields,
             [
@@ -1694,6 +1720,7 @@ mod tests {
                 "table_sql_token_source_is_null",
                 "table_sql_token_source_hex",
                 "table_virtual_token_hit",
+                "table_replace_token_hit",
                 "foreign_key_id_storage_class",
                 "foreign_key_id_value_hex",
                 "foreign_key_id",
@@ -1822,6 +1849,55 @@ UPDATE sqlite_schema SET sql=CAST(sql AS BLOB) WHERE name='sql_blob';
                 "missing blocker {blocker}"
             );
         }
+        let sql_blob = rows
+            .iter()
+            .find(|row| row.relation_name_hex == hex("sql_blob"))
+            .expect("non-TEXT SQL row");
+        assert_eq!(sql_blob.schema_sql_storage_class, "blob");
+        assert_eq!(sql_blob.table_replace_token_hit, 0);
+        assert_eq!(
+            sql_blob.conservative_blocker,
+            "schema_sql_storage_class_invalid"
+        );
+    }
+
+    #[test]
+    fn fixed_query_preserves_bounded_schema_replace_evidence() {
+        let setup = r#"
+CREATE TABLE parents(id INTEGER, UNIQUE(id) ON CONFLICT REPLACE);
+"#;
+        let Some(rows) = execute_fixed_query(setup) else {
+            return;
+        };
+        validate_projection_rows(&rows).expect("REPLACE catalog projection is internally exact");
+        let relation = rows
+            .iter()
+            .find(|row| row.fact_kind == "relation" && row.relation_name_hex == hex("parents"))
+            .expect("constraint-level REPLACE relation");
+        assert_eq!(relation.table_replace_token_hit, 1);
+        assert_eq!(relation.table_virtual_token_hit, 0);
+        assert_eq!(
+            relation.conservative_blocker,
+            "table_replace_semantics_unproven"
+        );
+
+        let mut contradictory = relation.clone();
+        contradictory.table_replace_token_hit = 0;
+        assert_eq!(
+            validate_projection_rows(&[contradictory])
+                .expect_err("REPLACE evidence bit cannot drift from retained bytes")
+                .classification,
+            D1CatalogEvidenceClassification::CatalogFactsContradictory
+        );
+
+        let mut malformed = relation.clone();
+        malformed.table_replace_token_hit = 2;
+        assert_eq!(
+            validate_projection_rows(&[malformed])
+                .expect_err("REPLACE evidence must remain boolean")
+                .classification,
+            D1CatalogEvidenceClassification::CatalogRowMalformed
+        );
     }
 
     #[test]
@@ -1886,6 +1962,7 @@ CREATE VIRTUAL TABLE documents USING fts5(body);
         let oversized_row: D1CatalogProjectionRow =
             serde_json::from_value(row(1, "oversized", Some(&oversized))).expect("typed row");
         assert_eq!(oversized_row.table_virtual_token_hit, 0);
+        assert_eq!(oversized_row.table_replace_token_hit, 0);
         assert_eq!(
             oversized_row.conservative_blocker,
             "table_sql_token_source_oversized"
@@ -2077,10 +2154,10 @@ CREATE VIRTUAL TABLE documents USING fts5(body);
         for body in [
             br#"{}"#.to_vec(),
             br#"[]"#.to_vec(),
-            br#"{"version":3,"meta":{"query_succeeded":true,"served_by_primary":true,"changed_db":false,"changes":0,"rows_written":0},"rows":[]}"#.to_vec(),
-            br#"{"version":3,"results_truncated":"false","meta":{"query_succeeded":true,"served_by_primary":true,"changed_db":false,"changes":0,"rows_written":0},"rows":[]}"#.to_vec(),
-            br#"{"version":3,"results_truncated":false,"results_truncated":false,"meta":{"query_succeeded":true,"served_by_primary":true,"changed_db":false,"changes":0,"rows_written":0},"rows":[]}"#.to_vec(),
-            br#"{"version":3,"results_truncated":false,"meta":{"query_succeeded":true,"served_by_primary":true,"changed_db":false,"changes":0,"rows_written":0},"rows":[],"arbitrary":true}"#.to_vec(),
+            br#"{"version":5,"meta":{"query_succeeded":true,"served_by_primary":true,"changed_db":false,"changes":0,"rows_written":0},"rows":[]}"#.to_vec(),
+            br#"{"version":5,"results_truncated":"false","meta":{"query_succeeded":true,"served_by_primary":true,"changed_db":false,"changes":0,"rows_written":0},"rows":[]}"#.to_vec(),
+            br#"{"version":5,"results_truncated":false,"results_truncated":false,"meta":{"query_succeeded":true,"served_by_primary":true,"changed_db":false,"changes":0,"rows_written":0},"rows":[]}"#.to_vec(),
+            br#"{"version":5,"results_truncated":false,"meta":{"query_succeeded":true,"served_by_primary":true,"changed_db":false,"changes":0,"rows_written":0},"rows":[],"arbitrary":true}"#.to_vec(),
         ] {
             let second = frame(
                 &target,

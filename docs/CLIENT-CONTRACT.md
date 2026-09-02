@@ -344,7 +344,7 @@ digest, custody, and no-retry semantics remain unchanged.
 ## Staged D1 catalog evidence contract
 
 The crate contains a side-effect-free, non-routed catalog evidence boundary for
-future guarded D1 write composition. Projection version 4 derives one immutable,
+future guarded D1 write composition. Projection version 5 derives one immutable,
 target-bound structured fact set from `sqlite_schema` and the
 `pragma_foreign_key_list()` table-valued function rather than accepting caller
 SQL or a generic provider envelope. Its internal provider-custody adapter
@@ -393,16 +393,20 @@ parent/action/match identity, unique contiguous sequences beginning at zero,
 and exact from/to evidence at every sequence. This matches the semantic field
 set used by migration reconciliation without coupling the two implementations.
 Relation rows retain SQL bytes only for structurally valid tables and permit
-only bounded ASCII token classification. The fixed query records a typed virtual-token bit
-for a case-insensitive `VIRTUAL` occurrence within 64 KiB; the verifier
-independently re-derives that bit from the retained bytes. Any hit is an exact
-`table_virtual_semantics_unproven` blocker because SQLite reports virtual and
-shadow relations as schema tables while the module may write its shadow tables.
-An oversized source blocks before token classification. View SQL and trigger
-bodies are never projected or interpreted. Missing owners or parents, malformed
-storage classes, ambiguous schema identities, unavailable or oversized table
-token sources, and unproven virtual/view/trigger write semantics remain exact
-conservative blockers.
+only bounded ASCII token classification. The fixed query records typed bits for
+case-insensitive `VIRTUAL` and `REPLACE` occurrences within 64 KiB; the verifier
+independently re-derives both bits from the retained bytes. A virtual hit is an
+exact `table_virtual_semantics_unproven` blocker because SQLite reports virtual
+and shadow relations as schema tables while the module may write its shadow
+tables. A REPLACE hit is an exact `table_replace_semantics_unproven` blocker
+because a table or constraint-level conflict policy can make a plain INSERT or
+UPDATE delete an incumbent and run ON DELETE effects. Token scans may
+conservatively match identifiers or comments, but never reopen ambiguous
+semantics. An oversized source blocks before token classification. View SQL and
+trigger bodies are never projected or interpreted. Missing owners or parents,
+malformed storage classes, ambiguous schema identities, unavailable or
+oversized table token sources, and unproven REPLACE/virtual/view/trigger write
+semantics remain exact conservative blockers.
 
 Rows are keyed by physical schema rowid and fact order and must be strictly
 ordered exactly as the fixed query specifies. The 1,001-row sentinel applies to
@@ -429,7 +433,7 @@ trigger bodies; traverses a graph; authorizes DDL, DML, foreign-key effects,
 implicit writes, provider admission, custody outside these exact reads, or any
 mutation. No public MCP tool currently exposes this staged contract.
 
-The next internal staged boundary consumes only that opaque version-4 product
+The next internal staged boundary consumes only that opaque version-5 product
 and derives a conservative reserved-relation write graph. Its configured root
 set is non-empty, ASCII-case closed, duplicate-free, limited to 64 identities,
 and must name relations present in the verified snapshot. Relations whose
@@ -447,6 +451,9 @@ ASCII-case-insensitive byte scan classifies any `AUTOINCREMENT` occurrence
 conservatively; a match adds only table-insert to `sqlite_sequence`-update and
 requires that exact physical table fact. This may over-classify quoted or
 commented occurrences, but cannot turn ambiguous text into permission.
+Any bounded table-source `REPLACE` hit blocks the complete graph before an
+INSERT or UPDATE decision can become `Allow`; unavailable or oversized sources
+remain blockers. This is conservative token evidence, not CREATE TABLE parsing.
 
 The module also owns a closed internal statement-shape expansion contract for
 future composition, but performs no composition or admission itself. Primitive

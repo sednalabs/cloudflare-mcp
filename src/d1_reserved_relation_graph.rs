@@ -1,6 +1,6 @@
 //! Conservative reserved-relation write graph from verified D1 catalog facts.
 //!
-//! This pure boundary accepts only the opaque version-4 catalog product. It
+//! This pure boundary accepts only the opaque version-5 catalog product. It
 //! creates operation-specific foreign-key and AUTOINCREMENT edges, then derives
 //! bounded cycle-safe decisions for every verified relation. Trigger bodies and
 //! view definitions are deliberately unavailable: reaching a trigger-owned
@@ -21,8 +21,8 @@ use crate::d1_catalog_evidence::{
 
 pub(crate) const D1_RESERVED_RELATION_GRAPH_OPERATION: &str = "d1_reserved_relation_write_graph";
 
-const GRAPH_VERSION: u8 = 2;
-const REQUIRED_CATALOG_VERSION: u8 = 4;
+const GRAPH_VERSION: u8 = 3;
+const REQUIRED_CATALOG_VERSION: u8 = 5;
 const MAX_CONFIGURED_RESERVED_ROOTS: usize = 64;
 const MAX_RELATIONS: usize = 1_000;
 const MAX_GRAPH_NODES: usize = MAX_RELATIONS * 3;
@@ -234,7 +234,9 @@ fn derive_from_verified_parts(
                 let identity = identity_from_hex(&row.relation_name_hex, true)?;
                 let relation = match row.relation_type.as_str() {
                     "table" => {
-                        if row.table_virtual_token_hit != 0 || !row.conservative_blocker.is_empty()
+                        if row.table_virtual_token_hit != 0
+                            || row.table_replace_token_hit != 0
+                            || !row.conservative_blocker.is_empty()
                         {
                             return Err(blocked_fact());
                         }

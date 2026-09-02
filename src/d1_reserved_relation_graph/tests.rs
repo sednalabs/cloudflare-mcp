@@ -45,12 +45,20 @@ fn table(schema_rowid: i64, name: &str, definition: Option<&str>) -> Value {
             .windows(b"VIRTUAL".len())
             .any(|window| window.eq_ignore_ascii_case(b"VIRTUAL"))
     });
+    let replace_token_hit = definition.is_some_and(|source| {
+        source
+            .as_bytes()
+            .windows(b"REPLACE".len())
+            .any(|window| window.eq_ignore_ascii_case(b"REPLACE"))
+    });
     let blocker = if definition.is_none() {
         "table_sql_token_source_unavailable"
     } else if oversized {
         "table_sql_token_source_oversized"
     } else if virtual_token_hit {
         "table_virtual_semantics_unproven"
+    } else if replace_token_hit {
+        "table_replace_semantics_unproven"
     } else {
         ""
     };
@@ -69,6 +77,7 @@ fn table(schema_rowid: i64, name: &str, definition: Option<&str>) -> Value {
         "table_sql_token_source_is_null": u8::from(definition.is_none()),
         "table_sql_token_source_hex": definition.map(hex).unwrap_or_default(),
         "table_virtual_token_hit": u8::from(virtual_token_hit && !oversized),
+        "table_replace_token_hit": u8::from(replace_token_hit && !oversized),
         "conservative_blocker": blocker,
     });
     value
@@ -94,6 +103,7 @@ fn view(schema_rowid: i64, name: &str) -> Value {
         "table_sql_token_source_is_null": 1,
         "table_sql_token_source_hex": "",
         "table_virtual_token_hit": 0,
+        "table_replace_token_hit": 0,
         "conservative_blocker": "view_write_semantics_unproven",
     });
     value
@@ -119,6 +129,7 @@ fn trigger(schema_rowid: i64, name: &str, owner: &str, owner_resolved: bool) -> 
         "table_sql_token_source_is_null": 1,
         "table_sql_token_source_hex": "",
         "table_virtual_token_hit": 0,
+        "table_replace_token_hit": 0,
         "conservative_blocker": if owner_resolved { "trigger_effects_unproven" } else { "schema_owner_unresolved" },
     });
     value
@@ -144,6 +155,7 @@ fn auxiliary(schema_rowid: i64, name: &str, owner: &str) -> Value {
         "table_sql_token_source_is_null": 1,
         "table_sql_token_source_hex": "",
         "table_virtual_token_hit": 0,
+        "table_replace_token_hit": 0,
         "conservative_blocker": "",
     });
     value
@@ -182,6 +194,7 @@ fn foreign_key(
         "table_sql_token_source_is_null": 1,
         "table_sql_token_source_hex": "",
         "table_virtual_token_hit": 0,
+        "table_replace_token_hit": 0,
         "foreign_key_id_storage_class": "integer",
         "foreign_key_id_value_hex": hex(&id.to_string()),
         "foreign_key_id": id,
@@ -212,7 +225,7 @@ fn verified(rows: Vec<Value>) -> D1CatalogEvidenceProduct {
         .collect::<Vec<_>>();
     rows.sort();
     let body = serde_json::to_vec(&json!({
-        "version": 4,
+        "version": 5,
         "results_truncated": false,
         "meta": {
             "query_succeeded": true,
@@ -663,6 +676,70 @@ fn virtual_table_evidence_blocks_graph_before_shadow_root_allowance() {
         .classification,
         D1ReservedRelationGraphClassification::CatalogFactBlocked
     );
+}
+
+#[test]
+fn schema_replace_blocks_plain_insert_and_update_before_reserved_delete_cascade() {
+    let catalog = verified(vec![
+        table(
+            1,
+            "reserved_child",
+            Some("CREATE TABLE reserved_child(parent_id)"),
+        ),
+        foreign_key(
+            1,
+            "reserved_child",
+            "parents",
+            0,
+            0,
+            "parent_id",
+            Some("id"),
+            "NO ACTION",
+            "CASCADE",
+            "NONE",
+            true,
+        ),
+        table(
+            2,
+            "parents",
+            Some("CREATE TABLE parents(id, UNIQUE(id) ON CONFLICT REPLACE)"),
+        ),
+    ]);
+    let replace_relation = catalog
+        .rows()
+        .iter()
+        .find(|row| row.relation_name_hex == hex("parents"))
+        .expect("REPLACE relation");
+    assert_eq!(replace_relation.table_replace_token_hit, 1);
+    assert_eq!(catalog.receipt().conservative_blocker_count, 1);
+
+    assert_eq!(
+        required_relation_write_operations(D1WriteOperationForm::Insert)
+            .expect("plain INSERT form"),
+        &[D1RelationWriteOperation::Insert]
+    );
+    assert_eq!(
+        required_relation_write_operations(D1WriteOperationForm::Update)
+            .expect("plain UPDATE form"),
+        &[D1RelationWriteOperation::Update]
+    );
+    assert_eq!(
+        derive_d1_reserved_relation_graph(&catalog, &["reserved_child".to_string()])
+            .expect_err("schema REPLACE can delete an incumbent and cascade")
+            .classification,
+        D1ReservedRelationGraphClassification::CatalogFactBlocked
+    );
+
+    let encoded = serde_json::to_string(catalog.receipt()).expect("aggregate catalog receipt");
+    for private in [
+        "REPLACE",
+        "parents",
+        "reserved_child",
+        "UNIQUE(id)",
+        DATABASE_ID,
+    ] {
+        assert!(!encoded.contains(private));
+    }
 }
 
 #[test]
