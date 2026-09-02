@@ -92,8 +92,8 @@ fn empty_dml_custody_authorization(target_key_sha256: &str) -> Value {
         artifact_evidence: Vec<(String, String)>,
     }
 
-    const LAYOUT_SHA256: &str = "68da1f2248681d61a387f503b370a73ebc848b9c34bec6afd00b24a0bef36b48";
-    const BUDGET_SHA256: &str = "97e3ea422008c9a0e6cbf3749e11d2b2bdbdedc49c29291fe62ea314453dcc49";
+    const LAYOUT_SHA256: &str = "68da1f2248681d61a387f503b370a73ebc848b9c34bec6afd00b24a0bef36b48"; // DevSkim: ignore DS173237 -- public layout specification digest, not a credential
+    const BUDGET_SHA256: &str = "97e3ea422008c9a0e6cbf3749e11d2b2bdbdedc49c29291fe62ea314453dcc49"; // DevSkim: ignore DS173237 -- public audit-budget specification digest, not a credential
     let digest = EmptyCompleteAuditDigest {
         version: 1,
         layout_sha256: LAYOUT_SHA256,
