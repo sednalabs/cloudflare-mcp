@@ -395,12 +395,92 @@ pub(crate) fn validate_d1_dml_attempt_successor(
     Ok(())
 }
 
+/// Re-derive the immutable full attempt binding from one canonical physical
+/// attempt receipt. This is namespace-audit evidence only and cannot authorize
+/// provider access, replay, recovery, or a lifecycle transition.
+pub(crate) fn validate_d1_dml_attempt_audit_binding(
+    receipt: &D1DmlAttemptCustodyReceipt,
+) -> Result<(), D1DmlAttemptCustodyError> {
+    let expected = hash_serialized(&(
+        CUSTODY_VERSION,
+        D1_DML_ATTEMPT_CUSTODY_OPERATION,
+        D1_DML_CUSTODY_LAYOUT_VERSION,
+        D1_DML_CUSTODY_LAYOUT_SHA256,
+        receipt.target_key_sha256.as_str(),
+        receipt.execute_plan_sha256.as_str(),
+        receipt.composition_sha256.as_str(),
+        receipt.composition_receipt_sha256.as_str(),
+        receipt.operation_id_sha256.as_str(),
+        receipt.execution_attempt_id_sha256.as_str(),
+        receipt.provider_request_id_sha256.as_str(),
+    ));
+    if receipt.attempt_binding_sha256 != expected {
+        return Err(custody_error(
+            D1DmlAttemptCustodyClassification::RestoredStateContradictory,
+            "attempt binding did not rederive from canonical physical evidence",
+        ));
+    }
+    Ok(())
+}
+
 fn option_addition<T: PartialEq>(expected: &Option<T>, successor: &Option<T>) -> Option<u8> {
     match (expected, successor) {
         (None, Some(_)) => Some(1),
         (left, right) if left == right => Some(0),
         _ => None,
     }
+}
+
+#[cfg(test)]
+pub(crate) fn synthetic_d1_dml_attempt_for_complete_audit(
+    target_key_sha256: &str,
+    execute_plan_sha256: &str,
+    identities: D1DmlAttemptIdentities<'_>,
+) -> D1DmlAttemptCustodyProduct {
+    let operation_id_sha256 = hash_bytes(identities.operation_id.as_bytes());
+    let execution_attempt_id_sha256 = hash_bytes(identities.execution_attempt_id.as_bytes());
+    let provider_request_id_sha256 = hash_bytes(identities.provider_request_id.as_bytes());
+    let composition_sha256 = hash_bytes(b"synthetic-complete-audit-composition");
+    let composition_receipt_sha256 = hash_bytes(b"synthetic-complete-audit-receipt");
+    let attempt_binding_sha256 = hash_serialized(&(
+        CUSTODY_VERSION,
+        D1_DML_ATTEMPT_CUSTODY_OPERATION,
+        D1_DML_CUSTODY_LAYOUT_VERSION,
+        D1_DML_CUSTODY_LAYOUT_SHA256,
+        target_key_sha256,
+        execute_plan_sha256,
+        composition_sha256.as_str(),
+        composition_receipt_sha256.as_str(),
+        operation_id_sha256.as_str(),
+        execution_attempt_id_sha256.as_str(),
+        provider_request_id_sha256.as_str(),
+    ));
+    product(
+        D1DmlAttemptState {
+            version: CUSTODY_VERSION,
+            operation: D1_DML_ATTEMPT_CUSTODY_OPERATION.to_string(),
+            layout_version: D1_DML_CUSTODY_LAYOUT_VERSION,
+            layout_sha256: D1_DML_CUSTODY_LAYOUT_SHA256.to_string(),
+            target_key_sha256: target_key_sha256.to_string(),
+            execute_plan_sha256: execute_plan_sha256.to_string(),
+            composition_sha256,
+            composition_receipt_sha256,
+            operation_id_sha256,
+            execution_attempt_id_sha256,
+            provider_request_id_sha256,
+            attempt_binding_sha256,
+            phase: D1DmlAttemptPhase::Prepared,
+            dispatch_reservations: 0,
+            ambiguity: None,
+            provider_assertion: None,
+            readback_assertion: None,
+            terminal_outcome: None,
+        },
+        D1DmlAttemptTransition::Prepared,
+        None,
+        false,
+    )
+    .expect("synthetic complete-audit attempt is canonical")
 }
 
 /// Prepare the exact successor for a later atomic compare-and-exchange. This

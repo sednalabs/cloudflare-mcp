@@ -105,9 +105,21 @@ malformed, linked, or mismatched siblings. CAS consumes the audited file
 identity, renames it, and re-audits for zero remaining scratch plus exact
 successor readback. The separately bounded stable
 complete audit traverses every shard, verifies canonical placement and
-claimant/attempt cross-links, and is required by restore, activation, and any
-destructive target-wide custody workflow. The undeployed flat candidate layout
-has no compatibility read or migration path.
+rederives each claimant intent, every physically complete three-namespace
+claimant-set digest, and every attempt binding. It then proves the relation in
+both directions: each attempt requires exactly one complete exact `Bound` set,
+and each complete or partial claimant set is classified against its referenced
+attempt. Conflicting bindings, duplicate namespaces, digest drift, malformed
+bytes, or incorrect placement fails closed. A canonical attempt without its
+complete exact set and a valid `Bound` set whose attempt is absent are explicit
+reconciliation evidence; `Pending`, partial, and CAS-scratch products are also
+`reconciliation_required`. The fixed aggregate receipt reports matched and
+unmatched attempts plus matched, unmatched, orphan, complete, and incomplete
+set counts and always declares
+`provider_dispatch_authority=none`. It is a required proof for the separately
+owned restore, activation, and destructive target-wide workflow integration;
+this audit alone performs or authorizes none of those operations. The
+undeployed flat candidate layout has no compatibility read or migration path.
 
 Dry-run the exact target, SQL bytes, parameters, row cap, and three
 pairwise-distinct opaque operation/attempt/provider-request identities. The dry

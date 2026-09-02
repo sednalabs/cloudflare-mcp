@@ -4994,6 +4994,29 @@ mod linux {
         scratches: BTreeMap<String, DmlScratchAudit>,
     }
 
+    #[derive(Serialize)]
+    struct DmlCompleteAuditDigest<'a> {
+        version: u8,
+        layout_sha256: &'a str,
+        target_key_sha256: &'a str,
+        claimant_count: usize,
+        attempt_count: usize,
+        pending_claimant_count: usize,
+        bound_claimant_count: usize,
+        cas_scratch_count: usize,
+        claimant_set_count: usize,
+        complete_claimant_set_count: usize,
+        matched_claimant_set_count: usize,
+        unmatched_claimant_set_count: usize,
+        unmatched_attempt_count: usize,
+        orphan_claimant_set_count: usize,
+        incomplete_claimant_set_count: usize,
+        reconciliation_required: bool,
+        provider_dispatch_authority:
+            crate::d1_dml_custody_layout::D1DmlCustodyAuditProviderAuthority,
+        artifact_evidence: &'a [(String, String)],
+    }
+
     fn parse_dml_scratch_name(name: &str) -> Option<(&str, &str, &str)> {
         let value = name.strip_prefix(".next.")?.strip_suffix(".json")?;
         let mut parts = value.split('.');
@@ -5294,7 +5317,7 @@ mod linux {
             String,
             Vec<crate::d1_dml_identity_claimant::D1DmlIdentityClaimantReceipt>,
         > = BTreeMap::new();
-        let mut attempts = Vec::new();
+        let mut attempts = BTreeMap::new();
         let mut scratch_count = 0usize;
         let mut artifact_evidence = Vec::new();
 
@@ -5335,17 +5358,32 @@ mod linux {
                                     .map_err(|_| "DML claimant was malformed during complete audit")?
                                     .receipt()
                                     .clone();
+                                crate::d1_dml_identity_claimant::validate_d1_dml_identity_claimant_audit_binding(&receipt)
+                                    .map_err(|_| "DML claimant intent binding did not rederive during complete audit")?;
                                 claimant_sets
                                     .entry(receipt.claimant_set_sha256.clone())
                                     .or_default()
                                     .push(receipt);
                             }
-                            DmlLeafKind::Attempt => attempts.push(
-                                crate::d1_dml_attempt_custody::inspect_d1_dml_attempt_state(&bytes)
+                            DmlLeafKind::Attempt => {
+                                let receipt =
+                                    crate::d1_dml_attempt_custody::inspect_d1_dml_attempt_state(
+                                        &bytes,
+                                    )
                                     .map_err(|_| "DML attempt was malformed during complete audit")?
                                     .receipt()
-                                    .clone(),
-                            ),
+                                    .clone();
+                                crate::d1_dml_attempt_custody::validate_d1_dml_attempt_audit_binding(&receipt)
+                                    .map_err(|_| "DML attempt binding did not rederive during complete audit")?;
+                                if attempts
+                                    .insert(receipt.attempt_binding_sha256.clone(), receipt)
+                                    .is_some()
+                                {
+                                    return Err(
+                                        "DML complete audit found duplicate attempt binding evidence",
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -5362,59 +5400,133 @@ mod linux {
             })
             .count();
         let bound_claimant_count = claimant_count - pending_claimant_count;
-        let incomplete_claimant_set_count = claimant_sets
-            .values()
-            .filter(|receipts| {
-                receipts.len() != 3
-                    || crate::d1_dml_identity_claimant::D1DmlIdentityNamespace::ALL
-                        .into_iter()
-                        .any(|namespace| {
-                            receipts
-                                .iter()
-                                .filter(|receipt| receipt.namespace == namespace)
-                                .count()
-                                != 1
-                        })
-            })
-            .count();
-        for attempt in &attempts {
-            let matching = claimant_sets.values().find(|receipts| {
-                receipts.len() == 3
-                    && receipts.iter().all(|receipt| {
-                        receipt.phase
-                            == crate::d1_dml_identity_claimant::D1DmlIdentityClaimantPhase::Bound
-                            && receipt.attempt_binding_sha256.as_deref()
-                                == Some(attempt.attempt_binding_sha256.as_str())
-                            && receipt.execute_plan_sha256 == attempt.execute_plan_sha256
-                            && receipt.identity_sha256.as_str()
-                                == match receipt.namespace {
-                                    crate::d1_dml_identity_claimant::D1DmlIdentityNamespace::Operation => attempt.operation_id_sha256.as_str(),
-                                    crate::d1_dml_identity_claimant::D1DmlIdentityNamespace::ExecutionAttempt => attempt.execution_attempt_id_sha256.as_str(),
-                                    crate::d1_dml_identity_claimant::D1DmlIdentityNamespace::ProviderRequest => attempt.provider_request_id_sha256.as_str(),
-                                }
-                    })
-            });
-            if matching.is_none() {
-                return Err("DML attempt lacked one complete exact Bound claimant set");
+        let claimant_set_count = claimant_sets.len();
+        let mut complete_claimant_set_count = 0usize;
+        let mut incomplete_claimant_set_count = 0usize;
+        let mut matched_claimant_set_count = 0usize;
+        let mut orphan_claimant_set_count = 0usize;
+        let mut referenced_attempts = BTreeMap::new();
+        let mut matched_attempts = BTreeSet::new();
+        for (claimant_set_sha256, receipts) in &mut claimant_sets {
+            receipts.sort_by_key(|receipt| receipt.namespace);
+            let first = receipts
+                .first()
+                .expect("claimant-set map entries are never empty");
+            if receipts.iter().any(|receipt| {
+                receipt.target_key_sha256 != first.target_key_sha256
+                    || receipt.execute_plan_sha256 != first.execute_plan_sha256
+                    || receipt.intent_binding_sha256 != first.intent_binding_sha256
+            }) {
+                return Err("DML claimant set contradicted its shared target or intent");
             }
+            for namespace in crate::d1_dml_identity_claimant::D1DmlIdentityNamespace::ALL {
+                if receipts
+                    .iter()
+                    .filter(|receipt| receipt.namespace == namespace)
+                    .count()
+                    > 1
+                {
+                    return Err("DML claimant set duplicated one physical namespace");
+                }
+            }
+            let complete = receipts.len()
+                == crate::d1_dml_identity_claimant::D1DmlIdentityNamespace::ALL.len();
+            if complete {
+                crate::d1_dml_identity_claimant::validate_complete_d1_dml_identity_claimant_set(
+                    receipts,
+                )
+                .map_err(|_| {
+                    "DML complete claimant-set digest did not rederive from physical identities"
+                })?;
+                complete_claimant_set_count += 1;
+            } else {
+                incomplete_claimant_set_count += 1;
+            }
+
+            let bound = receipts
+                .iter()
+                .filter(|receipt| {
+                    receipt.phase
+                        == crate::d1_dml_identity_claimant::D1DmlIdentityClaimantPhase::Bound
+                })
+                .collect::<Vec<_>>();
+            if bound.is_empty() {
+                continue;
+            }
+            let attempt_binding_sha256 = bound[0]
+                .attempt_binding_sha256
+                .as_deref()
+                .expect("inspected Bound claimant has one attempt binding");
+            if bound.iter().any(|receipt| {
+                receipt.attempt_binding_sha256.as_deref() != Some(attempt_binding_sha256)
+            }) {
+                return Err("DML claimant set named contradictory attempt bindings");
+            }
+            let Some(attempt) = attempts.get(attempt_binding_sha256) else {
+                orphan_claimant_set_count += 1;
+                continue;
+            };
+            if bound.iter().any(|receipt| {
+                receipt.target_key_sha256 != attempt.target_key_sha256
+                    || receipt.execute_plan_sha256 != attempt.execute_plan_sha256
+                    || receipt.identity_sha256.as_str()
+                        != match receipt.namespace {
+                            crate::d1_dml_identity_claimant::D1DmlIdentityNamespace::Operation => {
+                                attempt.operation_id_sha256.as_str()
+                            }
+                            crate::d1_dml_identity_claimant::D1DmlIdentityNamespace::ExecutionAttempt => {
+                                attempt.execution_attempt_id_sha256.as_str()
+                            }
+                            crate::d1_dml_identity_claimant::D1DmlIdentityNamespace::ProviderRequest => {
+                                attempt.provider_request_id_sha256.as_str()
+                            }
+                        }
+            }) {
+                return Err("DML claimant evidence contradicted its referenced attempt");
+            }
+            if referenced_attempts
+                .insert(
+                    attempt_binding_sha256.to_string(),
+                    claimant_set_sha256.clone(),
+                )
+                .is_some()
+            {
+                return Err("DML attempt was claimed by multiple claimant sets");
+            }
+            if !complete || bound.len() != receipts.len() {
+                continue;
+            }
+            matched_attempts.insert(attempt_binding_sha256.to_string());
+            matched_claimant_set_count += 1;
         }
+        let unmatched_claimant_set_count = claimant_set_count - matched_claimant_set_count;
+        let unmatched_attempt_count = attempts.len() - matched_attempts.len();
         let reconciliation_required =
-            scratch_count != 0 || incomplete_claimant_set_count != 0 || pending_claimant_count != 0;
+            scratch_count != 0 || unmatched_claimant_set_count != 0 || unmatched_attempt_count != 0;
         artifact_evidence.sort();
+        let provider_dispatch_authority =
+            crate::d1_dml_custody_layout::D1DmlCustodyAuditProviderAuthority::None;
         let audit_sha256 = sha256_bytes_hex(
-            &serde_json::to_vec(&(
-                D1_DML_CUSTODY_LAYOUT_VERSION,
-                D1_DML_CUSTODY_LAYOUT_SHA256,
+            &serde_json::to_vec(&DmlCompleteAuditDigest {
+                version: D1_DML_CUSTODY_LAYOUT_VERSION,
+                layout_sha256: D1_DML_CUSTODY_LAYOUT_SHA256,
                 target_key_sha256,
                 claimant_count,
-                attempts.len(),
+                attempt_count: attempts.len(),
                 pending_claimant_count,
                 bound_claimant_count,
-                scratch_count,
+                cas_scratch_count: scratch_count,
+                claimant_set_count,
+                complete_claimant_set_count,
+                matched_claimant_set_count,
+                unmatched_claimant_set_count,
+                unmatched_attempt_count,
+                orphan_claimant_set_count,
                 incomplete_claimant_set_count,
                 reconciliation_required,
-                artifact_evidence,
-            ))
+                provider_dispatch_authority,
+                artifact_evidence: &artifact_evidence,
+            })
             .expect("DML complete audit serialization is infallible"),
         );
         Ok(D1DmlCustodyCompleteAuditReceipt {
@@ -5426,8 +5538,15 @@ mod linux {
             pending_claimant_count,
             bound_claimant_count,
             cas_scratch_count: scratch_count,
+            claimant_set_count,
+            complete_claimant_set_count,
+            matched_claimant_set_count,
+            unmatched_claimant_set_count,
+            unmatched_attempt_count,
+            orphan_claimant_set_count,
             incomplete_claimant_set_count,
             reconciliation_required,
+            provider_dispatch_authority,
             audit_sha256,
         })
     }
@@ -5899,6 +6018,104 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    struct DmlCompleteAuditFixture {
+        root: PathBuf,
+        guard: D1TargetMutationGuard,
+        set: crate::d1_dml_identity_claimant::D1DmlIdentityClaimantSet,
+        attempt: crate::d1_dml_attempt_custody::D1DmlAttemptCustodyProduct,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn dml_complete_audit_fixture(label: &str) -> DmlCompleteAuditFixture {
+        use crate::d1_dml_attempt_custody::{
+            D1DmlAttemptIdentities, synthetic_d1_dml_attempt_for_complete_audit,
+        };
+        use crate::d1_dml_identity_claimant::derive_d1_dml_identity_claimant_set;
+        use crate::d1_target::normalize_d1_target;
+
+        let root = private_test_root(label);
+        let guard = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_execute_write",
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect("acquire complete-audit target guard");
+        guard
+            .ensure_d1_dml_custody_layout()
+            .expect("install complete-audit layout");
+        let target =
+            normalize_d1_target("acct-1", "123e4567-e89b-42d3-a456-426614174000").expect("target");
+        let identities = D1DmlAttemptIdentities {
+            operation_id: "operation-complete-audit-0001",
+            execution_attempt_id: "attempt-complete-audit-0001",
+            provider_request_id: "provider-complete-audit-0001",
+        };
+        let execute_plan_sha256 = sha256_bytes_hex(label.as_bytes());
+        let set = derive_d1_dml_identity_claimant_set(&target, &execute_plan_sha256, identities)
+            .expect("derive complete-audit claimant set");
+        let attempt = synthetic_d1_dml_attempt_for_complete_audit(
+            &target.target_key_sha256(),
+            &execute_plan_sha256,
+            identities,
+        );
+        DmlCompleteAuditFixture {
+            root,
+            guard,
+            set,
+            attempt,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn install_pending_audit_claimant(
+        fixture: &DmlCompleteAuditFixture,
+        namespace: crate::d1_dml_identity_claimant::D1DmlIdentityNamespace,
+    ) {
+        let pending = fixture.set.pending(namespace);
+        fixture
+            .guard
+            .create_d1_dml_identity_claimant(
+                namespace,
+                fixture.set.identity_sha256(namespace),
+                pending.state_bytes(),
+            )
+            .expect("install complete-audit Pending claimant");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn seal_audit_claimant(
+        fixture: &DmlCompleteAuditFixture,
+        namespace: crate::d1_dml_identity_claimant::D1DmlIdentityNamespace,
+    ) {
+        let pending = fixture.set.pending(namespace);
+        let bound = fixture
+            .set
+            .bound(namespace, &fixture.attempt.receipt().attempt_binding_sha256)
+            .expect("derive complete-audit Bound claimant");
+        fixture
+            .guard
+            .compare_exchange_d1_dml_identity_claimant(
+                namespace,
+                fixture.set.identity_sha256(namespace),
+                pending.state_bytes(),
+                bound.state_bytes(),
+            )
+            .expect("seal complete-audit claimant");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn install_audit_attempt(fixture: &DmlCompleteAuditFixture) {
+        fixture
+            .guard
+            .create_d1_dml_attempt_state(
+                &fixture.attempt.receipt().attempt_binding_sha256,
+                fixture.attempt.state_bytes(),
+            )
+            .expect("install complete-audit attempt");
+    }
+
+    #[cfg(target_os = "linux")]
     fn dml_claimant_scratch_fixture(label: &str) -> DmlClaimantScratchFixture {
         use crate::d1_dml_attempt_custody::D1DmlAttemptIdentities;
         use crate::d1_dml_identity_claimant::{
@@ -6185,9 +6402,315 @@ mod tests {
             .expect("stable complete audit");
         assert_eq!(audit.claimant_count, 192);
         assert_eq!(audit.pending_claimant_count, 192);
+        assert_eq!(audit.claimant_set_count, 64);
+        assert_eq!(audit.complete_claimant_set_count, 64);
+        assert_eq!(audit.matched_claimant_set_count, 0);
+        assert_eq!(audit.unmatched_claimant_set_count, 64);
+        assert_eq!(audit.orphan_claimant_set_count, 0);
         assert_eq!(audit.incomplete_claimant_set_count, 0);
         assert!(audit.reconciliation_required);
+        assert_eq!(
+            audit.provider_dispatch_authority,
+            crate::d1_dml_custody_layout::D1DmlCustodyAuditProviderAuthority::None
+        );
         fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn complete_dml_audit_proves_both_physical_insertion_orders_bidirectionally() {
+        use crate::d1_dml_identity_claimant::D1DmlIdentityNamespace;
+
+        let claimants_first = dml_complete_audit_fixture("dml-audit-claimants-first");
+        for namespace in D1DmlIdentityNamespace::ALL {
+            install_pending_audit_claimant(&claimants_first, namespace);
+            seal_audit_claimant(&claimants_first, namespace);
+        }
+        let orphan = claimants_first
+            .guard
+            .audit_d1_dml_custody_complete()
+            .expect("complete Bound set without attempt is classifiable");
+        assert_eq!(orphan.attempt_count, 0);
+        assert_eq!(orphan.claimant_set_count, 1);
+        assert_eq!(orphan.complete_claimant_set_count, 1);
+        assert_eq!(orphan.matched_claimant_set_count, 0);
+        assert_eq!(orphan.unmatched_claimant_set_count, 1);
+        assert_eq!(orphan.orphan_claimant_set_count, 1);
+        assert!(orphan.reconciliation_required);
+        assert_eq!(
+            orphan.provider_dispatch_authority,
+            crate::d1_dml_custody_layout::D1DmlCustodyAuditProviderAuthority::None
+        );
+        install_audit_attempt(&claimants_first);
+        let matched = claimants_first
+            .guard
+            .audit_d1_dml_custody_complete()
+            .expect("attempt closes the exact claimant-first product");
+        assert_eq!(matched.attempt_count, 1);
+        assert_eq!(matched.matched_claimant_set_count, 1);
+        assert_eq!(matched.unmatched_claimant_set_count, 0);
+        assert_eq!(matched.orphan_claimant_set_count, 0);
+        assert!(!matched.reconciliation_required);
+        let aggregate = serde_json::to_string(&matched).expect("aggregate audit receipt JSON");
+        for private_value in [
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "operation-complete-audit-0001",
+            "attempt-complete-audit-0001",
+            "provider-complete-audit-0001",
+            "dml-custody-v1/claimant",
+        ] {
+            assert!(
+                !aggregate.contains(private_value),
+                "aggregate complete audit must not expose private identity or path evidence"
+            );
+        }
+        fs::remove_dir_all(claimants_first.root).expect("claimants-first cleanup");
+
+        let attempt_first = dml_complete_audit_fixture("dml-audit-attempt-first");
+        install_audit_attempt(&attempt_first);
+        let unmatched = attempt_first
+            .guard
+            .audit_d1_dml_custody_complete()
+            .expect("an unmatched canonical attempt is reconciliation evidence");
+        assert_eq!(unmatched.attempt_count, 1);
+        assert_eq!(unmatched.unmatched_attempt_count, 1);
+        assert!(unmatched.reconciliation_required);
+        assert_eq!(
+            unmatched.provider_dispatch_authority,
+            crate::d1_dml_custody_layout::D1DmlCustodyAuditProviderAuthority::None
+        );
+        install_pending_audit_claimant(&attempt_first, D1DmlIdentityNamespace::Operation);
+        seal_audit_claimant(&attempt_first, D1DmlIdentityNamespace::Operation);
+        let partial_attempt = attempt_first
+            .guard
+            .audit_d1_dml_custody_complete()
+            .expect("partial exact claimant recovery remains reconciliation evidence");
+        assert_eq!(partial_attempt.unmatched_attempt_count, 1);
+        assert_eq!(partial_attempt.unmatched_claimant_set_count, 1);
+        assert_eq!(partial_attempt.incomplete_claimant_set_count, 1);
+        assert!(partial_attempt.reconciliation_required);
+        for namespace in D1DmlIdentityNamespace::ALL[1..].iter().copied() {
+            install_pending_audit_claimant(&attempt_first, namespace);
+            seal_audit_claimant(&attempt_first, namespace);
+        }
+        let restored = attempt_first
+            .guard
+            .audit_d1_dml_custody_complete()
+            .expect("later exact claimant set closes attempt-first restore");
+        assert_eq!(restored.matched_claimant_set_count, 1);
+        assert_eq!(restored.unmatched_claimant_set_count, 0);
+        assert_eq!(restored.unmatched_attempt_count, 0);
+        assert!(!restored.reconciliation_required);
+        fs::remove_dir_all(attempt_first.root).expect("attempt-first cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn complete_dml_audit_classifies_partial_orphan_and_scratch_products_without_authority() {
+        use crate::d1_dml_identity_claimant::D1DmlIdentityNamespace;
+
+        let partial = dml_complete_audit_fixture("dml-audit-partial");
+        install_pending_audit_claimant(&partial, D1DmlIdentityNamespace::Operation);
+        let pending = partial
+            .guard
+            .audit_d1_dml_custody_complete()
+            .expect("partial Pending set remains bounded reconciliation evidence");
+        assert_eq!(pending.claimant_set_count, 1);
+        assert_eq!(pending.complete_claimant_set_count, 0);
+        assert_eq!(pending.incomplete_claimant_set_count, 1);
+        assert_eq!(pending.unmatched_claimant_set_count, 1);
+        assert_eq!(pending.orphan_claimant_set_count, 0);
+        assert!(pending.reconciliation_required);
+
+        seal_audit_claimant(&partial, D1DmlIdentityNamespace::Operation);
+        let bound_partial = partial
+            .guard
+            .audit_d1_dml_custody_complete()
+            .expect("partial Bound set without attempt is orphan reconciliation evidence");
+        assert_eq!(bound_partial.incomplete_claimant_set_count, 1);
+        assert_eq!(bound_partial.orphan_claimant_set_count, 1);
+        assert_eq!(bound_partial.matched_claimant_set_count, 0);
+        assert!(bound_partial.reconciliation_required);
+        assert_eq!(
+            bound_partial.provider_dispatch_authority,
+            crate::d1_dml_custody_layout::D1DmlCustodyAuditProviderAuthority::None
+        );
+        fs::remove_dir_all(partial.root).expect("partial cleanup");
+
+        let scratch = dml_claimant_scratch_fixture("dml-audit-scratch");
+        let scratch_name = claimant_scratch_name(&scratch.digest, &scratch.pending, &scratch.bound);
+        install_claimant_scratch(&scratch, &scratch_name, &scratch.bound);
+        let scratch_audit = scratch
+            .guard
+            .audit_d1_dml_custody_complete()
+            .expect("one valid scratch is explicit reconciliation evidence");
+        assert_eq!(scratch_audit.cas_scratch_count, 1);
+        assert_eq!(scratch_audit.unmatched_claimant_set_count, 1);
+        assert!(scratch_audit.reconciliation_required);
+        assert_eq!(
+            scratch_audit.provider_dispatch_authority,
+            crate::d1_dml_custody_layout::D1DmlCustodyAuditProviderAuthority::None
+        );
+        fs::remove_dir_all(scratch.root).expect("scratch cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn complete_dml_audit_rejects_digest_tampered_physical_restores() {
+        use crate::d1_dml_identity_claimant::D1DmlIdentityNamespace;
+
+        let claimant_drift = dml_complete_audit_fixture("dml-audit-claimant-drift");
+        for namespace in D1DmlIdentityNamespace::ALL {
+            install_pending_audit_claimant(&claimant_drift, namespace);
+            seal_audit_claimant(&claimant_drift, namespace);
+        }
+        install_audit_attempt(&claimant_drift);
+        claimant_drift
+            .guard
+            .audit_d1_dml_custody_complete()
+            .expect("baseline graph is exact");
+        let operation_digest = claimant_drift
+            .set
+            .identity_sha256(D1DmlIdentityNamespace::Operation);
+        let operation_path = claimant_drift
+            .root
+            .join(&claimant_drift.guard.target_name)
+            .join("dml-custody-v1/claimant/operation")
+            .join(&operation_digest[..2])
+            .join(&operation_digest[2..4])
+            .join(format!("{operation_digest}.json"));
+        let original_claimant = fs::read(&operation_path).expect("read claimant fixture");
+        let mut claimant_json: Value =
+            serde_json::from_slice(&original_claimant).expect("claimant JSON");
+        claimant_json["intent_binding_sha256"] = json!("e".repeat(64));
+        fs::write(
+            &operation_path,
+            serde_json::to_vec(&claimant_json).expect("tampered claimant JSON"),
+        )
+        .expect("install intent-drift restore");
+        assert!(
+            claimant_drift
+                .guard
+                .audit_d1_dml_custody_complete()
+                .is_err(),
+            "canonical-looking claimant intent drift fails closed"
+        );
+        fs::write(&operation_path, original_claimant).expect("restore exact claimant");
+        claimant_drift
+            .guard
+            .audit_d1_dml_custody_complete()
+            .expect("restored exact claimant graph");
+        fs::remove_dir_all(claimant_drift.root).expect("claimant-drift cleanup");
+
+        let attempt_drift = dml_complete_audit_fixture("dml-audit-attempt-drift");
+        let original_binding = attempt_drift
+            .attempt
+            .receipt()
+            .attempt_binding_sha256
+            .clone();
+        let mut attempt_json: Value =
+            serde_json::from_slice(attempt_drift.attempt.state_bytes()).expect("attempt JSON");
+        let drifted_binding = "f".repeat(64);
+        attempt_json["attempt_binding_sha256"] = json!(drifted_binding);
+        let mut drifted_bytes = serde_json::to_vec(&attempt_json).expect("drifted attempt JSON");
+        drifted_bytes.push(b'\n');
+        let drifted_leaf = linux::open_dml_leaf(
+            &attempt_drift.guard.target,
+            linux::DmlLeafKind::Attempt,
+            &drifted_binding,
+            true,
+        )
+        .expect("open drifted attempt leaf")
+        .expect("drifted attempt leaf present");
+        linux::create_private_dml_state(
+            &drifted_leaf,
+            &format!("{drifted_binding}.json"),
+            &drifted_bytes,
+        )
+        .expect("install binding-drift attempt");
+        assert_ne!(original_binding, drifted_binding);
+        assert!(
+            attempt_drift.guard.audit_d1_dml_custody_complete().is_err(),
+            "canonical-looking attempt binding drift fails closed"
+        );
+        fs::remove_dir_all(attempt_drift.root).expect("attempt-drift cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn complete_dml_audit_rejects_duplicate_namespace_and_contradictory_bindings() {
+        use crate::d1_dml_identity_claimant::D1DmlIdentityNamespace;
+
+        let duplicate = dml_complete_audit_fixture("dml-audit-duplicate-namespace");
+        install_pending_audit_claimant(&duplicate, D1DmlIdentityNamespace::Operation);
+        let mut duplicate_json: Value = serde_json::from_slice(
+            duplicate
+                .set
+                .pending(D1DmlIdentityNamespace::Operation)
+                .state_bytes(),
+        )
+        .expect("duplicate claimant JSON");
+        let duplicate_identity = sha256_bytes_hex(b"second-physical-operation-claimant");
+        assert_ne!(
+            duplicate_identity,
+            duplicate
+                .set
+                .identity_sha256(D1DmlIdentityNamespace::Operation)
+        );
+        duplicate_json["identity_sha256"] = json!(duplicate_identity);
+        let duplicate_bytes =
+            serde_json::to_vec(&duplicate_json).expect("duplicate claimant bytes");
+        let duplicate_leaf = linux::open_dml_leaf(
+            &duplicate.guard.target,
+            linux::DmlLeafKind::Claimant(D1DmlIdentityNamespace::Operation),
+            &duplicate_identity,
+            true,
+        )
+        .expect("open duplicate claimant leaf")
+        .expect("duplicate claimant leaf present");
+        linux::create_private_dml_state(
+            &duplicate_leaf,
+            &format!("{duplicate_identity}.json"),
+            &duplicate_bytes,
+        )
+        .expect("install duplicate namespace claimant");
+        assert!(
+            duplicate.guard.audit_d1_dml_custody_complete().is_err(),
+            "two physical rows cannot claim one set namespace"
+        );
+        fs::remove_dir_all(duplicate.root).expect("duplicate cleanup");
+
+        let contradictory = dml_complete_audit_fixture("dml-audit-conflicting-bindings");
+        for namespace in D1DmlIdentityNamespace::ALL {
+            install_pending_audit_claimant(&contradictory, namespace);
+        }
+        seal_audit_claimant(&contradictory, D1DmlIdentityNamespace::Operation);
+        let conflicting_binding = "c".repeat(64);
+        for namespace in [
+            D1DmlIdentityNamespace::ExecutionAttempt,
+            D1DmlIdentityNamespace::ProviderRequest,
+        ] {
+            let pending = contradictory.set.pending(namespace);
+            let bound = contradictory
+                .set
+                .bound(namespace, &conflicting_binding)
+                .expect("derive conflicting Bound claimant");
+            contradictory
+                .guard
+                .compare_exchange_d1_dml_identity_claimant(
+                    namespace,
+                    contradictory.set.identity_sha256(namespace),
+                    pending.state_bytes(),
+                    bound.state_bytes(),
+                )
+                .expect("install conflicting Bound claimant");
+        }
+        assert!(
+            contradictory.guard.audit_d1_dml_custody_complete().is_err(),
+            "one claimant set cannot name contradictory attempt bindings"
+        );
+        fs::remove_dir_all(contradictory.root).expect("contradictory cleanup");
     }
 
     #[cfg(target_os = "linux")]

@@ -362,6 +362,109 @@ pub(crate) fn validate_d1_dml_identity_claimant_seal(
     Ok(())
 }
 
+/// Re-derive the immutable intent binding carried by one canonical physical
+/// claimant. This is complete-audit evidence only; a valid digest never grants
+/// provider authority and a partial claimant set cannot prove its own set
+/// digest until every namespace is physically present.
+pub(crate) fn validate_d1_dml_identity_claimant_audit_binding(
+    receipt: &D1DmlIdentityClaimantReceipt,
+) -> Result<(), D1DmlIdentityClaimantError> {
+    let expected = hash_serialized(&(
+        CLAIMANT_VERSION,
+        D1_DML_IDENTITY_CLAIMANT_OPERATION,
+        D1_DML_CUSTODY_LAYOUT_VERSION,
+        D1_DML_CUSTODY_LAYOUT_SHA256,
+        receipt.target_key_sha256.as_str(),
+        receipt.execute_plan_sha256.as_str(),
+        receipt.claimant_set_sha256.as_str(),
+    ));
+    if receipt.intent_binding_sha256 != expected {
+        return Err(claimant_error(
+            D1DmlIdentityClaimantClassification::RestoredClaimantContradictory,
+            "claimant intent binding did not rederive from canonical physical evidence",
+        ));
+    }
+    Ok(())
+}
+
+/// Re-derive one complete three-namespace claimant-set identity. The caller
+/// must have already inspected each physical row and grouped it by the claimed
+/// set digest. Missing rows remain reconciliation evidence, not input to this
+/// complete-set proof.
+pub(crate) fn validate_complete_d1_dml_identity_claimant_set(
+    receipts: &[D1DmlIdentityClaimantReceipt],
+) -> Result<(), D1DmlIdentityClaimantError> {
+    if receipts.len() != D1DmlIdentityNamespace::ALL.len() {
+        return Err(claimant_error(
+            D1DmlIdentityClaimantClassification::RestoredClaimantContradictory,
+            "complete claimant-set audit requires exactly three physical namespaces",
+        ));
+    }
+    for receipt in receipts {
+        validate_d1_dml_identity_claimant_audit_binding(receipt)?;
+    }
+    let first = &receipts[0];
+    if receipts.iter().any(|receipt| {
+        receipt.target_key_sha256 != first.target_key_sha256
+            || receipt.execute_plan_sha256 != first.execute_plan_sha256
+            || receipt.claimant_set_sha256 != first.claimant_set_sha256
+            || receipt.intent_binding_sha256 != first.intent_binding_sha256
+    }) {
+        return Err(claimant_error(
+            D1DmlIdentityClaimantClassification::RestoredClaimantContradictory,
+            "claimant-set members contradicted their shared target or intent",
+        ));
+    }
+    let mut identities = Vec::with_capacity(D1DmlIdentityNamespace::ALL.len());
+    for namespace in D1DmlIdentityNamespace::ALL {
+        let mut matching = receipts
+            .iter()
+            .filter(|receipt| receipt.namespace == namespace);
+        let receipt = matching.next().ok_or_else(|| {
+            claimant_error(
+                D1DmlIdentityClaimantClassification::RestoredClaimantContradictory,
+                "complete claimant set omitted one namespace",
+            )
+        })?;
+        if matching.next().is_some() {
+            return Err(claimant_error(
+                D1DmlIdentityClaimantClassification::RestoredClaimantContradictory,
+                "complete claimant set duplicated one namespace",
+            ));
+        }
+        identities.push((namespace, receipt.identity_sha256.clone()));
+    }
+    if identities
+        .iter()
+        .map(|(_, digest)| digest.as_str())
+        .collect::<BTreeSet<_>>()
+        .len()
+        != D1DmlIdentityNamespace::ALL.len()
+    {
+        return Err(claimant_error(
+            D1DmlIdentityClaimantClassification::RestoredClaimantContradictory,
+            "complete claimant set reused one identity digest across namespaces",
+        ));
+    }
+    let identities: [(D1DmlIdentityNamespace, String); 3] = identities
+        .try_into()
+        .expect("closed claimant namespace count is exactly three");
+    let expected = hash_serialized(&(
+        CLAIMANT_VERSION,
+        D1_DML_IDENTITY_CLAIMANT_OPERATION,
+        D1_DML_CUSTODY_LAYOUT_VERSION,
+        D1_DML_CUSTODY_LAYOUT_SHA256,
+        &identities,
+    ));
+    if first.claimant_set_sha256 != expected {
+        return Err(claimant_error(
+            D1DmlIdentityClaimantClassification::RestoredClaimantContradictory,
+            "complete claimant-set digest did not rederive from all physical identities",
+        ));
+    }
+    Ok(())
+}
+
 fn canonical_bytes(receipt: &D1DmlIdentityClaimantReceipt) -> Vec<u8> {
     serde_json::to_vec(receipt).expect("serializing claimant receipt cannot fail")
 }
@@ -540,6 +643,49 @@ mod tests {
                     .state_bytes()
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn complete_audit_rederives_intent_set_and_namespace_identity() {
+        let (_, set) = fixture();
+        let receipts = D1DmlIdentityNamespace::ALL
+            .into_iter()
+            .map(|namespace| set.pending(namespace).receipt().clone())
+            .collect::<Vec<_>>();
+        validate_complete_d1_dml_identity_claimant_set(&receipts)
+            .expect("canonical complete claimant set rederives");
+
+        let mut intent_drift = receipts.clone();
+        intent_drift[0].intent_binding_sha256 = "c".repeat(64);
+        assert!(
+            validate_d1_dml_identity_claimant_audit_binding(&intent_drift[0]).is_err(),
+            "canonical-looking intent drift fails closed"
+        );
+
+        let mut duplicate_namespace = receipts.clone();
+        duplicate_namespace[1].namespace = D1DmlIdentityNamespace::Operation;
+        assert!(
+            validate_complete_d1_dml_identity_claimant_set(&duplicate_namespace).is_err(),
+            "one namespace cannot occupy two physical claimant slots"
+        );
+
+        let mut set_drift = receipts;
+        for receipt in &mut set_drift {
+            receipt.claimant_set_sha256 = "d".repeat(64);
+            receipt.intent_binding_sha256 = hash_serialized(&(
+                CLAIMANT_VERSION,
+                D1_DML_IDENTITY_CLAIMANT_OPERATION,
+                D1_DML_CUSTODY_LAYOUT_VERSION,
+                D1_DML_CUSTODY_LAYOUT_SHA256,
+                receipt.target_key_sha256.as_str(),
+                receipt.execute_plan_sha256.as_str(),
+                receipt.claimant_set_sha256.as_str(),
+            ));
+        }
+        assert!(
+            validate_complete_d1_dml_identity_claimant_set(&set_drift).is_err(),
+            "a self-consistent intent cannot hide a forged claimant-set digest"
         );
     }
 }

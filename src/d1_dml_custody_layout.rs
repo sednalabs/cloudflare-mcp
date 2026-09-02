@@ -56,7 +56,20 @@ pub(crate) struct D1DmlCustodyCompleteAuditReceipt {
     pub(crate) pending_claimant_count: usize,
     pub(crate) bound_claimant_count: usize,
     pub(crate) cas_scratch_count: usize,
+    pub(crate) claimant_set_count: usize,
+    pub(crate) complete_claimant_set_count: usize,
+    pub(crate) matched_claimant_set_count: usize,
+    pub(crate) unmatched_claimant_set_count: usize,
+    pub(crate) unmatched_attempt_count: usize,
+    pub(crate) orphan_claimant_set_count: usize,
     pub(crate) incomplete_claimant_set_count: usize,
     pub(crate) reconciliation_required: bool,
+    pub(crate) provider_dispatch_authority: D1DmlCustodyAuditProviderAuthority,
     pub(crate) audit_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum D1DmlCustodyAuditProviderAuthority {
+    None,
 }

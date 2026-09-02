@@ -115,6 +115,20 @@ fn durable_successor_validator_accepts_one_addition_and_rejects_replay_or_revers
     );
 }
 
+#[test]
+fn complete_audit_rederives_the_full_attempt_binding() {
+    let fixture = fixture();
+    let prepared = prepare(&fixture);
+    validate_d1_dml_attempt_audit_binding(prepared.receipt())
+        .expect("canonical attempt binding rederives");
+    let mut drift = prepared.receipt().clone();
+    drift.attempt_binding_sha256 = "d".repeat(64);
+    assert!(
+        validate_d1_dml_attempt_audit_binding(&drift).is_err(),
+        "canonical-looking attempt-binding drift fails closed"
+    );
+}
+
 fn classification(
     result: Result<D1DmlAttemptCustodyProduct, D1DmlAttemptCustodyError>,
 ) -> D1DmlAttemptCustodyClassification {

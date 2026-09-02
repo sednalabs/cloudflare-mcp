@@ -149,8 +149,19 @@ are added by the graph derivation.
    first claimant file is installed. Flat/mixed layouts, unknown entries,
    incorrect placement, links, malformed bytes, and capacity exhaustion stop
    with zero provider mutations. Restore/activation operators must run the
-   separate complete custody audit, which traverses all leaves and checks the
-   three claimant namespaces against every attempt binding.
+   separate stable complete custody audit. It traverses all leaves, rederives
+   every physical claimant intent, every complete three-namespace claimant-set
+   digest, and every attempt binding, then checks both directions of the
+   relation. Every attempt requires exactly one complete exact `Bound` set.
+   Every claimant set, including a partial set, is classified against its
+   referenced attempt. Attempts without their complete exact set,
+   missing-attempt `Bound` sets, Pending/partial sets, and scratch state return
+   aggregate `reconciliation_required` evidence; malformed, contradictory,
+   duplicate, misplaced, or digest-drift evidence fails closed.
+   The receipt exposes only bounded counts and hashes and always reports
+   `provider_dispatch_authority=none`. Wiring this proof into restore,
+   activation, or another target-wide operation is a separate guarded workflow;
+   the audit neither performs nor authorizes those operations by itself.
    A scratch name binds the record digest, exact incumbent-state digest, and
    canonical successor-state digest. An affected leaf may contain zero or one
    rederived-valid scratch for a record; duplicate successors, a wrong or stale
