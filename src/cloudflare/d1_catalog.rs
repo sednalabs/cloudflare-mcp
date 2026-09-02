@@ -569,15 +569,27 @@ struct D1CatalogProviderEnvelope {
     success: bool,
     result: Vec<D1CatalogProviderResultSet>,
     errors: Vec<D1CatalogProviderIssue>,
-    #[serde(default)]
     messages: Vec<D1CatalogProviderIssue>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct D1CatalogProviderIssue {
-    code: i64,
-    message: String,
+    #[serde(rename = "code")]
+    _code: i64,
+    #[serde(rename = "message")]
+    _message: String,
+    #[serde(default, rename = "documentation_url")]
+    _documentation_url: Option<String>,
+    #[serde(default, rename = "source")]
+    _source: Option<D1CatalogProviderIssueSource>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct D1CatalogProviderIssueSource {
+    #[serde(default, rename = "pointer")]
+    _pointer: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -912,11 +924,12 @@ mod tests {
     fn exact_provider_body(
         outer_success_fields: &str,
         envelope_errors_fragment: &str,
+        envelope_messages_fragment: &str,
         inner_success_fields: &str,
         metadata_fields: &str,
     ) -> String {
         format!(
-            r#"{{{outer_success_fields}{envelope_errors_fragment},"messages":[],"result":[{{{inner_success_fields},"results":[],"meta":{{{metadata_fields}}}}}]}}"#
+            r#"{{{outer_success_fields}{envelope_errors_fragment}{envelope_messages_fragment},"result":[{{{inner_success_fields},"results":[],"meta":{{{metadata_fields}}}}}]}}"#
         )
     }
 
@@ -1276,24 +1289,28 @@ mod tests {
             exact_provider_body(
                 r#""success":false,"success":true"#,
                 r#","errors":[]"#,
+                r#","messages":[]"#,
                 r#""success":true"#,
                 &clean_meta,
             ),
             exact_provider_body(
                 r#""success":true,"success":false"#,
                 r#","errors":[]"#,
+                r#","messages":[]"#,
                 r#""success":true"#,
                 &clean_meta,
             ),
             exact_provider_body(
                 r#""success":true"#,
                 r#","errors":[]"#,
+                r#","messages":[]"#,
                 r#""success":false,"success":true"#,
                 &clean_meta,
             ),
             exact_provider_body(
                 r#""success":true"#,
                 r#","errors":[]"#,
+                r#","messages":[]"#,
                 r#""success":true,"success":false"#,
                 &clean_meta,
             ),
@@ -1311,6 +1328,7 @@ mod tests {
             bodies.push(exact_provider_body(
                 r#""success":true"#,
                 r#","errors":[]"#,
+                r#","messages":[]"#,
                 r#""success":true"#,
                 metadata,
             ));
@@ -1335,6 +1353,7 @@ mod tests {
         let body = exact_provider_body(
             r#""success":true"#,
             r#","errors":[]"#,
+            r#","messages":[]"#,
             r#""success":true"#,
             &primary_read_only_metadata(""),
         );
@@ -1356,6 +1375,7 @@ mod tests {
             let body = exact_provider_body(
                 r#""success":true"#,
                 fragment,
+                r#","messages":[]"#,
                 r#""success":true"#,
                 &metadata,
             );
@@ -1369,6 +1389,7 @@ mod tests {
         let body = exact_provider_body(
             r#""success":true"#,
             r#","errors":[{"code":7500,"message":"private fixture detail"}]"#,
+            r#","messages":[]"#,
             r#""success":true"#,
             &metadata,
         );
@@ -1390,6 +1411,7 @@ mod tests {
             let body = exact_provider_body(
                 r#""success":true"#,
                 fragment,
+                r#","messages":[]"#,
                 r#""success":true"#,
                 &metadata,
             );
@@ -1404,11 +1426,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn envelope_messages_must_be_present_typed_empty_and_duplicate_safe() {
+        let metadata = primary_read_only_metadata("");
+        for fragment in [
+            "",
+            r#","messages":null"#,
+            r#","messages":{}"#,
+            r#","messages":"empty""#,
+        ] {
+            let body = exact_provider_body(
+                r#""success":true"#,
+                r#","errors":[]"#,
+                fragment,
+                r#""success":true"#,
+                &metadata,
+            );
+            let error = raw_provider_error(body).await;
+            assert_eq!(
+                error.classification,
+                D1CatalogProviderCustodyClassification::ResponseMalformed
+            );
+        }
+
+        for fragment in [
+            r#","messages":[{"code":7500,"message":"first"}],"messages":[]"#,
+            r#","messages":[],"messages":[{"code":7500,"message":"second"}]"#,
+        ] {
+            let body = exact_provider_body(
+                r#""success":true"#,
+                r#","errors":[]"#,
+                fragment,
+                r#""success":true"#,
+                &metadata,
+            );
+            let error = raw_provider_error(body).await;
+            assert_eq!(
+                error.classification,
+                D1CatalogProviderCustodyClassification::ResponseDuplicateObjectKey
+            );
+            assert_eq!(error.provider_calls, 1);
+            assert_eq!(error.complete_response_bodies, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn official_extended_response_info_is_terminal_without_text_leakage() {
+        let metadata = primary_read_only_metadata("");
+        for (errors, messages, private_sentinel) in [
+            (
+                r#","errors":[{"code":7500,"message":"private error detail","documentation_url":"https://example.invalid/private-error","source":{"pointer":"/private/error"}}]"#,
+                r#","messages":[]"#,
+                "private error detail",
+            ),
+            (
+                r#","errors":[]"#,
+                r#","messages":[{"code":7501,"message":"private message detail","documentation_url":"https://example.invalid/private-message","source":{"pointer":"/private/message"}}]"#,
+                "private message detail",
+            ),
+        ] {
+            let body = exact_provider_body(
+                r#""success":true"#,
+                errors,
+                messages,
+                r#""success":true"#,
+                &metadata,
+            );
+            let error = raw_provider_error(body).await;
+            assert_eq!(
+                error.classification,
+                D1CatalogProviderCustodyClassification::ProviderQueryUnsuccessful
+            );
+            let error_json = serde_json::to_string(&error).expect("error");
+            assert!(!error_json.contains(private_sentinel));
+            assert!(!error_json.contains("example.invalid"));
+            assert!(!error_json.contains("/private/"));
+        }
+    }
+
+    #[tokio::test]
+    async fn response_info_unknown_and_duplicate_nested_fields_fail_closed() {
+        let metadata = primary_read_only_metadata("");
+        for errors in [
+            r#","errors":[{"code":7500,"message":"detail","unexpected":"field"}]"#,
+            r#","errors":[{"code":7500,"message":"detail","source":{"pointer":"/known","unexpected":"field"}}]"#,
+        ] {
+            let body = exact_provider_body(
+                r#""success":true"#,
+                errors,
+                r#","messages":[]"#,
+                r#""success":true"#,
+                &metadata,
+            );
+            let error = raw_provider_error(body).await;
+            assert_eq!(
+                error.classification,
+                D1CatalogProviderCustodyClassification::ResponseMalformed
+            );
+        }
+
+        let body = exact_provider_body(
+            r#""success":true"#,
+            r#","errors":[{"code":7500,"message":"detail","source":{"pointer":"/first","pointer":"/second"}}]"#,
+            r#","messages":[]"#,
+            r#""success":true"#,
+            &metadata,
+        );
+        let error = raw_provider_error(body).await;
+        assert_eq!(
+            error.classification,
+            D1CatalogProviderCustodyClassification::ResponseDuplicateObjectKey
+        );
+    }
+
+    #[tokio::test]
     async fn shared_json_depth_limit_accepts_the_limit_and_rejects_one_more() {
         let at_limit_nesting = D1_MIGRATION_JSON_MAX_CONTAINER_DEPTH - 4;
         let at_limit = exact_provider_body(
             r#""success":true"#,
             r#","errors":[]"#,
+            r#","messages":[]"#,
             r#""success":true"#,
             &primary_read_only_metadata(&format!(
                 r#","bounded_extension":{}"#,
@@ -1425,6 +1561,7 @@ mod tests {
         let over_limit = exact_provider_body(
             r#""success":true"#,
             r#","errors":[]"#,
+            r#","messages":[]"#,
             r#""success":true"#,
             &primary_read_only_metadata(&format!(
                 r#","bounded_extension":{}"#,
