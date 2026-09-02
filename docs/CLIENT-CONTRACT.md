@@ -515,33 +515,45 @@ complete composition-receipt digest. Raw identities, SQL, parameters, relation,
 account, and database values never enter the serializable receipt or errors.
 
 The pure version-1 state artifact is exact canonical JSON with one trailing
-newline under a 16-KiB cap. It is a private persistence input for a later
-separately reviewed boundary, not provider or execution authority. Restore
+newline under a 16-KiB cap. It is a private compare-and-exchange input for a
+later separately reviewed durable boundary, not provider or execution
+authority. Restore
 rejects absence where a state is required, oversized bytes, malformed JSON,
 duplicate or unknown fields, missing fields, noncanonical encoding, unsupported
 versions, malformed digests, phase/evidence contradictions, and any target,
 plan, composition, or identity drift. There is no permissive predecessor
 fallback. Exact pre-dispatch replay returns the same canonical state.
 
-Only `prepared -> dispatch_crossed` reports
-`dispatch_authorized_this_transition=true`. Its durable successor records one
-dispatch crossing and `do_not_redispatch_same_attempt`. A second crossing is
-quarantined as `reconciliation_required`; every later replay remains
-non-authorizing. Transport uncertainty and missing, incomplete, malformed, or
-contradictory responses enter the same no-redispatch state. Conflicting replay
-or conflicting incumbent evidence denies rather than replacing custody.
+`prepared -> dispatch_reserved` returns only a non-authorizing atomic-CAS
+proposal. Its receipt sets `dispatch_atomic_compare_exchange_required=true` and
+binds the exact expected prior-state and successor-state SHA-256 values. Calling
+the pure function twice with the same stale prepared bytes deliberately returns
+the same proposal; neither result proves freshness or authorizes dispatch. The
+later durable adapter must compare the exact current bytes and install the exact
+successor atomically. Only one successful compare-and-exchange may consume the
+reservation and permit one provider call; a stale compare failure must stop
+without provider access. The installed successor records one reservation and
+`do_not_redispatch_same_attempt`. A second reservation request from that
+successor is quarantined as `reconciliation_required`. Transport uncertainty
+and missing, incomplete, malformed, or contradictory responses enter the same
+no-redispatch state. Conflicting replay or incumbent evidence denies rather than
+replacing custody.
 
-Provider terminal evidence and independent readback evidence are separate
-typed, digest-bound slots and may arrive in either order. Neither slot, the
-custody file, nor a successful-looking response proves application alone. A
-successful changed/unchanged provider result plus expected-state readback
-converges on terminal `applied`; a terminal provider rejection plus absent-state
-readback converges on terminal `not_applied`. Crossed pairs remain
-`reconciliation_required`. The aggregate receipt exposes only phase,
+Provider terminal and independent readback inputs are separate typed caller
+assertions and may arrive in either order. Their hashes are checked only for
+canonical SHA-256 syntax and exact replay binding; this stage does not
+authenticate an artifact, provider origin, completed response, readback query,
+or the supplied classifications. A later adapter must derive both assertions
+from its authenticated provider and readback lifecycles. Within this pure
+combination classifier, successful changed/unchanged plus expected-state
+observation proposes terminal `applied`, while terminal rejection plus
+absent-state readback proposes terminal `not_applied`; crossed pairs remain
+`reconciliation_required`. These proposed terminal classifications are not
+provider or persistence authority. The aggregate receipt exposes only phase,
 transition, retry decision, booleans, counts, classifications, caps, and exact
 digests. This stage owns no filesystem persistence, public tool route, provider
-or D1 request, readback query, automatic retry, admission, deployment, or
-configuration.
+or D1 request, artifact authentication, readback query, automatic retry,
+admission, deployment, or configuration.
 
 ## Structured payload details for complex tools
 

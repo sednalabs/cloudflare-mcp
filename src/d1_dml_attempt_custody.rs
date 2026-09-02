@@ -2,15 +2,19 @@
 //!
 //! This pure state machine consumes the opaque exact-plan composition product,
 //! hashes three preallocated opaque identities, and emits one canonical private
-//! state artifact. Only the `Prepared -> DispatchCrossed` transition authorizes
-//! crossing a provider dispatch boundary, exactly once. Every later replay is
-//! non-authorizing. Ambiguous transport or response evidence is retained as
+//! state artifact. The `Prepared -> DispatchReserved` successor is only an
+//! atomic compare-and-exchange proposal bound to the exact prior and successor
+//! state digests. It never authorizes dispatch by itself. A later durable
+//! adapter must consume the exact prior bytes once before crossing the provider
+//! boundary. Ambiguous transport or response assertions are retained as
 //! `ReconciliationRequired` and can never authorize automatic redispatch.
 //!
-//! Provider terminal evidence and independent readback evidence occupy separate
-//! typed slots. Custody reaches a terminal outcome only when both are present
-//! and compatible. This module performs no persistence, provider request,
-//! readback, public routing, admission, retry, deployment, or configuration.
+//! Provider terminal and independent readback inputs are caller assertions, not
+//! authenticated artifacts. They occupy separate typed slots, and this stage
+//! produces only a proposed terminal classification when they are compatible.
+//! This module performs no persistence, provider request, artifact
+//! authentication, readback, public routing, admission, retry, deployment, or
+//! configuration.
 
 use std::collections::BTreeSet;
 
@@ -41,7 +45,7 @@ pub(crate) struct D1DmlAttemptIdentities<'a> {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum D1DmlAttemptPhase {
     Prepared,
-    DispatchCrossed,
+    DispatchReserved,
     ReconciliationRequired,
     TerminalApplied,
     TerminalNotApplied,
@@ -67,7 +71,9 @@ pub(crate) enum D1DmlProviderTerminalClassification {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct D1DmlProviderTerminalInput<'a> {
+/// Unauthenticated adapter input. A later boundary must derive this assertion
+/// from authenticated provider evidence; constructing it is never proof.
+pub(crate) struct D1DmlProviderTerminalAssertion<'a> {
     pub(crate) classification: D1DmlProviderTerminalClassification,
     pub(crate) evidence_sha256: &'a str,
 }
@@ -80,7 +86,10 @@ pub(crate) enum D1DmlReadbackTerminalClassification {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct D1DmlReadbackTerminalInput<'a> {
+/// Unauthenticated adapter input. A later boundary must derive this assertion
+/// from an independently executed and authenticated readback; constructing it
+/// or supplying syntactically valid digests is never proof.
+pub(crate) struct D1DmlReadbackTerminalAssertion<'a> {
     pub(crate) classification: D1DmlReadbackTerminalClassification,
     pub(crate) readback_plan_sha256: &'a str,
     pub(crate) evidence_sha256: &'a str,
@@ -88,7 +97,7 @@ pub(crate) struct D1DmlReadbackTerminalInput<'a> {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct D1DmlProviderTerminalEvidence {
+struct D1DmlProviderTerminalAssertionRecord {
     version: u8,
     attempt_binding_sha256: String,
     provider_request_id_sha256: String,
@@ -98,7 +107,7 @@ struct D1DmlProviderTerminalEvidence {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct D1DmlReadbackTerminalEvidence {
+struct D1DmlReadbackTerminalAssertionRecord {
     version: u8,
     attempt_binding_sha256: String,
     classification: D1DmlReadbackTerminalClassification,
@@ -127,10 +136,10 @@ struct D1DmlAttemptState {
     provider_request_id_sha256: String,
     attempt_binding_sha256: String,
     phase: D1DmlAttemptPhase,
-    dispatch_crossings: u8,
+    dispatch_reservations: u8,
     ambiguity: Option<D1DmlAttemptAmbiguity>,
-    provider_evidence: Option<D1DmlProviderTerminalEvidence>,
-    readback_evidence: Option<D1DmlReadbackTerminalEvidence>,
+    provider_assertion: Option<D1DmlProviderTerminalAssertionRecord>,
+    readback_assertion: Option<D1DmlReadbackTerminalAssertionRecord>,
     terminal_outcome: Option<D1DmlAttemptTerminalOutcome>,
 }
 
@@ -139,13 +148,13 @@ struct D1DmlAttemptState {
 pub(crate) enum D1DmlAttemptTransition {
     Prepared,
     ExactReplay,
-    DispatchBoundaryCrossed,
-    DispatchReplayQuarantined,
+    DispatchReservationPrepared,
+    DispatchReplayQuarantinePrepared,
     AmbiguityRecorded,
-    ProviderEvidenceRecorded,
-    ProviderEvidenceReplay,
-    ReadbackEvidenceRecorded,
-    ReadbackEvidenceReplay,
+    ProviderAssertionRecorded,
+    ProviderAssertionReplay,
+    ReadbackAssertionRecorded,
+    ReadbackAssertionReplay,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -174,14 +183,16 @@ pub(crate) struct D1DmlAttemptCustodyReceipt {
     pub(crate) state_sha256: String,
     pub(crate) state_size_bytes: usize,
     pub(crate) state_byte_cap: usize,
-    pub(crate) dispatch_crossings: u8,
-    pub(crate) dispatch_authorized_this_transition: bool,
+    pub(crate) dispatch_reservations: u8,
+    pub(crate) dispatch_atomic_compare_exchange_required: bool,
+    pub(crate) dispatch_expected_state_sha256: Option<String>,
+    pub(crate) dispatch_successor_state_sha256: Option<String>,
     pub(crate) exact_replay: bool,
     pub(crate) ambiguity: Option<D1DmlAttemptAmbiguity>,
-    pub(crate) provider_evidence_present: bool,
-    pub(crate) provider_evidence_sha256: Option<String>,
-    pub(crate) readback_evidence_present: bool,
-    pub(crate) readback_evidence_sha256: Option<String>,
+    pub(crate) provider_assertion_present: bool,
+    pub(crate) provider_assertion_sha256: Option<String>,
+    pub(crate) readback_assertion_present: bool,
+    pub(crate) readback_assertion_sha256: Option<String>,
     pub(crate) terminal_outcome: Option<D1DmlAttemptTerminalOutcome>,
 }
 
@@ -264,22 +275,26 @@ pub(crate) fn prepare_d1_dml_attempt(
                 provider_request_id_sha256: binding.provider_request_id_sha256.clone(),
                 attempt_binding_sha256: binding.attempt_binding_sha256.clone(),
                 phase: D1DmlAttemptPhase::Prepared,
-                dispatch_crossings: 0,
+                dispatch_reservations: 0,
                 ambiguity: None,
-                provider_evidence: None,
-                readback_evidence: None,
+                provider_assertion: None,
+                readback_assertion: None,
                 terminal_outcome: None,
             };
-            product(state, D1DmlAttemptTransition::Prepared, false, false)
+            product(state, D1DmlAttemptTransition::Prepared, None, false)
         }
         Some(bytes) => {
             let state = restore_exact_state(bytes, &binding)?;
-            product(state, D1DmlAttemptTransition::ExactReplay, false, true)
+            product(state, D1DmlAttemptTransition::ExactReplay, None, true)
         }
     }
 }
 
-pub(crate) fn cross_d1_dml_dispatch_boundary(
+/// Prepare the exact successor for a later atomic compare-and-exchange. This
+/// pure proposal is deliberately non-authorizing: only the separately reviewed
+/// durable adapter may compare the exact prior bytes, install the successor
+/// once, and then permit one provider dispatch.
+pub(crate) fn prepare_d1_dml_dispatch_reservation_cas(
     target: &D1TargetIdentity,
     composition: &D1ExactPlanCompositionProduct,
     identities: D1DmlAttemptIdentities<'_>,
@@ -289,29 +304,29 @@ pub(crate) fn cross_d1_dml_dispatch_boundary(
     let mut state = restore_exact_state(restored_state, &binding)?;
     match state.phase {
         D1DmlAttemptPhase::Prepared => {
-            state.dispatch_crossings = 1;
+            state.dispatch_reservations = 1;
             refresh_derived_state(&mut state)?;
             product(
                 state,
-                D1DmlAttemptTransition::DispatchBoundaryCrossed,
-                true,
+                D1DmlAttemptTransition::DispatchReservationPrepared,
+                Some(restored_state),
                 false,
             )
         }
-        D1DmlAttemptPhase::DispatchCrossed => {
+        D1DmlAttemptPhase::DispatchReserved => {
             state.ambiguity = Some(D1DmlAttemptAmbiguity::DispatchReplay);
             refresh_derived_state(&mut state)?;
             product(
                 state,
-                D1DmlAttemptTransition::DispatchReplayQuarantined,
+                D1DmlAttemptTransition::DispatchReplayQuarantinePrepared,
+                None,
                 false,
-                true,
             )
         }
         D1DmlAttemptPhase::ReconciliationRequired
         | D1DmlAttemptPhase::TerminalApplied
         | D1DmlAttemptPhase::TerminalNotApplied => {
-            product(state, D1DmlAttemptTransition::ExactReplay, false, true)
+            product(state, D1DmlAttemptTransition::ExactReplay, None, true)
         }
     }
 }
@@ -325,10 +340,7 @@ pub(crate) fn record_d1_dml_attempt_ambiguity(
 ) -> Result<D1DmlAttemptCustodyProduct, D1DmlAttemptCustodyError> {
     let binding = derive_attempt_binding(target, composition, identities)?;
     let mut state = restore_exact_state(restored_state, &binding)?;
-    require_dispatch_crossed(&state)?;
-    if state.terminal_outcome.is_some() {
-        return product(state, D1DmlAttemptTransition::ExactReplay, false, true);
-    }
+    require_dispatch_reserved(&state)?;
     if let Some(incumbent) = state.ambiguity {
         if incumbent != ambiguity {
             return Err(custody_error(
@@ -336,108 +348,114 @@ pub(crate) fn record_d1_dml_attempt_ambiguity(
                 "attempt ambiguity contradicted incumbent durable evidence",
             ));
         }
-        return product(state, D1DmlAttemptTransition::ExactReplay, false, true);
+        return product(state, D1DmlAttemptTransition::ExactReplay, None, true);
+    }
+    if state.terminal_outcome.is_some() {
+        return Err(custody_error(
+            D1DmlAttemptCustodyClassification::AmbiguityConflict,
+            "terminal attempt had no incumbent ambiguity to replay",
+        ));
     }
     state.ambiguity = Some(ambiguity);
     refresh_derived_state(&mut state)?;
     product(
         state,
         D1DmlAttemptTransition::AmbiguityRecorded,
-        false,
+        None,
         false,
     )
 }
 
-pub(crate) fn record_d1_dml_provider_terminal_evidence(
+pub(crate) fn record_d1_dml_provider_terminal_assertion(
     target: &D1TargetIdentity,
     composition: &D1ExactPlanCompositionProduct,
     identities: D1DmlAttemptIdentities<'_>,
     restored_state: &[u8],
-    evidence: D1DmlProviderTerminalInput<'_>,
+    assertion: D1DmlProviderTerminalAssertion<'_>,
 ) -> Result<D1DmlAttemptCustodyProduct, D1DmlAttemptCustodyError> {
     let binding = derive_attempt_binding(target, composition, identities)?;
     let mut state = restore_exact_state(restored_state, &binding)?;
-    require_dispatch_crossed(&state)?;
-    if !valid_sha256(evidence.evidence_sha256) {
+    require_dispatch_reserved(&state)?;
+    if !valid_sha256(assertion.evidence_sha256) {
         return Err(custody_error(
             D1DmlAttemptCustodyClassification::EvidenceDigestInvalid,
-            "provider terminal evidence digest was not canonical SHA-256",
+            "provider terminal assertion digest was not canonical SHA-256",
         ));
     }
-    let candidate = D1DmlProviderTerminalEvidence {
+    let candidate = D1DmlProviderTerminalAssertionRecord {
         version: CUSTODY_VERSION,
         attempt_binding_sha256: binding.attempt_binding_sha256,
         provider_request_id_sha256: binding.provider_request_id_sha256,
-        classification: evidence.classification,
-        evidence_sha256: evidence.evidence_sha256.to_string(),
+        classification: assertion.classification,
+        evidence_sha256: assertion.evidence_sha256.to_string(),
     };
-    if let Some(incumbent) = &state.provider_evidence {
+    if let Some(incumbent) = &state.provider_assertion {
         if incumbent != &candidate {
             return Err(custody_error(
                 D1DmlAttemptCustodyClassification::EvidenceConflict,
-                "provider terminal evidence contradicted the incumbent product",
+                "provider terminal assertion contradicted the incumbent product",
             ));
         }
         return product(
             state,
-            D1DmlAttemptTransition::ProviderEvidenceReplay,
-            false,
+            D1DmlAttemptTransition::ProviderAssertionReplay,
+            None,
             true,
         );
     }
-    state.provider_evidence = Some(candidate);
+    state.provider_assertion = Some(candidate);
     refresh_derived_state(&mut state)?;
     product(
         state,
-        D1DmlAttemptTransition::ProviderEvidenceRecorded,
-        false,
+        D1DmlAttemptTransition::ProviderAssertionRecorded,
+        None,
         false,
     )
 }
 
-pub(crate) fn record_d1_dml_readback_terminal_evidence(
+pub(crate) fn record_d1_dml_readback_terminal_assertion(
     target: &D1TargetIdentity,
     composition: &D1ExactPlanCompositionProduct,
     identities: D1DmlAttemptIdentities<'_>,
     restored_state: &[u8],
-    evidence: D1DmlReadbackTerminalInput<'_>,
+    assertion: D1DmlReadbackTerminalAssertion<'_>,
 ) -> Result<D1DmlAttemptCustodyProduct, D1DmlAttemptCustodyError> {
     let binding = derive_attempt_binding(target, composition, identities)?;
     let mut state = restore_exact_state(restored_state, &binding)?;
-    require_dispatch_crossed(&state)?;
-    if !valid_sha256(evidence.readback_plan_sha256) || !valid_sha256(evidence.evidence_sha256) {
+    require_dispatch_reserved(&state)?;
+    if !valid_sha256(assertion.readback_plan_sha256) || !valid_sha256(assertion.evidence_sha256) {
         return Err(custody_error(
             D1DmlAttemptCustodyClassification::EvidenceDigestInvalid,
-            "readback terminal evidence digests were not canonical SHA-256",
+            "readback terminal assertion digests were not canonical SHA-256",
         ));
     }
-    let candidate = D1DmlReadbackTerminalEvidence {
+    let candidate = D1DmlReadbackTerminalAssertionRecord {
         version: CUSTODY_VERSION,
         attempt_binding_sha256: binding.attempt_binding_sha256,
-        classification: evidence.classification,
-        readback_plan_sha256: evidence.readback_plan_sha256.to_string(),
-        evidence_sha256: evidence.evidence_sha256.to_string(),
+        classification: assertion.classification,
+        readback_plan_sha256: assertion.readback_plan_sha256.to_string(),
+        evidence_sha256: assertion.evidence_sha256.to_string(),
     };
-    if let Some(incumbent) = &state.readback_evidence {
+    if let Some(incumbent) = &state.readback_assertion {
         if incumbent != &candidate {
             return Err(custody_error(
                 D1DmlAttemptCustodyClassification::EvidenceConflict,
-                "readback terminal evidence contradicted the incumbent product",
+                "readback terminal assertion contradicted the incumbent product",
             ));
         }
         return product(
             state,
-            D1DmlAttemptTransition::ReadbackEvidenceReplay,
-            false,
+            D1DmlAttemptTransition::ReadbackAssertionReplay,
+            None,
             true,
         );
     }
-    state.readback_evidence = Some(candidate);
+    state.readback_assertion = Some(candidate);
     refresh_derived_state(&mut state)?;
     product(
         state,
-        D1DmlAttemptTransition::ReadbackEvidenceRecorded,
-        false,
+        D1DmlAttemptTransition::ReadbackAssertionRecorded,
+        None,
         false,
     )
 }
@@ -578,8 +596,8 @@ fn validate_state(state: &D1DmlAttemptState) -> Result<(), D1DmlAttemptCustodyEr
             "attempt state artifact contained malformed digest evidence",
         ));
     }
-    validate_provider_evidence(state)?;
-    validate_readback_evidence(state)?;
+    validate_provider_assertion(state)?;
+    validate_readback_assertion(state)?;
     let (expected_phase, expected_terminal) = derive_phase_and_terminal(state)?;
     if state.phase != expected_phase || state.terminal_outcome != expected_terminal {
         return Err(custody_error(
@@ -600,16 +618,16 @@ fn refresh_derived_state(state: &mut D1DmlAttemptState) -> Result<(), D1DmlAttem
 fn derive_phase_and_terminal(
     state: &D1DmlAttemptState,
 ) -> Result<(D1DmlAttemptPhase, Option<D1DmlAttemptTerminalOutcome>), D1DmlAttemptCustodyError> {
-    if state.dispatch_crossings > 1 {
+    if state.dispatch_reservations > 1 {
         return Err(custody_error(
             D1DmlAttemptCustodyClassification::RestoredStateContradictory,
-            "attempt state claimed more than one dispatch-boundary crossing",
+            "attempt state claimed more than one dispatch reservation",
         ));
     }
-    if state.dispatch_crossings == 0 {
+    if state.dispatch_reservations == 0 {
         if state.ambiguity.is_some()
-            || state.provider_evidence.is_some()
-            || state.readback_evidence.is_some()
+            || state.provider_assertion.is_some()
+            || state.readback_assertion.is_some()
             || state.terminal_outcome.is_some()
         {
             return Err(custody_error(
@@ -620,7 +638,7 @@ fn derive_phase_and_terminal(
         return Ok((D1DmlAttemptPhase::Prepared, None));
     }
 
-    let evidence_outcome = match (&state.provider_evidence, &state.readback_evidence) {
+    let assertion_outcome = match (&state.provider_assertion, &state.readback_assertion) {
         (Some(provider), Some(readback)) => {
             match (provider.classification, readback.classification) {
                 (
@@ -637,55 +655,55 @@ fn derive_phase_and_terminal(
         }
         _ => None,
     };
-    let contradictory_pair = state.provider_evidence.is_some()
-        && state.readback_evidence.is_some()
-        && evidence_outcome.is_none();
-    let phase = match evidence_outcome {
+    let contradictory_pair = state.provider_assertion.is_some()
+        && state.readback_assertion.is_some()
+        && assertion_outcome.is_none();
+    let phase = match assertion_outcome {
         Some(D1DmlAttemptTerminalOutcome::Applied) => D1DmlAttemptPhase::TerminalApplied,
         Some(D1DmlAttemptTerminalOutcome::NotApplied) => D1DmlAttemptPhase::TerminalNotApplied,
         None if state.ambiguity.is_some() || contradictory_pair => {
             D1DmlAttemptPhase::ReconciliationRequired
         }
-        None => D1DmlAttemptPhase::DispatchCrossed,
+        None => D1DmlAttemptPhase::DispatchReserved,
     };
-    Ok((phase, evidence_outcome))
+    Ok((phase, assertion_outcome))
 }
 
-fn validate_provider_evidence(state: &D1DmlAttemptState) -> Result<(), D1DmlAttemptCustodyError> {
-    if let Some(evidence) = &state.provider_evidence
-        && (evidence.version != CUSTODY_VERSION
-            || evidence.attempt_binding_sha256 != state.attempt_binding_sha256
-            || evidence.provider_request_id_sha256 != state.provider_request_id_sha256
-            || !valid_sha256(&evidence.evidence_sha256))
+fn validate_provider_assertion(state: &D1DmlAttemptState) -> Result<(), D1DmlAttemptCustodyError> {
+    if let Some(assertion) = &state.provider_assertion
+        && (assertion.version != CUSTODY_VERSION
+            || assertion.attempt_binding_sha256 != state.attempt_binding_sha256
+            || assertion.provider_request_id_sha256 != state.provider_request_id_sha256
+            || !valid_sha256(&assertion.evidence_sha256))
     {
         return Err(custody_error(
             D1DmlAttemptCustodyClassification::RestoredStateContradictory,
-            "provider terminal evidence contradicted attempt custody",
+            "provider terminal assertion contradicted attempt custody",
         ));
     }
     Ok(())
 }
 
-fn validate_readback_evidence(state: &D1DmlAttemptState) -> Result<(), D1DmlAttemptCustodyError> {
-    if let Some(evidence) = &state.readback_evidence
-        && (evidence.version != CUSTODY_VERSION
-            || evidence.attempt_binding_sha256 != state.attempt_binding_sha256
-            || !valid_sha256(&evidence.readback_plan_sha256)
-            || !valid_sha256(&evidence.evidence_sha256))
+fn validate_readback_assertion(state: &D1DmlAttemptState) -> Result<(), D1DmlAttemptCustodyError> {
+    if let Some(assertion) = &state.readback_assertion
+        && (assertion.version != CUSTODY_VERSION
+            || assertion.attempt_binding_sha256 != state.attempt_binding_sha256
+            || !valid_sha256(&assertion.readback_plan_sha256)
+            || !valid_sha256(&assertion.evidence_sha256))
     {
         return Err(custody_error(
             D1DmlAttemptCustodyClassification::RestoredStateContradictory,
-            "readback terminal evidence contradicted attempt custody",
+            "readback terminal assertion contradicted attempt custody",
         ));
     }
     Ok(())
 }
 
-fn require_dispatch_crossed(state: &D1DmlAttemptState) -> Result<(), D1DmlAttemptCustodyError> {
-    if state.dispatch_crossings != 1 {
+fn require_dispatch_reserved(state: &D1DmlAttemptState) -> Result<(), D1DmlAttemptCustodyError> {
+    if state.dispatch_reservations != 1 {
         return Err(custody_error(
             D1DmlAttemptCustodyClassification::TransitionBeforeDispatch,
-            "post-dispatch evidence cannot precede the durable dispatch crossing",
+            "post-dispatch assertion cannot precede the durable dispatch reservation",
         ));
     }
     Ok(())
@@ -694,20 +712,23 @@ fn require_dispatch_crossed(state: &D1DmlAttemptState) -> Result<(), D1DmlAttemp
 fn product(
     state: D1DmlAttemptState,
     transition: D1DmlAttemptTransition,
-    dispatch_authorized_this_transition: bool,
+    dispatch_expected_state: Option<&[u8]>,
     exact_replay: bool,
 ) -> Result<D1DmlAttemptCustodyProduct, D1DmlAttemptCustodyError> {
     validate_state(&state)?;
     let state_bytes = canonical_state_bytes(&state)?;
     let retry_decision = match state.phase {
         D1DmlAttemptPhase::Prepared => D1DmlAttemptRetryDecision::DispatchNotYetCrossed,
-        D1DmlAttemptPhase::DispatchCrossed | D1DmlAttemptPhase::ReconciliationRequired => {
+        D1DmlAttemptPhase::DispatchReserved | D1DmlAttemptPhase::ReconciliationRequired => {
             D1DmlAttemptRetryDecision::DoNotRedispatchSameAttempt
         }
         D1DmlAttemptPhase::TerminalApplied | D1DmlAttemptPhase::TerminalNotApplied => {
             D1DmlAttemptRetryDecision::TerminalReplayOnly
         }
     };
+    let state_sha256 = hash_bytes(&state_bytes);
+    let dispatch_expected_state_sha256 = dispatch_expected_state.map(hash_bytes);
+    let dispatch_successor_state_sha256 = dispatch_expected_state.map(|_| state_sha256.clone());
     let receipt = D1DmlAttemptCustodyReceipt {
         version: CUSTODY_VERSION,
         operation: D1_DML_ATTEMPT_CUSTODY_OPERATION,
@@ -722,17 +743,19 @@ fn product(
         execution_attempt_id_sha256: state.execution_attempt_id_sha256.clone(),
         provider_request_id_sha256: state.provider_request_id_sha256.clone(),
         attempt_binding_sha256: state.attempt_binding_sha256.clone(),
-        state_sha256: hash_bytes(&state_bytes),
+        state_sha256,
         state_size_bytes: state_bytes.len(),
         state_byte_cap: D1_DML_ATTEMPT_STATE_BYTE_CAP,
-        dispatch_crossings: state.dispatch_crossings,
-        dispatch_authorized_this_transition,
+        dispatch_reservations: state.dispatch_reservations,
+        dispatch_atomic_compare_exchange_required: dispatch_expected_state.is_some(),
+        dispatch_expected_state_sha256,
+        dispatch_successor_state_sha256,
         exact_replay,
         ambiguity: state.ambiguity,
-        provider_evidence_present: state.provider_evidence.is_some(),
-        provider_evidence_sha256: state.provider_evidence.as_ref().map(hash_serialized),
-        readback_evidence_present: state.readback_evidence.is_some(),
-        readback_evidence_sha256: state.readback_evidence.as_ref().map(hash_serialized),
+        provider_assertion_present: state.provider_assertion.is_some(),
+        provider_assertion_sha256: state.provider_assertion.as_ref().map(hash_serialized),
+        readback_assertion_present: state.readback_assertion.is_some(),
+        readback_assertion_sha256: state.readback_assertion.as_ref().map(hash_serialized),
         terminal_outcome: state.terminal_outcome,
     };
     Ok(D1DmlAttemptCustodyProduct {

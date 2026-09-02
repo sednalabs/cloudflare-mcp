@@ -1064,29 +1064,38 @@ receipt. Never substitute caller JSON, a serialized composition receipt, SQL,
 or a generic provider response.
 
 Persist the returned canonical private state only through the future reviewed
-custody boundary. Its version-1 bytes are capped at 16 KiB and include one
+durable compare-and-exchange boundary. Its version-1 bytes are capped at 16 KiB and include one
 trailing newline. On restore, require exact canonical bytes and reject missing,
 oversized, malformed, duplicate-keyed, unknown-field, incomplete, predecessor,
 digest-drifted, or internally contradictory evidence. An exact prepared replay
 converges without changing state. A conflicting target, plan, composition, or
 identity replay denies.
 
-Exactly one transition may authorize provider dispatch:
-`prepared -> dispatch_crossed`. Persist that successor before crossing the
-external boundary. Once it exists, the same attempt is permanently
-`do_not_redispatch_same_attempt`; a repeated crossing, transport uncertainty,
+`prepared -> dispatch_reserved` is a non-authorizing atomic-CAS proposal. It
+binds the exact prior-state and successor-state digests and explicitly requires
+the later durable adapter to compare the exact current bytes and install that
+successor atomically. Repeating the pure call with stale prepared bytes returns
+the same proposal, never fresh dispatch authority. Only the adapter's one
+successful compare-and-exchange may consume the reservation and permit the
+provider call; a stale compare failure must stop before provider access. Once
+the successor is durably installed, the same attempt is permanently
+`do_not_redispatch_same_attempt`; a repeated reservation, transport uncertainty,
 or missing/incomplete/malformed/contradictory response becomes
 `reconciliation_required`. Do not infer that an unobserved response means the
 provider did not accept the request.
 
-Record terminal provider evidence and independently verified readback evidence
-in their separate typed slots. Either insertion order must converge on the same
-canonical terminal state. Provider success plus expected-state observation is
-terminal `applied`; terminal provider rejection plus absent-state readback is
-terminal `not_applied`. One slot alone is nonterminal, and a crossed pair stays
-under reconciliation. Receipts and errors are aggregate/content-free and do
-not authorize persistence, provider/D1 access, readback, retry, routing,
-admission, deployment, or configuration.
+The provider-terminal and readback inputs at this stage are typed caller
+assertions, not authenticated evidence. Canonical digest syntax proves neither
+artifact bytes nor provider/readback provenance. The later adapter must derive
+the assertions from authenticated provider and independently executed readback
+lifecycles before storing them in their separate slots. Either insertion order
+must converge on the same canonical proposed terminal classification. Provider
+success plus expected-state observation proposes `applied`; terminal provider
+rejection plus absent-state readback proposes `not_applied`. One slot alone is
+nonterminal, and a crossed pair stays under reconciliation. Receipts and errors
+are aggregate/content-free and do not authorize persistence, provider/D1
+access, artifact authentication, readback, retry, routing, admission,
+deployment, or configuration.
 
 ## Safety Profiles
 
