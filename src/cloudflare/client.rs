@@ -6303,7 +6303,19 @@ mod tests {
 
     #[tokio::test]
     async fn d1_dml_provider_adapter_rejects_noncanonical_request_id_before_dispatch() {
-        let client = CloudflareClient::new(test_config("http://127.0.0.1:9".to_string())) // DevSkim: ignore DS137138 -- reserved non-routable local test endpoint
+        let dispatches = Arc::new(Mutex::new(0usize));
+        let dispatches_for_route = dispatches.clone();
+        let router = Router::new().route(
+            "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
+            post(move || {
+                let dispatches = dispatches_for_route.clone();
+                async move {
+                    *dispatches.lock().expect("dispatch count") += 1;
+                    Json(json!({"success": true, "result": []}))
+                }
+            }),
+        );
+        let client = CloudflareClient::new(test_config(spawn_router(router).await))
             .expect("D1 DML adapter client");
         let invalid = [
             "operation!fixture-0001".to_string(),
@@ -6329,6 +6341,7 @@ mod tests {
             assert_eq!(error.lifecycle.provider_calls(), 0);
             assert_eq!(error.lifecycle.provider_mutations(), 0);
         }
+        assert_eq!(*dispatches.lock().expect("dispatch count"), 0);
     }
 
     #[tokio::test]
