@@ -99,7 +99,10 @@ compare-and-exchange before the only DML provider request.
 The pre-provider classifier uses a capped lexical token stream. An UPSERT must
 contain one balanced top-level `ON CONFLICT ... DO UPDATE SET` action; tabs,
 newlines, repeated ASCII whitespace, and keyword case are equivalent. String
-literals cannot create keyword authority. Comments remain unsupported, and
+literals cannot create keyword authority. Boundary normalization removes only
+ASCII whitespace; non-ASCII space, separator, control, or BOM bytes outside a
+string literal remain syntax and fail closed, including after a semicolon.
+Comments remain unsupported, and
 `DO NOTHING`, truncated or duplicate actions, unbalanced/deep parentheses,
 token exhaustion, and unknown conflict forms stop before any catalog read.
 Only plain `INSERT` may carry that UPSERT action. `INSERT OR REPLACE` and

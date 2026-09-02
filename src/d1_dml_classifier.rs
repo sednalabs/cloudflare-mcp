@@ -45,7 +45,7 @@ pub(crate) struct D1DmlClassifierError {
 }
 
 pub(crate) fn classify_d1_dml(sql: &str) -> Result<D1ClassifiedDml, D1DmlClassifierError> {
-    if sql.is_empty() || sql.trim().is_empty() {
+    if sql.is_empty() {
         return Err(error(
             D1DmlClassifierClassification::Empty,
             "D1 DML SQL was empty",
@@ -55,6 +55,13 @@ pub(crate) fn classify_d1_dml(sql: &str) -> Result<D1ClassifiedDml, D1DmlClassif
         return Err(error(
             D1DmlClassifierClassification::TooLarge,
             "D1 DML SQL exceeded the exact classifier byte cap",
+        ));
+    }
+    let trimmed = trim_ascii_sql_whitespace(sql);
+    if trimmed.is_empty() {
+        return Err(error(
+            D1DmlClassifierClassification::Empty,
+            "D1 DML SQL was empty",
         ));
     }
     if sql.contains("--")
@@ -70,8 +77,10 @@ pub(crate) fn classify_d1_dml(sql: &str) -> Result<D1ClassifiedDml, D1DmlClassif
             "comments and quoted identifiers are outside the closed D1 DML contract",
         ));
     }
-    let trimmed = sql.trim();
-    let body = trimmed.strip_suffix(';').unwrap_or(trimmed).trim_end();
+    let body = trimmed
+        .strip_suffix(';')
+        .map(trim_ascii_sql_whitespace_end)
+        .unwrap_or(trimmed);
     if body.contains(';') {
         return Err(error(
             D1DmlClassifierClassification::MultipleStatements,
@@ -200,6 +209,34 @@ pub(crate) fn classify_d1_dml(sql: &str) -> Result<D1ClassifiedDml, D1DmlClassif
     })
 }
 
+fn trim_ascii_sql_whitespace(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    let start = bytes
+        .iter()
+        .position(|byte| !is_ascii_sql_whitespace(*byte))
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !is_ascii_sql_whitespace(*byte))
+        .map(|index| index + 1)
+        .unwrap_or(start);
+    &value[start..end]
+}
+
+fn trim_ascii_sql_whitespace_end(value: &str) -> &str {
+    let end = value
+        .as_bytes()
+        .iter()
+        .rposition(|byte| !is_ascii_sql_whitespace(*byte))
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    &value[..end]
+}
+
+fn is_ascii_sql_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum D1SqlTokenKind {
     Word,
@@ -219,7 +256,7 @@ fn tokenize_sql(sql: &str) -> Result<Vec<D1SqlToken>, D1DmlClassifierError> {
     let mut tokens = Vec::new();
     let mut index = 0usize;
     while index < bytes.len() {
-        if bytes[index].is_ascii_whitespace() {
+        if is_ascii_sql_whitespace(bytes[index]) {
             index += 1;
             continue;
         }
@@ -664,6 +701,58 @@ mod tests {
                 .classification,
             D1DmlClassifierClassification::TokenLimitExceeded
         );
+
+        let oversized_ascii_whitespace = " ".repeat(MAX_SQL_BYTES + 1);
+        assert_eq!(
+            classify_d1_dml(&oversized_ascii_whitespace)
+                .expect_err("raw byte cap must precede boundary normalization")
+                .classification,
+            D1DmlClassifierClassification::TooLarge
+        );
+    }
+
+    #[test]
+    fn unicode_boundary_syntax_is_never_trimmed_before_classification() {
+        let lexical_cases = [
+            "\u{00a0}UPDATE stories SET id=?",
+            "UPDATE stories SET id=?\u{00a0}",
+            "\u{2003}INSERT INTO stories(id) VALUES (?)",
+            "DELETE FROM stories WHERE id=?\u{2028}",
+            "\u{feff}REPLACE INTO stories(id) VALUES (?)",
+            "UPDATE stories SET id=?\u{200b}",
+            "\u{00a0}",
+        ];
+        for sql in lexical_cases {
+            assert_eq!(
+                classify_d1_dml(sql)
+                    .expect_err("non-ASCII boundary syntax must reach the lexer")
+                    .classification,
+                D1DmlClassifierClassification::LexicalStructureUnsupported,
+                "{sql:?}"
+            );
+        }
+        for sql in [
+            "UPDATE stories SET id=?;\u{00a0}",
+            "DELETE FROM stories WHERE id=?;\u{2003}",
+            "REPLACE INTO stories(id) VALUES (?);\u{feff}",
+        ] {
+            assert_eq!(
+                classify_d1_dml(sql)
+                    .expect_err("semicolon plus Unicode boundary syntax must deny")
+                    .classification,
+                D1DmlClassifierClassification::MultipleStatements,
+                "{sql:?}"
+            );
+        }
+
+        let ascii_boundary = classify_d1_dml("\t\r\n UPDATE stories SET id=? ;\u{000b}\u{000c}")
+            .expect("ASCII SQL boundary whitespace remains accepted");
+        assert_eq!(ascii_boundary.relation, "stories");
+        let literal = classify_d1_dml(
+            "INSERT INTO stories(note) VALUES ('\u{00a0}\u{2003}\u{2028}\u{feff}')",
+        )
+        .expect("non-ASCII string-literal bytes remain data, not syntax");
+        assert_eq!(literal.relation, "stories");
     }
 
     #[test]
