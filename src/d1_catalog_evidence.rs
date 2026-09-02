@@ -7,9 +7,10 @@
 //! row, preserves storage classes, and uses SQLite metadata for relation,
 //! trigger-owner, and complete foreign-key facts including from/to/match. Only
 //! structurally canonical TEXT child identities reach the foreign-key PRAGMA.
-//! It retains table SQL bytes only as a later AUTOINCREMENT token source and
-//! emits explicit conservative blockers where structured metadata cannot prove
-//! later write semantics. It cannot
+//! It retains table SQL bytes and permits only bounded later ASCII token
+//! classification for AUTOINCREMENT and virtual-table evidence. It emits
+//! explicit conservative blockers where structured metadata cannot prove later
+//! write semantics. It cannot
 //! authenticate provider dispatch or response EOF; that custody belongs to the
 //! internal provider adapter that constructs the frames. It deliberately does
 //! not parse schema SQL, trigger bodies, or views and does not build or traverse
@@ -27,9 +28,10 @@ pub(crate) const D1_CATALOG_EVIDENCE_OPERATION: &str = "d1_catalog_evidence";
 pub(crate) const D1_CATALOG_MAX_ROWS: usize = 1_000;
 pub(crate) const D1_CATALOG_PROVIDER_ROW_CAP: usize = D1_CATALOG_MAX_ROWS + 1;
 pub(crate) const D1_CATALOG_PROVIDER_BYTE_CAP: usize = 4 * 1024 * 1024;
+pub(crate) const D1_CATALOG_TABLE_SQL_TOKEN_SOURCE_BYTE_CAP: usize = 64 * 1024;
 
-const D1_CATALOG_PROJECTION_VERSION: u8 = 3;
-const D1_CATALOG_EVIDENCE_VERSION: u8 = 3;
+const D1_CATALOG_PROJECTION_VERSION: u8 = 4;
+const D1_CATALOG_EVIDENCE_VERSION: u8 = 4;
 const D1_CATALOG_QUERY: &str = r#"WITH
 schema_raw AS (
   SELECT rowid AS schema_rowid,
@@ -104,6 +106,10 @@ schema_facts AS (
       THEN 0 ELSE 1 END AS table_sql_token_source_is_null,
     CASE WHEN structural_blocker = '' AND raw_type = 'table' AND sql_storage_class = 'text'
       THEN hex(raw_sql) ELSE '' END AS table_sql_token_source_hex,
+    CASE WHEN structural_blocker = '' AND raw_type = 'table' AND sql_storage_class = 'text'
+        AND length(CAST(raw_sql AS BLOB)) <= 65536
+        AND instr(lower(raw_sql), 'virtual') != 0
+      THEN 1 ELSE 0 END AS table_virtual_token_hit,
     'not_applicable' AS foreign_key_id_storage_class, '' AS foreign_key_id_value_hex,
     -1 AS foreign_key_id,
     'not_applicable' AS foreign_key_seq_storage_class, '' AS foreign_key_seq_value_hex,
@@ -120,6 +126,12 @@ schema_facts AS (
       WHEN raw_type = 'trigger' THEN 'trigger_effects_unproven'
       WHEN raw_type = 'table' AND sql_storage_class = 'null'
         THEN 'table_sql_token_source_unavailable'
+      WHEN raw_type = 'table' AND sql_storage_class = 'text'
+          AND length(CAST(raw_sql AS BLOB)) > 65536
+        THEN 'table_sql_token_source_oversized'
+      WHEN raw_type = 'table' AND sql_storage_class = 'text'
+          AND instr(lower(raw_sql), 'virtual') != 0
+        THEN 'table_virtual_semantics_unproven'
       ELSE ''
     END AS conservative_blocker
   FROM schema_classified
@@ -186,6 +198,7 @@ foreign_key_facts AS (
     'not_applicable' AS owner_name_storage_class, '' AS owner_name_hex,
     'not_applicable' AS schema_sql_storage_class,
     1 AS table_sql_token_source_is_null, '' AS table_sql_token_source_hex,
+    0 AS table_virtual_token_hit,
     id_storage_class AS foreign_key_id_storage_class,
     id_value_hex AS foreign_key_id_value_hex,
     CASE WHEN id_storage_class = 'integer' THEN raw_id ELSE -1 END AS foreign_key_id,
@@ -223,6 +236,7 @@ ORDER BY schema_rowid, fact_order, fact_kind COLLATE BINARY,
   relation_name_hex COLLATE BINARY, owner_name_storage_class COLLATE BINARY,
   owner_name_hex COLLATE BINARY, schema_sql_storage_class COLLATE BINARY,
   table_sql_token_source_is_null, table_sql_token_source_hex COLLATE BINARY,
+  table_virtual_token_hit,
   foreign_key_id_storage_class COLLATE BINARY, foreign_key_id_value_hex COLLATE BINARY,
   foreign_key_id, foreign_key_seq_storage_class COLLATE BINARY,
   foreign_key_seq_value_hex COLLATE BINARY, foreign_key_seq,
@@ -416,6 +430,7 @@ pub(crate) struct D1CatalogProjectionRow {
     pub(crate) schema_sql_storage_class: String,
     pub(crate) table_sql_token_source_is_null: u8,
     pub(crate) table_sql_token_source_hex: String,
+    pub(crate) table_virtual_token_hit: u8,
     pub(crate) foreign_key_id_storage_class: String,
     pub(crate) foreign_key_id_value_hex: String,
     pub(crate) foreign_key_id: i64,
@@ -469,6 +484,7 @@ pub(crate) fn derive_d1_catalog_evidence_plan(
             "schema_sql_storage_class",
             "table_sql_token_source_is_null",
             "table_sql_token_source_hex",
+            "table_virtual_token_hit",
             "foreign_key_id_storage_class",
             "foreign_key_id_value_hex",
             "foreign_key_id",
@@ -742,6 +758,7 @@ fn validate_projection_rows(rows: &[D1CatalogProjectionRow]) -> Result<(), D1Cat
             )
             || !matches!(row.table_sql_token_source_is_null, 0 | 1)
             || !canonical_upper_hex(&row.table_sql_token_source_hex, true)
+            || !matches!(row.table_virtual_token_hit, 0 | 1)
             || !storage_hex_pair(
                 &row.foreign_key_id_storage_class,
                 &row.foreign_key_id_value_hex,
@@ -858,6 +875,7 @@ fn validate_structured_relationships(
             || row.schema_sql_storage_class != "not_applicable"
             || row.table_sql_token_source_is_null != 1
             || !row.table_sql_token_source_hex.is_empty()
+            || row.table_virtual_token_hit != 0
             || !foreign_key_storage_markers_applicable(row)
         {
             return Err(contradictory_facts());
@@ -956,6 +974,20 @@ fn validate_schema_fact(
             _ => return Ok(false),
         }
     };
+    let token_source = if structural_blocker.is_empty()
+        && recognized_type == Some("table")
+        && row.schema_sql_storage_class == "text"
+    {
+        Some(decode_upper_hex(&row.table_sql_token_source_hex)?)
+    } else {
+        None
+    };
+    let token_source_oversized = token_source
+        .as_ref()
+        .is_some_and(|source| source.len() > D1_CATALOG_TABLE_SQL_TOKEN_SOURCE_BYTE_CAP);
+    let virtual_token_hit = token_source
+        .as_ref()
+        .is_some_and(|source| contains_ascii_token(source, b"VIRTUAL"));
     let expected_blocker = if !structural_blocker.is_empty() {
         structural_blocker
     } else {
@@ -965,6 +997,8 @@ fn validate_schema_fact(
             Some("table") if row.schema_sql_storage_class == "null" => {
                 "table_sql_token_source_unavailable"
             }
+            Some("table") if token_source_oversized => "table_sql_token_source_oversized",
+            Some("table") if virtual_token_hit => "table_virtual_semantics_unproven",
             _ => "",
         }
     };
@@ -974,7 +1008,17 @@ fn validate_schema_fact(
     Ok(row.fact_kind == expected_kind
         && row.conservative_blocker == expected_blocker
         && row.table_sql_token_source_is_null == u8::from(!token_available)
-        && (token_available || row.table_sql_token_source_hex.is_empty()))
+        && (token_available || row.table_sql_token_source_hex.is_empty())
+        && row.table_virtual_token_hit == u8::from(virtual_token_hit && !token_source_oversized))
+}
+
+fn contains_ascii_token(source: &[u8], token: &[u8]) -> bool {
+    source.windows(token.len()).any(|window| {
+        window
+            .iter()
+            .zip(token)
+            .all(|(actual, expected)| actual.to_ascii_uppercase() == *expected)
+    })
 }
 
 fn expected_schema_structural_blocker(
@@ -1352,6 +1396,19 @@ mod tests {
     }
 
     fn row(schema_rowid: i64, name: &str, definition: Option<&str>) -> Value {
+        let oversized = definition
+            .is_some_and(|source| source.len() > D1_CATALOG_TABLE_SQL_TOKEN_SOURCE_BYTE_CAP);
+        let virtual_token_hit =
+            definition.is_some_and(|source| contains_ascii_token(source.as_bytes(), b"VIRTUAL"));
+        let blocker = if definition.is_none() {
+            "table_sql_token_source_unavailable"
+        } else if oversized {
+            "table_sql_token_source_oversized"
+        } else if virtual_token_hit {
+            "table_virtual_semantics_unproven"
+        } else {
+            ""
+        };
         let mut value = json!({
             "schema_rowid": schema_rowid,
             "fact_order": 0,
@@ -1366,7 +1423,8 @@ mod tests {
             "schema_sql_storage_class": if definition.is_some() { "text" } else { "null" },
             "table_sql_token_source_is_null": u8::from(definition.is_none()),
             "table_sql_token_source_hex": definition.map(hex).unwrap_or_default(),
-            "conservative_blocker": if definition.is_some() { "" } else { "table_sql_token_source_unavailable" },
+            "table_virtual_token_hit": u8::from(virtual_token_hit && !oversized),
+            "conservative_blocker": blocker,
         });
         value
             .as_object_mut()
@@ -1390,6 +1448,7 @@ mod tests {
             "schema_sql_storage_class": "text",
             "table_sql_token_source_is_null": 1,
             "table_sql_token_source_hex": "",
+            "table_virtual_token_hit": 0,
             "conservative_blocker": "view_write_semantics_unproven",
         });
         value
@@ -1414,6 +1473,7 @@ mod tests {
             "schema_sql_storage_class": "text",
             "table_sql_token_source_is_null": 1,
             "table_sql_token_source_hex": "",
+            "table_virtual_token_hit": 0,
             "conservative_blocker": if owner_resolved { "trigger_effects_unproven" } else { "schema_owner_unresolved" },
         });
         value
@@ -1450,6 +1510,7 @@ mod tests {
             "schema_sql_storage_class": "not_applicable",
             "table_sql_token_source_is_null": 1,
             "table_sql_token_source_hex": "",
+            "table_virtual_token_hit": 0,
             "foreign_key_id_storage_class": "integer",
             "foreign_key_id_value_hex": hex(&id.to_string()),
             "foreign_key_id": id,
@@ -1498,6 +1559,7 @@ mod tests {
             "schema_sql_storage_class": sql_storage,
             "table_sql_token_source_is_null": 1,
             "table_sql_token_source_hex": "",
+            "table_virtual_token_hit": 0,
             "conservative_blocker": blocker,
         });
         value
@@ -1555,7 +1617,7 @@ mod tests {
 
     fn payload(rows: Vec<Value>) -> Vec<u8> {
         serde_json::to_vec(&json!({
-            "version": 3,
+            "version": 4,
             "results_truncated": false,
             "meta": {
                 "query_succeeded": true,
@@ -1613,8 +1675,8 @@ mod tests {
     fn plan_is_exact_fixed_projection_for_one_canonical_target() {
         let target = target();
         let (plan, plan_sha256) = derive_d1_catalog_evidence_plan(&target).expect("plan");
-        assert_eq!(plan.version, 3);
-        assert_eq!(plan.projection_version, 3);
+        assert_eq!(plan.version, 4);
+        assert_eq!(plan.projection_version, 4);
         assert_eq!(
             plan.projection_fields,
             [
@@ -1631,6 +1693,7 @@ mod tests {
                 "schema_sql_storage_class",
                 "table_sql_token_source_is_null",
                 "table_sql_token_source_hex",
+                "table_virtual_token_hit",
                 "foreign_key_id_storage_class",
                 "foreign_key_id_value_hex",
                 "foreign_key_id",
@@ -1759,6 +1822,75 @@ UPDATE sqlite_schema SET sql=CAST(sql AS BLOB) WHERE name='sql_blob';
                 "missing blocker {blocker}"
             );
         }
+    }
+
+    #[test]
+    fn fixed_query_preserves_bounded_virtual_table_and_shadow_evidence() {
+        let setup = r#"
+CREATE TABLE ledger(id INTEGER PRIMARY KEY);
+CREATE VIRTUAL TABLE documents USING fts5(body);
+"#;
+        let Some(rows) = execute_fixed_query(setup) else {
+            return;
+        };
+        validate_projection_rows(&rows).expect("virtual catalog projection is internally exact");
+
+        let virtual_relation = rows
+            .iter()
+            .find(|row| row.fact_kind == "relation" && row.relation_name_hex == hex("documents"))
+            .expect("FTS5 virtual relation");
+        assert_eq!(virtual_relation.relation_type, "table");
+        assert_eq!(virtual_relation.table_virtual_token_hit, 1);
+        assert_eq!(
+            virtual_relation.conservative_blocker,
+            "table_virtual_semantics_unproven"
+        );
+        for shadow_name in [
+            "documents_data",
+            "documents_idx",
+            "documents_content",
+            "documents_docsize",
+            "documents_config",
+        ] {
+            assert!(
+                rows.iter().any(|row| {
+                    row.fact_kind == "relation" && row.relation_name_hex == hex(shadow_name)
+                }),
+                "missing physical FTS5 shadow table {shadow_name}"
+            );
+        }
+
+        let mut contradictory = virtual_relation.clone();
+        contradictory.table_virtual_token_hit = 0;
+        let mut contradictory_rows = rows.clone();
+        let position = contradictory_rows
+            .iter()
+            .position(|row| row.schema_rowid == contradictory.schema_rowid && row.fact_order == 0)
+            .expect("virtual row position");
+        contradictory_rows[position] = contradictory;
+        contradictory_rows.sort();
+        assert_eq!(
+            validate_projection_rows(&contradictory_rows)
+                .expect_err("virtual evidence bit cannot drift from retained bytes")
+                .classification,
+            D1CatalogEvidenceClassification::CatalogFactsContradictory
+        );
+    }
+
+    #[test]
+    fn oversized_table_token_sources_are_explicit_blockers() {
+        let oversized = format!(
+            "CREATE TABLE oversized(value TEXT /* {} */)",
+            "x".repeat(D1_CATALOG_TABLE_SQL_TOKEN_SOURCE_BYTE_CAP)
+        );
+        let oversized_row: D1CatalogProjectionRow =
+            serde_json::from_value(row(1, "oversized", Some(&oversized))).expect("typed row");
+        assert_eq!(oversized_row.table_virtual_token_hit, 0);
+        assert_eq!(
+            oversized_row.conservative_blocker,
+            "table_sql_token_source_oversized"
+        );
+        validate_projection_rows(&[oversized_row]).expect("oversized evidence is exact blocker");
     }
 
     #[test]

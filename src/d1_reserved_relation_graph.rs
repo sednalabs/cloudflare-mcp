@@ -1,6 +1,6 @@
 //! Conservative reserved-relation write graph from verified D1 catalog facts.
 //!
-//! This pure boundary accepts only the opaque version-3 catalog product. It
+//! This pure boundary accepts only the opaque version-4 catalog product. It
 //! creates operation-specific foreign-key and AUTOINCREMENT edges, then derives
 //! bounded cycle-safe decisions for every verified relation. Trigger bodies and
 //! view definitions are deliberately unavailable: reaching a trigger-owned
@@ -15,19 +15,18 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::d1_catalog_evidence::{
-    D1_CATALOG_EVIDENCE_OPERATION, D1CatalogEvidenceProduct, D1CatalogEvidenceReceipt,
-    D1CatalogProjectionRow,
+    D1_CATALOG_EVIDENCE_OPERATION, D1_CATALOG_TABLE_SQL_TOKEN_SOURCE_BYTE_CAP,
+    D1CatalogEvidenceProduct, D1CatalogEvidenceReceipt, D1CatalogProjectionRow,
 };
 
 pub(crate) const D1_RESERVED_RELATION_GRAPH_OPERATION: &str = "d1_reserved_relation_write_graph";
 
-const GRAPH_VERSION: u8 = 1;
-const REQUIRED_CATALOG_VERSION: u8 = 3;
+const GRAPH_VERSION: u8 = 2;
+const REQUIRED_CATALOG_VERSION: u8 = 4;
 const MAX_CONFIGURED_RESERVED_ROOTS: usize = 64;
 const MAX_RELATIONS: usize = 1_000;
 const MAX_GRAPH_NODES: usize = MAX_RELATIONS * 3;
 const MAX_GRAPH_EDGES: usize = 4_096;
-const MAX_TABLE_TOKEN_SOURCE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -39,6 +38,46 @@ pub(crate) enum D1RelationWriteOperation {
 
 impl D1RelationWriteOperation {
     const ALL: [Self; 3] = [Self::Insert, Self::Update, Self::Delete];
+}
+
+/// Closed internal statement-shape contract for the future DML composer.
+///
+/// This is deliberately not a parser, admission decision, or executor. It
+/// prevents a future compound form from being treated as only one primitive;
+/// its consumer must require `Allow` for every returned operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum D1WriteOperationForm {
+    Insert,
+    Update,
+    Delete,
+    Replace,
+    InsertOrReplace,
+    UpsertDoUpdate,
+    UpdateOrReplace,
+    UnsupportedCompound,
+}
+
+pub(crate) fn required_relation_write_operations(
+    form: D1WriteOperationForm,
+) -> Result<&'static [D1RelationWriteOperation], D1ReservedRelationGraphError> {
+    use D1RelationWriteOperation::{Delete, Insert, Update};
+    use D1WriteOperationForm::{
+        Delete as DeleteForm, Insert as InsertForm, InsertOrReplace, Replace, UnsupportedCompound,
+        Update as UpdateForm, UpdateOrReplace, UpsertDoUpdate,
+    };
+
+    match form {
+        InsertForm => Ok(&[Insert]),
+        UpdateForm => Ok(&[Update]),
+        DeleteForm => Ok(&[Delete]),
+        Replace | InsertOrReplace => Ok(&[Delete, Insert]),
+        UpsertDoUpdate => Ok(&[Insert, Update]),
+        UpdateOrReplace => Ok(&[Update, Delete]),
+        UnsupportedCompound => Err(graph_error(
+            D1ReservedRelationGraphClassification::CompoundWriteUnsupported,
+            "compound D1 write form is outside the closed primitive expansion contract",
+        )),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -155,6 +194,7 @@ pub(crate) enum D1ReservedRelationGraphClassification {
     ReservedRootDuplicate,
     ReservedRootAbsent,
     AutoincrementEvidenceUnsupported,
+    CompoundWriteUnsupported,
     GraphLimitExceeded,
 }
 
@@ -194,7 +234,8 @@ fn derive_from_verified_parts(
                 let identity = identity_from_hex(&row.relation_name_hex, true)?;
                 let relation = match row.relation_type.as_str() {
                     "table" => {
-                        if !row.conservative_blocker.is_empty() {
+                        if row.table_virtual_token_hit != 0 || !row.conservative_blocker.is_empty()
+                        {
                             return Err(blocked_fact());
                         }
                         let source = table_token_source(row)?;
@@ -549,7 +590,7 @@ fn table_token_source(
         return Err(blocked_fact());
     }
     let source = decode_upper_hex(&row.table_sql_token_source_hex)?;
-    if source.len() > MAX_TABLE_TOKEN_SOURCE_BYTES {
+    if source.len() > D1_CATALOG_TABLE_SQL_TOKEN_SOURCE_BYTE_CAP {
         return Err(graph_error(
             D1ReservedRelationGraphClassification::AutoincrementEvidenceUnsupported,
             "table token source exceeded the exact local classification bound",

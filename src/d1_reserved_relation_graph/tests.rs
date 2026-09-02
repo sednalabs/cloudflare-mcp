@@ -38,6 +38,22 @@ fn schema_sentinels() -> Value {
 }
 
 fn table(schema_rowid: i64, name: &str, definition: Option<&str>) -> Value {
+    let oversized = definition.is_some_and(|source| source.len() > 64 * 1024);
+    let virtual_token_hit = definition.is_some_and(|source| {
+        source
+            .as_bytes()
+            .windows(b"VIRTUAL".len())
+            .any(|window| window.eq_ignore_ascii_case(b"VIRTUAL"))
+    });
+    let blocker = if definition.is_none() {
+        "table_sql_token_source_unavailable"
+    } else if oversized {
+        "table_sql_token_source_oversized"
+    } else if virtual_token_hit {
+        "table_virtual_semantics_unproven"
+    } else {
+        ""
+    };
     let mut value = json!({
         "schema_rowid": schema_rowid,
         "fact_order": 0,
@@ -52,7 +68,8 @@ fn table(schema_rowid: i64, name: &str, definition: Option<&str>) -> Value {
         "schema_sql_storage_class": if definition.is_some() { "text" } else { "null" },
         "table_sql_token_source_is_null": u8::from(definition.is_none()),
         "table_sql_token_source_hex": definition.map(hex).unwrap_or_default(),
-        "conservative_blocker": if definition.is_some() { "" } else { "table_sql_token_source_unavailable" },
+        "table_virtual_token_hit": u8::from(virtual_token_hit && !oversized),
+        "conservative_blocker": blocker,
     });
     value
         .as_object_mut()
@@ -76,6 +93,7 @@ fn view(schema_rowid: i64, name: &str) -> Value {
         "schema_sql_storage_class": "text",
         "table_sql_token_source_is_null": 1,
         "table_sql_token_source_hex": "",
+        "table_virtual_token_hit": 0,
         "conservative_blocker": "view_write_semantics_unproven",
     });
     value
@@ -100,6 +118,7 @@ fn trigger(schema_rowid: i64, name: &str, owner: &str, owner_resolved: bool) -> 
         "schema_sql_storage_class": "text",
         "table_sql_token_source_is_null": 1,
         "table_sql_token_source_hex": "",
+        "table_virtual_token_hit": 0,
         "conservative_blocker": if owner_resolved { "trigger_effects_unproven" } else { "schema_owner_unresolved" },
     });
     value
@@ -124,6 +143,7 @@ fn auxiliary(schema_rowid: i64, name: &str, owner: &str) -> Value {
         "schema_sql_storage_class": "text",
         "table_sql_token_source_is_null": 1,
         "table_sql_token_source_hex": "",
+        "table_virtual_token_hit": 0,
         "conservative_blocker": "",
     });
     value
@@ -161,6 +181,7 @@ fn foreign_key(
         "schema_sql_storage_class": "not_applicable",
         "table_sql_token_source_is_null": 1,
         "table_sql_token_source_hex": "",
+        "table_virtual_token_hit": 0,
         "foreign_key_id_storage_class": "integer",
         "foreign_key_id_value_hex": hex(&id.to_string()),
         "foreign_key_id": id,
@@ -191,7 +212,7 @@ fn verified(rows: Vec<Value>) -> D1CatalogEvidenceProduct {
         .collect::<Vec<_>>();
     rows.sort();
     let body = serde_json::to_vec(&json!({
-        "version": 3,
+        "version": 4,
         "results_truncated": false,
         "meta": {
             "query_succeeded": true,
@@ -603,6 +624,160 @@ fn every_projection_blocker_family_denies_the_complete_graph() {
             .expect_err("schema blocker denies")
             .classification,
         D1ReservedRelationGraphClassification::CatalogFactBlocked
+    );
+}
+
+#[test]
+fn virtual_table_evidence_blocks_graph_before_shadow_root_allowance() {
+    let catalog = verified(vec![
+        table(1, "ledger", Some("CREATE TABLE ledger(id)")),
+        table(
+            2,
+            "documents",
+            Some("CrEaTe ViRtUaL TABLE documents USING fts5(body)"),
+        ),
+        table(
+            3,
+            "documents_data",
+            Some("CREATE TABLE documents_data(id INTEGER PRIMARY KEY, block BLOB)"),
+        ),
+    ]);
+    assert_eq!(catalog.receipt().conservative_blocker_count, 1);
+    assert_eq!(catalog.rows()[1].table_virtual_token_hit, 1);
+    assert_eq!(
+        derive_d1_reserved_relation_graph(&catalog, &["documents_data".to_string()])
+            .expect_err("virtual module can write configured shadow roots")
+            .classification,
+        D1ReservedRelationGraphClassification::CatalogFactBlocked
+    );
+
+    let mut malformed_rows = catalog.rows().to_vec();
+    malformed_rows[1].table_virtual_token_hit = 2;
+    assert_eq!(
+        derive_from_verified_parts(
+            catalog.receipt(),
+            &malformed_rows,
+            &["documents_data".to_string()]
+        )
+        .expect_err("non-boolean virtual evidence denies defensively")
+        .classification,
+        D1ReservedRelationGraphClassification::CatalogFactBlocked
+    );
+}
+
+#[test]
+fn compound_write_forms_expand_to_every_required_primitive() {
+    use D1RelationWriteOperation::{Delete, Insert, Update};
+    use D1WriteOperationForm::{
+        Delete as DeleteForm, Insert as InsertForm, InsertOrReplace, Replace, UnsupportedCompound,
+        Update as UpdateForm, UpdateOrReplace, UpsertDoUpdate,
+    };
+
+    for (form, expected) in [
+        (InsertForm, &[Insert][..]),
+        (UpdateForm, &[Update][..]),
+        (DeleteForm, &[Delete][..]),
+        (Replace, &[Delete, Insert][..]),
+        (InsertOrReplace, &[Delete, Insert][..]),
+        (UpsertDoUpdate, &[Insert, Update][..]),
+        (UpdateOrReplace, &[Update, Delete][..]),
+    ] {
+        assert_eq!(
+            required_relation_write_operations(form).expect("supported expansion"),
+            expected
+        );
+    }
+    assert_eq!(
+        required_relation_write_operations(UnsupportedCompound)
+            .expect_err("unknown compound form denies")
+            .classification,
+        D1ReservedRelationGraphClassification::CompoundWriteUnsupported
+    );
+
+    let product = derive_d1_reserved_relation_graph(
+        &verified(vec![
+            table(
+                1,
+                "reserved_child",
+                Some("CREATE TABLE reserved_child(parent_id)"),
+            ),
+            foreign_key(
+                1,
+                "reserved_child",
+                "parents",
+                0,
+                0,
+                "parent_id",
+                Some("id"),
+                "SET NULL",
+                "CASCADE",
+                "NONE",
+                true,
+            ),
+            table(2, "parents", Some("CREATE TABLE parents(id)")),
+        ]),
+        &["reserved_child".to_string()],
+    )
+    .expect("operation-specific graph");
+    for form in [Replace, InsertOrReplace, UpsertDoUpdate] {
+        let decisions = required_relation_write_operations(form)
+            .expect("supported form")
+            .iter()
+            .map(|operation| {
+                product
+                    .decision_for("parents", *operation)
+                    .expect("decision")
+            })
+            .collect::<Vec<_>>();
+        assert!(decisions.contains(&D1ReservedRelationDecision::Allow));
+        assert!(decisions.contains(&D1ReservedRelationDecision::DenyReservedReachable));
+        assert!(
+            !decisions
+                .iter()
+                .all(|decision| *decision == D1ReservedRelationDecision::Allow)
+        );
+    }
+
+    let delete_only = derive_d1_reserved_relation_graph(
+        &verified(vec![
+            table(
+                1,
+                "reserved_child",
+                Some("CREATE TABLE reserved_child(parent_id)"),
+            ),
+            foreign_key(
+                1,
+                "reserved_child",
+                "parents",
+                0,
+                0,
+                "parent_id",
+                Some("id"),
+                "NO ACTION",
+                "CASCADE",
+                "NONE",
+                true,
+            ),
+            table(2, "parents", Some("CREATE TABLE parents(id)")),
+        ]),
+        &["reserved_child".to_string()],
+    )
+    .expect("delete-only graph");
+    let update_or_replace = required_relation_write_operations(UpdateOrReplace)
+        .expect("supported form")
+        .iter()
+        .map(|operation| {
+            delete_only
+                .decision_for("parents", *operation)
+                .expect("decision")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        update_or_replace,
+        vec![
+            D1ReservedRelationDecision::Allow,
+            D1ReservedRelationDecision::DenyReservedReachable,
+        ]
     );
 }
 

@@ -951,7 +951,7 @@ origin or EOF outside the trusted HTTP adapter lifecycle. Errors remain
 content-free and omit request/provider bodies and private identities.
 
 This contract only establishes that two adapter-issued frames contain one
-stable canonical typed version-3 catalog projection. The fixed query first
+stable canonical typed version-4 catalog projection. The fixed query first
 enumerates every physical `sqlite_schema` row with rowid, storage classes, and
 exact hex bytes for type/name/owner. It does not filter malformed type rows or
 erase TEXT/BLOB/integer distinctions with an unmarked cast. Only unique,
@@ -964,9 +964,12 @@ update/delete actions, and match mode with their exact storage classes and bytes
 Treat `to=NULL` and an empty TEXT target as different evidence. Composite
 constraints require contiguous sequence cardinality and stable shared
 parent/action/match facts. The projection retains SQL bytes only for valid table
-relations as a later AUTOINCREMENT token source. View SQL and trigger bodies are
-excluded. Unresolved parents or owners, malformed or aliased catalog rows, and
-structurally unproven view/trigger write semantics remain conservative blockers.
+relations and permits only bounded ASCII token classification. It records and independently
+re-verifies a case-insensitive `VIRTUAL` hit within 64 KiB; any hit blocks because
+a virtual module may mutate schema-table shadow relations. Oversized sources
+block before classification. View SQL and trigger bodies are excluded.
+Unresolved parents or owners, malformed or aliased catalog rows, and
+structurally unproven virtual/view/trigger write semantics remain conservative blockers.
 The row sentinel covers schema and foreign-key/blocker facts together.
 
 The internal opaque verifier product may be handed only to later pure
@@ -977,7 +980,7 @@ independence/EOF, execution, custody, provider admission, DML composition,
 mutation, deployment, and public routing must not infer authority from the
 catalog receipt or projection alone.
 
-The internal reserved-relation graph stage accepts only the opaque version-3
+The internal reserved-relation graph stage accepts only the opaque version-4
 product, never caller JSON or a generic D1 response. Supply one non-empty set of
 at most 64 configured reserved relation identities. They must be printable
 ASCII, distinct under SQLite ASCII case folding, outside the automatic
@@ -995,6 +998,13 @@ sequence/cardinality proof. The only SQL-byte classification is a conservative
 case-insensitive search for `AUTOINCREMENT` within a 64-KiB table source. Any
 match requires `sqlite_sequence` and adds table-insert to sequence-update; the
 classifier intentionally prefers a false-positive denial over parsing DDL.
+
+For a future DML composer, use the graph module's closed internal expansion
+contract and require every returned primitive decision to be `Allow`: REPLACE
+and INSERT OR REPLACE are DELETE plus INSERT; UPSERT DO UPDATE is INSERT plus
+UPDATE; UPDATE OR REPLACE is UPDATE plus DELETE. Unsupported compound forms
+deny. This stage still performs no statement parsing, composition, admission,
+execution, provider call, or mutation.
 
 Do not parse trigger or view SQL to reopen a decision. All operations on a view
 deny. All operations on, or FK paths reaching, a relation that owns any trigger
