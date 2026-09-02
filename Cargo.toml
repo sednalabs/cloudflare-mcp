@@ -14,11 +14,12 @@ blake3 = "1"
 futures = "0.3.31"
 hmac = "0.12.1"
 libc = "0.2.186"
-mcp-toolkit-auth = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "6a2bb8174464cb2fcff1fc319c1e37a0da27cd79", package = "mcp-toolkit-auth" }
-mcp-toolkit-core = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "6a2bb8174464cb2fcff1fc319c1e37a0da27cd79", package = "mcp-toolkit-core" }
-mcp-toolkit-http = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "6a2bb8174464cb2fcff1fc319c1e37a0da27cd79", package = "mcp-toolkit-http", features = ["session"] }
-mcp-toolkit-observability = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "6a2bb8174464cb2fcff1fc319c1e37a0da27cd79", package = "mcp-toolkit-observability" }
-mcp-toolkit-policy-core = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "6a2bb8174464cb2fcff1fc319c1e37a0da27cd79", package = "mcp-toolkit-policy-core" }
+mcp-toolkit-auth = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "590caf41e2ea142772a9d708d7acca6973ba632e", package = "mcp-toolkit-auth" }
+mcp-toolkit-core = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "590caf41e2ea142772a9d708d7acca6973ba632e", package = "mcp-toolkit-core" }
+mcp-toolkit-http = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "590caf41e2ea142772a9d708d7acca6973ba632e", package = "mcp-toolkit-http", features = ["session"] }
+mcp-toolkit-observability = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "590caf41e2ea142772a9d708d7acca6973ba632e", package = "mcp-toolkit-observability" }
+mcp-toolkit-policy-core = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "590caf41e2ea142772a9d708d7acca6973ba632e", package = "mcp-toolkit-policy-core" }
+mcp-toolkit-private-artifact = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "590caf41e2ea142772a9d708d7acca6973ba632e", package = "mcp-toolkit-private-artifact" }
 mime_guess = "2.0.5"
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
 rmcp = { version = "=2.1.0", features = ["server", "transport-io", "transport-streamable-http-server", "macros", "elicitation", "schemars"] }
@@ -36,5 +37,5 @@ url = "2.5.7"
 
 [dev-dependencies]
 jsonwebtoken = "10.4.0"
-mcp-toolkit-testing = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "6a2bb8174464cb2fcff1fc319c1e37a0da27cd79", package = "mcp-toolkit-testing" }
+mcp-toolkit-testing = { git = "https://github.com/sednalabs/mcp-toolkit-rs", rev = "590caf41e2ea142772a9d708d7acca6973ba632e", package = "mcp-toolkit-testing" }
 tower = "0.5.2"

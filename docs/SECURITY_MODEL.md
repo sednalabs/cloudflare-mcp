@@ -149,8 +149,11 @@ systems, secret files should be regular owner-only files.
 
 ## Private D1 SQL Artifact Transport
 
-Private SQL upload preparation uses the same Unix custody policy as retained D1
-migration evidence: a current-operator-owned private root, root- or
+Private SQL upload preparation delegates generic descriptor-bound read custody
+to the pinned `mcp-toolkit-private-artifact` crate, while the local adapter
+retains D1-specific non-empty and error-code policy. It uses the same Unix
+custody policy as retained D1 migration evidence: a current-operator-owned
+private root, root- or
 current-operator-owned safe external
 ancestors, descriptor-relative traversal without symlink following, private
 single-link regular files, and stable device/inode/size/content readback. A held
