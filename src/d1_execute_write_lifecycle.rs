@@ -269,14 +269,7 @@ async fn execute_reserved_attempt(
             {
                 let _ = result;
                 return custody_error(
-                    json!({
-                        "authority": base,
-                        "provider_response": {
-                            "response_body_sha256": write.response_body_sha256,
-                            "response_body_size_bytes": write.response_body_size_bytes,
-                            "provider_lifecycle": write.lifecycle,
-                        }
-                    }),
+                    base,
                     "d1.execute_write_custody_unproven",
                     "durable Prepared attempt state could not be installed exactly",
                     2,
@@ -324,7 +317,7 @@ async fn execute_reserved_attempt(
     {
         let _ = result;
         return custody_error(
-            json!({"authority": base, "provider_evidence": provider_evidence}),
+            base,
             "d1.execute_write_custody_unproven",
             "DispatchReserved successor could not be atomically installed",
             2,

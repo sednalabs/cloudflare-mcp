@@ -129,7 +129,7 @@ pub(crate) fn classify_d1_dml(sql: &str) -> Result<D1ClassifiedDml, D1DmlClassif
             D1WriteOperationForm::Delete,
             2,
         ),
-        "INSERT" | "UPDATE" | "DELETE" | "REPLACE" => {
+        "DELETE" | "REPLACE" => {
             return Err(error(
                 D1DmlClassifierClassification::CompoundFormUnsupported,
                 "DML form was outside the closed contract",
