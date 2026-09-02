@@ -18202,6 +18202,7 @@ fn expected_d1_execute_write_mutation_plan(dry_run: bool) -> Value {
             json!({"ordinal": 3, "action": "install_prepared_attempt_custody", "side_effect": true, "target": {"create_once": true, "phase": "Prepared"}}),
             json!({"ordinal": 4, "action": "install_dispatch_reservation", "side_effect": true, "target": {"atomic_compare_exchange": true, "phase": "DispatchReserved"}}),
             json!({"ordinal": 5, "action": "submit_one_d1_dml_request", "side_effect": true, "target": {"maximum_provider_mutations": 1}}),
+            json!({"ordinal": 6, "action": "persist_post_provider_attempt_custody", "side_effect": true, "target": {"atomic_compare_exchange": true, "conditional_outcomes": {"provider_acknowledgement": "ProviderAssertionRecorded", "response_missing_or_ambiguous": "Ambiguous"}, "exactly_one_outcome": true}}),
         ]);
     }
     json!({"operation": "d1_execute_write", "steps": steps})
@@ -18325,11 +18326,59 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
     assert_eq!(content["provider_calls"], json!(3));
     assert_eq!(content["provider_mutations"], json!(1));
     assert_eq!(content["outcome"]["zero_change"], json!(false));
+    assert_eq!(
+        content["custody"]["transition"],
+        json!("provider_assertion_recorded")
+    );
     assert_eq!(content["automatic_retry_permitted"], json!(false));
     assert_eq!(
         content["evidence"]["mutation_plan"],
         expected_d1_execute_write_mutation_plan(false),
         "{content}"
+    );
+    let acknowledgement_evidence = &content["evidence"];
+    assert_eq!(
+        acknowledgement_evidence,
+        &json!({
+            "operation": "d1_execute_write",
+            "execution_plan": acknowledgement_evidence["execution_plan"].clone(),
+            "execute_plan_sha256": acknowledgement_evidence["execute_plan_sha256"].clone(),
+            "catalog_provider_custody": acknowledgement_evidence["catalog_provider_custody"].clone(),
+            "catalog_evidence": acknowledgement_evidence["catalog_evidence"].clone(),
+            "reserved_relation_graph": acknowledgement_evidence["reserved_relation_graph"].clone(),
+            "composition": acknowledgement_evidence["composition"].clone(),
+            "attempt": acknowledgement_evidence["attempt"].clone(),
+            "mutation_plan": expected_d1_execute_write_mutation_plan(false),
+            "automatic_retry_permitted": false,
+            "reached_phase": {
+                "phase": "post_provider_attempt_custody_persisted",
+                "prepared_state_installed": true,
+                "dispatch_reserved_installed": true,
+                "provider_submission_attempted": true,
+                "post_provider_custody_persisted": true,
+                "post_provider_custody_outcome": "ProviderAssertionRecorded",
+            },
+        }),
+        "whole provider-acknowledgement evidence drifted: {content}"
+    );
+    assert_eq!(
+        content,
+        &json!({
+            "ok": true,
+            "status": "provider_acknowledged_reconciliation_required",
+            "outcome": content["outcome"].clone(),
+            "response_body_sha256": content["response_body_sha256"].clone(),
+            "response_body_size_bytes": content["response_body_size_bytes"].clone(),
+            "provider_lifecycle": content["provider_lifecycle"].clone(),
+            "custody": content["custody"].clone(),
+            "evidence": acknowledgement_evidence.clone(),
+            "automatic_retry_permitted": false,
+            "operator_guidance": "Provider acknowledgement is authenticated evidence, not terminal state authority; finalize through w13462 recovery readback.",
+            "provider_calls": 3,
+            "provider_mutations": 1,
+            "audit": content["audit"].clone(),
+        }),
+        "whole provider-acknowledgement envelope drifted: {content}"
     );
     assert_d1_execute_write_audit(
         content,
@@ -18638,6 +18687,7 @@ fn d1_execute_write_response_loss_reports_the_completed_mutation_attempt() {
     assert_eq!(lost["status"], json!("reconciliation_required"));
     assert_eq!(lost["provider_calls"], json!(3), "{lost}");
     assert_eq!(lost["provider_mutations"], json!(1), "{lost}");
+    assert_eq!(lost["custody"]["transition"], json!("ambiguity_recorded"));
     assert_eq!(
         lost["provider_evidence"]["provider_lifecycle"]["dispatch_stage"],
         json!("attempted")
@@ -18647,6 +18697,47 @@ fn d1_execute_write_response_loss_reports_the_completed_mutation_attempt() {
         lost["evidence"]["mutation_plan"],
         expected_d1_execute_write_mutation_plan(false),
         "{lost}"
+    );
+    let ambiguity_evidence = &lost["evidence"];
+    assert_eq!(
+        ambiguity_evidence,
+        &json!({
+            "operation": "d1_execute_write",
+            "execution_plan": ambiguity_evidence["execution_plan"].clone(),
+            "execute_plan_sha256": ambiguity_evidence["execute_plan_sha256"].clone(),
+            "catalog_provider_custody": ambiguity_evidence["catalog_provider_custody"].clone(),
+            "catalog_evidence": ambiguity_evidence["catalog_evidence"].clone(),
+            "reserved_relation_graph": ambiguity_evidence["reserved_relation_graph"].clone(),
+            "composition": ambiguity_evidence["composition"].clone(),
+            "attempt": ambiguity_evidence["attempt"].clone(),
+            "mutation_plan": expected_d1_execute_write_mutation_plan(false),
+            "automatic_retry_permitted": false,
+            "reached_phase": {
+                "phase": "post_provider_attempt_custody_persisted",
+                "prepared_state_installed": true,
+                "dispatch_reserved_installed": true,
+                "provider_submission_attempted": true,
+                "post_provider_custody_persisted": true,
+                "post_provider_custody_outcome": "Ambiguous",
+            },
+        }),
+        "whole response-loss evidence drifted: {lost}"
+    );
+    assert_eq!(
+        lost,
+        &json!({
+            "ok": false,
+            "status": "reconciliation_required",
+            "provider_evidence": lost["provider_evidence"].clone(),
+            "custody": lost["custody"].clone(),
+            "evidence": ambiguity_evidence.clone(),
+            "automatic_retry_permitted": false,
+            "error": lost["error"].clone(),
+            "provider_calls": 3,
+            "provider_mutations": 1,
+            "audit": lost["audit"].clone(),
+        }),
+        "whole response-loss envelope drifted: {lost}"
     );
     assert_d1_execute_write_audit(
         lost,

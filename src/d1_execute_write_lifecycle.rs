@@ -177,6 +177,18 @@ fn d1_execute_write_mutation_plan(dry_run: bool) -> MutationPlan {
         true,
         json!({"maximum_provider_mutations": 1}),
     )
+    .step(
+        "persist_post_provider_attempt_custody",
+        true,
+        json!({
+            "atomic_compare_exchange": true,
+            "conditional_outcomes": {
+                "provider_acknowledgement": "ProviderAssertionRecorded",
+                "response_missing_or_ambiguous": "Ambiguous",
+            },
+            "exactly_one_outcome": true,
+        }),
+    )
 }
 
 fn finalize_d1_execute_write_result(
@@ -605,6 +617,7 @@ async fn execute_reserved_attempt(
                         reserved.state_bytes(),
                         D1DmlAttemptAmbiguity::ResponseContradictory,
                         base,
+                        true,
                         error.code,
                         error.message,
                         provider,
@@ -652,6 +665,8 @@ async fn execute_reserved_attempt(
                     Some(&binding),
                 ));
             }
+            let evidence =
+                with_post_provider_custody_evidence(base, true, "ProviderAssertionRecorded");
             provider.apply(CallToolResult::structured(json!({
                 "ok": true,
                 "status": D1ExecuteWriteLifecycleStatus::ProviderAcknowledgedReconciliationRequired.as_str(),
@@ -660,7 +675,7 @@ async fn execute_reserved_attempt(
                 "response_body_size_bytes": write.response_body_size_bytes,
                 "provider_lifecycle": write.lifecycle,
                 "custody": asserted.receipt(),
-                "evidence": base,
+                "evidence": evidence,
                 "automatic_retry_permitted": false,
                 "operator_guidance": "Provider acknowledgement is authenticated evidence, not terminal state authority; finalize through w13462 recovery readback."
             })))
@@ -679,6 +694,7 @@ async fn execute_reserved_attempt(
                     reserved.state_bytes(),
                     D1DmlAttemptAmbiguity::ResponseMissing,
                     base,
+                    false,
                     &error.error.code,
                     "provider dispatch did not produce terminal authenticated evidence",
                     provider,
@@ -694,6 +710,7 @@ async fn execute_reserved_attempt(
                     reserved.state_bytes(),
                     D1DmlAttemptAmbiguity::TransportUncertain,
                     base,
+                    true,
                     &error.error.code,
                     "provider attempt outcome was ambiguous",
                     provider,
@@ -716,6 +733,7 @@ fn persist_ambiguity(
     incumbent: &[u8],
     ambiguity: D1DmlAttemptAmbiguity,
     base: Value,
+    provider_submission_attempted: bool,
     error_code: &str,
     message: &str,
     provider: D1ProviderAccounting,
@@ -749,15 +767,38 @@ fn persist_ambiguity(
             Some(binding),
         ));
     }
+    let evidence =
+        with_post_provider_custody_evidence(base, provider_submission_attempted, "Ambiguous");
     provider.apply(CallToolResult::structured_error(json!({
         "ok": false,
         "status": D1ExecuteWriteLifecycleStatus::ReconciliationRequired.as_str(),
         "provider_evidence": provider_evidence,
         "custody": product.receipt(),
-        "evidence": base,
+        "evidence": evidence,
         "automatic_retry_permitted": false,
         "error": {"code": error_code, "message": message, "hint": "Retain custody and use the governed recovery path; do not replay this attempt."}
     })))
+}
+
+fn with_post_provider_custody_evidence(
+    mut evidence: Value,
+    provider_submission_attempted: bool,
+    custody_outcome: &'static str,
+) -> Value {
+    if let Some(object) = evidence.as_object_mut() {
+        object.insert(
+            "reached_phase".to_string(),
+            json!({
+                "phase": "post_provider_attempt_custody_persisted",
+                "prepared_state_installed": true,
+                "dispatch_reserved_installed": true,
+                "provider_submission_attempted": provider_submission_attempted,
+                "post_provider_custody_persisted": true,
+                "post_provider_custody_outcome": custody_outcome,
+            }),
+        );
+    }
+    evidence
 }
 
 fn configured_reserved_roots() -> Result<Vec<String>, &'static str> {
@@ -957,6 +998,7 @@ mod tests {
                     {"ordinal": 3, "action": "install_prepared_attempt_custody", "side_effect": true, "target": {"create_once": true, "phase": "Prepared"}},
                     {"ordinal": 4, "action": "install_dispatch_reservation", "side_effect": true, "target": {"atomic_compare_exchange": true, "phase": "DispatchReserved"}},
                     {"ordinal": 5, "action": "submit_one_d1_dml_request", "side_effect": true, "target": {"maximum_provider_mutations": 1}},
+                    {"ordinal": 6, "action": "persist_post_provider_attempt_custody", "side_effect": true, "target": {"atomic_compare_exchange": true, "conditional_outcomes": {"provider_acknowledgement": "ProviderAssertionRecorded", "response_missing_or_ambiguous": "Ambiguous"}, "exactly_one_outcome": true}},
                 ],
             })
         );

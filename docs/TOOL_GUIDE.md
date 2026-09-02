@@ -145,8 +145,12 @@ are added by the graph derivation.
    Prepared, DispatchReserved, and provider submission all false.
 4. Require the receipt to show a create-once Prepared state followed by one
    exact atomic `DispatchReserved` installation before the single DML request.
-   The live public mutation plan marks all three operations as side effects;
-   neither durable custody mutation appears in the dry-run plan.
+   The live public mutation plan marks all three operations as side effects and
+   also declares one conditional post-provider custody compare-and-exchange:
+   acknowledgement records `ProviderAssertionRecorded`, while missing or
+   ambiguous response evidence records `Ambiguous`. Reached-phase evidence
+   identifies the installed successor and whether submission was attempted;
+   none of these durable custody mutations appears in the dry-run plan.
    A provider acknowledgement reports three total provider calls (two catalog
    reads and one mutation), one provider mutation, exact body digest/size and
    lifecycle, and `automatic_retry_permitted=false`. Zero-change metadata is a

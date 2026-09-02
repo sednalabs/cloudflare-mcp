@@ -97,7 +97,12 @@ step. A live call must repeat every byte and identity and supply that digest. It
 recomputes catalog/graph/composition authority under the shared target guard,
 then durably installs one create-once Prepared state and one DispatchReserved
 compare-and-exchange before the only DML provider request. The live mutation
-plan marks both custody writes and provider submission as side effects. Audit
+plan marks both custody writes and provider submission as side effects. It also
+marks the required post-provider custody compare-and-exchange as a side effect:
+authenticated acknowledgement records `ProviderAssertionRecorded`, while a
+missing or ambiguous response records `Ambiguous`. Reached-phase evidence names
+the installed successor and whether provider submission was attempted; dry-run
+contains none of these write or submission steps. Audit
 outcome is closed to `planned`, `error`, or `reconciliation_required`; a
 provider acknowledgement or response-loss ambiguity remains
 `reconciliation_required`, not terminal success.
@@ -131,7 +136,8 @@ Never replay an incumbent attempt. A provider acknowledgement, including a
 valid zero-change acknowledgement, remains retained for effect-specific
 readback and terminal finalization. Transport loss, response ambiguity,
 provider rejection, storage drift, or exact replay is reconciliation-only and
-keeps `automatic_retry_permitted=false`. Validate this lifecycle only with
+keeps `automatic_retry_permitted=false`; the durable post-provider successor is
+custody for reconciliation, never authority to submit again. Validate this lifecycle only with
 synthetic local files and mock provider endpoints; do not use a live D1 target.
 
 ## First-ledger bootstrap for an empty D1 target
