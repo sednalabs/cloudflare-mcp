@@ -692,6 +692,134 @@ impl D1TargetMutationGuard {
         }
     }
 
+    /// Read one create-once identity claimant through the held target directory.
+    pub(crate) fn read_d1_dml_identity_claimant(
+        &self,
+        namespace: crate::d1_dml_identity_claimant::D1DmlIdentityNamespace,
+        identity_sha256: &str,
+    ) -> Result<Option<Vec<u8>>, CallToolResult> {
+        self.revalidate()?;
+        #[cfg(target_os = "linux")]
+        {
+            linux::read_d1_dml_identity_claimant(&self.target, namespace, identity_sha256)
+                .map_err(|message| d1_dml_attempt_store_error(&self.target_key_sha256, message))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (namespace, identity_sha256);
+            Err(d1_dml_attempt_store_error(
+                &self.target_key_sha256,
+                "durable DML identity claimants require Linux dirfd-bound storage",
+            ))
+        }
+    }
+
+    /// Install one canonical Pending claimant exactly once.
+    pub(crate) fn create_d1_dml_identity_claimant(
+        &self,
+        namespace: crate::d1_dml_identity_claimant::D1DmlIdentityNamespace,
+        identity_sha256: &str,
+        state: &[u8],
+    ) -> Result<(), CallToolResult> {
+        self.revalidate()?;
+        self.validate_d1_dml_identity_claimant(namespace, identity_sha256, state)?;
+        if crate::d1_dml_identity_claimant::inspect_d1_dml_identity_claimant(state)
+            .map_err(|_| {
+                d1_dml_attempt_store_error(
+                    &self.target_key_sha256,
+                    "DML identity claimant creation was not canonical",
+                )
+            })?
+            .receipt()
+            .phase
+            != crate::d1_dml_identity_claimant::D1DmlIdentityClaimantPhase::Pending
+        {
+            return Err(d1_dml_attempt_store_error(
+                &self.target_key_sha256,
+                "DML identity claimant creation requires Pending state",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            linux::create_d1_dml_identity_claimant(&self.target, namespace, identity_sha256, state)
+                .map_err(|message| d1_dml_attempt_store_error(&self.target_key_sha256, message))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (namespace, identity_sha256, state);
+            Err(d1_dml_attempt_store_error(
+                &self.target_key_sha256,
+                "durable DML identity claimants require Linux dirfd-bound storage",
+            ))
+        }
+    }
+
+    /// Seal one exact Pending claimant to its full attempt binding.
+    pub(crate) fn compare_exchange_d1_dml_identity_claimant(
+        &self,
+        namespace: crate::d1_dml_identity_claimant::D1DmlIdentityNamespace,
+        identity_sha256: &str,
+        expected: &[u8],
+        successor: &[u8],
+    ) -> Result<(), CallToolResult> {
+        self.revalidate()?;
+        self.validate_d1_dml_identity_claimant(namespace, identity_sha256, expected)?;
+        self.validate_d1_dml_identity_claimant(namespace, identity_sha256, successor)?;
+        crate::d1_dml_identity_claimant::validate_d1_dml_identity_claimant_seal(
+            expected, successor,
+        )
+        .map_err(|_| {
+            d1_dml_attempt_store_error(
+                &self.target_key_sha256,
+                "DML identity claimant successor was not the exact Pending-to-Bound seal",
+            )
+        })?;
+        #[cfg(target_os = "linux")]
+        {
+            linux::compare_exchange_d1_dml_identity_claimant(
+                &self.target,
+                namespace,
+                identity_sha256,
+                expected,
+                successor,
+            )
+            .map_err(|message| d1_dml_attempt_store_error(&self.target_key_sha256, message))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (namespace, identity_sha256, expected, successor);
+            Err(d1_dml_attempt_store_error(
+                &self.target_key_sha256,
+                "durable DML identity claimants require Linux dirfd-bound storage",
+            ))
+        }
+    }
+
+    fn validate_d1_dml_identity_claimant(
+        &self,
+        namespace: crate::d1_dml_identity_claimant::D1DmlIdentityNamespace,
+        identity_sha256: &str,
+        state: &[u8],
+    ) -> Result<(), CallToolResult> {
+        let product = crate::d1_dml_identity_claimant::inspect_d1_dml_identity_claimant(state)
+            .map_err(|_| {
+                d1_dml_attempt_store_error(
+                    &self.target_key_sha256,
+                    "DML identity claimant was malformed or contradicted the closed custody product",
+                )
+            })?;
+        if product.receipt().target_key_sha256 != self.target_key_sha256
+            || product.receipt().namespace != namespace
+            || product.receipt().identity_sha256 != identity_sha256
+        {
+            return Err(d1_dml_attempt_store_error(
+                &self.target_key_sha256,
+                "DML identity claimant contradicted its target or filename binding",
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_d1_dml_attempt_state(
         &self,
         attempt_binding_sha256: &str,
@@ -2491,6 +2619,30 @@ mod linux {
                     return Err("permanent target guard contains unexpected payload bytes");
                 }
                 guard_present = true;
+                entries.push(snapshot);
+                continue;
+            }
+
+            let claimant_name = crate::d1_dml_identity_claimant::D1DmlIdentityNamespace::ALL
+                .into_iter()
+                .find_map(|namespace| {
+                    name.strip_prefix(&format!("dml-claimant.{}.", namespace.filename_label()))
+                        .and_then(|value| value.strip_suffix(".state.json"))
+                        .map(|identity_sha256| (namespace, identity_sha256))
+                });
+            if let Some((namespace, identity_sha256)) = claimant_name {
+                let (snapshot, bytes) = private_custody_file_snapshot(target, &name)?;
+                let product =
+                    crate::d1_dml_identity_claimant::inspect_d1_dml_identity_claimant(&bytes)
+                        .map_err(|_| "DML identity claimant was malformed or contradictory")?;
+                if product.receipt().target_key_sha256 != expected_target_key_sha256
+                    || product.receipt().namespace != namespace
+                    || product.receipt().identity_sha256 != identity_sha256
+                {
+                    return Err(
+                        "DML identity claimant contradicted its target or filename binding",
+                    );
+                }
                 entries.push(snapshot);
                 continue;
             }
@@ -4572,6 +4724,25 @@ mod linux {
         Ok(format!("dml-attempt.{binding}.state.json"))
     }
 
+    fn d1_dml_identity_claimant_name(
+        namespace: crate::d1_dml_identity_claimant::D1DmlIdentityNamespace,
+        identity_sha256: &str,
+    ) -> Result<String, &'static str> {
+        if identity_sha256.len() != 64
+            || !identity_sha256
+                .as_bytes()
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || matches!(*byte, b'a'..=b'f'))
+        {
+            return Err("DML identity claimant digest was not canonical SHA-256");
+        }
+        Ok(format!(
+            "dml-claimant.{}.{}.state.json",
+            namespace.filename_label(),
+            identity_sha256
+        ))
+    }
+
     fn read_private_dml_state(
         target: &fs::File,
         name: &str,
@@ -4692,6 +4863,72 @@ mod linux {
         match read_private_dml_state(target, &name)? {
             Some(readback) if readback == successor => Ok(()),
             _ => Err("DML attempt compare-and-exchange readback contradicted successor bytes"),
+        }
+    }
+
+    pub(super) fn read_d1_dml_identity_claimant(
+        target: &fs::File,
+        namespace: crate::d1_dml_identity_claimant::D1DmlIdentityNamespace,
+        identity_sha256: &str,
+    ) -> Result<Option<Vec<u8>>, &'static str> {
+        read_private_dml_state(
+            target,
+            &d1_dml_identity_claimant_name(namespace, identity_sha256)?,
+        )
+    }
+
+    pub(super) fn create_d1_dml_identity_claimant(
+        target: &fs::File,
+        namespace: crate::d1_dml_identity_claimant::D1DmlIdentityNamespace,
+        identity_sha256: &str,
+        state: &[u8],
+    ) -> Result<(), &'static str> {
+        create_private_dml_state(
+            target,
+            &d1_dml_identity_claimant_name(namespace, identity_sha256)?,
+            state,
+        )
+    }
+
+    pub(super) fn compare_exchange_d1_dml_identity_claimant(
+        target: &fs::File,
+        namespace: crate::d1_dml_identity_claimant::D1DmlIdentityNamespace,
+        identity_sha256: &str,
+        expected: &[u8],
+        successor: &[u8],
+    ) -> Result<(), &'static str> {
+        let name = d1_dml_identity_claimant_name(namespace, identity_sha256)?;
+        match read_private_dml_state(target, &name)? {
+            Some(incumbent) if incumbent == expected => {}
+            Some(_) => return Err("DML identity claimant compare-and-exchange conflicted"),
+            None => return Err("DML identity claimant compare-and-exchange found no incumbent"),
+        }
+        let successor_sha256 = sha256_bytes_hex(successor);
+        let temporary = format!(
+            ".dml-claimant-next.{}.{}.{}",
+            namespace.filename_label(),
+            identity_sha256,
+            successor_sha256
+        );
+        create_private_dml_state(target, &temporary, successor)?;
+        let source = c_string_name(&temporary)?;
+        let destination = c_string_name(&name)?;
+        let renamed = unsafe {
+            libc::renameat(
+                target.as_raw_fd(),
+                source.as_ptr(),
+                target.as_raw_fd(),
+                destination.as_ptr(),
+            )
+        };
+        if renamed != 0 {
+            return Err("DML identity claimant successor could not be installed");
+        }
+        sync_d1_lease_directory(target)
+            .map_err(|_| "DML identity claimant directory sync failed")?;
+        match read_private_dml_state(target, &name)? {
+            Some(readback) if readback == successor => Ok(()),
+            _ => Err("DML identity claimant readback contradicted successor bytes"),
         }
     }
 
@@ -4915,6 +5152,129 @@ mod tests {
             .is_err(),
             "stale expected bytes must fail closed"
         );
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dml_identity_claimants_reconcile_partial_install_and_partial_seal() {
+        use crate::d1_dml_attempt_custody::D1DmlAttemptIdentities;
+        use crate::d1_dml_identity_claimant::{
+            D1DmlIdentityClaimantPhase, D1DmlIdentityNamespace, derive_d1_dml_identity_claimant_set,
+        };
+        use crate::d1_target::normalize_d1_target;
+
+        let root = private_test_root("dml-identity-claimants");
+        let guard = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_execute_write",
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect("acquire target guard");
+        let target =
+            normalize_d1_target("acct-1", "123e4567-e89b-42d3-a456-426614174000").expect("target");
+        let set = derive_d1_dml_identity_claimant_set(
+            &target,
+            &"a".repeat(64),
+            D1DmlAttemptIdentities {
+                operation_id: "operation-fixture-0001",
+                execution_attempt_id: "attempt-fixture-0001",
+                provider_request_id: "provider-fixture-0001",
+            },
+        )
+        .expect("claimant set");
+
+        for namespace in D1DmlIdentityNamespace::ALL[..2].iter().copied() {
+            let pending = set.pending(namespace);
+            linux::create_d1_dml_identity_claimant(
+                &guard.target,
+                namespace,
+                set.identity_sha256(namespace),
+                pending.state_bytes(),
+            )
+            .expect("install partial Pending set");
+        }
+        let last = D1DmlIdentityNamespace::ProviderRequest;
+        assert_eq!(
+            linux::read_d1_dml_identity_claimant(&guard.target, last, set.identity_sha256(last),)
+                .expect("read partial absence"),
+            None
+        );
+
+        let pending = set.pending(last);
+        linux::create_d1_dml_identity_claimant(
+            &guard.target,
+            last,
+            set.identity_sha256(last),
+            pending.state_bytes(),
+        )
+        .expect("complete Pending set");
+
+        let binding = "b".repeat(64);
+        for namespace in D1DmlIdentityNamespace::ALL {
+            let incumbent = linux::read_d1_dml_identity_claimant(
+                &guard.target,
+                namespace,
+                set.identity_sha256(namespace),
+            )
+            .expect("read Pending claimant")
+            .expect("claimant present");
+            let restored = set
+                .restore_exact(namespace, &incumbent)
+                .expect("exact claimant");
+            if namespace == D1DmlIdentityNamespace::Operation {
+                let bound = set.bound(namespace, &binding).expect("bound claimant");
+                linux::compare_exchange_d1_dml_identity_claimant(
+                    &guard.target,
+                    namespace,
+                    set.identity_sha256(namespace),
+                    restored.state_bytes(),
+                    bound.state_bytes(),
+                )
+                .expect("install partial Bound set");
+            }
+        }
+
+        for namespace in D1DmlIdentityNamespace::ALL {
+            let incumbent = linux::read_d1_dml_identity_claimant(
+                &guard.target,
+                namespace,
+                set.identity_sha256(namespace),
+            )
+            .expect("read mixed claimant")
+            .expect("claimant present");
+            let restored = set
+                .restore_exact(namespace, &incumbent)
+                .expect("restore mixed claimant");
+            if restored.receipt().phase == D1DmlIdentityClaimantPhase::Pending {
+                let bound = set.bound(namespace, &binding).expect("bound claimant");
+                linux::compare_exchange_d1_dml_identity_claimant(
+                    &guard.target,
+                    namespace,
+                    set.identity_sha256(namespace),
+                    restored.state_bytes(),
+                    bound.state_bytes(),
+                )
+                .expect("complete Bound set");
+            }
+        }
+        for namespace in D1DmlIdentityNamespace::ALL {
+            let bytes = linux::read_d1_dml_identity_claimant(
+                &guard.target,
+                namespace,
+                set.identity_sha256(namespace),
+            )
+            .expect("read complete Bound claimant")
+            .expect("bound claimant present");
+            assert_eq!(
+                set.restore_exact(namespace, &bytes)
+                    .expect("restore Bound claimant")
+                    .receipt()
+                    .phase,
+                D1DmlIdentityClaimantPhase::Bound
+            );
+        }
         fs::remove_dir_all(root).expect("test cleanup");
     }
 

@@ -5184,7 +5184,7 @@ fn spawn_fake_d1_execute_write_response_loss_api() -> (String, Arc<Mutex<Vec<Val
     let requests = Arc::new(Mutex::new(Vec::new()));
     let requests_for_thread = requests.clone();
     thread::spawn(move || {
-        for stream in listener.incoming().take(5) {
+        for stream in listener.incoming().take(7) {
             let mut stream = stream.expect("fake D1 response-loss stream");
             let (headers, body) = read_http_request(&mut stream);
             let request_line = headers.lines().next().unwrap_or_default().to_string();
@@ -18310,12 +18310,16 @@ fn expected_d1_execute_write_mutation_plan(dry_run: bool) -> Value {
         json!({"ordinal": 2, "action": "compose_reserved_relation_authority", "side_effect": false, "target": {}}),
     ];
     if !dry_run {
-        steps.extend([
-            json!({"ordinal": 3, "action": "install_prepared_attempt_custody", "side_effect": true, "target": {"create_once": true, "phase": "Prepared"}}),
-            json!({"ordinal": 4, "action": "install_dispatch_reservation", "side_effect": true, "target": {"atomic_compare_exchange": true, "phase": "DispatchReserved"}}),
-            json!({"ordinal": 5, "action": "submit_one_d1_dml_request", "side_effect": true, "target": {"maximum_provider_mutations": 1}}),
-            json!({"ordinal": 6, "action": "persist_post_provider_attempt_custody", "side_effect": true, "target": {"atomic_compare_exchange": true, "conditional_outcomes": {"provider_acknowledgement": "ProviderAssertionRecorded", "response_missing_or_ambiguous": "Ambiguous"}, "exactly_one_outcome": true}}),
-        ]);
+        steps = vec![
+            json!({"ordinal": 1, "action": "install_pending_identity_claimants", "side_effect": true, "target": {"create_once": true, "namespace_count": 3, "phase": "Pending"}}),
+            json!({"ordinal": 2, "action": "collect_stable_catalog", "side_effect": false, "target": {"observations": 2}}),
+            json!({"ordinal": 3, "action": "compose_reserved_relation_authority", "side_effect": false, "target": {}}),
+            json!({"ordinal": 4, "action": "seal_identity_claimants", "side_effect": true, "target": {"atomic_compare_exchange": true, "complete_set_required_for_dispatch": true, "namespace_count": 3, "phase": "Bound"}}),
+            json!({"ordinal": 5, "action": "install_prepared_attempt_custody", "side_effect": true, "target": {"create_once": true, "phase": "Prepared"}}),
+            json!({"ordinal": 6, "action": "install_dispatch_reservation", "side_effect": true, "target": {"atomic_compare_exchange": true, "phase": "DispatchReserved"}}),
+            json!({"ordinal": 7, "action": "submit_one_d1_dml_request", "side_effect": true, "target": {"maximum_provider_mutations": 1}}),
+            json!({"ordinal": 8, "action": "persist_post_provider_attempt_custody", "side_effect": true, "target": {"atomic_compare_exchange": true, "conditional_outcomes": {"provider_acknowledgement": "ProviderAssertionRecorded", "response_missing_or_ambiguous": "Ambiguous"}, "exactly_one_outcome": true}}),
+        ];
     }
     json!({"operation": "d1_execute_write", "steps": steps})
 }
@@ -18411,6 +18415,7 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
     live_args["dry_run"] = json!(false);
     live_args["approved_composition_sha256"] = json!(approved);
     let replay_args = live_args.clone();
+    let malformed_claimant_replay_args = live_args.clone();
     let response = mcp.call_tool(3, "d1_execute_write", live_args);
     assert_tool_text_matches_structured(&response);
     let content = structured_content(&response);
@@ -18515,6 +18520,7 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
         );
     }
 
+    let mut max_rows_conflict_args = replay_args.clone();
     let replay_response = mcp.call_tool(4, "d1_execute_write", replay_args);
     assert_tool_text_matches_structured(&replay_response);
     let replay = structured_content(&replay_response);
@@ -18522,6 +18528,25 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
     assert_eq!(replay["status"], json!("reconciliation_required"));
     assert_eq!(replay["provider_calls"], json!(2));
     assert_eq!(replay["provider_mutations"], json!(0));
+
+    max_rows_conflict_args["max_rows"] = json!(1);
+    let request_count_before_conflict = requests.lock().expect("write request log lock").len();
+    let conflict_response = mcp.call_tool(41, "d1_execute_write", max_rows_conflict_args);
+    assert_tool_text_matches_structured(&conflict_response);
+    let conflict = structured_content(&conflict_response);
+    assert_eq!(conflict["ok"], json!(false), "{conflict}");
+    assert_eq!(conflict["status"], json!("blocked"), "{conflict}");
+    assert_eq!(conflict["provider_calls"], json!(0));
+    assert_eq!(conflict["provider_mutations"], json!(0));
+    assert_eq!(
+        conflict["error"]["code"],
+        json!("d1.execute_write_identity_claimant_conflict")
+    );
+    assert_eq!(
+        requests.lock().expect("write request log lock").len(),
+        request_count_before_conflict,
+        "max_rows-only identity reuse must stop before catalog and DML provider access"
+    );
 
     let zero_args = json!({
         "database_id": "123e4567-e89b-42d3-a456-426614174000",
@@ -18565,6 +18590,7 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
     );
     assert_d1_execute_write_audit(zero, false, "reconciliation_required", None, audit_target);
 
+    let requests_handle = requests.clone();
     let requests = requests.lock().expect("request log lock");
     assert_eq!(requests.len(), 12);
     assert_eq!(
@@ -18593,6 +18619,23 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
         json!("UPDATE example SET enabled = 1 WHERE id = 7")
     );
     drop(requests);
+
+    let malformed_claimant = manifest_target_path(&lease_root).join(format!(
+        "dml-claimant.provider-request.{}.state.json",
+        sha256_hex("provider-fixture-0001")
+    ));
+    fs::write(&malformed_claimant, b"null").expect("install malformed restored claimant");
+    let malformed_response = mcp.call_tool(42, "d1_execute_write", malformed_claimant_replay_args);
+    assert_tool_text_matches_structured(&malformed_response);
+    let malformed = structured_content(&malformed_response);
+    assert_eq!(malformed["ok"], json!(false), "{malformed}");
+    assert_eq!(malformed["provider_calls"], json!(0));
+    assert_eq!(malformed["provider_mutations"], json!(0));
+    assert_eq!(
+        requests_handle.lock().expect("request log lock").len(),
+        12,
+        "physically present malformed claimant must fail before provider access"
+    );
     mcp.terminate();
     fs::remove_dir_all(lease_root).expect("target guard cleanup");
 }
@@ -18792,6 +18835,7 @@ fn d1_execute_write_response_loss_reports_the_completed_mutation_attempt() {
     let mut live_args = exact_args;
     live_args["dry_run"] = json!(false);
     live_args["approved_composition_sha256"] = dry["approved_composition_sha256_required"].clone();
+    let replay_args = live_args.clone();
     let lost_response = mcp.call_tool(3, "d1_execute_write", live_args);
     assert_tool_text_matches_structured(&lost_response);
     let lost = structured_content(&lost_response);
@@ -18859,8 +18903,16 @@ fn d1_execute_write_response_loss_reports_the_completed_mutation_attempt() {
         audit_target,
     );
 
+    let replay_response = mcp.call_tool(4, "d1_execute_write", replay_args);
+    assert_tool_text_matches_structured(&replay_response);
+    let replay = structured_content(&replay_response);
+    assert_eq!(replay["ok"], json!(false), "{replay}");
+    assert_eq!(replay["status"], json!("reconciliation_required"));
+    assert_eq!(replay["provider_calls"], json!(2));
+    assert_eq!(replay["provider_mutations"], json!(0));
+
     let requests = requests.lock().expect("response-loss request log lock");
-    assert_eq!(requests.len(), 5);
+    assert_eq!(requests.len(), 7);
     assert_eq!(
         requests
             .iter()

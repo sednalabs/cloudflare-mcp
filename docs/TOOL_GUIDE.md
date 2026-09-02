@@ -137,15 +137,22 @@ are added by the graph derivation.
    the audit outcome is `planned`.
 3. Approve that digest, then repeat the exact target, SQL bytes, params,
    identities, and row cap with `dry_run=false` and
-   `approved_composition_sha256`. Live execution recomputes the two-read
-   authority under the permanent target guard. Any drift blocks with zero DML
-   provider calls. If the held guard changes after those two reads, the blocked
+   `approved_composition_sha256`. Before any provider access, live execution
+   create-once installs one `Pending` claimant in each operation,
+   execution-attempt, and provider-request namespace. Reuse against a changed
+   plan, including only a changed row cap, fails before catalog access. Exact
+   partial installation converges; malformed physical claimants fail closed.
+   Live execution then recomputes the two-read authority under the permanent
+   target guard and seals all three claimants to the exact full attempt binding.
+   If the held guard changes after those two reads, the blocked
    receipt preserves `provider_calls=2`, `provider_mutations=0`, the complete
    live mutation plan, and an explicit post-catalog/pre-DML reached phase with
    Prepared, DispatchReserved, and provider submission all false.
-4. Require the receipt to show a create-once Prepared state followed by one
+4. Require the complete three-namespace `Bound` claimant set to be reread, then
+   require the receipt to show a create-once Prepared state followed by one
    exact atomic `DispatchReserved` installation before the single DML request.
-   The live public mutation plan marks all three operations as side effects and
+   The live public mutation plan marks claimant creation/sealing, both attempt
+   custody writes, and provider submission as side effects and
    also declares one conditional post-provider custody compare-and-exchange:
    acknowledgement records `ProviderAssertionRecorded`, while missing or
    ambiguous response evidence records `Ambiguous`. Reached-phase evidence

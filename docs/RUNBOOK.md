@@ -93,11 +93,18 @@ Dry-run the exact target, SQL bytes, parameters, row cap, and three
 pairwise-distinct opaque operation/attempt/provider-request identities. The dry
 run performs two read-only primary catalog observations and returns the exact
 composition digest; its mutation plan contains no local or provider side-effect
-step. A live call must repeat every byte and identity and supply that digest. It
-recomputes catalog/graph/composition authority under the shared target guard,
-then durably installs one create-once Prepared state and one DispatchReserved
+step. A live call must repeat every byte and identity and supply that digest.
+Under the shared target guard, it first create-once installs three independent
+`Pending` identity claimants bound to the exact caller plan. Physically present
+malformed or conflicting claimants fail closed before catalog access; an exact
+partial set is completed deterministically. After recomputing
+catalog/graph/composition authority, live execution seals all three claimants
+by exact compare-and-exchange to the one full attempt binding. No provider
+dispatch is permitted until the complete `Bound` set is reread. It then durably
+installs one create-once Prepared state and one DispatchReserved
 compare-and-exchange before the only DML provider request. The live mutation
-plan marks both custody writes and provider submission as side effects. It also
+plan marks claimant installation/sealing, both attempt-custody writes, and
+provider submission as side effects. It also
 marks the required post-provider custody compare-and-exchange as a side effect:
 authenticated acknowledgement records `ProviderAssertionRecorded`, while a
 missing or ambiguous response records `Ambiguous`. Reached-phase evidence names

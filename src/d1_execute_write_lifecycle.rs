@@ -19,6 +19,10 @@ use crate::d1_dml_attempt_custody::{
     record_d1_dml_provider_terminal_assertion,
 };
 use crate::d1_dml_classifier::classify_d1_dml;
+use crate::d1_dml_identity_claimant::{
+    D1DmlIdentityClaimantPhase, D1DmlIdentityClaimantSet, D1DmlIdentityNamespace,
+    derive_d1_dml_identity_claimant_set,
+};
 use crate::d1_exact_plan_composition::compose_d1_exact_write_plan;
 use crate::d1_execute_write::{
     D1_EXECUTE_WRITE_OPERATION, classify_d1_execute_write_result, derive_d1_execute_write_plan,
@@ -171,13 +175,25 @@ pub(crate) fn finalize_d1_execute_write_zero_call_denial(
 }
 
 fn d1_execute_write_mutation_plan(dry_run: bool) -> MutationPlan {
-    let plan = MutationPlan::new(D1_EXECUTE_WRITE_OPERATION)
-        .step("collect_stable_catalog", false, json!({"observations": 2}))
-        .step("compose_reserved_relation_authority", false, json!({}));
     if dry_run {
-        return plan;
+        return MutationPlan::new(D1_EXECUTE_WRITE_OPERATION)
+            .step("collect_stable_catalog", false, json!({"observations": 2}))
+            .step("compose_reserved_relation_authority", false, json!({}));
     }
-    plan.step(
+    MutationPlan::new(D1_EXECUTE_WRITE_OPERATION)
+    .step(
+        "install_pending_identity_claimants",
+        true,
+        json!({"create_once": true, "namespace_count": 3, "phase": "Pending"}),
+    )
+    .step("collect_stable_catalog", false, json!({"observations": 2}))
+    .step("compose_reserved_relation_authority", false, json!({}))
+    .step(
+        "seal_identity_claimants",
+        true,
+        json!({"atomic_compare_exchange": true, "namespace_count": 3, "phase": "Bound", "complete_set_required_for_dispatch": true}),
+    )
+    .step(
         "install_prepared_attempt_custody",
         true,
         json!({"create_once": true, "phase": "Prepared"}),
@@ -305,6 +321,11 @@ async fn execute_inner(
         input.params,
         input.max_rows,
     );
+    let identities = D1DmlAttemptIdentities {
+        operation_id: input.operation_id,
+        execution_attempt_id: input.execution_attempt_id,
+        provider_request_id: input.provider_request_id,
+    };
 
     // Live execution acquires the same permanent target guard as every other
     // existing-target mutation before authority collection and keeps it
@@ -320,6 +341,25 @@ async fn execute_inner(
             Ok(guard) => Some(guard),
             Err(result) => return provider.apply(result),
         }
+    };
+    let claimant_set = if let Some(guard) = guard.as_ref() {
+        let claimant_set =
+            match derive_d1_dml_identity_claimant_set(target, &execute_plan_sha256, identities) {
+                Ok(set) => set,
+                Err(error) => {
+                    return provider.apply(identity_claimant_error(
+                        error.code,
+                        error.message,
+                        "pre_catalog_claimant_derivation",
+                    ));
+                }
+            };
+        if let Err(result) = install_pending_identity_claimants(guard, &claimant_set) {
+            return provider.apply(result);
+        }
+        Some(claimant_set)
+    } else {
+        None
     };
     let (catalog_plan, catalog_plan_sha256) = match derive_d1_catalog_evidence_plan(target) {
         Ok(value) => value,
@@ -390,11 +430,6 @@ async fn execute_inner(
         }
     };
     let composition_receipt = composition.receipt();
-    let identities = D1DmlAttemptIdentities {
-        operation_id: input.operation_id,
-        execution_attempt_id: input.execution_attempt_id,
-        provider_request_id: input.provider_request_id,
-    };
     let planned_attempt = match prepare_d1_dml_attempt(target, &composition, identities, None) {
         Ok(product) => product,
         Err(error) => {
@@ -433,7 +468,202 @@ async fn execute_inner(
     if let Err(result) = guard.revalidate() {
         return provider.apply(post_catalog_guard_denial(result, mutation_plan, base));
     }
+    if let Err(result) = seal_identity_claimants(
+        &guard,
+        claimant_set
+            .as_ref()
+            .expect("live execution installed identity claimants"),
+        &planned_attempt.receipt().attempt_binding_sha256,
+    ) {
+        return provider.apply(result);
+    }
     execute_reserved_attempt(client, target, input, composition, guard, base, provider).await
+}
+
+fn install_pending_identity_claimants(
+    guard: &D1TargetMutationGuard,
+    set: &D1DmlIdentityClaimantSet,
+) -> Result<(), CallToolResult> {
+    let mut incumbents = Vec::with_capacity(D1DmlIdentityNamespace::ALL.len());
+    for namespace in D1DmlIdentityNamespace::ALL {
+        let identity_sha256 = set.identity_sha256(namespace);
+        let incumbent = guard
+            .read_d1_dml_identity_claimant(namespace, identity_sha256)
+            .map_err(|_| {
+                identity_claimant_error(
+                    "d1.execute_write_identity_claimant_custody_unproven",
+                    "physical identity claimant presence could not be inspected exactly",
+                    "pre_catalog_claimant_inspection",
+                )
+            })?;
+        if let Some(bytes) = incumbent.as_deref() {
+            set.restore_exact(namespace, bytes).map_err(|error| {
+                identity_claimant_error(error.code, error.message, "pre_catalog_claimant_conflict")
+            })?;
+        }
+        incumbents.push((namespace, incumbent));
+    }
+
+    for (namespace, incumbent) in incumbents {
+        if incumbent.is_none() {
+            let pending = set.pending(namespace);
+            guard
+                .create_d1_dml_identity_claimant(
+                    namespace,
+                    set.identity_sha256(namespace),
+                    pending.state_bytes(),
+                )
+                .map_err(|_| {
+                    identity_claimant_error(
+                        "d1.execute_write_identity_claimant_custody_unproven",
+                        "one deterministic Pending identity claimant could not be installed exactly",
+                        "pre_catalog_claimant_install",
+                    )
+                })?;
+        }
+    }
+
+    for namespace in D1DmlIdentityNamespace::ALL {
+        let identity_sha256 = set.identity_sha256(namespace);
+        let bytes = guard
+            .read_d1_dml_identity_claimant(namespace, identity_sha256)
+            .map_err(|_| {
+                identity_claimant_error(
+                    "d1.execute_write_identity_claimant_custody_unproven",
+                    "identity claimant set could not be reread after installation",
+                    "pre_catalog_claimant_readback",
+                )
+            })?
+            .ok_or_else(|| {
+                identity_claimant_error(
+                    "d1.execute_write_identity_claimant_custody_unproven",
+                    "one physically required identity claimant was absent after installation",
+                    "pre_catalog_claimant_readback",
+                )
+            })?;
+        set.restore_exact(namespace, &bytes).map_err(|error| {
+            identity_claimant_error(error.code, error.message, "pre_catalog_claimant_readback")
+        })?;
+    }
+    Ok(())
+}
+
+fn seal_identity_claimants(
+    guard: &D1TargetMutationGuard,
+    set: &D1DmlIdentityClaimantSet,
+    attempt_binding_sha256: &str,
+) -> Result<(), CallToolResult> {
+    let mut incumbents = Vec::with_capacity(D1DmlIdentityNamespace::ALL.len());
+    for namespace in D1DmlIdentityNamespace::ALL {
+        let identity_sha256 = set.identity_sha256(namespace);
+        let bytes = guard
+            .read_d1_dml_identity_claimant(namespace, identity_sha256)
+            .map_err(|_| {
+                identity_claimant_error(
+                    "d1.execute_write_identity_claimant_custody_unproven",
+                    "identity claimant could not be inspected before full-binding seal",
+                    "post_catalog_claimant_inspection",
+                )
+            })?
+            .ok_or_else(|| {
+                identity_claimant_error(
+                    "d1.execute_write_identity_claimant_custody_unproven",
+                    "one physically required identity claimant was absent before seal",
+                    "post_catalog_claimant_inspection",
+                )
+            })?;
+        let restored = set.restore_exact(namespace, &bytes).map_err(|error| {
+            identity_claimant_error(error.code, error.message, "post_catalog_claimant_conflict")
+        })?;
+        if restored.receipt().phase == D1DmlIdentityClaimantPhase::Bound
+            && restored.receipt().attempt_binding_sha256.as_deref() != Some(attempt_binding_sha256)
+        {
+            return Err(identity_claimant_error(
+                "d1.execute_write_identity_claimant_conflict",
+                "identity claimant was already sealed to a conflicting full attempt binding",
+                "post_catalog_claimant_conflict",
+            ));
+        }
+        incumbents.push((namespace, restored));
+    }
+
+    for (namespace, incumbent) in incumbents {
+        if incumbent.receipt().phase == D1DmlIdentityClaimantPhase::Pending {
+            let bound = set
+                .bound(namespace, attempt_binding_sha256)
+                .map_err(|error| {
+                    identity_claimant_error(error.code, error.message, "post_catalog_claimant_seal")
+                })?;
+            guard
+                .compare_exchange_d1_dml_identity_claimant(
+                    namespace,
+                    set.identity_sha256(namespace),
+                    incumbent.state_bytes(),
+                    bound.state_bytes(),
+                )
+                .map_err(|_| {
+                    identity_claimant_error(
+                        "d1.execute_write_identity_claimant_custody_unproven",
+                        "Pending identity claimant could not be atomically sealed",
+                        "post_catalog_claimant_seal",
+                    )
+                })?;
+        }
+    }
+
+    for namespace in D1DmlIdentityNamespace::ALL {
+        let identity_sha256 = set.identity_sha256(namespace);
+        let bytes = guard
+            .read_d1_dml_identity_claimant(namespace, identity_sha256)
+            .map_err(|_| {
+                identity_claimant_error(
+                    "d1.execute_write_identity_claimant_custody_unproven",
+                    "sealed identity claimant set could not be reread exactly",
+                    "post_catalog_claimant_readback",
+                )
+            })?
+            .ok_or_else(|| {
+                identity_claimant_error(
+                    "d1.execute_write_identity_claimant_custody_unproven",
+                    "one sealed identity claimant was physically absent",
+                    "post_catalog_claimant_readback",
+                )
+            })?;
+        let restored = set.restore_exact(namespace, &bytes).map_err(|error| {
+            identity_claimant_error(error.code, error.message, "post_catalog_claimant_readback")
+        })?;
+        if restored.receipt().phase != D1DmlIdentityClaimantPhase::Bound
+            || restored.receipt().attempt_binding_sha256.as_deref() != Some(attempt_binding_sha256)
+        {
+            return Err(identity_claimant_error(
+                "d1.execute_write_identity_claimant_custody_unproven",
+                "provider dispatch requires three exact Bound identity claimants",
+                "post_catalog_claimant_readback",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn identity_claimant_error(code: &str, message: &str, phase: &str) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": D1_EXECUTE_WRITE_OPERATION,
+        "status": D1ExecuteWriteLifecycleStatus::ReconciliationRequired.as_str(),
+        "evidence": {
+            "identity_claimants": {
+                "namespace_count": D1DmlIdentityNamespace::ALL.len(),
+                "phase": phase,
+                "complete_bound_set_required_for_dispatch": true,
+            }
+        },
+        "automatic_retry_permitted": false,
+        "error": {
+            "code": code,
+            "message": message,
+            "hint": "Do not issue a provider write; reconcile the exact durable identity claimant set."
+        }
+    }))
 }
 
 fn post_catalog_guard_denial(
@@ -1172,12 +1402,14 @@ mod tests {
             json!({
                 "operation": "d1_execute_write",
                 "steps": [
-                    {"ordinal": 1, "action": "collect_stable_catalog", "side_effect": false, "target": {"observations": 2}},
-                    {"ordinal": 2, "action": "compose_reserved_relation_authority", "side_effect": false, "target": {}},
-                    {"ordinal": 3, "action": "install_prepared_attempt_custody", "side_effect": true, "target": {"create_once": true, "phase": "Prepared"}},
-                    {"ordinal": 4, "action": "install_dispatch_reservation", "side_effect": true, "target": {"atomic_compare_exchange": true, "phase": "DispatchReserved"}},
-                    {"ordinal": 5, "action": "submit_one_d1_dml_request", "side_effect": true, "target": {"maximum_provider_mutations": 1}},
-                    {"ordinal": 6, "action": "persist_post_provider_attempt_custody", "side_effect": true, "target": {"atomic_compare_exchange": true, "conditional_outcomes": {"provider_acknowledgement": "ProviderAssertionRecorded", "response_missing_or_ambiguous": "Ambiguous"}, "exactly_one_outcome": true}},
+                    {"ordinal": 1, "action": "install_pending_identity_claimants", "side_effect": true, "target": {"create_once": true, "namespace_count": 3, "phase": "Pending"}},
+                    {"ordinal": 2, "action": "collect_stable_catalog", "side_effect": false, "target": {"observations": 2}},
+                    {"ordinal": 3, "action": "compose_reserved_relation_authority", "side_effect": false, "target": {}},
+                    {"ordinal": 4, "action": "seal_identity_claimants", "side_effect": true, "target": {"atomic_compare_exchange": true, "complete_set_required_for_dispatch": true, "namespace_count": 3, "phase": "Bound"}},
+                    {"ordinal": 5, "action": "install_prepared_attempt_custody", "side_effect": true, "target": {"create_once": true, "phase": "Prepared"}},
+                    {"ordinal": 6, "action": "install_dispatch_reservation", "side_effect": true, "target": {"atomic_compare_exchange": true, "phase": "DispatchReserved"}},
+                    {"ordinal": 7, "action": "submit_one_d1_dml_request", "side_effect": true, "target": {"maximum_provider_mutations": 1}},
+                    {"ordinal": 8, "action": "persist_post_provider_attempt_custody", "side_effect": true, "target": {"atomic_compare_exchange": true, "conditional_outcomes": {"provider_acknowledgement": "ProviderAssertionRecorded", "response_missing_or_ambiguous": "Ambiguous"}, "exactly_one_outcome": true}},
                 ],
             })
         );
