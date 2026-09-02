@@ -423,6 +423,44 @@ trigger bodies; traverses a graph; authorizes DDL, DML, foreign-key effects,
 implicit writes, provider admission, custody outside these exact reads, or any
 mutation. No public MCP tool currently exposes this staged contract.
 
+The next internal staged boundary consumes only that opaque version-3 product
+and derives a conservative reserved-relation write graph. Its configured root
+set is non-empty, ASCII-case closed, duplicate-free, limited to 64 identities,
+and must name relations present in the verified snapshot. Relations whose
+canonical identity begins with `sqlite_` or `_cf_` are automatic roots and may
+not be reintroduced as configured aliases. Index facts remain validated,
+counted non-addressable schema auxiliaries; they are not writable graph nodes.
+
+Each table or view has INSERT, UPDATE, and DELETE nodes. Foreign-key CASCADE
+adds the corresponding parent-update to child-update or parent-delete to
+child-delete edge; SET NULL and SET DEFAULT add child-update edges; RESTRICT
+and NO ACTION add no write edge. Composite rows form one edge group only after
+the catalog verifier has proven contiguous sequence/cardinality and stable
+parent/action/match facts. Table SQL is not parsed. A bounded 64-KiB,
+ASCII-case-insensitive byte scan classifies any `AUTOINCREMENT` occurrence
+conservatively; a match adds only table-insert to `sqlite_sequence`-update and
+requires that exact physical table fact. This may over-classify quoted or
+commented occurrences, but cannot turn ambiguous text into permission.
+
+View writes always deny because view definitions are unavailable. Every write
+to, or foreign-key traversal reaching, a trigger-owned relation denies because
+trigger bodies and events are unavailable. Reserved reachability has higher
+deny precedence than those uncertainty classifications. A schema blocker,
+foreign-key blocker, unresolved parent, unavailable table token source,
+unknown fact family, malformed consumer text, missing auxiliary/trigger owner,
+or unsupported action denies the complete graph derivation. Traversal uses a
+visited set and exact limits of 1,000 relations, 3,000 operation nodes, and
+4,096 edges.
+
+The opaque graph product contains internal per-relation decisions. Its
+serializable receipt binds the catalog target/snapshot, closed-root digest,
+graph and decision digests, and aggregate counts only; it contains no relation,
+column, SQL, account, or database identity. This boundary still performs no
+caller-DML composition, provider request, public routing, admission, custody,
+mutation, deployment, or authorization. A later separately reviewed composer
+must bind an exact DML target and operation to this product before provider
+dispatch.
+
 ## Structured payload details for complex tools
 
 For `effect_assertion_id=schema_create_objects_additive_seed_rows_v1` or its

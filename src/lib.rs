@@ -20,6 +20,8 @@ pub(crate) mod d1_migration_reconciliation;
 pub(crate) mod d1_migration_seed_rows;
 pub(crate) mod d1_migration_terminal;
 pub(crate) mod d1_migration_terminal_semantics;
+#[allow(dead_code)] // staged pure graph; DML composition is a later authority boundary
+pub(crate) mod d1_reserved_relation_graph;
 pub(crate) mod d1_target;
 pub mod dns_route;
 pub mod mutation;

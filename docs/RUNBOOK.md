@@ -977,6 +977,39 @@ independence/EOF, execution, custody, provider admission, DML composition,
 mutation, deployment, and public routing must not infer authority from the
 catalog receipt or projection alone.
 
+The internal reserved-relation graph stage accepts only the opaque version-3
+product, never caller JSON or a generic D1 response. Supply one non-empty set of
+at most 64 configured reserved relation identities. They must be printable
+ASCII, distinct under SQLite ASCII case folding, outside the automatic
+`sqlite_`/`_cf_` families, and physically present as verified relations. The
+stage adds every present automatic-family relation as a root. Missing roots and
+all schema/foreign-key blocker facts are terminal unavailable evidence; do not
+drop blocker rows and retry graph derivation.
+
+The stage creates INSERT, UPDATE, and DELETE nodes only for verified table/view
+relations. Valid index facts are linked and counted as non-addressable schema
+auxiliaries. FK CASCADE, SET NULL, and SET DEFAULT create only their documented
+operation-specific child-write edges; RESTRICT and NO ACTION create none.
+Composite constraints contribute one edge group after the projection's exact
+sequence/cardinality proof. The only SQL-byte classification is a conservative
+case-insensitive search for `AUTOINCREMENT` within a 64-KiB table source. Any
+match requires `sqlite_sequence` and adds table-insert to sequence-update; the
+classifier intentionally prefers a false-positive denial over parsing DDL.
+
+Do not parse trigger or view SQL to reopen a decision. All operations on a view
+deny. All operations on, or FK paths reaching, a relation that owns any trigger
+deny. Paths reaching a reserved root deny with higher precedence. Cycle-safe
+traversal is limited to 1,000 relations, 3,000 nodes, and 4,096 edges. Any
+unknown/malformed fact, missing relation/owner, unavailable table SQL token
+source, unsupported action, or cap breach denies the complete product.
+
+The success receipt is aggregate-safe: target/catalog/root/graph/decision
+digests and counts only. It exposes no names, columns, SQL, account, or database
+identity. This staged module has no public tool, provider call, DML composition,
+admission, mutation, deployment, or live effect. Do not treat a graph receipt as
+write authority; later composition must bind an exact classified DML operation
+and relation to the opaque graph product.
+
 ## Safety Profiles
 
 ### Read-Only
