@@ -390,11 +390,8 @@ mod tests {
     use crate::d1_target::normalize_d1_target;
 
     fn fixture() -> (D1TargetIdentity, D1DmlIdentityClaimantSet) {
-        let target = normalize_d1_target(
-            "0123456789abcdef0123456789abcdef",
-            "123e4567-e89b-42d3-a456-426614174000",
-        )
-        .expect("target");
+        let target =
+            normalize_d1_target("acct-1", "123e4567-e89b-42d3-a456-426614174000").expect("target");
         let set = derive_d1_dml_identity_claimant_set(
             &target,
             &"a".repeat(64),
