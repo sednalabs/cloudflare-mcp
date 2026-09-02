@@ -10,7 +10,7 @@ pub(crate) const D1_DML_CUSTODY_LAYOUT_NAME: &str = "dml-custody-v1";
 pub(crate) const D1_DML_CUSTODY_LAYOUT_MARKER_NAME: &str = "layout.json";
 pub(crate) const D1_DML_CUSTODY_LAYOUT_VERSION: u8 = 1;
 pub(crate) const D1_DML_CUSTODY_LAYOUT_SHA256: &str =
-    "68da1f2248681d61a387f503b370a73ebc848b9c34bec6afd00b24a0bef36b48";
+    "68da1f2248681d61a387f503b370a73ebc848b9c34bec6afd00b24a0bef36b48"; // DevSkim: ignore DS173237 -- public layout specification digest, not a credential
 pub(crate) const D1_DML_CUSTODY_LEAF_ENTRY_LIMIT: usize = 4_096;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
