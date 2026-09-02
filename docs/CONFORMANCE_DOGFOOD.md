@@ -26,6 +26,7 @@ for operator workflows.
 | Resources | `resources::tests::openai_tool_search_config_uses_deferred_loading_and_safe_approval_default` and the stdio resource read smoke cover resource payloads through both direct and MCP paths. |
 | Elicitation gates | `config::tests::*elicitation*` and `server::tests::*elicitation*` cover mandatory dangerous-tool gates, dry-run bypass, and read-action bypasses. |
 | Error envelopes | Stdio smoke tests assert structured tool errors for invalid plans, denied mutations, D1 validation failures, and unsupported tool paths. |
+| Private artifact custody | `src/private_file_custody.rs` adapts `mcp-toolkit-private-artifact` while focused tests preserve the D1-specific non-empty and aggregate error-code contract. |
 | Mutation audit metadata | Stdio smoke tests for `api_mutate`, account API tokens, WAF apply, portal bridge, Workers upload, and R2/D1 operations assert dry-run plans, confirmation tokens, and correlation/audit fields. |
 | Schema snapshots | `tools::tests::tool_schema_snapshot_contract_is_stable` guards the committed tool schema contract. |
 | Release provenance | `scripts/generate-release-provenance.sh` and the Rust Validation workflow tie source commit, dirty state, binary hash, tool count, inventory hash, schema/catalog hashes, and pinned `mcp-toolkit-rs` revision. |

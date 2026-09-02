@@ -235,7 +235,10 @@ encode or otherwise repair a rejected identity.
 ### Private SQL artifact and upload boundary
 
 The reusable private-artifact boundary is intentionally lower-level than any D1
-import workflow. It opens a local SQL artifact through held Linux descriptors,
+import workflow. Generic descriptor-bound read custody comes from the pinned
+`mcp-toolkit-private-artifact` crate; the Cloudflare adapter retains the
+non-empty SQL and stable D1 error-code contract. It opens a local SQL artifact
+through held Linux descriptors,
 applies the migration custody root/ancestor/owner/mode/hardlink policy, including
 root-or-current-operator ownership for every external ancestor, hashes
 the exact stable descriptor bytes, and re-proves the descriptor-to-path binding
