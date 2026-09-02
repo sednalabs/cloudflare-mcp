@@ -951,10 +951,21 @@ origin or EOF outside the trusted HTTP adapter lifecycle. Errors remain
 content-free and omit request/provider bodies and private identities.
 
 This contract only establishes that two adapter-issued frames contain one
-stable canonical typed catalog projection. Schema meaning and write
-reachability belong to the separate graph-authority boundary. Physical read
-independence/EOF, execution, custody, provider admission, and public routing
-must not infer authority from the catalog receipt alone.
+stable canonical typed version-2 catalog projection. The fixed query obtains
+relation type/name and trigger ownership from `sqlite_schema`, and foreign-key
+child/parent/id/sequence/update/delete facts from the
+`pragma_foreign_key_list()` table-valued function. It retains SQL bytes only for
+table relations as a later AUTOINCREMENT token source. View SQL and trigger
+bodies are excluded. Unresolved parents or owners and structurally unproven
+view/trigger write semantics remain explicit conservative blockers.
+
+The internal opaque verifier product may be handed only to later pure
+consumers. Its aggregate-safe receipt counts fact families and blockers but
+contains no relation names or SQL. It is not a full CREATE TABLE parser, trigger
+parser, view interpreter, graph traversal, or authority decision. Physical read
+independence/EOF, execution, custody, provider admission, DML composition,
+mutation, deployment, and public routing must not infer authority from the
+catalog receipt or projection alone.
 
 ## Safety Profiles
 

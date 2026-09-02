@@ -1,15 +1,19 @@
-//! Side-effect-free, exact D1 catalog observation evidence.
+//! Side-effect-free, exact D1 structured catalog projection evidence.
 //!
 //! This module owns one immutable catalog query/projection and verifies that two
 //! adapter-issued frames claim distinct, primary-served, complete observations
 //! whose canonical typed projections describe one stable snapshot for one
-//! canonical D1 target. It cannot authenticate provider dispatch or response
-//! EOF; that custody belongs to the internal provider adapter that constructs
-//! the frames. It deliberately does not interpret DDL, triggers, foreign keys, or a
-//! write graph, and it has no provider client, public tool route, custody, or
-//! mutation capability.
+//! canonical D1 target. The fixed projection uses SQLite metadata for relation,
+//! trigger-owner, and foreign-key facts. It retains table SQL bytes only as a
+//! later AUTOINCREMENT token source and emits explicit conservative blockers
+//! where structured metadata cannot prove later write semantics. It cannot
+//! authenticate provider dispatch or response EOF; that custody belongs to the
+//! internal provider adapter that constructs the frames. It deliberately does
+//! not parse schema SQL, trigger bodies, or views and does not build or traverse
+//! a write graph. It has no provider client, public tool route, or mutation
+//! capability.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -21,17 +25,49 @@ pub(crate) const D1_CATALOG_MAX_ROWS: usize = 1_000;
 pub(crate) const D1_CATALOG_PROVIDER_ROW_CAP: usize = D1_CATALOG_MAX_ROWS + 1;
 pub(crate) const D1_CATALOG_PROVIDER_BYTE_CAP: usize = 4 * 1024 * 1024;
 
-const D1_CATALOG_PROJECTION_VERSION: u8 = 1;
-const D1_CATALOG_EVIDENCE_VERSION: u8 = 1;
-const D1_CATALOG_QUERY: &str = "SELECT type AS object_type, \
-hex(CAST(name AS BLOB)) AS object_name_hex, \
-hex(CAST(tbl_name AS BLOB)) AS parent_name_hex, \
-CASE WHEN sql IS NULL THEN 1 ELSE 0 END AS definition_is_null, \
-CASE WHEN sql IS NULL THEN '' ELSE hex(CAST(sql AS BLOB)) END AS definition_hex \
-FROM sqlite_schema \
-WHERE type IN ('table', 'view', 'trigger') \
-ORDER BY type COLLATE BINARY, name COLLATE BINARY, tbl_name COLLATE BINARY, sql COLLATE BINARY \
-LIMIT 1001";
+const D1_CATALOG_PROJECTION_VERSION: u8 = 2;
+const D1_CATALOG_EVIDENCE_VERSION: u8 = 2;
+const D1_CATALOG_QUERY: &str = "WITH \
+relation_facts AS (SELECT 'relation' AS fact_kind, type AS relation_type, \
+hex(CAST(name AS BLOB)) AS relation_name_hex, '' AS owner_name_hex, \
+'' AS parent_name_hex, -1 AS foreign_key_id, -1 AS foreign_key_seq, \
+'' AS on_update, '' AS on_delete, \
+CASE WHEN type = 'view' THEN 'view_write_semantics_unproven' \
+WHEN sql IS NULL THEN 'table_sql_token_source_unavailable' ELSE '' END AS conservative_blocker, \
+CASE WHEN type = 'table' AND sql IS NOT NULL THEN 0 ELSE 1 END AS table_sql_token_source_is_null, \
+CASE WHEN type = 'table' AND sql IS NOT NULL THEN hex(CAST(sql AS BLOB)) ELSE '' END AS table_sql_token_source_hex \
+FROM sqlite_schema WHERE type IN ('table', 'view')), \
+trigger_facts AS (SELECT 'trigger_owner' AS fact_kind, 'trigger' AS relation_type, \
+hex(CAST(name AS BLOB)) AS relation_name_hex, \
+CASE WHEN tbl_name IS NULL THEN '' ELSE hex(CAST(tbl_name AS BLOB)) END AS owner_name_hex, \
+'' AS parent_name_hex, -1 AS foreign_key_id, -1 AS foreign_key_seq, \
+'' AS on_update, '' AS on_delete, \
+CASE WHEN EXISTS (SELECT 1 FROM sqlite_schema AS owner \
+WHERE owner.type IN ('table', 'view') AND owner.name = trigger_row.tbl_name COLLATE NOCASE) \
+THEN 'trigger_effects_unproven' ELSE 'trigger_owner_unresolved' END AS conservative_blocker, \
+1 AS table_sql_token_source_is_null, '' AS table_sql_token_source_hex \
+FROM sqlite_schema AS trigger_row WHERE type = 'trigger'), \
+foreign_key_facts AS (SELECT 'foreign_key' AS fact_kind, 'table' AS relation_type, \
+hex(CAST(child.name AS BLOB)) AS relation_name_hex, '' AS owner_name_hex, \
+hex(CAST(fk.\"table\" AS BLOB)) AS parent_name_hex, \
+fk.id AS foreign_key_id, fk.seq AS foreign_key_seq, \
+fk.on_update AS on_update, fk.on_delete AS on_delete, \
+CASE WHEN EXISTS (SELECT 1 FROM sqlite_schema AS parent \
+WHERE parent.type = 'table' AND parent.name = fk.\"table\" COLLATE NOCASE) \
+THEN '' ELSE 'foreign_key_parent_unresolved' END AS conservative_blocker, \
+1 AS table_sql_token_source_is_null, '' AS table_sql_token_source_hex \
+FROM sqlite_schema AS child JOIN pragma_foreign_key_list(child.name) AS fk \
+WHERE child.type = 'table'), \
+facts AS (SELECT * FROM relation_facts UNION ALL SELECT * FROM trigger_facts \
+UNION ALL SELECT * FROM foreign_key_facts) \
+SELECT fact_kind, relation_type, relation_name_hex, owner_name_hex, parent_name_hex, \
+foreign_key_id, foreign_key_seq, on_update, on_delete, conservative_blocker, \
+table_sql_token_source_is_null, table_sql_token_source_hex FROM facts \
+ORDER BY fact_kind COLLATE BINARY, relation_type COLLATE BINARY, \
+relation_name_hex COLLATE BINARY, owner_name_hex COLLATE BINARY, \
+parent_name_hex COLLATE BINARY, foreign_key_id, foreign_key_seq, \
+on_update COLLATE BINARY, on_delete COLLATE BINARY, conservative_blocker COLLATE BINARY, \
+table_sql_token_source_is_null, table_sql_token_source_hex COLLATE BINARY LIMIT 1001";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct D1CatalogEvidencePlan {
@@ -41,7 +77,7 @@ pub(crate) struct D1CatalogEvidencePlan {
     pub(crate) database_id: String,
     pub(crate) target_key_sha256: String,
     pub(crate) projection_version: u8,
-    pub(crate) projection_fields: [&'static str; 5],
+    pub(crate) projection_fields: [&'static str; 12],
     pub(crate) query: &'static str,
     pub(crate) query_sha256: String,
     pub(crate) query_size_bytes: usize,
@@ -113,11 +149,33 @@ pub(crate) struct D1CatalogEvidenceReceipt {
     pub(crate) projection_version: u8,
     pub(crate) catalog_snapshot_sha256: String,
     pub(crate) catalog_row_count: usize,
+    pub(crate) relation_fact_count: usize,
+    pub(crate) trigger_owner_fact_count: usize,
+    pub(crate) foreign_key_fact_count: usize,
+    pub(crate) conservative_blocker_count: usize,
     pub(crate) observation_pair_sha256: String,
     pub(crate) stable_primary_observations: u8,
     pub(crate) provider_row_cap: usize,
     pub(crate) provider_byte_cap: usize,
     pub(crate) response_body_sizes: [usize; 2],
+}
+
+/// Opaque verifier-issued structured projection for later pure consumers.
+/// It cannot be created from caller JSON or a generic D1 response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct D1CatalogEvidenceProduct {
+    receipt: D1CatalogEvidenceReceipt,
+    rows: Vec<D1CatalogProjectionRow>,
+}
+
+impl D1CatalogEvidenceProduct {
+    pub(crate) fn receipt(&self) -> &D1CatalogEvidenceReceipt {
+        &self.receipt
+    }
+
+    pub(crate) fn rows(&self) -> &[D1CatalogProjectionRow] {
+        &self.rows
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -142,6 +200,7 @@ pub(crate) enum D1CatalogEvidenceClassification {
     CatalogRowLimitExceeded,
     CatalogRowMalformed,
     CatalogRowsNonCanonical,
+    CatalogFactsContradictory,
     CatalogSnapshotsUnstable,
 }
 
@@ -173,12 +232,19 @@ struct D1CatalogReadMetadata {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(deny_unknown_fields)]
-struct D1CatalogProjectionRow {
-    object_type: String,
-    object_name_hex: String,
-    parent_name_hex: String,
-    definition_is_null: u8,
-    definition_hex: String,
+pub(crate) struct D1CatalogProjectionRow {
+    pub(crate) fact_kind: String,
+    pub(crate) relation_type: String,
+    pub(crate) relation_name_hex: String,
+    pub(crate) owner_name_hex: String,
+    pub(crate) parent_name_hex: String,
+    pub(crate) foreign_key_id: i64,
+    pub(crate) foreign_key_seq: i64,
+    pub(crate) on_update: String,
+    pub(crate) on_delete: String,
+    pub(crate) conservative_blocker: String,
+    pub(crate) table_sql_token_source_is_null: u8,
+    pub(crate) table_sql_token_source_hex: String,
 }
 
 pub(crate) fn derive_d1_catalog_evidence_plan(
@@ -199,11 +265,18 @@ pub(crate) fn derive_d1_catalog_evidence_plan(
         target_key_sha256: target.target_key_sha256(),
         projection_version: D1_CATALOG_PROJECTION_VERSION,
         projection_fields: [
-            "object_type",
-            "object_name_hex",
+            "fact_kind",
+            "relation_type",
+            "relation_name_hex",
+            "owner_name_hex",
             "parent_name_hex",
-            "definition_is_null",
-            "definition_hex",
+            "foreign_key_id",
+            "foreign_key_seq",
+            "on_update",
+            "on_delete",
+            "conservative_blocker",
+            "table_sql_token_source_is_null",
+            "table_sql_token_source_hex",
         ],
         query: D1_CATALOG_QUERY,
         query_sha256: sha256_hex(D1_CATALOG_QUERY.as_bytes()),
@@ -223,6 +296,17 @@ pub(crate) fn prove_d1_catalog_evidence(
     first: &D1CatalogObservationFrame<'_>,
     second: &D1CatalogObservationFrame<'_>,
 ) -> Result<D1CatalogEvidenceReceipt, D1CatalogEvidenceError> {
+    prove_d1_catalog_product(target, supplied_plan, expected_plan_sha256, first, second)
+        .map(|product| product.receipt)
+}
+
+pub(crate) fn prove_d1_catalog_product(
+    target: &D1TargetIdentity,
+    supplied_plan: &D1CatalogEvidencePlan,
+    expected_plan_sha256: &str,
+    first: &D1CatalogObservationFrame<'_>,
+    second: &D1CatalogObservationFrame<'_>,
+) -> Result<D1CatalogEvidenceProduct, D1CatalogEvidenceError> {
     if !canonical_sha256(expected_plan_sha256) {
         return Err(evidence_error(
             D1CatalogEvidenceClassification::PlanDigestInvalid,
@@ -269,7 +353,27 @@ pub(crate) fn prove_d1_catalog_evidence(
         ));
     }
 
-    Ok(D1CatalogEvidenceReceipt {
+    let relation_fact_count = first_payload
+        .rows
+        .iter()
+        .filter(|row| row.fact_kind == "relation")
+        .count();
+    let trigger_owner_fact_count = first_payload
+        .rows
+        .iter()
+        .filter(|row| row.fact_kind == "trigger_owner")
+        .count();
+    let foreign_key_fact_count = first_payload
+        .rows
+        .iter()
+        .filter(|row| row.fact_kind == "foreign_key")
+        .count();
+    let conservative_blocker_count = first_payload
+        .rows
+        .iter()
+        .filter(|row| !row.conservative_blocker.is_empty())
+        .count();
+    let receipt = D1CatalogEvidenceReceipt {
         version: D1_CATALOG_EVIDENCE_VERSION,
         operation: D1_CATALOG_EVIDENCE_OPERATION,
         target_key_sha256: derived_plan.target_key_sha256,
@@ -278,11 +382,19 @@ pub(crate) fn prove_d1_catalog_evidence(
         projection_version: derived_plan.projection_version,
         catalog_snapshot_sha256: hash_serialized(&first_payload.rows),
         catalog_row_count: first_payload.rows.len(),
+        relation_fact_count,
+        trigger_owner_fact_count,
+        foreign_key_fact_count,
+        conservative_blocker_count,
         observation_pair_sha256: hash_serialized(&identities),
         stable_primary_observations: 2,
         provider_row_cap: derived_plan.provider_row_cap,
         provider_byte_cap: derived_plan.provider_byte_cap,
         response_body_sizes: [first.body_size_bytes, second.body_size_bytes],
+    };
+    Ok(D1CatalogEvidenceProduct {
+        receipt,
+        rows: first_payload.rows,
     })
 }
 
@@ -374,36 +486,187 @@ fn validate_observation(
 }
 
 fn validate_projection_rows(rows: &[D1CatalogProjectionRow]) -> Result<(), D1CatalogEvidenceError> {
-    let mut previous: Option<(&str, &str, &str, u8, &str)> = None;
+    let mut previous: Option<&D1CatalogProjectionRow> = None;
     for row in rows {
-        if !matches!(row.object_type.as_str(), "table" | "trigger" | "view")
-            || !canonical_upper_hex(&row.object_name_hex, false)
-            || !canonical_upper_hex(&row.parent_name_hex, false)
-            || !matches!(row.definition_is_null, 0 | 1)
-            || !canonical_upper_hex(&row.definition_hex, true)
-            || (row.definition_is_null == 1 && !row.definition_hex.is_empty())
+        if !canonical_upper_hex(&row.relation_name_hex, true)
+            || !canonical_upper_hex(&row.owner_name_hex, true)
+            || !canonical_upper_hex(&row.parent_name_hex, true)
+            || !matches!(row.table_sql_token_source_is_null, 0 | 1)
+            || !canonical_upper_hex(&row.table_sql_token_source_hex, true)
+            || !canonical_row_shape(row)
         {
             return Err(evidence_error(
                 D1CatalogEvidenceClassification::CatalogRowMalformed,
                 "catalog projection row was not canonical typed evidence",
             ));
         }
-        let current = (
-            row.object_type.as_str(),
-            row.object_name_hex.as_str(),
-            row.parent_name_hex.as_str(),
-            row.definition_is_null ^ 1,
-            row.definition_hex.as_str(),
-        );
-        if previous.is_some_and(|prior| prior >= current) {
+        if previous.is_some_and(|prior| prior >= row) {
             return Err(evidence_error(
                 D1CatalogEvidenceClassification::CatalogRowsNonCanonical,
                 "catalog projection rows were duplicate or outside exact query order",
             ));
         }
-        previous = Some(current);
+        previous = Some(row);
+    }
+    validate_structured_relationships(rows)
+}
+
+fn canonical_row_shape(row: &D1CatalogProjectionRow) -> bool {
+    match (row.fact_kind.as_str(), row.relation_type.as_str()) {
+        ("relation", "table") => {
+            row.owner_name_hex.is_empty()
+                && row.parent_name_hex.is_empty()
+                && row.foreign_key_id == -1
+                && row.foreign_key_seq == -1
+                && row.on_update.is_empty()
+                && row.on_delete.is_empty()
+                && ((row.table_sql_token_source_is_null == 0
+                    && row.conservative_blocker.is_empty())
+                    || (row.table_sql_token_source_is_null == 1
+                        && row.table_sql_token_source_hex.is_empty()
+                        && row.conservative_blocker == "table_sql_token_source_unavailable"))
+        }
+        ("relation", "view") => {
+            row.owner_name_hex.is_empty()
+                && row.parent_name_hex.is_empty()
+                && row.foreign_key_id == -1
+                && row.foreign_key_seq == -1
+                && row.on_update.is_empty()
+                && row.on_delete.is_empty()
+                && row.conservative_blocker == "view_write_semantics_unproven"
+                && row.table_sql_token_source_is_null == 1
+                && row.table_sql_token_source_hex.is_empty()
+        }
+        ("trigger_owner", "trigger") => {
+            row.parent_name_hex.is_empty()
+                && row.foreign_key_id == -1
+                && row.foreign_key_seq == -1
+                && row.on_update.is_empty()
+                && row.on_delete.is_empty()
+                && matches!(
+                    row.conservative_blocker.as_str(),
+                    "trigger_effects_unproven" | "trigger_owner_unresolved"
+                )
+                && row.table_sql_token_source_is_null == 1
+                && row.table_sql_token_source_hex.is_empty()
+        }
+        ("foreign_key", "table") => {
+            row.owner_name_hex.is_empty()
+                && row.foreign_key_id >= 0
+                && row.foreign_key_seq >= 0
+                && canonical_foreign_key_action(&row.on_update)
+                && canonical_foreign_key_action(&row.on_delete)
+                && matches!(
+                    row.conservative_blocker.as_str(),
+                    "" | "foreign_key_parent_unresolved"
+                )
+                && row.table_sql_token_source_is_null == 1
+                && row.table_sql_token_source_hex.is_empty()
+        }
+        _ => false,
+    }
+}
+
+fn canonical_foreign_key_action(value: &str) -> bool {
+    matches!(
+        value,
+        "NO ACTION" | "RESTRICT" | "SET NULL" | "SET DEFAULT" | "CASCADE"
+    )
+}
+
+fn validate_structured_relationships(
+    rows: &[D1CatalogProjectionRow],
+) -> Result<(), D1CatalogEvidenceError> {
+    let mut relations = BTreeMap::new();
+    let mut triggers = BTreeSet::new();
+    for row in rows.iter().filter(|row| row.fact_kind == "relation") {
+        let identity = sqlite_ascii_identity(&row.relation_name_hex)?;
+        if relations
+            .insert(identity, row.relation_type.as_str())
+            .is_some()
+        {
+            return Err(contradictory_facts());
+        }
+    }
+    for row in rows.iter().filter(|row| row.fact_kind == "trigger_owner") {
+        let trigger = sqlite_ascii_identity(&row.relation_name_hex)?;
+        if !triggers.insert(trigger) {
+            return Err(contradictory_facts());
+        }
+        let owner = sqlite_ascii_identity(&row.owner_name_hex)?;
+        let owner_present = relations.contains_key(&owner);
+        if owner_present != (row.conservative_blocker == "trigger_effects_unproven") {
+            return Err(contradictory_facts());
+        }
+    }
+
+    let mut foreign_keys: BTreeMap<
+        (Vec<u8>, i64),
+        (Vec<u8>, String, String, String, BTreeSet<i64>),
+    > = BTreeMap::new();
+    for row in rows.iter().filter(|row| row.fact_kind == "foreign_key") {
+        let child = sqlite_ascii_identity(&row.relation_name_hex)?;
+        if relations.get(&child) != Some(&"table") {
+            return Err(contradictory_facts());
+        }
+        let parent = sqlite_ascii_identity(&row.parent_name_hex)?;
+        let parent_present = relations.get(&parent) == Some(&"table");
+        if parent_present != row.conservative_blocker.is_empty() {
+            return Err(contradictory_facts());
+        }
+        let entry = foreign_keys
+            .entry((child, row.foreign_key_id))
+            .or_insert_with(|| {
+                (
+                    parent.clone(),
+                    row.on_update.clone(),
+                    row.on_delete.clone(),
+                    row.conservative_blocker.clone(),
+                    BTreeSet::new(),
+                )
+            });
+        if entry.0 != parent
+            || entry.1 != row.on_update
+            || entry.2 != row.on_delete
+            || entry.3 != row.conservative_blocker
+            || !entry.4.insert(row.foreign_key_seq)
+        {
+            return Err(contradictory_facts());
+        }
+    }
+    for (_, _, _, _, sequences) in foreign_keys.values() {
+        if sequences.iter().copied().ne(0..sequences.len() as i64) {
+            return Err(contradictory_facts());
+        }
     }
     Ok(())
+}
+
+fn sqlite_ascii_identity(value: &str) -> Result<Vec<u8>, D1CatalogEvidenceError> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let high = hex_nibble(pair[0]).ok_or_else(contradictory_facts)?;
+        let low = hex_nibble(pair[1]).ok_or_else(contradictory_facts)?;
+        let byte = (high << 4) | low;
+        decoded.push(byte.to_ascii_lowercase());
+    }
+    Ok(decoded)
+}
+
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn contradictory_facts() -> D1CatalogEvidenceError {
+    evidence_error(
+        D1CatalogEvidenceClassification::CatalogFactsContradictory,
+        "structured catalog facts contradicted their relation or constraint identities",
+    )
 }
 
 fn validate_body_size(
@@ -488,11 +751,77 @@ mod tests {
 
     fn row(name: &str, definition: Option<&str>) -> Value {
         json!({
-            "object_type": "table",
-            "object_name_hex": hex(name),
-            "parent_name_hex": hex(name),
-            "definition_is_null": u8::from(definition.is_none()),
-            "definition_hex": definition.map(hex).unwrap_or_default(),
+            "fact_kind": "relation",
+            "relation_type": "table",
+            "relation_name_hex": hex(name),
+            "owner_name_hex": "",
+            "parent_name_hex": "",
+            "foreign_key_id": -1,
+            "foreign_key_seq": -1,
+            "on_update": "",
+            "on_delete": "",
+            "conservative_blocker": if definition.is_some() { "" } else { "table_sql_token_source_unavailable" },
+            "table_sql_token_source_is_null": u8::from(definition.is_none()),
+            "table_sql_token_source_hex": definition.map(hex).unwrap_or_default(),
+        })
+    }
+
+    fn view(name: &str) -> Value {
+        json!({
+            "fact_kind": "relation",
+            "relation_type": "view",
+            "relation_name_hex": hex(name),
+            "owner_name_hex": "",
+            "parent_name_hex": "",
+            "foreign_key_id": -1,
+            "foreign_key_seq": -1,
+            "on_update": "",
+            "on_delete": "",
+            "conservative_blocker": "view_write_semantics_unproven",
+            "table_sql_token_source_is_null": 1,
+            "table_sql_token_source_hex": "",
+        })
+    }
+
+    fn trigger(name: &str, owner: &str, owner_resolved: bool) -> Value {
+        json!({
+            "fact_kind": "trigger_owner",
+            "relation_type": "trigger",
+            "relation_name_hex": hex(name),
+            "owner_name_hex": hex(owner),
+            "parent_name_hex": "",
+            "foreign_key_id": -1,
+            "foreign_key_seq": -1,
+            "on_update": "",
+            "on_delete": "",
+            "conservative_blocker": if owner_resolved { "trigger_effects_unproven" } else { "trigger_owner_unresolved" },
+            "table_sql_token_source_is_null": 1,
+            "table_sql_token_source_hex": "",
+        })
+    }
+
+    fn foreign_key(
+        child: &str,
+        parent: &str,
+        id: i64,
+        seq: i64,
+        on_update: &str,
+        on_delete: &str,
+        parent_resolved: bool,
+    ) -> Value {
+        json!({
+            "fact_kind": "foreign_key",
+            "relation_type": "table",
+            "relation_name_hex": hex(child),
+            "owner_name_hex": "",
+            "parent_name_hex": hex(parent),
+            "foreign_key_id": id,
+            "foreign_key_seq": seq,
+            "on_update": on_update,
+            "on_delete": on_delete,
+            "conservative_blocker": if parent_resolved { "" } else { "foreign_key_parent_unresolved" },
+            "table_sql_token_source_is_null": 1,
+            "table_sql_token_source_hex": "",
         })
     }
 
@@ -506,7 +835,7 @@ mod tests {
 
     fn payload(rows: Vec<Value>) -> Vec<u8> {
         serde_json::to_vec(&json!({
-            "version": 1,
+            "version": 2,
             "results_truncated": false,
             "meta": {
                 "query_succeeded": true,
@@ -564,7 +893,25 @@ mod tests {
     fn plan_is_exact_fixed_projection_for_one_canonical_target() {
         let target = target();
         let (plan, plan_sha256) = derive_d1_catalog_evidence_plan(&target).expect("plan");
-        assert_eq!(plan.version, 1);
+        assert_eq!(plan.version, 2);
+        assert_eq!(plan.projection_version, 2);
+        assert_eq!(
+            plan.projection_fields,
+            [
+                "fact_kind",
+                "relation_type",
+                "relation_name_hex",
+                "owner_name_hex",
+                "parent_name_hex",
+                "foreign_key_id",
+                "foreign_key_seq",
+                "on_update",
+                "on_delete",
+                "conservative_blocker",
+                "table_sql_token_source_is_null",
+                "table_sql_token_source_hex",
+            ]
+        );
         assert_eq!(plan.target_key_sha256, target.target_key_sha256());
         assert_eq!(plan.query, D1_CATALOG_QUERY);
         assert_eq!(plan.query_sha256, sha256_hex(D1_CATALOG_QUERY.as_bytes()));
@@ -634,6 +981,10 @@ mod tests {
         );
         let receipt = prove(&plan, &plan_sha256, &first, &second).expect("stable evidence");
         assert_eq!(receipt.catalog_row_count, 1);
+        assert_eq!(receipt.relation_fact_count, 1);
+        assert_eq!(receipt.trigger_owner_fact_count, 0);
+        assert_eq!(receipt.foreign_key_fact_count, 0);
+        assert_eq!(receipt.conservative_blocker_count, 0);
         assert_eq!(receipt.stable_primary_observations, 2);
         assert_eq!(receipt.response_body_sizes, [body.len(), body.len()]);
         let encoded = serde_json::to_string(&receipt).expect("receipt");
@@ -765,10 +1116,10 @@ mod tests {
         for body in [
             br#"{}"#.to_vec(),
             br#"[]"#.to_vec(),
-            br#"{"version":1,"meta":{"query_succeeded":true,"served_by_primary":true,"changed_db":false,"changes":0,"rows_written":0},"rows":[]}"#.to_vec(),
-            br#"{"version":1,"results_truncated":"false","meta":{"query_succeeded":true,"served_by_primary":true,"changed_db":false,"changes":0,"rows_written":0},"rows":[]}"#.to_vec(),
-            br#"{"version":1,"results_truncated":false,"results_truncated":false,"meta":{"query_succeeded":true,"served_by_primary":true,"changed_db":false,"changes":0,"rows_written":0},"rows":[]}"#.to_vec(),
-            br#"{"version":1,"results_truncated":false,"meta":{"query_succeeded":true,"served_by_primary":true,"changed_db":false,"changes":0,"rows_written":0},"rows":[],"arbitrary":true}"#.to_vec(),
+            br#"{"version":2,"meta":{"query_succeeded":true,"served_by_primary":true,"changed_db":false,"changes":0,"rows_written":0},"rows":[]}"#.to_vec(),
+            br#"{"version":2,"results_truncated":"false","meta":{"query_succeeded":true,"served_by_primary":true,"changed_db":false,"changes":0,"rows_written":0},"rows":[]}"#.to_vec(),
+            br#"{"version":2,"results_truncated":false,"results_truncated":false,"meta":{"query_succeeded":true,"served_by_primary":true,"changed_db":false,"changes":0,"rows_written":0},"rows":[]}"#.to_vec(),
+            br#"{"version":2,"results_truncated":false,"meta":{"query_succeeded":true,"served_by_primary":true,"changed_db":false,"changes":0,"rows_written":0},"rows":[],"arbitrary":true}"#.to_vec(),
         ] {
             let second = frame(
                 &target,
@@ -873,6 +1224,163 @@ mod tests {
     }
 
     #[test]
+    fn structured_relation_trigger_and_foreign_key_facts_are_exact_and_aggregate_safe() {
+        let target = target();
+        let (plan, plan_sha256) = derive_d1_catalog_evidence_plan(&target).expect("plan");
+        let body = payload(vec![
+            foreign_key("child", "parent", 0, 0, "SET NULL", "CASCADE", true),
+            row(
+                "child",
+                Some("CREATE TABLE child(parent_id REFERENCES parent(id))"),
+            ),
+            row(
+                "parent",
+                Some("CREATE TABLE parent(id INTEGER PRIMARY KEY)"),
+            ),
+            view("parent_view"),
+            trigger("child_after_insert", "child", true),
+        ]);
+        let first = frame(
+            &target,
+            &plan_sha256,
+            "dispatch-first-0001",
+            "read-first-00000001",
+            &body,
+        );
+        let second = frame(
+            &target,
+            &plan_sha256,
+            "dispatch-second-001",
+            "read-second-0000001",
+            &body,
+        );
+        let product = prove_d1_catalog_product(&target, &plan, &plan_sha256, &first, &second)
+            .expect("structured product");
+        assert_eq!(product.rows().len(), 5);
+        assert_eq!(product.receipt().relation_fact_count, 3);
+        assert_eq!(product.receipt().trigger_owner_fact_count, 1);
+        assert_eq!(product.receipt().foreign_key_fact_count, 1);
+        assert_eq!(product.receipt().conservative_blocker_count, 2);
+        let encoded = serde_json::to_string(product.receipt()).expect("receipt");
+        for private_value in ["child", "parent", "CASCADE", "CREATE TABLE"] {
+            assert!(!encoded.contains(private_value));
+        }
+    }
+
+    #[test]
+    fn empty_sqlite_identifiers_remain_exact_structured_facts() {
+        let target = target();
+        let (plan, plan_sha256) = derive_d1_catalog_evidence_plan(&target).expect("plan");
+        let body = payload(vec![
+            row("", Some("CREATE TABLE \"\"(id INTEGER)")),
+            trigger("", "", true),
+        ]);
+        let first = frame(
+            &target,
+            &plan_sha256,
+            "dispatch-first-0001",
+            "read-first-00000001",
+            &body,
+        );
+        let second = frame(
+            &target,
+            &plan_sha256,
+            "dispatch-second-001",
+            "read-second-0000001",
+            &body,
+        );
+        let product = prove_d1_catalog_product(&target, &plan, &plan_sha256, &first, &second)
+            .expect("empty identifiers remain exact");
+        assert_eq!(product.rows().len(), 2);
+        assert_eq!(product.rows()[0].relation_name_hex, "");
+        assert_eq!(product.rows()[1].owner_name_hex, "");
+        assert_eq!(product.receipt().conservative_blocker_count, 1);
+    }
+
+    #[test]
+    fn unresolved_structured_facts_require_exact_conservative_blockers() {
+        let target = target();
+        let (plan, plan_sha256) = derive_d1_catalog_evidence_plan(&target).expect("plan");
+        let unresolved = payload(vec![
+            foreign_key("child", "missing", 0, 0, "NO ACTION", "CASCADE", false),
+            row(
+                "child",
+                Some("CREATE TABLE child(parent_id REFERENCES missing(id))"),
+            ),
+            row("opaque", None),
+            trigger("orphaned", "missing", false),
+        ]);
+        let first = frame(
+            &target,
+            &plan_sha256,
+            "dispatch-first-0001",
+            "read-first-00000001",
+            &unresolved,
+        );
+        let second = frame(
+            &target,
+            &plan_sha256,
+            "dispatch-second-001",
+            "read-second-0000001",
+            &unresolved,
+        );
+        let receipt = prove(&plan, &plan_sha256, &first, &second).expect("blocked facts");
+        assert_eq!(receipt.conservative_blocker_count, 3);
+
+        let contradictory = payload(vec![
+            foreign_key("child", "missing", 0, 0, "NO ACTION", "CASCADE", true),
+            row(
+                "child",
+                Some("CREATE TABLE child(parent_id REFERENCES missing(id))"),
+            ),
+        ]);
+        let contradictory_frame = frame(
+            &target,
+            &plan_sha256,
+            "dispatch-second-001",
+            "read-second-0000001",
+            &contradictory,
+        );
+        assert_eq!(
+            classification(
+                &plan,
+                &plan_sha256,
+                &contradictory_frame,
+                &contradictory_frame
+            ),
+            D1CatalogEvidenceClassification::CatalogFactsContradictory
+        );
+
+        let sequence_gap = payload(vec![
+            foreign_key("child", "parent", 0, 1, "NO ACTION", "CASCADE", true),
+            row(
+                "child",
+                Some("CREATE TABLE child(parent_id REFERENCES parent(id))"),
+            ),
+            row(
+                "parent",
+                Some("CREATE TABLE parent(id INTEGER PRIMARY KEY)"),
+            ),
+        ]);
+        let sequence_gap_frame = frame(
+            &target,
+            &plan_sha256,
+            "dispatch-second-001",
+            "read-second-0000001",
+            &sequence_gap,
+        );
+        assert_eq!(
+            classification(
+                &plan,
+                &plan_sha256,
+                &sequence_gap_frame,
+                &sequence_gap_frame
+            ),
+            D1CatalogEvidenceClassification::CatalogFactsContradictory
+        );
+    }
+
+    #[test]
     fn row_sentinel_projection_shape_order_and_stability_fail_closed() {
         let target = target();
         let (plan, plan_sha256) = derive_d1_catalog_evidence_plan(&target).expect("plan");
@@ -917,11 +1425,18 @@ mod tests {
         );
 
         let malformed = payload(vec![json!({
-            "object_type": "table",
-            "object_name_hex": "lowercase",
-            "parent_name_hex": "AA",
-            "definition_is_null": 1,
-            "definition_hex": "AA",
+            "fact_kind": "relation",
+            "relation_type": "table",
+            "relation_name_hex": "lowercase",
+            "owner_name_hex": "",
+            "parent_name_hex": "",
+            "foreign_key_id": -1,
+            "foreign_key_seq": -1,
+            "on_update": "",
+            "on_delete": "",
+            "conservative_blocker": "",
+            "table_sql_token_source_is_null": 1,
+            "table_sql_token_source_hex": "AA",
         })]);
         let malformed_frame = frame(
             &target,
