@@ -92,10 +92,15 @@ override it.
 Dry-run the exact target, SQL bytes, parameters, row cap, and three
 pairwise-distinct opaque operation/attempt/provider-request identities. The dry
 run performs two read-only primary catalog observations and returns the exact
-composition digest. A live call must repeat every byte and identity and supply
-that digest. It recomputes catalog/graph/composition authority under the shared
-target guard, then durably installs one Prepared -> DispatchReserved
-compare-and-exchange before the only DML provider request.
+composition digest; its mutation plan contains no local or provider side-effect
+step. A live call must repeat every byte and identity and supply that digest. It
+recomputes catalog/graph/composition authority under the shared target guard,
+then durably installs one create-once Prepared state and one DispatchReserved
+compare-and-exchange before the only DML provider request. The live mutation
+plan marks both custody writes and provider submission as side effects. Audit
+outcome is closed to `planned`, `error`, or `reconciliation_required`; a
+provider acknowledgement or response-loss ambiguity remains
+`reconciliation_required`, not terminal success.
 The pre-provider classifier uses a capped lexical token stream. An UPSERT must
 contain one balanced top-level `ON CONFLICT ... DO UPDATE SET` action; tabs,
 newlines, repeated ASCII whitespace, and keyword case are equivalent. String

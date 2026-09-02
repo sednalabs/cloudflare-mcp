@@ -4440,13 +4440,18 @@ impl CloudflareMcp {
                         "Provide the exact Cloudflare account_id or configure CLOUDFLARE_MCP_DEFAULT_ACCOUNT_ID.",
                     ),
                     audit,
+                    args.dry_run,
                 ));
             }
         };
         let target = match normalize_d1_target(resolved_account_id, &args.database_id) {
             Ok(target) => target,
             Err(result) => {
-                return Ok(finalize_d1_execute_write_zero_call_denial(result, audit));
+                return Ok(finalize_d1_execute_write_zero_call_denial(
+                    result,
+                    audit,
+                    args.dry_run,
+                ));
             }
         };
         audit.set_target(json!({"target_key_sha256": target.target_key_sha256()}));

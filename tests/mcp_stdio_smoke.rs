@@ -18179,6 +18179,54 @@ fn d1_delete_database_requires_token_and_deletes_through_stdio_boundary() {
     fs::remove_dir_all(lease_root).expect("target guard cleanup");
 }
 
+fn expected_d1_execute_write_mutation_plan(dry_run: bool) -> Value {
+    let mut steps = vec![
+        json!({"ordinal": 1, "action": "collect_stable_catalog", "side_effect": false, "target": {"observations": 2}}),
+        json!({"ordinal": 2, "action": "compose_reserved_relation_authority", "side_effect": false, "target": {}}),
+    ];
+    if !dry_run {
+        steps.extend([
+            json!({"ordinal": 3, "action": "install_prepared_attempt_custody", "side_effect": true, "target": {"create_once": true, "phase": "Prepared"}}),
+            json!({"ordinal": 4, "action": "install_dispatch_reservation", "side_effect": true, "target": {"atomic_compare_exchange": true, "phase": "DispatchReserved"}}),
+            json!({"ordinal": 5, "action": "submit_one_d1_dml_request", "side_effect": true, "target": {"maximum_provider_mutations": 1}}),
+        ]);
+    }
+    json!({"operation": "d1_execute_write", "steps": steps})
+}
+
+fn assert_d1_execute_write_audit(
+    content: &Value,
+    dry_run: bool,
+    outcome: &str,
+    error_code: Option<&str>,
+    target: Value,
+) {
+    let mut actual = content["audit"].clone();
+    actual["correlation"]["correlation_id"] = json!("<dynamic>");
+    actual["started_at_unix_ms"] = json!(0);
+    actual["completed_at_unix_ms"] = json!(0);
+    assert_eq!(
+        actual,
+        json!({
+            "correlation": {
+                "correlation_id": "<dynamic>",
+                "request_id": null,
+                "session_id": null,
+            },
+            "actor": "unknown",
+            "action": "d1_execute_write",
+            "target": target,
+            "started_at_unix_ms": 0,
+            "completed_at_unix_ms": 0,
+            "dry_run": dry_run,
+            "outcome": outcome,
+            "error_code": error_code,
+            "approval": null,
+        }),
+        "whole audit payload drifted: {content}"
+    );
+}
+
 #[test]
 fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
     #[cfg(unix)]
@@ -18220,6 +18268,15 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
     assert_tool_text_matches_structured(&dry_response);
     let dry = structured_content(&dry_response);
     assert_eq!(dry["ok"], json!(true), "{dry}");
+    let audit_target = json!({
+        "target_key_sha256": sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000")
+    });
+    assert_eq!(
+        dry["evidence"]["mutation_plan"],
+        expected_d1_execute_write_mutation_plan(true),
+        "{dry}"
+    );
+    assert_d1_execute_write_audit(dry, true, "planned", None, audit_target.clone());
     let approved = dry["approved_composition_sha256_required"]
         .as_str()
         .expect("composition approval")
@@ -18256,6 +18313,18 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
     assert_eq!(content["provider_mutations"], json!(1));
     assert_eq!(content["outcome"]["zero_change"], json!(false));
     assert_eq!(content["automatic_retry_permitted"], json!(false));
+    assert_eq!(
+        content["evidence"]["mutation_plan"],
+        expected_d1_execute_write_mutation_plan(false),
+        "{content}"
+    );
+    assert_d1_execute_write_audit(
+        content,
+        false,
+        "reconciliation_required",
+        None,
+        audit_target.clone(),
+    );
     let rendered = content.to_string();
     for private_value in [
         "acct-1",
@@ -18293,6 +18362,12 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
     assert_tool_text_matches_structured(&zero_dry_response);
     let zero_dry = structured_content(&zero_dry_response);
     assert_eq!(zero_dry["ok"], json!(true), "{zero_dry}");
+    assert_eq!(
+        zero_dry["evidence"]["mutation_plan"],
+        expected_d1_execute_write_mutation_plan(true),
+        "{zero_dry}"
+    );
+    assert_d1_execute_write_audit(zero_dry, true, "planned", None, audit_target.clone());
     let zero_approved = zero_dry["approved_composition_sha256_required"]
         .as_str()
         .expect("zero-change composition approval")
@@ -18309,6 +18384,12 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
     assert_eq!(zero["provider_calls"], json!(3));
     assert_eq!(zero["provider_mutations"], json!(1));
     assert_eq!(zero["automatic_retry_permitted"], json!(false));
+    assert_eq!(
+        zero["evidence"]["mutation_plan"],
+        expected_d1_execute_write_mutation_plan(false),
+        "{zero}"
+    );
+    assert_d1_execute_write_audit(zero, false, "reconciliation_required", None, audit_target);
 
     let requests = requests.lock().expect("request log lock");
     assert_eq!(requests.len(), 12);
@@ -18385,6 +18466,15 @@ fn d1_execute_write_response_loss_reports_the_completed_mutation_attempt() {
     assert_eq!(dry["ok"], json!(true), "{dry}");
     assert_eq!(dry["provider_calls"], json!(2), "{dry}");
     assert_eq!(dry["provider_mutations"], json!(0), "{dry}");
+    let audit_target = json!({
+        "target_key_sha256": sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000")
+    });
+    assert_eq!(
+        dry["evidence"]["mutation_plan"],
+        expected_d1_execute_write_mutation_plan(true),
+        "{dry}"
+    );
+    assert_d1_execute_write_audit(dry, true, "planned", None, audit_target.clone());
 
     let mut live_args = exact_args;
     live_args["dry_run"] = json!(false);
@@ -18401,6 +18491,18 @@ fn d1_execute_write_response_loss_reports_the_completed_mutation_attempt() {
         json!("attempted")
     );
     assert_eq!(lost["automatic_retry_permitted"], json!(false));
+    assert_eq!(
+        lost["evidence"]["mutation_plan"],
+        expected_d1_execute_write_mutation_plan(false),
+        "{lost}"
+    );
+    assert_d1_execute_write_audit(
+        lost,
+        false,
+        "reconciliation_required",
+        Some("cloudflare.transport_error"),
+        audit_target,
+    );
 
     let requests = requests.lock().expect("response-loss request log lock");
     assert_eq!(requests.len(), 5);
@@ -18599,6 +18701,22 @@ fn d1_execute_write_preflight_schema_audit_and_zero_call_envelope_are_total() {
             json!(expected_code),
             "{label}"
         );
+        if label == "exclamation operation identity" {
+            assert_eq!(
+                content["mutation_plan"],
+                expected_d1_execute_write_mutation_plan(true),
+                "{content}"
+            );
+            assert_d1_execute_write_audit(
+                content,
+                true,
+                "error",
+                Some(expected_code),
+                json!({
+                    "target_key_sha256": sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000")
+                }),
+            );
+        }
         assert_tool_text_matches_structured(&response);
         assert!(
             matches!(provider.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
@@ -18625,6 +18743,11 @@ fn d1_execute_write_preflight_schema_audit_and_zero_call_envelope_are_total() {
     );
     assert!(
         guard_content["mutation_plan"].is_object(),
+        "{guard_content}"
+    );
+    assert_eq!(
+        guard_content["mutation_plan"],
+        expected_d1_execute_write_mutation_plan(false),
         "{guard_content}"
     );
     assert_eq!(guard_content["evidence"], Value::Null);

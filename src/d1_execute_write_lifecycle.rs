@@ -31,6 +31,52 @@ use crate::mutation::{MutationAuditSession, MutationPlan, emit_mutation_audit_lo
 
 pub(crate) const D1_RESERVED_RELATIONS_ENV: &str = "CLOUDFLARE_MCP_D1_RESERVED_RELATIONS";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum D1ExecuteWriteLifecycleStatus {
+    Planned,
+    Blocked,
+    ReconciliationRequired,
+    ProviderAcknowledgedReconciliationRequired,
+}
+
+impl D1ExecuteWriteLifecycleStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Blocked => "blocked",
+            Self::ReconciliationRequired => "reconciliation_required",
+            Self::ProviderAcknowledgedReconciliationRequired => {
+                "provider_acknowledged_reconciliation_required"
+            }
+        }
+    }
+
+    fn from_payload(payload: Option<&Value>) -> Option<Self> {
+        match payload
+            .and_then(|value| value.get("status"))
+            .and_then(Value::as_str)
+        {
+            Some("planned") => Some(Self::Planned),
+            Some("blocked") => Some(Self::Blocked),
+            Some("reconciliation_required") => Some(Self::ReconciliationRequired),
+            Some("provider_acknowledged_reconciliation_required") => {
+                Some(Self::ProviderAcknowledgedReconciliationRequired)
+            }
+            _ => None,
+        }
+    }
+
+    fn audit_outcome(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Blocked => "error",
+            Self::ReconciliationRequired | Self::ProviderAcknowledgedReconciliationRequired => {
+                "reconciliation_required"
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct D1ProviderAccounting {
     completed_calls: usize,
@@ -81,15 +127,17 @@ pub(crate) async fn execute_d1_write_lifecycle(
     input: D1ExecuteWriteLifecycleInput<'_>,
     audit: MutationAuditSession,
 ) -> CallToolResult {
-    let mutation_plan = d1_execute_write_mutation_plan();
+    let dry_run = input.dry_run;
+    let mutation_plan = d1_execute_write_mutation_plan(dry_run);
     let mut result = execute_inner(client, target, input, &mutation_plan).await;
-    finalize_d1_execute_write_result(&mut result, audit);
+    finalize_d1_execute_write_result(&mut result, audit, dry_run);
     result
 }
 
 pub(crate) fn finalize_d1_execute_write_zero_call_denial(
     mut result: CallToolResult,
     audit: MutationAuditSession,
+    dry_run: bool,
 ) -> CallToolResult {
     let mut payload = result
         .structured_content
@@ -103,36 +151,49 @@ pub(crate) fn finalize_d1_execute_write_zero_call_denial(
     }
     result.is_error = Some(true);
     result.structured_content = Some(payload);
-    finalize_d1_execute_write_result(&mut result, audit);
+    finalize_d1_execute_write_result(&mut result, audit, dry_run);
     result
 }
 
-fn d1_execute_write_mutation_plan() -> MutationPlan {
-    MutationPlan::new(D1_EXECUTE_WRITE_OPERATION)
+fn d1_execute_write_mutation_plan(dry_run: bool) -> MutationPlan {
+    let plan = MutationPlan::new(D1_EXECUTE_WRITE_OPERATION)
         .step("collect_stable_catalog", false, json!({"observations": 2}))
-        .step("compose_reserved_relation_authority", false, json!({}))
-        .step(
-            "install_dispatch_reservation",
-            false,
-            json!({"atomic_compare_exchange": true}),
-        )
-        .step(
-            "submit_one_d1_dml_request",
-            true,
-            json!({"maximum_provider_mutations": 1}),
-        )
+        .step("compose_reserved_relation_authority", false, json!({}));
+    if dry_run {
+        return plan;
+    }
+    plan.step(
+        "install_prepared_attempt_custody",
+        true,
+        json!({"create_once": true, "phase": "Prepared"}),
+    )
+    .step(
+        "install_dispatch_reservation",
+        true,
+        json!({"atomic_compare_exchange": true, "phase": "DispatchReserved"}),
+    )
+    .step(
+        "submit_one_d1_dml_request",
+        true,
+        json!({"maximum_provider_mutations": 1}),
+    )
 }
 
-fn finalize_d1_execute_write_result(result: &mut CallToolResult, audit: MutationAuditSession) {
-    normalize_zero_call_denial(result);
-    let is_error = result.is_error.unwrap_or(false);
+fn finalize_d1_execute_write_result(
+    result: &mut CallToolResult,
+    audit: MutationAuditSession,
+    dry_run: bool,
+) {
+    normalize_zero_call_denial(result, dry_run);
+    let status = D1ExecuteWriteLifecycleStatus::from_payload(result.structured_content.as_ref())
+        .unwrap_or(D1ExecuteWriteLifecycleStatus::Blocked);
     let error_code = result
         .structured_content
         .as_ref()
         .and_then(|value| value.get("error"))
         .and_then(|value| value.get("code"))
         .and_then(Value::as_str);
-    let audit_record = audit.finish(if is_error { "error" } else { "success" }, error_code);
+    let audit_record = audit.finish(status.audit_outcome(), error_code);
     if let Some(Value::Object(content)) = result.structured_content.as_mut() {
         content.insert(
             "audit".to_string(),
@@ -143,7 +204,7 @@ fn finalize_d1_execute_write_result(result: &mut CallToolResult, audit: Mutation
     emit_mutation_audit_log(&audit_record);
 }
 
-fn normalize_zero_call_denial(result: &mut CallToolResult) {
+fn normalize_zero_call_denial(result: &mut CallToolResult, dry_run: bool) {
     let Some(Value::Object(content)) = result.structured_content.as_mut() else {
         return;
     };
@@ -156,13 +217,16 @@ fn normalize_zero_call_denial(result: &mut CallToolResult) {
         return;
     }
     content.insert("operation".to_string(), json!(D1_EXECUTE_WRITE_OPERATION));
-    content.insert("status".to_string(), json!("blocked"));
+    content.insert(
+        "status".to_string(),
+        json!(D1ExecuteWriteLifecycleStatus::Blocked.as_str()),
+    );
     content.insert("provider_calls".to_string(), json!(0));
     content.insert("provider_mutations".to_string(), json!(0));
     content.insert("automatic_retry_permitted".to_string(), json!(false));
     content
         .entry("mutation_plan".to_string())
-        .or_insert_with(|| json!(d1_execute_write_mutation_plan()));
+        .or_insert_with(|| json!(d1_execute_write_mutation_plan(dry_run)));
     content.entry("evidence".to_string()).or_insert(Value::Null);
 }
 
@@ -325,7 +389,7 @@ async fn execute_inner(
     if input.dry_run {
         return provider.apply(CallToolResult::structured(json!({
             "ok": true,
-            "status": "planned",
+            "status": D1ExecuteWriteLifecycleStatus::Planned.as_str(),
             "approved_composition_sha256_required": composition_receipt.composition_sha256,
             "evidence": base,
         })));
@@ -435,7 +499,7 @@ async fn execute_reserved_attempt(
     if restored.receipt().phase != D1DmlAttemptPhase::Prepared {
         return provider.apply(CallToolResult::structured_error(json!({
             "ok": false,
-            "status": "reconciliation_required",
+            "status": D1ExecuteWriteLifecycleStatus::ReconciliationRequired.as_str(),
             "custody": restored.receipt(),
             "evidence": base,
             "automatic_retry_permitted": false,
@@ -551,7 +615,7 @@ async fn execute_reserved_attempt(
             }
             provider.apply(CallToolResult::structured(json!({
                 "ok": true,
-                "status": "provider_acknowledged_reconciliation_required",
+                "status": D1ExecuteWriteLifecycleStatus::ProviderAcknowledgedReconciliationRequired.as_str(),
                 "outcome": outcome,
                 "response_body_sha256": write.response_body_sha256,
                 "response_body_size_bytes": write.response_body_size_bytes,
@@ -648,7 +712,7 @@ fn persist_ambiguity(
     }
     provider.apply(CallToolResult::structured_error(json!({
         "ok": false,
-        "status": "reconciliation_required",
+        "status": D1ExecuteWriteLifecycleStatus::ReconciliationRequired.as_str(),
         "provider_evidence": provider_evidence,
         "custody": product.receipt(),
         "evidence": base,
@@ -679,7 +743,7 @@ fn blocked(
     evidence: Option<Value>,
 ) -> CallToolResult {
     CallToolResult::structured_error(json!({
-        "ok": false, "operation": D1_EXECUTE_WRITE_OPERATION, "status": "blocked",
+        "ok": false, "operation": D1_EXECUTE_WRITE_OPERATION, "status": D1ExecuteWriteLifecycleStatus::Blocked.as_str(),
         "mutation_plan": mutation_plan, "evidence": evidence,
         "automatic_retry_permitted": false,
         "error": {"code": code, "message": message, "hint": "Correct the exact authority input and repeat dry-run; no DML provider call was issued."}
@@ -688,7 +752,7 @@ fn blocked(
 
 fn custody_error(base: Value, code: &str, message: &str, binding: Option<&str>) -> CallToolResult {
     CallToolResult::structured_error(json!({
-        "ok": false, "operation": D1_EXECUTE_WRITE_OPERATION, "status": "reconciliation_required",
+        "ok": false, "operation": D1_EXECUTE_WRITE_OPERATION, "status": D1ExecuteWriteLifecycleStatus::ReconciliationRequired.as_str(),
         "custody": {"attempt_binding_sha256": binding, "retained": binding.is_some()},
         "evidence": base, "automatic_retry_permitted": false,
         "error": {"code": code, "message": message, "hint": "Do not issue or replay a provider write; inspect durable attempt custody."}
@@ -795,6 +859,68 @@ mod tests {
                 "{phase}"
             );
         }
+    }
+
+    #[test]
+    fn lifecycle_status_drives_the_closed_audit_outcome_vocabulary() {
+        let cases = [
+            (D1ExecuteWriteLifecycleStatus::Planned, "planned"),
+            (D1ExecuteWriteLifecycleStatus::Blocked, "error"),
+            (
+                D1ExecuteWriteLifecycleStatus::ReconciliationRequired,
+                "reconciliation_required",
+            ),
+            (
+                D1ExecuteWriteLifecycleStatus::ProviderAcknowledgedReconciliationRequired,
+                "reconciliation_required",
+            ),
+        ];
+
+        for (status, audit_outcome) in cases {
+            assert_eq!(status.audit_outcome(), audit_outcome);
+            assert_eq!(
+                D1ExecuteWriteLifecycleStatus::from_payload(Some(&json!({
+                    "status": status.as_str()
+                }))),
+                Some(status)
+            );
+        }
+        assert_eq!(
+            D1ExecuteWriteLifecycleStatus::from_payload(Some(&json!({
+                "status": "success"
+            }))),
+            None,
+            "unowned terminal vocabulary must fail closed"
+        );
+    }
+
+    #[test]
+    fn dry_run_and_live_mutation_plans_are_exact_about_side_effects() {
+        assert_eq!(
+            serde_json::to_value(d1_execute_write_mutation_plan(true))
+                .expect("serialize dry-run plan"),
+            json!({
+                "operation": "d1_execute_write",
+                "steps": [
+                    {"ordinal": 1, "action": "collect_stable_catalog", "side_effect": false, "target": {"observations": 2}},
+                    {"ordinal": 2, "action": "compose_reserved_relation_authority", "side_effect": false, "target": {}},
+                ],
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(d1_execute_write_mutation_plan(false))
+                .expect("serialize live plan"),
+            json!({
+                "operation": "d1_execute_write",
+                "steps": [
+                    {"ordinal": 1, "action": "collect_stable_catalog", "side_effect": false, "target": {"observations": 2}},
+                    {"ordinal": 2, "action": "compose_reserved_relation_authority", "side_effect": false, "target": {}},
+                    {"ordinal": 3, "action": "install_prepared_attempt_custody", "side_effect": true, "target": {"create_once": true, "phase": "Prepared"}},
+                    {"ordinal": 4, "action": "install_dispatch_reservation", "side_effect": true, "target": {"atomic_compare_exchange": true, "phase": "DispatchReserved"}},
+                    {"ordinal": 5, "action": "submit_one_d1_dml_request", "side_effect": true, "target": {"maximum_provider_mutations": 1}},
+                ],
+            })
+        );
     }
 
     #[test]

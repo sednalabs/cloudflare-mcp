@@ -132,7 +132,9 @@ are added by the graph derivation.
 2. Call `d1_execute_write` with `dry_run=true`. It performs exactly two
    read-only primary catalog observations, classifies the exact SQL bytes,
    derives all direct and indirect write primitives, and returns the exact
-   `composition_sha256`. No DML provider call or local attempt state is made.
+   `composition_sha256`. Its public mutation plan contains only those read and
+   composition steps. No DML provider call or local attempt state is made, and
+   the audit outcome is `planned`.
 3. Approve that digest, then repeat the exact target, SQL bytes, params,
    identities, and row cap with `dry_run=false` and
    `approved_composition_sha256`. Live execution recomputes the two-read
@@ -140,6 +142,8 @@ are added by the graph derivation.
    provider calls.
 4. Require the receipt to show a create-once Prepared state followed by one
    exact atomic `DispatchReserved` installation before the single DML request.
+   The live public mutation plan marks all three operations as side effects;
+   neither durable custody mutation appears in the dry-run plan.
    A provider acknowledgement reports three total provider calls (two catalog
    reads and one mutation), one provider mutation, exact body digest/size and
    lifecycle, and `automatic_retry_permitted=false`. Zero-change metadata is a
@@ -147,7 +151,10 @@ are added by the graph derivation.
 5. Do not treat provider acknowledgement as terminal effect authority. Preserve
    custody and use the separately governed effect-specific recovery path. An
    ambiguous response, custody error, or replay never permits redispatch of the
-   same attempt or provider request identity.
+   same attempt or provider request identity. The closed audit outcomes are
+   `planned`, `error`, and `reconciliation_required`; both provider
+   acknowledgement and response-loss ambiguity audit as
+   `reconciliation_required`, never `success`.
 
 Audit custody begins before account, database, and opaque-identity validation.
 Every handler-owned denial before provider access returns the same typed blocked
