@@ -23,7 +23,7 @@ use crate::d1_catalog_evidence::{
 };
 use crate::d1_target::D1TargetIdentity;
 
-const D1_CATALOG_PROVIDER_CUSTODY_VERSION: u8 = 3;
+const D1_CATALOG_PROVIDER_CUSTODY_VERSION: u8 = 5;
 const D1_CATALOG_PROVIDER_CUSTODY_OPERATION: &str = "d1_catalog_provider_custody";
 
 static D1_CATALOG_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -628,6 +628,8 @@ struct D1CatalogProviderRow {
     schema_sql_storage_class: String,
     table_sql_token_source_is_null: u8,
     table_sql_token_source_hex: String,
+    table_virtual_token_hit: u8,
+    table_replace_token_hit: u8,
     foreign_key_id_storage_class: String,
     foreign_key_id_value_hex: String,
     foreign_key_id: i64,
@@ -1037,6 +1039,8 @@ mod tests {
             "schema_sql_storage_class": "text",
             "table_sql_token_source_is_null": 0,
             "table_sql_token_source_hex": hex("CREATE TABLE item (id INTEGER)"),
+            "table_virtual_token_hit": 0,
+            "table_replace_token_hit": 0,
             "foreign_key_id_storage_class": "not_applicable",
             "foreign_key_id_value_hex": "",
             "foreign_key_id": -1,
@@ -1115,8 +1119,8 @@ mod tests {
 
         assert_eq!(bodies.lock().expect("bodies").len(), 2);
         assert_eq!(custody_receipt.provider_calls, 2);
-        assert_eq!(custody_receipt.version, 3);
-        assert_eq!(custody_receipt.projection_version, 3);
+        assert_eq!(custody_receipt.version, 5);
+        assert_eq!(custody_receipt.projection_version, 5);
         assert_eq!(custody_receipt.complete_response_bodies, 2);
         assert_eq!(custody_receipt.primary_read_only_observations, 2);
         assert_eq!(custody_receipt.preallocated_dispatch_identities, 2);

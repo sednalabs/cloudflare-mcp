@@ -344,7 +344,7 @@ digest, custody, and no-retry semantics remain unchanged.
 ## Staged D1 catalog evidence contract
 
 The crate contains a side-effect-free, non-routed catalog evidence boundary for
-future guarded D1 write composition. Projection version 3 derives one immutable,
+future guarded D1 write composition. Projection version 5 derives one immutable,
 target-bound structured fact set from `sqlite_schema` and the
 `pragma_foreign_key_list()` table-valued function rather than accepting caller
 SQL or a generic provider envelope. Its internal provider-custody adapter
@@ -392,11 +392,21 @@ match mode. `to=NULL` and `to=''` remain distinct. Composite rows require one
 parent/action/match identity, unique contiguous sequences beginning at zero,
 and exact from/to evidence at every sequence. This matches the semantic field
 set used by migration reconciliation without coupling the two implementations.
-Relation rows retain SQL bytes only for structurally valid tables and only as a
-later AUTOINCREMENT token source. View SQL and trigger bodies are never
-projected or interpreted. Missing owners or parents, malformed storage classes,
-ambiguous schema identities, unavailable table token sources, and unproven
-view/trigger write semantics remain exact conservative blockers.
+Relation rows retain SQL bytes only for structurally valid tables and permit
+only bounded ASCII token classification. The fixed query records typed bits for
+case-insensitive `VIRTUAL` and `REPLACE` occurrences within 64 KiB; the verifier
+independently re-derives both bits from the retained bytes. A virtual hit is an
+exact `table_virtual_semantics_unproven` blocker because SQLite reports virtual
+and shadow relations as schema tables while the module may write its shadow
+tables. A REPLACE hit is an exact `table_replace_semantics_unproven` blocker
+because a table or constraint-level conflict policy can make a plain INSERT or
+UPDATE delete an incumbent and run ON DELETE effects. Token scans may
+conservatively match identifiers or comments, but never reopen ambiguous
+semantics. An oversized source blocks before token classification. View SQL and
+trigger bodies are never projected or interpreted. Missing owners or parents,
+malformed storage classes, ambiguous schema identities, unavailable or
+oversized table token sources, and unproven REPLACE/virtual/view/trigger write
+semantics remain exact conservative blockers.
 
 Rows are keyed by physical schema rowid and fact order and must be strictly
 ordered exactly as the fixed query specifies. The 1,001-row sentinel applies to
@@ -422,6 +432,55 @@ or SQL. Neither receipt nor product parses CREATE TABLE text, view SQL, or
 trigger bodies; traverses a graph; authorizes DDL, DML, foreign-key effects,
 implicit writes, provider admission, custody outside these exact reads, or any
 mutation. No public MCP tool currently exposes this staged contract.
+
+The next internal staged boundary consumes only that opaque version-5 product
+and derives a conservative reserved-relation write graph. Its configured root
+set is non-empty, ASCII-case closed, duplicate-free, limited to 64 identities,
+and must name relations present in the verified snapshot. Relations whose
+canonical identity begins with `sqlite_` or `_cf_` are automatic roots and may
+not be reintroduced as configured aliases. Index facts remain validated,
+counted non-addressable schema auxiliaries; they are not writable graph nodes.
+
+Each table or view has INSERT, UPDATE, and DELETE nodes. Foreign-key CASCADE
+adds the corresponding parent-update to child-update or parent-delete to
+child-delete edge; SET NULL and SET DEFAULT add child-update edges; RESTRICT
+and NO ACTION add no write edge. Composite rows form one edge group only after
+the catalog verifier has proven contiguous sequence/cardinality and stable
+parent/action/match facts. Table SQL is not parsed. A bounded 64-KiB,
+ASCII-case-insensitive byte scan classifies any `AUTOINCREMENT` occurrence
+conservatively; a match adds only table-insert to `sqlite_sequence`-update and
+requires that exact physical table fact. This may over-classify quoted or
+commented occurrences, but cannot turn ambiguous text into permission.
+Any bounded table-source `REPLACE` hit blocks the complete graph before an
+INSERT or UPDATE decision can become `Allow`; unavailable or oversized sources
+remain blockers. This is conservative token evidence, not CREATE TABLE parsing.
+
+The module also owns a closed internal statement-shape expansion contract for
+future composition, but performs no composition or admission itself. Primitive
+INSERT, UPDATE, and DELETE each require their corresponding graph decision.
+REPLACE and INSERT OR REPLACE require DELETE then INSERT; UPSERT DO UPDATE
+requires INSERT then UPDATE; UPDATE OR REPLACE requires UPDATE then DELETE.
+Every effective primitive must independently be `Allow`; an unsupported
+compound form denies instead of defaulting to one primitive.
+
+View writes always deny because view definitions are unavailable. Every write
+to, or foreign-key traversal reaching, a trigger-owned relation denies because
+trigger bodies and events are unavailable. Reserved reachability has higher
+deny precedence than those uncertainty classifications. A schema blocker,
+foreign-key blocker, unresolved parent, unavailable table token source,
+unknown fact family, malformed consumer text, missing auxiliary/trigger owner,
+or unsupported action denies the complete graph derivation. Traversal uses a
+visited set and exact limits of 1,000 relations, 3,000 operation nodes, and
+4,096 edges.
+
+The opaque graph product contains internal per-relation decisions. Its
+serializable receipt binds the catalog target/snapshot, closed-root digest,
+graph and decision digests, and aggregate counts only; it contains no relation,
+column, SQL, account, or database identity. This boundary still performs no
+caller-DML composition, provider request, public routing, admission, custody,
+mutation, deployment, or authorization. A later separately reviewed composer
+must bind an exact DML target and operation to this product before provider
+dispatch.
 
 ## Structured payload details for complex tools
 
