@@ -39,6 +39,21 @@ enum D1ExecuteWriteLifecycleStatus {
     ProviderAcknowledgedReconciliationRequired,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostProviderSuccessorPersistence {
+    NotInstalled,
+    FailedOrUnproven,
+}
+
+impl PostProviderSuccessorPersistence {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotInstalled => "not_installed",
+            Self::FailedOrUnproven => "failed_or_unproven",
+        }
+    }
+}
+
 impl D1ExecuteWriteLifecycleStatus {
     fn as_str(self) -> &'static str {
         match self {
@@ -632,6 +647,12 @@ async fn execute_reserved_attempt(
             } else {
                 D1DmlProviderTerminalClassification::SucceededChanged
             };
+            let provider_evidence = json!({
+                "response_body_sha256": write.response_body_sha256,
+                "response_body_size_bytes": write.response_body_size_bytes,
+                "provider_lifecycle": write.lifecycle,
+                "provider_outcome": outcome,
+            });
             let asserted = match record_d1_dml_provider_terminal_assertion(
                 target,
                 &composition,
@@ -644,11 +665,15 @@ async fn execute_reserved_attempt(
             ) {
                 Ok(product) => product,
                 Err(error) => {
-                    return provider.apply(custody_error(
+                    return provider.apply(post_provider_custody_failure(
                         base,
+                        Some(provider_evidence),
+                        true,
+                        "ProviderAssertionRecorded",
+                        PostProviderSuccessorPersistence::NotInstalled,
                         error.code,
                         error.message,
-                        Some(&binding),
+                        &binding,
                     ));
                 }
             };
@@ -658,11 +683,15 @@ async fn execute_reserved_attempt(
                 asserted.state_bytes(),
             ) {
                 let _ = result;
-                return provider.apply(custody_error(
+                return provider.apply(post_provider_custody_failure(
                     base,
+                    Some(provider_evidence),
+                    true,
+                    "ProviderAssertionRecorded",
+                    PostProviderSuccessorPersistence::FailedOrUnproven,
                     "d1.execute_write_custody_unproven",
                     "authenticated provider assertion could not be durably installed",
-                    Some(&binding),
+                    &binding,
                 ));
             }
             let evidence =
@@ -748,11 +777,15 @@ fn persist_ambiguity(
     ) {
         Ok(product) => product,
         Err(error) => {
-            return provider.apply(custody_error(
+            return provider.apply(post_provider_custody_failure(
                 base,
+                provider_evidence,
+                provider_submission_attempted,
+                "Ambiguous",
+                PostProviderSuccessorPersistence::NotInstalled,
                 error.code,
                 error.message,
-                Some(binding),
+                binding,
             ));
         }
     };
@@ -760,11 +793,15 @@ fn persist_ambiguity(
         guard.compare_exchange_d1_dml_attempt_state(binding, incumbent, product.state_bytes())
     {
         let _ = result;
-        return provider.apply(custody_error(
+        return provider.apply(post_provider_custody_failure(
             base,
+            provider_evidence,
+            provider_submission_attempted,
+            "Ambiguous",
+            PostProviderSuccessorPersistence::FailedOrUnproven,
             "d1.execute_write_custody_unproven",
             "ambiguity evidence could not be durably installed",
-            Some(binding),
+            binding,
         ));
     }
     let evidence =
@@ -799,6 +836,52 @@ fn with_post_provider_custody_evidence(
         );
     }
     evidence
+}
+
+fn post_provider_custody_failure(
+    base: Value,
+    provider_evidence: Option<Value>,
+    provider_submission_attempted: bool,
+    intended_successor: &'static str,
+    persistence: PostProviderSuccessorPersistence,
+    code: &str,
+    message: &str,
+    binding: &str,
+) -> CallToolResult {
+    let mut evidence = base;
+    if let Some(object) = evidence.as_object_mut() {
+        object.insert(
+            "reached_phase".to_string(),
+            json!({
+                "phase": "post_provider_attempt_custody_persistence_failed",
+                "prepared_state_installed": true,
+                "dispatch_reserved_installed": true,
+                "provider_submission_attempted": provider_submission_attempted,
+                "post_provider_custody_persisted": false,
+                "post_provider_custody_outcome": intended_successor,
+                "post_provider_successor_persistence": persistence.as_str(),
+                "post_provider_successor_installation_confirmed": false,
+            }),
+        );
+    }
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "status": D1ExecuteWriteLifecycleStatus::ReconciliationRequired.as_str(),
+        "provider_evidence": provider_evidence,
+        "custody": {
+            "attempt_binding_sha256": binding,
+            "post_provider_successor": intended_successor,
+            "post_provider_successor_persistence": persistence.as_str(),
+            "post_provider_successor_installation_confirmed": false,
+        },
+        "evidence": evidence,
+        "automatic_retry_permitted": false,
+        "error": {
+            "code": code,
+            "message": message,
+            "hint": "Retain all available evidence and use the governed recovery path; never replay this provider attempt."
+        }
+    }))
 }
 
 fn configured_reserved_roots() -> Result<Vec<String>, &'static str> {
@@ -972,6 +1055,101 @@ mod tests {
             None,
             "unowned terminal vocabulary must fail closed"
         );
+    }
+
+    #[test]
+    fn post_provider_derivation_failures_preserve_whole_aggregate_evidence() {
+        let provider_evidence = json!({
+            "response_body_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "response_body_size_bytes": 42,
+            "provider_lifecycle": {
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "complete",
+                "http_status": 200,
+            },
+            "provider_outcome": {"changed_db": true, "changes": 1, "rows_written": 1},
+        });
+        let base = json!({
+            "operation": "d1_execute_write",
+            "mutation_plan": d1_execute_write_mutation_plan(false),
+            "automatic_retry_permitted": false,
+        });
+        let binding = "b".repeat(64);
+        for (label, intended_successor, code, message) in [
+            (
+                "provider assertion rejection",
+                "ProviderAssertionRecorded",
+                "d1.dml_attempt_evidence_conflict",
+                "provider assertion contradicted durable attempt evidence",
+            ),
+            (
+                "ambiguity record rejection",
+                "Ambiguous",
+                "d1.dml_attempt_ambiguity_conflict",
+                "ambiguity contradicted durable attempt evidence",
+            ),
+        ] {
+            let mut accounting = D1ProviderAccounting::default();
+            accounting.record_catalog_calls(2);
+            accounting.record_dml_lifecycle(lifecycle("attempted"));
+            let result = accounting.apply(post_provider_custody_failure(
+                base.clone(),
+                Some(provider_evidence.clone()),
+                true,
+                intended_successor,
+                PostProviderSuccessorPersistence::NotInstalled,
+                code,
+                message,
+                &binding,
+            ));
+            let expected = json!({
+                "ok": false,
+                "status": "reconciliation_required",
+                "provider_evidence": provider_evidence,
+                "custody": {
+                    "attempt_binding_sha256": binding,
+                    "post_provider_successor": intended_successor,
+                    "post_provider_successor_persistence": "not_installed",
+                    "post_provider_successor_installation_confirmed": false,
+                },
+                "evidence": {
+                    "operation": "d1_execute_write",
+                    "mutation_plan": d1_execute_write_mutation_plan(false),
+                    "automatic_retry_permitted": false,
+                    "reached_phase": {
+                        "phase": "post_provider_attempt_custody_persistence_failed",
+                        "prepared_state_installed": true,
+                        "dispatch_reserved_installed": true,
+                        "provider_submission_attempted": true,
+                        "post_provider_custody_persisted": false,
+                        "post_provider_custody_outcome": intended_successor,
+                        "post_provider_successor_persistence": "not_installed",
+                        "post_provider_successor_installation_confirmed": false,
+                    },
+                },
+                "automatic_retry_permitted": false,
+                "error": {
+                    "code": code,
+                    "message": message,
+                    "hint": "Retain all available evidence and use the governed recovery path; never replay this provider attempt.",
+                },
+                "provider_calls": 3,
+                "provider_mutations": 1,
+            });
+            assert_eq!(result.structured_content, Some(expected.clone()), "{label}");
+            let content = serde_json::to_value(&result.content[0])
+                .expect("serialize post-provider custody failure content");
+            let text = content["text"]
+                .as_str()
+                .expect("post-provider custody failure text");
+            assert_eq!(
+                serde_json::from_str::<Value>(text)
+                    .expect("post-provider custody failure text JSON"),
+                expected,
+                "{label} text/structured drift"
+            );
+        }
     }
 
     #[test]

@@ -102,7 +102,13 @@ marks the required post-provider custody compare-and-exchange as a side effect:
 authenticated acknowledgement records `ProviderAssertionRecorded`, while a
 missing or ambiguous response records `Ambiguous`. Reached-phase evidence names
 the installed successor and whether provider submission was attempted; dry-run
-contains none of these write or submission steps. Audit
+contains none of these write or submission steps. If successor derivation or
+its compare-and-exchange fails after an attempted submission, require the
+failure receipt to retain aggregate response digest/size and provider lifecycle,
+classify derivation failure as `not_installed` or compare-and-exchange failure
+as `failed_or_unproven`, leave successor installation unconfirmed, and keep
+reconciliation-only no-retry authority without returning response body text or
+raw identities. Audit
 outcome is closed to `planned`, `error`, or `reconciliation_required`; a
 provider acknowledgement or response-loss ambiguity remains
 `reconciliation_required`, not terminal success.

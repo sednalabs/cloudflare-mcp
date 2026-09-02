@@ -5244,6 +5244,118 @@ fn spawn_fake_d1_execute_write_response_loss_api() -> (String, Arc<Mutex<Vec<Val
     (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only response-loss test fixture
 }
 
+fn spawn_fake_d1_execute_write_post_provider_custody_failure_api(
+    target: PathBuf,
+    acknowledge: bool,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").expect("bind fake D1 post-provider custody-failure API"); // DevSkim: ignore DS162092 -- loopback-only custody-failure test fixture
+    let addr = listener
+        .local_addr()
+        .expect("fake D1 post-provider custody-failure API addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().take(5) {
+            let mut stream = stream.expect("fake D1 post-provider custody-failure stream");
+            let (headers, body) = read_http_request(&mut stream);
+            let request_line = headers.lines().next().unwrap_or_default().to_string();
+            let mut request_parts = request_line.split_whitespace();
+            let method = request_parts.next().unwrap_or_default().to_string();
+            let path = request_parts.next().unwrap_or_default().to_string();
+            let body_json: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            requests_for_thread
+                .lock()
+                .expect("post-provider custody-failure request log lock")
+                .push(json!({
+                    "method": method,
+                    "path": path,
+                    "body": body_json,
+                }));
+
+            if !body_json["sql"]
+                .as_str()
+                .is_some_and(|sql| sql.contains("schema_raw AS ("))
+            {
+                let attempt = fs::read_dir(&target)
+                    .expect("read target custody directory")
+                    .map(|entry| entry.expect("read target custody entry").path())
+                    .find(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| {
+                                name.starts_with("dml-attempt.") && name.ends_with(".state.json")
+                            })
+                    })
+                    .expect("DispatchReserved attempt custody before provider response");
+                fs::rename(&attempt, attempt.with_extension("post-provider-displaced"))
+                    .expect("displace attempt custody before successor persistence");
+                if !acknowledge {
+                    drop(stream);
+                    continue;
+                }
+                let response = serde_json::to_vec(&json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": [{
+                        "success": true,
+                        "errors": [],
+                        "results": [],
+                        "meta": {
+                            "served_by_primary": true,
+                            "changed_db": true,
+                            "changes": 1,
+                            "rows_written": 1
+                        }
+                    }],
+                }))
+                .expect("serialize post-provider acknowledgement");
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                    response.len()
+                )
+                .expect("write post-provider acknowledgement headers");
+                stream
+                    .write_all(&response)
+                    .expect("write post-provider acknowledgement");
+                continue;
+            }
+
+            let response = serde_json::to_vec(&json!({
+                "success": true,
+                "errors": [],
+                "messages": [],
+                "result": [{
+                    "success": true,
+                    "results": [
+                        d1_catalog_relation_row("example", 1),
+                        d1_catalog_relation_row("protected", 2)
+                    ],
+                    "meta": {
+                        "served_by_primary": true,
+                        "changed_db": false,
+                        "changes": 0,
+                        "rows_written": 0
+                    }
+                }],
+            }))
+            .expect("serialize post-provider custody-failure catalog response");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                response.len()
+            )
+            .expect("write post-provider custody-failure catalog headers");
+            stream
+                .write_all(&response)
+                .expect("write post-provider custody-failure catalog response");
+        }
+    });
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only custody-failure test fixture
+}
+
 fn d1_catalog_relation_row(name: &str, schema_rowid: i64) -> Value {
     let hex = |value: &str| {
         value
@@ -18760,6 +18872,216 @@ fn d1_execute_write_response_loss_reports_the_completed_mutation_attempt() {
     drop(requests);
     mcp.terminate();
     fs::remove_dir_all(lease_root).expect("target guard cleanup");
+}
+
+#[cfg(unix)]
+fn assert_d1_execute_write_post_provider_custody_failure(acknowledge: bool) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let label = if acknowledge {
+        "provider-acknowledgement-cas"
+    } else {
+        "ambiguity-cas"
+    };
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-d1-write-{label}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos()
+    ));
+    fs::create_dir(&lease_root).expect("create private target guard root");
+    fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+        .expect("make target guard root private");
+    let (base_url, requests) = spawn_fake_d1_execute_write_post_provider_custody_failure_api(
+        manifest_target_path(&lease_root),
+        acknowledge,
+    );
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+        (
+            "CLOUDFLARE_MCP_D1_RESERVED_RELATIONS",
+            "protected".to_string(),
+        ),
+    ]);
+    let row_id = if acknowledge { 11 } else { 12 };
+    let exact_args = json!({
+        "database_id": "123e4567-e89b-42d3-a456-426614174000",
+        "sql": format!("UPDATE example SET enabled = 1 WHERE id = {row_id}"),
+        "operation_id": format!("operation-{label}-fixture"),
+        "execution_attempt_id": format!("attempt-{label}-fixture"),
+        "provider_request_id": format!("provider-{label}-fixture")
+    });
+    let mut dry_args = exact_args.clone();
+    dry_args["dry_run"] = json!(true);
+    let dry_response = mcp.call_tool(2, "d1_execute_write", dry_args);
+    assert_tool_text_matches_structured(&dry_response);
+    let dry = structured_content(&dry_response);
+    assert_eq!(dry["ok"], json!(true), "{label}: {dry}");
+
+    let mut live_args = exact_args.clone();
+    live_args["dry_run"] = json!(false);
+    live_args["approved_composition_sha256"] = dry["approved_composition_sha256_required"].clone();
+    let response = mcp.call_tool(3, "d1_execute_write", live_args);
+    assert_tool_text_matches_structured(&response);
+    let content = structured_content(&response);
+    let intended_successor = if acknowledge {
+        "ProviderAssertionRecorded"
+    } else {
+        "Ambiguous"
+    };
+    assert_eq!(content["ok"], json!(false), "{label}: {content}");
+    assert_eq!(content["status"], json!("reconciliation_required"));
+    assert_eq!(content["provider_calls"], json!(3));
+    assert_eq!(content["provider_mutations"], json!(1));
+    assert_eq!(content["automatic_retry_permitted"], json!(false));
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.execute_write_custody_unproven")
+    );
+    let provider_evidence = &content["provider_evidence"];
+    if acknowledge {
+        assert_eq!(
+            provider_evidence,
+            &json!({
+                "response_body_sha256": provider_evidence["response_body_sha256"].clone(),
+                "response_body_size_bytes": provider_evidence["response_body_size_bytes"].clone(),
+                "provider_lifecycle": provider_evidence["provider_lifecycle"].clone(),
+                "provider_outcome": provider_evidence["provider_outcome"].clone(),
+            }),
+            "{label}: whole provider acknowledgement evidence drifted"
+        );
+    } else {
+        assert_eq!(
+            provider_evidence,
+            &json!({
+                "response_body_sha256": provider_evidence["response_body_sha256"].clone(),
+                "response_body_size_bytes": provider_evidence["response_body_size_bytes"].clone(),
+                "provider_lifecycle": provider_evidence["provider_lifecycle"].clone(),
+                "provider_error": provider_evidence["provider_error"].clone(),
+            }),
+            "{label}: whole response-loss provider evidence drifted"
+        );
+    }
+    assert_eq!(
+        provider_evidence["provider_lifecycle"]["dispatch_stage"],
+        json!("attempted")
+    );
+    assert_eq!(
+        content["custody"],
+        json!({
+            "attempt_binding_sha256": content["custody"]["attempt_binding_sha256"].clone(),
+            "post_provider_successor": intended_successor,
+            "post_provider_successor_persistence": "failed_or_unproven",
+            "post_provider_successor_installation_confirmed": false,
+        }),
+        "{label}: whole failed custody receipt drifted"
+    );
+    let evidence = &content["evidence"];
+    assert_eq!(
+        evidence,
+        &json!({
+            "operation": "d1_execute_write",
+            "execution_plan": evidence["execution_plan"].clone(),
+            "execute_plan_sha256": evidence["execute_plan_sha256"].clone(),
+            "catalog_provider_custody": evidence["catalog_provider_custody"].clone(),
+            "catalog_evidence": evidence["catalog_evidence"].clone(),
+            "reserved_relation_graph": evidence["reserved_relation_graph"].clone(),
+            "composition": evidence["composition"].clone(),
+            "attempt": evidence["attempt"].clone(),
+            "mutation_plan": expected_d1_execute_write_mutation_plan(false),
+            "automatic_retry_permitted": false,
+            "reached_phase": {
+                "phase": "post_provider_attempt_custody_persistence_failed",
+                "prepared_state_installed": true,
+                "dispatch_reserved_installed": true,
+                "provider_submission_attempted": true,
+                "post_provider_custody_persisted": false,
+                "post_provider_custody_outcome": intended_successor,
+                "post_provider_successor_persistence": "failed_or_unproven",
+                "post_provider_successor_installation_confirmed": false,
+            },
+        }),
+        "{label}: whole reached-phase evidence drifted: {content}"
+    );
+    assert_eq!(
+        content,
+        &json!({
+            "ok": false,
+            "status": "reconciliation_required",
+            "provider_evidence": provider_evidence.clone(),
+            "custody": content["custody"].clone(),
+            "evidence": evidence.clone(),
+            "automatic_retry_permitted": false,
+            "error": content["error"].clone(),
+            "provider_calls": 3,
+            "provider_mutations": 1,
+            "audit": content["audit"].clone(),
+        }),
+        "{label}: whole post-provider custody-failure envelope drifted"
+    );
+    assert_d1_execute_write_audit(
+        content,
+        false,
+        "reconciliation_required",
+        Some("d1.execute_write_custody_unproven"),
+        json!({
+            "target_key_sha256": sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000")
+        }),
+    );
+    let rendered = content.to_string();
+    for private_value in [
+        "acct-1",
+        "123e4567-e89b-42d3-a456-426614174000",
+        "example",
+        exact_args["sql"].as_str().expect("private SQL fixture"),
+        exact_args["operation_id"]
+            .as_str()
+            .expect("private operation fixture"),
+        exact_args["execution_attempt_id"]
+            .as_str()
+            .expect("private attempt fixture"),
+        exact_args["provider_request_id"]
+            .as_str()
+            .expect("private provider fixture"),
+    ] {
+        assert!(
+            !rendered.contains(private_value),
+            "{label}: public failure envelope leaked private input"
+        );
+    }
+    let requests = requests
+        .lock()
+        .expect("post-provider custody-failure request log lock");
+    assert_eq!(requests.len(), 5);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request["body"]["sql"] == exact_args["sql"])
+            .count(),
+        1,
+        "{label}: the provider DML must never be retried"
+    );
+    drop(requests);
+    mcp.terminate();
+    fs::remove_dir_all(lease_root).expect("target guard cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn d1_execute_write_acknowledgement_cas_failure_retains_provider_evidence() {
+    assert_d1_execute_write_post_provider_custody_failure(true);
+}
+
+#[cfg(unix)]
+#[test]
+fn d1_execute_write_ambiguity_cas_failure_retains_provider_evidence() {
+    assert_d1_execute_write_post_provider_custody_failure(false);
 }
 
 #[cfg(unix)]

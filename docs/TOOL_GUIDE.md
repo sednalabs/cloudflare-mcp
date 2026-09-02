@@ -151,6 +151,13 @@ are added by the graph derivation.
    ambiguous response evidence records `Ambiguous`. Reached-phase evidence
    identifies the installed successor and whether submission was attempted;
    none of these durable custody mutations appears in the dry-run plan.
+   If either successor cannot be derived or atomically installed after an
+   attempted submission, the reconciliation-required failure must preserve the
+   aggregate response digest/size and provider lifecycle, state that the
+   intended successor is `not_installed` after derivation rejection or
+   `failed_or_unproven` after compare-and-exchange failure, leave installation
+   unconfirmed, and forbid replay without exposing response body text or raw
+   identities.
    A provider acknowledgement reports three total provider calls (two catalog
    reads and one mutation), one provider mutation, exact body digest/size and
    lifecycle, and `automatic_retry_permitted=false`. Zero-change metadata is a
