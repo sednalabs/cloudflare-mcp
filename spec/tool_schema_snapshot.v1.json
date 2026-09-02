@@ -1793,10 +1793,10 @@
         },
         "required": [
           "database_id",
-          "execution_attempt_id",
+          "sql",
           "operation_id",
-          "provider_request_id",
-          "sql"
+          "execution_attempt_id",
+          "provider_request_id"
         ],
         "type": "object"
       },
