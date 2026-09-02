@@ -66,6 +66,21 @@ fn table(schema_rowid: i64, name: &str) -> Value {
 }
 
 fn verified(rows: Vec<Value>) -> D1CatalogEvidenceProduct {
+    verified_with_observation_ids(
+        rows,
+        [
+            "dispatch-first-0001",
+            "read-first-00000001",
+            "dispatch-second-001",
+            "read-second-0000001",
+        ],
+    )
+}
+
+fn verified_with_observation_ids(
+    rows: Vec<Value>,
+    observation_ids: [&str; 4],
+) -> D1CatalogEvidenceProduct {
     let mut rows = rows
         .into_iter()
         .map(|row| serde_json::from_value::<D1CatalogProjectionRow>(row).expect("typed row"))
@@ -90,15 +105,15 @@ fn verified(rows: Vec<Value>) -> D1CatalogEvidenceProduct {
     let first = frame(
         &target,
         &catalog_plan_sha256,
-        "dispatch-first-0001",
-        "read-first-00000001",
+        observation_ids[0],
+        observation_ids[1],
         &body,
     );
     let second = frame(
         &target,
         &catalog_plan_sha256,
-        "dispatch-second-001",
-        "read-second-0000001",
+        observation_ids[2],
+        observation_ids[3],
         &body,
     );
     prove_d1_catalog_product(
@@ -618,4 +633,65 @@ fn evidence_arrival_order_does_not_change_exact_composition() {
     )
     .expect("second ordering");
     assert_eq!(first.receipt(), second.receipt());
+}
+
+#[test]
+fn fresh_observation_identities_preserve_exact_semantic_composition() {
+    let rows = vec![
+        table(1, "d1_migrations"),
+        table(2, "items"),
+        table(3, "other_items"),
+    ];
+    let first_catalog = verified_with_observation_ids(
+        rows.clone(),
+        [
+            "dispatch-dry-first",
+            "read-dry-first-0001",
+            "dispatch-dry-second",
+            "read-dry-second-001",
+        ],
+    );
+    let second_catalog = verified_with_observation_ids(
+        rows,
+        [
+            "dispatch-live-first",
+            "read-live-first-001",
+            "dispatch-live-second",
+            "read-live-second-01",
+        ],
+    );
+    assert_ne!(
+        first_catalog.receipt().observation_pair_sha256,
+        second_catalog.receipt().observation_pair_sha256,
+        "fresh physical observations must retain distinct custody identities"
+    );
+    let first_graph =
+        derive_d1_reserved_relation_graph(&first_catalog, &["d1_migrations".to_string()])
+            .expect("first reserved graph");
+    let second_graph =
+        derive_d1_reserved_relation_graph(&second_catalog, &["d1_migrations".to_string()])
+            .expect("second reserved graph");
+    let first = compose(
+        D1WriteStatementKind::Update,
+        "UPDATE items SET value = ?",
+        "items",
+        D1WriteOperationForm::Update,
+        &first_catalog,
+        &first_graph,
+    )
+    .expect("dry-run composition");
+    let second = compose(
+        D1WriteStatementKind::Update,
+        "UPDATE items SET value = ?",
+        "items",
+        D1WriteOperationForm::Update,
+        &second_catalog,
+        &second_graph,
+    )
+    .expect("live composition");
+    assert_eq!(
+        first.receipt(),
+        second.receipt(),
+        "fresh observation custody must not make an unchanged semantic approval unreplayable"
+    );
 }

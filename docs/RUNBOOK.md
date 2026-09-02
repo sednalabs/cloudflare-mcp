@@ -96,6 +96,10 @@ composition digest. A live call must repeat every byte and identity and supply
 that digest. It recomputes catalog/graph/composition authority under the shared
 target guard, then durably installs one Prepared -> DispatchReserved
 compare-and-exchange before the only DML provider request.
+Fresh dry-run and live observation identities are expected to differ. The
+composition validates both complete observation receipts but hashes their
+stable catalog-authority projection, so an unchanged normalized snapshot and
+graph reproduce the approval while any semantic catalog drift rejects it.
 
 Never replay an incumbent attempt. A provider acknowledgement, including a
 valid zero-change acknowledgement, remains retained for effect-specific

@@ -56,6 +56,37 @@ pub(crate) struct D1ExactPlanCompositionReceipt {
     pub(crate) composition_sha256: String,
 }
 
+/// Stable catalog authority committed into an approval composition.
+///
+/// The full catalog receipt is validated before this projection is built. Its
+/// observation-pair digest deliberately proves fresh physical read custody and
+/// therefore changes on every dry-run/live collection. Approval authority must
+/// instead converge when the exact catalog query, normalized snapshot, shape,
+/// caps, and stable-read cardinality are unchanged.
+#[derive(Serialize)]
+struct D1StableCatalogAuthorityReceipt<'a> {
+    version: u8,
+    operation: &'static str,
+    target_key_sha256: &'a str,
+    query_plan_sha256: &'a str,
+    query_sha256: &'a str,
+    projection_version: u8,
+    catalog_snapshot_sha256: &'a str,
+    catalog_row_count: usize,
+    schema_physical_row_count: usize,
+    relation_fact_count: usize,
+    trigger_owner_fact_count: usize,
+    schema_auxiliary_fact_count: usize,
+    schema_blocker_fact_count: usize,
+    foreign_key_fact_count: usize,
+    foreign_key_blocker_fact_count: usize,
+    conservative_blocker_count: usize,
+    stable_primary_observations: u8,
+    provider_row_cap: usize,
+    provider_byte_cap: usize,
+    response_body_sizes: [usize; 2],
+}
+
 /// Opaque pure composition product. Relation identity and the classified plan
 /// remain internal; only the aggregate-safe receipt is serializable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,7 +222,7 @@ where
     }
 
     let target_key_sha256 = target.target_key_sha256();
-    let catalog_receipt_sha256 = hash_serialized(catalog_receipt);
+    let catalog_receipt_sha256 = hash_stable_catalog_authority(catalog_receipt);
     let graph_receipt_sha256 = hash_serialized(graph_receipt);
     let classified_relation_sha256 = hash_bytes(canonical_relation.as_bytes());
     let classified_form_sha256 = hash_serialized(&form_label(classified_form));
@@ -361,6 +392,31 @@ fn catalog_receipt_shape_is_consistent(receipt: &D1CatalogEvidenceReceipt) -> bo
         && valid_sha256(&receipt.query_sha256)
         && valid_sha256(&receipt.catalog_snapshot_sha256)
         && valid_sha256(&receipt.observation_pair_sha256)
+}
+
+fn hash_stable_catalog_authority(receipt: &D1CatalogEvidenceReceipt) -> String {
+    hash_serialized(&D1StableCatalogAuthorityReceipt {
+        version: receipt.version,
+        operation: receipt.operation,
+        target_key_sha256: &receipt.target_key_sha256,
+        query_plan_sha256: &receipt.query_plan_sha256,
+        query_sha256: &receipt.query_sha256,
+        projection_version: receipt.projection_version,
+        catalog_snapshot_sha256: &receipt.catalog_snapshot_sha256,
+        catalog_row_count: receipt.catalog_row_count,
+        schema_physical_row_count: receipt.schema_physical_row_count,
+        relation_fact_count: receipt.relation_fact_count,
+        trigger_owner_fact_count: receipt.trigger_owner_fact_count,
+        schema_auxiliary_fact_count: receipt.schema_auxiliary_fact_count,
+        schema_blocker_fact_count: receipt.schema_blocker_fact_count,
+        foreign_key_fact_count: receipt.foreign_key_fact_count,
+        foreign_key_blocker_fact_count: receipt.foreign_key_blocker_fact_count,
+        conservative_blocker_count: receipt.conservative_blocker_count,
+        stable_primary_observations: receipt.stable_primary_observations,
+        provider_row_cap: receipt.provider_row_cap,
+        provider_byte_cap: receipt.provider_byte_cap,
+        response_body_sizes: receipt.response_body_sizes,
+    })
 }
 
 fn validate_graph_receipt(

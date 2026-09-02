@@ -495,7 +495,7 @@ duplicated, reordered, unsupported, malformed, version-drifted, or
 contradictory evidence fails closed.
 
 Only the aggregate-safe composition receipt is serializable. It binds the
-exact plan, target, catalog receipt/snapshot, graph receipt/graph/decision,
+exact plan, target, stable catalog-authority receipt projection/snapshot, graph receipt/graph/decision,
 classified relation, classified form, ordered primitive set, and selected
 decision evidence by SHA-256 plus primitive/allow counts. It contains no SQL,
 parameters, relation, account, or database identity. The opaque product retains
@@ -504,6 +504,13 @@ not parse SQL or create classifier authority: its relation and compound form
 must come from the separately reviewed exact classifier. It exposes no public
 tool, provider call, D1 execution, mutation admission, custody, deployment, or
 configuration effect, and the receipt alone never authorizes dispatch.
+The composer still validates the complete two-observation catalog receipt.
+Its approval digest deliberately excludes only the fresh observation-pair
+identity, which changes between dry-run and live collection, while retaining
+the exact query, normalized snapshot, fact counts, caps, normalized body sizes,
+and stable-read cardinality. Thus fresh physical reads converge only when the
+semantic catalog authority is unchanged; observation custody remains visible
+in the separate catalog receipt.
 
 The next internal recoverable-attempt boundary consumes only the verified
 canonical target and opaque exact-plan composition product. Before any later
