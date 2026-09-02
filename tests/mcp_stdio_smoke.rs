@@ -18138,7 +18138,9 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
     let mut dry_args = exact_args.clone();
     dry_args["dry_run"] = json!(true);
     let dry = mcp.call_tool(2, "d1_execute_write", dry_args);
-    let approved = structured_content(&dry)["approved_composition_sha256_required"]
+    let dry = structured_content(&dry);
+    assert_eq!(dry["ok"], json!(true), "{dry}");
+    let approved = dry["approved_composition_sha256_required"]
         .as_str()
         .expect("composition approval")
         .to_string();
@@ -18183,7 +18185,9 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
     let mut zero_dry_args = zero_args.clone();
     zero_dry_args["dry_run"] = json!(true);
     let zero_dry = mcp.call_tool(5, "d1_execute_write", zero_dry_args);
-    let zero_approved = structured_content(&zero_dry)["approved_composition_sha256_required"]
+    let zero_dry = structured_content(&zero_dry);
+    assert_eq!(zero_dry["ok"], json!(true), "{zero_dry}");
+    let zero_approved = zero_dry["approved_composition_sha256_required"]
         .as_str()
         .expect("zero-change composition approval")
         .to_string();
