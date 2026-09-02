@@ -5502,7 +5502,7 @@ mod tests {
     async fn spawn_single_raw_d1_database_mutation_response(
         response: Option<Vec<u8>>,
     ) -> (String, Arc<AtomicUsize>) {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind("127.0.0.1:0") // DevSkim: ignore DS162092 -- loopback-only unit-test fixture
             .await
             .expect("bind raw D1 database mutation fixture");
         let addr = listener.local_addr().expect("raw mutation fixture address");
@@ -5549,7 +5549,7 @@ mod tests {
                     .expect("write raw mutation response");
             }
         });
-        (format!("http://{addr}"), calls)
+        (format!("http://{addr}"), calls) // DevSkim: ignore DS137138 -- loopback-only unit-test fixture
     }
 
     fn refused_loopback_url(path: &str) -> String {
