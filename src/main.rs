@@ -1048,7 +1048,7 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use axum::body::{Body, to_bytes};
-    use axum::http::{Request, StatusCode, header::AUTHORIZATION};
+    use axum::http::{HeaderMap, Request, StatusCode, header::AUTHORIZATION};
     use axum::routing::get;
     use axum::{Json, Router};
     use jsonwebtoken::{EncodingKey, Header, encode};
@@ -1080,18 +1080,33 @@ mod tests {
     use cloudflare_mcp::server::CloudflareMcp;
 
     fn make_delegation_token(secret: &str, issuer: &str, audience: &str) -> String {
+        make_delegation_token_with_confirmation(secret, issuer, audience, None)
+    }
+
+    fn make_delegation_token_with_confirmation(
+        secret: &str,
+        issuer: &str,
+        audience: &str,
+        confirmation: Option<serde_json::Value>,
+    ) -> String {
         let exp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time")
             .as_secs()
             + 300;
-        let claims = json!({
+        let mut claims = json!({
             "exp": exp,
             "sub": "agent-test",
             "aud": audience,
             "iss": issuer,
             "jti": "test-jti-1"
         });
+        if let Some(confirmation) = confirmation {
+            claims
+                .as_object_mut()
+                .expect("delegation claims object")
+                .insert("cnf".to_string(), confirmation);
+        }
         encode(
             &Header::default(),
             &claims,
@@ -1392,6 +1407,71 @@ mod tests {
             .expect("response");
         assert_ne!(authenticated.status(), StatusCode::UNAUTHORIZED);
         assert_ne!(authenticated.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn sender_constrained_token_presented_as_bearer_fails_closed_without_leakage() {
+        let signing_material = fixture_material("delegation");
+        let confirmation_thumbprint = "fixture-confirmation-thumbprint";
+        let token = make_delegation_token_with_confirmation(
+            &signing_material,
+            "issuer.test",
+            "audience.test",
+            Some(json!({"jkt": confirmation_thumbprint})),
+        );
+
+        let authenticator =
+            Authenticator::new(test_config().auth_config).expect("test authenticator");
+        let error = match authenticator
+            .authenticate_token(&HeaderMap::new(), &token)
+            .await
+        {
+            Ok(_) => panic!("sender-constrained token must not enter the bearer-only boundary"),
+            Err(error) => error,
+        };
+        assert_eq!(error.decision_code(), "SENDER_CONSTRAINED_BEARER_TOKEN");
+
+        let response = test_router()
+            .await
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("host", "127.0.0.1")
+                    .header("content-type", "application/json")
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let challenge = response
+            .headers()
+            .get("www-authenticate")
+            .and_then(|value| value.to_str().ok())
+            .expect("WWW-Authenticate header")
+            .to_string();
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("response body");
+        let body = std::str::from_utf8(&body).expect("UTF-8 response body");
+
+        assert!(challenge.contains("error=\"invalid_token\""));
+        assert_eq!(body, "Invalid bearer token.");
+        for private_value in [
+            token.as_str(),
+            confirmation_thumbprint,
+            "sender_constrained",
+            "SENDER_CONSTRAINED_BEARER_TOKEN",
+            "cnf",
+        ] {
+            assert!(!challenge.contains(private_value));
+            assert!(!body.contains(private_value));
+        }
     }
 
     #[tokio::test]

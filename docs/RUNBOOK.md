@@ -29,6 +29,10 @@ Before using the server for production-like changes:
 - Enable MCP auth before any non-loopback bind. Set both
   `CLOUDFLARE_MCP_AUTH_RESOURCE_URL` and `CLOUDFLARE_MCP_AUTH_AUDIENCE` to
   explicit HTTPS URLs; non-loopback binds do not derive or accept HTTP values.
+- The current HTTP auth surface is Bearer-only. Ordinary Bearer tokens remain
+  supported, but any token carrying a `cnf` confirmation claim is rejected as
+  sender-constrained rather than accepted without proof of possession. Do not
+  present DPoP-bound tokens to this surface; DPoP is not implemented here.
 - Use least-privilege Cloudflare API tokens.
 - Keep secrets in environment variables or protected files outside the
   repository.
