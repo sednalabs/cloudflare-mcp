@@ -98,6 +98,23 @@ fn reserve_dispatch(fixture: &Fixture, state: &[u8]) -> D1DmlAttemptCustodyProdu
         .expect("dispatch reservation proposal")
 }
 
+#[test]
+fn durable_successor_validator_accepts_one_addition_and_rejects_replay_or_reverse() {
+    let fixture = fixture();
+    let prepared = prepare(&fixture);
+    let reserved = reserve_dispatch(&fixture, prepared.state_bytes());
+    validate_d1_dml_attempt_successor(prepared.state_bytes(), reserved.state_bytes())
+        .expect("Prepared to DispatchReserved is one exact durable successor");
+    assert!(
+        validate_d1_dml_attempt_successor(prepared.state_bytes(), prepared.state_bytes()).is_err(),
+        "exact replay is not a CAS successor"
+    );
+    assert!(
+        validate_d1_dml_attempt_successor(reserved.state_bytes(), prepared.state_bytes()).is_err(),
+        "reverse transition is not monotonic"
+    );
+}
+
 fn classification(
     result: Result<D1DmlAttemptCustodyProduct, D1DmlAttemptCustodyError>,
 ) -> D1DmlAttemptCustodyClassification {

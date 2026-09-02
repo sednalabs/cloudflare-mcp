@@ -330,6 +330,79 @@ pub(crate) fn inspect_d1_dml_attempt_state(
     product(state, D1DmlAttemptTransition::ExactReplay, None, true)
 }
 
+/// Validate one exact durable CAS successor using only the canonical incumbent
+/// and successor bytes. This is storage authority, not provider authority: it
+/// permits exactly one monotonic state-machine field addition and rejects
+/// replay, deletion, replacement, or immutable-binding drift.
+pub(crate) fn validate_d1_dml_attempt_successor(
+    expected: &[u8],
+    successor: &[u8],
+) -> Result<(), D1DmlAttemptCustodyError> {
+    inspect_d1_dml_attempt_state(expected)?;
+    inspect_d1_dml_attempt_state(successor)?;
+    let expected_state = serde_json::from_slice::<D1DmlAttemptState>(expected)
+        .expect("inspected incumbent attempt state is canonical JSON");
+    let successor_state = serde_json::from_slice::<D1DmlAttemptState>(successor)
+        .expect("inspected successor attempt state is canonical JSON");
+
+    let immutable_matches = expected_state.version == successor_state.version
+        && expected_state.operation == successor_state.operation
+        && expected_state.layout_version == successor_state.layout_version
+        && expected_state.layout_sha256 == successor_state.layout_sha256
+        && expected_state.target_key_sha256 == successor_state.target_key_sha256
+        && expected_state.execute_plan_sha256 == successor_state.execute_plan_sha256
+        && expected_state.composition_sha256 == successor_state.composition_sha256
+        && expected_state.composition_receipt_sha256 == successor_state.composition_receipt_sha256
+        && expected_state.operation_id_sha256 == successor_state.operation_id_sha256
+        && expected_state.execution_attempt_id_sha256
+            == successor_state.execution_attempt_id_sha256
+        && expected_state.provider_request_id_sha256 == successor_state.provider_request_id_sha256
+        && expected_state.attempt_binding_sha256 == successor_state.attempt_binding_sha256;
+    if !immutable_matches {
+        return Err(custody_error(
+            D1DmlAttemptCustodyClassification::ReplayConflict,
+            "attempt CAS successor changed immutable binding evidence",
+        ));
+    }
+
+    let dispatch_transition = expected_state.dispatch_reservations == 0
+        && successor_state.dispatch_reservations == 1
+        && expected_state.ambiguity == successor_state.ambiguity
+        && expected_state.provider_assertion == successor_state.provider_assertion
+        && expected_state.readback_assertion == successor_state.readback_assertion;
+    let additive_evidence_transition = expected_state.dispatch_reservations == 1
+        && successor_state.dispatch_reservations == 1
+        && [
+            option_addition(&expected_state.ambiguity, &successor_state.ambiguity),
+            option_addition(
+                &expected_state.provider_assertion,
+                &successor_state.provider_assertion,
+            ),
+            option_addition(
+                &expected_state.readback_assertion,
+                &successor_state.readback_assertion,
+            ),
+        ]
+        .into_iter()
+        .try_fold(0_u8, |count, addition| addition.map(|value| count + value))
+            == Some(1);
+    if !dispatch_transition && !additive_evidence_transition {
+        return Err(custody_error(
+            D1DmlAttemptCustodyClassification::ReplayConflict,
+            "attempt CAS successor was not one exact monotonic transition",
+        ));
+    }
+    Ok(())
+}
+
+fn option_addition<T: PartialEq>(expected: &Option<T>, successor: &Option<T>) -> Option<u8> {
+    match (expected, successor) {
+        (None, Some(_)) => Some(1),
+        (left, right) if left == right => Some(0),
+        _ => None,
+    }
+}
+
 /// Prepare the exact successor for a later atomic compare-and-exchange. This
 /// pure proposal is deliberately non-authorizing: only the separately reviewed
 /// durable adapter may compare the exact prior bytes, install the successor

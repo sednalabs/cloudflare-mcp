@@ -151,6 +151,12 @@ are added by the graph derivation.
    with zero provider mutations. Restore/activation operators must run the
    separate complete custody audit, which traverses all leaves and checks the
    three claimant namespaces against every attempt binding.
+   A scratch name binds the record digest, exact incumbent-state digest, and
+   canonical successor-state digest. An affected leaf may contain zero or one
+   rederived-valid scratch for a record; duplicate successors, a wrong or stale
+   predecessor, a mismatched successor body, or unsafe file identity blocks
+   before CAS. Rename consumes that audited identity and is followed by stable
+   leaf audit and exact successor readback.
    Live execution then recomputes the two-read authority under the permanent
    target guard and seals all three claimants to the exact full attempt binding.
    If the held guard changes after those two reads, the blocked

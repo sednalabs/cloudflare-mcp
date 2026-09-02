@@ -97,8 +97,13 @@ unknown, non-private, or malformed artifacts fail closed. The held target guard
 audits only affected leaves on the hot path. Before creating any claimant in a
 set, every affected leaf must have capacity for all missing permanent entries
 plus one CAS scratch entry; attempt creation applies the same reservation.
-Exact `.next.<digest>.<successor-digest>.json` scratch is crash-reconcilable,
-while any contradictory scratch stops execution. The separately bounded stable
+Exact `.next.<record-digest>.<predecessor-digest>.<successor-digest>.json`
+scratch is crash-reconcilable. Stable leaf audit permits at most one scratch
+per record, rederives its predecessor from the permanent incumbent and its
+successor from canonical scratch bytes, and rejects duplicate, stale,
+malformed, linked, or mismatched siblings. CAS consumes the audited file
+identity, renames it, and re-audits for zero remaining scratch plus exact
+successor readback. The separately bounded stable
 complete audit traverses every shard, verifies canonical placement and
 claimant/attempt cross-links, and is required by restore, activation, and any
 destructive target-wide custody workflow. The undeployed flat candidate layout

@@ -4979,10 +4979,32 @@ mod linux {
         Ok(Some(leaf))
     }
 
-    fn parse_dml_scratch_name(name: &str) -> Option<(&str, &str)> {
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct DmlScratchAudit {
+        name: String,
+        record_sha256: String,
+        predecessor_sha256: String,
+        successor_sha256: String,
+        file_identity: D1LeaseFileIdentity,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct DmlLeafAudit {
+        entry_count: usize,
+        scratches: BTreeMap<String, DmlScratchAudit>,
+    }
+
+    fn parse_dml_scratch_name(name: &str) -> Option<(&str, &str, &str)> {
         let value = name.strip_prefix(".next.")?.strip_suffix(".json")?;
-        let (digest, successor) = value.split_once('.')?;
-        (valid_dml_digest(digest) && valid_dml_digest(successor)).then_some((digest, successor))
+        let mut parts = value.split('.');
+        let record = parts.next()?;
+        let predecessor = parts.next()?;
+        let successor = parts.next()?;
+        (parts.next().is_none()
+            && valid_dml_digest(record)
+            && valid_dml_digest(predecessor)
+            && valid_dml_digest(successor))
+        .then_some((record, predecessor, successor))
     }
 
     fn audit_dml_leaf(
@@ -4990,15 +5012,17 @@ mod linux {
         kind: DmlLeafKind,
         prefix: &str,
         target_key_sha256: &str,
-    ) -> Result<usize, &'static str> {
+    ) -> Result<DmlLeafAudit, &'static str> {
         let mut names = directory_entry_names(leaf)?;
         names.sort();
+        let mut permanent_states = BTreeMap::new();
+        let mut scratch_candidates = Vec::new();
         for raw_name in &names {
             let name = std::str::from_utf8(raw_name)
                 .map_err(|_| "DML custody leaf contained a non-UTF-8 entry")?;
-            let (digest, scratch_sha256) =
-                if let Some((digest, successor)) = parse_dml_scratch_name(name) {
-                    (digest, Some(successor))
+            let (digest, scratch_binding) =
+                if let Some((record, predecessor, successor)) = parse_dml_scratch_name(name) {
+                    (record, Some((predecessor, successor)))
                 } else if let Some(digest) = name
                     .strip_suffix(".json")
                     .filter(|value| valid_dml_digest(value))
@@ -5010,9 +5034,9 @@ mod linux {
             if &digest[..4] != prefix {
                 return Err("DML custody artifact was placed in a non-canonical shard");
             }
-            let bytes = read_private_dml_state(leaf, name)?
+            let (file_identity, bytes) = read_private_dml_state_snapshot(leaf, name)?
                 .ok_or("DML custody artifact disappeared during leaf audit")?;
-            if scratch_sha256.is_some_and(|expected| sha256_bytes_hex(&bytes) != expected) {
+            if scratch_binding.is_some_and(|(_, successor)| sha256_bytes_hex(&bytes) != successor) {
                 return Err("DML CAS scratch name contradicted its successor bytes");
             }
             match kind {
@@ -5038,13 +5062,65 @@ mod linux {
                     }
                 }
             }
+            if let Some((predecessor, successor)) = scratch_binding {
+                if predecessor == successor {
+                    return Err("DML CAS scratch did not name a distinct successor");
+                }
+                scratch_candidates.push(DmlScratchAudit {
+                    name: name.to_string(),
+                    record_sha256: digest.to_string(),
+                    predecessor_sha256: predecessor.to_string(),
+                    successor_sha256: successor.to_string(),
+                    file_identity,
+                });
+            } else {
+                permanent_states.insert(digest.to_string(), bytes);
+            }
         }
         let mut stable_names = directory_entry_names(leaf)?;
         stable_names.sort();
         if stable_names != names {
             return Err("DML custody leaf changed during stable audit");
         }
-        Ok(names.len())
+        let mut scratches = BTreeMap::new();
+        for scratch in scratch_candidates {
+            let incumbent = permanent_states
+                .get(&scratch.record_sha256)
+                .ok_or("DML CAS scratch had no permanent incumbent record")?;
+            if sha256_bytes_hex(incumbent) != scratch.predecessor_sha256 {
+                return Err("DML CAS scratch contradicted the exact incumbent bytes");
+            }
+            let scratch_bytes = read_private_dml_state(leaf, &scratch.name)?
+                .ok_or("DML CAS scratch disappeared during authority validation")?;
+            match kind {
+                DmlLeafKind::Attempt => {
+                    crate::d1_dml_attempt_custody::validate_d1_dml_attempt_successor(
+                        incumbent,
+                        &scratch_bytes,
+                    )
+                    .map_err(|_| "DML attempt CAS scratch was not a canonical successor")?;
+                }
+                DmlLeafKind::Claimant(_) => {
+                    crate::d1_dml_identity_claimant::validate_d1_dml_identity_claimant_seal(
+                        incumbent,
+                        &scratch_bytes,
+                    )
+                    .map_err(|_| "DML claimant CAS scratch was not a canonical successor")?;
+                }
+            }
+            if scratches
+                .insert(scratch.record_sha256.clone(), scratch)
+                .is_some()
+            {
+                return Err(
+                    "DML custody leaf contained multiple CAS scratch successors for one record",
+                );
+            }
+        }
+        Ok(DmlLeafAudit {
+            entry_count: names.len(),
+            scratches,
+        })
     }
 
     fn preflight_dml_leaf_capacity(
@@ -5057,13 +5133,118 @@ mod linux {
         let leaf = open_dml_leaf(target, kind, digest, true)?
             .ok_or("DML custody leaf could not be installed")?;
         let prefix = &digest[..4];
-        let existing = audit_dml_leaf(&leaf, kind, prefix, target_key_sha256)?;
+        let existing = audit_dml_leaf(&leaf, kind, prefix, target_key_sha256)?.entry_count;
         if !dml_leaf_capacity_available(existing, missing_permanent_entries) {
             return Err(
                 "DML custody leaf lacks capacity for permanent entries plus one CAS scratch slot",
             );
         }
         Ok(())
+    }
+
+    fn dml_cas_scratch_name(record: &str, expected: &[u8], successor: &[u8]) -> String {
+        format!(
+            ".next.{record}.{}.{}.json",
+            sha256_bytes_hex(expected),
+            sha256_bytes_hex(successor)
+        )
+    }
+
+    fn prepare_dml_cas_scratch(
+        target: &fs::File,
+        leaf: &fs::File,
+        kind: DmlLeafKind,
+        record: &str,
+        target_key_sha256: &str,
+        expected: &[u8],
+        successor: &[u8],
+    ) -> Result<DmlScratchAudit, &'static str> {
+        let prefix = &record[..4];
+        let initial = audit_dml_leaf(leaf, kind, prefix, target_key_sha256)?;
+        let permanent_name = format!("{record}.json");
+        match read_private_dml_state(leaf, &permanent_name)? {
+            Some(incumbent) if incumbent == expected => {}
+            Some(_) => return Err("DML CAS found conflicting permanent incumbent bytes"),
+            None => return Err("DML CAS found no permanent incumbent state"),
+        }
+
+        let expected_name = dml_cas_scratch_name(record, expected, successor);
+        let expected_predecessor_sha256 = sha256_bytes_hex(expected);
+        let expected_successor_sha256 = sha256_bytes_hex(successor);
+        match initial.scratches.get(record) {
+            Some(scratch)
+                if scratch.name == expected_name
+                    && scratch.predecessor_sha256 == expected_predecessor_sha256
+                    && scratch.successor_sha256 == expected_successor_sha256 => {}
+            Some(_) => {
+                return Err("DML CAS found a contradictory incumbent-bound scratch successor");
+            }
+            None => {
+                preflight_dml_leaf_capacity(target, kind, record, target_key_sha256, 0)?;
+                create_private_dml_state(leaf, &expected_name, successor)?;
+            }
+        }
+
+        let prepared = audit_dml_leaf(leaf, kind, prefix, target_key_sha256)?;
+        let scratch = prepared
+            .scratches
+            .get(record)
+            .ok_or("DML CAS scratch was absent after exact preparation")?;
+        if scratch.name != expected_name
+            || scratch.predecessor_sha256 != expected_predecessor_sha256
+            || scratch.successor_sha256 != expected_successor_sha256
+        {
+            return Err("DML CAS prepared scratch identity contradicted the exact transition");
+        }
+        validate_named_private_file(leaf, &scratch.name, &scratch.file_identity)
+            .map_err(|_| "DML CAS prepared scratch changed before consumption")?;
+        match read_private_dml_state(leaf, &scratch.name)? {
+            Some(bytes) if bytes == successor => Ok(scratch.clone()),
+            _ => Err("DML CAS prepared scratch contradicted canonical successor bytes"),
+        }
+    }
+
+    fn install_dml_cas_scratch(
+        leaf: &fs::File,
+        kind: DmlLeafKind,
+        record: &str,
+        target_key_sha256: &str,
+        permanent_name: &str,
+        scratch: &DmlScratchAudit,
+        successor: &[u8],
+    ) -> Result<(), &'static str> {
+        let audited = audit_dml_leaf(leaf, kind, &record[..4], target_key_sha256)?;
+        let current = audited
+            .scratches
+            .get(record)
+            .ok_or("DML CAS scratch was absent immediately before rename")?;
+        if current != scratch {
+            return Err("DML CAS scratch identity changed before rename");
+        }
+        validate_named_private_file(leaf, &current.name, &current.file_identity)
+            .map_err(|_| "DML CAS audited scratch changed before rename")?;
+        let source = c_string_name(&current.name)?;
+        let destination = c_string_name(permanent_name)?;
+        let renamed = unsafe {
+            libc::renameat(
+                leaf.as_raw_fd(),
+                source.as_ptr(),
+                leaf.as_raw_fd(),
+                destination.as_ptr(),
+            )
+        };
+        if renamed != 0 {
+            return Err("DML CAS audited scratch successor could not be installed");
+        }
+        sync_d1_lease_directory(leaf).map_err(|_| "DML CAS successor directory sync failed")?;
+        let installed = audit_dml_leaf(leaf, kind, &record[..4], target_key_sha256)?;
+        if installed.scratches.contains_key(record) {
+            return Err("DML CAS scratch remained after successor rename");
+        }
+        match read_private_dml_state(leaf, permanent_name)? {
+            Some(readback) if readback == successor => Ok(()),
+            _ => Err("DML CAS readback contradicted the installed successor bytes"),
+        }
     }
 
     pub(super) fn dml_leaf_capacity_available(
@@ -5264,10 +5445,10 @@ mod linux {
         Ok(second)
     }
 
-    fn read_private_dml_state(
+    fn read_private_dml_state_snapshot(
         target: &fs::File,
         name: &str,
-    ) -> Result<Option<Vec<u8>>, &'static str> {
+    ) -> Result<Option<(D1LeaseFileIdentity, Vec<u8>)>, &'static str> {
         let named = match open_named_entry(target, name) {
             Ok(named) => named,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -5301,7 +5482,14 @@ mod linux {
         let bytes = read_held_file(&state)?;
         validate_named_private_file(target, name, &expected)
             .map_err(|_| "DML attempt state changed during readback")?;
-        Ok(Some(bytes))
+        Ok(Some((expected, bytes)))
+    }
+
+    fn read_private_dml_state(
+        target: &fs::File,
+        name: &str,
+    ) -> Result<Option<Vec<u8>>, &'static str> {
+        read_private_dml_state_snapshot(target, name).map(|state| state.map(|(_, bytes)| bytes))
     }
 
     pub(super) fn create_private_dml_state(
@@ -5379,56 +5567,28 @@ mod linux {
         let name = d1_dml_attempt_name(binding)?;
         let product = crate::d1_dml_attempt_custody::inspect_d1_dml_attempt_state(successor)
             .map_err(|_| "DML attempt successor was malformed before storage")?;
+        crate::d1_dml_attempt_custody::validate_d1_dml_attempt_successor(expected, successor)
+            .map_err(|_| "DML attempt successor was not the exact incumbent transition")?;
         let leaf = open_dml_leaf(target, DmlLeafKind::Attempt, binding, false)?
             .ok_or("DML attempt compare-and-exchange found no incumbent shard")?;
-        audit_dml_leaf(
+        let scratch = prepare_dml_cas_scratch(
+            target,
             &leaf,
             DmlLeafKind::Attempt,
-            &binding[..4],
+            binding,
             &product.receipt().target_key_sha256,
+            expected,
+            successor,
         )?;
-        match read_private_dml_state(&leaf, &name)? {
-            Some(incumbent) if incumbent == expected => {}
-            Some(_) => {
-                return Err("DML attempt compare-and-exchange found conflicting incumbent bytes");
-            }
-            None => return Err("DML attempt compare-and-exchange found no incumbent state"),
-        }
-        let successor_sha256 = sha256_bytes_hex(successor);
-        let temporary = format!(".next.{binding}.{successor_sha256}.json");
-        match read_private_dml_state(&leaf, &temporary)? {
-            Some(bytes) if bytes == successor => {}
-            Some(_) => return Err("DML attempt CAS scratch contradicted exact successor bytes"),
-            None => {
-                preflight_dml_leaf_capacity(
-                    target,
-                    DmlLeafKind::Attempt,
-                    binding,
-                    &product.receipt().target_key_sha256,
-                    0,
-                )?;
-                create_private_dml_state(&leaf, &temporary, successor)?;
-            }
-        }
-        let source = c_string_name(&temporary)?;
-        let destination = c_string_name(&name)?;
-        let renamed = unsafe {
-            libc::renameat(
-                leaf.as_raw_fd(),
-                source.as_ptr(),
-                leaf.as_raw_fd(),
-                destination.as_ptr(),
-            )
-        };
-        if renamed != 0 {
-            return Err("DML attempt compare-and-exchange successor could not be installed");
-        }
-        sync_d1_lease_directory(&leaf)
-            .map_err(|_| "DML attempt compare-and-exchange directory sync failed")?;
-        match read_private_dml_state(&leaf, &name)? {
-            Some(readback) if readback == successor => Ok(()),
-            _ => Err("DML attempt compare-and-exchange readback contradicted successor bytes"),
-        }
+        install_dml_cas_scratch(
+            &leaf,
+            DmlLeafKind::Attempt,
+            binding,
+            &product.receipt().target_key_sha256,
+            &name,
+            &scratch,
+            successor,
+        )
     }
 
     pub(super) fn read_d1_dml_identity_claimant(
@@ -5526,52 +5686,24 @@ mod linux {
             false,
         )?
         .ok_or("DML identity claimant compare-and-exchange found no incumbent shard")?;
-        audit_dml_leaf(
+        let scratch = prepare_dml_cas_scratch(
+            target,
             &leaf,
             DmlLeafKind::Claimant(namespace),
-            &identity_sha256[..4],
+            identity_sha256,
             &product.receipt().target_key_sha256,
+            expected,
+            successor,
         )?;
-        match read_private_dml_state(&leaf, &name)? {
-            Some(incumbent) if incumbent == expected => {}
-            Some(_) => return Err("DML identity claimant compare-and-exchange conflicted"),
-            None => return Err("DML identity claimant compare-and-exchange found no incumbent"),
-        }
-        let successor_sha256 = sha256_bytes_hex(successor);
-        let temporary = format!(".next.{identity_sha256}.{successor_sha256}.json");
-        match read_private_dml_state(&leaf, &temporary)? {
-            Some(bytes) if bytes == successor => {}
-            Some(_) => return Err("DML claimant CAS scratch contradicted exact successor bytes"),
-            None => {
-                preflight_dml_leaf_capacity(
-                    target,
-                    DmlLeafKind::Claimant(namespace),
-                    identity_sha256,
-                    &product.receipt().target_key_sha256,
-                    0,
-                )?;
-                create_private_dml_state(&leaf, &temporary, successor)?;
-            }
-        }
-        let source = c_string_name(&temporary)?;
-        let destination = c_string_name(&name)?;
-        let renamed = unsafe {
-            libc::renameat(
-                leaf.as_raw_fd(),
-                source.as_ptr(),
-                leaf.as_raw_fd(),
-                destination.as_ptr(),
-            )
-        };
-        if renamed != 0 {
-            return Err("DML identity claimant successor could not be installed");
-        }
-        sync_d1_lease_directory(&leaf)
-            .map_err(|_| "DML identity claimant directory sync failed")?;
-        match read_private_dml_state(&leaf, &name)? {
-            Some(readback) if readback == successor => Ok(()),
-            _ => Err("DML identity claimant readback contradicted successor bytes"),
-        }
+        install_dml_cas_scratch(
+            &leaf,
+            DmlLeafKind::Claimant(namespace),
+            identity_sha256,
+            &product.receipt().target_key_sha256,
+            &name,
+            &scratch,
+            successor,
+        )
     }
 
     #[cfg(test)]
@@ -5756,6 +5888,95 @@ mod tests {
     use std::time::Duration;
 
     #[cfg(target_os = "linux")]
+    struct DmlClaimantScratchFixture {
+        root: PathBuf,
+        guard: D1TargetMutationGuard,
+        set: crate::d1_dml_identity_claimant::D1DmlIdentityClaimantSet,
+        namespace: crate::d1_dml_identity_claimant::D1DmlIdentityNamespace,
+        digest: String,
+        pending: Vec<u8>,
+        bound: Vec<u8>,
+    }
+
+    #[cfg(target_os = "linux")]
+    fn dml_claimant_scratch_fixture(label: &str) -> DmlClaimantScratchFixture {
+        use crate::d1_dml_attempt_custody::D1DmlAttemptIdentities;
+        use crate::d1_dml_identity_claimant::{
+            D1DmlIdentityNamespace, derive_d1_dml_identity_claimant_set,
+        };
+        use crate::d1_target::normalize_d1_target;
+
+        let root = private_test_root(label);
+        let guard = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_execute_write",
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect("acquire target guard");
+        guard.ensure_d1_dml_custody_layout().expect("layout");
+        let target =
+            normalize_d1_target("acct-1", "123e4567-e89b-42d3-a456-426614174000").expect("target");
+        let set = derive_d1_dml_identity_claimant_set(
+            &target,
+            &"a".repeat(64),
+            D1DmlAttemptIdentities {
+                operation_id: "operation-scratch-fixture",
+                execution_attempt_id: "attempt-scratch-fixture",
+                provider_request_id: "provider-scratch-fixture",
+            },
+        )
+        .expect("claimant set");
+        let namespace = D1DmlIdentityNamespace::Operation;
+        let digest = set.identity_sha256(namespace).to_string();
+        let pending = set.pending(namespace).state_bytes().to_vec();
+        let bound = set
+            .bound(namespace, &"b".repeat(64))
+            .expect("bound claimant")
+            .state_bytes()
+            .to_vec();
+        guard
+            .create_d1_dml_identity_claimant(namespace, &digest, &pending)
+            .expect("install Pending claimant");
+        DmlClaimantScratchFixture {
+            root,
+            guard,
+            set,
+            namespace,
+            digest,
+            pending,
+            bound,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn claimant_scratch_name(record: &str, expected: &[u8], successor: &[u8]) -> String {
+        format!(
+            ".next.{record}.{}.{}.json",
+            sha256_bytes_hex(expected),
+            sha256_bytes_hex(successor)
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn install_claimant_scratch(
+        fixture: &DmlClaimantScratchFixture,
+        name: &str,
+        bytes: &[u8],
+    ) -> fs::File {
+        let leaf = linux::open_dml_leaf(
+            &fixture.guard.target,
+            linux::DmlLeafKind::Claimant(fixture.namespace),
+            &fixture.digest,
+            false,
+        )
+        .expect("open scratch leaf")
+        .expect("scratch leaf present");
+        linux::create_private_dml_state(&leaf, name, bytes).expect("install scratch fixture");
+        leaf
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn dml_identity_claimants_reconcile_partial_install_and_partial_seal() {
         use crate::d1_dml_attempt_custody::D1DmlAttemptIdentities;
@@ -5844,9 +6065,10 @@ mod tests {
                 .expect("open claimant leaf")
                 .expect("claimant leaf present");
                 let successor_sha256 = sha256_bytes_hex(bound.state_bytes());
+                let predecessor_sha256 = sha256_bytes_hex(restored.state_bytes());
                 linux::create_private_dml_state(
                     &leaf,
-                    &format!(".next.{digest}.{successor_sha256}.json"),
+                    &format!(".next.{digest}.{predecessor_sha256}.{successor_sha256}.json"),
                     bound.state_bytes(),
                 )
                 .expect("install exact crash scratch");
@@ -5977,6 +6199,232 @@ mod tests {
         assert!(!linux::dml_leaf_capacity_available(before, 1));
         assert_eq!(before, limit - 1, "failed preflight writes no entry");
         assert!(!linux::dml_leaf_capacity_available(usize::MAX, 1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dml_cas_scratch_crash_before_and_after_rename_converges_exactly_once() {
+        let fixture = dml_claimant_scratch_fixture("dml-scratch-crash");
+        let scratch_name = claimant_scratch_name(&fixture.digest, &fixture.pending, &fixture.bound);
+        install_claimant_scratch(&fixture, &scratch_name, &fixture.bound);
+
+        fixture
+            .guard
+            .compare_exchange_d1_dml_identity_claimant(
+                fixture.namespace,
+                &fixture.digest,
+                &fixture.pending,
+                &fixture.bound,
+            )
+            .expect("resume exact pre-rename scratch");
+        assert_eq!(
+            fixture
+                .guard
+                .read_d1_dml_identity_claimant(fixture.namespace, &fixture.digest)
+                .expect("read installed successor"),
+            Some(fixture.bound.clone())
+        );
+        assert!(
+            fixture
+                .guard
+                .compare_exchange_d1_dml_identity_claimant(
+                    fixture.namespace,
+                    &fixture.digest,
+                    &fixture.pending,
+                    &fixture.bound,
+                )
+                .is_err(),
+            "post-rename replay must not prepare a second scratch"
+        );
+        let leaf_path = fixture
+            .root
+            .join(&fixture.guard.target_name)
+            .join("dml-custody-v1/claimant/operation")
+            .join(&fixture.digest[..2])
+            .join(&fixture.digest[2..4]);
+        assert_eq!(
+            fs::read_dir(leaf_path)
+                .expect("read leaf")
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .ok()
+                        .and_then(|entry| entry.file_name().into_string().ok())
+                        .is_some_and(|name| name.starts_with(".next."))
+                })
+                .count(),
+            0
+        );
+        fs::remove_dir_all(fixture.root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dml_leaf_audit_rejects_duplicate_wrong_and_stale_scratch_authority() {
+        let duplicate = dml_claimant_scratch_fixture("dml-scratch-duplicate");
+        let alternative = duplicate
+            .set
+            .bound(duplicate.namespace, &"c".repeat(64))
+            .expect("alternative bound claimant")
+            .state_bytes()
+            .to_vec();
+        let first_name =
+            claimant_scratch_name(&duplicate.digest, &duplicate.pending, &duplicate.bound);
+        let second_name =
+            claimant_scratch_name(&duplicate.digest, &duplicate.pending, &alternative);
+        install_claimant_scratch(&duplicate, &first_name, &duplicate.bound);
+        install_claimant_scratch(&duplicate, &second_name, &alternative);
+        assert!(
+            duplicate
+                .guard
+                .read_d1_dml_identity_claimant(duplicate.namespace, &duplicate.digest)
+                .is_err(),
+            "two canonical successors for one record must be contradictory"
+        );
+        fs::remove_dir_all(duplicate.root).expect("duplicate cleanup");
+
+        let wrong_incumbent = dml_claimant_scratch_fixture("dml-scratch-wrong-incumbent");
+        let wrong_incumbent_name = format!(
+            ".next.{}.{}.{}.json",
+            wrong_incumbent.digest,
+            "d".repeat(64),
+            sha256_bytes_hex(&wrong_incumbent.bound)
+        );
+        install_claimant_scratch(
+            &wrong_incumbent,
+            &wrong_incumbent_name,
+            &wrong_incumbent.bound,
+        );
+        assert!(
+            wrong_incumbent
+                .guard
+                .read_d1_dml_identity_claimant(wrong_incumbent.namespace, &wrong_incumbent.digest,)
+                .is_err(),
+            "scratch predecessor must be the current permanent bytes"
+        );
+        fs::remove_dir_all(wrong_incumbent.root).expect("wrong incumbent cleanup");
+
+        let wrong_successor = dml_claimant_scratch_fixture("dml-scratch-wrong-successor");
+        let wrong_successor_name = format!(
+            ".next.{}.{}.{}.json",
+            wrong_successor.digest,
+            sha256_bytes_hex(&wrong_successor.pending),
+            "e".repeat(64)
+        );
+        install_claimant_scratch(
+            &wrong_successor,
+            &wrong_successor_name,
+            &wrong_successor.bound,
+        );
+        assert!(
+            wrong_successor
+                .guard
+                .read_d1_dml_identity_claimant(wrong_successor.namespace, &wrong_successor.digest,)
+                .is_err(),
+            "scratch successor digest must rederive from canonical bytes"
+        );
+        fs::remove_dir_all(wrong_successor.root).expect("wrong successor cleanup");
+
+        let stale = dml_claimant_scratch_fixture("dml-scratch-stale");
+        stale
+            .guard
+            .compare_exchange_d1_dml_identity_claimant(
+                stale.namespace,
+                &stale.digest,
+                &stale.pending,
+                &stale.bound,
+            )
+            .expect("install successor");
+        let stale_name = claimant_scratch_name(&stale.digest, &stale.pending, &stale.bound);
+        install_claimant_scratch(&stale, &stale_name, &stale.bound);
+        assert!(
+            stale
+                .guard
+                .read_d1_dml_identity_claimant(stale.namespace, &stale.digest)
+                .is_err(),
+            "scratch bound to a predecessor replaced by rename must be stale"
+        );
+        fs::remove_dir_all(stale.root).expect("stale cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dml_leaf_audit_rejects_malformed_and_non_private_scratch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let malformed_name = dml_claimant_scratch_fixture("dml-scratch-malformed-name");
+        install_claimant_scratch(&malformed_name, ".next.bad.json", &malformed_name.bound);
+        assert!(
+            malformed_name
+                .guard
+                .read_d1_dml_identity_claimant(malformed_name.namespace, &malformed_name.digest,)
+                .is_err()
+        );
+        fs::remove_dir_all(malformed_name.root).expect("malformed-name cleanup");
+
+        let malformed_body = dml_claimant_scratch_fixture("dml-scratch-malformed-body");
+        let malformed_bytes = b"null\n";
+        let malformed_body_name = claimant_scratch_name(
+            &malformed_body.digest,
+            &malformed_body.pending,
+            malformed_bytes,
+        );
+        install_claimant_scratch(&malformed_body, &malformed_body_name, malformed_bytes);
+        assert!(
+            malformed_body
+                .guard
+                .read_d1_dml_identity_claimant(malformed_body.namespace, &malformed_body.digest,)
+                .is_err()
+        );
+        fs::remove_dir_all(malformed_body.root).expect("malformed-body cleanup");
+
+        let unsafe_mode = dml_claimant_scratch_fixture("dml-scratch-mode");
+        let unsafe_name = claimant_scratch_name(
+            &unsafe_mode.digest,
+            &unsafe_mode.pending,
+            &unsafe_mode.bound,
+        );
+        let unsafe_leaf = install_claimant_scratch(&unsafe_mode, &unsafe_name, &unsafe_mode.bound);
+        let unsafe_path = unsafe_mode
+            .root
+            .join(&unsafe_mode.guard.target_name)
+            .join("dml-custody-v1/claimant/operation")
+            .join(&unsafe_mode.digest[..2])
+            .join(&unsafe_mode.digest[2..4])
+            .join(&unsafe_name);
+        fs::set_permissions(&unsafe_path, fs::Permissions::from_mode(0o640))
+            .expect("make scratch non-private");
+        assert!(
+            unsafe_mode
+                .guard
+                .read_d1_dml_identity_claimant(unsafe_mode.namespace, &unsafe_mode.digest)
+                .is_err()
+        );
+        drop(unsafe_leaf);
+        fs::remove_dir_all(unsafe_mode.root).expect("mode cleanup");
+
+        let hardlink = dml_claimant_scratch_fixture("dml-scratch-hardlink");
+        let hardlink_name =
+            claimant_scratch_name(&hardlink.digest, &hardlink.pending, &hardlink.bound);
+        install_claimant_scratch(&hardlink, &hardlink_name, &hardlink.bound);
+        let leaf_path = hardlink
+            .root
+            .join(&hardlink.guard.target_name)
+            .join("dml-custody-v1/claimant/operation")
+            .join(&hardlink.digest[..2])
+            .join(&hardlink.digest[2..4]);
+        fs::hard_link(
+            leaf_path.join(&hardlink_name),
+            leaf_path.join("linked-scratch"),
+        )
+        .expect("hardlink scratch fixture");
+        assert!(
+            hardlink
+                .guard
+                .read_d1_dml_identity_claimant(hardlink.namespace, &hardlink.digest)
+                .is_err()
+        );
+        fs::remove_dir_all(hardlink.root).expect("hardlink cleanup");
     }
 
     #[cfg(target_os = "linux")]
