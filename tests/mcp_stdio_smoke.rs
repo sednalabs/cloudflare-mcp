@@ -5152,7 +5152,7 @@ fn spawn_fake_d1_database_mutation_api(
 }
 
 fn spawn_fake_d1_execute_write_response_loss_api() -> (String, Arc<Mutex<Vec<Value>>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake D1 response-loss API");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake D1 response-loss API"); // DevSkim: ignore DS162092 -- loopback-only response-loss test fixture
     let addr = listener
         .local_addr()
         .expect("fake D1 response-loss API addr");
@@ -5216,7 +5216,7 @@ fn spawn_fake_d1_execute_write_response_loss_api() -> (String, Arc<Mutex<Vec<Val
                 .expect("write catalog response body");
         }
     });
-    (format!("http://{addr}"), requests)
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only response-loss test fixture
 }
 
 fn d1_catalog_relation_row(name: &str, schema_rowid: i64) -> Value {
