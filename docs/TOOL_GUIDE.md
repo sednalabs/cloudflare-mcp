@@ -182,8 +182,18 @@ are added by the graph derivation.
    operation last. Matching dry/live calls return identical plan bytes and
    `intended_plan_sha256`; `execution_evidence` separately reports unobserved
    dry state or live `created`/`already_present`, aggregate audit identity,
-   final match, and provider result. Delete confirmation binds this complete
-   static contract and reviewed reason, never an unknown runtime audit hash.
+   final match, and provider result. The shared local D1 database mutation
+   lifecycle maps token/validation/request-build failure to
+   `failed_before_dispatch` (`provider_calls=0`, `provider_mutations=0`) and
+   every attempted request without decoded success to
+   `uncertain_after_dispatch` (`provider_calls=1`, mutation unknown). Its closed
+   dispatch/response/body stages and optional HTTP status distinguish transport,
+   HTTP, body-read, and decoded-contract failures without inspecting error text.
+   The client performs one no-redirect attempt and never retries an ambiguous
+   rename/delete; only decoded success reports one call and one mutation. The
+   serialized receipt contains no token, header, or raw response body. Delete
+   confirmation binds this complete static contract and reviewed reason, never
+   an unknown runtime audit hash.
    An existing hostile or partial layout is never repaired. Absent
    retained/recovery layout, changed, unstable, over-budget, malformed,
    partial, orphaned, or otherwise reconciliation-required custody stops

@@ -7,6 +7,7 @@
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::cloudflare::d1_database_mutation::D1DatabaseMutationLifecycle;
 use crate::d1_dml_custody_layout::{
     D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_SHA256, D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_VERSION,
     D1_DML_CUSTODY_LAYOUT_NAME, D1_DML_CUSTODY_LAYOUT_SHA256, D1_DML_CUSTODY_LAYOUT_VERSION,
@@ -118,7 +119,8 @@ pub(crate) enum D1TargetWideRuntimeState {
     Matched,
     NotDispatched,
     Succeeded,
-    FailedOrUncertain,
+    FailedBeforeDispatch,
+    UncertainAfterDispatch,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -148,6 +150,8 @@ pub(crate) struct D1TargetWideProviderEvidence {
     pub(crate) outcome: D1TargetWideRuntimeState,
     pub(crate) provider_calls: u8,
     pub(crate) provider_mutations: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) lifecycle: Option<D1DatabaseMutationLifecycle>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -181,6 +185,7 @@ impl D1TargetWideExecutionEvidence {
                 outcome: D1TargetWideRuntimeState::NotDispatched,
                 provider_calls: 0,
                 provider_mutations: Some(0),
+                lifecycle: None,
             },
         }
     }
@@ -229,16 +234,22 @@ impl D1TargetWideExecutionEvidence {
         self.final_revalidation.exact_authorization_identity_matched = Some(false);
     }
 
-    pub(crate) fn provider_succeeded(&mut self) {
+    pub(crate) fn provider_succeeded(&mut self, lifecycle: D1DatabaseMutationLifecycle) {
         self.provider.outcome = D1TargetWideRuntimeState::Succeeded;
-        self.provider.provider_calls = 1;
-        self.provider.provider_mutations = Some(1);
+        self.provider.provider_calls = lifecycle.provider_calls();
+        self.provider.provider_mutations = lifecycle.provider_mutations();
+        self.provider.lifecycle = Some(lifecycle);
     }
 
-    pub(crate) fn provider_failed_or_uncertain(&mut self) {
-        self.provider.outcome = D1TargetWideRuntimeState::FailedOrUncertain;
-        self.provider.provider_calls = 1;
-        self.provider.provider_mutations = None;
+    pub(crate) fn provider_failed(&mut self, lifecycle: D1DatabaseMutationLifecycle) {
+        self.provider.outcome = if lifecycle.failed_before_dispatch() {
+            D1TargetWideRuntimeState::FailedBeforeDispatch
+        } else {
+            D1TargetWideRuntimeState::UncertainAfterDispatch
+        };
+        self.provider.provider_calls = lifecycle.provider_calls();
+        self.provider.provider_mutations = lifecycle.provider_mutations();
+        self.provider.lifecycle = Some(lifecycle);
     }
 }
 
@@ -376,7 +387,7 @@ mod tests {
         };
         live.audit_authorized(&authorization);
         live.revalidation_matched(&authorization);
-        live.provider_succeeded();
+        live.provider_succeeded(D1DatabaseMutationLifecycle::succeeded(200));
 
         assert_eq!(plan.plan_sha256, live.intended_plan_sha256);
         assert_eq!(live.local_layout.outcome, D1TargetWideRuntimeState::Created);
@@ -390,5 +401,35 @@ mod tests {
             Some(&authorization)
         );
         assert_eq!(live.provider.provider_mutations, Some(1));
+    }
+
+    #[test]
+    fn provider_lifecycle_maps_without_error_text_inference() {
+        let plan = delete_plan("retire synthetic fixture");
+        let mut before_dispatch = D1TargetWideExecutionEvidence::unobserved(&plan);
+        before_dispatch.provider_failed(D1DatabaseMutationLifecycle::pre_dispatch());
+        assert_eq!(
+            before_dispatch.provider.outcome,
+            D1TargetWideRuntimeState::FailedBeforeDispatch
+        );
+        assert_eq!(before_dispatch.provider.provider_calls, 0);
+        assert_eq!(before_dispatch.provider.provider_mutations, Some(0));
+
+        let mut after_dispatch = D1TargetWideExecutionEvidence::unobserved(&plan);
+        after_dispatch.provider_failed(D1DatabaseMutationLifecycle::body_read_failed(200, true));
+        assert_eq!(
+            after_dispatch.provider.outcome,
+            D1TargetWideRuntimeState::UncertainAfterDispatch
+        );
+        assert_eq!(after_dispatch.provider.provider_calls, 1);
+        assert_eq!(after_dispatch.provider.provider_mutations, None);
+        assert_eq!(
+            after_dispatch
+                .provider
+                .lifecycle
+                .expect("provider lifecycle")
+                .body_stage,
+            "partially_read"
+        );
     }
 }

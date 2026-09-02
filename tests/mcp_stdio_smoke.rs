@@ -5223,6 +5223,34 @@ fn spawn_fake_d1_database_mutation_api(
     spawn_fake_d1_database_mutation_api_with_guard_drift(expected_requests, None)
 }
 
+fn spawn_fake_d1_database_mutation_disconnect_api(
+    expected_requests: usize,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind disconnecting D1 API"); // DevSkim: ignore DS162092 -- loopback-only MCP test fixture
+    let addr = listener.local_addr().expect("disconnecting D1 API addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().take(expected_requests) {
+            let mut stream = stream.expect("disconnecting D1 API stream");
+            let (headers, body) = read_http_request(&mut stream);
+            let request_line = headers.lines().next().unwrap_or_default().to_string();
+            let mut request_parts = request_line.split_whitespace();
+            let method = request_parts.next().unwrap_or_default().to_string();
+            let path = request_parts.next().unwrap_or_default().to_string();
+            requests_for_thread
+                .lock()
+                .expect("disconnect request log")
+                .push(json!({
+                    "method": method,
+                    "path": path,
+                    "body_present": !body.is_empty(),
+                }));
+        }
+    });
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
+}
+
 fn spawn_fake_d1_database_mutation_api_with_guard_drift(
     expected_requests: usize,
     guard_to_displace_after_second_request: Option<PathBuf>,
@@ -18534,7 +18562,18 @@ fn d1_rename_database_uses_patch_through_stdio_boundary() {
     );
     assert_eq!(
         content["execution_evidence"]["provider"],
-        json!({"outcome": "succeeded", "provider_calls": 1, "provider_mutations": 1})
+        json!({
+            "outcome": "succeeded",
+            "provider_calls": 1,
+            "provider_mutations": 1,
+            "lifecycle": {
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 200,
+                "apply_status": "applied"
+            }
+        })
     );
 
     let second = mcp.call_tool(
@@ -18637,6 +18676,191 @@ fn d1_rename_database_reports_observed_layout_when_complete_audit_blocks_provide
         json!({"outcome": "not_dispatched", "provider_calls": 0, "provider_mutations": 0})
     );
     assert!(requests.lock().expect("request log lock").is_empty());
+
+    mcp.terminate();
+    fs::remove_dir_all(lease_root).expect("target guard cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn d1_target_wide_database_mutations_report_pre_dispatch_failure_with_zero_calls() {
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-d1-target-wide-pre-dispatch-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos()
+    ));
+    install_activated_manifest_root_without_dml_layout(&lease_root);
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        (
+            "CLOUDFLARE_MCP_API_BASE_URL",
+            "http://127.0.0.1:9".to_string(),
+        ),
+        ("CLOUDFLARE_API_TOKEN", String::new()),
+        ("CLOUDFLARE_MCP_API_TOKEN", String::new()),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+
+    let rename = structured_content(&mcp.call_tool(
+        2,
+        "d1_rename_database",
+        json!({
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "name": "renamed-db",
+            "dry_run": false
+        }),
+    ))
+    .clone();
+    assert_eq!(rename["ok"], json!(false), "{rename}");
+    assert_eq!(
+        rename["error"]["code"],
+        json!("cloudflare.config_missing_token")
+    );
+    assert_eq!(
+        rename["execution_evidence"]["provider"],
+        json!({
+            "outcome": "failed_before_dispatch",
+            "provider_calls": 0,
+            "provider_mutations": 0,
+            "lifecycle": {
+                "dispatch_stage": "pre_dispatch",
+                "response_stage": "not_received",
+                "body_stage": "not_read",
+                "http_status": null,
+                "apply_status": "rejected_before_apply"
+            }
+        })
+    );
+
+    let delete_dry = structured_content(&mcp.call_tool(
+        3,
+        "d1_delete_database",
+        json!({
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "dry_run": true,
+            "reason": "synthetic pre-dispatch proof"
+        }),
+    ))
+    .clone();
+    let token = delete_dry["required_confirmation_token"]
+        .as_str()
+        .expect("delete confirmation token")
+        .to_string();
+    let delete = structured_content(&mcp.call_tool(
+        4,
+        "d1_delete_database",
+        json!({
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "dry_run": false,
+            "confirmation_token": token,
+            "reason": "synthetic pre-dispatch proof"
+        }),
+    ))
+    .clone();
+    assert_eq!(delete["ok"], json!(false), "{delete}");
+    assert_eq!(
+        delete["error"]["code"],
+        json!("cloudflare.config_missing_token")
+    );
+    assert_eq!(
+        delete["execution_evidence"]["provider"],
+        rename["execution_evidence"]["provider"]
+    );
+
+    mcp.terminate();
+    fs::remove_dir_all(lease_root).expect("target guard cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn d1_target_wide_database_mutations_report_disconnect_as_uncertain_without_retry() {
+    let (base_url, requests) = spawn_fake_d1_database_mutation_disconnect_api(2);
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-d1-target-wide-disconnect-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos()
+    ));
+    install_activated_manifest_root_without_dml_layout(&lease_root);
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+
+    let rename = structured_content(&mcp.call_tool(
+        2,
+        "d1_rename_database",
+        json!({
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "name": "renamed-db",
+            "dry_run": false
+        }),
+    ))
+    .clone();
+    assert_eq!(rename["ok"], json!(false), "{rename}");
+    assert_eq!(rename["error"]["code"], json!("cloudflare.transport_error"));
+    assert_eq!(rename["error"]["retryable"], json!(false));
+    assert_eq!(
+        rename["execution_evidence"]["provider"],
+        json!({
+            "outcome": "uncertain_after_dispatch",
+            "provider_calls": 1,
+            "provider_mutations": null,
+            "lifecycle": {
+                "dispatch_stage": "attempted",
+                "response_stage": "not_received",
+                "body_stage": "not_read",
+                "http_status": null,
+                "apply_status": "uncertain_after_dispatch"
+            }
+        })
+    );
+
+    let delete_dry = structured_content(&mcp.call_tool(
+        3,
+        "d1_delete_database",
+        json!({
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "dry_run": true,
+            "reason": "synthetic disconnect proof"
+        }),
+    ))
+    .clone();
+    let token = delete_dry["required_confirmation_token"]
+        .as_str()
+        .expect("delete confirmation token")
+        .to_string();
+    let delete = structured_content(&mcp.call_tool(
+        4,
+        "d1_delete_database",
+        json!({
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "dry_run": false,
+            "confirmation_token": token,
+            "reason": "synthetic disconnect proof"
+        }),
+    ))
+    .clone();
+    assert_eq!(delete["ok"], json!(false), "{delete}");
+    assert_eq!(delete["error"]["code"], json!("cloudflare.transport_error"));
+    assert_eq!(
+        delete["execution_evidence"]["provider"],
+        rename["execution_evidence"]["provider"]
+    );
+    let requests = requests.lock().expect("disconnect request log");
+    assert_eq!(requests.len(), 2, "exactly one attempt per mutation");
+    assert_eq!(requests[0]["method"], json!("PATCH"));
+    assert_eq!(requests[1]["method"], json!("DELETE"));
 
     mcp.terminate();
     fs::remove_dir_all(lease_root).expect("target guard cleanup");
@@ -18769,7 +18993,18 @@ fn d1_delete_database_requires_token_and_deletes_through_stdio_boundary() {
     );
     assert_eq!(
         content["execution_evidence"]["provider"],
-        json!({"outcome": "succeeded", "provider_calls": 1, "provider_mutations": 1})
+        json!({
+            "outcome": "succeeded",
+            "provider_calls": 1,
+            "provider_mutations": 1,
+            "lifecycle": {
+                "dispatch_stage": "attempted",
+                "response_stage": "received",
+                "body_stage": "completely_read",
+                "http_status": 200,
+                "apply_status": "applied"
+            }
+        })
     );
     assert!(
         manifest_target_path(&lease_root)

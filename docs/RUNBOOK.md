@@ -135,7 +135,17 @@ return the same `intended_plan_sha256` and plan bytes. Runtime
 `execution_evidence` is separate: dry-run reports local custody `unobserved`,
 audit/revalidation unmaterialized, and zero local/provider effects; live reports
 `created` or `already_present`, the aggregate-safe audit identity, exact final
-match, and provider evidence. Delete consent is derived from the complete
+match, and provider evidence. Rename/delete share one D1-database-only client
+lifecycle. Token, validation, and request-build failures are
+`failed_before_dispatch` with zero provider calls and zero provider mutations.
+Once the single no-redirect request is attempted, transport loss, HTTP errors,
+body-read loss, and malformed or contradictory responses are
+`uncertain_after_dispatch` with one provider call and an unknown mutation
+count; response stages include only aggregate-safe body state and optional HTTP
+status. No such failure is retried. A decoded successful Cloudflare contract is
+`succeeded` with one call and one mutation. Returned errors contain the existing
+sanitized adapter error plus that typed lifecycle, never request headers,
+tokens, or raw response bodies. Delete consent is derived from the complete
 static plan, including its reason and provider request, rather than a future
 runtime audit digest. The layout step is local custody maintenance and declares
 no provider-dispatch authority. Retained and recovery workflows never install

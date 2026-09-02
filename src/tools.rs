@@ -3981,23 +3981,23 @@ impl CloudflareMcp {
             execution_evidence.revalidation_matched(&dml_custody_authorization);
             match self
                 .cloudflare
-                .rename_d1_database(account_id, database_id, name)
+                .rename_d1_database_with_lifecycle(account_id, database_id, name)
                 .await
             {
-                Ok(database) => {
-                    execution_evidence.provider_succeeded();
+                Ok(mutation) => {
+                    execution_evidence.provider_succeeded(mutation.lifecycle);
                     CallToolResult::structured(json!({
                         "ok": true,
                         "operation": "d1_rename_database",
                         "account_id": account_id,
                         "database_id": database_id,
                         "new_name": name,
-                        "database": database,
+                        "database": mutation.result,
                     }))
                 }
                 Err(err) => {
-                    execution_evidence.provider_failed_or_uncertain();
-                    adapter_error_result(err)
+                    execution_evidence.provider_failed(err.lifecycle);
+                    adapter_error_result(err.error)
                 }
             }
         };
@@ -4170,22 +4170,22 @@ impl CloudflareMcp {
             execution_evidence.revalidation_matched(&dml_custody_authorization);
             match self
                 .cloudflare
-                .delete_d1_database(account_id, database_id)
+                .delete_d1_database_with_lifecycle(account_id, database_id)
                 .await
             {
-                Ok(result) => {
-                    execution_evidence.provider_succeeded();
+                Ok(mutation) => {
+                    execution_evidence.provider_succeeded(mutation.lifecycle);
                     CallToolResult::structured(json!({
                         "ok": true,
                         "operation": "d1_delete_database",
                         "account_id": account_id,
                         "database_id": database_id,
-                        "result": result,
+                        "result": mutation.result,
                     }))
                 }
                 Err(err) => {
-                    execution_evidence.provider_failed_or_uncertain();
-                    adapter_error_result(err)
+                    execution_evidence.provider_failed(err.lifecycle);
+                    adapter_error_result(err.error)
                 }
             }
         };

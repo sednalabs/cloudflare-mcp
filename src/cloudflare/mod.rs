@@ -4,6 +4,7 @@ mod capabilities;
 pub mod client;
 #[allow(dead_code)] // staged internal provider-custody boundary; no public tool route yet
 pub(crate) mod d1_catalog;
+pub(crate) mod d1_database_mutation;
 #[allow(dead_code)] // staged low-level boundary; lifecycle consumers are intentionally out of scope
 pub(crate) mod d1_import_upload;
 mod email_routing;
