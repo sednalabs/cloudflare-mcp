@@ -120,6 +120,28 @@ pub(crate) struct D1CatalogEvidenceReceipt {
     pub(crate) response_body_sizes: [usize; 2],
 }
 
+/// Verifier-issued catalog product for downstream side-effect-free policy.
+///
+/// The accepted rows stay private to this crate and are available only through
+/// read-only accessors. Downstream policy therefore cannot construct this
+/// product from caller JSON or a generic D1 response while the aggregate
+/// receipt remains safe to serialize.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct D1VerifiedCatalogEvidence {
+    receipt: D1CatalogEvidenceReceipt,
+    rows: Vec<D1CatalogProjectionRow>,
+}
+
+impl D1VerifiedCatalogEvidence {
+    pub(crate) fn receipt(&self) -> &D1CatalogEvidenceReceipt {
+        &self.receipt
+    }
+
+    pub(crate) fn rows(&self) -> &[D1CatalogProjectionRow] {
+        &self.rows
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum D1CatalogEvidenceClassification {
@@ -173,12 +195,30 @@ struct D1CatalogReadMetadata {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(deny_unknown_fields)]
-struct D1CatalogProjectionRow {
+pub(crate) struct D1CatalogProjectionRow {
     object_type: String,
     object_name_hex: String,
     parent_name_hex: String,
     definition_is_null: u8,
     definition_hex: String,
+}
+
+impl D1CatalogProjectionRow {
+    pub(crate) fn object_type(&self) -> &str {
+        &self.object_type
+    }
+
+    pub(crate) fn object_name_hex(&self) -> &str {
+        &self.object_name_hex
+    }
+
+    pub(crate) fn parent_name_hex(&self) -> &str {
+        &self.parent_name_hex
+    }
+
+    pub(crate) fn definition_hex(&self) -> Option<&str> {
+        (self.definition_is_null == 0).then_some(self.definition_hex.as_str())
+    }
 }
 
 pub(crate) fn derive_d1_catalog_evidence_plan(
@@ -223,6 +263,19 @@ pub(crate) fn prove_d1_catalog_evidence(
     first: &D1CatalogObservationFrame<'_>,
     second: &D1CatalogObservationFrame<'_>,
 ) -> Result<D1CatalogEvidenceReceipt, D1CatalogEvidenceError> {
+    prove_d1_catalog_product(target, supplied_plan, expected_plan_sha256, first, second)
+        .map(|product| product.receipt)
+}
+
+/// Verify and retain the exact accepted projection for a downstream pure
+/// policy boundary. This is the only constructor for the opaque product.
+pub(crate) fn prove_d1_catalog_product(
+    target: &D1TargetIdentity,
+    supplied_plan: &D1CatalogEvidencePlan,
+    expected_plan_sha256: &str,
+    first: &D1CatalogObservationFrame<'_>,
+    second: &D1CatalogObservationFrame<'_>,
+) -> Result<D1VerifiedCatalogEvidence, D1CatalogEvidenceError> {
     if !canonical_sha256(expected_plan_sha256) {
         return Err(evidence_error(
             D1CatalogEvidenceClassification::PlanDigestInvalid,
@@ -269,7 +322,7 @@ pub(crate) fn prove_d1_catalog_evidence(
         ));
     }
 
-    Ok(D1CatalogEvidenceReceipt {
+    let receipt = D1CatalogEvidenceReceipt {
         version: D1_CATALOG_EVIDENCE_VERSION,
         operation: D1_CATALOG_EVIDENCE_OPERATION,
         target_key_sha256: derived_plan.target_key_sha256,
@@ -283,6 +336,10 @@ pub(crate) fn prove_d1_catalog_evidence(
         provider_row_cap: derived_plan.provider_row_cap,
         provider_byte_cap: derived_plan.provider_byte_cap,
         response_body_sizes: [first.body_size_bytes, second.body_size_bytes],
+    };
+    Ok(D1VerifiedCatalogEvidence {
+        receipt,
+        rows: first_payload.rows,
     })
 }
 

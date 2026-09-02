@@ -956,6 +956,30 @@ reachability belong to the separate graph-authority boundary. Physical read
 independence/EOF, execution, custody, provider admission, and public routing
 must not infer authority from the catalog receipt alone.
 
+The next internal boundary receives only the verifier-issued opaque catalog
+product, never generic D1 JSON or the aggregate receipt by itself. It derives a
+closed write graph for every catalog relation and insert/update/delete
+operation. The parser is intentionally modular and narrow: a bounded lexer,
+table/view plus foreign-key projection, trigger projection, and bounded graph
+traversal. Unsupported syntax, missing definitions or references, aliases, and
+limit overflow are terminal unavailable graph evidence rather than reasons to
+guess.
+
+Configure 1 to 64 exact reserved relation names for this pure derivation.
+SQLite ASCII case-insensitive duplicates and explicit `sqlite_*` or `_cf_*`
+aliases fail closed; those two families are reserved automatically when present
+in the accepted catalog. Configured relations must be present. The graph follows
+trigger writes, `AUTOINCREMENT` writes to `sqlite_sequence`, mutating foreign-key
+actions, replace-delete effects, and upsert-update effects. It marks an
+unhandled view operation unavailable, traverses cycles once per exact
+relation/operation node, and caps unique edges at 20,000.
+
+Only aggregate counts and digests are serializable. Exact names, definitions,
+edges, and per-node decisions stay in the opaque in-process product for the
+separate composition owner. There is no MCP invocation, provider read, DML
+planning, write admission, mutation, dispatch, retry, or deployment procedure
+for this graph slice.
+
 ## Safety Profiles
 
 ### Read-Only

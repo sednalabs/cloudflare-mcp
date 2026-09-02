@@ -396,6 +396,46 @@ sizes. Neither receipt parses or authorizes DDL, triggers, foreign keys,
 implicit writes, DML, provider admission, custody outside these exact reads, or
 any mutation. No public MCP tool currently exposes this staged contract.
 
+The verifier can also retain the accepted typed rows in an opaque crate-local
+catalog product. That product has no caller-JSON constructor: downstream pure
+policy receives exact rows only after the same two-frame verification, while
+the existing aggregate evidence receipt remains the serializable surface.
+
+The staged reserved-relation graph consumes only that verifier-issued product.
+It accepts 1 to 64 explicit reserved relation identities under SQLite ASCII
+case-insensitive equivalence and automatically reserves every catalog identity
+in the `sqlite_*` and `_cf_*` families. Explicit aliases of those automatic
+families, case aliases, missing configured relations, non-ASCII/control-bearing
+names, missing non-internal definitions, and unresolved references fail closed.
+
+Schema interpretation is split into a bounded lexer, relation/foreign-key
+projection, trigger projection, and graph traversal rather than a general SQL
+parser. The supported catalog grammar is unqualified `CREATE TABLE`,
+`CREATE VIEW ... AS SELECT|WITH`, and `CREATE TRIGGER` with table
+`BEFORE`/`AFTER` or view `INSTEAD OF` timing. Every accepted definition is
+ASCII, at most 512 KiB and at most 32,768 lexical tokens; comments, quoting,
+balanced parentheses, trigger `WHEN`, internal semicolons, and nested
+`CASE ... END` are consumed under the closed grammar. Unsupported or malformed
+definitions fail closed.
+
+The graph has one node for each table/view and `insert`, `update`, or `delete`
+operation. Trigger DML creates operation-specific edges; `REPLACE`, conflict
+`REPLACE`, and insert upsert-update paths retain their secondary delete/update
+effects. An insert into an `AUTOINCREMENT` table reaches the automatically
+reserved `sqlite_sequence` table. Foreign-key `CASCADE`, `SET NULL`, and
+`SET DEFAULT` create only the corresponding parent-update/parent-delete child
+write; `RESTRICT` and `NO ACTION` create no write edge. A view operation without
+an exact matching `INSTEAD OF` trigger is denied as unsupported. Traversal is
+cycle-safe and bounded to the verified relation nodes and at most 20,000 unique
+edges.
+
+The opaque graph product retains per-node allow/deny decisions for a separate
+future DML-composition boundary. Its serializable receipt contains only catalog
+and reserved-set digests, graph/decision digests, and aggregate object, node,
+edge, allow, and deny counts. It exposes no relation, trigger, SQL, or private
+target identity. This slice performs no DML-plan composition, provider
+dispatch, mutation, admission, custody, public tool routing, or retry.
+
 ## Structured payload details for complex tools
 
 For `effect_assertion_id=schema_create_objects_additive_seed_rows_v1` or its
