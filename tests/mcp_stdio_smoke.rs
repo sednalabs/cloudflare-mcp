@@ -5099,7 +5099,7 @@ fn spawn_fake_d1_database_mutation_api(
                     "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 ) if body_json["sql"]
                     .as_str()
-                    .is_some_and(|sql| sql.contains("schema_rows")) =>
+                    .is_some_and(|sql| sql.contains("schema_raw AS (")) =>
                 {
                     json!({
                         "success": true,
