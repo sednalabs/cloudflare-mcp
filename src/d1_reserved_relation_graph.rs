@@ -400,8 +400,14 @@ fn derive_from_verified_parts(
         &decisions,
         D1ReservedRelationDecision::DenyViewWriteSemanticsUnproven,
     );
-    let graph_sha256 = hash_serialized(&(&edges, &trigger_owned_relations, &view_relations));
-    let decision_sha256 = hash_serialized(&decisions);
+    let serialized_edges = edges
+        .iter()
+        .map(|(source, targets)| (source, targets.iter().collect::<Vec<_>>()))
+        .collect::<Vec<_>>();
+    let serialized_decisions = decisions.iter().collect::<Vec<_>>();
+    let graph_sha256 =
+        hash_serialized(&(serialized_edges, &trigger_owned_relations, &view_relations));
+    let decision_sha256 = hash_serialized(&serialized_decisions);
     let table_count = relations
         .values()
         .filter(|relation| relation.kind == RelationKind::Table)
