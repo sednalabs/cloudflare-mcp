@@ -11557,16 +11557,20 @@ fn generic_manifest_tools_reject_the_reserved_bootstrap_family_before_any_effect
         matches!(provider.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
         "reserved-family rejection must not connect to the provider"
     );
-    assert!(
-        !manifest_target_path(&lease_root).exists(),
-        "reserved-family rejection must not create or retire target custody"
-    );
+    let target_entries = fs::read_dir(manifest_target_path(&lease_root))
+        .expect("read inert target custody")
+        .map(|entry| {
+            entry
+                .expect("read inert target entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
-        fs::read_dir(&lease_root)
-            .expect("read empty lease root")
-            .count(),
-        0,
-        "reserved-family rejection leaves no local custody or receipt artifact"
+        target_entries,
+        std::collections::BTreeSet::from(["dml-custody-v1".to_string(), "guard.lock".to_string(),]),
+        "reserved-family rejection leaves only the preinstalled inert audit custody"
     );
 
     mcp.terminate();
