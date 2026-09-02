@@ -505,6 +505,44 @@ must come from the separately reviewed exact classifier. It exposes no public
 tool, provider call, D1 execution, mutation admission, custody, deployment, or
 configuration effect, and the receipt alone never authorizes dispatch.
 
+The next internal recoverable-attempt boundary consumes only the verified
+canonical target and opaque exact-plan composition product. Before any later
+provider adapter exists, the caller preallocates pairwise-distinct opaque
+operation, execution-attempt, and provider-request identities under the closed
+16-to-128-byte ASCII grammar. Custody hashes those identities immediately and
+binds them to the exact target, execute-plan digest, composition digest, and
+complete composition-receipt digest. Raw identities, SQL, parameters, relation,
+account, and database values never enter the serializable receipt or errors.
+
+The pure version-1 state artifact is exact canonical JSON with one trailing
+newline under a 16-KiB cap. It is a private persistence input for a later
+separately reviewed boundary, not provider or execution authority. Restore
+rejects absence where a state is required, oversized bytes, malformed JSON,
+duplicate or unknown fields, missing fields, noncanonical encoding, unsupported
+versions, malformed digests, phase/evidence contradictions, and any target,
+plan, composition, or identity drift. There is no permissive predecessor
+fallback. Exact pre-dispatch replay returns the same canonical state.
+
+Only `prepared -> dispatch_crossed` reports
+`dispatch_authorized_this_transition=true`. Its durable successor records one
+dispatch crossing and `do_not_redispatch_same_attempt`. A second crossing is
+quarantined as `reconciliation_required`; every later replay remains
+non-authorizing. Transport uncertainty and missing, incomplete, malformed, or
+contradictory responses enter the same no-redispatch state. Conflicting replay
+or conflicting incumbent evidence denies rather than replacing custody.
+
+Provider terminal evidence and independent readback evidence are separate
+typed, digest-bound slots and may arrive in either order. Neither slot, the
+custody file, nor a successful-looking response proves application alone. A
+successful changed/unchanged provider result plus expected-state readback
+converges on terminal `applied`; a terminal provider rejection plus absent-state
+readback converges on terminal `not_applied`. Crossed pairs remain
+`reconciliation_required`. The aggregate receipt exposes only phase,
+transition, retry decision, booleans, counts, classifications, caps, and exact
+digests. This stage owns no filesystem persistence, public tool route, provider
+or D1 request, readback query, automatic retry, admission, deployment, or
+configuration.
+
 ## Structured payload details for complex tools
 
 For `effect_assertion_id=schema_create_objects_additive_seed_rows_v1` or its

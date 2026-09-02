@@ -1054,6 +1054,40 @@ consume the opaque product only after its exact classifier has bound the SQL
 bytes to the supplied relation and compound form; a composition receipt by
 itself is never execution authority.
 
+The internal D1 DML attempt-custody stage is the next pure handoff. Supply only
+the verified canonical target, opaque exact-plan composition product, and three
+preallocated pairwise-distinct opaque identities for the operation,
+execution-attempt, and provider request. Each identity must already satisfy the
+closed 16-to-128-byte ASCII grammar. The stage hashes all three and binds them
+to the target, exact execution plan, composition, and complete composition
+receipt. Never substitute caller JSON, a serialized composition receipt, SQL,
+or a generic provider response.
+
+Persist the returned canonical private state only through the future reviewed
+custody boundary. Its version-1 bytes are capped at 16 KiB and include one
+trailing newline. On restore, require exact canonical bytes and reject missing,
+oversized, malformed, duplicate-keyed, unknown-field, incomplete, predecessor,
+digest-drifted, or internally contradictory evidence. An exact prepared replay
+converges without changing state. A conflicting target, plan, composition, or
+identity replay denies.
+
+Exactly one transition may authorize provider dispatch:
+`prepared -> dispatch_crossed`. Persist that successor before crossing the
+external boundary. Once it exists, the same attempt is permanently
+`do_not_redispatch_same_attempt`; a repeated crossing, transport uncertainty,
+or missing/incomplete/malformed/contradictory response becomes
+`reconciliation_required`. Do not infer that an unobserved response means the
+provider did not accept the request.
+
+Record terminal provider evidence and independently verified readback evidence
+in their separate typed slots. Either insertion order must converge on the same
+canonical terminal state. Provider success plus expected-state observation is
+terminal `applied`; terminal provider rejection plus absent-state readback is
+terminal `not_applied`. One slot alone is nonterminal, and a crossed pair stays
+under reconciliation. Receipts and errors are aggregate/content-free and do
+not authorize persistence, provider/D1 access, readback, retry, routing,
+admission, deployment, or configuration.
+
 ## Safety Profiles
 
 ### Read-Only
