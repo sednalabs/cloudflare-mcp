@@ -1059,8 +1059,9 @@ mod tests {
 
     #[test]
     fn post_provider_derivation_failures_preserve_whole_aggregate_evidence() {
+        let response_body_sha256 = hash_serialized(&"synthetic provider response");
         let provider_evidence = json!({
-            "response_body_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "response_body_sha256": response_body_sha256,
             "response_body_size_bytes": 42,
             "provider_lifecycle": {
                 "dispatch_stage": "attempted",
