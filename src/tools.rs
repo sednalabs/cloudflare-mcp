@@ -920,13 +920,13 @@ pub struct D1ExecuteWriteArgs {
     pub database_id: String,
     pub sql: String,
     /// Preallocated opaque operation identity. It is hashed before receipts.
-    #[schemars(length(min = 16, max = 128), regex(pattern = r"^[!-~]+$"))]
+    #[schemars(length(min = 16, max = 128), regex(pattern = r"^[A-Za-z0-9._:-]+$"))]
     pub operation_id: String,
     /// Preallocated opaque single-attempt identity. It is hashed before receipts.
-    #[schemars(length(min = 16, max = 128), regex(pattern = r"^[!-~]+$"))]
+    #[schemars(length(min = 16, max = 128), regex(pattern = r"^[A-Za-z0-9._:-]+$"))]
     pub execution_attempt_id: String,
     /// Preallocated opaque provider-request identity. It is hashed before receipts.
-    #[schemars(length(min = 16, max = 128), regex(pattern = r"^[!-~]+$"))]
+    #[schemars(length(min = 16, max = 128), regex(pattern = r"^[A-Za-z0-9._:-]+$"))]
     pub provider_request_id: String,
     /// Exact composition digest returned by dry-run; required for live execution.
     #[serde(default)]

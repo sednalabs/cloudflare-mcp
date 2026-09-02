@@ -16,7 +16,7 @@ use crate::d1_dml_attempt_custody::{
     D1DmlAttemptAmbiguity, D1DmlAttemptIdentities, D1DmlAttemptPhase,
     D1DmlProviderTerminalAssertion, D1DmlProviderTerminalClassification, prepare_d1_dml_attempt,
     prepare_d1_dml_dispatch_reservation_cas, record_d1_dml_attempt_ambiguity,
-    record_d1_dml_provider_terminal_assertion,
+    record_d1_dml_provider_terminal_assertion, valid_d1_dml_opaque_identity,
 };
 use crate::d1_dml_classifier::classify_d1_dml;
 use crate::d1_exact_plan_composition::compose_d1_exact_write_plan;
@@ -352,12 +352,13 @@ fn validate_opaque_identities(
         input.execution_attempt_id,
         input.provider_request_id,
     ];
-    if identities.iter().any(|value| {
-        !(16..=128).contains(&value.len()) || !value.bytes().all(|byte| matches!(byte, 0x21..=0x7e))
-    }) {
+    if identities
+        .iter()
+        .any(|value| !valid_d1_dml_opaque_identity(value))
+    {
         return Err((
             "d1.execute_write_opaque_identity_invalid",
-            "operation, execution-attempt and provider-request identities must each be 16..=128 bytes of printable ASCII without spaces",
+            "operation, execution-attempt and provider-request identities must each be 16..=128 ASCII letters, digits, '.', '_', ':' or '-'",
         ));
     }
     if identities
@@ -796,7 +797,7 @@ mod tests {
     }
 
     #[test]
-    fn opaque_identity_preflight_requires_graphic_ascii_and_pairwise_distinct_values() {
+    fn opaque_identity_preflight_matches_custody_grammar_and_requires_distinct_values() {
         fn input<'a>(
             operation_id: &'a str,
             execution_attempt_id: &'a str,
@@ -822,8 +823,8 @@ mod tests {
             )),
             Ok(())
         );
-        let minimum = "!".repeat(16);
-        let maximum = "~".repeat(128);
+        let minimum = "A".repeat(16);
+        let maximum = "z".repeat(128);
         assert_eq!(
             validate_opaque_identities(&input(&minimum, &maximum, "provider-fixture-0001")),
             Ok(())
@@ -833,6 +834,9 @@ mod tests {
             "identity has space",
             "identity-with-control\n",
             "identity-with-nonascii-é",
+            "operation!fixture-0001",
+            "operation/fixture-0001",
+            "operation@fixture-0001",
         ] {
             assert_eq!(
                 validate_opaque_identities(&input(
@@ -842,11 +846,11 @@ mod tests {
                 )),
                 Err((
                     "d1.execute_write_opaque_identity_invalid",
-                    "operation, execution-attempt and provider-request identities must each be 16..=128 bytes of printable ASCII without spaces"
+                    "operation, execution-attempt and provider-request identities must each be 16..=128 ASCII letters, digits, '.', '_', ':' or '-'"
                 ))
             );
         }
-        for invalid in ["!".repeat(15), "~".repeat(129)] {
+        for invalid in ["A".repeat(15), "z".repeat(129)] {
             assert_eq!(
                 validate_opaque_identities(&input(
                     &invalid,

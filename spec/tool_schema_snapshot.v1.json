@@ -1766,7 +1766,7 @@
             "description": "Preallocated opaque single-attempt identity. It is hashed before receipts.",
             "maxLength": 128,
             "minLength": 16,
-            "pattern": "^[!-~]+$",
+            "pattern": "^[A-Za-z0-9._:-]+$",
             "type": "string"
           },
           "max_rows": {
@@ -1782,7 +1782,7 @@
             "description": "Preallocated opaque operation identity. It is hashed before receipts.",
             "maxLength": 128,
             "minLength": 16,
-            "pattern": "^[!-~]+$",
+            "pattern": "^[A-Za-z0-9._:-]+$",
             "type": "string"
           },
           "params": {
@@ -1794,7 +1794,7 @@
             "description": "Preallocated opaque provider-request identity. It is hashed before receipts.",
             "maxLength": 128,
             "minLength": 16,
-            "pattern": "^[!-~]+$",
+            "pattern": "^[A-Za-z0-9._:-]+$",
             "type": "string"
           },
           "sql": {

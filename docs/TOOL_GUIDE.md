@@ -122,11 +122,12 @@ server authority: callers cannot weaken or replace it. Every configured root
 must exist in the stable structured catalog; automatic SQLite reserved roots
 are added by the graph derivation.
 
-1. Allocate three pairwise-distinct opaque identities of 16-128 graphic
-   printable ASCII bytes (`!` through `~`, with no spaces): operation,
-   execution attempt, and provider request. The public schema enforces the same
-   bounds and rejects unknown arguments. Never put recipient data, SQL,
-   relation names, or credentials in these identities.
+1. Allocate three pairwise-distinct opaque identities of 16-128 ASCII bytes
+   containing only letters, digits, `.`, `_`, `:`, or `-`: operation,
+   execution attempt, and provider request. The public schema and early
+   preflight enforce the same custody grammar and reject unknown arguments.
+   Never put recipient data, SQL, relation names, or credentials in these
+   identities.
 2. Call `d1_execute_write` with `dry_run=true`. It performs exactly two
    read-only primary catalog observations, classifies the exact SQL bytes,
    derives all direct and indirect write primitives, and returns the exact

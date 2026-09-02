@@ -18454,7 +18454,10 @@ fn d1_execute_write_preflight_schema_audit_and_zero_call_envelope_are_total() {
     ] {
         assert_eq!(schema["properties"][identity]["minLength"], json!(16));
         assert_eq!(schema["properties"][identity]["maxLength"], json!(128));
-        assert_eq!(schema["properties"][identity]["pattern"], json!("^[!-~]+$"));
+        assert_eq!(
+            schema["properties"][identity]["pattern"],
+            json!("^[A-Za-z0-9._:-]+$")
+        );
     }
 
     let discovery = mcp.call_tool(
@@ -18527,6 +18530,33 @@ fn d1_execute_write_preflight_schema_audit_and_zero_call_envelope_are_total() {
             {
                 let mut args = valid.clone();
                 args["operation_id"] = json!("operation has spaces");
+                args
+            },
+            "d1.execute_write_opaque_identity_invalid",
+        ),
+        (
+            "exclamation operation identity",
+            {
+                let mut args = valid.clone();
+                args["operation_id"] = json!("operation!fixture-0001");
+                args
+            },
+            "d1.execute_write_opaque_identity_invalid",
+        ),
+        (
+            "slash attempt identity",
+            {
+                let mut args = valid.clone();
+                args["execution_attempt_id"] = json!("attempt/fixture-0001");
+                args
+            },
+            "d1.execute_write_opaque_identity_invalid",
+        ),
+        (
+            "at-sign provider identity",
+            {
+                let mut args = valid.clone();
+                args["provider_request_id"] = json!("provider@fixture-0001");
                 args
             },
             "d1.execute_write_opaque_identity_invalid",
