@@ -602,6 +602,15 @@ struct StrictD1MigrationManifestEnvelope<T> {
     errors: Option<Value>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictD1DmlEnvelope {
+    success: bool,
+    result: Value,
+    errors: Value,
+    messages: Value,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct CloudflareApiError {
     code: Option<i64>,
@@ -4111,17 +4120,16 @@ fn decode_strict_d1_dml_envelope(body: &str) -> Result<CloudflareEnvelope<Value>
             "Treat the DML outcome as ambiguous; retain custody and do not replay the attempt.",
         ),
     })?;
-    let envelope: StrictD1MigrationManifestEnvelope<Value> = serde_json::from_value(value)
-        .map_err(|error| {
-            AdapterError::new(
-                "cloudflare.d1.execute_write_malformed_envelope",
-                format!("failed decoding strict D1 DML envelope: {error}"),
-                "Treat the DML outcome as ambiguous; retain custody and do not replay the attempt.",
-            )
-        })?;
+    let envelope: StrictD1DmlEnvelope = serde_json::from_value(value).map_err(|error| {
+        AdapterError::new(
+            "cloudflare.d1.execute_write_malformed_envelope",
+            format!("failed decoding strict D1 DML envelope: {error}"),
+            "Treat the DML outcome as ambiguous; retain custody and do not replay the attempt.",
+        )
+    })?;
     match envelope.errors {
-        Some(Value::Array(ref errors)) if errors.is_empty() => {}
-        Some(Value::Array(_)) => {
+        Value::Array(ref errors) if errors.is_empty() => {}
+        Value::Array(_) => {
             return Err(AdapterError::new(
                 "cloudflare.d1.execute_write_contradictory_envelope",
                 "Cloudflare DML envelope reported a non-empty errors array",
@@ -4136,6 +4144,16 @@ fn decode_strict_d1_dml_envelope(body: &str) -> Result<CloudflareEnvelope<Value>
             ));
         }
     }
+    match envelope.messages {
+        Value::Array(ref messages) if messages.is_empty() => {}
+        _ => {
+            return Err(AdapterError::new(
+                "cloudflare.d1.execute_write_malformed_envelope",
+                "Cloudflare DML envelope did not contain one exact empty messages array",
+                "Treat the DML outcome as ambiguous; retain custody and do not replay the attempt.",
+            ));
+        }
+    }
     if !envelope.success {
         return Err(AdapterError::new(
             "cloudflare.d1.execute_write_unsuccessful_envelope",
@@ -4145,7 +4163,7 @@ fn decode_strict_d1_dml_envelope(body: &str) -> Result<CloudflareEnvelope<Value>
     }
     Ok(CloudflareEnvelope {
         success: true,
-        result: envelope.result,
+        result: Some(envelope.result),
         errors: Vec::new(),
         messages: Vec::new(),
         result_info: None,
@@ -5178,7 +5196,7 @@ mod tests {
         D1MigrationProviderError, D1MigrationProviderErrorLocation,
         D1MigrationReconciliationReadLifecycle, DuplicateSafeJsonError,
         classify_d1_migration_provider_error, decode_json_rejecting_duplicate_object_keys,
-        decode_strict_d1_migration_manifest_envelope,
+        decode_strict_d1_dml_envelope, decode_strict_d1_migration_manifest_envelope,
         decode_strict_d1_migration_reconciliation_envelope, is_d1_sqlite_auth_error, path_segment,
         with_request_api_token_override, worker_listing_identity, worker_version_id,
         worker_version_page_metadata,
@@ -6236,6 +6254,54 @@ mod tests {
         assert_eq!(
             classify_d1_migration_provider_error(&provider_error_body, 1_024),
             None
+        );
+    }
+
+    #[test]
+    fn strict_d1_dml_envelope_rejects_top_level_and_messages_drift() {
+        let accepted = decode_strict_d1_dml_envelope(
+            r#"{"success":true,"result":[],"errors":[],"messages":[]}"#,
+        )
+        .expect("exact DML envelope");
+        assert!(accepted.success);
+        assert_eq!(accepted.result, Some(json!([])));
+        assert!(accepted.errors.is_empty());
+        assert!(accepted.messages.is_empty());
+
+        for body in [
+            r#"{"success":true,"result":[],"errors":[],"messages":[],"unexpected":true}"#,
+            r#"{"success":true,"result":[],"errors":[]}"#,
+            r#"{"success":true,"result":[],"errors":[],"messages":null}"#,
+            r#"{"success":true,"result":[],"errors":[],"messages":{}}"#,
+            r#"{"success":true,"result":[],"errors":[],"messages":[{"code":1}]}"#,
+            r#"{"success":true,"errors":[],"messages":[]}"#,
+            r#"{"success":true,"result":[],"messages":[]}"#,
+            r#"{"success":true,"result":[],"errors":null,"messages":[]}"#,
+        ] {
+            let error = decode_strict_d1_dml_envelope(body)
+                .expect_err("DML envelope drift must remain ambiguous");
+            assert_eq!(
+                error.code, "cloudflare.d1.execute_write_malformed_envelope",
+                "{body}"
+            );
+        }
+
+        let contradictory = decode_strict_d1_dml_envelope(
+            r#"{"success":true,"result":[],"errors":[{"code":1}],"messages":[]}"#,
+        )
+        .expect_err("non-empty errors contradict DML success");
+        assert_eq!(
+            contradictory.code,
+            "cloudflare.d1.execute_write_contradictory_envelope"
+        );
+
+        let duplicate = decode_strict_d1_dml_envelope(
+            r#"{"success":true,"result":[],"errors":[],"messages":[],"messages":[]}"#,
+        )
+        .expect_err("duplicate messages authority must fail closed");
+        assert_eq!(
+            duplicate.code,
+            "cloudflare.d1.execute_write_duplicate_object_key"
         );
     }
 

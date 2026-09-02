@@ -1738,6 +1738,7 @@
       "description": "Plan or reserve and dispatch one exact audited D1 row-write. Dry-run performs two stable primary catalog reads and returns the exact composition digest required for live execution. Live execution durably reserves one preallocated attempt before one provider request; replay or ambiguity never redispatches.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
         "properties": {
           "account_id": {
             "default": null,
@@ -1763,6 +1764,9 @@
           },
           "execution_attempt_id": {
             "description": "Preallocated opaque single-attempt identity. It is hashed before receipts.",
+            "maxLength": 128,
+            "minLength": 16,
+            "pattern": "^[!-~]+$",
             "type": "string"
           },
           "max_rows": {
@@ -1776,6 +1780,9 @@
           },
           "operation_id": {
             "description": "Preallocated opaque operation identity. It is hashed before receipts.",
+            "maxLength": 128,
+            "minLength": 16,
+            "pattern": "^[!-~]+$",
             "type": "string"
           },
           "params": {
@@ -1785,6 +1792,9 @@
           },
           "provider_request_id": {
             "description": "Preallocated opaque provider-request identity. It is hashed before receipts.",
+            "maxLength": 128,
+            "minLength": 16,
+            "pattern": "^[!-~]+$",
             "type": "string"
           },
           "sql": {

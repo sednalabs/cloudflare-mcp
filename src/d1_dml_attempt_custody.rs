@@ -859,9 +859,7 @@ fn all_state_digests_are_valid(state: &D1DmlAttemptState) -> bool {
 
 fn valid_opaque_identity(value: &str) -> bool {
     (MIN_OPAQUE_IDENTITY_BYTES..=MAX_OPAQUE_IDENTITY_BYTES).contains(&value.len())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+        && value.bytes().all(|byte| matches!(byte, 0x21..=0x7e))
 }
 
 fn valid_sha256(value: &str) -> bool {

@@ -41,6 +41,37 @@ pub(crate) struct D1ExecuteWritePlan {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct D1ExecuteWritePublicEvidence {
+    pub(crate) version: u8,
+    pub(crate) operation: &'static str,
+    pub(crate) target_key_sha256: String,
+    pub(crate) execution_session_sha256: String,
+    pub(crate) statement_kind: D1WriteStatementKind,
+    pub(crate) sql_sha256: String,
+    pub(crate) sql_size_bytes: usize,
+    pub(crate) params_sha256: String,
+    pub(crate) params_size_bytes: usize,
+    pub(crate) max_rows: usize,
+}
+
+impl D1ExecuteWritePlan {
+    pub(crate) fn public_evidence(&self) -> D1ExecuteWritePublicEvidence {
+        D1ExecuteWritePublicEvidence {
+            version: self.version,
+            operation: self.operation,
+            target_key_sha256: self.target_key_sha256.clone(),
+            execution_session_sha256: self.execution_session_sha256.clone(),
+            statement_kind: self.statement_kind,
+            sql_sha256: self.sql_sha256.clone(),
+            sql_size_bytes: self.sql_size_bytes,
+            params_sha256: self.params_sha256.clone(),
+            params_size_bytes: self.params_size_bytes,
+            max_rows: self.max_rows,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct D1ExecuteWriteOutcome {
     pub(crate) statement_kind: D1WriteStatementKind,
     pub(crate) changed_db: bool,
@@ -226,7 +257,7 @@ mod tests {
 
     use super::{
         D1WriteResultClassification, D1WriteStatementKind, classify_d1_execute_write_result,
-        derive_d1_execute_write_plan,
+        derive_d1_execute_write_plan, sha256_bytes_hex,
     };
 
     fn result(changed_db: bool, changes: u64, rows_written: u64) -> Value {
@@ -364,6 +395,56 @@ mod tests {
             ),
         ];
         assert!(variants.iter().all(|variant| variant != &baseline_hash));
+    }
+
+    #[test]
+    fn public_execution_evidence_is_aggregate_only_and_whole_object_stable() {
+        let account_id = "private-account-fixture";
+        let database_id = "123e4567-e89b-42d3-a456-426614174000";
+        let sql = "UPDATE private_relation SET private_value = ?";
+        let params = [json!("private-param")];
+        let params_bytes = serde_json::to_vec(&params).expect("serialize fixture params");
+        let (plan, _) = derive_d1_execute_write_plan(
+            account_id,
+            database_id,
+            &"a".repeat(64),
+            &"b".repeat(64),
+            D1WriteStatementKind::Update,
+            sql,
+            &params,
+            25,
+        );
+
+        let evidence = serde_json::to_value(plan.public_evidence())
+            .expect("serialize aggregate public evidence");
+        assert_eq!(
+            evidence,
+            json!({
+                "version": 2,
+                "operation": "d1_execute_write",
+                "target_key_sha256": "a".repeat(64),
+                "execution_session_sha256": "b".repeat(64),
+                "statement_kind": "UPDATE",
+                "sql_sha256": sha256_bytes_hex(sql.as_bytes()),
+                "sql_size_bytes": sql.len(),
+                "params_sha256": sha256_bytes_hex(&params_bytes),
+                "params_size_bytes": params_bytes.len(),
+                "max_rows": 25,
+            })
+        );
+        let rendered = evidence.to_string();
+        for private_value in [
+            account_id,
+            database_id,
+            sql,
+            "private_relation",
+            "private-param",
+        ] {
+            assert!(
+                !rendered.contains(private_value),
+                "public evidence leaked {private_value}: {rendered}"
+            );
+        }
     }
 
     #[test]

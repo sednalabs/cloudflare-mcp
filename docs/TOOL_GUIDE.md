@@ -122,9 +122,11 @@ server authority: callers cannot weaken or replace it. Every configured root
 must exist in the stable structured catalog; automatic SQLite reserved roots
 are added by the graph derivation.
 
-1. Allocate three pairwise-distinct opaque identities of 16-128 printable
-   ASCII bytes: operation, execution attempt, and provider request. Never put
-   recipient data, SQL, relation names, or credentials in these identities.
+1. Allocate three pairwise-distinct opaque identities of 16-128 graphic
+   printable ASCII bytes (`!` through `~`, with no spaces): operation,
+   execution attempt, and provider request. The public schema enforces the same
+   bounds and rejects unknown arguments. Never put recipient data, SQL,
+   relation names, or credentials in these identities.
 2. Call `d1_execute_write` with `dry_run=true`. It performs exactly two
    read-only primary catalog observations, classifies the exact SQL bytes,
    derives all direct and indirect write primitives, and returns the exact
@@ -144,6 +146,16 @@ are added by the graph derivation.
    custody and use the separately governed effect-specific recovery path. An
    ambiguous response, custody error, or replay never permits redispatch of the
    same attempt or provider request identity.
+
+Audit custody begins before account, database, and opaque-identity validation.
+Every handler-owned denial before provider access returns the same typed blocked
+envelope with zero provider calls and mutations. Public evidence contains only
+aggregate counts, sizes, hashes, phases, and decisions: it never returns raw
+account/database identities, opaque identities, SQL, params, or relation names.
+RMCP text and structured JSON are exact whole-payload equivalents after audit
+insertion. Provider DML responses must use the exact strict top-level envelope,
+including empty `errors` and `messages` arrays; unknown, duplicate, missing, or
+malformed fields remain ambiguous and never authorize replay.
 
 Local validation must use synthetic fixtures and a mock provider, never a live
 D1 database. Durable state is stored below the same operator-owned migration

@@ -5,7 +5,6 @@
 //! provider call. Ambiguous or merely provider-acknowledged attempts remain in
 //! durable custody for the separately owned recovery authority.
 
-use axum::http::request::Parts;
 use rmcp::model::CallToolResult;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -58,9 +57,7 @@ impl D1ProviderAccounting {
                 "provider_mutations".to_string(),
                 json!(self.completed_mutations),
             );
-            result.content = vec![rmcp::model::ContentBlock::text(
-                Value::Object(content.clone()).to_string(),
-            )];
+            synchronize_structured_text(&mut result);
         }
         result
     }
@@ -81,9 +78,36 @@ pub(crate) async fn execute_d1_write_lifecycle(
     client: &CloudflareClient,
     target: &D1TargetIdentity,
     input: D1ExecuteWriteLifecycleInput<'_>,
-    parts: Option<&Parts>,
+    audit: MutationAuditSession,
 ) -> CallToolResult {
-    let mutation_plan = MutationPlan::new(D1_EXECUTE_WRITE_OPERATION)
+    let mutation_plan = d1_execute_write_mutation_plan();
+    let mut result = execute_inner(client, target, input, &mutation_plan).await;
+    finalize_d1_execute_write_result(&mut result, audit);
+    result
+}
+
+pub(crate) fn finalize_d1_execute_write_zero_call_denial(
+    mut result: CallToolResult,
+    audit: MutationAuditSession,
+) -> CallToolResult {
+    let mut payload = result
+        .structured_content
+        .take()
+        .unwrap_or_else(|| json!({"ok": false}));
+    if !payload.is_object() {
+        payload = json!({"ok": false, "error": {"code": "d1.execute_write_invalid_preflight", "message": "D1 write preflight failed before provider access", "hint": "Correct the exact request and repeat dry-run."}});
+    }
+    if let Some(content) = payload.as_object_mut() {
+        content.insert("ok".to_string(), json!(false));
+    }
+    result.is_error = Some(true);
+    result.structured_content = Some(payload);
+    finalize_d1_execute_write_result(&mut result, audit);
+    result
+}
+
+fn d1_execute_write_mutation_plan() -> MutationPlan {
+    MutationPlan::new(D1_EXECUTE_WRITE_OPERATION)
         .step("collect_stable_catalog", false, json!({"observations": 2}))
         .step("compose_reserved_relation_authority", false, json!({}))
         .step(
@@ -95,14 +119,11 @@ pub(crate) async fn execute_d1_write_lifecycle(
             "submit_one_d1_dml_request",
             true,
             json!({"maximum_provider_mutations": 1}),
-        );
-    let audit = MutationAuditSession::start(
-        parts,
-        D1_EXECUTE_WRITE_OPERATION,
-        json!({"target_key_sha256": target.target_key_sha256()}),
-        input.dry_run,
-    );
-    let mut result = execute_inner(client, target, input, &mutation_plan).await;
+        )
+}
+
+fn finalize_d1_execute_write_result(result: &mut CallToolResult, audit: MutationAuditSession) {
+    normalize_zero_call_denial(result);
     let is_error = result.is_error.unwrap_or(false);
     let error_code = result
         .structured_content
@@ -117,8 +138,37 @@ pub(crate) async fn execute_d1_write_lifecycle(
             serde_json::to_value(&audit_record).expect("serializing mutation audit cannot fail"),
         );
     }
+    synchronize_structured_text(result);
     emit_mutation_audit_log(&audit_record);
-    result
+}
+
+fn normalize_zero_call_denial(result: &mut CallToolResult) {
+    let Some(Value::Object(content)) = result.structured_content.as_mut() else {
+        return;
+    };
+    if content.get("ok").and_then(Value::as_bool) != Some(false)
+        || content
+            .get("provider_calls")
+            .and_then(Value::as_u64)
+            .is_some_and(|calls| calls != 0)
+    {
+        return;
+    }
+    content.insert("operation".to_string(), json!(D1_EXECUTE_WRITE_OPERATION));
+    content.insert("status".to_string(), json!("blocked"));
+    content.insert("provider_calls".to_string(), json!(0));
+    content.insert("provider_mutations".to_string(), json!(0));
+    content.insert("automatic_retry_permitted".to_string(), json!(false));
+    content
+        .entry("mutation_plan".to_string())
+        .or_insert_with(|| json!(d1_execute_write_mutation_plan()));
+    content.entry("evidence".to_string()).or_insert(Value::Null);
+}
+
+fn synchronize_structured_text(result: &mut CallToolResult) {
+    if let Some(payload) = result.structured_content.as_ref() {
+        result.content = vec![rmcp::model::ContentBlock::text(payload.to_string())];
+    }
 }
 
 async fn execute_inner(
@@ -128,6 +178,9 @@ async fn execute_inner(
     mutation_plan: &MutationPlan,
 ) -> CallToolResult {
     let mut provider = D1ProviderAccounting::default();
+    if let Err((code, message)) = validate_opaque_identities(&input) {
+        return provider.apply(blocked(code, message, mutation_plan, None));
+    }
     let classified = match classify_d1_dml(input.sql) {
         Ok(classified) => classified,
         Err(error) => {
@@ -258,7 +311,7 @@ async fn execute_inner(
     };
     let base = json!({
         "operation": D1_EXECUTE_WRITE_OPERATION,
-        "execution_plan": execute_plan,
+        "execution_plan": execute_plan.public_evidence(),
         "execute_plan_sha256": execute_plan_sha256,
         "catalog_provider_custody": provider_catalog.receipt,
         "catalog_evidence": catalog.receipt(),
@@ -289,6 +342,36 @@ async fn execute_inner(
         return provider.apply(result);
     }
     execute_reserved_attempt(client, target, input, composition, guard, base, provider).await
+}
+
+fn validate_opaque_identities(
+    input: &D1ExecuteWriteLifecycleInput<'_>,
+) -> Result<(), (&'static str, &'static str)> {
+    let identities = [
+        input.operation_id,
+        input.execution_attempt_id,
+        input.provider_request_id,
+    ];
+    if identities.iter().any(|value| {
+        !(16..=128).contains(&value.len()) || !value.bytes().all(|byte| matches!(byte, 0x21..=0x7e))
+    }) {
+        return Err((
+            "d1.execute_write_opaque_identity_invalid",
+            "operation, execution-attempt and provider-request identities must each be 16..=128 bytes of printable ASCII without spaces",
+        ));
+    }
+    if identities
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        != 3
+    {
+        return Err((
+            "d1.execute_write_opaque_identity_duplicate",
+            "operation, execution-attempt and provider-request identities must be pairwise distinct",
+        ));
+    }
+    Ok(())
 }
 
 async fn execute_reserved_attempt(
@@ -698,6 +781,92 @@ mod tests {
                 })),
                 "{phase}"
             );
+            let content = serde_json::to_value(&result.content[0])
+                .expect("serialize accounted result content");
+            let text = content["text"].as_str().expect("accounted result text");
+            assert_eq!(
+                serde_json::from_str::<Value>(text).expect("accounted result text JSON"),
+                result
+                    .structured_content
+                    .clone()
+                    .expect("accounted payload"),
+                "{phase}"
+            );
         }
+    }
+
+    #[test]
+    fn opaque_identity_preflight_requires_graphic_ascii_and_pairwise_distinct_values() {
+        fn input<'a>(
+            operation_id: &'a str,
+            execution_attempt_id: &'a str,
+            provider_request_id: &'a str,
+        ) -> D1ExecuteWriteLifecycleInput<'a> {
+            D1ExecuteWriteLifecycleInput {
+                sql: "UPDATE example SET enabled = 1",
+                params: &[],
+                operation_id,
+                execution_attempt_id,
+                provider_request_id,
+                approved_composition_sha256: None,
+                dry_run: true,
+                max_rows: 100,
+            }
+        }
+
+        assert_eq!(
+            validate_opaque_identities(&input(
+                "operation-fixture-0001",
+                "attempt-fixture-0001",
+                "provider-fixture-0001"
+            )),
+            Ok(())
+        );
+        let minimum = "!".repeat(16);
+        let maximum = "~".repeat(128);
+        assert_eq!(
+            validate_opaque_identities(&input(&minimum, &maximum, "provider-fixture-0001")),
+            Ok(())
+        );
+        for invalid in [
+            "short",
+            "identity has space",
+            "identity-with-control\n",
+            "identity-with-nonascii-é",
+        ] {
+            assert_eq!(
+                validate_opaque_identities(&input(
+                    invalid,
+                    "attempt-fixture-0001",
+                    "provider-fixture-0001"
+                )),
+                Err((
+                    "d1.execute_write_opaque_identity_invalid",
+                    "operation, execution-attempt and provider-request identities must each be 16..=128 bytes of printable ASCII without spaces"
+                ))
+            );
+        }
+        for invalid in ["!".repeat(15), "~".repeat(129)] {
+            assert_eq!(
+                validate_opaque_identities(&input(
+                    &invalid,
+                    "attempt-fixture-0001",
+                    "provider-fixture-0001"
+                ))
+                .map_err(|(code, _)| code),
+                Err("d1.execute_write_opaque_identity_invalid")
+            );
+        }
+        assert_eq!(
+            validate_opaque_identities(&input(
+                "same-identity-fixture-0001",
+                "same-identity-fixture-0001",
+                "provider-fixture-0001"
+            )),
+            Err((
+                "d1.execute_write_opaque_identity_duplicate",
+                "operation, execution-attempt and provider-request identities must be pairwise distinct"
+            ))
+        );
     }
 }

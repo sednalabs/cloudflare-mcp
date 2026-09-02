@@ -531,6 +531,18 @@ fn structured_content(response: &Value) -> &Value {
         .unwrap_or_else(|| panic!("missing structuredContent in response: {response}"))
 }
 
+fn assert_tool_text_matches_structured(response: &Value) {
+    let structured = structured_content(response);
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("missing RMCP text content in response: {response}"));
+    assert_eq!(
+        serde_json::from_str::<Value>(text).expect("RMCP text content must be JSON"),
+        *structured,
+        "RMCP text and structuredContent must remain whole-payload equivalent"
+    );
+}
+
 fn text_resource_content(response: &Value) -> String {
     response["result"]["contents"]
         .as_array()
@@ -18204,8 +18216,9 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
     });
     let mut dry_args = exact_args.clone();
     dry_args["dry_run"] = json!(true);
-    let dry = mcp.call_tool(2, "d1_execute_write", dry_args);
-    let dry = structured_content(&dry);
+    let dry_response = mcp.call_tool(2, "d1_execute_write", dry_args);
+    assert_tool_text_matches_structured(&dry_response);
+    let dry = structured_content(&dry_response);
     assert_eq!(dry["ok"], json!(true), "{dry}");
     let approved = dry["approved_composition_sha256_required"]
         .as_str()
@@ -18216,11 +18229,20 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
     live_args["approved_composition_sha256"] = json!(approved);
     let replay_args = live_args.clone();
     let response = mcp.call_tool(3, "d1_execute_write", live_args);
+    assert_tool_text_matches_structured(&response);
     let content = structured_content(&response);
     assert_eq!(content["ok"], json!(true), "{content}");
-    assert_eq!(
-        content["evidence"]["execution_plan"]["database_id"],
-        json!("123e4567-e89b-42d3-a456-426614174000")
+    assert!(
+        content["evidence"]["execution_plan"]
+            .get("account_id")
+            .is_none(),
+        "{content}"
+    );
+    assert!(
+        content["evidence"]["execution_plan"]
+            .get("database_id")
+            .is_none(),
+        "{content}"
     );
     assert_eq!(
         content["evidence"]["execution_plan"]["target_key_sha256"],
@@ -18234,9 +18256,25 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
     assert_eq!(content["provider_mutations"], json!(1));
     assert_eq!(content["outcome"]["zero_change"], json!(false));
     assert_eq!(content["automatic_retry_permitted"], json!(false));
+    let rendered = content.to_string();
+    for private_value in [
+        "acct-1",
+        "123e4567-e89b-42d3-a456-426614174000",
+        "UPDATE example SET enabled = 1 WHERE id = 7",
+        "example",
+        "operation-fixture-0001",
+        "attempt-fixture-0001",
+        "provider-fixture-0001",
+    ] {
+        assert!(
+            !rendered.contains(private_value),
+            "public write evidence leaked {private_value}: {rendered}"
+        );
+    }
 
-    let replay = mcp.call_tool(4, "d1_execute_write", replay_args);
-    let replay = structured_content(&replay);
+    let replay_response = mcp.call_tool(4, "d1_execute_write", replay_args);
+    assert_tool_text_matches_structured(&replay_response);
+    let replay = structured_content(&replay_response);
     assert_eq!(replay["ok"], json!(false), "{replay}");
     assert_eq!(replay["status"], json!("reconciliation_required"));
     assert_eq!(replay["provider_calls"], json!(2));
@@ -18251,8 +18289,9 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
     });
     let mut zero_dry_args = zero_args.clone();
     zero_dry_args["dry_run"] = json!(true);
-    let zero_dry = mcp.call_tool(5, "d1_execute_write", zero_dry_args);
-    let zero_dry = structured_content(&zero_dry);
+    let zero_dry_response = mcp.call_tool(5, "d1_execute_write", zero_dry_args);
+    assert_tool_text_matches_structured(&zero_dry_response);
+    let zero_dry = structured_content(&zero_dry_response);
     assert_eq!(zero_dry["ok"], json!(true), "{zero_dry}");
     let zero_approved = zero_dry["approved_composition_sha256_required"]
         .as_str()
@@ -18261,8 +18300,9 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
     let mut zero_live_args = zero_args;
     zero_live_args["dry_run"] = json!(false);
     zero_live_args["approved_composition_sha256"] = json!(zero_approved);
-    let zero = mcp.call_tool(6, "d1_execute_write", zero_live_args);
-    let zero = structured_content(&zero);
+    let zero_response = mcp.call_tool(6, "d1_execute_write", zero_live_args);
+    assert_tool_text_matches_structured(&zero_response);
+    let zero = structured_content(&zero_response);
     assert_eq!(zero["ok"], json!(true), "{zero}");
     assert_eq!(zero["outcome"]["zero_change"], json!(true));
     assert_eq!(zero["outcome"]["changed_db"], json!(false));
@@ -18340,6 +18380,7 @@ fn d1_execute_write_response_loss_reports_the_completed_mutation_attempt() {
     let mut dry_args = exact_args.clone();
     dry_args["dry_run"] = json!(true);
     let dry_response = mcp.call_tool(2, "d1_execute_write", dry_args);
+    assert_tool_text_matches_structured(&dry_response);
     let dry = structured_content(&dry_response);
     assert_eq!(dry["ok"], json!(true), "{dry}");
     assert_eq!(dry["provider_calls"], json!(2), "{dry}");
@@ -18349,6 +18390,7 @@ fn d1_execute_write_response_loss_reports_the_completed_mutation_attempt() {
     live_args["dry_run"] = json!(false);
     live_args["approved_composition_sha256"] = dry["approved_composition_sha256_required"].clone();
     let lost_response = mcp.call_tool(3, "d1_execute_write", live_args);
+    assert_tool_text_matches_structured(&lost_response);
     let lost = structured_content(&lost_response);
     assert_eq!(lost["ok"], json!(false), "{lost}");
     assert_eq!(lost["status"], json!("reconciliation_required"));
@@ -18373,6 +18415,219 @@ fn d1_execute_write_response_loss_reports_the_completed_mutation_attempt() {
     drop(requests);
     mcp.terminate();
     fs::remove_dir_all(lease_root).expect("target guard cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn d1_execute_write_preflight_schema_audit_and_zero_call_envelope_are_total() {
+    let provider =
+        TcpListener::bind("127.0.0.1:0").expect("bind no-call D1 execute-write preflight witness"); // DevSkim: ignore DS162092 -- loopback-only no-call test witness
+    provider
+        .set_nonblocking(true)
+        .expect("make D1 provider witness nonblocking");
+    let provider_url = format!(
+        "http://{}",
+        provider.local_addr().expect("D1 provider witness address")
+    ); // DevSkim: ignore DS137138 -- loopback-only no-call test witness
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", provider_url),
+        ("CLOUDFLARE_MCP_DEFAULT_ACCOUNT_ID", String::new()),
+        (
+            "CLOUDFLARE_MCP_D1_RESERVED_RELATIONS",
+            "protected".to_string(),
+        ),
+    ]);
+
+    let listed = mcp.request(2, "tools/list", json!({}));
+    let listed_tool = listed["result"]["tools"]
+        .as_array()
+        .and_then(|tools| {
+            tools
+                .iter()
+                .find(|tool| tool["name"] == json!("d1_execute_write"))
+        })
+        .expect("listed d1_execute_write schema");
+    let schema = &listed_tool["inputSchema"];
+    assert_eq!(schema["additionalProperties"], json!(false), "{schema}");
+    for identity in [
+        "operation_id",
+        "execution_attempt_id",
+        "provider_request_id",
+    ] {
+        assert_eq!(schema["properties"][identity]["minLength"], json!(16));
+        assert_eq!(schema["properties"][identity]["maxLength"], json!(128));
+        assert_eq!(schema["properties"][identity]["pattern"], json!("^[!-~]+$"));
+    }
+
+    let discovery = mcp.call_tool(
+        3,
+        "find_tools",
+        json!({
+            "query": "d1 execute write",
+            "group": "d1",
+            "read_only": false,
+            "limit": 20,
+            "include_schema": true
+        }),
+    );
+    assert_eq!(
+        structured_content(&discovery)["schemas"]["d1_execute_write"],
+        *listed_tool,
+        "deferred catalog schema must equal tools/list exactly"
+    );
+
+    let valid = json!({
+        "account_id": "acct-1",
+        "database_id": "123e4567-e89b-42d3-a456-426614174000",
+        "sql": "UPDATE example SET enabled = 1",
+        "operation_id": "operation-fixture-0001",
+        "execution_attempt_id": "attempt-fixture-0001",
+        "provider_request_id": "provider-fixture-0001",
+        "dry_run": true
+    });
+    let cases = [
+        (
+            "missing account",
+            {
+                let mut args = valid.clone();
+                args.as_object_mut()
+                    .expect("args object")
+                    .remove("account_id");
+                args
+            },
+            "d1.execute_write_account_id_required",
+        ),
+        (
+            "invalid account",
+            {
+                let mut args = valid.clone();
+                args["account_id"] = json!(" acct-1");
+                args
+            },
+            "d1.invalid_target_identity",
+        ),
+        (
+            "invalid database",
+            {
+                let mut args = valid.clone();
+                args["database_id"] = json!("not-a-canonical-database-id");
+                args
+            },
+            "d1.invalid_target_identity",
+        ),
+        (
+            "short operation identity",
+            {
+                let mut args = valid.clone();
+                args["operation_id"] = json!("short");
+                args
+            },
+            "d1.execute_write_opaque_identity_invalid",
+        ),
+        (
+            "spaced operation identity",
+            {
+                let mut args = valid.clone();
+                args["operation_id"] = json!("operation has spaces");
+                args
+            },
+            "d1.execute_write_opaque_identity_invalid",
+        ),
+        (
+            "duplicate operation identity",
+            {
+                let mut args = valid.clone();
+                args["execution_attempt_id"] = args["operation_id"].clone();
+                args
+            },
+            "d1.execute_write_opaque_identity_duplicate",
+        ),
+    ];
+
+    for (index, (label, args, expected_code)) in cases.into_iter().enumerate() {
+        let response = mcp.call_tool(10 + index as u64, "d1_execute_write", args);
+        let content = structured_content(&response);
+        assert_eq!(
+            content,
+            &json!({
+                "ok": false,
+                "operation": "d1_execute_write",
+                "status": "blocked",
+                "provider_calls": 0,
+                "provider_mutations": 0,
+                "automatic_retry_permitted": false,
+                "error": content["error"].clone(),
+                "audit": content["audit"].clone(),
+                "mutation_plan": content.get("mutation_plan").cloned().unwrap_or(Value::Null),
+                "evidence": content.get("evidence").cloned().unwrap_or(Value::Null),
+            }),
+            "{label}: zero-call denial envelope drifted: {content}"
+        );
+        assert_eq!(content["error"]["code"], json!(expected_code), "{label}");
+        assert_eq!(content["audit"]["action"], json!("d1_execute_write"));
+        assert_eq!(content["audit"]["outcome"], json!("error"));
+        assert_eq!(
+            content["audit"]["error_code"],
+            json!(expected_code),
+            "{label}"
+        );
+        assert_tool_text_matches_structured(&response);
+        assert!(
+            matches!(provider.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "{label} must not connect to the provider"
+        );
+    }
+
+    let mut guard_args = valid.clone();
+    guard_args["dry_run"] = json!(false);
+    let guard_denial = mcp.call_tool(25, "d1_execute_write", guard_args);
+    let guard_content = structured_content(&guard_denial);
+    assert_eq!(guard_content["ok"], json!(false), "{guard_content}");
+    assert_eq!(guard_content["operation"], json!("d1_execute_write"));
+    assert_eq!(guard_content["status"], json!("blocked"));
+    assert_eq!(guard_content["provider_calls"], json!(0));
+    assert_eq!(guard_content["provider_mutations"], json!(0));
+    assert_eq!(
+        guard_content["error"]["code"],
+        json!("d1.target_guard_root_unconfigured")
+    );
+    assert_eq!(
+        guard_content["audit"]["error_code"],
+        json!("d1.target_guard_root_unconfigured")
+    );
+    assert!(
+        guard_content["mutation_plan"].is_object(),
+        "{guard_content}"
+    );
+    assert_eq!(guard_content["evidence"], Value::Null);
+    assert_tool_text_matches_structured(&guard_denial);
+    assert!(
+        matches!(provider.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "shared guard zero-call denial must not connect to the provider"
+    );
+
+    let unknown = mcp.call_tool(30, "d1_execute_write", {
+        let mut args = valid;
+        args["unexpected"] = json!("must be rejected");
+        args
+    });
+    assert_eq!(unknown["result"]["isError"], json!(true), "{unknown}");
+    assert!(
+        unknown["result"]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("unknown field `unexpected`")),
+        "unknown input fields must fail at strict argument decoding: {unknown}"
+    );
+    assert!(
+        unknown["result"].get("structuredContent").is_none(),
+        "framework-owned strict argument rejection must not invent a handler payload: {unknown}"
+    );
+    assert!(
+        matches!(provider.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "strict argument rejection must not connect to the provider"
+    );
+
+    mcp.terminate();
 }
 
 #[cfg(unix)]

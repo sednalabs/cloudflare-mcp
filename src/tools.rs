@@ -38,7 +38,11 @@ use crate::cloudflare::{
     AccessAppUpsertRequest, AccessPolicyWrite, BulkRedirectItemWrite, CacheRule, CacheRuleset,
     DnsRecordUpsertRequest, PagesDeploymentTriggerRequest, with_request_api_token_override,
 };
-use crate::d1_execute_write_lifecycle::{D1ExecuteWriteLifecycleInput, execute_d1_write_lifecycle};
+use crate::d1_execute_write::D1_EXECUTE_WRITE_OPERATION;
+use crate::d1_execute_write_lifecycle::{
+    D1ExecuteWriteLifecycleInput, execute_d1_write_lifecycle,
+    finalize_d1_execute_write_zero_call_denial,
+};
 use crate::d1_migration_bootstrap::{
     D1_BOOTSTRAP_LEASE_FAMILY, D1_BOOTSTRAP_OPERATION, D1BootstrapExecutionInput,
     d1_bootstrap_mutation_plan, d1_bootstrap_mutation_target,
@@ -909,16 +913,20 @@ pub struct PagesEnsureDomainArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct D1ExecuteWriteArgs {
     #[serde(default)]
     pub account_id: Option<String>,
     pub database_id: String,
     pub sql: String,
     /// Preallocated opaque operation identity. It is hashed before receipts.
+    #[schemars(length(min = 16, max = 128), regex(pattern = r"^[!-~]+$"))]
     pub operation_id: String,
     /// Preallocated opaque single-attempt identity. It is hashed before receipts.
+    #[schemars(length(min = 16, max = 128), regex(pattern = r"^[!-~]+$"))]
     pub execution_attempt_id: String,
     /// Preallocated opaque provider-request identity. It is hashed before receipts.
+    #[schemars(length(min = 16, max = 128), regex(pattern = r"^[!-~]+$"))]
     pub provider_request_id: String,
     /// Exact composition digest returned by dry-run; required for live execution.
     #[serde(default)]
@@ -4409,16 +4417,39 @@ impl CloudflareMcp {
         Parameters(args): Parameters<D1ExecuteWriteArgs>,
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, crate::McpError> {
-        if let Some(account_id) = args.account_id.as_deref()
-            && let Err(result) = normalize_d1_target(account_id, &args.database_id)
+        let request_target_bytes =
+            serde_json::to_vec(&(args.account_id.as_deref(), args.database_id.as_str()))
+                .expect("serializing the D1 request target cannot fail");
+        let mut audit = MutationAuditSession::start(
+            Some(&parts),
+            D1_EXECUTE_WRITE_OPERATION,
+            json!({"request_target_sha256": sha256_bytes_hex(&request_target_bytes)}),
+            args.dry_run,
+        );
+        let resolved_account_id = match args
+            .account_id
+            .as_deref()
+            .or(self.default_account_id.as_deref())
         {
-            return Ok(result);
-        }
-        let resolved_account_id = resolve_account_id(self, args.account_id.as_deref())?;
+            Some(account_id) => account_id,
+            None => {
+                return Ok(finalize_d1_execute_write_zero_call_denial(
+                    invalid_argument_result(
+                        "d1.execute_write_account_id_required",
+                        "account_id is required for D1 write planning",
+                        "Provide the exact Cloudflare account_id or configure CLOUDFLARE_MCP_DEFAULT_ACCOUNT_ID.",
+                    ),
+                    audit,
+                ));
+            }
+        };
         let target = match normalize_d1_target(resolved_account_id, &args.database_id) {
             Ok(target) => target,
-            Err(result) => return Ok(result),
+            Err(result) => {
+                return Ok(finalize_d1_execute_write_zero_call_denial(result, audit));
+            }
         };
+        audit.set_target(json!({"target_key_sha256": target.target_key_sha256()}));
         let max_rows = args.max_rows.unwrap_or(100).clamp(1, 1000);
         Ok(execute_d1_write_lifecycle(
             &self.cloudflare,
@@ -4433,7 +4464,7 @@ impl CloudflareMcp {
                 dry_run: args.dry_run,
                 max_rows,
             },
-            Some(&parts),
+            audit,
         )
         .await)
     }
