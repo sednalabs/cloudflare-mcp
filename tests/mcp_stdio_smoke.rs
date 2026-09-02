@@ -18237,11 +18237,12 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
 #[cfg(unix)]
 #[test]
 fn d1_execute_write_compound_classifier_denials_are_pre_provider() {
-    let provider = TcpListener::bind("127.0.0.1:0").expect("bind no-call D1 provider witness");
+    let provider = TcpListener::bind("127.0.0.1:0").expect("bind no-call D1 provider witness"); // DevSkim: ignore DS162092 -- loopback-only no-call test witness
     provider
         .set_nonblocking(true)
         .expect("make D1 provider witness nonblocking");
     let provider_url = format!(
+        // DevSkim: ignore DS137138 -- loopback-only no-call test witness
         "http://{}",
         provider.local_addr().expect("D1 provider witness address")
     );
