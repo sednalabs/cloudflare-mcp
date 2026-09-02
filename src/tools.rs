@@ -84,10 +84,11 @@ use crate::dns_route::{
     DnsRouteConflict, DnsRouteVerificationState, plan_dns_route_reconciliation, verify_dns_route,
 };
 use crate::mutation::{
-    MutationAuditSession, MutationPlan, emit_mutation_audit_log, plan_apply_access_allowlist,
-    plan_cache_mutation, plan_connector_control, plan_emergency_unpublish, plan_ensure_tunnel,
-    plan_lock_first_publish, plan_patch_worker_settings, plan_replace_access_policies,
-    plan_upload_worker_script, plan_upsert_access_app, plan_upsert_dns_cname,
+    MutationAuditSession, MutationPlan, MutationPlanStep, emit_mutation_audit_log,
+    plan_apply_access_allowlist, plan_cache_mutation, plan_connector_control,
+    plan_emergency_unpublish, plan_ensure_tunnel, plan_lock_first_publish,
+    plan_patch_worker_settings, plan_replace_access_policies, plan_upload_worker_script,
+    plan_upsert_access_app, plan_upsert_dns_cname,
 };
 use crate::pages_deploy::{
     MAX_PAGES_ASSET_COUNT_DEFAULT, PagesDirectoryInspectOptions,
@@ -3878,7 +3879,7 @@ impl CloudflareMcp {
                 "Pass the desired database name in the name argument.",
             ));
         }
-        let plan = MutationPlan::new("d1_rename_database")
+        let mut plan = MutationPlan::new("d1_rename_database")
             .step(
                 "validate_d1_database_rename",
                 false,
@@ -3927,7 +3928,16 @@ impl CloudflareMcp {
                 Ok(guard) => guard,
                 Err(result) => return Ok(finalize_mutation_result(result, &plan, audit, false)),
             };
-            if let Err(result) = guard.revalidate() {
+            let dml_custody_authorization = match guard.authorize_target_wide_d1_dml_custody() {
+                Ok(authorization) => authorization,
+                Err(result) => {
+                    return Ok(finalize_mutation_result(result, &plan, audit, false));
+                }
+            };
+            bind_complete_d1_dml_custody_before_side_effect(&mut plan, &dml_custody_authorization);
+            if let Err(result) =
+                guard.revalidate_target_wide_d1_dml_custody(&dml_custody_authorization)
+            {
                 return Ok(finalize_mutation_result(result, &plan, audit, false));
             }
             match self
@@ -3985,7 +3995,7 @@ impl CloudflareMcp {
             Err(err) => return Ok(api_catalog_error_result(err)),
         };
         let required_token = mutation_confirmation_token(operation, &path, &None);
-        let plan = MutationPlan::new("d1_delete_database")
+        let mut plan = MutationPlan::new("d1_delete_database")
             .step(
                 "validate_d1_database_delete",
                 false,
@@ -4057,7 +4067,16 @@ impl CloudflareMcp {
                 Ok(guard) => guard,
                 Err(result) => return Ok(finalize_mutation_result(result, &plan, audit, false)),
             };
-            if let Err(result) = guard.revalidate() {
+            let dml_custody_authorization = match guard.authorize_target_wide_d1_dml_custody() {
+                Ok(authorization) => authorization,
+                Err(result) => {
+                    return Ok(finalize_mutation_result(result, &plan, audit, false));
+                }
+            };
+            bind_complete_d1_dml_custody_before_side_effect(&mut plan, &dml_custody_authorization);
+            if let Err(result) =
+                guard.revalidate_target_wide_d1_dml_custody(&dml_custody_authorization)
+            {
                 return Ok(finalize_mutation_result(result, &plan, audit, false));
             }
             match self
@@ -14122,6 +14141,29 @@ fn finalize_mutation_result(
     result
 }
 
+fn bind_complete_d1_dml_custody_before_side_effect(
+    plan: &mut MutationPlan,
+    authorization: &crate::d1_dml_custody_layout::D1DmlCustodyCompleteAuditAuthorization,
+) {
+    let insertion = plan
+        .steps
+        .iter()
+        .position(|step| step.side_effect)
+        .unwrap_or(plan.steps.len());
+    plan.steps.insert(
+        insertion,
+        MutationPlanStep {
+            ordinal: 0,
+            action: "authorize_complete_d1_dml_custody",
+            side_effect: false,
+            target: json!(authorization),
+        },
+    );
+    for (index, step) in plan.steps.iter_mut().enumerate() {
+        step.ordinal = (index.saturating_add(1)).min(u8::MAX as usize) as u8;
+    }
+}
+
 fn extract_error_code(payload: &serde_json::Value) -> Option<String> {
     payload
         .get("error")
@@ -14184,7 +14226,9 @@ mod tests {
     use crate::cloudflare::model::WorkerScript;
     use crate::config::PortalAgentConfig;
     use crate::config::{ApiTokenSource, CloudflareApiConfig, ElicitationConfig, ResumeMode};
-    use crate::d1_migration_lease::acquire_d1_migration_lease_at;
+    use crate::d1_migration_lease::{
+        acquire_d1_migration_lease_at, acquire_d1_target_mutation_guard_at,
+    };
     use crate::d1_migration_manifest::{
         D1ManifestReconciliationEvidence, classify_d1_manifest_ledger,
         d1_manifest_contextualize_failure, d1_manifest_plan_mismatch_result,
@@ -14316,6 +14360,20 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("create migration test dir");
         dir
+    }
+
+    #[cfg(target_os = "linux")]
+    fn prepare_complete_dml_custody_test_root(root: &std::path::Path) {
+        let guard = acquire_d1_target_mutation_guard_at(
+            root.to_path_buf(),
+            "test_fixture",
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect("acquire fixture target guard");
+        guard
+            .ensure_d1_dml_custody_layout()
+            .expect("install clean complete DML custody layout");
     }
 
     async fn spawn_router(router: Router) -> String {
@@ -17429,6 +17487,7 @@ mod tests {
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
                 .expect("make lease root private");
         }
+        prepare_complete_dml_custody_test_root(&root);
         let digest = "a".repeat(64);
         let mut first = acquire_d1_migration_lease_at(
             root.clone(),
@@ -17477,6 +17536,7 @@ mod tests {
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
                 .expect("make lease root private");
         }
+        prepare_complete_dml_custody_test_root(&root);
         let mut lease = acquire_d1_migration_lease_at(
             root.clone(),
             "acct-1",
@@ -17599,6 +17659,7 @@ mod tests {
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
                 .expect("make lease root private");
         }
+        prepare_complete_dml_custody_test_root(&root);
         let mut first = acquire_d1_migration_lease_at(
             root.clone(),
             "acct-1",

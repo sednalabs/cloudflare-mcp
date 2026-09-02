@@ -61,6 +61,80 @@ fn manifest_target_path(lease_root: &Path) -> PathBuf {
     ))
 }
 
+fn empty_dml_custody_authorization(target_key_sha256: &str) -> Value {
+    #[derive(Serialize)]
+    struct EmptyCompleteAuditDigest<'a> {
+        version: u8,
+        layout_sha256: &'a str,
+        audit_budget_version: u8,
+        audit_budget_sha256: &'a str,
+        audited_leaf_limit: usize,
+        physical_artifact_limit: usize,
+        artifact_payload_byte_limit: usize,
+        audited_leaf_count: usize,
+        physical_artifact_count: usize,
+        artifact_payload_bytes: usize,
+        target_key_sha256: &'a str,
+        claimant_count: usize,
+        attempt_count: usize,
+        pending_claimant_count: usize,
+        bound_claimant_count: usize,
+        cas_scratch_count: usize,
+        claimant_set_count: usize,
+        complete_claimant_set_count: usize,
+        matched_claimant_set_count: usize,
+        unmatched_claimant_set_count: usize,
+        unmatched_attempt_count: usize,
+        orphan_claimant_set_count: usize,
+        incomplete_claimant_set_count: usize,
+        reconciliation_required: bool,
+        provider_dispatch_authority: &'static str,
+        artifact_evidence: Vec<(String, String)>,
+    }
+
+    const LAYOUT_SHA256: &str = "68da1f2248681d61a387f503b370a73ebc848b9c34bec6afd00b24a0bef36b48";
+    const BUDGET_SHA256: &str = "97e3ea422008c9a0e6cbf3749e11d2b2bdbdedc49c29291fe62ea314453dcc49";
+    let digest = EmptyCompleteAuditDigest {
+        version: 1,
+        layout_sha256: LAYOUT_SHA256,
+        audit_budget_version: 1,
+        audit_budget_sha256: BUDGET_SHA256,
+        audited_leaf_limit: 16_384,
+        physical_artifact_limit: 65_536,
+        artifact_payload_byte_limit: 268_435_456,
+        audited_leaf_count: 0,
+        physical_artifact_count: 0,
+        artifact_payload_bytes: 0,
+        target_key_sha256,
+        claimant_count: 0,
+        attempt_count: 0,
+        pending_claimant_count: 0,
+        bound_claimant_count: 0,
+        cas_scratch_count: 0,
+        claimant_set_count: 0,
+        complete_claimant_set_count: 0,
+        matched_claimant_set_count: 0,
+        unmatched_claimant_set_count: 0,
+        unmatched_attempt_count: 0,
+        orphan_claimant_set_count: 0,
+        incomplete_claimant_set_count: 0,
+        reconciliation_required: false,
+        provider_dispatch_authority: "none",
+        artifact_evidence: Vec::new(),
+    };
+    let audit_sha256 = sha256_hex(
+        &serde_json::to_string(&digest).expect("serialize empty complete-audit fixture"),
+    );
+    json!({
+        "version": 1,
+        "target_key_sha256": target_key_sha256,
+        "layout_sha256": LAYOUT_SHA256,
+        "audit_budget_version": 1,
+        "audit_budget_sha256": BUDGET_SHA256,
+        "audit_sha256": audit_sha256,
+    })
+}
+
 #[cfg(unix)]
 fn install_activated_manifest_root(lease_root: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -93,6 +167,38 @@ fn install_activated_manifest_root(lease_root: &Path) {
     .expect("write activated-root target registration");
     fs::set_permissions(&registration, fs::Permissions::from_mode(0o600))
         .expect("make activated-root target registration private");
+
+    let target = manifest_target_path(lease_root);
+    fs::create_dir_all(&target).expect("create complete-audit target fixture");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
+        .expect("make complete-audit target fixture private");
+    let target_guard = target.join("guard.lock");
+    fs::write(&target_guard, b"").expect("write complete-audit target guard");
+    fs::set_permissions(&target_guard, fs::Permissions::from_mode(0o600))
+        .expect("make complete-audit target guard private");
+    let layout = target.join("dml-custody-v1");
+    for directory in [
+        layout.clone(),
+        layout.join("claimant"),
+        layout.join("claimant/operation"),
+        layout.join("claimant/execution-attempt"),
+        layout.join("claimant/provider-request"),
+        layout.join("attempt"),
+    ] {
+        fs::create_dir_all(&directory).expect("create empty complete-audit layout fixture");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .expect("make complete-audit layout directory private");
+    }
+    let layout_marker = layout.join("layout.json");
+    fs::write(
+        &layout_marker,
+        format!(
+            "{{\"version\":1,\"layout\":\"dml-custody-v1\",\"layout_sha256\":\"68da1f2248681d61a387f503b370a73ebc848b9c34bec6afd00b24a0bef36b48\",\"target_key_sha256\":\"{target_key_sha256}\"}}\n"
+        ),
+    )
+    .expect("write complete-audit layout marker");
+    fs::set_permissions(&layout_marker, fs::Permissions::from_mode(0o600))
+        .expect("make complete-audit layout marker private");
 }
 
 #[cfg(unix)]
@@ -101,7 +207,7 @@ fn lock_manifest_target_guard(lease_root: &Path) -> fs::File {
 
     install_activated_manifest_root(lease_root);
     let target = manifest_target_path(lease_root);
-    fs::create_dir(&target).expect("create permanent target directory");
+    fs::create_dir_all(&target).expect("create permanent target directory");
     fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
         .expect("make permanent target directory private");
     let guard_path = target.join("guard.lock");
@@ -233,7 +339,7 @@ fn create_retained_reconciliation_fixture(
     #[cfg(unix)]
     install_activated_manifest_root(lease_root);
     let target = manifest_target_path(lease_root);
-    fs::create_dir(&target).expect("create retained target");
+    fs::create_dir_all(&target).expect("create retained target");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -332,6 +438,9 @@ fn create_retained_reconciliation_fixture(
         "approved_plan_sha256": approved_plan_sha256,
         "migration_family": "newsletter-core",
         "created_at_unix_ms": 1_800_000_000_000_u64,
+        "dml_custody_authorization": empty_dml_custody_authorization(
+            &sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000")
+        ),
     });
     let payload_bytes = serde_json::to_vec(&payload).expect("serialize retained payload");
     let payload_sha256 = {
@@ -397,6 +506,27 @@ impl McpStdioProcess {
     }
 
     fn start_with_env(envs: Vec<(&'static str, String)>) -> Self {
+        #[cfg(unix)]
+        // Live target-wide stdio fixtures start from the accepted empty
+        // complete-custody baseline. Tests for absent, hostile, or legacy
+        // custody provide a nonempty or unsafe root and therefore bypass this
+        // fixture preparation deliberately.
+        if let Some((_, root)) = envs
+            .iter()
+            .find(|(key, _)| *key == "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT")
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let root = Path::new(root);
+            if fs::symlink_metadata(root).is_ok_and(|metadata| {
+                metadata.is_dir()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.permissions().mode() & 0o777 == 0o700
+            }) && fs::read_dir(root).is_ok_and(|mut entries| entries.next().is_none())
+            {
+                install_activated_manifest_root(root);
+            }
+        }
         let exe = env!("CARGO_BIN_EXE_cloudflare-mcp");
         let mut command = Command::new(exe);
         command
@@ -9586,11 +9716,10 @@ fn d1_apply_migration_manifest_rejects_unproven_reserved_ledger_authority_before
             "{label} must not reach a provider mutation"
         );
         assert!(
-            fs::read_dir(&lease_root)
-                .expect("authority lease root")
-                .next()
-                .is_none(),
-            "{label} must not create local custody before authority is proven"
+            !manifest_target_path(&lease_root)
+                .join("active.lease.json")
+                .exists(),
+            "{label} must not create migration authority before provider ledger authority is proven"
         );
         mcp.terminate();
         let _ = fs::remove_dir_all(&lease_root);
@@ -18198,8 +18327,6 @@ fn d1_apply_migration_manifest_partial_multi_statement_response_loss_stays_unkno
 
 #[test]
 fn d1_rename_database_uses_patch_through_stdio_boundary() {
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     let (base_url, requests) = spawn_fake_d1_database_mutation_api(1);
     let lease_root = PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-d1-rename-guard-{}-{}",
@@ -18209,10 +18336,8 @@ fn d1_rename_database_uses_patch_through_stdio_boundary() {
             .expect("system clock after Unix epoch")
             .as_nanos()
     ));
-    fs::create_dir(&lease_root).expect("create private target guard root");
     #[cfg(unix)]
-    fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
-        .expect("make target guard root private");
+    install_activated_manifest_root(&lease_root);
     let mut mcp = McpStdioProcess::start_with_env(vec![
         ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
         (
@@ -18232,6 +18357,18 @@ fn d1_rename_database_uses_patch_through_stdio_boundary() {
     let content = structured_content(&response);
     assert_eq!(content["ok"], json!(true), "{content}");
     assert_eq!(content["database"]["name"], json!("renamed-db"));
+    assert_eq!(
+        content["plan"]["steps"][1]["action"],
+        json!("authorize_complete_d1_dml_custody")
+    );
+    assert_eq!(
+        content["plan"]["steps"][2]["action"],
+        json!("apply_d1_database_patch")
+    );
+    assert_eq!(
+        content["plan"]["steps"][1]["target"]["target_key_sha256"],
+        json!(sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000"))
+    );
     let requests = requests.lock().expect("request log lock");
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0]["method"], json!("PATCH"));
@@ -18246,8 +18383,6 @@ fn d1_rename_database_uses_patch_through_stdio_boundary() {
 
 #[test]
 fn d1_delete_database_requires_token_and_deletes_through_stdio_boundary() {
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     let (base_url, requests) = spawn_fake_d1_database_mutation_api(1);
     let lease_root = PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-d1-delete-guard-{}-{}",
@@ -18257,10 +18392,8 @@ fn d1_delete_database_requires_token_and_deletes_through_stdio_boundary() {
             .expect("system clock after Unix epoch")
             .as_nanos()
     ));
-    fs::create_dir(&lease_root).expect("create private target guard root");
     #[cfg(unix)]
-    fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
-        .expect("make target guard root private");
+    install_activated_manifest_root(&lease_root);
     let mut mcp = McpStdioProcess::start_with_env(vec![
         ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
         (
@@ -18299,6 +18432,14 @@ fn d1_delete_database_requires_token_and_deletes_through_stdio_boundary() {
     let content = structured_content(&response);
     assert_eq!(content["ok"], json!(true), "{content}");
     assert_eq!(content["result"]["deleted"], json!(true));
+    assert_eq!(
+        content["plan"]["steps"][1]["action"],
+        json!("authorize_complete_d1_dml_custody")
+    );
+    assert_eq!(
+        content["plan"]["steps"][2]["action"],
+        json!("apply_d1_database_delete")
+    );
     let requests = requests.lock().expect("request log lock");
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0]["method"], json!("DELETE"));

@@ -140,6 +140,7 @@ pub(crate) struct D1MigrationLease {
     active_file_identity: D1LeaseFileIdentity,
     #[cfg(target_os = "linux")]
     released: bool,
+    dml_custody_authorization: crate::d1_dml_custody_layout::D1DmlCustodyCompleteAuditAuthorization,
     bootstrap_initializer_dispatch_protocol: bool,
     pub(crate) identity: D1MigrationLeaseIdentity,
 }
@@ -191,6 +192,7 @@ pub(crate) struct D1RetainedMigrationLeaseIdentity {
 struct D1RetainedMigrationLeasePayload {
     approved_plan_sha256: String,
     created_at_unix_ms: u64,
+    dml_custody_authorization: crate::d1_dml_custody_layout::D1DmlCustodyCompleteAuditAuthorization,
     migration_family: String,
     nonce: String,
     target_key_sha256: String,
@@ -344,6 +346,7 @@ pub(crate) struct D1RetainedMigrationLease {
     evidence_file_identity: D1LeaseFileIdentity,
     #[cfg(target_os = "linux")]
     evidence_name: String,
+    dml_custody_authorization: crate::d1_dml_custody_layout::D1DmlCustodyCompleteAuditAuthorization,
     bootstrap_initializer_dispatch_protocol: bool,
     pub(crate) identity: D1RetainedMigrationLeaseIdentity,
 }
@@ -448,7 +451,7 @@ impl D1MigrationLease {
                 true,
             )
             .map_err(|message| self.revalidation_failure(message))?;
-            Ok(())
+            self.revalidate_dml_custody_authorization()
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -500,6 +503,9 @@ impl D1MigrationLease {
             true,
         )
         .map_err(|message| self.release_failure(message))?;
+        self.revalidate_dml_custody_authorization().map_err(|_| {
+            self.release_failure("complete DML custody changed before lease retirement")
+        })?;
 
         rename_owned_lease_no_replace(
             &self.target,
@@ -515,6 +521,11 @@ impl D1MigrationLease {
             )
         })?;
         if sync_d1_lease_directory(&self.target).is_err() {
+            if self.revalidate_dml_custody_authorization().is_err() {
+                return Err(self.release_failure(
+                    "complete DML custody changed before active-lease restoration",
+                ));
+            }
             let restored = restore_active_or_leave_blocker(
                 &self.target,
                 RETIRING_LEASE_NAME,
@@ -530,6 +541,9 @@ impl D1MigrationLease {
         }
 
         let retired_name = format!("retired.{}.lease.json", self.identity.nonce);
+        self.revalidate_dml_custody_authorization().map_err(|_| {
+            self.release_failure("complete DML custody changed before terminal retirement")
+        })?;
         rename_owned_lease_no_replace(
             &self.target,
             RETIRING_LEASE_NAME,
@@ -544,6 +558,11 @@ impl D1MigrationLease {
             )
         })?;
         if sync_d1_lease_directory(&self.target).is_err() {
+            if self.revalidate_dml_custody_authorization().is_err() {
+                return Err(self.release_failure(
+                    "complete DML custody changed before active-lease restoration",
+                ));
+            }
             let restored = restore_active_or_leave_blocker(
                 &self.target,
                 &retired_name,
@@ -560,6 +579,21 @@ impl D1MigrationLease {
 
         self.released = true;
         self.guard.take();
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn revalidate_dml_custody_authorization(&self) -> Result<(), CallToolResult> {
+        let current = linux::authorize_target_wide_d1_dml_custody(
+            &self.target,
+            &self.identity.target_key_sha256,
+        )
+        .map_err(|message| self.revalidation_failure(message))?;
+        if current != self.dml_custody_authorization {
+            return Err(self.revalidation_failure(
+                "complete DML custody changed after migration authority was bound",
+            ));
+        }
         Ok(())
     }
 
@@ -639,7 +673,7 @@ impl D1TargetMutationGuard {
     /// Separately owned target-wide audit for restore, activation, and other
     /// destructive-boundary workflows. The live path deliberately uses only
     /// affected-leaf audits.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn audit_d1_dml_custody_complete(
         &self,
     ) -> Result<crate::d1_dml_custody_layout::D1DmlCustodyCompleteAuditReceipt, CallToolResult>
@@ -657,6 +691,54 @@ impl D1TargetMutationGuard {
                 "complete DML custody audit requires Linux dirfd-bound storage",
             ))
         }
+    }
+
+    /// Produce the only complete-audit projection accepted by a target-wide
+    /// authority workflow. This does not authorize ordinary DML dispatch.
+    pub(crate) fn authorize_target_wide_d1_dml_custody(
+        &self,
+    ) -> Result<crate::d1_dml_custody_layout::D1DmlCustodyCompleteAuditAuthorization, CallToolResult>
+    {
+        self.revalidate()?;
+        #[cfg(target_os = "linux")]
+        {
+            linux::authorize_target_wide_d1_dml_custody(&self.target, &self.target_key_sha256)
+                .map_err(|message| {
+                    d1_target_guard_error(
+                        self.operation,
+                        "d1.target_wide_dml_custody_unproven",
+                        message,
+                        &self.target_key_sha256,
+                    )
+                })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(d1_target_guard_error(
+                self.operation,
+                "d1.target_guard_platform_unsupported",
+                "complete DML custody authority requires Linux dirfd-bound storage",
+                &self.target_key_sha256,
+            ))
+        }
+    }
+
+    /// Re-run the bounded complete audit at the last owned target-wide
+    /// boundary and require the exact identity bound into the caller's plan.
+    pub(crate) fn revalidate_target_wide_d1_dml_custody(
+        &self,
+        expected: &crate::d1_dml_custody_layout::D1DmlCustodyCompleteAuditAuthorization,
+    ) -> Result<(), CallToolResult> {
+        let current = self.authorize_target_wide_d1_dml_custody()?;
+        if current != *expected {
+            return Err(d1_target_guard_error(
+                self.operation,
+                "d1.target_wide_dml_custody_changed",
+                "complete DML custody changed after the target-wide plan was bound",
+                &self.target_key_sha256,
+            ));
+        }
+        self.revalidate()
     }
 
     /// Read one exact DML-attempt state through the held target directory.
@@ -984,7 +1066,8 @@ impl D1RetainedMigrationLease {
                 &self.evidence_file_identity,
                 &self.identity,
             )
-            .map_err(d1_retained_lease_revalidation_error)
+            .map_err(d1_retained_lease_revalidation_error)?;
+            self.revalidate_dml_custody_authorization()
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -994,6 +1077,21 @@ impl D1RetainedMigrationLease {
 
     pub(crate) fn is_retired(&self) -> bool {
         self.identity.namespace == "retired"
+    }
+
+    #[cfg(target_os = "linux")]
+    fn revalidate_dml_custody_authorization(&self) -> Result<(), CallToolResult> {
+        let current = linux::authorize_target_wide_d1_dml_custody(
+            &self.target,
+            &self.identity.target_key_sha256,
+        )
+        .map_err(d1_retained_lease_revalidation_error)?;
+        if current != self.dml_custody_authorization {
+            return Err(d1_retained_lease_revalidation_error(
+                "complete DML custody changed after retained migration authority was bound",
+            ));
+        }
+        Ok(())
     }
 
     /// Prove that this lease was created under the marker-before-dispatch
@@ -1356,6 +1454,12 @@ impl D1RetainedMigrationLease {
                         local_namespace_mutations,
                     });
                 }
+            }
+            if let Err(result) = self.revalidate() {
+                return Err(D1TerminalRetirementFailure {
+                    result,
+                    local_namespace_mutations,
+                });
             }
             if let Err(message) = linux::rename_retained_lease_no_replace(
                 &self.target,
@@ -1897,6 +2001,15 @@ pub(crate) fn d1_migration_lease_requirements(
         "active_evidence": "active.lease.json and transient retiring.lease.json are never auto-reclaimed; malformed, symlink, non-regular, or otherwise present active/retiring evidence stops the next apply for governed reconciliation",
         "cross_host_limitation": "Cross-process serialization covers only hosts sharing the same configured operator-owned lease root. It is not a Cloudflare/provider-distributed lease.",
         "platform_requirement": "Linux on a trusted filesystem supporting working renameat2 RENAME_NOREPLACE, directory fsync, and advisory file locks; unsupported platforms or filesystems fail closed before provider I/O. Cross-host or shared-filesystem semantics require separate proof; retained evidence requires the governed recovery path.",
+        "complete_dml_custody_authority": {
+            "required": true,
+            "layout_sha256": crate::d1_dml_custody_layout::D1_DML_CUSTODY_LAYOUT_SHA256,
+            "audit_budget_version": crate::d1_dml_custody_layout::D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_VERSION,
+            "audit_budget_sha256": crate::d1_dml_custody_layout::D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_SHA256,
+            "binding": "the exact clean complete-audit identity is persisted in the lease payload and therefore inherited by every terminal receipt through lease_payload_sha256",
+            "last_boundary_revalidation": true,
+            "provider_dispatch_authority_from_audit": false,
+        },
         "target_identity_activation": {
             "contract_version": 2,
             "target_identity_contract": "lowercase_hyphenated_uuid_v1",
@@ -2152,6 +2265,22 @@ fn d1_lease_root_error(code: &'static str, message: &'static str) -> CallToolRes
     CallToolResult::structured_error(json!({
         "ok": false, "operation": "d1_apply_migration_manifest", "status": "reconciliation_required", "lease_retained": false,
         "error": {"code": code, "message": message, "hint": "Use an absolute, operator-owned 0700 lease root with safe ancestors."}
+    }))
+}
+
+fn d1_migration_dml_custody_error(code: &'static str, message: &'static str) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": "d1_apply_migration_manifest",
+        "status": "reconciliation_required",
+        "provider_calls": 0,
+        "provider_mutations": 0,
+        "lease_retained": false,
+        "error": {
+            "code": code,
+            "message": message,
+            "hint": "Do not persist migration authority or issue provider SQL. Reconcile the complete target DML custody graph and run a fresh approved plan."
+        }
     }))
 }
 
@@ -4136,6 +4265,8 @@ mod linux {
         guard: fs::File,
         guard_identity: D1LeaseFileIdentity,
         identity: D1MigrationLeaseIdentity,
+        dml_custody_authorization:
+            crate::d1_dml_custody_layout::D1DmlCustodyCompleteAuditAuthorization,
         payload: &[u8],
         bootstrap_initializer_dispatch_protocol: bool,
     ) -> Result<D1MigrationLease, CallToolResult> {
@@ -4169,6 +4300,18 @@ mod linux {
                     message,
                 ));
             }
+        }
+        let current_dml_custody_authorization =
+            authorize_target_wide_d1_dml_custody(&target, &identity.target_key_sha256).map_err(
+                |message| {
+                    d1_migration_dml_custody_error("d1.migration_dml_custody_unproven", message)
+                },
+            )?;
+        if current_dml_custody_authorization != dml_custody_authorization {
+            return Err(d1_migration_dml_custody_error(
+                "d1.migration_dml_custody_changed",
+                "complete DML custody changed before active migration authority was persisted",
+            ));
         }
 
         let name = c_string_name(ACTIVE_LEASE_NAME)
@@ -4280,6 +4423,7 @@ mod linux {
             active,
             active_file_identity: active_identity,
             released: false,
+            dml_custody_authorization,
             bootstrap_initializer_dispatch_protocol,
             identity,
         })
@@ -4545,6 +4689,15 @@ mod linux {
                 "retained lease target, family, plan, nonce, or payload digest contradicts the exact caller identity",
             ));
         }
+        let current_dml_custody_authorization =
+            authorize_target_wide_d1_dml_custody(&target, &target_hash)
+                .map_err(d1_retained_lease_revalidation_error)?;
+        if payload.dml_custody_authorization != current_dml_custody_authorization {
+            return Err(d1_retained_lease_error(
+                "d1.migration_reconciliation_dml_custody_changed",
+                "complete DML custody no longer matches the authority bound into the retained lease",
+            ));
+        }
         let identity = D1RetainedMigrationLeaseIdentity {
             target_key_sha256: target_hash,
             namespace,
@@ -4564,6 +4717,7 @@ mod linux {
             evidence,
             evidence_file_identity,
             evidence_name,
+            dml_custody_authorization: payload.dml_custody_authorization,
             bootstrap_initializer_dispatch_protocol: payload
                 .initializer_dispatch_protocol
                 .as_deref()
@@ -4799,9 +4953,13 @@ mod linux {
         )
         .map_err(|message| d1_lease_root_error("d1.migration_lease_custody_changed", message))?;
         maybe_pause_after_guard_for_test(&root_path);
+        let dml_custody_authorization = authorize_target_wide_d1_dml_custody(&target, &target_hash)
+            .map_err(|message| {
+                d1_migration_dml_custody_error("d1.migration_dml_custody_unproven", message)
+            })?;
         let nonce = d1_migration_lease_nonce(&target_hash, plan_sha256);
         let bootstrap_initializer_dispatch_protocol = family == "migration-ledger-bootstrap-v1";
-        let mut payload = json!({"version": 2, "target_key_sha256": &target_hash, "nonce": &nonce, "approved_plan_sha256": plan_sha256, "migration_family": family, "created_at_unix_ms": now_unix_ms()});
+        let mut payload = json!({"version": 2, "target_key_sha256": &target_hash, "nonce": &nonce, "approved_plan_sha256": plan_sha256, "migration_family": family, "created_at_unix_ms": now_unix_ms(), "dml_custody_authorization": &dml_custody_authorization});
         if bootstrap_initializer_dispatch_protocol {
             payload["initializer_dispatch_protocol"] =
                 json!(D1_BOOTSTRAP_INITIALIZER_DISPATCH_PROTOCOL);
@@ -4823,6 +4981,7 @@ mod linux {
             guard,
             guard_identity,
             identity,
+            dml_custody_authorization,
             &encoded,
             bootstrap_initializer_dispatch_protocol,
         )
@@ -5729,7 +5888,6 @@ mod linux {
         })
     }
 
-    #[allow(dead_code)]
     pub(super) fn audit_d1_dml_custody_complete(
         target: &fs::File,
         target_key_sha256: &str,
@@ -5741,12 +5899,22 @@ mod linux {
         )
     }
 
+    pub(super) fn authorize_target_wide_d1_dml_custody(
+        target: &fs::File,
+        target_key_sha256: &str,
+    ) -> Result<crate::d1_dml_custody_layout::D1DmlCustodyCompleteAuditAuthorization, &'static str>
+    {
+        audit_d1_dml_custody_complete(target, target_key_sha256)?
+            .authorize_target_wide_custody(target_key_sha256)
+    }
+
     fn audit_d1_dml_custody_complete_with_limits(
         target: &fs::File,
         target_key_sha256: &str,
         limits: DmlCompleteAuditLimits,
     ) -> Result<crate::d1_dml_custody_layout::D1DmlCustodyCompleteAuditReceipt, &'static str> {
         let first = complete_dml_audit_once(target, target_key_sha256, limits)?;
+        maybe_pause_complete_dml_audit_after_first_for_test(target);
         let second = complete_dml_audit_once(target, target_key_sha256, limits)?;
         if first != second {
             return Err("DML custody changed during stable complete audit");
@@ -6105,6 +6273,15 @@ mod linux {
     static ROOT_NAMESPACE_AUDIT_PAUSE_HOOK: OnceLock<Mutex<Option<RootNamespaceAuditPauseHook>>> =
         OnceLock::new();
     #[cfg(test)]
+    struct CompleteDmlAuditPauseHook {
+        target_identity: D1LeaseFileIdentity,
+        entered: mpsc::Sender<()>,
+        resume: mpsc::Receiver<()>,
+    }
+    #[cfg(test)]
+    static COMPLETE_DML_AUDIT_PAUSE_HOOK: OnceLock<Mutex<Option<CompleteDmlAuditPauseHook>>> =
+        OnceLock::new();
+    #[cfg(test)]
     pub(super) fn install_activation_marker_pause_hook(
         target_key_sha256: String,
         entered: mpsc::Sender<()>,
@@ -6134,6 +6311,24 @@ mod linux {
             .expect("root namespace audit pause hook lock");
         *hook = Some(RootNamespaceAuditPauseHook {
             root_identity: identity(&metadata),
+            entered,
+            resume,
+        });
+    }
+    #[cfg(test)]
+    pub(super) fn install_complete_dml_audit_pause_hook(
+        target_path: &Path,
+        entered: mpsc::Sender<()>,
+        resume: mpsc::Receiver<()>,
+    ) {
+        let metadata = fs::symlink_metadata(target_path)
+            .expect("complete DML audit pause hook target metadata");
+        let mut hook = COMPLETE_DML_AUDIT_PAUSE_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .expect("complete DML audit pause hook lock");
+        *hook = Some(CompleteDmlAuditPauseHook {
+            target_identity: identity(&metadata),
             entered,
             resume,
         });
@@ -6230,6 +6425,32 @@ mod linux {
     }
     #[cfg(not(test))]
     fn maybe_pause_root_namespace_audit_after_first_for_test(_root: &fs::File) {}
+    #[cfg(test)]
+    fn maybe_pause_complete_dml_audit_after_first_for_test(target: &fs::File) {
+        let target_identity = target.metadata().ok().map(|metadata| identity(&metadata));
+        let hook = {
+            let mut hook = COMPLETE_DML_AUDIT_PAUSE_HOOK
+                .get_or_init(|| Mutex::new(None))
+                .lock()
+                .expect("complete DML audit pause hook lock");
+            if hook
+                .as_ref()
+                .is_some_and(|candidate| Some(candidate.target_identity) == target_identity)
+            {
+                hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some(hook) = hook {
+            hook.entered
+                .send(())
+                .expect("complete DML audit test receiver");
+            hook.resume.recv().expect("complete DML audit test release");
+        }
+    }
+    #[cfg(not(test))]
+    fn maybe_pause_complete_dml_audit_after_first_for_test(_target: &fs::File) {}
 }
 
 #[cfg(target_os = "linux")]
@@ -6275,7 +6496,7 @@ mod tests {
 
         let root = private_test_root(label);
         let guard = acquire_d1_target_mutation_guard_at(
-            root.clone(),
+            root.to_path_buf(),
             "d1_execute_write",
             "acct-1",
             "123e4567-e89b-42d3-a456-426614174000",
@@ -6766,6 +6987,194 @@ mod tests {
         assert_eq!(restored.unmatched_attempt_count, 0);
         assert!(!restored.reconciliation_required);
         fs::remove_dir_all(attempt_first.root).expect("attempt-first cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_wide_dml_authority_rejects_absent_partial_orphan_stale_and_nonfixed_evidence() {
+        use crate::d1_dml_identity_claimant::D1DmlIdentityNamespace;
+
+        let absent_root = private_unactivated_test_root("dml-authority-absent");
+        let absent_guard = acquire_d1_target_mutation_guard_at(
+            absent_root.clone(),
+            "d1_delete_database",
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect("acquire target guard without a DML layout");
+        let absent = absent_guard
+            .authorize_target_wide_d1_dml_custody()
+            .expect_err("absent complete custody cannot authorize deletion")
+            .structured_content
+            .expect("structured absent-custody error");
+        assert_eq!(
+            absent["error"]["code"],
+            json!("d1.target_wide_dml_custody_unproven")
+        );
+        assert_eq!(absent["provider_mutations"], json!(0));
+        drop(absent_guard);
+        let target_name = format!(
+            "d1-migration-target-{}",
+            sha256_bytes_hex(b"acct-1\0123e4567-e89b-42d3-a456-426614174000")
+        );
+        assert!(
+            !absent_root
+                .join(&target_name)
+                .join(ACTIVE_LEASE_NAME)
+                .exists(),
+            "failed complete audit must not persist migration authority"
+        );
+        fs::remove_dir_all(absent_root).expect("absent cleanup");
+
+        let partial = dml_complete_audit_fixture("dml-authority-partial");
+        install_pending_audit_claimant(&partial, D1DmlIdentityNamespace::Operation);
+        assert!(
+            partial
+                .guard
+                .authorize_target_wide_d1_dml_custody()
+                .is_err(),
+            "partial claimant custody is reconciliation evidence, not authority"
+        );
+        fs::remove_dir_all(partial.root).expect("partial cleanup");
+
+        let clean = dml_complete_audit_fixture("dml-authority-stale");
+        for namespace in D1DmlIdentityNamespace::ALL {
+            install_pending_audit_claimant(&clean, namespace);
+            seal_audit_claimant(&clean, namespace);
+        }
+        assert!(
+            clean.guard.authorize_target_wide_d1_dml_custody().is_err(),
+            "a complete Bound claimant set without its attempt is orphan evidence"
+        );
+        install_audit_attempt(&clean);
+        let authorization = clean
+            .guard
+            .authorize_target_wide_d1_dml_custody()
+            .expect("matched graph authorizes a target-wide boundary");
+        let mut nonfixed_budget = clean
+            .guard
+            .audit_d1_dml_custody_complete()
+            .expect("clean aggregate receipt");
+        nonfixed_budget.audited_leaf_limit -= 1;
+        assert!(
+            nonfixed_budget
+                .authorize_target_wide_custody(&clean.guard.target_key_sha256)
+                .is_err(),
+            "a nonfixed or over-budget receipt identity cannot authorize"
+        );
+
+        let attempt_binding = &clean.attempt.receipt().attempt_binding_sha256;
+        let attempt_path = clean
+            .root
+            .join(&clean.guard.target_name)
+            .join("dml-custody-v1/attempt")
+            .join(&attempt_binding[..2])
+            .join(&attempt_binding[2..4])
+            .join(format!("{attempt_binding}.json"));
+        fs::remove_file(attempt_path).expect("simulate a changed restored graph");
+        let stale = clean
+            .guard
+            .revalidate_target_wide_d1_dml_custody(&authorization)
+            .expect_err("stale audit identity must fail at the last authority boundary")
+            .structured_content
+            .expect("structured stale-custody error");
+        assert_eq!(
+            stale["error"]["code"],
+            json!("d1.target_wide_dml_custody_unproven")
+        );
+        fs::remove_dir_all(clean.root).expect("stale cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn target_wide_dml_authority_rejects_a_graph_that_changes_between_complete_passes() {
+        use crate::d1_dml_identity_claimant::D1DmlIdentityNamespace;
+
+        let fixture = dml_complete_audit_fixture("dml-authority-unstable");
+        for namespace in D1DmlIdentityNamespace::ALL {
+            install_pending_audit_claimant(&fixture, namespace);
+            seal_audit_claimant(&fixture, namespace);
+        }
+        install_audit_attempt(&fixture);
+        let attempt_binding = fixture.attempt.receipt().attempt_binding_sha256.clone();
+        let target_path = fixture.root.join(&fixture.guard.target_name);
+        let attempt_path = target_path
+            .join("dml-custody-v1/attempt")
+            .join(&attempt_binding[..2])
+            .join(&attempt_binding[2..4])
+            .join(format!("{attempt_binding}.json"));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        linux::install_complete_dml_audit_pause_hook(&target_path, entered_tx, resume_rx);
+        let guard = fixture.guard;
+        let audited = std::thread::spawn(move || guard.authorize_target_wide_d1_dml_custody());
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("complete audit reached its stable-pass boundary");
+        fs::remove_file(attempt_path).expect("change graph between complete passes");
+        resume_tx.send(()).expect("resume complete audit");
+        let error = audited
+            .join()
+            .expect("complete-audit thread")
+            .expect_err("unstable complete custody cannot authorize")
+            .structured_content
+            .expect("structured unstable-custody error");
+        assert_eq!(
+            error["error"]["code"],
+            json!("d1.target_wide_dml_custody_unproven")
+        );
+        assert_eq!(
+            error["error"]["message"],
+            json!("DML custody changed during stable complete audit")
+        );
+        fs::remove_dir_all(fixture.root).expect("unstable cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn migration_authority_receipt_binds_complete_audit_and_rechecks_before_retirement() {
+        let root = private_test_root("migration-complete-audit-binding");
+        let plan = "a".repeat(64);
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &plan,
+        )
+        .expect("clean complete audit permits migration authority");
+        let active = owner.active_path_for_test().expect("active lease path");
+        let payload = fs::read(&active).expect("read active lease receipt");
+        assert_eq!(
+            sha256_bytes_hex(&payload),
+            owner.identity.payload_sha256,
+            "downstream lease identity must bind the complete-audit projection"
+        );
+        let decoded: Value = serde_json::from_slice(&payload).expect("lease receipt JSON");
+        assert_eq!(
+            decoded["dml_custody_authorization"]["audit_sha256"],
+            json!(&owner.dml_custody_authorization.audit_sha256)
+        );
+
+        let marker = active
+            .parent()
+            .expect("target directory")
+            .join("dml-custody-v1/layout.json");
+        fs::remove_file(marker).expect("simulate an incomplete restored layout");
+        assert!(
+            owner.revalidate().is_err(),
+            "changed complete custody blocks migration provider authority"
+        );
+        assert!(
+            owner.release().is_err(),
+            "changed complete custody blocks terminal retirement"
+        );
+        assert!(
+            active.exists(),
+            "blocked retirement retains active evidence"
+        );
+        owner.retain();
+        fs::remove_dir_all(root).expect("migration audit binding cleanup");
     }
 
     #[cfg(target_os = "linux")]
@@ -7466,6 +7875,15 @@ mod tests {
                 "active_evidence": "active.lease.json and transient retiring.lease.json are never auto-reclaimed; malformed, symlink, non-regular, or otherwise present active/retiring evidence stops the next apply for governed reconciliation",
                 "cross_host_limitation": "Cross-process serialization covers only hosts sharing the same configured operator-owned lease root. It is not a Cloudflare/provider-distributed lease.",
                 "platform_requirement": "Linux on a trusted filesystem supporting working renameat2 RENAME_NOREPLACE, directory fsync, and advisory file locks; unsupported platforms or filesystems fail closed before provider I/O. Cross-host or shared-filesystem semantics require separate proof; retained evidence requires the governed recovery path.",
+                "complete_dml_custody_authority": {
+                    "required": true,
+                    "layout_sha256": crate::d1_dml_custody_layout::D1_DML_CUSTODY_LAYOUT_SHA256,
+                    "audit_budget_version": crate::d1_dml_custody_layout::D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_VERSION,
+                    "audit_budget_sha256": crate::d1_dml_custody_layout::D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_SHA256,
+                    "binding": "the exact clean complete-audit identity is persisted in the lease payload and therefore inherited by every terminal receipt through lease_payload_sha256",
+                    "last_boundary_revalidation": true,
+                    "provider_dispatch_authority_from_audit": false,
+                },
                 "target_identity_activation": {
                     "contract_version": 2,
                     "target_identity_contract": "lowercase_hyphenated_uuid_v1",
@@ -7598,11 +8016,27 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn private_test_root(label: &str) -> PathBuf {
         let root = private_unactivated_test_root(label);
+        prepare_test_dml_layout(&root);
+        root
+    }
+
+    #[cfg(target_os = "linux")]
+    fn prepare_test_dml_layout(root: &Path) {
         let root_file = fs::File::open(&root).expect("open private test root");
         let target_key_sha256 = sha256_bytes_hex(b"acct-1\0123e4567-e89b-42d3-a456-426614174000");
         linux::ensure_target_identity_activation(&root_file, &target_key_sha256)
             .expect("activate canonical target identity for existing custody tests");
-        root
+        let guard = acquire_d1_target_mutation_guard_at(
+            root.to_path_buf(),
+            "test_fixture",
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect("acquire fixture target guard");
+        guard
+            .ensure_d1_dml_custody_layout()
+            .expect("install clean complete-audit fixture layout");
+        drop(guard);
     }
 
     #[cfg(target_os = "linux")]
@@ -7863,6 +8297,9 @@ mod tests {
         )
         .expect("create the canonical target custody directory");
         let target_key_sha256 = initial.target_key_sha256.clone();
+        let dml_custody_authorization = initial
+            .authorize_target_wide_d1_dml_custody()
+            .expect("clean fixture custody authorization");
         drop(initial);
 
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
@@ -7888,6 +8325,7 @@ mod tests {
         let payload = serde_json::to_vec(&json!({
             "approved_plan_sha256": "a".repeat(64),
             "created_at_unix_ms": 1,
+            "dml_custody_authorization": dml_custody_authorization,
             "migration_family": "newsletter-core",
             "nonce": nonce,
             "target_key_sha256": target_key_sha256,
@@ -8423,6 +8861,8 @@ mod tests {
             "the absence preflight must not create a target directory or guard"
         );
 
+        prepare_test_dml_layout(&root);
+
         let mut owner = acquire_d1_migration_lease_at(
             root.clone(),
             "acct-1",
@@ -8561,7 +9001,6 @@ mod tests {
                 "d1-migration-target-{}",
                 sha256_bytes_hex(b"acct-1\0123e4567-e89b-42d3-a456-426614174000")
             ));
-            fs::create_dir(&target).expect("target directory");
             fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
                 .expect("private target directory");
             install(&target.join(ACTIVE_LEASE_NAME)).expect("install hostile active entry");
@@ -8586,7 +9025,6 @@ mod tests {
             "d1-migration-target-{}",
             sha256_bytes_hex(b"acct-1\0123e4567-e89b-42d3-a456-426614174000")
         ));
-        fs::create_dir(&target).expect("target directory");
         fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
             .expect("private target directory");
         fs::write(target.join(RETIRING_LEASE_NAME), b"retiring evidence")
@@ -8668,6 +9106,7 @@ mod tests {
                 fs::create_dir(&root).expect("nested lease root");
                 fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
                     .expect("nested lease root permissions");
+                prepare_test_dml_layout(&root);
                 root
             } else {
                 base.clone()
@@ -9720,8 +10159,8 @@ mod tests {
                 .expect("read initial target directory")
                 .count();
             assert_eq!(
-                existing_entries, 2,
-                "permanent guard and retained lease consume two entries"
+                existing_entries, 3,
+                "permanent guard, complete DML layout, and retained lease consume three entries"
             );
             let mut retained_payload: Value = serde_json::from_slice(
                 &fs::read(target.join(ACTIVE_LEASE_NAME)).expect("read retained payload"),

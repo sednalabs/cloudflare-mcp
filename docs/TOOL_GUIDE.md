@@ -167,10 +167,18 @@ are added by the graph derivation.
    receives a fresh independent budget. Exceeding any cap returns no aggregate
    receipt or audit digest and reveals no artifact path, identity, or bytes.
    The fixed layout marker remains under its separate layout-snapshot cap;
-   variable leaf artifacts are the globally budgeted graph. Wiring this proof
-   into restore, activation, or another target-wide operation is a separate
-   guarded workflow; the audit neither performs nor authorizes those operations
-   by itself.
+   variable leaf artifacts are the globally budgeted graph. Target-wide
+   authority accepts only the clean fixed-budget projection of this proof.
+   Migration lease acquisition persists its exact target/layout/budget/audit
+   identity in `active.lease.json`; retained recovery, terminal receipt,
+   restoration, and retirement re-audit it at their last owned boundary.
+   Terminal receipts inherit the binding through `lease_payload_sha256`.
+   Curated database rename/delete bind the same aggregate identity into the
+   live mutation plan and require exact fresh re-audit immediately before the
+   provider request. Absent, changed, unstable, over-budget, malformed,
+   partial, orphaned, or otherwise reconciliation-required custody stops before
+   provider mutation. The audit still neither performs nor independently
+   authorizes a provider request, and ordinary DML remains affected-leaf scoped.
    A scratch name binds the record digest, exact incumbent-state digest, and
    canonical successor-state digest. An affected leaf may contain zero or one
    rederived-valid scratch for a record; duplicate successors, a wrong or stale

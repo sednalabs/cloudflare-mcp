@@ -116,9 +116,19 @@ reconciliation evidence; `Pending`, partial, and CAS-scratch products are also
 `reconciliation_required`. The fixed aggregate receipt reports matched and
 unmatched attempts plus matched, unmatched, orphan, complete, and incomplete
 set counts and always declares
-`provider_dispatch_authority=none`. It is a required proof for the separately
-owned restore, activation, and destructive target-wide workflow integration;
-this audit alone performs or authorizes none of those operations. The
+`provider_dispatch_authority=none`. Target-wide authority accepts only a clean
+fixed-budget projection of that receipt: no Pending claimant, CAS scratch,
+partial/orphan/unmatched set, unmatched attempt, malformed artifact, or
+nonfixed layout/budget identity. Migration lease acquisition runs that proof
+before creating `active.lease.json`, persists the exact audit identity in the
+lease payload, and re-runs it at provider, receipt-persistence, restoration,
+and retirement boundaries. Because terminal receipts bind
+`lease_payload_sha256`, they also bind the exact complete-audit identity.
+Curated database rename and delete add the same identity to their live
+mutation plan and require an exact fresh re-audit immediately before the
+provider call. Missing, changed, unstable, over-budget, or merely
+reconciliation-required evidence stops with zero provider mutations. The
+audit alone still performs or authorizes no provider dispatch. The
 complete pass has a fixed, versioned DML-specific global budget: at most 16,384
 canonical leaves, 65,536 physical leaf artifacts, and 268,435,456 total
 artifact payload bytes. It reserves leaf capacity before descent, artifact
@@ -339,10 +349,23 @@ failure reports the invoked curated tool as its operation and zero provider
 calls/mutations; preserve that caller-correlated receipt when diagnosing the
 contention.
 
+Before rename, delete, migration activation, retained-evidence reconciliation,
+terminal receipt persistence, rollback restoration, or retirement, the target
+must already contain the exact `dml-custody-v1` layout and its stable complete
+audit must be clean. An absent layout is not an empty/default state. The live
+rename/delete plan exposes `authorize_complete_d1_dml_custody` with only the
+aggregate target/layout/budget/audit identity. Migration lease bytes carry the
+same identity; recovery rejects legacy, malformed, or changed lease bytes and
+re-audits current physical custody under the held guard. Do not copy an audit
+digest between targets or runs. Ordinary `d1_execute_write` remains leaf-scoped
+and does not pay for or inherit this target-wide authority gate.
+
 Generic `api_mutate` is not a fallback for an existing D1 target. Delete,
 export, import, query/raw query, time-travel restore, full update and partial
 update are denied before request construction. Use the curated guarded tool
-where one exists; otherwise defer to a separately governed lifecycle. Always
+where one exists; otherwise defer to a separately governed lifecycle. A future
+restore/import/activation surface must compose this same complete-audit gate;
+the current denial is not permission to bypass it. Always
 copy account and database IDs exactly from Cloudflare. Existing D1 database IDs
 must be canonical lowercase hyphenated UUIDs; uppercase, mixed-case, compact or
 braced variants are aliases, not independent targets. Do not trim, recase,

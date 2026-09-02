@@ -52,7 +52,6 @@ pub(crate) fn validate_layout_marker(bytes: &[u8], target_key_sha256: &str) -> b
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[allow(dead_code)] // separately owned restore/activation audit; hot DML path audits affected leaves
 pub(crate) struct D1DmlCustodyCompleteAuditReceipt {
     pub(crate) version: u8,
     pub(crate) layout_sha256: String,
@@ -86,4 +85,72 @@ pub(crate) struct D1DmlCustodyCompleteAuditReceipt {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum D1DmlCustodyAuditProviderAuthority {
     None,
+}
+
+/// Exact clean complete-audit identity carried across target-wide authority
+/// boundaries. The complete receipt remains aggregate diagnostic evidence;
+/// only this closed projection may authorize a later local or provider step.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct D1DmlCustodyCompleteAuditAuthorization {
+    pub(crate) version: u8,
+    pub(crate) target_key_sha256: String,
+    pub(crate) layout_sha256: String,
+    pub(crate) audit_budget_version: u8,
+    pub(crate) audit_budget_sha256: String,
+    pub(crate) audit_sha256: String,
+}
+
+impl D1DmlCustodyCompleteAuditReceipt {
+    pub(crate) fn authorize_target_wide_custody(
+        &self,
+        expected_target_key_sha256: &str,
+    ) -> Result<D1DmlCustodyCompleteAuditAuthorization, &'static str> {
+        let counts_are_clean = self.pending_claimant_count == 0
+            && self.cas_scratch_count == 0
+            && self.claimant_count == self.bound_claimant_count
+            && self.claimant_count
+                == self
+                    .claimant_set_count
+                    .checked_mul(3)
+                    .ok_or("DML complete-audit claimant count overflowed")?
+            && self.claimant_set_count == self.complete_claimant_set_count
+            && self.claimant_set_count == self.matched_claimant_set_count
+            && self.attempt_count == self.matched_claimant_set_count
+            && self.unmatched_claimant_set_count == 0
+            && self.unmatched_attempt_count == 0
+            && self.orphan_claimant_set_count == 0
+            && self.incomplete_claimant_set_count == 0;
+        let fixed_identity_is_exact = self.version == D1_DML_CUSTODY_LAYOUT_VERSION
+            && self.target_key_sha256 == expected_target_key_sha256
+            && self.layout_sha256 == D1_DML_CUSTODY_LAYOUT_SHA256
+            && self.audit_budget_version == D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_VERSION
+            && self.audit_budget_sha256 == D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_SHA256
+            && self.audited_leaf_limit == D1_DML_CUSTODY_COMPLETE_AUDIT_LEAF_LIMIT
+            && self.physical_artifact_limit == D1_DML_CUSTODY_COMPLETE_AUDIT_ARTIFACT_LIMIT
+            && self.artifact_payload_byte_limit == D1_DML_CUSTODY_COMPLETE_AUDIT_PAYLOAD_BYTE_LIMIT
+            && self.audited_leaf_count <= self.audited_leaf_limit
+            && self.physical_artifact_count <= self.physical_artifact_limit
+            && self.artifact_payload_bytes <= self.artifact_payload_byte_limit
+            && self.audit_sha256.len() == 64
+            && self
+                .audit_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'));
+        if self.reconciliation_required
+            || self.provider_dispatch_authority != D1DmlCustodyAuditProviderAuthority::None
+            || !fixed_identity_is_exact
+            || !counts_are_clean
+        {
+            return Err("DML complete custody is not clean target-wide authority");
+        }
+        Ok(D1DmlCustodyCompleteAuditAuthorization {
+            version: self.version,
+            target_key_sha256: self.target_key_sha256.clone(),
+            layout_sha256: self.layout_sha256.clone(),
+            audit_budget_version: self.audit_budget_version,
+            audit_budget_sha256: self.audit_budget_sha256.clone(),
+            audit_sha256: self.audit_sha256.clone(),
+        })
+    }
 }
