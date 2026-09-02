@@ -358,6 +358,10 @@ impl D1DmlWriteLifecycle {
     pub(crate) fn provider_calls(self) -> usize {
         usize::from(self.dispatch_stage == "attempted")
     }
+
+    pub(crate) fn provider_mutations(self) -> usize {
+        usize::from(self.dispatch_stage == "attempted")
+    }
 }
 
 pub(crate) fn d1_migration_reconciliation_only_cause(error: &AdapterErrorPayload) -> Value {

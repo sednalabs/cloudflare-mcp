@@ -5151,6 +5151,74 @@ fn spawn_fake_d1_database_mutation_api(
     (format!("http://{addr}"), requests)
 }
 
+fn spawn_fake_d1_execute_write_response_loss_api() -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake D1 response-loss API");
+    let addr = listener
+        .local_addr()
+        .expect("fake D1 response-loss API addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().take(5) {
+            let mut stream = stream.expect("fake D1 response-loss stream");
+            let (headers, body) = read_http_request(&mut stream);
+            let request_line = headers.lines().next().unwrap_or_default().to_string();
+            let mut request_parts = request_line.split_whitespace();
+            let method = request_parts.next().unwrap_or_default().to_string();
+            let path = request_parts.next().unwrap_or_default().to_string();
+            let body_json: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            requests_for_thread
+                .lock()
+                .expect("response-loss request log lock")
+                .push(json!({
+                    "method": method,
+                    "path": path,
+                    "body": body_json,
+                }));
+
+            if !body_json["sql"]
+                .as_str()
+                .is_some_and(|sql| sql.contains("schema_raw AS ("))
+            {
+                // The request crossed the provider boundary. Closing without a
+                // response makes the DML outcome ambiguous without retrying it.
+                drop(stream);
+                continue;
+            }
+
+            let response = serde_json::to_vec(&json!({
+                "success": true,
+                "errors": [],
+                "messages": [],
+                "result": [{
+                    "success": true,
+                    "results": [
+                        d1_catalog_relation_row("example", 1),
+                        d1_catalog_relation_row("protected", 2)
+                    ],
+                    "meta": {
+                        "served_by_primary": true,
+                        "changed_db": false,
+                        "changes": 0,
+                        "rows_written": 0
+                    }
+                }],
+            }))
+            .expect("serialize catalog response");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                response.len()
+            )
+            .expect("write catalog response headers");
+            stream
+                .write_all(&response)
+                .expect("write catalog response body");
+        }
+    });
+    (format!("http://{addr}"), requests)
+}
+
 fn d1_catalog_relation_row(name: &str, schema_rowid: i64) -> Value {
     let hex = |value: &str| {
         value
@@ -18228,6 +18296,79 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
     assert_eq!(
         requests[4]["body"]["sql"],
         json!("UPDATE example SET enabled = 1 WHERE id = 7")
+    );
+    drop(requests);
+    mcp.terminate();
+    fs::remove_dir_all(lease_root).expect("target guard cleanup");
+}
+
+#[test]
+fn d1_execute_write_response_loss_reports_the_completed_mutation_attempt() {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    let (base_url, requests) = spawn_fake_d1_execute_write_response_loss_api();
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-d1-write-response-loss-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos()
+    ));
+    fs::create_dir(&lease_root).expect("create private target guard root");
+    #[cfg(unix)]
+    fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+        .expect("make target guard root private");
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+        (
+            "CLOUDFLARE_MCP_D1_RESERVED_RELATIONS",
+            "protected".to_string(),
+        ),
+    ]);
+    let exact_args = json!({
+        "database_id": "123e4567-e89b-42d3-a456-426614174000",
+        "sql": "UPDATE example SET enabled = 1 WHERE id = 9",
+        "operation_id": "operation-loss-fixture",
+        "execution_attempt_id": "attempt-loss-fixture",
+        "provider_request_id": "provider-loss-fixture"
+    });
+    let mut dry_args = exact_args.clone();
+    dry_args["dry_run"] = json!(true);
+    let dry_response = mcp.call_tool(2, "d1_execute_write", dry_args);
+    let dry = structured_content(&dry_response);
+    assert_eq!(dry["ok"], json!(true), "{dry}");
+    assert_eq!(dry["provider_calls"], json!(2), "{dry}");
+    assert_eq!(dry["provider_mutations"], json!(0), "{dry}");
+
+    let mut live_args = exact_args;
+    live_args["dry_run"] = json!(false);
+    live_args["approved_composition_sha256"] = dry["approved_composition_sha256_required"].clone();
+    let lost_response = mcp.call_tool(3, "d1_execute_write", live_args);
+    let lost = structured_content(&lost_response);
+    assert_eq!(lost["ok"], json!(false), "{lost}");
+    assert_eq!(lost["status"], json!("reconciliation_required"));
+    assert_eq!(lost["provider_calls"], json!(3), "{lost}");
+    assert_eq!(lost["provider_mutations"], json!(1), "{lost}");
+    assert_eq!(
+        lost["provider_evidence"]["provider_lifecycle"]["dispatch_stage"],
+        json!("attempted")
+    );
+    assert_eq!(lost["automatic_retry_permitted"], json!(false));
+
+    let requests = requests.lock().expect("response-loss request log lock");
+    assert_eq!(requests.len(), 5);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request["body"]["sql"]
+                == json!("UPDATE example SET enabled = 1 WHERE id = 9"))
+            .count(),
+        1
     );
     drop(requests);
     mcp.terminate();
