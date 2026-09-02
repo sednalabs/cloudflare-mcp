@@ -912,20 +912,43 @@ reconstructed commit identity.
 
 The internal catalog-evidence boundary is deliberately not an operator tool.
 It is a pure prerequisite for a later guarded composition path and performs no
-Cloudflare request or local/provider mutation.
+local/provider mutation. Its separate provider-custody adapter owns the only
+Cloudflare reads that may construct catalog observation frames.
 
-Its successor provider-custody adapter must dispatch the fixed plan query twice.
-The two calls must use four distinct bounded dispatch/read identities and the
-canonical target returned by the D1 target normalizer. The pure verifier does
-not authenticate physical dispatch or response EOF; only that adapter may
-construct its frames, after retaining those lifecycle facts. Do not feed generic
-`d1_query_read_only` JSON into this boundary. Normalize only the fixed
-projection after the provider read has proven a complete body, the exact
-1,001-row and 4 MiB caps, successful primary service, and exact read-only
-metadata. Missing or non-boolean non-truncation evidence, a cap change, a
-1,001st row, malformed/unknown payload fields, another target or plan, and a
-changed canonical typed row projection between observations are terminal
-unavailable evidence for this proof attempt.
+The adapter preallocates four distinct bounded dispatch/read identities before
+I/O, then dispatches the fixed plan query twice for the canonical normalized
+target. Each read makes one no-redirect HTTP attempt with no adapter retry. The
+request/response custody binding covers the exact target, query and query
+digest, plan digest, and 1,001-row/4 MiB caps. The raw provider body must reach
+EOF within the byte cap before the shared duplicate-key-rejecting JSON decoder
+accepts it under the 32-container nesting bound. Following Cloudflare's [D1
+Query API response
+contract](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/query/),
+the envelope must include explicitly present, typed, empty `errors` and
+`messages` arrays, while its one successful result set has only `meta`,
+`results`, and `success`. ResponseInfo entries use the closed official `code`,
+`message`, optional `documentation_url`, and optional `source.pointer` shape;
+any non-empty array is terminal and its text is omitted from custody errors and
+receipts. The result metadata must prove primary service plus
+`changed_db=false`, `changes=0`, and `rows_written=0`. Only then does the adapter
+normalize the fixed projection and construct a frame. Do not feed generic
+`d1_query_read_only` JSON into this boundary.
+
+Network ambiguity, redirects or non-success status, incomplete or oversized
+bodies, duplicate keys, unknown envelope or ResponseInfo fields, excessive JSON
+nesting, missing/malformed/non-empty envelope errors or messages, malformed
+envelopes, non-primary or mutating metadata, response-binding drift, identity
+reuse, a cap change, and the 1,001st row are
+terminal unavailable evidence for that attempt. A first-read failure stops
+before the second request; a second-read failure preserves the truthful
+aggregate count and does not retry.
+
+The success receipt binds each body completed at EOF by SHA-256 and byte size,
+but retains neither body bytes nor private dispatch/read identities. Treat that
+digest as comparison evidence only: without separately authorized exact bytes
+it cannot replay the decode, and it never independently authenticates provider
+origin or EOF outside the trusted HTTP adapter lifecycle. Errors remain
+content-free and omit request/provider bodies and private identities.
 
 This contract only establishes that two adapter-issued frames contain one
 stable canonical typed catalog projection. Schema meaning and write
