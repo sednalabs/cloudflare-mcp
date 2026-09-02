@@ -18425,10 +18425,8 @@ fn d1_execute_write_preflight_schema_audit_and_zero_call_envelope_are_total() {
     provider
         .set_nonblocking(true)
         .expect("make D1 provider witness nonblocking");
-    let provider_url = format!(
-        "http://{}",
-        provider.local_addr().expect("D1 provider witness address")
-    ); // DevSkim: ignore DS137138 -- loopback-only no-call test witness
+    let provider_address = provider.local_addr().expect("D1 provider witness address");
+    let provider_url = format!("http://{provider_address}"); // DevSkim: ignore DS137138 -- loopback-only no-call test witness
     let mut mcp = McpStdioProcess::start_with_env(vec![
         ("CLOUDFLARE_MCP_API_BASE_URL", provider_url),
         ("CLOUDFLARE_MCP_DEFAULT_ACCOUNT_ID", String::new()),
