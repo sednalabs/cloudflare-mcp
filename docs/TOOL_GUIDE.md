@@ -139,7 +139,10 @@ are added by the graph derivation.
    identities, and row cap with `dry_run=false` and
    `approved_composition_sha256`. Live execution recomputes the two-read
    authority under the permanent target guard. Any drift blocks with zero DML
-   provider calls.
+   provider calls. If the held guard changes after those two reads, the blocked
+   receipt preserves `provider_calls=2`, `provider_mutations=0`, the complete
+   live mutation plan, and an explicit post-catalog/pre-DML reached phase with
+   Prepared, DispatchReserved, and provider submission all false.
 4. Require the receipt to show a create-once Prepared state followed by one
    exact atomic `DispatchReserved` installation before the single DML request.
    The live public mutation plan marks all three operations as side effects;

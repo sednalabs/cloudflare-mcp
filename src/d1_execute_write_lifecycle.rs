@@ -404,9 +404,48 @@ async fn execute_inner(
     }
     let guard = guard.expect("live execution installed target guard");
     if let Err(result) = guard.revalidate() {
-        return provider.apply(result);
+        return provider.apply(post_catalog_guard_denial(result, mutation_plan, base));
     }
     execute_reserved_attempt(client, target, input, composition, guard, base, provider).await
+}
+
+fn post_catalog_guard_denial(
+    result: CallToolResult,
+    mutation_plan: &MutationPlan,
+    mut evidence: Value,
+) -> CallToolResult {
+    let error = result
+        .structured_content
+        .as_ref()
+        .and_then(|content| content.get("error"))
+        .cloned()
+        .unwrap_or_else(|| {
+            json!({
+                "code": "d1.target_guard_custody_changed",
+                "message": "permanent target custody changed after catalog authority collection",
+                "hint": "Do not issue provider SQL; restore or reconcile exact target custody before repeating dry-run."
+            })
+        });
+    if let Some(object) = evidence.as_object_mut() {
+        object.insert(
+            "reached_phase".to_string(),
+            json!({
+                "phase": "post_catalog_pre_dml_guard_revalidation",
+                "prepared_state_installed": false,
+                "dispatch_reserved_installed": false,
+                "provider_submission_attempted": false,
+            }),
+        );
+    }
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": D1_EXECUTE_WRITE_OPERATION,
+        "status": D1ExecuteWriteLifecycleStatus::Blocked.as_str(),
+        "mutation_plan": mutation_plan,
+        "evidence": evidence,
+        "automatic_retry_permitted": false,
+        "error": error,
+    }))
 }
 
 fn validate_opaque_identities(

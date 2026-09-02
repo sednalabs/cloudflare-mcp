@@ -5062,12 +5062,19 @@ fn spawn_fake_graphql_api(response_body: Value) -> String {
 fn spawn_fake_d1_database_mutation_api(
     expected_requests: usize,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
+    spawn_fake_d1_database_mutation_api_with_guard_drift(expected_requests, None)
+}
+
+fn spawn_fake_d1_database_mutation_api_with_guard_drift(
+    expected_requests: usize,
+    guard_to_displace_after_second_request: Option<PathBuf>,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake D1 API");
     let addr = listener.local_addr().expect("fake D1 API addr");
     let requests = Arc::new(Mutex::new(Vec::new()));
     let requests_for_thread = requests.clone();
     thread::spawn(move || {
-        for stream in listener.incoming().take(expected_requests) {
+        for (index, stream) in listener.incoming().take(expected_requests).enumerate() {
             let mut stream = stream.expect("fake D1 API stream");
             let (headers, body) = read_http_request(&mut stream);
             let request_line = headers.lines().next().unwrap_or_default().to_string();
@@ -5151,6 +5158,12 @@ fn spawn_fake_d1_database_mutation_api(
                 }),
             };
             let response = serde_json::to_vec(&response).expect("serialize response");
+            if index == 1
+                && let Some(guard) = guard_to_displace_after_second_request.as_ref()
+            {
+                fs::rename(guard, guard.with_extension("catalog-drifted"))
+                    .expect("displace target guard after the second catalog read");
+            }
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
@@ -18420,6 +18433,145 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
     );
     drop(requests);
     mcp.terminate();
+    fs::remove_dir_all(lease_root).expect("target guard cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn d1_execute_write_post_catalog_guard_drift_returns_complete_pre_dml_evidence() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let exact_args = json!({
+        "database_id": "123e4567-e89b-42d3-a456-426614174000",
+        "sql": "UPDATE example SET enabled = 1 WHERE id = 10",
+        "operation_id": "operation-drift-fixture",
+        "execution_attempt_id": "attempt-drift-fixture",
+        "provider_request_id": "provider-drift-fixture"
+    });
+    let (dry_base_url, dry_requests) = spawn_fake_d1_database_mutation_api(2);
+    let mut dry_mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", dry_base_url),
+        (
+            "CLOUDFLARE_MCP_D1_RESERVED_RELATIONS",
+            "protected".to_string(),
+        ),
+    ]);
+    let mut dry_args = exact_args.clone();
+    dry_args["dry_run"] = json!(true);
+    let dry_response = dry_mcp.call_tool(2, "d1_execute_write", dry_args);
+    assert_tool_text_matches_structured(&dry_response);
+    let dry = structured_content(&dry_response);
+    assert_eq!(dry["ok"], json!(true), "{dry}");
+    let approved = dry["approved_composition_sha256_required"]
+        .as_str()
+        .expect("drift composition approval")
+        .to_string();
+    assert_eq!(dry_requests.lock().expect("dry request log").len(), 2);
+    dry_mcp.terminate();
+
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-d1-write-post-catalog-drift-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos()
+    ));
+    fs::create_dir(&lease_root).expect("create private target guard root");
+    fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+        .expect("make target guard root private");
+    let guard = manifest_target_path(&lease_root).join("guard.lock");
+    let (live_base_url, live_requests) =
+        spawn_fake_d1_database_mutation_api_with_guard_drift(2, Some(guard));
+    let mut live_mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", live_base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+        (
+            "CLOUDFLARE_MCP_D1_RESERVED_RELATIONS",
+            "protected".to_string(),
+        ),
+    ]);
+    let mut live_args = exact_args;
+    live_args["dry_run"] = json!(false);
+    live_args["approved_composition_sha256"] = json!(approved);
+    let response = live_mcp.call_tool(3, "d1_execute_write", live_args);
+    assert_tool_text_matches_structured(&response);
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["operation"], json!("d1_execute_write"));
+    assert_eq!(content["status"], json!("blocked"));
+    assert_eq!(content["provider_calls"], json!(2));
+    assert_eq!(content["provider_mutations"], json!(0));
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.target_guard_custody_changed")
+    );
+    assert_eq!(
+        content["mutation_plan"],
+        expected_d1_execute_write_mutation_plan(false),
+        "{content}"
+    );
+    let evidence = &content["evidence"];
+    assert_eq!(
+        evidence,
+        &json!({
+            "operation": "d1_execute_write",
+            "execution_plan": evidence["execution_plan"].clone(),
+            "execute_plan_sha256": evidence["execute_plan_sha256"].clone(),
+            "catalog_provider_custody": evidence["catalog_provider_custody"].clone(),
+            "catalog_evidence": evidence["catalog_evidence"].clone(),
+            "reserved_relation_graph": evidence["reserved_relation_graph"].clone(),
+            "composition": evidence["composition"].clone(),
+            "attempt": evidence["attempt"].clone(),
+            "mutation_plan": expected_d1_execute_write_mutation_plan(false),
+            "automatic_retry_permitted": false,
+            "reached_phase": {
+                "phase": "post_catalog_pre_dml_guard_revalidation",
+                "prepared_state_installed": false,
+                "dispatch_reserved_installed": false,
+                "provider_submission_attempted": false,
+            },
+        }),
+        "whole post-catalog evidence drifted: {content}"
+    );
+    assert_d1_execute_write_audit(
+        content,
+        false,
+        "error",
+        Some("d1.target_guard_custody_changed"),
+        json!({
+            "target_key_sha256": sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000")
+        }),
+    );
+    assert_eq!(
+        content,
+        &json!({
+            "ok": false,
+            "operation": "d1_execute_write",
+            "status": "blocked",
+            "mutation_plan": expected_d1_execute_write_mutation_plan(false),
+            "evidence": evidence.clone(),
+            "automatic_retry_permitted": false,
+            "error": content["error"].clone(),
+            "provider_calls": 2,
+            "provider_mutations": 0,
+            "audit": content["audit"].clone(),
+        }),
+        "whole late-guard denial envelope drifted: {content}"
+    );
+    let requests = live_requests.lock().expect("live request log");
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests.iter().all(|request| request["body"]["sql"]
+            .as_str()
+            .is_some_and(|sql| sql.contains("schema_raw AS ("))),
+        "late guard drift must stop before provider DML: {requests:?}"
+    );
+    drop(requests);
+    live_mcp.terminate();
     fs::remove_dir_all(lease_root).expect("target guard cleanup");
 }
 

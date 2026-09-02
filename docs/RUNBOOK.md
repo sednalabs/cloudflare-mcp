@@ -101,6 +101,10 @@ plan marks both custody writes and provider submission as side effects. Audit
 outcome is closed to `planned`, `error`, or `reconciliation_required`; a
 provider acknowledgement or response-loss ambiguity remains
 `reconciliation_required`, not terminal success.
+If guard custody changes after the two catalog reads but before Prepared
+creation, return a complete blocked lifecycle receipt with two provider reads,
+zero provider mutations, the complete live plan, and explicit false flags for
+Prepared, DispatchReserved, and provider submission.
 The pre-provider classifier uses a capped lexical token stream. An UPSERT must
 contain one balanced top-level `ON CONFLICT ... DO UPDATE SET` action; tabs,
 newlines, repeated ASCII whitespace, and keyword case are equivalent. String
