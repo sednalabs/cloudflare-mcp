@@ -344,14 +344,15 @@ digest, custody, and no-retry semantics remain unchanged.
 ## Staged D1 catalog evidence contract
 
 The crate contains a side-effect-free, non-routed catalog evidence boundary for
-future guarded D1 write composition. It derives one immutable, target-bound
-`sqlite_schema` projection rather than accepting caller SQL or a generic
-provider envelope. Its internal provider-custody adapter normalizes two physical
-observations into the exact versioned projection payload and binds each one to
-the same canonical target and rederived plan using four distinct dispatch/read
-identities preallocated before either request. The pure verifier cannot
-authenticate physical dispatch or response EOF by itself and accepts frames
-constructed only from this retained adapter custody.
+future guarded D1 write composition. Projection version 3 derives one immutable,
+target-bound structured fact set from `sqlite_schema` and the
+`pragma_foreign_key_list()` table-valued function rather than accepting caller
+SQL or a generic provider envelope. Its internal provider-custody adapter
+normalizes two physical observations into that exact versioned projection
+payload and binds each one to the same canonical target and rederived plan using
+four distinct dispatch/read identities preallocated before either request. The
+pure verifier cannot authenticate physical dispatch or response EOF by itself
+and accepts frames constructed only from this retained adapter custody.
 
 Each provider read is exactly one POST through the existing no-redirect
 Cloudflare client. The adapter binds the canonical account/database target,
@@ -375,12 +376,34 @@ Each observation must prove a complete body under the exact 4 MiB byte cap, a
 literal `results_truncated=false` under the exact 1,001-row provider cap, and
 typed successful primary read-only metadata (`changed_db=false`, `changes=0`,
 and `rows_written=0`). The 1,001st row is a completeness sentinel, not catalog
-content. Projection rows expose only object type plus uppercase hexadecimal
-bytes for object name, parent name, and nullable definition text. They must be
-strictly ordered exactly as the fixed query specifies. The two payloads must
-deserialize to equal typed row vectors. The snapshot digest covers canonical
-JSON reserialization of that typed vector; equality of the original provider
-JSON bytes is neither required nor claimed.
+content. Projection rows are a closed typed union of relation, trigger-owner,
+schema-auxiliary, schema-blocker, foreign-key, and foreign-key-blocker facts.
+The query enumerates every physical `sqlite_schema` row before classification.
+It retains the SQLite storage class and uppercase hexadecimal bytes of schema
+type, name, and owner fields, plus the SQL storage class. A non-TEXT or otherwise
+malformed field therefore becomes an explicit blocker row instead of being
+normalized by a cast or omitted by a type predicate. Only unique printable-ASCII
+TEXT table names with structurally valid catalog fields are eligible inputs to
+`pragma_foreign_key_list()`; blocker names never reach that function.
+
+Foreign-key rows retain native typed id and sequence plus the storage class and
+exact bytes of referenced table, `from`, `to`, update action, delete action, and
+match mode. `to=NULL` and `to=''` remain distinct. Composite rows require one
+parent/action/match identity, unique contiguous sequences beginning at zero,
+and exact from/to evidence at every sequence. This matches the semantic field
+set used by migration reconciliation without coupling the two implementations.
+Relation rows retain SQL bytes only for structurally valid tables and only as a
+later AUTOINCREMENT token source. View SQL and trigger bodies are never
+projected or interpreted. Missing owners or parents, malformed storage classes,
+ambiguous schema identities, unavailable table token sources, and unproven
+view/trigger write semantics remain exact conservative blockers.
+
+Rows are keyed by physical schema rowid and fact order and must be strictly
+ordered exactly as the fixed query specifies. The 1,001-row sentinel applies to
+the complete union, so a late blocker cannot be silently dropped within the
+accepted bound. The two payloads must deserialize to equal typed row vectors.
+The snapshot digest covers canonical JSON reserialization of that typed vector;
+equality of the original provider JSON bytes is neither required nor claimed.
 
 The adapter receipt contains only target/plan/query digests, the SHA-256 and
 size of each body completed at EOF, and aggregate counts and caps; raw request
@@ -392,9 +415,13 @@ HTTP adapter lifecycle that issued the receipt. The owned result exposes two
 borrowed frames for the pure verifier only after both complete primary read-only
 reads pass custody checks. The verifier receipt contains only
 target/plan/query/snapshot and observation-pair digests, counts, caps, and body
-sizes. Neither receipt parses or authorizes DDL, triggers, foreign keys,
-implicit writes, DML, provider admission, custody outside these exact reads, or
-any mutation. No public MCP tool currently exposes this staged contract.
+sizes. The verifier additionally returns an internal opaque product containing
+the accepted typed rows; its aggregate-safe receipt counts physical schema rows,
+each fact/blocker family, and all conservative blockers without exposing names
+or SQL. Neither receipt nor product parses CREATE TABLE text, view SQL, or
+trigger bodies; traverses a graph; authorizes DDL, DML, foreign-key effects,
+implicit writes, provider admission, custody outside these exact reads, or any
+mutation. No public MCP tool currently exposes this staged contract.
 
 ## Structured payload details for complex tools
 

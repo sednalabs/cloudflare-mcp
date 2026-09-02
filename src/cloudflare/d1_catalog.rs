@@ -23,9 +23,8 @@ use crate::d1_catalog_evidence::{
 };
 use crate::d1_target::D1TargetIdentity;
 
-const D1_CATALOG_PROVIDER_CUSTODY_VERSION: u8 = 1;
+const D1_CATALOG_PROVIDER_CUSTODY_VERSION: u8 = 3;
 const D1_CATALOG_PROVIDER_CUSTODY_OPERATION: &str = "d1_catalog_provider_custody";
-const D1_CATALOG_PROJECTION_VERSION: u8 = 1;
 
 static D1_CATALOG_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -68,6 +67,7 @@ pub(crate) struct D1CatalogProviderCustodyReceipt {
     pub(crate) target_key_sha256: String,
     pub(crate) query_plan_sha256: String,
     pub(crate) query_sha256: String,
+    pub(crate) projection_version: u8,
     pub(crate) provider_calls: usize,
     pub(crate) preallocated_dispatch_identities: usize,
     pub(crate) preallocated_read_identities: usize,
@@ -87,6 +87,7 @@ struct D1CatalogProviderRequestBinding {
     target_key_sha256: String,
     query_plan_sha256: String,
     query_sha256: String,
+    projection_version: u8,
     query: String,
     provider_row_cap: usize,
     provider_byte_cap: usize,
@@ -105,6 +106,7 @@ impl D1CatalogProviderRequestBinding {
             && self.target_key_sha256 == target.target_key_sha256()
             && self.query_plan_sha256 == plan_sha256
             && self.query_sha256 == plan.query_sha256
+            && self.projection_version == plan.projection_version
             && self.query == plan.query
             && self.provider_row_cap == plan.provider_row_cap
             && self.provider_byte_cap == plan.provider_byte_cap
@@ -401,6 +403,7 @@ where
         target_key_sha256,
         query_plan_sha256: derived_plan_sha256.clone(),
         query_sha256: derived_plan.query_sha256.clone(),
+        projection_version: derived_plan.projection_version,
         provider_calls: 2,
         preallocated_dispatch_identities: 2,
         preallocated_read_identities: 2,
@@ -450,6 +453,7 @@ fn provider_request(
         target_key_sha256: target.target_key_sha256(),
         query_plan_sha256: plan_sha256.to_string(),
         query_sha256: plan.query_sha256.clone(),
+        projection_version: plan.projection_version,
         query: plan.query.to_string(),
         provider_row_cap: plan.provider_row_cap,
         provider_byte_cap: plan.provider_byte_cap,
@@ -611,11 +615,39 @@ struct D1CatalogProviderMetadata {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct D1CatalogProviderRow {
-    object_type: String,
-    object_name_hex: String,
+    schema_rowid: i64,
+    fact_order: u8,
+    fact_kind: String,
+    relation_type_storage_class: String,
+    relation_type_value_hex: String,
+    relation_type: String,
+    relation_name_storage_class: String,
+    relation_name_hex: String,
+    owner_name_storage_class: String,
+    owner_name_hex: String,
+    schema_sql_storage_class: String,
+    table_sql_token_source_is_null: u8,
+    table_sql_token_source_hex: String,
+    foreign_key_id_storage_class: String,
+    foreign_key_id_value_hex: String,
+    foreign_key_id: i64,
+    foreign_key_seq_storage_class: String,
+    foreign_key_seq_value_hex: String,
+    foreign_key_seq: i64,
+    parent_name_storage_class: String,
     parent_name_hex: String,
-    definition_is_null: u8,
-    definition_hex: String,
+    from_column_storage_class: String,
+    from_column_hex: String,
+    to_column_storage_class: String,
+    to_column_is_null: u8,
+    to_column_hex: String,
+    on_update_storage_class: String,
+    on_update_hex: String,
+    on_delete_storage_class: String,
+    on_delete_hex: String,
+    match_storage_class: String,
+    match_hex: String,
+    conservative_blocker: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -797,7 +829,7 @@ impl D1CatalogProviderBoundary for CloudflareClient {
             ));
         }
         let projection_body = serde_json::to_vec(&D1CatalogProjectionPayload {
-            version: D1_CATALOG_PROJECTION_VERSION,
+            version: request.projection_version,
             results_truncated: false,
             meta: D1CatalogProjectionMetadata {
                 query_succeeded: true,
@@ -992,11 +1024,39 @@ mod tests {
                 .collect::<String>()
         };
         json!({
-            "object_type": "table",
-            "object_name_hex": hex(name),
-            "parent_name_hex": hex(name),
-            "definition_is_null": 0,
-            "definition_hex": hex("CREATE TABLE item (id INTEGER)")
+            "schema_rowid": 1,
+            "fact_order": 0,
+            "fact_kind": "relation",
+            "relation_type_storage_class": "text",
+            "relation_type_value_hex": hex("table"),
+            "relation_type": "table",
+            "relation_name_storage_class": "text",
+            "relation_name_hex": hex(name),
+            "owner_name_storage_class": "text",
+            "owner_name_hex": hex(name),
+            "schema_sql_storage_class": "text",
+            "table_sql_token_source_is_null": 0,
+            "table_sql_token_source_hex": hex("CREATE TABLE item (id INTEGER)"),
+            "foreign_key_id_storage_class": "not_applicable",
+            "foreign_key_id_value_hex": "",
+            "foreign_key_id": -1,
+            "foreign_key_seq_storage_class": "not_applicable",
+            "foreign_key_seq_value_hex": "",
+            "foreign_key_seq": -1,
+            "parent_name_storage_class": "not_applicable",
+            "parent_name_hex": "",
+            "from_column_storage_class": "not_applicable",
+            "from_column_hex": "",
+            "to_column_storage_class": "not_applicable",
+            "to_column_is_null": 1,
+            "to_column_hex": "",
+            "on_update_storage_class": "not_applicable",
+            "on_update_hex": "",
+            "on_delete_storage_class": "not_applicable",
+            "on_delete_hex": "",
+            "match_storage_class": "not_applicable",
+            "match_hex": "",
+            "conservative_blocker": ""
         })
     }
 
@@ -1055,6 +1115,8 @@ mod tests {
 
         assert_eq!(bodies.lock().expect("bodies").len(), 2);
         assert_eq!(custody_receipt.provider_calls, 2);
+        assert_eq!(custody_receipt.version, 3);
+        assert_eq!(custody_receipt.projection_version, 3);
         assert_eq!(custody_receipt.complete_response_bodies, 2);
         assert_eq!(custody_receipt.primary_read_only_observations, 2);
         assert_eq!(custody_receipt.preallocated_dispatch_identities, 2);
@@ -1077,6 +1139,7 @@ mod tests {
                 .all(|size| *size > 0)
         );
         assert_eq!(evidence.stable_primary_observations, 2);
+        assert_eq!(evidence.relation_fact_count, 1);
         let receipt_json = serde_json::to_value(custody_receipt).expect("receipt");
         assert!(receipt_json.get("dispatch_id").is_none());
         assert!(receipt_json.get("read_id").is_none());
@@ -1128,7 +1191,7 @@ mod tests {
                 MockMode::WrongQuery => binding.query.push_str(" "),
             }
             let projection_body = serde_json::to_vec(&D1CatalogProjectionPayload {
-                version: 1,
+                version: request.projection_version,
                 results_truncated: false,
                 meta: D1CatalogProjectionMetadata {
                     query_succeeded: true,
