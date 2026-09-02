@@ -87,6 +87,13 @@ pub(crate) enum D1DmlCustodyAuditProviderAuthority {
     None,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum D1DmlCustodyLayoutEnsureOutcome {
+    Created,
+    AlreadyPresent,
+}
+
 /// Exact clean complete-audit identity carried across target-wide authority
 /// boundaries. The complete receipt remains aggregate diagnostic evidence;
 /// only this closed projection may authorize a later local or provider step.

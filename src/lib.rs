@@ -32,6 +32,7 @@ pub(crate) mod d1_opaque_identity;
 #[allow(dead_code)] // staged pure graph; DML composition is a later authority boundary
 pub(crate) mod d1_reserved_relation_graph;
 pub(crate) mod d1_target;
+pub(crate) mod d1_target_wide_mutation;
 pub mod dns_route;
 pub mod mutation;
 pub(crate) mod pages_deploy;

@@ -80,15 +80,17 @@ use crate::d1_migration_terminal::{
     finalize_d1_migration_reconciliation,
 };
 use crate::d1_target::normalize_d1_target;
+use crate::d1_target_wide_mutation::{
+    D1TargetWideExecutionEvidence, D1TargetWideIntendedPlan, d1_target_wide_intended_plan,
+};
 use crate::dns_route::{
     DnsRouteConflict, DnsRouteVerificationState, plan_dns_route_reconciliation, verify_dns_route,
 };
 use crate::mutation::{
-    MutationAuditSession, MutationPlan, MutationPlanStep, emit_mutation_audit_log,
-    plan_apply_access_allowlist, plan_cache_mutation, plan_connector_control,
-    plan_emergency_unpublish, plan_ensure_tunnel, plan_lock_first_publish,
-    plan_patch_worker_settings, plan_replace_access_policies, plan_upload_worker_script,
-    plan_upsert_access_app, plan_upsert_dns_cname,
+    MutationAuditSession, MutationPlan, emit_mutation_audit_log, plan_apply_access_allowlist,
+    plan_cache_mutation, plan_connector_control, plan_emergency_unpublish, plan_ensure_tunnel,
+    plan_lock_first_publish, plan_patch_worker_settings, plan_replace_access_policies,
+    plan_upload_worker_script, plan_upsert_access_app, plan_upsert_dns_cname,
 };
 use crate::pages_deploy::{
     MAX_PAGES_ASSET_COUNT_DEFAULT, PagesDirectoryInspectOptions,
@@ -3879,25 +3881,23 @@ impl CloudflareMcp {
                 "Pass the desired database name in the name argument.",
             ));
         }
-        let mut plan = MutationPlan::new("d1_rename_database")
-            .step(
-                "validate_d1_database_rename",
-                false,
-                json!({
-                    "account_id": account_id,
-                    "database_id": database_id,
-                    "new_name": name,
-                }),
-            )
-            .step(
-                "apply_d1_database_patch",
-                true,
-                json!({
-                    "method": "PATCH",
-                    "path": "/accounts/{account_id}/d1/database/{database_id}",
-                    "body": {"name": name},
-                }),
-            );
+        let intended_plan = d1_target_wide_intended_plan(
+            "d1_rename_database",
+            "validate_d1_database_rename",
+            json!({
+                "account_id": account_id,
+                "database_id": database_id,
+                "new_name": name,
+            }),
+            &target.target_key_sha256(),
+            "apply_d1_database_patch",
+            json!({
+                "method": "PATCH",
+                "path": "/accounts/{account_id}/d1/database/{database_id}",
+                "body": {"name": name},
+            }),
+        );
+        let mut execution_evidence = D1TargetWideExecutionEvidence::unobserved(&intended_plan);
         let audit = MutationAuditSession::start(
             None,
             "d1_rename_database",
@@ -3905,6 +3905,7 @@ impl CloudflareMcp {
                 "account_id": account_id,
                 "database_id": database_id,
                 "new_name": name,
+                "intended_plan_sha256": intended_plan.plan_sha256,
             }),
             args.dry_run,
         );
@@ -3926,41 +3927,88 @@ impl CloudflareMcp {
                 database_id,
             ) {
                 Ok(guard) => guard,
-                Err(result) => return Ok(finalize_mutation_result(result, &plan, audit, false)),
-            };
-            if let Err(result) = guard.ensure_target_wide_d1_dml_custody_layout() {
-                return Ok(finalize_mutation_result(result, &plan, audit, false));
-            }
-            let dml_custody_authorization = match guard.authorize_target_wide_d1_dml_custody() {
-                Ok(authorization) => authorization,
                 Err(result) => {
-                    return Ok(finalize_mutation_result(result, &plan, audit, false));
+                    return Ok(finalize_d1_target_wide_mutation_result(
+                        result,
+                        &intended_plan,
+                        &execution_evidence,
+                        audit,
+                        false,
+                    ));
                 }
             };
-            bind_complete_d1_dml_custody_before_side_effect(&mut plan, &dml_custody_authorization);
+            match guard.ensure_target_wide_d1_dml_custody_layout() {
+                Ok(outcome) => execution_evidence.layout_observed(outcome),
+                Err(result) => {
+                    execution_evidence.layout_failed();
+                    return Ok(finalize_d1_target_wide_mutation_result(
+                        result,
+                        &intended_plan,
+                        &execution_evidence,
+                        audit,
+                        false,
+                    ));
+                }
+            }
+            let dml_custody_authorization = match guard.authorize_target_wide_d1_dml_custody() {
+                Ok(authorization) => {
+                    execution_evidence.audit_authorized(&authorization);
+                    authorization
+                }
+                Err(result) => {
+                    execution_evidence.audit_failed();
+                    return Ok(finalize_d1_target_wide_mutation_result(
+                        result,
+                        &intended_plan,
+                        &execution_evidence,
+                        audit,
+                        false,
+                    ));
+                }
+            };
             if let Err(result) =
                 guard.revalidate_target_wide_d1_dml_custody(&dml_custody_authorization)
             {
-                return Ok(finalize_mutation_result(result, &plan, audit, false));
+                execution_evidence.revalidation_failed();
+                return Ok(finalize_d1_target_wide_mutation_result(
+                    result,
+                    &intended_plan,
+                    &execution_evidence,
+                    audit,
+                    false,
+                ));
             }
+            execution_evidence.revalidation_matched(&dml_custody_authorization);
             match self
                 .cloudflare
                 .rename_d1_database(account_id, database_id, name)
                 .await
             {
-                Ok(database) => CallToolResult::structured(json!({
-                    "ok": true,
-                    "operation": "d1_rename_database",
-                    "account_id": account_id,
-                    "database_id": database_id,
-                    "new_name": name,
-                    "database": database,
-                })),
-                Err(err) => adapter_error_result(err),
+                Ok(database) => {
+                    execution_evidence.provider_succeeded();
+                    CallToolResult::structured(json!({
+                        "ok": true,
+                        "operation": "d1_rename_database",
+                        "account_id": account_id,
+                        "database_id": database_id,
+                        "new_name": name,
+                        "database": database,
+                    }))
+                }
+                Err(err) => {
+                    execution_evidence.provider_failed_or_uncertain();
+                    adapter_error_result(err)
+                }
             }
         };
 
-        Ok(finalize_mutation_result(base, &plan, audit, args.dry_run))
+        Ok(finalize_d1_target_wide_mutation_result(
+            base,
+            &intended_plan,
+            &execution_evidence,
+            audit,
+            args.dry_run,
+        ))
     }
 
     #[tool(
@@ -3997,25 +4045,23 @@ impl CloudflareMcp {
             Ok(path) => path,
             Err(err) => return Ok(api_catalog_error_result(err)),
         };
-        let required_token = mutation_confirmation_token(operation, &path, &None);
-        let mut plan = MutationPlan::new("d1_delete_database")
-            .step(
-                "validate_d1_database_delete",
-                false,
-                json!({
-                    "account_id": account_id,
-                    "database_id": database_id,
-                    "reason": args.reason.clone(),
-                }),
-            )
-            .step(
-                "apply_d1_database_delete",
-                true,
-                json!({
-                    "method": "DELETE",
-                    "path": path,
-                }),
-            );
+        let intended_plan = d1_target_wide_intended_plan(
+            "d1_delete_database",
+            "validate_d1_database_delete",
+            json!({
+                "account_id": account_id,
+                "database_id": database_id,
+                "reason": args.reason.clone(),
+            }),
+            &target.target_key_sha256(),
+            "apply_d1_database_delete",
+            json!({
+                "method": "DELETE",
+                "path": path,
+            }),
+        );
+        let required_token = intended_plan.confirmation_token();
+        let mut execution_evidence = D1TargetWideExecutionEvidence::unobserved(&intended_plan);
         let audit = MutationAuditSession::start(
             None,
             "d1_delete_database",
@@ -4023,6 +4069,7 @@ impl CloudflareMcp {
                 "account_id": account_id,
                 "database_id": database_id,
                 "reason": args.reason.clone(),
+                "intended_plan_sha256": intended_plan.plan_sha256,
             }),
             args.dry_run,
         );
@@ -4036,6 +4083,7 @@ impl CloudflareMcp {
                 "user-agent": "<configured>"
             },
             "required_confirmation_token": required_token,
+            "intended_plan_sha256": intended_plan.plan_sha256,
         });
 
         let base = if args.dry_run {
@@ -4068,40 +4116,87 @@ impl CloudflareMcp {
                 database_id,
             ) {
                 Ok(guard) => guard,
-                Err(result) => return Ok(finalize_mutation_result(result, &plan, audit, false)),
-            };
-            if let Err(result) = guard.ensure_target_wide_d1_dml_custody_layout() {
-                return Ok(finalize_mutation_result(result, &plan, audit, false));
-            }
-            let dml_custody_authorization = match guard.authorize_target_wide_d1_dml_custody() {
-                Ok(authorization) => authorization,
                 Err(result) => {
-                    return Ok(finalize_mutation_result(result, &plan, audit, false));
+                    return Ok(finalize_d1_target_wide_mutation_result(
+                        result,
+                        &intended_plan,
+                        &execution_evidence,
+                        audit,
+                        false,
+                    ));
                 }
             };
-            bind_complete_d1_dml_custody_before_side_effect(&mut plan, &dml_custody_authorization);
+            match guard.ensure_target_wide_d1_dml_custody_layout() {
+                Ok(outcome) => execution_evidence.layout_observed(outcome),
+                Err(result) => {
+                    execution_evidence.layout_failed();
+                    return Ok(finalize_d1_target_wide_mutation_result(
+                        result,
+                        &intended_plan,
+                        &execution_evidence,
+                        audit,
+                        false,
+                    ));
+                }
+            }
+            let dml_custody_authorization = match guard.authorize_target_wide_d1_dml_custody() {
+                Ok(authorization) => {
+                    execution_evidence.audit_authorized(&authorization);
+                    authorization
+                }
+                Err(result) => {
+                    execution_evidence.audit_failed();
+                    return Ok(finalize_d1_target_wide_mutation_result(
+                        result,
+                        &intended_plan,
+                        &execution_evidence,
+                        audit,
+                        false,
+                    ));
+                }
+            };
             if let Err(result) =
                 guard.revalidate_target_wide_d1_dml_custody(&dml_custody_authorization)
             {
-                return Ok(finalize_mutation_result(result, &plan, audit, false));
+                execution_evidence.revalidation_failed();
+                return Ok(finalize_d1_target_wide_mutation_result(
+                    result,
+                    &intended_plan,
+                    &execution_evidence,
+                    audit,
+                    false,
+                ));
             }
+            execution_evidence.revalidation_matched(&dml_custody_authorization);
             match self
                 .cloudflare
                 .delete_d1_database(account_id, database_id)
                 .await
             {
-                Ok(result) => CallToolResult::structured(json!({
-                    "ok": true,
-                    "operation": "d1_delete_database",
-                    "account_id": account_id,
-                    "database_id": database_id,
-                    "result": result,
-                })),
-                Err(err) => adapter_error_result(err),
+                Ok(result) => {
+                    execution_evidence.provider_succeeded();
+                    CallToolResult::structured(json!({
+                        "ok": true,
+                        "operation": "d1_delete_database",
+                        "account_id": account_id,
+                        "database_id": database_id,
+                        "result": result,
+                    }))
+                }
+                Err(err) => {
+                    execution_evidence.provider_failed_or_uncertain();
+                    adapter_error_result(err)
+                }
             }
         };
 
-        Ok(finalize_mutation_result(base, &plan, audit, args.dry_run))
+        Ok(finalize_d1_target_wide_mutation_result(
+            base,
+            &intended_plan,
+            &execution_evidence,
+            audit,
+            args.dry_run,
+        ))
     }
 
     #[tool(
@@ -14167,40 +14262,23 @@ fn finalize_mutation_result(
     result
 }
 
-fn bind_complete_d1_dml_custody_before_side_effect(
-    plan: &mut MutationPlan,
-    authorization: &crate::d1_dml_custody_layout::D1DmlCustodyCompleteAuditAuthorization,
-) {
-    let insertion = plan
-        .steps
-        .iter()
-        .position(|step| step.side_effect)
-        .unwrap_or(plan.steps.len());
-    plan.steps.splice(
-        insertion..insertion,
-        [
-            MutationPlanStep {
-                ordinal: 0,
-                action: "ensure_d1_dml_custody_layout",
-                side_effect: true,
-                target: json!({
-                    "target_key_sha256": authorization.target_key_sha256,
-                    "layout_sha256": authorization.layout_sha256,
-                    "effect_scope": "local_custody_only",
-                    "provider_dispatch_authority": "none",
-                }),
-            },
-            MutationPlanStep {
-                ordinal: 0,
-                action: "authorize_complete_d1_dml_custody",
-                side_effect: false,
-                target: json!(authorization),
-            },
-        ],
-    );
-    for (index, step) in plan.steps.iter_mut().enumerate() {
-        step.ordinal = (index.saturating_add(1)).min(u8::MAX as usize) as u8;
+fn finalize_d1_target_wide_mutation_result(
+    mut result: CallToolResult,
+    intended_plan: &D1TargetWideIntendedPlan,
+    execution_evidence: &D1TargetWideExecutionEvidence,
+    audit: MutationAuditSession,
+    dry_run: bool,
+) -> CallToolResult {
+    if let Some(payload) = result.structured_content.as_mut()
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.insert(
+            "intended_plan_sha256".to_string(),
+            json!(intended_plan.plan_sha256),
+        );
+        object.insert("execution_evidence".to_string(), json!(execution_evidence));
     }
+    finalize_mutation_result(result, &intended_plan.plan, audit, dry_run)
 }
 
 fn extract_error_code(payload: &serde_json::Value) -> Option<String> {

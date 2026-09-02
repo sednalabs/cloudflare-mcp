@@ -673,21 +673,24 @@ impl D1TargetMutationGuard {
     /// Install the fixed empty layout only for a fresh target-wide operation.
     /// Retained/recovery callers deliberately do not use this path: absence in
     /// those workflows is evidence loss and must remain fail-closed.
-    pub(crate) fn ensure_target_wide_d1_dml_custody_layout(&self) -> Result<(), CallToolResult> {
+    pub(crate) fn ensure_target_wide_d1_dml_custody_layout(
+        &self,
+    ) -> Result<crate::d1_dml_custody_layout::D1DmlCustodyLayoutEnsureOutcome, CallToolResult> {
         self.revalidate()?;
         #[cfg(target_os = "linux")]
         {
-            linux::ensure_d1_dml_custody_layout(&self.target, &self.target_key_sha256).map_err(
-                |message| {
-                    d1_target_guard_error(
-                        self.operation,
-                        "d1.target_wide_dml_custody_layout_unavailable",
-                        message,
-                        &self.target_key_sha256,
-                    )
-                },
-            )?;
-            self.revalidate()
+            let outcome =
+                linux::ensure_d1_dml_custody_layout(&self.target, &self.target_key_sha256)
+                    .map_err(|message| {
+                        d1_target_guard_error(
+                            self.operation,
+                            "d1.target_wide_dml_custody_layout_unavailable",
+                            message,
+                            &self.target_key_sha256,
+                        )
+                    })?;
+            self.revalidate()?;
+            Ok(outcome)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -5077,11 +5080,13 @@ mod linux {
     pub(super) fn ensure_d1_dml_custody_layout(
         target: &fs::File,
         target_key_sha256: &str,
-    ) -> Result<(), &'static str> {
-        use crate::d1_dml_custody_layout::D1_DML_CUSTODY_LAYOUT_NAME;
+    ) -> Result<crate::d1_dml_custody_layout::D1DmlCustodyLayoutEnsureOutcome, &'static str> {
+        use crate::d1_dml_custody_layout::{
+            D1_DML_CUSTODY_LAYOUT_NAME, D1DmlCustodyLayoutEnsureOutcome,
+        };
         if entry_present(target, D1_DML_CUSTODY_LAYOUT_NAME)? {
             d1_dml_layout_snapshot(target, target_key_sha256)?;
-            return Ok(());
+            return Ok(D1DmlCustodyLayoutEnsureOutcome::AlreadyPresent);
         }
         if directory_entry_names(target)?.len() >= MAX_TARGET_CUSTODY_DIRECTORY_ENTRIES {
             return Err("target custody namespace has no capacity for the DML layout");
@@ -5094,7 +5099,7 @@ mod linux {
             |_| "target custody directory could not be synchronized after DML layout installation",
         )?;
         d1_dml_layout_snapshot(target, target_key_sha256)?;
-        Ok(())
+        Ok(D1DmlCustodyLayoutEnsureOutcome::Created)
     }
 
     fn d1_dml_attempt_name(binding: &str) -> Result<String, &'static str> {

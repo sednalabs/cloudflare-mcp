@@ -126,13 +126,21 @@ persists the exact audit identity in the lease payload and re-runs it at
 provider, receipt-persistence, restoration, and retirement boundaries. Because
 terminal receipts bind `lease_payload_sha256`, they also bind the exact
 complete-audit identity.
-Curated database rename and delete use the same fresh-only layout step, add it
-before the audit identity in their live mutation plan, and require an exact
-fresh re-audit immediately before the provider call. The layout step is local
-custody maintenance and declares no provider-dispatch authority. Retained and
-recovery workflows never install or repair a missing layout: missing, changed,
-unstable, over-budget, or merely reconciliation-required evidence stops with
-zero provider mutations. The
+Curated database rename and delete use the same fresh-only layout step. Before
+dry/live branching they derive one canonical five-step intended plan: validate
+the exact operator intent, conditionally create the fixed layout during live
+guarded execution, require a clean complete audit, require exact final
+revalidation, then dispatch the provider operation last. Dry-run and live
+return the same `intended_plan_sha256` and plan bytes. Runtime
+`execution_evidence` is separate: dry-run reports local custody `unobserved`,
+audit/revalidation unmaterialized, and zero local/provider effects; live reports
+`created` or `already_present`, the aggregate-safe audit identity, exact final
+match, and provider evidence. Delete consent is derived from the complete
+static plan, including its reason and provider request, rather than a future
+runtime audit digest. The layout step is local custody maintenance and declares
+no provider-dispatch authority. Retained and recovery workflows never install
+or repair a missing layout: missing, changed, unstable, over-budget, or merely
+reconciliation-required evidence stops with zero provider mutations. The
 audit alone still performs or authorizes no provider dispatch. The
 complete pass has a fixed, versioned DML-specific global budget: at most 16,384
 canonical leaves, 65,536 physical leaf artifacts, and 268,435,456 total
@@ -356,11 +364,16 @@ contention.
 
 Fresh rename, delete, manifest, and bootstrap acquisition may create only the
 fixed empty `dml-custody-v1` layout, under the already-held permanent target
-guard and before any complete-audit authorization. Their live plans record
-`ensure_d1_dml_custody_layout` as `local_custody_only` with
-`provider_dispatch_authority=none`, followed by
-`authorize_complete_d1_dml_custody`. An existing layout must validate exactly;
-these paths do not replace, flatten, or repair hostile or partial evidence.
+guard and before any complete-audit authorization. Rename/delete previews show
+the complete static live skeleton, recording `ensure_d1_dml_custody_layout` as
+`create_if_absent_at_live_guarded_execution`, `local_custody_only`, and
+`provider_dispatch_authority=none`, followed by complete audit, final exact
+revalidation, and the provider request last. The returned
+`intended_plan_sha256` is stable across matching dry/live calls; runtime custody
+facts appear only in `execution_evidence`. An existing layout must validate
+exactly; these paths do not replace, flatten, or repair hostile or partial
+evidence. If audit or revalidation fails after ensure, the error preserves the
+observed local outcome while proving zero provider dispatch.
 Retained-evidence reconciliation, terminal receipt persistence, rollback
 restoration, and retirement require the layout to remain present and exact;
 absence is evidence loss, not an empty/default state, and those paths create

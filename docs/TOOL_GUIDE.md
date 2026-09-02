@@ -175,13 +175,19 @@ are added by the graph derivation.
    recovery, terminal receipt, restoration, and retirement re-audit it at
    their last owned boundary without creating or repairing layout evidence.
    Terminal receipts inherit the binding through `lease_payload_sha256`.
-   Fresh curated database rename/delete record
-   `ensure_d1_dml_custody_layout` as a local-custody-only step before binding
-   the same aggregate identity into the live mutation plan, then require exact
-   fresh re-audit immediately before the provider request. An existing hostile
-   or partial layout is never repaired. Absent retained/recovery layout,
-   changed, unstable, over-budget, malformed, partial, orphaned, or otherwise
-   reconciliation-required custody stops before provider mutation. The local
+   Fresh curated database rename/delete derive one static five-step plan before
+   dry/live branching. It records `ensure_d1_dml_custody_layout` as
+   `create_if_absent_at_live_guarded_execution` and local-custody-only, requires
+   the clean complete audit and exact final revalidation, and puts the provider
+   operation last. Matching dry/live calls return identical plan bytes and
+   `intended_plan_sha256`; `execution_evidence` separately reports unobserved
+   dry state or live `created`/`already_present`, aggregate audit identity,
+   final match, and provider result. Delete confirmation binds this complete
+   static contract and reviewed reason, never an unknown runtime audit hash.
+   An existing hostile or partial layout is never repaired. Absent
+   retained/recovery layout, changed, unstable, over-budget, malformed,
+   partial, orphaned, or otherwise reconciliation-required custody stops
+   before provider mutation. The local
    ensure step and the audit still confer no provider authority, and ordinary
    DML remains affected-leaf scoped.
    A scratch name binds the record digest, exact incumbent-state digest, and
