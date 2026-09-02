@@ -5108,7 +5108,7 @@ fn spawn_fake_d1_database_mutation_api(
                         "result": [{
                             "success": true,
                             "errors": [],
-                            "results": [d1_catalog_relation_row("example", 1, 0), d1_catalog_relation_row("protected", 2, 1)],
+                            "results": [d1_catalog_relation_row("example", 1), d1_catalog_relation_row("protected", 2)],
                             "meta": {"served_by_primary": true, "changed_db": false, "changes": 0, "rows_written": 0}
                         }],
                     })
@@ -5152,7 +5152,7 @@ fn spawn_fake_d1_database_mutation_api(
     (format!("http://{addr}"), requests)
 }
 
-fn d1_catalog_relation_row(name: &str, schema_rowid: i64, fact_order: i64) -> Value {
+fn d1_catalog_relation_row(name: &str, schema_rowid: i64) -> Value {
     let hex = |value: &str| {
         value
             .as_bytes()
@@ -5161,7 +5161,7 @@ fn d1_catalog_relation_row(name: &str, schema_rowid: i64, fact_order: i64) -> Va
             .collect::<String>()
     };
     json!({
-        "schema_rowid": schema_rowid, "fact_order": fact_order, "fact_kind": "relation",
+        "schema_rowid": schema_rowid, "fact_order": 0, "fact_kind": "relation",
         "relation_type_storage_class": "text", "relation_type_value_hex": hex("table"), "relation_type": "table",
         "relation_name_storage_class": "text", "relation_name_hex": hex(name),
         "owner_name_storage_class": "text", "owner_name_hex": hex(name),
