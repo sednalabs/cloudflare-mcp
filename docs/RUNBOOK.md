@@ -1054,6 +1054,49 @@ consume the opaque product only after its exact classifier has bound the SQL
 bytes to the supplied relation and compound form; a composition receipt by
 itself is never execution authority.
 
+The internal D1 DML attempt-custody stage is the next pure handoff. Supply only
+the verified canonical target, opaque exact-plan composition product, and three
+preallocated pairwise-distinct opaque identities for the operation,
+execution-attempt, and provider request. Each identity must already satisfy the
+closed 16-to-128-byte ASCII grammar. The stage hashes all three and binds them
+to the target, exact execution plan, composition, and complete composition
+receipt. Never substitute caller JSON, a serialized composition receipt, SQL,
+or a generic provider response.
+
+Persist the returned canonical private state only through the future reviewed
+durable compare-and-exchange boundary. Its version-1 bytes are capped at 16 KiB and include one
+trailing newline. On restore, require exact canonical bytes and reject missing,
+oversized, malformed, duplicate-keyed, unknown-field, incomplete, predecessor,
+digest-drifted, or internally contradictory evidence. An exact prepared replay
+converges without changing state. A conflicting target, plan, composition, or
+identity replay denies.
+
+`prepared -> dispatch_reserved` is a non-authorizing atomic-CAS proposal. It
+binds the exact prior-state and successor-state digests and explicitly requires
+the later durable adapter to compare the exact current bytes and install that
+successor atomically. Repeating the pure call with stale prepared bytes returns
+the same proposal, never fresh dispatch authority. Only the adapter's one
+successful compare-and-exchange may consume the reservation and permit the
+provider call; a stale compare failure must stop before provider access. Once
+the successor is durably installed, the same attempt is permanently
+`do_not_redispatch_same_attempt`; a repeated reservation, transport uncertainty,
+or missing/incomplete/malformed/contradictory response becomes
+`reconciliation_required`. Do not infer that an unobserved response means the
+provider did not accept the request.
+
+The provider-terminal and readback inputs at this stage are typed caller
+assertions, not authenticated evidence. Canonical digest syntax proves neither
+artifact bytes nor provider/readback provenance. The later adapter must derive
+the assertions from authenticated provider and independently executed readback
+lifecycles before storing them in their separate slots. Either insertion order
+must converge on the same canonical proposed terminal classification. Provider
+success plus expected-state observation proposes `applied`; terminal provider
+rejection plus absent-state readback proposes `not_applied`. One slot alone is
+nonterminal, and a crossed pair stays under reconciliation. Receipts and errors
+are aggregate/content-free and do not authorize persistence, provider/D1
+access, artifact authentication, readback, retry, routing, admission,
+deployment, or configuration.
+
 ## Safety Profiles
 
 ### Read-Only

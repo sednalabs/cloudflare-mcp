@@ -10,6 +10,8 @@ pub mod cloudflare;
 pub mod config;
 #[allow(dead_code)] // staged evidence boundary; provider dispatch and graph consumers are separate
 pub(crate) mod d1_catalog_evidence;
+#[allow(dead_code)] // staged pure custody; persistence and provider integration are separate
+pub(crate) mod d1_dml_attempt_custody;
 #[allow(dead_code)] // staged pure product; route integration and mutation admission are separate
 pub(crate) mod d1_exact_plan_composition;
 pub(crate) mod d1_execute_write;
