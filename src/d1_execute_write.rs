@@ -442,7 +442,7 @@ mod tests {
         ] {
             assert!(
                 !rendered.contains(private_value),
-                "public evidence leaked {private_value}: {rendered}"
+                "public evidence redaction regression"
             );
         }
     }

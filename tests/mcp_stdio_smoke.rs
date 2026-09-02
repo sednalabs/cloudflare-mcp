@@ -18268,7 +18268,7 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
     ] {
         assert!(
             !rendered.contains(private_value),
-            "public write evidence leaked {private_value}: {rendered}"
+            "public write evidence redaction regression"
         );
     }
 
