@@ -159,9 +159,18 @@ are added by the graph derivation.
    aggregate `reconciliation_required` evidence; malformed, contradictory,
    duplicate, misplaced, or digest-drift evidence fails closed.
    The receipt exposes only bounded counts and hashes and always reports
-   `provider_dispatch_authority=none`. Wiring this proof into restore,
-   activation, or another target-wide operation is a separate guarded workflow;
-   the audit neither performs nor authorizes those operations by itself.
+   `provider_dispatch_authority=none`. Its versioned DML-only traversal budget
+   permits at most 16,384 canonical leaves, 65,536 physical leaf artifacts, and
+   268,435,456 aggregate payload bytes per pass. Leaf capacity is consumed
+   before descent, the complete leaf artifact count before payload validation,
+   and each payload's held metadata size before reading. The second stable pass
+   receives a fresh independent budget. Exceeding any cap returns no aggregate
+   receipt or audit digest and reveals no artifact path, identity, or bytes.
+   The fixed layout marker remains under its separate layout-snapshot cap;
+   variable leaf artifacts are the globally budgeted graph. Wiring this proof
+   into restore, activation, or another target-wide operation is a separate
+   guarded workflow; the audit neither performs nor authorizes those operations
+   by itself.
    A scratch name binds the record digest, exact incumbent-state digest, and
    canonical successor-state digest. An affected leaf may contain zero or one
    rederived-valid scratch for a record; duplicate successors, a wrong or stale

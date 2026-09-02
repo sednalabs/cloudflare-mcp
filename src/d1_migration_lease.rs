@@ -4992,12 +4992,112 @@ mod linux {
     struct DmlLeafAudit {
         entry_count: usize,
         scratches: BTreeMap<String, DmlScratchAudit>,
+        artifacts: BTreeMap<String, Vec<u8>>,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct DmlCompleteAuditLimits {
+        leaf_limit: usize,
+        artifact_limit: usize,
+        payload_byte_limit: usize,
+    }
+
+    impl DmlCompleteAuditLimits {
+        const fn fixed() -> Self {
+            Self {
+                leaf_limit: crate::d1_dml_custody_layout::D1_DML_CUSTODY_COMPLETE_AUDIT_LEAF_LIMIT,
+                artifact_limit:
+                    crate::d1_dml_custody_layout::D1_DML_CUSTODY_COMPLETE_AUDIT_ARTIFACT_LIMIT,
+                payload_byte_limit:
+                    crate::d1_dml_custody_layout::D1_DML_CUSTODY_COMPLETE_AUDIT_PAYLOAD_BYTE_LIMIT,
+            }
+        }
+
+        fn identity_sha256(self) -> String {
+            sha256_bytes_hex(
+                format!(
+                    "d1-dml-complete-audit-budget-v{}|canonical_leaf_limit={}|physical_artifact_limit={}|artifact_payload_byte_limit={}",
+                    crate::d1_dml_custody_layout::D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_VERSION,
+                    self.leaf_limit,
+                    self.artifact_limit,
+                    self.payload_byte_limit,
+                )
+                .as_bytes(),
+            )
+        }
+    }
+
+    #[derive(Debug)]
+    struct DmlCompleteAuditBudget {
+        limits: DmlCompleteAuditLimits,
+        audited_leaf_count: usize,
+        physical_artifact_count: usize,
+        artifact_payload_bytes: usize,
+    }
+
+    impl DmlCompleteAuditBudget {
+        fn new(limits: DmlCompleteAuditLimits) -> Self {
+            Self {
+                limits,
+                audited_leaf_count: 0,
+                physical_artifact_count: 0,
+                artifact_payload_bytes: 0,
+            }
+        }
+
+        fn reserve_leaf(&mut self) -> Result<(), &'static str> {
+            self.audited_leaf_count = self
+                .audited_leaf_count
+                .checked_add(1)
+                .filter(|count| *count <= self.limits.leaf_limit)
+                .ok_or("DML complete audit exceeded its canonical-leaf budget")?;
+            Ok(())
+        }
+
+        fn reserve_artifacts(&mut self, count: usize) -> Result<(), &'static str> {
+            self.physical_artifact_count = self
+                .physical_artifact_count
+                .checked_add(count)
+                .filter(|total| *total <= self.limits.artifact_limit)
+                .ok_or("DML complete audit exceeded its physical-artifact budget")?;
+            Ok(())
+        }
+
+        fn remaining_payload_bytes(&self) -> usize {
+            self.limits
+                .payload_byte_limit
+                .saturating_sub(self.artifact_payload_bytes)
+        }
+
+        fn record_payload_bytes(&mut self, count: usize) -> Result<(), &'static str> {
+            self.artifact_payload_bytes = self
+                .artifact_payload_bytes
+                .checked_add(count)
+                .filter(|total| *total <= self.limits.payload_byte_limit)
+                .ok_or("DML complete audit exceeded its artifact-payload byte budget")?;
+            Ok(())
+        }
+
+        fn retain_cross_shard_entry(&self, current_len: usize) -> Result<(), &'static str> {
+            if current_len >= self.limits.artifact_limit {
+                return Err("DML complete audit exceeded its retained-evidence budget");
+            }
+            Ok(())
+        }
     }
 
     #[derive(Serialize)]
     struct DmlCompleteAuditDigest<'a> {
         version: u8,
         layout_sha256: &'a str,
+        audit_budget_version: u8,
+        audit_budget_sha256: &'a str,
+        audited_leaf_limit: usize,
+        physical_artifact_limit: usize,
+        artifact_payload_byte_limit: usize,
+        audited_leaf_count: usize,
+        physical_artifact_count: usize,
+        artifact_payload_bytes: usize,
         target_key_sha256: &'a str,
         claimant_count: usize,
         attempt_count: usize,
@@ -5036,9 +5136,32 @@ mod linux {
         prefix: &str,
         target_key_sha256: &str,
     ) -> Result<DmlLeafAudit, &'static str> {
+        audit_dml_leaf_inner(leaf, kind, prefix, target_key_sha256, None)
+    }
+
+    fn audit_dml_leaf_with_complete_budget(
+        leaf: &fs::File,
+        kind: DmlLeafKind,
+        prefix: &str,
+        target_key_sha256: &str,
+        budget: &mut DmlCompleteAuditBudget,
+    ) -> Result<DmlLeafAudit, &'static str> {
+        audit_dml_leaf_inner(leaf, kind, prefix, target_key_sha256, Some(budget))
+    }
+
+    fn audit_dml_leaf_inner(
+        leaf: &fs::File,
+        kind: DmlLeafKind,
+        prefix: &str,
+        target_key_sha256: &str,
+        mut complete_budget: Option<&mut DmlCompleteAuditBudget>,
+    ) -> Result<DmlLeafAudit, &'static str> {
         let mut names = directory_entry_names(leaf)?;
         names.sort();
-        let mut permanent_states = BTreeMap::new();
+        if let Some(budget) = complete_budget.as_deref_mut() {
+            budget.reserve_artifacts(names.len())?;
+        }
+        let mut artifacts = BTreeMap::new();
         let mut scratch_candidates = Vec::new();
         for raw_name in &names {
             let name = std::str::from_utf8(raw_name)
@@ -5057,8 +5180,15 @@ mod linux {
             if &digest[..4] != prefix {
                 return Err("DML custody artifact was placed in a non-canonical shard");
             }
-            let (file_identity, bytes) = read_private_dml_state_snapshot(leaf, name)?
-                .ok_or("DML custody artifact disappeared during leaf audit")?;
+            let payload_limit = complete_budget
+                .as_deref()
+                .map(DmlCompleteAuditBudget::remaining_payload_bytes);
+            let (file_identity, bytes) =
+                read_private_dml_state_snapshot_with_payload_limit(leaf, name, payload_limit)?
+                    .ok_or("DML custody artifact disappeared during leaf audit")?;
+            if let Some(budget) = complete_budget.as_deref_mut() {
+                budget.record_payload_bytes(bytes.len())?;
+            }
             if scratch_binding.is_some_and(|(_, successor)| sha256_bytes_hex(&bytes) != successor) {
                 return Err("DML CAS scratch name contradicted its successor bytes");
             }
@@ -5096,8 +5226,9 @@ mod linux {
                     successor_sha256: successor.to_string(),
                     file_identity,
                 });
-            } else {
-                permanent_states.insert(digest.to_string(), bytes);
+            }
+            if artifacts.insert(name.to_string(), bytes).is_some() {
+                return Err("DML custody leaf repeated one physical artifact name");
             }
         }
         let mut stable_names = directory_entry_names(leaf)?;
@@ -5107,13 +5238,15 @@ mod linux {
         }
         let mut scratches = BTreeMap::new();
         for scratch in scratch_candidates {
-            let incumbent = permanent_states
-                .get(&scratch.record_sha256)
+            let permanent_name = format!("{}.json", scratch.record_sha256);
+            let incumbent = artifacts
+                .get(&permanent_name)
                 .ok_or("DML CAS scratch had no permanent incumbent record")?;
             if sha256_bytes_hex(incumbent) != scratch.predecessor_sha256 {
                 return Err("DML CAS scratch contradicted the exact incumbent bytes");
             }
-            let scratch_bytes = read_private_dml_state(leaf, &scratch.name)?
+            let scratch_bytes = artifacts
+                .get(&scratch.name)
                 .ok_or("DML CAS scratch disappeared during authority validation")?;
             match kind {
                 DmlLeafKind::Attempt => {
@@ -5143,6 +5276,7 @@ mod linux {
         Ok(DmlLeafAudit {
             entry_count: names.len(),
             scratches,
+            artifacts,
         })
     }
 
@@ -5296,7 +5430,6 @@ mod linux {
             {
                 return Err("DML shard namespace contained a non-canonical entry");
             }
-            open_private_dml_directory(directory, &name)?;
             names.push(name);
         }
         names.sort();
@@ -5307,17 +5440,32 @@ mod linux {
     fn complete_dml_audit_once(
         target: &fs::File,
         target_key_sha256: &str,
+        limits: DmlCompleteAuditLimits,
     ) -> Result<crate::d1_dml_custody_layout::D1DmlCustodyCompleteAuditReceipt, &'static str> {
         use crate::d1_dml_custody_layout::{
-            D1_DML_CUSTODY_LAYOUT_SHA256, D1_DML_CUSTODY_LAYOUT_VERSION,
-            D1DmlCustodyCompleteAuditReceipt,
+            D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_SHA256,
+            D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_VERSION, D1_DML_CUSTODY_LAYOUT_SHA256,
+            D1_DML_CUSTODY_LAYOUT_VERSION, D1DmlCustodyCompleteAuditReceipt,
         };
         d1_dml_layout_snapshot(target, target_key_sha256)?;
+        let audit_budget_sha256 = limits.identity_sha256();
+        if limits.leaf_limit
+            == crate::d1_dml_custody_layout::D1_DML_CUSTODY_COMPLETE_AUDIT_LEAF_LIMIT
+            && limits.artifact_limit
+                == crate::d1_dml_custody_layout::D1_DML_CUSTODY_COMPLETE_AUDIT_ARTIFACT_LIMIT
+            && limits.payload_byte_limit
+                == crate::d1_dml_custody_layout::D1_DML_CUSTODY_COMPLETE_AUDIT_PAYLOAD_BYTE_LIMIT
+            && audit_budget_sha256 != D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_SHA256
+        {
+            return Err("DML complete-audit fixed budget identity did not rederive");
+        }
+        let mut budget = DmlCompleteAuditBudget::new(limits);
         let mut claimant_sets: BTreeMap<
             String,
             Vec<crate::d1_dml_identity_claimant::D1DmlIdentityClaimantReceipt>,
         > = BTreeMap::new();
         let mut attempts = BTreeMap::new();
+        let mut retained_claimant_count = 0usize;
         let mut scratch_count = 0usize;
         let mut artifact_evidence = Vec::new();
 
@@ -5330,20 +5478,24 @@ mod linux {
             for aa in canonical_shard_names(&family)? {
                 let (level_one, _) = open_private_dml_directory(&family, &aa)?;
                 for bb in canonical_shard_names(&level_one)? {
+                    budget.reserve_leaf()?;
                     let (leaf, _) = open_private_dml_directory(&level_one, &bb)?;
                     let prefix = format!("{aa}{bb}");
-                    audit_dml_leaf(&leaf, kind, &prefix, target_key_sha256)?;
-                    for raw in directory_entry_names(&leaf)? {
-                        let name = String::from_utf8(raw)
-                            .map_err(|_| "DML custody leaf contained a non-UTF-8 entry")?;
-                        let bytes = read_private_dml_state(&leaf, &name)?
-                            .ok_or("DML custody artifact disappeared during complete audit")?;
+                    let audited = audit_dml_leaf_with_complete_budget(
+                        &leaf,
+                        kind,
+                        &prefix,
+                        target_key_sha256,
+                        &mut budget,
+                    )?;
+                    for (name, bytes) in audited.artifacts {
                         let family_label = match kind {
                             DmlLeafKind::Attempt => "attempt".to_string(),
                             DmlLeafKind::Claimant(namespace) => {
                                 format!("claimant/{}", namespace.filename_label())
                             }
                         };
+                        budget.retain_cross_shard_entry(artifact_evidence.len())?;
                         artifact_evidence.push((
                             format!("{family_label}/{aa}/{bb}/{name}"),
                             sha256_bytes_hex(&bytes),
@@ -5360,10 +5512,17 @@ mod linux {
                                     .clone();
                                 crate::d1_dml_identity_claimant::validate_d1_dml_identity_claimant_audit_binding(&receipt)
                                     .map_err(|_| "DML claimant intent binding did not rederive during complete audit")?;
-                                claimant_sets
+                                if !claimant_sets.contains_key(&receipt.claimant_set_sha256) {
+                                    budget.retain_cross_shard_entry(claimant_sets.len())?;
+                                }
+                                let receipts = claimant_sets
                                     .entry(receipt.claimant_set_sha256.clone())
-                                    .or_default()
-                                    .push(receipt);
+                                    .or_default();
+                                budget.retain_cross_shard_entry(retained_claimant_count)?;
+                                retained_claimant_count = retained_claimant_count
+                                    .checked_add(1)
+                                    .ok_or("DML complete audit claimant retention overflowed")?;
+                                receipts.push(receipt);
                             }
                             DmlLeafKind::Attempt => {
                                 let receipt =
@@ -5375,6 +5534,7 @@ mod linux {
                                     .clone();
                                 crate::d1_dml_attempt_custody::validate_d1_dml_attempt_audit_binding(&receipt)
                                     .map_err(|_| "DML attempt binding did not rederive during complete audit")?;
+                                budget.retain_cross_shard_entry(attempts.len())?;
                                 if attempts
                                     .insert(receipt.attempt_binding_sha256.clone(), receipt)
                                     .is_some()
@@ -5484,6 +5644,7 @@ mod linux {
             }) {
                 return Err("DML claimant evidence contradicted its referenced attempt");
             }
+            budget.retain_cross_shard_entry(referenced_attempts.len())?;
             if referenced_attempts
                 .insert(
                     attempt_binding_sha256.to_string(),
@@ -5496,6 +5657,7 @@ mod linux {
             if !complete || bound.len() != receipts.len() {
                 continue;
             }
+            budget.retain_cross_shard_entry(matched_attempts.len())?;
             matched_attempts.insert(attempt_binding_sha256.to_string());
             matched_claimant_set_count += 1;
         }
@@ -5510,6 +5672,14 @@ mod linux {
             &serde_json::to_vec(&DmlCompleteAuditDigest {
                 version: D1_DML_CUSTODY_LAYOUT_VERSION,
                 layout_sha256: D1_DML_CUSTODY_LAYOUT_SHA256,
+                audit_budget_version: D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_VERSION,
+                audit_budget_sha256: &audit_budget_sha256,
+                audited_leaf_limit: limits.leaf_limit,
+                physical_artifact_limit: limits.artifact_limit,
+                artifact_payload_byte_limit: limits.payload_byte_limit,
+                audited_leaf_count: budget.audited_leaf_count,
+                physical_artifact_count: budget.physical_artifact_count,
+                artifact_payload_bytes: budget.artifact_payload_bytes,
                 target_key_sha256,
                 claimant_count,
                 attempt_count: attempts.len(),
@@ -5532,6 +5702,14 @@ mod linux {
         Ok(D1DmlCustodyCompleteAuditReceipt {
             version: D1_DML_CUSTODY_LAYOUT_VERSION,
             layout_sha256: D1_DML_CUSTODY_LAYOUT_SHA256.to_string(),
+            audit_budget_version: D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_VERSION,
+            audit_budget_sha256,
+            audited_leaf_limit: limits.leaf_limit,
+            physical_artifact_limit: limits.artifact_limit,
+            artifact_payload_byte_limit: limits.payload_byte_limit,
+            audited_leaf_count: budget.audited_leaf_count,
+            physical_artifact_count: budget.physical_artifact_count,
+            artifact_payload_bytes: budget.artifact_payload_bytes,
             target_key_sha256: target_key_sha256.to_string(),
             claimant_count,
             attempt_count: attempts.len(),
@@ -5556,17 +5734,56 @@ mod linux {
         target: &fs::File,
         target_key_sha256: &str,
     ) -> Result<crate::d1_dml_custody_layout::D1DmlCustodyCompleteAuditReceipt, &'static str> {
-        let first = complete_dml_audit_once(target, target_key_sha256)?;
-        let second = complete_dml_audit_once(target, target_key_sha256)?;
+        audit_d1_dml_custody_complete_with_limits(
+            target,
+            target_key_sha256,
+            DmlCompleteAuditLimits::fixed(),
+        )
+    }
+
+    fn audit_d1_dml_custody_complete_with_limits(
+        target: &fs::File,
+        target_key_sha256: &str,
+        limits: DmlCompleteAuditLimits,
+    ) -> Result<crate::d1_dml_custody_layout::D1DmlCustodyCompleteAuditReceipt, &'static str> {
+        let first = complete_dml_audit_once(target, target_key_sha256, limits)?;
+        let second = complete_dml_audit_once(target, target_key_sha256, limits)?;
         if first != second {
             return Err("DML custody changed during stable complete audit");
         }
         Ok(second)
     }
 
+    #[cfg(test)]
+    pub(super) fn audit_d1_dml_custody_complete_with_test_limits(
+        target: &fs::File,
+        target_key_sha256: &str,
+        leaf_limit: usize,
+        artifact_limit: usize,
+        payload_byte_limit: usize,
+    ) -> Result<crate::d1_dml_custody_layout::D1DmlCustodyCompleteAuditReceipt, &'static str> {
+        audit_d1_dml_custody_complete_with_limits(
+            target,
+            target_key_sha256,
+            DmlCompleteAuditLimits {
+                leaf_limit,
+                artifact_limit,
+                payload_byte_limit,
+            },
+        )
+    }
+
     fn read_private_dml_state_snapshot(
         target: &fs::File,
         name: &str,
+    ) -> Result<Option<(D1LeaseFileIdentity, Vec<u8>)>, &'static str> {
+        read_private_dml_state_snapshot_with_payload_limit(target, name, None)
+    }
+
+    fn read_private_dml_state_snapshot_with_payload_limit(
+        target: &fs::File,
+        name: &str,
+        payload_byte_limit: Option<usize>,
     ) -> Result<Option<(D1LeaseFileIdentity, Vec<u8>)>, &'static str> {
         let named = match open_named_entry(target, name) {
             Ok(named) => named,
@@ -5583,6 +5800,11 @@ mod linux {
         {
             return Err("DML attempt state was not one bounded private regular file");
         }
+        if payload_byte_limit.is_some_and(|limit| {
+            usize::try_from(metadata.len()).map_or(true, |length| length > limit)
+        }) {
+            return Err("DML complete audit exceeded its artifact-payload byte budget");
+        }
         let expected = identity(&metadata);
         let name_c = c_string_name(name)?;
         let state = open_at(
@@ -5598,7 +5820,25 @@ mod linux {
         if !private_file(&held) || held.nlink() != 1 || identity(&held) != expected {
             return Err("DML attempt state changed while it was rebound");
         }
+        if payload_byte_limit
+            .is_some_and(|limit| usize::try_from(held.len()).map_or(true, |length| length > limit))
+        {
+            return Err("DML complete audit exceeded its artifact-payload byte budget");
+        }
+        if held.len() != metadata.len() {
+            return Err("DML attempt state changed size while it was rebound");
+        }
         let bytes = read_held_file(&state)?;
+        let after_read = state
+            .metadata()
+            .map_err(|_| "held DML attempt state metadata was unavailable after read")?;
+        if !private_file(&after_read)
+            || after_read.nlink() != 1
+            || identity(&after_read) != expected
+            || after_read.len() != held.len()
+        {
+            return Err("DML attempt state changed while its payload was read");
+        }
         validate_named_private_file(target, name, &expected)
             .map_err(|_| "DML attempt state changed during readback")?;
         Ok(Some((expected, bytes)))
@@ -6451,6 +6691,29 @@ mod tests {
         assert_eq!(matched.unmatched_claimant_set_count, 0);
         assert_eq!(matched.orphan_claimant_set_count, 0);
         assert!(!matched.reconciliation_required);
+        assert_eq!(
+            matched.audit_budget_version,
+            crate::d1_dml_custody_layout::D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_VERSION
+        );
+        assert_eq!(
+            matched.audit_budget_sha256,
+            crate::d1_dml_custody_layout::D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_SHA256
+        );
+        assert_eq!(
+            matched.audited_leaf_limit,
+            crate::d1_dml_custody_layout::D1_DML_CUSTODY_COMPLETE_AUDIT_LEAF_LIMIT
+        );
+        assert_eq!(
+            matched.physical_artifact_limit,
+            crate::d1_dml_custody_layout::D1_DML_CUSTODY_COMPLETE_AUDIT_ARTIFACT_LIMIT
+        );
+        assert_eq!(
+            matched.artifact_payload_byte_limit,
+            crate::d1_dml_custody_layout::D1_DML_CUSTODY_COMPLETE_AUDIT_PAYLOAD_BYTE_LIMIT
+        );
+        assert_eq!(matched.physical_artifact_count, 4);
+        assert!(matched.audited_leaf_count > 0);
+        assert!(matched.artifact_payload_bytes > 0);
         let aggregate = serde_json::to_string(&matched).expect("aggregate audit receipt JSON");
         for private_value in [
             "acct-1",
@@ -6503,6 +6766,101 @@ mod tests {
         assert_eq!(restored.unmatched_attempt_count, 0);
         assert!(!restored.reconciliation_required);
         fs::remove_dir_all(attempt_first.root).expect("attempt-first cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn complete_dml_audit_enforces_each_global_budget_at_the_exact_boundary() {
+        use crate::d1_dml_identity_claimant::D1DmlIdentityNamespace;
+
+        let fixture = dml_complete_audit_fixture("dml-audit-global-budget");
+        for namespace in D1DmlIdentityNamespace::ALL {
+            install_pending_audit_claimant(&fixture, namespace);
+            seal_audit_claimant(&fixture, namespace);
+        }
+        install_audit_attempt(&fixture);
+        let baseline = fixture
+            .guard
+            .audit_d1_dml_custody_complete()
+            .expect("default global budget accepts one exact matched graph");
+        assert_eq!(baseline.matched_claimant_set_count, 1);
+        assert_eq!(baseline.unmatched_claimant_set_count, 0);
+        assert_eq!(baseline.unmatched_attempt_count, 0);
+        assert!(!baseline.reconciliation_required);
+
+        let exact = linux::audit_d1_dml_custody_complete_with_test_limits(
+            &fixture.guard.target,
+            &fixture.guard.target_key_sha256,
+            baseline.audited_leaf_count,
+            baseline.physical_artifact_count,
+            baseline.artifact_payload_bytes,
+        )
+        .expect("both stable passes receive fresh exact-boundary budgets");
+        assert_eq!(exact.audited_leaf_count, exact.audited_leaf_limit);
+        assert_eq!(exact.physical_artifact_count, exact.physical_artifact_limit);
+        assert_eq!(
+            exact.artifact_payload_bytes,
+            exact.artifact_payload_byte_limit
+        );
+        assert_eq!(exact.matched_claimant_set_count, 1);
+        assert!(!exact.reconciliation_required);
+        assert_ne!(exact.audit_budget_sha256, baseline.audit_budget_sha256);
+        assert_ne!(exact.audit_sha256, baseline.audit_sha256);
+
+        let cases = [
+            (
+                baseline
+                    .audited_leaf_count
+                    .checked_sub(1)
+                    .expect("matched graph has at least one canonical leaf"),
+                baseline.physical_artifact_count,
+                baseline.artifact_payload_bytes,
+                "DML complete audit exceeded its canonical-leaf budget",
+            ),
+            (
+                baseline.audited_leaf_count,
+                baseline
+                    .physical_artifact_count
+                    .checked_sub(1)
+                    .expect("matched graph has at least one physical artifact"),
+                baseline.artifact_payload_bytes,
+                "DML complete audit exceeded its physical-artifact budget",
+            ),
+            (
+                baseline.audited_leaf_count,
+                baseline.physical_artifact_count,
+                baseline
+                    .artifact_payload_bytes
+                    .checked_sub(1)
+                    .expect("matched graph has nonempty payload evidence"),
+                "DML complete audit exceeded its artifact-payload byte budget",
+            ),
+        ];
+        for (leaf_limit, artifact_limit, payload_byte_limit, expected_error) in cases {
+            let error = linux::audit_d1_dml_custody_complete_with_test_limits(
+                &fixture.guard.target,
+                &fixture.guard.target_key_sha256,
+                leaf_limit,
+                artifact_limit,
+                payload_byte_limit,
+            )
+            .expect_err("one-over-budget audit yields no aggregate receipt");
+            assert_eq!(error, expected_error);
+            for private_value in [
+                "acct-1",
+                "123e4567-e89b-42d3-a456-426614174000",
+                "operation-complete-audit-0001",
+                "attempt-complete-audit-0001",
+                "provider-complete-audit-0001",
+                "dml-custody-v1",
+            ] {
+                assert!(
+                    !error.contains(private_value),
+                    "budget exhaustion must not expose paths, identities, or raw bytes"
+                );
+            }
+        }
+        fs::remove_dir_all(fixture.root).expect("global-budget cleanup");
     }
 
     #[cfg(target_os = "linux")]

@@ -119,7 +119,18 @@ set counts and always declares
 `provider_dispatch_authority=none`. It is a required proof for the separately
 owned restore, activation, and destructive target-wide workflow integration;
 this audit alone performs or authorizes none of those operations. The
-undeployed flat candidate layout has no compatibility read or migration path.
+complete pass has a fixed, versioned DML-specific global budget: at most 16,384
+canonical leaves, 65,536 physical leaf artifacts, and 268,435,456 total
+artifact payload bytes. It reserves leaf capacity before descent, artifact
+capacity before any payload read, and remaining bytes from held metadata before
+each read. Every cross-shard retained collection is bounded by the same
+artifact ceiling. The stable second pass starts with a fresh budget and must
+independently reproduce the first receipt. Budget exhaustion fails before an
+aggregate receipt, audit digest, or authority claim exists and returns no path,
+identity, or payload detail. The fixed layout marker is separately bounded and
+validated by the layout snapshot; these global counts cover the variable leaf
+graph. The undeployed flat candidate layout has no compatibility read or
+migration path.
 
 Dry-run the exact target, SQL bytes, parameters, row cap, and three
 pairwise-distinct opaque operation/attempt/provider-request identities. The dry

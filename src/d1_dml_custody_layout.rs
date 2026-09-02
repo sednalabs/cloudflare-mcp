@@ -12,6 +12,12 @@ pub(crate) const D1_DML_CUSTODY_LAYOUT_VERSION: u8 = 1;
 pub(crate) const D1_DML_CUSTODY_LAYOUT_SHA256: &str =
     "68da1f2248681d61a387f503b370a73ebc848b9c34bec6afd00b24a0bef36b48"; // DevSkim: ignore DS173237 -- public layout specification digest, not a credential
 pub(crate) const D1_DML_CUSTODY_LEAF_ENTRY_LIMIT: usize = 4_096;
+pub(crate) const D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_VERSION: u8 = 1;
+pub(crate) const D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_SHA256: &str =
+    "97e3ea422008c9a0e6cbf3749e11d2b2bdbdedc49c29291fe62ea314453dcc49"; // DevSkim: ignore DS173237 -- public DML audit-budget specification digest, not a credential
+pub(crate) const D1_DML_CUSTODY_COMPLETE_AUDIT_LEAF_LIMIT: usize = 16_384;
+pub(crate) const D1_DML_CUSTODY_COMPLETE_AUDIT_ARTIFACT_LIMIT: usize = 65_536;
+pub(crate) const D1_DML_CUSTODY_COMPLETE_AUDIT_PAYLOAD_BYTE_LIMIT: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -50,6 +56,14 @@ pub(crate) fn validate_layout_marker(bytes: &[u8], target_key_sha256: &str) -> b
 pub(crate) struct D1DmlCustodyCompleteAuditReceipt {
     pub(crate) version: u8,
     pub(crate) layout_sha256: String,
+    pub(crate) audit_budget_version: u8,
+    pub(crate) audit_budget_sha256: String,
+    pub(crate) audited_leaf_limit: usize,
+    pub(crate) physical_artifact_limit: usize,
+    pub(crate) artifact_payload_byte_limit: usize,
+    pub(crate) audited_leaf_count: usize,
+    pub(crate) physical_artifact_count: usize,
+    pub(crate) artifact_payload_bytes: usize,
     pub(crate) target_key_sha256: String,
     pub(crate) claimant_count: usize,
     pub(crate) attempt_count: usize,
