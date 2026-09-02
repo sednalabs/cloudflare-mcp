@@ -89,6 +89,21 @@ lowercase `CLOUDFLARE_MCP_D1_RESERVED_RELATIONS`. The latter is operator
 authority and must include every protected application root; callers cannot
 override it.
 
+Live DML custody uses only the fixed `dml-custody-v1` target child. Its
+canonical marker binds the target and layout digest; claimants live at
+`claimant/<namespace>/<aa>/<bb>/<identity-digest>.json` and attempts at
+`attempt/<aa>/<bb>/<binding-digest>.json`. Flat, mixed, linked, misplaced,
+unknown, non-private, or malformed artifacts fail closed. The held target guard
+audits only affected leaves on the hot path. Before creating any claimant in a
+set, every affected leaf must have capacity for all missing permanent entries
+plus one CAS scratch entry; attempt creation applies the same reservation.
+Exact `.next.<digest>.<successor-digest>.json` scratch is crash-reconcilable,
+while any contradictory scratch stops execution. The separately bounded stable
+complete audit traverses every shard, verifies canonical placement and
+claimant/attempt cross-links, and is required by restore, activation, and any
+destructive target-wide custody workflow. The undeployed flat candidate layout
+has no compatibility read or migration path.
+
 Dry-run the exact target, SQL bytes, parameters, row cap, and three
 pairwise-distinct opaque operation/attempt/provider-request identities. The dry
 run performs two read-only primary catalog observations and returns the exact
@@ -103,7 +118,8 @@ by exact compare-and-exchange to the one full attempt binding. No provider
 dispatch is permitted until the complete `Bound` set is reread. It then durably
 installs one create-once Prepared state and one DispatchReserved
 compare-and-exchange before the only DML provider request. The live mutation
-plan marks claimant installation/sealing, both attempt-custody writes, and
+plan marks atomic layout/capacity preparation, claimant installation/sealing,
+both attempt-custody writes, and
 provider submission as side effects. It also
 marks the required post-provider custody compare-and-exchange as a side effect:
 authenticated acknowledgement records `ProviderAssertionRecorded`, while a

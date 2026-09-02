@@ -182,6 +182,11 @@ fn d1_execute_write_mutation_plan(dry_run: bool) -> MutationPlan {
     }
     MutationPlan::new(D1_EXECUTE_WRITE_OPERATION)
     .step(
+        "ensure_sharded_dml_custody_and_capacity",
+        true,
+        json!({"layout": "dml-custody-v1", "atomic_layout_install": true, "claimant_set_capacity_preflight": true, "cas_scratch_slots_per_affected_leaf": 1}),
+    )
+    .step(
         "install_pending_identity_claimants",
         true,
         json!({"create_once": true, "namespace_count": 3, "phase": "Pending"}),
@@ -343,6 +348,9 @@ async fn execute_inner(
         }
     };
     let claimant_set = if let Some(guard) = guard.as_ref() {
+        if let Err(result) = guard.ensure_d1_dml_custody_layout() {
+            return provider.apply(result);
+        }
         let claimant_set =
             match derive_d1_dml_identity_claimant_set(target, &execute_plan_sha256, identities) {
                 Ok(set) => set,
@@ -503,6 +511,8 @@ fn install_pending_identity_claimants(
         }
         incumbents.push((namespace, incumbent));
     }
+
+    guard.preflight_d1_dml_identity_claimant_set_capacity(set)?;
 
     for (namespace, incumbent) in incumbents {
         if incumbent.is_none() {
@@ -1402,14 +1412,15 @@ mod tests {
             json!({
                 "operation": "d1_execute_write",
                 "steps": [
-                    {"ordinal": 1, "action": "install_pending_identity_claimants", "side_effect": true, "target": {"create_once": true, "namespace_count": 3, "phase": "Pending"}},
-                    {"ordinal": 2, "action": "collect_stable_catalog", "side_effect": false, "target": {"observations": 2}},
-                    {"ordinal": 3, "action": "compose_reserved_relation_authority", "side_effect": false, "target": {}},
-                    {"ordinal": 4, "action": "seal_identity_claimants", "side_effect": true, "target": {"atomic_compare_exchange": true, "complete_set_required_for_dispatch": true, "namespace_count": 3, "phase": "Bound"}},
-                    {"ordinal": 5, "action": "install_prepared_attempt_custody", "side_effect": true, "target": {"create_once": true, "phase": "Prepared"}},
-                    {"ordinal": 6, "action": "install_dispatch_reservation", "side_effect": true, "target": {"atomic_compare_exchange": true, "phase": "DispatchReserved"}},
-                    {"ordinal": 7, "action": "submit_one_d1_dml_request", "side_effect": true, "target": {"maximum_provider_mutations": 1}},
-                    {"ordinal": 8, "action": "persist_post_provider_attempt_custody", "side_effect": true, "target": {"atomic_compare_exchange": true, "conditional_outcomes": {"provider_acknowledgement": "ProviderAssertionRecorded", "response_missing_or_ambiguous": "Ambiguous"}, "exactly_one_outcome": true}},
+                    {"ordinal": 1, "action": "ensure_sharded_dml_custody_and_capacity", "side_effect": true, "target": {"atomic_layout_install": true, "cas_scratch_slots_per_affected_leaf": 1, "claimant_set_capacity_preflight": true, "layout": "dml-custody-v1"}},
+                    {"ordinal": 2, "action": "install_pending_identity_claimants", "side_effect": true, "target": {"create_once": true, "namespace_count": 3, "phase": "Pending"}},
+                    {"ordinal": 3, "action": "collect_stable_catalog", "side_effect": false, "target": {"observations": 2}},
+                    {"ordinal": 4, "action": "compose_reserved_relation_authority", "side_effect": false, "target": {}},
+                    {"ordinal": 5, "action": "seal_identity_claimants", "side_effect": true, "target": {"atomic_compare_exchange": true, "complete_set_required_for_dispatch": true, "namespace_count": 3, "phase": "Bound"}},
+                    {"ordinal": 6, "action": "install_prepared_attempt_custody", "side_effect": true, "target": {"create_once": true, "phase": "Prepared"}},
+                    {"ordinal": 7, "action": "install_dispatch_reservation", "side_effect": true, "target": {"atomic_compare_exchange": true, "phase": "DispatchReserved"}},
+                    {"ordinal": 8, "action": "submit_one_d1_dml_request", "side_effect": true, "target": {"maximum_provider_mutations": 1}},
+                    {"ordinal": 9, "action": "persist_post_provider_attempt_custody", "side_effect": true, "target": {"atomic_compare_exchange": true, "conditional_outcomes": {"provider_acknowledgement": "ProviderAssertionRecorded", "response_missing_or_ambiguous": "Ambiguous"}, "exactly_one_outcome": true}},
                 ],
             })
         );

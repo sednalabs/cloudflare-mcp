@@ -142,6 +142,15 @@ are added by the graph derivation.
    execution-attempt, and provider-request namespace. Reuse against a changed
    plan, including only a changed row cap, fails before catalog access. Exact
    partial installation converges; malformed physical claimants fail closed.
+   The private store is the fixed target-bound `dml-custody-v1` layout. Both
+   claimant and attempt artifacts are deterministically sharded by the first
+   four digest characters. The hot path stably audits each affected leaf and
+   reserves all missing permanent entries plus one CAS scratch slot before the
+   first claimant file is installed. Flat/mixed layouts, unknown entries,
+   incorrect placement, links, malformed bytes, and capacity exhaustion stop
+   with zero provider mutations. Restore/activation operators must run the
+   separate complete custody audit, which traverses all leaves and checks the
+   three claimant namespaces against every attempt binding.
    Live execution then recomputes the two-read authority under the permanent
    target guard and seals all three claimants to the exact full attempt binding.
    If the held guard changes after those two reads, the blocked
@@ -151,8 +160,9 @@ are added by the graph derivation.
 4. Require the complete three-namespace `Bound` claimant set to be reread, then
    require the receipt to show a create-once Prepared state followed by one
    exact atomic `DispatchReserved` installation before the single DML request.
-   The live public mutation plan marks claimant creation/sealing, both attempt
-   custody writes, and provider submission as side effects and
+   The live public mutation plan marks layout/capacity preparation, claimant
+   creation/sealing, both attempt custody writes, and provider submission as
+   side effects and
    also declares one conditional post-provider custody compare-and-exchange:
    acknowledgement records `ProviderAssertionRecorded`, while missing or
    ambiguous response evidence records `Ambiguous`. Reached-phase evidence

@@ -21,6 +21,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::d1_dml_custody_layout::{D1_DML_CUSTODY_LAYOUT_SHA256, D1_DML_CUSTODY_LAYOUT_VERSION};
 use crate::d1_exact_plan_composition::{
     D1_EXACT_PLAN_COMPOSITION_OPERATION, D1ExactPlanCompositionProduct,
 };
@@ -126,6 +127,8 @@ pub(crate) enum D1DmlAttemptTerminalOutcome {
 struct D1DmlAttemptState {
     version: u8,
     operation: String,
+    layout_version: u8,
+    layout_sha256: String,
     target_key_sha256: String,
     execute_plan_sha256: String,
     composition_sha256: String,
@@ -168,6 +171,8 @@ pub(crate) enum D1DmlAttemptRetryDecision {
 pub(crate) struct D1DmlAttemptCustodyReceipt {
     pub(crate) version: u8,
     pub(crate) operation: &'static str,
+    pub(crate) layout_version: u8,
+    pub(crate) layout_sha256: String,
     pub(crate) phase: D1DmlAttemptPhase,
     pub(crate) transition: D1DmlAttemptTransition,
     pub(crate) retry_decision: D1DmlAttemptRetryDecision,
@@ -265,6 +270,8 @@ pub(crate) fn prepare_d1_dml_attempt(
             let state = D1DmlAttemptState {
                 version: CUSTODY_VERSION,
                 operation: D1_DML_ATTEMPT_CUSTODY_OPERATION.to_string(),
+                layout_version: D1_DML_CUSTODY_LAYOUT_VERSION,
+                layout_sha256: D1_DML_CUSTODY_LAYOUT_SHA256.to_string(),
                 target_key_sha256: binding.target_key_sha256.clone(),
                 execute_plan_sha256: binding.execute_plan_sha256.clone(),
                 composition_sha256: binding.composition_sha256.clone(),
@@ -557,6 +564,8 @@ fn derive_attempt_binding(
     let attempt_binding_sha256 = hash_serialized(&(
         CUSTODY_VERSION,
         D1_DML_ATTEMPT_CUSTODY_OPERATION,
+        D1_DML_CUSTODY_LAYOUT_VERSION,
+        D1_DML_CUSTODY_LAYOUT_SHA256,
         target_key_sha256.as_str(),
         receipt.execute_plan_sha256.as_str(),
         receipt.composition_sha256.as_str(),
@@ -617,7 +626,11 @@ fn restore_exact_state(
 }
 
 fn validate_state(state: &D1DmlAttemptState) -> Result<(), D1DmlAttemptCustodyError> {
-    if state.version != CUSTODY_VERSION || state.operation != D1_DML_ATTEMPT_CUSTODY_OPERATION {
+    if state.version != CUSTODY_VERSION
+        || state.operation != D1_DML_ATTEMPT_CUSTODY_OPERATION
+        || state.layout_version != D1_DML_CUSTODY_LAYOUT_VERSION
+        || state.layout_sha256 != D1_DML_CUSTODY_LAYOUT_SHA256
+    {
         return Err(custody_error(
             D1DmlAttemptCustodyClassification::RestoredStateUnsupported,
             "attempt state artifact version or operation was unsupported",
@@ -765,6 +778,8 @@ fn product(
     let receipt = D1DmlAttemptCustodyReceipt {
         version: CUSTODY_VERSION,
         operation: D1_DML_ATTEMPT_CUSTODY_OPERATION,
+        layout_version: state.layout_version,
+        layout_sha256: state.layout_sha256.clone(),
         phase: state.phase,
         transition,
         retry_decision,
@@ -843,6 +858,7 @@ fn composition_receipt_digests_are_valid(
 
 fn all_state_digests_are_valid(state: &D1DmlAttemptState) -> bool {
     [
+        &state.layout_sha256,
         &state.target_key_sha256,
         &state.execute_plan_sha256,
         &state.composition_sha256,

@@ -5277,15 +5277,22 @@ fn spawn_fake_d1_execute_write_post_provider_custody_failure_api(
                 .as_str()
                 .is_some_and(|sql| sql.contains("schema_raw AS ("))
             {
-                let attempt = fs::read_dir(&target)
-                    .expect("read target custody directory")
-                    .map(|entry| entry.expect("read target custody entry").path())
+                let attempt_root = target.join("dml-custody-v1").join("attempt");
+                let attempt = fs::read_dir(&attempt_root)
+                    .expect("read attempt shard level one")
+                    .flat_map(|entry| {
+                        fs::read_dir(entry.expect("read attempt aa shard").path())
+                            .expect("read attempt shard level two")
+                    })
+                    .flat_map(|entry| {
+                        fs::read_dir(entry.expect("read attempt bb shard").path())
+                            .expect("read attempt custody leaf")
+                    })
+                    .map(|entry| entry.expect("read attempt custody entry").path())
                     .find(|path| {
                         path.file_name()
                             .and_then(|name| name.to_str())
-                            .is_some_and(|name| {
-                                name.starts_with("dml-attempt.") && name.ends_with(".state.json")
-                            })
+                            .is_some_and(|name| !name.starts_with('.') && name.ends_with(".json"))
                     })
                     .expect("DispatchReserved attempt custody before provider response");
                 fs::rename(&attempt, attempt.with_extension("post-provider-displaced"))
@@ -18311,14 +18318,15 @@ fn expected_d1_execute_write_mutation_plan(dry_run: bool) -> Value {
     ];
     if !dry_run {
         steps = vec![
-            json!({"ordinal": 1, "action": "install_pending_identity_claimants", "side_effect": true, "target": {"create_once": true, "namespace_count": 3, "phase": "Pending"}}),
-            json!({"ordinal": 2, "action": "collect_stable_catalog", "side_effect": false, "target": {"observations": 2}}),
-            json!({"ordinal": 3, "action": "compose_reserved_relation_authority", "side_effect": false, "target": {}}),
-            json!({"ordinal": 4, "action": "seal_identity_claimants", "side_effect": true, "target": {"atomic_compare_exchange": true, "complete_set_required_for_dispatch": true, "namespace_count": 3, "phase": "Bound"}}),
-            json!({"ordinal": 5, "action": "install_prepared_attempt_custody", "side_effect": true, "target": {"create_once": true, "phase": "Prepared"}}),
-            json!({"ordinal": 6, "action": "install_dispatch_reservation", "side_effect": true, "target": {"atomic_compare_exchange": true, "phase": "DispatchReserved"}}),
-            json!({"ordinal": 7, "action": "submit_one_d1_dml_request", "side_effect": true, "target": {"maximum_provider_mutations": 1}}),
-            json!({"ordinal": 8, "action": "persist_post_provider_attempt_custody", "side_effect": true, "target": {"atomic_compare_exchange": true, "conditional_outcomes": {"provider_acknowledgement": "ProviderAssertionRecorded", "response_missing_or_ambiguous": "Ambiguous"}, "exactly_one_outcome": true}}),
+            json!({"ordinal": 1, "action": "ensure_sharded_dml_custody_and_capacity", "side_effect": true, "target": {"atomic_layout_install": true, "cas_scratch_slots_per_affected_leaf": 1, "claimant_set_capacity_preflight": true, "layout": "dml-custody-v1"}}),
+            json!({"ordinal": 2, "action": "install_pending_identity_claimants", "side_effect": true, "target": {"create_once": true, "namespace_count": 3, "phase": "Pending"}}),
+            json!({"ordinal": 3, "action": "collect_stable_catalog", "side_effect": false, "target": {"observations": 2}}),
+            json!({"ordinal": 4, "action": "compose_reserved_relation_authority", "side_effect": false, "target": {}}),
+            json!({"ordinal": 5, "action": "seal_identity_claimants", "side_effect": true, "target": {"atomic_compare_exchange": true, "complete_set_required_for_dispatch": true, "namespace_count": 3, "phase": "Bound"}}),
+            json!({"ordinal": 6, "action": "install_prepared_attempt_custody", "side_effect": true, "target": {"create_once": true, "phase": "Prepared"}}),
+            json!({"ordinal": 7, "action": "install_dispatch_reservation", "side_effect": true, "target": {"atomic_compare_exchange": true, "phase": "DispatchReserved"}}),
+            json!({"ordinal": 8, "action": "submit_one_d1_dml_request", "side_effect": true, "target": {"maximum_provider_mutations": 1}}),
+            json!({"ordinal": 9, "action": "persist_post_provider_attempt_custody", "side_effect": true, "target": {"atomic_compare_exchange": true, "conditional_outcomes": {"provider_acknowledgement": "ProviderAssertionRecorded", "response_missing_or_ambiguous": "Ambiguous"}, "exactly_one_outcome": true}}),
         ];
     }
     json!({"operation": "d1_execute_write", "steps": steps})
@@ -18620,10 +18628,14 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
     );
     drop(requests);
 
-    let malformed_claimant = manifest_target_path(&lease_root).join(format!(
-        "dml-claimant.provider-request.{}.state.json",
-        sha256_hex("provider-fixture-0001")
-    ));
+    let malformed_digest = sha256_hex("provider-fixture-0001");
+    let malformed_claimant = manifest_target_path(&lease_root)
+        .join("dml-custody-v1")
+        .join("claimant")
+        .join("provider-request")
+        .join(&malformed_digest[..2])
+        .join(&malformed_digest[2..4])
+        .join(format!("{malformed_digest}.json"));
     fs::write(&malformed_claimant, b"null").expect("install malformed restored claimant");
     let malformed_response = mcp.call_tool(42, "d1_execute_write", malformed_claimant_replay_args);
     assert_tool_text_matches_structured(&malformed_response);

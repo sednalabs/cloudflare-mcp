@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::d1_dml_attempt_custody::D1DmlAttemptIdentities;
+use crate::d1_dml_custody_layout::{D1_DML_CUSTODY_LAYOUT_SHA256, D1_DML_CUSTODY_LAYOUT_VERSION};
 use crate::d1_opaque_identity::valid_d1_opaque_identity;
 use crate::d1_target::{D1TargetIdentity, normalize_d1_target};
 
@@ -57,12 +58,14 @@ pub(crate) enum D1DmlIdentityClaimantPhase {
 pub(crate) struct D1DmlIdentityClaimantReceipt {
     version: u8,
     operation: String,
+    pub(crate) layout_version: u8,
+    pub(crate) layout_sha256: String,
     pub(crate) namespace: D1DmlIdentityNamespace,
     pub(crate) target_key_sha256: String,
     pub(crate) identity_sha256: String,
-    claimant_set_sha256: String,
-    execute_plan_sha256: String,
-    intent_binding_sha256: String,
+    pub(crate) claimant_set_sha256: String,
+    pub(crate) execute_plan_sha256: String,
+    pub(crate) intent_binding_sha256: String,
     pub(crate) phase: D1DmlIdentityClaimantPhase,
     pub(crate) attempt_binding_sha256: Option<String>,
 }
@@ -154,6 +157,8 @@ impl D1DmlIdentityClaimantSet {
         let receipt = D1DmlIdentityClaimantReceipt {
             version: CLAIMANT_VERSION,
             operation: D1_DML_IDENTITY_CLAIMANT_OPERATION.to_string(),
+            layout_version: D1_DML_CUSTODY_LAYOUT_VERSION,
+            layout_sha256: D1_DML_CUSTODY_LAYOUT_SHA256.to_string(),
             namespace,
             target_key_sha256: self.target_key_sha256.clone(),
             identity_sha256: self.identity_sha256(namespace).to_string(),
@@ -252,11 +257,15 @@ pub(crate) fn derive_d1_dml_identity_claimant_set(
     let claimant_set_sha256 = hash_serialized(&(
         CLAIMANT_VERSION,
         D1_DML_IDENTITY_CLAIMANT_OPERATION,
+        D1_DML_CUSTODY_LAYOUT_VERSION,
+        D1_DML_CUSTODY_LAYOUT_SHA256,
         &identities,
     ));
     let intent_binding_sha256 = hash_serialized(&(
         CLAIMANT_VERSION,
         D1_DML_IDENTITY_CLAIMANT_OPERATION,
+        D1_DML_CUSTODY_LAYOUT_VERSION,
+        D1_DML_CUSTODY_LAYOUT_SHA256,
         target_key_sha256.as_str(),
         execute_plan_sha256,
         claimant_set_sha256.as_str(),
@@ -299,6 +308,8 @@ pub(crate) fn inspect_d1_dml_identity_claimant(
     }
     if receipt.version != CLAIMANT_VERSION
         || receipt.operation != D1_DML_IDENTITY_CLAIMANT_OPERATION
+        || receipt.layout_version != D1_DML_CUSTODY_LAYOUT_VERSION
+        || receipt.layout_sha256 != D1_DML_CUSTODY_LAYOUT_SHA256
         || !valid_sha256(&receipt.target_key_sha256)
         || !valid_sha256(&receipt.identity_sha256)
         || !valid_sha256(&receipt.claimant_set_sha256)
@@ -410,6 +421,14 @@ mod tests {
         let (_, set) = fixture();
         for namespace in D1DmlIdentityNamespace::ALL {
             let pending = set.pending(namespace);
+            assert_eq!(
+                pending.receipt().layout_version,
+                D1_DML_CUSTODY_LAYOUT_VERSION
+            );
+            assert_eq!(
+                pending.receipt().layout_sha256,
+                D1_DML_CUSTODY_LAYOUT_SHA256
+            );
             assert_eq!(
                 set.restore_exact(namespace, pending.state_bytes())
                     .expect("pending replay")

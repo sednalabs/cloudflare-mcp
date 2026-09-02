@@ -617,6 +617,48 @@ impl D1TargetMutationGuard {
         }
     }
 
+    /// Install or rebind the one immutable sharded DML custody layout before
+    /// any claimant or attempt artifact is inspected.
+    pub(crate) fn ensure_d1_dml_custody_layout(&self) -> Result<(), CallToolResult> {
+        self.revalidate()?;
+        #[cfg(target_os = "linux")]
+        {
+            linux::ensure_d1_dml_custody_layout(&self.target, &self.target_key_sha256)
+                .map_err(|message| d1_dml_attempt_store_error(&self.target_key_sha256, message))?;
+            self.revalidate()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(d1_dml_attempt_store_error(
+                &self.target_key_sha256,
+                "durable sharded DML custody requires Linux dirfd-bound storage",
+            ))
+        }
+    }
+
+    /// Separately owned target-wide audit for restore, activation, and other
+    /// destructive-boundary workflows. The live path deliberately uses only
+    /// affected-leaf audits.
+    #[allow(dead_code)]
+    pub(crate) fn audit_d1_dml_custody_complete(
+        &self,
+    ) -> Result<crate::d1_dml_custody_layout::D1DmlCustodyCompleteAuditReceipt, CallToolResult>
+    {
+        self.revalidate()?;
+        #[cfg(target_os = "linux")]
+        {
+            linux::audit_d1_dml_custody_complete(&self.target, &self.target_key_sha256)
+                .map_err(|message| d1_dml_attempt_store_error(&self.target_key_sha256, message))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(d1_dml_attempt_store_error(
+                &self.target_key_sha256,
+                "complete DML custody audit requires Linux dirfd-bound storage",
+            ))
+        }
+    }
+
     /// Read one exact DML-attempt state through the held target directory.
     /// The opaque attempt binding is used only as a bounded filename digest.
     pub(crate) fn read_d1_dml_attempt_state(
@@ -626,8 +668,12 @@ impl D1TargetMutationGuard {
         self.revalidate()?;
         #[cfg(target_os = "linux")]
         {
-            linux::read_d1_dml_attempt_state(&self.target, attempt_binding_sha256)
-                .map_err(|message| d1_dml_attempt_store_error(&self.target_key_sha256, message))
+            linux::read_d1_dml_attempt_state(
+                &self.target,
+                attempt_binding_sha256,
+                &self.target_key_sha256,
+            )
+            .map_err(|message| d1_dml_attempt_store_error(&self.target_key_sha256, message))
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -701,8 +747,13 @@ impl D1TargetMutationGuard {
         self.revalidate()?;
         #[cfg(target_os = "linux")]
         {
-            linux::read_d1_dml_identity_claimant(&self.target, namespace, identity_sha256)
-                .map_err(|message| d1_dml_attempt_store_error(&self.target_key_sha256, message))
+            linux::read_d1_dml_identity_claimant(
+                &self.target,
+                namespace,
+                identity_sha256,
+                &self.target_key_sha256,
+            )
+            .map_err(|message| d1_dml_attempt_store_error(&self.target_key_sha256, message))
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -710,6 +761,32 @@ impl D1TargetMutationGuard {
             Err(d1_dml_attempt_store_error(
                 &self.target_key_sha256,
                 "durable DML identity claimants require Linux dirfd-bound storage",
+            ))
+        }
+    }
+
+    /// Reserve capacity for every missing member of one three-namespace
+    /// claimant set before the first permanent claimant file is created.
+    pub(crate) fn preflight_d1_dml_identity_claimant_set_capacity(
+        &self,
+        set: &crate::d1_dml_identity_claimant::D1DmlIdentityClaimantSet,
+    ) -> Result<(), CallToolResult> {
+        self.revalidate()?;
+        #[cfg(target_os = "linux")]
+        {
+            linux::preflight_d1_dml_identity_claimant_set_capacity(
+                &self.target,
+                set,
+                &self.target_key_sha256,
+            )
+            .map_err(|message| d1_dml_attempt_store_error(&self.target_key_sha256, message))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = set;
+            Err(d1_dml_attempt_store_error(
+                &self.target_key_sha256,
+                "durable DML identity claimant capacity proof requires Linux dirfd-bound storage",
             ))
         }
     }
@@ -2102,7 +2179,7 @@ mod linux {
         AT_FDCWD, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_PATH, O_RDONLY, O_RDWR,
         O_WRONLY,
     };
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::{CStr, CString, c_char};
     use std::io;
     use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
@@ -2598,6 +2675,89 @@ mod linux {
             .filter(|value| valid_retained_nonce(value))
     }
 
+    fn open_private_dml_directory(
+        parent: &fs::File,
+        name: &str,
+    ) -> Result<(fs::File, D1LeaseFileIdentity), &'static str> {
+        let name_c = c_string_name(name)?;
+        let directory = open_directory_at(parent.as_raw_fd(), &name_c)
+            .map_err(|_| "DML custody directory was absent, linked, or unavailable")?;
+        let metadata = directory
+            .metadata()
+            .map_err(|_| "DML custody directory metadata was unavailable")?;
+        if !private_dir(&metadata) {
+            return Err("DML custody directory was not current-operator-owned mode 0700");
+        }
+        let expected = identity(&metadata);
+        let rebound = open_directory_at(parent.as_raw_fd(), &name_c)
+            .map_err(|_| "DML custody directory could not be rebound")?;
+        let rebound_metadata = rebound
+            .metadata()
+            .map_err(|_| "rebound DML custody directory metadata was unavailable")?;
+        if !private_dir(&rebound_metadata) || identity(&rebound_metadata) != expected {
+            return Err("DML custody directory changed while it was rebound");
+        }
+        Ok((directory, expected))
+    }
+
+    fn d1_dml_layout_snapshot(
+        target: &fs::File,
+        target_key_sha256: &str,
+    ) -> Result<CustodyFileSnapshot, &'static str> {
+        use crate::d1_dml_custody_layout::{
+            D1_DML_CUSTODY_LAYOUT_MARKER_NAME, D1_DML_CUSTODY_LAYOUT_NAME, validate_layout_marker,
+        };
+        let (layout, layout_identity) =
+            open_private_dml_directory(target, D1_DML_CUSTODY_LAYOUT_NAME)?;
+        let mut top = directory_entry_names(&layout)?;
+        top.sort();
+        if top
+            != [
+                b"attempt".to_vec(),
+                b"claimant".to_vec(),
+                b"layout.json".to_vec(),
+            ]
+        {
+            return Err("DML custody layout root contained an unknown or missing entry");
+        }
+        let (marker, marker_bytes) =
+            private_custody_file_snapshot(&layout, D1_DML_CUSTODY_LAYOUT_MARKER_NAME)?;
+        if !validate_layout_marker(&marker_bytes, target_key_sha256) {
+            return Err("DML custody layout marker was malformed or contradictory");
+        }
+        let (claimant, claimant_identity) = open_private_dml_directory(&layout, "claimant")?;
+        let mut namespaces = directory_entry_names(&claimant)?;
+        namespaces.sort();
+        if namespaces
+            != [
+                b"execution-attempt".to_vec(),
+                b"operation".to_vec(),
+                b"provider-request".to_vec(),
+            ]
+        {
+            return Err("DML claimant layout contained an unknown or missing namespace");
+        }
+        let mut namespace_identities = Vec::new();
+        for namespace in crate::d1_dml_identity_claimant::D1DmlIdentityNamespace::ALL {
+            let (_, namespace_identity) =
+                open_private_dml_directory(&claimant, namespace.filename_label())?;
+            namespace_identities.push((namespace.filename_label(), namespace_identity));
+        }
+        let (_, attempt_identity) = open_private_dml_directory(&layout, "attempt")?;
+        let payload_sha256 = sha256_bytes_hex(
+            format!(
+                "{}|{:?}|{:?}|{:?}",
+                marker.payload_sha256, claimant_identity, namespace_identities, attempt_identity
+            )
+            .as_bytes(),
+        );
+        Ok(CustodyFileSnapshot {
+            name: D1_DML_CUSTODY_LAYOUT_NAME.to_string(),
+            file_identity: layout_identity,
+            payload_sha256,
+        })
+    }
+
     fn target_custody_snapshot_once(
         target: &fs::File,
         expected_target_key_sha256: &str,
@@ -2622,44 +2782,8 @@ mod linux {
                 entries.push(snapshot);
                 continue;
             }
-
-            let claimant_name = crate::d1_dml_identity_claimant::D1DmlIdentityNamespace::ALL
-                .into_iter()
-                .find_map(|namespace| {
-                    name.strip_prefix(&format!("dml-claimant.{}.", namespace.filename_label()))
-                        .and_then(|value| value.strip_suffix(".state.json"))
-                        .map(|identity_sha256| (namespace, identity_sha256))
-                });
-            if let Some((namespace, identity_sha256)) = claimant_name {
-                let (snapshot, bytes) = private_custody_file_snapshot(target, &name)?;
-                let product =
-                    crate::d1_dml_identity_claimant::inspect_d1_dml_identity_claimant(&bytes)
-                        .map_err(|_| "DML identity claimant was malformed or contradictory")?;
-                if product.receipt().target_key_sha256 != expected_target_key_sha256
-                    || product.receipt().namespace != namespace
-                    || product.receipt().identity_sha256 != identity_sha256
-                {
-                    return Err(
-                        "DML identity claimant contradicted its target or filename binding",
-                    );
-                }
-                entries.push(snapshot);
-                continue;
-            }
-
-            if let Some(binding) = name
-                .strip_prefix("dml-attempt.")
-                .and_then(|value| value.strip_suffix(".state.json"))
-            {
-                let (snapshot, bytes) = private_custody_file_snapshot(target, &name)?;
-                let product = crate::d1_dml_attempt_custody::inspect_d1_dml_attempt_state(&bytes)
-                    .map_err(|_| "DML attempt state was malformed or contradictory")?;
-                if product.receipt().target_key_sha256 != expected_target_key_sha256
-                    || product.receipt().attempt_binding_sha256 != binding
-                {
-                    return Err("DML attempt state contradicted its target or filename binding");
-                }
-                entries.push(snapshot);
+            if name == crate::d1_dml_custody_layout::D1_DML_CUSTODY_LAYOUT_NAME {
+                entries.push(d1_dml_layout_snapshot(target, expected_target_key_sha256)?);
                 continue;
             }
 
@@ -4712,35 +4836,432 @@ mod linux {
         directory.sync_all()
     }
 
-    fn d1_dml_attempt_name(binding: &str) -> Result<String, &'static str> {
-        if binding.len() != 64
-            || !binding
+    fn valid_dml_digest(digest: &str) -> bool {
+        digest.len() == 64
+            && digest
                 .as_bytes()
                 .iter()
                 .all(|byte| byte.is_ascii_digit() || matches!(*byte, b'a'..=b'f'))
-        {
+    }
+
+    fn create_private_dml_directory(
+        parent: &fs::File,
+        name: &str,
+    ) -> Result<fs::File, &'static str> {
+        let name_c = c_string_name(name)?;
+        if unsafe { mkdirat(parent.as_raw_fd(), name_c.as_ptr(), 0o700) } != 0 {
+            return Err("DML custody directory could not be created exclusively");
+        }
+        sync_d1_lease_directory(parent)
+            .map_err(|_| "DML custody parent directory could not be synchronized")?;
+        open_private_dml_directory(parent, name).map(|(directory, _)| directory)
+    }
+
+    fn create_dml_layout_tree(
+        target: &fs::File,
+        scratch_name: &str,
+        target_key_sha256: &str,
+    ) -> Result<(), &'static str> {
+        let layout = create_private_dml_directory(target, scratch_name)?;
+        let marker = crate::d1_dml_custody_layout::canonical_layout_marker_bytes(target_key_sha256);
+        create_private_dml_state(
+            &layout,
+            crate::d1_dml_custody_layout::D1_DML_CUSTODY_LAYOUT_MARKER_NAME,
+            &marker,
+        )?;
+        let claimant = create_private_dml_directory(&layout, "claimant")?;
+        for namespace in crate::d1_dml_identity_claimant::D1DmlIdentityNamespace::ALL {
+            create_private_dml_directory(&claimant, namespace.filename_label())?;
+        }
+        create_private_dml_directory(&layout, "attempt")?;
+        sync_d1_lease_directory(&layout)
+            .map_err(|_| "DML custody layout could not be synchronized")?;
+        Ok(())
+    }
+
+    pub(super) fn ensure_d1_dml_custody_layout(
+        target: &fs::File,
+        target_key_sha256: &str,
+    ) -> Result<(), &'static str> {
+        use crate::d1_dml_custody_layout::D1_DML_CUSTODY_LAYOUT_NAME;
+        if entry_present(target, D1_DML_CUSTODY_LAYOUT_NAME)? {
+            d1_dml_layout_snapshot(target, target_key_sha256)?;
+            return Ok(());
+        }
+        if directory_entry_names(target)?.len() >= MAX_TARGET_CUSTODY_DIRECTORY_ENTRIES {
+            return Err("target custody namespace has no capacity for the DML layout");
+        }
+        let scratch = ".dml-custody-v1.init";
+        create_dml_layout_tree(target, scratch, target_key_sha256)?;
+        rename_at_no_replace(target, scratch, D1_DML_CUSTODY_LAYOUT_NAME)
+            .map_err(|_| "DML custody layout could not be installed without replacement")?;
+        sync_d1_lease_directory(target).map_err(
+            |_| "target custody directory could not be synchronized after DML layout installation",
+        )?;
+        d1_dml_layout_snapshot(target, target_key_sha256)?;
+        Ok(())
+    }
+
+    fn d1_dml_attempt_name(binding: &str) -> Result<String, &'static str> {
+        if !valid_dml_digest(binding) {
             return Err("DML attempt binding was not canonical SHA-256");
         }
-        Ok(format!("dml-attempt.{binding}.state.json"))
+        Ok(format!("{binding}.json"))
     }
 
     fn d1_dml_identity_claimant_name(
-        namespace: crate::d1_dml_identity_claimant::D1DmlIdentityNamespace,
+        _namespace: crate::d1_dml_identity_claimant::D1DmlIdentityNamespace,
         identity_sha256: &str,
     ) -> Result<String, &'static str> {
-        if identity_sha256.len() != 64
-            || !identity_sha256
-                .as_bytes()
-                .iter()
-                .all(|byte| byte.is_ascii_digit() || matches!(*byte, b'a'..=b'f'))
-        {
+        if !valid_dml_digest(identity_sha256) {
             return Err("DML identity claimant digest was not canonical SHA-256");
         }
-        Ok(format!(
-            "dml-claimant.{}.{}.state.json",
-            namespace.filename_label(),
-            identity_sha256
-        ))
+        Ok(format!("{identity_sha256}.json"))
+    }
+
+    #[derive(Clone, Copy)]
+    pub(super) enum DmlLeafKind {
+        Claimant(crate::d1_dml_identity_claimant::D1DmlIdentityNamespace),
+        Attempt,
+    }
+
+    fn open_dml_family_directory(
+        target: &fs::File,
+        kind: DmlLeafKind,
+    ) -> Result<fs::File, &'static str> {
+        let (layout, _) = open_private_dml_directory(
+            target,
+            crate::d1_dml_custody_layout::D1_DML_CUSTODY_LAYOUT_NAME,
+        )?;
+        match kind {
+            DmlLeafKind::Attempt => open_private_dml_directory(&layout, "attempt").map(|v| v.0),
+            DmlLeafKind::Claimant(namespace) => {
+                let (claimant, _) = open_private_dml_directory(&layout, "claimant")?;
+                open_private_dml_directory(&claimant, namespace.filename_label()).map(|v| v.0)
+            }
+        }
+    }
+
+    fn open_or_create_dml_shard(parent: &fs::File, name: &str) -> Result<fs::File, &'static str> {
+        match open_private_dml_directory(parent, name) {
+            Ok((directory, _)) => Ok(directory),
+            Err(_) if !entry_present(parent, name)? => create_private_dml_directory(parent, name),
+            Err(_) => Err("DML shard entry was not one canonical private directory"),
+        }
+    }
+
+    pub(super) fn open_dml_leaf(
+        target: &fs::File,
+        kind: DmlLeafKind,
+        digest: &str,
+        create: bool,
+    ) -> Result<Option<fs::File>, &'static str> {
+        if !valid_dml_digest(digest) {
+            return Err("DML custody digest was not canonical SHA-256");
+        }
+        let family = open_dml_family_directory(target, kind)?;
+        let first = &digest[..2];
+        let second = &digest[2..4];
+        let level_one = if create {
+            open_or_create_dml_shard(&family, first)?
+        } else if !entry_present(&family, first)? {
+            return Ok(None);
+        } else {
+            open_private_dml_directory(&family, first)?.0
+        };
+        let leaf = if create {
+            open_or_create_dml_shard(&level_one, second)?
+        } else if !entry_present(&level_one, second)? {
+            return Ok(None);
+        } else {
+            open_private_dml_directory(&level_one, second)?.0
+        };
+        Ok(Some(leaf))
+    }
+
+    fn parse_dml_scratch_name(name: &str) -> Option<(&str, &str)> {
+        let value = name.strip_prefix(".next.")?.strip_suffix(".json")?;
+        let (digest, successor) = value.split_once('.')?;
+        (valid_dml_digest(digest) && valid_dml_digest(successor)).then_some((digest, successor))
+    }
+
+    fn audit_dml_leaf(
+        leaf: &fs::File,
+        kind: DmlLeafKind,
+        prefix: &str,
+        target_key_sha256: &str,
+    ) -> Result<usize, &'static str> {
+        let mut names = directory_entry_names(leaf)?;
+        names.sort();
+        for raw_name in &names {
+            let name = std::str::from_utf8(raw_name)
+                .map_err(|_| "DML custody leaf contained a non-UTF-8 entry")?;
+            let (digest, scratch_sha256) =
+                if let Some((digest, successor)) = parse_dml_scratch_name(name) {
+                    (digest, Some(successor))
+                } else if let Some(digest) = name
+                    .strip_suffix(".json")
+                    .filter(|value| valid_dml_digest(value))
+                {
+                    (digest, None)
+                } else {
+                    return Err("DML custody leaf contained an unknown entry");
+                };
+            if &digest[..4] != prefix {
+                return Err("DML custody artifact was placed in a non-canonical shard");
+            }
+            let bytes = read_private_dml_state(leaf, name)?
+                .ok_or("DML custody artifact disappeared during leaf audit")?;
+            if scratch_sha256.is_some_and(|expected| sha256_bytes_hex(&bytes) != expected) {
+                return Err("DML CAS scratch name contradicted its successor bytes");
+            }
+            match kind {
+                DmlLeafKind::Attempt => {
+                    let product =
+                        crate::d1_dml_attempt_custody::inspect_d1_dml_attempt_state(&bytes)
+                            .map_err(|_| "DML attempt state in shard was malformed")?;
+                    if product.receipt().target_key_sha256 != target_key_sha256
+                        || product.receipt().attempt_binding_sha256 != digest
+                    {
+                        return Err("DML attempt state contradicted its shard placement");
+                    }
+                }
+                DmlLeafKind::Claimant(namespace) => {
+                    let product =
+                        crate::d1_dml_identity_claimant::inspect_d1_dml_identity_claimant(&bytes)
+                            .map_err(|_| "DML claimant state in shard was malformed")?;
+                    if product.receipt().target_key_sha256 != target_key_sha256
+                        || product.receipt().namespace != namespace
+                        || product.receipt().identity_sha256 != digest
+                    {
+                        return Err("DML claimant state contradicted its shard placement");
+                    }
+                }
+            }
+        }
+        let mut stable_names = directory_entry_names(leaf)?;
+        stable_names.sort();
+        if stable_names != names {
+            return Err("DML custody leaf changed during stable audit");
+        }
+        Ok(names.len())
+    }
+
+    fn preflight_dml_leaf_capacity(
+        target: &fs::File,
+        kind: DmlLeafKind,
+        digest: &str,
+        target_key_sha256: &str,
+        missing_permanent_entries: usize,
+    ) -> Result<(), &'static str> {
+        let leaf = open_dml_leaf(target, kind, digest, true)?
+            .ok_or("DML custody leaf could not be installed")?;
+        let prefix = &digest[..4];
+        let existing = audit_dml_leaf(&leaf, kind, prefix, target_key_sha256)?;
+        if !dml_leaf_capacity_available(existing, missing_permanent_entries) {
+            return Err(
+                "DML custody leaf lacks capacity for permanent entries plus one CAS scratch slot",
+            );
+        }
+        Ok(())
+    }
+
+    pub(super) fn dml_leaf_capacity_available(
+        existing: usize,
+        missing_permanent_entries: usize,
+    ) -> bool {
+        existing
+            .checked_add(missing_permanent_entries)
+            .and_then(|count| count.checked_add(1))
+            .is_some_and(|reserved| {
+                reserved <= crate::d1_dml_custody_layout::D1_DML_CUSTODY_LEAF_ENTRY_LIMIT
+            })
+    }
+
+    #[allow(dead_code)]
+    fn canonical_shard_names(directory: &fs::File) -> Result<Vec<String>, &'static str> {
+        let mut names = Vec::new();
+        for raw in directory_entry_names(directory)? {
+            let name = String::from_utf8(raw)
+                .map_err(|_| "DML shard namespace contained a non-UTF-8 entry")?;
+            if name.len() != 2
+                || !name
+                    .as_bytes()
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || matches!(*byte, b'a'..=b'f'))
+            {
+                return Err("DML shard namespace contained a non-canonical entry");
+            }
+            open_private_dml_directory(directory, &name)?;
+            names.push(name);
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    #[allow(dead_code)]
+    fn complete_dml_audit_once(
+        target: &fs::File,
+        target_key_sha256: &str,
+    ) -> Result<crate::d1_dml_custody_layout::D1DmlCustodyCompleteAuditReceipt, &'static str> {
+        use crate::d1_dml_custody_layout::{
+            D1_DML_CUSTODY_LAYOUT_SHA256, D1_DML_CUSTODY_LAYOUT_VERSION,
+            D1DmlCustodyCompleteAuditReceipt,
+        };
+        d1_dml_layout_snapshot(target, target_key_sha256)?;
+        let mut claimant_sets: BTreeMap<
+            String,
+            Vec<crate::d1_dml_identity_claimant::D1DmlIdentityClaimantReceipt>,
+        > = BTreeMap::new();
+        let mut attempts = Vec::new();
+        let mut scratch_count = 0usize;
+        let mut artifact_evidence = Vec::new();
+
+        let kinds = crate::d1_dml_identity_claimant::D1DmlIdentityNamespace::ALL
+            .into_iter()
+            .map(DmlLeafKind::Claimant)
+            .chain(std::iter::once(DmlLeafKind::Attempt));
+        for kind in kinds {
+            let family = open_dml_family_directory(target, kind)?;
+            for aa in canonical_shard_names(&family)? {
+                let (level_one, _) = open_private_dml_directory(&family, &aa)?;
+                for bb in canonical_shard_names(&level_one)? {
+                    let (leaf, _) = open_private_dml_directory(&level_one, &bb)?;
+                    let prefix = format!("{aa}{bb}");
+                    audit_dml_leaf(&leaf, kind, &prefix, target_key_sha256)?;
+                    for raw in directory_entry_names(&leaf)? {
+                        let name = String::from_utf8(raw)
+                            .map_err(|_| "DML custody leaf contained a non-UTF-8 entry")?;
+                        let bytes = read_private_dml_state(&leaf, &name)?
+                            .ok_or("DML custody artifact disappeared during complete audit")?;
+                        let family_label = match kind {
+                            DmlLeafKind::Attempt => "attempt".to_string(),
+                            DmlLeafKind::Claimant(namespace) => {
+                                format!("claimant/{}", namespace.filename_label())
+                            }
+                        };
+                        artifact_evidence.push((
+                            format!("{family_label}/{aa}/{bb}/{name}"),
+                            sha256_bytes_hex(&bytes),
+                        ));
+                        if parse_dml_scratch_name(&name).is_some() {
+                            scratch_count += 1;
+                            continue;
+                        }
+                        match kind {
+                            DmlLeafKind::Claimant(_) => {
+                                let receipt = crate::d1_dml_identity_claimant::inspect_d1_dml_identity_claimant(&bytes)
+                                    .map_err(|_| "DML claimant was malformed during complete audit")?
+                                    .receipt()
+                                    .clone();
+                                claimant_sets
+                                    .entry(receipt.claimant_set_sha256.clone())
+                                    .or_default()
+                                    .push(receipt);
+                            }
+                            DmlLeafKind::Attempt => attempts.push(
+                                crate::d1_dml_attempt_custody::inspect_d1_dml_attempt_state(&bytes)
+                                    .map_err(|_| "DML attempt was malformed during complete audit")?
+                                    .receipt()
+                                    .clone(),
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+
+        let claimant_count = claimant_sets.values().map(Vec::len).sum::<usize>();
+        let pending_claimant_count = claimant_sets
+            .values()
+            .flatten()
+            .filter(|receipt| {
+                receipt.phase
+                    == crate::d1_dml_identity_claimant::D1DmlIdentityClaimantPhase::Pending
+            })
+            .count();
+        let bound_claimant_count = claimant_count - pending_claimant_count;
+        let incomplete_claimant_set_count = claimant_sets
+            .values()
+            .filter(|receipts| {
+                receipts.len() != 3
+                    || crate::d1_dml_identity_claimant::D1DmlIdentityNamespace::ALL
+                        .into_iter()
+                        .any(|namespace| {
+                            receipts
+                                .iter()
+                                .filter(|receipt| receipt.namespace == namespace)
+                                .count()
+                                != 1
+                        })
+            })
+            .count();
+        for attempt in &attempts {
+            let matching = claimant_sets.values().find(|receipts| {
+                receipts.len() == 3
+                    && receipts.iter().all(|receipt| {
+                        receipt.phase
+                            == crate::d1_dml_identity_claimant::D1DmlIdentityClaimantPhase::Bound
+                            && receipt.attempt_binding_sha256.as_deref()
+                                == Some(attempt.attempt_binding_sha256.as_str())
+                            && receipt.execute_plan_sha256 == attempt.execute_plan_sha256
+                            && receipt.identity_sha256.as_str()
+                                == match receipt.namespace {
+                                    crate::d1_dml_identity_claimant::D1DmlIdentityNamespace::Operation => attempt.operation_id_sha256.as_str(),
+                                    crate::d1_dml_identity_claimant::D1DmlIdentityNamespace::ExecutionAttempt => attempt.execution_attempt_id_sha256.as_str(),
+                                    crate::d1_dml_identity_claimant::D1DmlIdentityNamespace::ProviderRequest => attempt.provider_request_id_sha256.as_str(),
+                                }
+                    })
+            });
+            if matching.is_none() {
+                return Err("DML attempt lacked one complete exact Bound claimant set");
+            }
+        }
+        let reconciliation_required =
+            scratch_count != 0 || incomplete_claimant_set_count != 0 || pending_claimant_count != 0;
+        artifact_evidence.sort();
+        let audit_sha256 = sha256_bytes_hex(
+            &serde_json::to_vec(&(
+                D1_DML_CUSTODY_LAYOUT_VERSION,
+                D1_DML_CUSTODY_LAYOUT_SHA256,
+                target_key_sha256,
+                claimant_count,
+                attempts.len(),
+                pending_claimant_count,
+                bound_claimant_count,
+                scratch_count,
+                incomplete_claimant_set_count,
+                reconciliation_required,
+                artifact_evidence,
+            ))
+            .expect("DML complete audit serialization is infallible"),
+        );
+        Ok(D1DmlCustodyCompleteAuditReceipt {
+            version: D1_DML_CUSTODY_LAYOUT_VERSION,
+            layout_sha256: D1_DML_CUSTODY_LAYOUT_SHA256.to_string(),
+            target_key_sha256: target_key_sha256.to_string(),
+            claimant_count,
+            attempt_count: attempts.len(),
+            pending_claimant_count,
+            bound_claimant_count,
+            cas_scratch_count: scratch_count,
+            incomplete_claimant_set_count,
+            reconciliation_required,
+            audit_sha256,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn audit_d1_dml_custody_complete(
+        target: &fs::File,
+        target_key_sha256: &str,
+    ) -> Result<crate::d1_dml_custody_layout::D1DmlCustodyCompleteAuditReceipt, &'static str> {
+        let first = complete_dml_audit_once(target, target_key_sha256)?;
+        let second = complete_dml_audit_once(target, target_key_sha256)?;
+        if first != second {
+            return Err("DML custody changed during stable complete audit");
+        }
+        Ok(second)
     }
 
     fn read_private_dml_state(
@@ -4783,7 +5304,7 @@ mod linux {
         Ok(Some(bytes))
     }
 
-    fn create_private_dml_state(
+    pub(super) fn create_private_dml_state(
         target: &fs::File,
         name: &str,
         state: &[u8],
@@ -4816,8 +5337,18 @@ mod linux {
     pub(super) fn read_d1_dml_attempt_state(
         target: &fs::File,
         binding: &str,
+        target_key_sha256: &str,
     ) -> Result<Option<Vec<u8>>, &'static str> {
-        read_private_dml_state(target, &d1_dml_attempt_name(binding)?)
+        let Some(leaf) = open_dml_leaf(target, DmlLeafKind::Attempt, binding, false)? else {
+            return Ok(None);
+        };
+        audit_dml_leaf(
+            &leaf,
+            DmlLeafKind::Attempt,
+            &binding[..4],
+            target_key_sha256,
+        )?;
+        read_private_dml_state(&leaf, &d1_dml_attempt_name(binding)?)
     }
 
     pub(super) fn create_d1_dml_attempt_state(
@@ -4825,7 +5356,18 @@ mod linux {
         binding: &str,
         state: &[u8],
     ) -> Result<(), &'static str> {
-        create_private_dml_state(target, &d1_dml_attempt_name(binding)?, state)
+        let product = crate::d1_dml_attempt_custody::inspect_d1_dml_attempt_state(state)
+            .map_err(|_| "DML attempt state was malformed before storage")?;
+        let leaf = open_dml_leaf(target, DmlLeafKind::Attempt, binding, true)?
+            .ok_or("DML attempt shard could not be installed")?;
+        preflight_dml_leaf_capacity(
+            target,
+            DmlLeafKind::Attempt,
+            binding,
+            &product.receipt().target_key_sha256,
+            1,
+        )?;
+        create_private_dml_state(&leaf, &d1_dml_attempt_name(binding)?, state)
     }
 
     pub(super) fn compare_exchange_d1_dml_attempt_state(
@@ -4835,7 +5377,17 @@ mod linux {
         successor: &[u8],
     ) -> Result<(), &'static str> {
         let name = d1_dml_attempt_name(binding)?;
-        match read_private_dml_state(target, &name)? {
+        let product = crate::d1_dml_attempt_custody::inspect_d1_dml_attempt_state(successor)
+            .map_err(|_| "DML attempt successor was malformed before storage")?;
+        let leaf = open_dml_leaf(target, DmlLeafKind::Attempt, binding, false)?
+            .ok_or("DML attempt compare-and-exchange found no incumbent shard")?;
+        audit_dml_leaf(
+            &leaf,
+            DmlLeafKind::Attempt,
+            &binding[..4],
+            &product.receipt().target_key_sha256,
+        )?;
+        match read_private_dml_state(&leaf, &name)? {
             Some(incumbent) if incumbent == expected => {}
             Some(_) => {
                 return Err("DML attempt compare-and-exchange found conflicting incumbent bytes");
@@ -4843,24 +5395,37 @@ mod linux {
             None => return Err("DML attempt compare-and-exchange found no incumbent state"),
         }
         let successor_sha256 = sha256_bytes_hex(successor);
-        let temporary = format!(".dml-next.{binding}.{successor_sha256}");
-        create_private_dml_state(target, &temporary, successor)?;
+        let temporary = format!(".next.{binding}.{successor_sha256}.json");
+        match read_private_dml_state(&leaf, &temporary)? {
+            Some(bytes) if bytes == successor => {}
+            Some(_) => return Err("DML attempt CAS scratch contradicted exact successor bytes"),
+            None => {
+                preflight_dml_leaf_capacity(
+                    target,
+                    DmlLeafKind::Attempt,
+                    binding,
+                    &product.receipt().target_key_sha256,
+                    0,
+                )?;
+                create_private_dml_state(&leaf, &temporary, successor)?;
+            }
+        }
         let source = c_string_name(&temporary)?;
         let destination = c_string_name(&name)?;
         let renamed = unsafe {
             libc::renameat(
-                target.as_raw_fd(),
+                leaf.as_raw_fd(),
                 source.as_ptr(),
-                target.as_raw_fd(),
+                leaf.as_raw_fd(),
                 destination.as_ptr(),
             )
         };
         if renamed != 0 {
             return Err("DML attempt compare-and-exchange successor could not be installed");
         }
-        sync_d1_lease_directory(target)
+        sync_d1_lease_directory(&leaf)
             .map_err(|_| "DML attempt compare-and-exchange directory sync failed")?;
-        match read_private_dml_state(target, &name)? {
+        match read_private_dml_state(&leaf, &name)? {
             Some(readback) if readback == successor => Ok(()),
             _ => Err("DML attempt compare-and-exchange readback contradicted successor bytes"),
         }
@@ -4870,11 +5435,49 @@ mod linux {
         target: &fs::File,
         namespace: crate::d1_dml_identity_claimant::D1DmlIdentityNamespace,
         identity_sha256: &str,
+        target_key_sha256: &str,
     ) -> Result<Option<Vec<u8>>, &'static str> {
-        read_private_dml_state(
+        let Some(leaf) = open_dml_leaf(
             target,
+            DmlLeafKind::Claimant(namespace),
+            identity_sha256,
+            false,
+        )?
+        else {
+            return Ok(None);
+        };
+        audit_dml_leaf(
+            &leaf,
+            DmlLeafKind::Claimant(namespace),
+            &identity_sha256[..4],
+            target_key_sha256,
+        )?;
+        read_private_dml_state(
+            &leaf,
             &d1_dml_identity_claimant_name(namespace, identity_sha256)?,
         )
+    }
+
+    pub(super) fn preflight_d1_dml_identity_claimant_set_capacity(
+        target: &fs::File,
+        set: &crate::d1_dml_identity_claimant::D1DmlIdentityClaimantSet,
+        target_key_sha256: &str,
+    ) -> Result<(), &'static str> {
+        for namespace in crate::d1_dml_identity_claimant::D1DmlIdentityNamespace::ALL {
+            let digest = set.identity_sha256(namespace);
+            let leaf = open_dml_leaf(target, DmlLeafKind::Claimant(namespace), digest, true)?
+                .ok_or("DML claimant shard could not be installed")?;
+            let name = d1_dml_identity_claimant_name(namespace, digest)?;
+            let missing = usize::from(read_private_dml_state(&leaf, &name)?.is_none());
+            preflight_dml_leaf_capacity(
+                target,
+                DmlLeafKind::Claimant(namespace),
+                digest,
+                target_key_sha256,
+                missing,
+            )?;
+        }
+        Ok(())
     }
 
     pub(super) fn create_d1_dml_identity_claimant(
@@ -4883,8 +5486,24 @@ mod linux {
         identity_sha256: &str,
         state: &[u8],
     ) -> Result<(), &'static str> {
-        create_private_dml_state(
+        let product = crate::d1_dml_identity_claimant::inspect_d1_dml_identity_claimant(state)
+            .map_err(|_| "DML identity claimant was malformed before storage")?;
+        let leaf = open_dml_leaf(
             target,
+            DmlLeafKind::Claimant(namespace),
+            identity_sha256,
+            true,
+        )?
+        .ok_or("DML claimant shard could not be installed")?;
+        preflight_dml_leaf_capacity(
+            target,
+            DmlLeafKind::Claimant(namespace),
+            identity_sha256,
+            &product.receipt().target_key_sha256,
+            1,
+        )?;
+        create_private_dml_state(
+            &leaf,
             &d1_dml_identity_claimant_name(namespace, identity_sha256)?,
             state,
         )
@@ -4898,35 +5517,58 @@ mod linux {
         successor: &[u8],
     ) -> Result<(), &'static str> {
         let name = d1_dml_identity_claimant_name(namespace, identity_sha256)?;
-        match read_private_dml_state(target, &name)? {
+        let product = crate::d1_dml_identity_claimant::inspect_d1_dml_identity_claimant(successor)
+            .map_err(|_| "DML claimant successor was malformed before storage")?;
+        let leaf = open_dml_leaf(
+            target,
+            DmlLeafKind::Claimant(namespace),
+            identity_sha256,
+            false,
+        )?
+        .ok_or("DML identity claimant compare-and-exchange found no incumbent shard")?;
+        audit_dml_leaf(
+            &leaf,
+            DmlLeafKind::Claimant(namespace),
+            &identity_sha256[..4],
+            &product.receipt().target_key_sha256,
+        )?;
+        match read_private_dml_state(&leaf, &name)? {
             Some(incumbent) if incumbent == expected => {}
             Some(_) => return Err("DML identity claimant compare-and-exchange conflicted"),
             None => return Err("DML identity claimant compare-and-exchange found no incumbent"),
         }
         let successor_sha256 = sha256_bytes_hex(successor);
-        let temporary = format!(
-            ".dml-claimant-next.{}.{}.{}",
-            namespace.filename_label(),
-            identity_sha256,
-            successor_sha256
-        );
-        create_private_dml_state(target, &temporary, successor)?;
+        let temporary = format!(".next.{identity_sha256}.{successor_sha256}.json");
+        match read_private_dml_state(&leaf, &temporary)? {
+            Some(bytes) if bytes == successor => {}
+            Some(_) => return Err("DML claimant CAS scratch contradicted exact successor bytes"),
+            None => {
+                preflight_dml_leaf_capacity(
+                    target,
+                    DmlLeafKind::Claimant(namespace),
+                    identity_sha256,
+                    &product.receipt().target_key_sha256,
+                    0,
+                )?;
+                create_private_dml_state(&leaf, &temporary, successor)?;
+            }
+        }
         let source = c_string_name(&temporary)?;
         let destination = c_string_name(&name)?;
         let renamed = unsafe {
             libc::renameat(
-                target.as_raw_fd(),
+                leaf.as_raw_fd(),
                 source.as_ptr(),
-                target.as_raw_fd(),
+                leaf.as_raw_fd(),
                 destination.as_ptr(),
             )
         };
         if renamed != 0 {
             return Err("DML identity claimant successor could not be installed");
         }
-        sync_d1_lease_directory(target)
+        sync_d1_lease_directory(&leaf)
             .map_err(|_| "DML identity claimant directory sync failed")?;
-        match read_private_dml_state(target, &name)? {
+        match read_private_dml_state(&leaf, &name)? {
             Some(readback) if readback == successor => Ok(()),
             _ => Err("DML identity claimant readback contradicted successor bytes"),
         }
@@ -5110,50 +5752,8 @@ use linux::{
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::time::Duration;
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn dml_attempt_state_is_exclusive_and_exact_compare_exchange() {
-        let root = private_test_root("dml-attempt-cas");
-        let guard = acquire_d1_target_mutation_guard_at(
-            root.clone(),
-            "d1_execute_write",
-            "acct-1",
-            "123e4567-e89b-42d3-a456-426614174000",
-        )
-        .expect("acquire target guard");
-        let binding = "a".repeat(64);
-        let prepared = br#"{"phase":"prepared"}"#;
-        let reserved = br#"{"phase":"dispatch_reserved"}"#;
-        assert_eq!(
-            linux::read_d1_dml_attempt_state(&guard.target, &binding).expect("read absence"),
-            None
-        );
-        linux::create_d1_dml_attempt_state(&guard.target, &binding, prepared)
-            .expect("create prepared state");
-        assert!(
-            linux::create_d1_dml_attempt_state(&guard.target, &binding, prepared).is_err(),
-            "initial state must be create-once"
-        );
-        linux::compare_exchange_d1_dml_attempt_state(&guard.target, &binding, prepared, reserved)
-            .expect("install exact successor");
-        assert_eq!(
-            linux::read_d1_dml_attempt_state(&guard.target, &binding).expect("read successor"),
-            Some(reserved.to_vec())
-        );
-        assert!(
-            linux::compare_exchange_d1_dml_attempt_state(
-                &guard.target,
-                &binding,
-                prepared,
-                b"conflict",
-            )
-            .is_err(),
-            "stale expected bytes must fail closed"
-        );
-        fs::remove_dir_all(root).expect("test cleanup");
-    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -5172,6 +5772,9 @@ mod tests {
             "123e4567-e89b-42d3-a456-426614174000",
         )
         .expect("acquire target guard");
+        guard
+            .ensure_d1_dml_custody_layout()
+            .expect("install sharded custody layout");
         let target =
             normalize_d1_target("acct-1", "123e4567-e89b-42d3-a456-426614174000").expect("target");
         let set = derive_d1_dml_identity_claimant_set(
@@ -5197,8 +5800,13 @@ mod tests {
         }
         let last = D1DmlIdentityNamespace::ProviderRequest;
         assert_eq!(
-            linux::read_d1_dml_identity_claimant(&guard.target, last, set.identity_sha256(last),)
-                .expect("read partial absence"),
+            linux::read_d1_dml_identity_claimant(
+                &guard.target,
+                last,
+                set.identity_sha256(last),
+                &guard.target_key_sha256,
+            )
+            .expect("read partial absence"),
             None
         );
 
@@ -5217,6 +5825,7 @@ mod tests {
                 &guard.target,
                 namespace,
                 set.identity_sha256(namespace),
+                &guard.target_key_sha256,
             )
             .expect("read Pending claimant")
             .expect("claimant present");
@@ -5225,6 +5834,22 @@ mod tests {
                 .expect("exact claimant");
             if namespace == D1DmlIdentityNamespace::Operation {
                 let bound = set.bound(namespace, &binding).expect("bound claimant");
+                let digest = set.identity_sha256(namespace);
+                let leaf = linux::open_dml_leaf(
+                    &guard.target,
+                    linux::DmlLeafKind::Claimant(namespace),
+                    digest,
+                    false,
+                )
+                .expect("open claimant leaf")
+                .expect("claimant leaf present");
+                let successor_sha256 = sha256_bytes_hex(bound.state_bytes());
+                linux::create_private_dml_state(
+                    &leaf,
+                    &format!(".next.{digest}.{successor_sha256}.json"),
+                    bound.state_bytes(),
+                )
+                .expect("install exact crash scratch");
                 linux::compare_exchange_d1_dml_identity_claimant(
                     &guard.target,
                     namespace,
@@ -5241,6 +5866,7 @@ mod tests {
                 &guard.target,
                 namespace,
                 set.identity_sha256(namespace),
+                &guard.target_key_sha256,
             )
             .expect("read mixed claimant")
             .expect("claimant present");
@@ -5264,6 +5890,7 @@ mod tests {
                 &guard.target,
                 namespace,
                 set.identity_sha256(namespace),
+                &guard.target_key_sha256,
             )
             .expect("read complete Bound claimant")
             .expect("bound claimant present");
@@ -5275,6 +5902,220 @@ mod tests {
                 D1DmlIdentityClaimantPhase::Bound
             );
         }
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dml_shards_scale_and_complete_audit_every_canonical_leaf() {
+        use crate::d1_dml_attempt_custody::D1DmlAttemptIdentities;
+        use crate::d1_dml_identity_claimant::{
+            D1DmlIdentityNamespace, derive_d1_dml_identity_claimant_set,
+        };
+        use crate::d1_target::normalize_d1_target;
+
+        let root = private_test_root("dml-many-shards");
+        let guard = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_execute_write",
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect("acquire target guard");
+        guard
+            .ensure_d1_dml_custody_layout()
+            .expect("install fixed layout");
+        let target =
+            normalize_d1_target("acct-1", "123e4567-e89b-42d3-a456-426614174000").expect("target");
+        let mut leaves = BTreeSet::new();
+        for index in 0..64 {
+            let operation = format!("operation-volume-{index:04}");
+            let attempt = format!("attempt-volume-{index:04}");
+            let provider = format!("provider-volume-{index:04}");
+            let set = derive_d1_dml_identity_claimant_set(
+                &target,
+                &sha256_bytes_hex(format!("plan-{index}").as_bytes()),
+                D1DmlAttemptIdentities {
+                    operation_id: &operation,
+                    execution_attempt_id: &attempt,
+                    provider_request_id: &provider,
+                },
+            )
+            .expect("derive volume claimant set");
+            guard
+                .preflight_d1_dml_identity_claimant_set_capacity(&set)
+                .expect("preflight complete set before writes");
+            for namespace in D1DmlIdentityNamespace::ALL {
+                let digest = set.identity_sha256(namespace);
+                leaves.insert((namespace, digest[..4].to_string()));
+                let pending = set.pending(namespace);
+                guard
+                    .create_d1_dml_identity_claimant(namespace, digest, pending.state_bytes())
+                    .expect("install sharded claimant");
+            }
+        }
+        assert!(
+            leaves.len() > 150,
+            "volume must exercise many independent leaves"
+        );
+        let audit = guard
+            .audit_d1_dml_custody_complete()
+            .expect("stable complete audit");
+        assert_eq!(audit.claimant_count, 192);
+        assert_eq!(audit.pending_claimant_count, 192);
+        assert_eq!(audit.incomplete_claimant_set_count, 0);
+        assert!(audit.reconciliation_required);
+        fs::remove_dir_all(root).expect("test cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dml_leaf_capacity_reserves_all_missing_entries_and_one_cas_slot() {
+        let limit = crate::d1_dml_custody_layout::D1_DML_CUSTODY_LEAF_ENTRY_LIMIT;
+        assert!(linux::dml_leaf_capacity_available(limit - 2, 1));
+        let before = limit - 1;
+        assert!(!linux::dml_leaf_capacity_available(before, 1));
+        assert_eq!(before, limit - 1, "failed preflight writes no entry");
+        assert!(!linux::dml_leaf_capacity_available(usize::MAX, 1));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dml_layout_and_complete_audit_reject_flat_unknown_misplaced_links_and_mixed_state() {
+        use crate::d1_dml_attempt_custody::D1DmlAttemptIdentities;
+        use crate::d1_dml_identity_claimant::{
+            D1DmlIdentityNamespace, derive_d1_dml_identity_claimant_set,
+        };
+        use crate::d1_target::normalize_d1_target;
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let flat_root = private_test_root("dml-flat-only");
+        let flat_guard = acquire_d1_target_mutation_guard_at(
+            flat_root.clone(),
+            "d1_execute_write",
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect("acquire flat-only target guard");
+        let flat_only = flat_root
+            .join(&flat_guard.target_name)
+            .join(format!("dml-attempt.{}.state.json", "a".repeat(64)));
+        fs::write(&flat_only, b"{}\n").expect("flat-only candidate artifact");
+        fs::set_permissions(&flat_only, fs::Permissions::from_mode(0o600))
+            .expect("private flat-only file");
+        assert!(
+            flat_guard.revalidate().is_err(),
+            "flat-only layout fails closed"
+        );
+        drop(flat_guard);
+        fs::remove_dir_all(flat_root).expect("flat-only cleanup");
+
+        let root = private_test_root("dml-hostile-layout");
+        let guard = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_execute_write",
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect("acquire target guard");
+        guard.ensure_d1_dml_custody_layout().expect("layout");
+        let target =
+            normalize_d1_target("acct-1", "123e4567-e89b-42d3-a456-426614174000").expect("target");
+        let set = derive_d1_dml_identity_claimant_set(
+            &target,
+            &"a".repeat(64),
+            D1DmlAttemptIdentities {
+                operation_id: "operation-hostile-0001",
+                execution_attempt_id: "attempt-hostile-0001",
+                provider_request_id: "provider-hostile-0001",
+            },
+        )
+        .expect("set");
+        guard
+            .preflight_d1_dml_identity_claimant_set_capacity(&set)
+            .expect("capacity");
+        for namespace in D1DmlIdentityNamespace::ALL {
+            let pending = set.pending(namespace);
+            guard
+                .create_d1_dml_identity_claimant(
+                    namespace,
+                    set.identity_sha256(namespace),
+                    pending.state_bytes(),
+                )
+                .expect("claimant");
+        }
+        guard
+            .audit_d1_dml_custody_complete()
+            .expect("clean structure");
+
+        let target_path = root.join(&guard.target_name);
+        let marker = target_path.join("dml-custody-v1/layout.json");
+        let marker_bytes = fs::read(&marker).expect("read canonical marker");
+        fs::write(&marker, b"null\n").expect("malformed marker fixture");
+        assert!(
+            guard.revalidate().is_err(),
+            "malformed marker must fail closed"
+        );
+        fs::write(&marker, marker_bytes).expect("restore canonical marker fixture");
+        guard.revalidate().expect("restored marker revalidates");
+
+        let flat = target_path.join(format!(
+            "dml-claimant.operation.{}.state.json",
+            set.identity_sha256(D1DmlIdentityNamespace::Operation)
+        ));
+        fs::write(&flat, b"{}\n").expect("flat candidate artifact");
+        fs::set_permissions(&flat, fs::Permissions::from_mode(0o600)).expect("private flat file");
+        assert!(
+            guard.revalidate().is_err(),
+            "flat plus sharded must fail closed"
+        );
+        fs::remove_file(&flat).expect("remove hostile flat fixture");
+
+        let digest = set.identity_sha256(D1DmlIdentityNamespace::Operation);
+        let leaf = target_path
+            .join("dml-custody-v1/claimant/operation")
+            .join(&digest[..2])
+            .join(&digest[2..4]);
+        let unknown = leaf.join("unknown");
+        fs::write(&unknown, b"x").expect("unknown leaf entry");
+        assert!(guard.audit_d1_dml_custody_complete().is_err());
+        fs::remove_file(&unknown).expect("remove unknown fixture");
+
+        let incumbent = leaf.join(format!("{digest}.json"));
+        let misplaced_digest = format!(
+            "{}{}",
+            &digest[..63],
+            if digest.ends_with('0') { "1" } else { "0" }
+        );
+        let misplaced = leaf.join(format!("{misplaced_digest}.json"));
+        fs::copy(&incumbent, &misplaced).expect("misplaced claimant");
+        fs::set_permissions(&misplaced, fs::Permissions::from_mode(0o600))
+            .expect("private misplaced file");
+        assert!(guard.audit_d1_dml_custody_complete().is_err());
+        fs::remove_file(&misplaced).expect("remove misplaced fixture");
+
+        let linked_digest = format!(
+            "{}{}",
+            &digest[..63],
+            if digest.ends_with('1') { "2" } else { "1" }
+        );
+        let linked = leaf.join(format!("{linked_digest}.json"));
+        fs::hard_link(&incumbent, &linked).expect("hardlink fixture");
+        assert!(guard.audit_d1_dml_custody_complete().is_err());
+        fs::remove_file(&linked).expect("remove hardlink fixture");
+
+        let symlink_digest = format!(
+            "{}{}",
+            &digest[..63],
+            if digest.ends_with('2') { "3" } else { "2" }
+        );
+        let linked = leaf.join(format!("{symlink_digest}.json"));
+        symlink(&incumbent, &linked).expect("symlink fixture");
+        assert!(guard.audit_d1_dml_custody_complete().is_err());
+        fs::remove_file(&linked).expect("remove symlink fixture");
+        guard
+            .audit_d1_dml_custody_complete()
+            .expect("restored clean structure");
         fs::remove_dir_all(root).expect("test cleanup");
     }
 
