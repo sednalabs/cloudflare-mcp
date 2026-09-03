@@ -4,7 +4,7 @@
 //! observations are deliberately reported beside the plan, never spliced into
 //! it, so dry-run consent and live execution bind identical intended effects.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::cloudflare::d1_database_mutation::D1DatabaseMutationLifecycle;
@@ -20,7 +20,7 @@ const TARGET_WIDE_PLAN_VERSION: u8 = 2;
 pub(crate) const TARGET_WIDE_OPERATION_VERSION: u8 = 1;
 pub(crate) const TARGET_WIDE_CONSENT_VERSION: u8 = 1;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct D1TargetWideIntendedPlan {
     pub(crate) plan: MutationPlan,
     pub(crate) plan_sha256: String,
@@ -33,7 +33,7 @@ impl D1TargetWideIntendedPlan {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct D1TargetWideConsentBinding {
     pub(crate) consent_version: u8,
     pub(crate) operation: &'static str,
@@ -43,6 +43,87 @@ pub(crate) struct D1TargetWideConsentBinding {
     pub(crate) reason: Option<String>,
     pub(crate) intended_plan_sha256: String,
     pub(crate) plan: MutationPlan,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct D1RenameDatabaseChange {
+    new_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct D1DeleteDatabaseChange {
+    delete_database: bool,
+}
+
+/// Rebuild the only current six-step target-wide plan from typed canonical
+/// request facts. Supplied plan steps, digests, consent versions, and tokens
+/// never select or alter the reconstructed product.
+pub(crate) fn rederive_d1_target_wide_intended_plan(
+    target: &crate::d1_target::D1TargetIdentity,
+    operation: &str,
+    requested_change: &Value,
+    reason: Option<&str>,
+) -> Result<D1TargetWideIntendedPlan, &'static str> {
+    let normalized = crate::d1_target::normalize_d1_target(&target.account_id, &target.database_id)
+        .map_err(|_| "target-wide plan target was not canonical")?;
+    if &normalized != target {
+        return Err("target-wide plan target was not canonical");
+    }
+    let normalized_target = json!({
+        "account_id": target.account_id,
+        "database_id": target.database_id,
+    });
+    let target_key_sha256 = target.target_key_sha256();
+    let provider_path = format!(
+        "/accounts/{}/d1/database/{}",
+        target.account_id, target.database_id
+    );
+    match operation {
+        "d1_rename_database" => {
+            let change = serde_json::from_value::<D1RenameDatabaseChange>(requested_change.clone())
+                .map_err(|_| "D1 rename change did not match the closed canonical shape")?;
+            if change.new_name.is_empty() || change.new_name.trim() != change.new_name {
+                return Err("D1 rename name was not exact canonical input");
+            }
+            Ok(d1_target_wide_intended_plan(
+                "d1_rename_database",
+                "validate_d1_database_rename",
+                normalized_target,
+                json!({"new_name": change.new_name.clone()}),
+                reason.map(str::to_string),
+                &target_key_sha256,
+                "apply_d1_database_patch",
+                json!({
+                    "method": "PATCH",
+                    "path": provider_path,
+                    "body": {"name": change.new_name},
+                }),
+            ))
+        }
+        "d1_delete_database" => {
+            let change = serde_json::from_value::<D1DeleteDatabaseChange>(requested_change.clone())
+                .map_err(|_| "D1 delete change did not match the closed canonical shape")?;
+            if !change.delete_database {
+                return Err("D1 delete change did not request exact deletion");
+            }
+            Ok(d1_target_wide_intended_plan(
+                "d1_delete_database",
+                "validate_d1_database_delete",
+                normalized_target,
+                json!({"delete_database": true}),
+                reason.map(str::to_string),
+                &target_key_sha256,
+                "apply_d1_database_delete",
+                json!({
+                    "method": "DELETE",
+                    "path": provider_path,
+                }),
+            ))
+        }
+        _ => Err("target-wide operation was outside rename/delete"),
+    }
 }
 
 pub(crate) fn d1_target_wide_intended_plan(
@@ -461,6 +542,87 @@ mod tests {
         for variant in variants {
             assert_ne!(confirmation_token_for_binding(&variant), baseline_token);
         }
+    }
+
+    #[test]
+    fn typed_rederivation_closes_rename_and_delete_request_shapes() {
+        let target = crate::d1_target::normalize_d1_target(
+            "acct-example",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect("canonical target");
+        let rename = rederive_d1_target_wide_intended_plan(
+            &target,
+            "d1_rename_database",
+            &json!({"new_name": "canonical-name"}),
+            Some("reviewed reason"),
+        )
+        .expect("typed canonical rename");
+        assert_eq!(rename.plan.steps.len(), 6);
+        assert_eq!(
+            rename.plan.steps[5].target,
+            json!({
+                "method": "PATCH",
+                "path": "/accounts/acct-example/d1/database/123e4567-e89b-42d3-a456-426614174000",
+                "body": {"name": "canonical-name"},
+            })
+        );
+        let delete = rederive_d1_target_wide_intended_plan(
+            &target,
+            "d1_delete_database",
+            &json!({"delete_database": true}),
+            None,
+        )
+        .expect("typed canonical delete");
+        assert_eq!(delete.plan.steps.len(), 6);
+        assert_eq!(
+            delete.plan.steps[5].target,
+            json!({
+                "method": "DELETE",
+                "path": "/accounts/acct-example/d1/database/123e4567-e89b-42d3-a456-426614174000",
+            })
+        );
+
+        for invalid in [
+            json!({"new_name": " canonical-name"}),
+            json!({"new_name": ""}),
+            json!({"new_name": "canonical-name", "unknown": true}),
+            json!({"new_name": 7}),
+        ] {
+            assert!(
+                rederive_d1_target_wide_intended_plan(
+                    &target,
+                    "d1_rename_database",
+                    &invalid,
+                    None,
+                )
+                .is_err()
+            );
+        }
+        for invalid in [
+            json!({"delete_database": false}),
+            json!({"delete_database": true, "unknown": true}),
+            json!({"delete_database": "true"}),
+        ] {
+            assert!(
+                rederive_d1_target_wide_intended_plan(
+                    &target,
+                    "d1_delete_database",
+                    &invalid,
+                    None,
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            rederive_d1_target_wide_intended_plan(
+                &target,
+                "d1_unknown_database_operation",
+                &json!({}),
+                None,
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -24,7 +24,10 @@ use crate::d1_dml_identity_reservation::{
 use crate::d1_migration_lease::D1TargetMutationGuard;
 use crate::d1_opaque_identity::valid_d1_opaque_identity;
 use crate::d1_target::{D1TargetIdentity, normalize_d1_target};
-use crate::d1_target_wide_mutation::{D1TargetWideIntendedPlan, target_wide_plan_sha256};
+use crate::d1_target_wide_mutation::{
+    D1TargetWideIntendedPlan, TARGET_WIDE_CONSENT_VERSION, TARGET_WIDE_OPERATION_VERSION,
+    rederive_d1_target_wide_intended_plan,
+};
 
 pub(crate) const D1_TARGET_WIDE_ATTEMPT_CUSTODY_OPERATION: &str = "d1_target_wide_attempt_custody";
 const TARGET_WIDE_ATTEMPT_VERSION: u8 = 1;
@@ -34,6 +37,8 @@ const TARGET_WIDE_ATTEMPT_VERSION: u8 = 1;
 struct D1TargetWideAttemptState {
     version: u8,
     operation: String,
+    consent_version: u8,
+    operation_version: u8,
     layout_version: u8,
     layout_sha256: String,
     target_operation: String,
@@ -62,6 +67,8 @@ pub(crate) enum D1TargetWidePreparedTransition {
 pub(crate) struct D1TargetWidePreparedReceipt {
     pub(crate) version: u8,
     pub(crate) operation: &'static str,
+    pub(crate) consent_version: u8,
+    pub(crate) operation_version: u8,
     pub(crate) target_operation: String,
     pub(crate) layout_version: u8,
     pub(crate) layout_sha256: String,
@@ -130,6 +137,8 @@ pub(crate) struct D1TargetWidePreparedError {
 
 #[derive(Debug, Clone)]
 struct PreparedBinding {
+    consent_version: u8,
+    operation_version: u8,
     target_operation: String,
     target_key_sha256: String,
     intended_plan_sha256: String,
@@ -142,6 +151,27 @@ struct PreparedBinding {
     execution_attempt_id_sha256: String,
     provider_request_id_sha256: String,
     attempt_binding_sha256: String,
+}
+
+#[derive(Serialize)]
+struct D1TargetWideAttemptBindingMaterial<'a> {
+    version: u8,
+    operation: &'a str,
+    layout_version: u8,
+    layout_sha256: &'a str,
+    consent_version: u8,
+    operation_version: u8,
+    target_operation: &'a str,
+    target_key_sha256: &'a str,
+    intended_plan_sha256: &'a str,
+    consent_binding_sha256: &'a str,
+    confirmation_token_sha256: &'a str,
+    normalized_target_sha256: &'a str,
+    requested_change_sha256: &'a str,
+    reason_sha256: &'a str,
+    operation_id_sha256: &'a str,
+    execution_attempt_id_sha256: &'a str,
+    provider_request_id_sha256: &'a str,
 }
 
 pub(crate) fn prepare_d1_target_wide_attempt(
@@ -179,6 +209,7 @@ pub(crate) fn install_d1_target_wide_prepared_custody(
     confirmation_token: &str,
     identities: D1DmlAttemptIdentities<'_>,
 ) -> Result<D1TargetWidePreparedProduct, CallToolResult> {
+    guard.assert_exact_target(target)?;
     let prepared =
         prepare_d1_target_wide_attempt(target, intended_plan, confirmation_token, identities, None)
             .map_err(prepared_error_result)?;
@@ -276,29 +307,37 @@ fn derive_binding(
             "D1 target identity was not exact canonical input",
         ));
     }
-    let consent = &intended_plan.consent_binding;
-    let target_operation = consent.operation;
-    if !matches!(
-        target_operation,
-        "d1_rename_database" | "d1_delete_database"
-    ) || intended_plan.plan.operation != target_operation
-        || intended_plan.plan != consent.plan
-        || intended_plan.plan_sha256 != consent.intended_plan_sha256
-        || target_wide_plan_sha256(&intended_plan.plan) != intended_plan.plan_sha256
-        || consent.normalized_target
-            != json!({"account_id": target.account_id, "database_id": target.database_id})
+    let supplied_consent = &intended_plan.consent_binding;
+    let expected = rederive_d1_target_wide_intended_plan(
+        target,
+        supplied_consent.operation,
+        &supplied_consent.requested_change,
+        supplied_consent.reason.as_deref(),
+    )
+    .map_err(|_| {
+        prepared_error(
+            D1TargetWidePreparedClassification::IntendedPlanInvalid,
+            "target-wide intended plan could not be rederived from canonical request facts",
+        )
+    })?;
+    if supplied_consent.consent_version != TARGET_WIDE_CONSENT_VERSION
+        || supplied_consent.operation_version != TARGET_WIDE_OPERATION_VERSION
+        || intended_plan != &expected
     {
         return Err(prepared_error(
             D1TargetWidePreparedClassification::IntendedPlanInvalid,
-            "target-wide intended plan contradicted its operation, target, or consent binding",
+            "target-wide intended plan was not the complete current canonical six-step consent product",
         ));
     }
-    if confirmation_token != intended_plan.confirmation_token() {
+    let expected_token = expected.confirmation_token();
+    if confirmation_token != expected_token {
         return Err(prepared_error(
             D1TargetWidePreparedClassification::ConsentMismatch,
-            "target-wide confirmation token did not match the exact intended plan",
+            "target-wide confirmation token did not match the rederived canonical consent product",
         ));
     }
+    let consent = &expected.consent_binding;
+    let target_operation = consent.operation;
     let opaque = [
         identities.operation_id,
         identities.execution_attempt_id,
@@ -326,27 +365,31 @@ fn derive_binding(
     let operation_id_sha256 = hash_bytes(identities.operation_id.as_bytes());
     let execution_attempt_id_sha256 = hash_bytes(identities.execution_attempt_id.as_bytes());
     let provider_request_id_sha256 = hash_bytes(identities.provider_request_id.as_bytes());
-    let attempt_binding_sha256 = hash_serialized(&(
-        TARGET_WIDE_ATTEMPT_VERSION,
-        D1_TARGET_WIDE_ATTEMPT_CUSTODY_OPERATION,
-        D1_DML_CUSTODY_LAYOUT_VERSION,
-        D1_DML_CUSTODY_LAYOUT_SHA256,
+    let attempt_binding_sha256 = hash_serialized(&D1TargetWideAttemptBindingMaterial {
+        version: TARGET_WIDE_ATTEMPT_VERSION,
+        operation: D1_TARGET_WIDE_ATTEMPT_CUSTODY_OPERATION,
+        layout_version: D1_DML_CUSTODY_LAYOUT_VERSION,
+        layout_sha256: D1_DML_CUSTODY_LAYOUT_SHA256,
+        consent_version: consent.consent_version,
+        operation_version: consent.operation_version,
         target_operation,
-        target_key_sha256.as_str(),
-        intended_plan.plan_sha256.as_str(),
-        consent_binding_sha256.as_str(),
-        confirmation_token_sha256.as_str(),
-        normalized_target_sha256.as_str(),
-        requested_change_sha256.as_str(),
-        reason_sha256.as_str(),
-        operation_id_sha256.as_str(),
-        execution_attempt_id_sha256.as_str(),
-        provider_request_id_sha256.as_str(),
-    ));
+        target_key_sha256: &target_key_sha256,
+        intended_plan_sha256: &expected.plan_sha256,
+        consent_binding_sha256: &consent_binding_sha256,
+        confirmation_token_sha256: &confirmation_token_sha256,
+        normalized_target_sha256: &normalized_target_sha256,
+        requested_change_sha256: &requested_change_sha256,
+        reason_sha256: &reason_sha256,
+        operation_id_sha256: &operation_id_sha256,
+        execution_attempt_id_sha256: &execution_attempt_id_sha256,
+        provider_request_id_sha256: &provider_request_id_sha256,
+    });
     Ok(PreparedBinding {
+        consent_version: consent.consent_version,
+        operation_version: consent.operation_version,
         target_operation: target_operation.to_string(),
         target_key_sha256,
-        intended_plan_sha256: intended_plan.plan_sha256.clone(),
+        intended_plan_sha256: expected.plan_sha256,
         consent_binding_sha256,
         confirmation_token_sha256,
         normalized_target_sha256,
@@ -363,6 +406,8 @@ fn state_from_binding(binding: &PreparedBinding) -> D1TargetWideAttemptState {
     D1TargetWideAttemptState {
         version: TARGET_WIDE_ATTEMPT_VERSION,
         operation: D1_TARGET_WIDE_ATTEMPT_CUSTODY_OPERATION.to_string(),
+        consent_version: binding.consent_version,
+        operation_version: binding.operation_version,
         layout_version: D1_DML_CUSTODY_LAYOUT_VERSION,
         layout_sha256: D1_DML_CUSTODY_LAYOUT_SHA256.to_string(),
         target_operation: binding.target_operation.clone(),
@@ -429,6 +474,8 @@ fn parse_canonical_state(
 fn validate_state(state: &D1TargetWideAttemptState) -> Result<(), D1TargetWidePreparedError> {
     if state.version != TARGET_WIDE_ATTEMPT_VERSION
         || state.operation != D1_TARGET_WIDE_ATTEMPT_CUSTODY_OPERATION
+        || state.consent_version != TARGET_WIDE_CONSENT_VERSION
+        || state.operation_version != TARGET_WIDE_OPERATION_VERSION
         || state.layout_version != D1_DML_CUSTODY_LAYOUT_VERSION
         || state.layout_sha256 != D1_DML_CUSTODY_LAYOUT_SHA256
     {
@@ -463,23 +510,25 @@ fn validate_state(state: &D1TargetWideAttemptState) -> Result<(), D1TargetWidePr
             "target-wide attempt state contradicted the closed Prepared product",
         ));
     }
-    let expected_binding = hash_serialized(&(
-        state.version,
-        state.operation.as_str(),
-        state.layout_version,
-        state.layout_sha256.as_str(),
-        state.target_operation.as_str(),
-        state.target_key_sha256.as_str(),
-        state.intended_plan_sha256.as_str(),
-        state.consent_binding_sha256.as_str(),
-        state.confirmation_token_sha256.as_str(),
-        state.normalized_target_sha256.as_str(),
-        state.requested_change_sha256.as_str(),
-        state.reason_sha256.as_str(),
-        state.operation_id_sha256.as_str(),
-        state.execution_attempt_id_sha256.as_str(),
-        state.provider_request_id_sha256.as_str(),
-    ));
+    let expected_binding = hash_serialized(&D1TargetWideAttemptBindingMaterial {
+        version: state.version,
+        operation: &state.operation,
+        layout_version: state.layout_version,
+        layout_sha256: &state.layout_sha256,
+        consent_version: state.consent_version,
+        operation_version: state.operation_version,
+        target_operation: &state.target_operation,
+        target_key_sha256: &state.target_key_sha256,
+        intended_plan_sha256: &state.intended_plan_sha256,
+        consent_binding_sha256: &state.consent_binding_sha256,
+        confirmation_token_sha256: &state.confirmation_token_sha256,
+        normalized_target_sha256: &state.normalized_target_sha256,
+        requested_change_sha256: &state.requested_change_sha256,
+        reason_sha256: &state.reason_sha256,
+        operation_id_sha256: &state.operation_id_sha256,
+        execution_attempt_id_sha256: &state.execution_attempt_id_sha256,
+        provider_request_id_sha256: &state.provider_request_id_sha256,
+    });
     if state.attempt_binding_sha256 != expected_binding {
         return Err(prepared_error(
             D1TargetWidePreparedClassification::RestoredStateContradictory,
@@ -499,6 +548,8 @@ fn product(
     let receipt = D1TargetWidePreparedReceipt {
         version: state.version,
         operation: D1_TARGET_WIDE_ATTEMPT_CUSTODY_OPERATION,
+        consent_version: state.consent_version,
+        operation_version: state.operation_version,
         target_operation: state.target_operation.clone(),
         layout_version: state.layout_version,
         layout_sha256: state.layout_sha256.clone(),

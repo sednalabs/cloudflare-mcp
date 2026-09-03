@@ -206,8 +206,11 @@ are added by the graph derivation.
    explicitly `not_installed` and has no provider-dispatch authority, so the
    sixth step is currently unreachable through these tools.
    A distinct internal target-wide Prepared product now binds the exact consent
-   token, full static plan, target/change/reason, and three hashed opaque
-   identities. It can converge an exact partial local claimant set and install
+   token, full static plan, target/change/reason, current consent/operation
+   versions, and three hashed opaque identities. It rederives the typed canonical
+   six-step product and rejects detached recomputed substitutes. The held guard
+   asserts its exact target before any local namespace access. It can then
+   converge an exact partial local claimant set and install
    only create-once `Prepared` custody under the held target guard. It has no
    public route or provider/readback effect and does not make step 5 complete;
    owner-aware audit, dispatch reservation, provider execution, and recovery

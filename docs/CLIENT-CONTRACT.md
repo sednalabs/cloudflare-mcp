@@ -532,11 +532,15 @@ plan, composition, or identity drift. There is no permissive predecessor
 fallback. Exact pre-dispatch replay returns the same canonical state.
 
 Target-wide rename/delete have a distinct internal version-1 Prepared product
-in the same private sharded custody layout. It accepts only the current exact
-static consent plan and matching confirmation token plus three pairwise-distinct
-opaque identifiers. Its aggregate receipt exposes hashes, phase, size/cap, and
-zero-effect counters only. The guarded local installer reuses the claimant
-capacity, create-once, CAS-seal, descriptor/path, and exact-readback primitives;
+in the same private sharded custody layout. It rederives the typed current
+six-step plan and consent from the canonical target, requested change, and
+reason; a caller-supplied plan, digest, binding, or recomputed token is never
+authority. It requires full equality with that product, including the current
+consent and operation versions, and persists those versions in the attempt,
+binding hash, replay comparison, and aggregate receipt. The guarded local
+installer first proves that its captured target exactly matches the requested
+target, before layout, capacity, claimant, or attempt access, then reuses the
+claimant capacity, create-once, CAS-seal, descriptor/path, and exact-readback primitives;
 an exact partial claimant set may converge, while changed intent, operation,
 target, reason, plan, consent, identity, restored bytes, or unsafe filesystem
 evidence fails closed. This internal Prepared product has no public route and

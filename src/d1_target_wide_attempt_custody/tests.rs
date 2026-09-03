@@ -1,13 +1,22 @@
+#[cfg(target_os = "linux")]
+use std::collections::BTreeMap;
+#[cfg(target_os = "linux")]
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
 use super::*;
 use crate::d1_dml_identity_claimant::D1DmlIdentityNamespace;
 #[cfg(target_os = "linux")]
-use crate::d1_migration_lease::acquire_d1_target_mutation_guard_for_test;
+use crate::d1_migration_lease::{
+    acquire_d1_target_mutation_guard_at, acquire_d1_target_mutation_guard_for_test,
+};
 use crate::d1_target::normalize_d1_target;
-use crate::d1_target_wide_mutation::d1_target_wide_intended_plan;
+use crate::d1_target_wide_mutation::{
+    rederive_d1_target_wide_intended_plan, target_wide_plan_sha256,
+};
 
 const DATABASE_ID: &str = "123e4567-e89b-42d3-a456-426614174000";
 const OPERATION_ID: &str = "target-operation-0001";
@@ -27,31 +36,93 @@ fn ids() -> D1DmlAttemptIdentities<'static> {
 }
 
 fn rename_plan(name: &str, reason: Option<&str>) -> D1TargetWideIntendedPlan {
-    let target = target();
-    d1_target_wide_intended_plan(
+    rename_plan_for(&target(), name, reason)
+}
+
+fn rename_plan_for(
+    target: &D1TargetIdentity,
+    name: &str,
+    reason: Option<&str>,
+) -> D1TargetWideIntendedPlan {
+    rederive_d1_target_wide_intended_plan(
+        target,
         "d1_rename_database",
-        "validate_d1_database_rename",
-        json!({"account_id": target.account_id, "database_id": target.database_id}),
-        json!({"new_name": name}),
-        reason.map(str::to_string),
-        &target.target_key_sha256(),
-        "apply_d1_database_patch",
-        json!({"method": "PATCH", "path": "/synthetic", "body": {"name": name}}),
+        &json!({"new_name": name}),
+        reason,
     )
+    .expect("canonical rename plan")
 }
 
 fn delete_plan(reason: Option<&str>) -> D1TargetWideIntendedPlan {
-    let target = target();
-    d1_target_wide_intended_plan(
+    rederive_d1_target_wide_intended_plan(
+        &target(),
         "d1_delete_database",
-        "validate_d1_database_delete",
-        json!({"account_id": target.account_id, "database_id": target.database_id}),
-        json!({"delete_database": true}),
-        reason.map(str::to_string),
-        &target.target_key_sha256(),
-        "apply_d1_database_delete",
-        json!({"method": "DELETE", "path": "/synthetic"}),
+        &json!({"delete_database": true}),
+        reason,
     )
+    .expect("canonical delete plan")
+}
+
+fn rebind_detached_plan(plan: &mut D1TargetWideIntendedPlan) {
+    plan.plan_sha256 = target_wide_plan_sha256(&plan.plan);
+    plan.consent_binding.plan = plan.plan.clone();
+    plan.consent_binding.intended_plan_sha256 = plan.plan_sha256.clone();
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, (u32, Vec<u8>)> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn visit(root: &Path, current: &Path, entries: &mut BTreeMap<PathBuf, (u32, Vec<u8>)>) {
+        let mut children = fs::read_dir(current)
+            .expect("read fixture directory")
+            .map(|entry| entry.expect("read fixture entry").path())
+            .collect::<Vec<_>>();
+        children.sort();
+        for child in children {
+            let relative = child.strip_prefix(root).expect("relative fixture path");
+            let metadata = fs::symlink_metadata(&child).expect("fixture metadata");
+            let mode = metadata.permissions().mode() & 0o7777;
+            if metadata.is_dir() {
+                entries.insert(relative.to_path_buf(), (mode, Vec::new()));
+                visit(root, &child, entries);
+            } else {
+                entries.insert(
+                    relative.to_path_buf(),
+                    (mode, fs::read(&child).expect("read fixture file")),
+                );
+            }
+        }
+    }
+
+    let mut entries = BTreeMap::new();
+    visit(root, root, &mut entries);
+    entries
+}
+
+#[cfg(target_os = "linux")]
+fn plant_hostile_attempt_shard(root: &Path, target: &D1TargetIdentity, marker: &[u8]) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let shard = root
+        .join(format!(
+            "d1-migration-target-{}",
+            target.target_key_sha256()
+        ))
+        .join("dml-custody-v1")
+        .join("attempt")
+        .join("ff")
+        .join("ff");
+    fs::create_dir_all(&shard).expect("create hostile shard parents");
+    let mut current = shard.as_path();
+    while current != root {
+        fs::set_permissions(current, fs::Permissions::from_mode(0o700))
+            .expect("secure hostile shard parent");
+        current = current.parent().expect("hostile shard parent");
+    }
+    let path = shard.join(format!("{}.json", "f".repeat(64)));
+    fs::write(&path, marker).expect("write hostile shard");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("secure hostile shard");
 }
 
 fn prepare(plan: &D1TargetWideIntendedPlan) -> D1TargetWidePreparedProduct {
@@ -90,6 +161,14 @@ fn prepared_product_binds_complete_consent_and_distinct_opaque_identities() {
     assert_eq!(replay.state_bytes(), prepared.state_bytes());
     assert!(replay.receipt().exact_replay);
     assert_eq!(replay.receipt().phase, D1DmlAttemptPhase::Prepared);
+    assert_eq!(
+        replay.receipt().consent_version,
+        TARGET_WIDE_CONSENT_VERSION
+    );
+    assert_eq!(
+        replay.receipt().operation_version,
+        TARGET_WIDE_OPERATION_VERSION
+    );
     assert_eq!(replay.receipt().provider_calls, 0);
     assert_eq!(replay.receipt().provider_mutations, 0);
     assert!(!replay.receipt().automatic_retry_permitted);
@@ -117,6 +196,79 @@ fn prepared_product_binds_complete_consent_and_distinct_opaque_identities() {
         )),
         D1TargetWidePreparedClassification::OpaqueIdentityDuplicate
     );
+}
+
+#[test]
+fn detached_self_consistent_plan_and_token_never_replace_canonical_rederivation() {
+    let canonical = rename_plan("synthetic-name", Some("reviewed reason"));
+    let mut variants = Vec::new();
+
+    let mut operation = canonical.clone();
+    operation.consent_binding.operation = "d1_delete_database";
+    variants.push(("operation", operation));
+
+    let mut consent_version = canonical.clone();
+    consent_version.consent_binding.consent_version += 1;
+    variants.push(("consent version", consent_version));
+
+    let mut operation_version = canonical.clone();
+    operation_version.consent_binding.operation_version += 1;
+    operation_version.plan.steps[0].target["operation_version"] =
+        json!(TARGET_WIDE_OPERATION_VERSION + 1);
+    rebind_detached_plan(&mut operation_version);
+    variants.push(("operation version", operation_version));
+
+    let mut validation_action = canonical.clone();
+    validation_action.plan.steps[0].action = "validate_d1_database_delete";
+    rebind_detached_plan(&mut validation_action);
+    variants.push(("validation action", validation_action));
+
+    let mut validation_target = canonical.clone();
+    validation_target.plan.steps[0].target["normalized_target"]["account_id"] =
+        json!("acct-detached");
+    rebind_detached_plan(&mut validation_target);
+    variants.push(("validation target", validation_target));
+
+    let mut consent_target = canonical.clone();
+    consent_target.consent_binding.normalized_target["account_id"] = json!("acct-detached");
+    variants.push(("consent target", consent_target));
+
+    let mut requested_change = canonical.clone();
+    requested_change.consent_binding.requested_change = json!({"new_name": "detached-name"});
+    variants.push(("requested change", requested_change));
+
+    let mut reason = canonical.clone();
+    reason.consent_binding.reason = Some("detached reason".to_string());
+    variants.push(("reason", reason));
+
+    let mut provider_method = canonical.clone();
+    provider_method.plan.steps[5].target["method"] = json!("DELETE");
+    rebind_detached_plan(&mut provider_method);
+    variants.push(("provider method", provider_method));
+
+    let mut provider_path = canonical.clone();
+    provider_path.plan.steps[5].target["path"] = json!("/detached");
+    rebind_detached_plan(&mut provider_path);
+    variants.push(("provider path", provider_path));
+
+    let mut provider_body = canonical.clone();
+    provider_body.plan.steps[5].target["body"] = json!({"name": "detached-name"});
+    rebind_detached_plan(&mut provider_body);
+    variants.push(("provider body", provider_body));
+
+    for (label, detached) in variants {
+        assert_eq!(
+            classification(prepare_d1_target_wide_attempt(
+                &target(),
+                &detached,
+                &detached.confirmation_token(),
+                ids(),
+                None,
+            )),
+            D1TargetWidePreparedClassification::IntendedPlanInvalid,
+            "{label} must not become authority by recomputing its digest and token"
+        );
+    }
 }
 
 #[test]
@@ -266,6 +418,30 @@ fn malformed_noncanonical_unsupported_and_contradictory_restores_fail_closed() {
         )),
         D1TargetWidePreparedClassification::RestoredStateUnsupported
     );
+    let mut unsupported_consent = state(prepared.state_bytes());
+    unsupported_consent.consent_version += 1;
+    assert_eq!(
+        classification(prepare_d1_target_wide_attempt(
+            &target(),
+            &plan,
+            &plan.confirmation_token(),
+            ids(),
+            Some(&unchecked_bytes(&unsupported_consent)),
+        )),
+        D1TargetWidePreparedClassification::RestoredStateUnsupported
+    );
+    let mut unsupported_operation = state(prepared.state_bytes());
+    unsupported_operation.operation_version += 1;
+    assert_eq!(
+        classification(prepare_d1_target_wide_attempt(
+            &target(),
+            &plan,
+            &plan.confirmation_token(),
+            ids(),
+            Some(&unchecked_bytes(&unsupported_operation)),
+        )),
+        D1TargetWidePreparedClassification::RestoredStateUnsupported
+    );
     let mut contradictory = state(prepared.state_bytes());
     contradictory.phase = D1DmlAttemptPhase::DispatchReserved;
     assert_eq!(
@@ -383,6 +559,49 @@ fn local_prepared_install_converges_attempt_first_partial_state() {
     assert_eq!(audit.unmatched_attempt_count, 0);
     assert!(audit.reconciliation_required);
     drop(guard);
+    fs::remove_dir_all(root).expect("remove fixture root");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn guard_target_mismatch_precedes_layout_and_preserves_hostile_namespaces_exactly() {
+    let target_a = target();
+    let target_b = normalize_d1_target("acct-2", "223e4567-e89b-42d3-a456-426614174000")
+        .expect("second canonical target");
+    let plan_b = rename_plan_for(&target_b, "target-b-name", Some("reviewed target B"));
+    let (root, guard_a) =
+        acquire_d1_target_mutation_guard_for_test("prepared-guard-mismatch", "d1_rename_database");
+    let guard_b = acquire_d1_target_mutation_guard_at(
+        root.clone(),
+        "d1_rename_database",
+        &target_b.account_id,
+        &target_b.database_id,
+    )
+    .expect("acquire independent target B guard");
+    plant_hostile_attempt_shard(&root, &target_a, b"hostile target A\n");
+    plant_hostile_attempt_shard(&root, &target_b, b"hostile target B\n");
+    let before = snapshot_tree(&root);
+
+    let error = install_d1_target_wide_prepared_custody(
+        &guard_a,
+        &target_b,
+        &plan_b,
+        &plan_b.confirmation_token(),
+        ids(),
+    )
+    .expect_err("guard A must reject target B before any custody read or write")
+    .structured_content
+    .expect("structured guard mismatch");
+    assert_eq!(
+        error["error"]["code"],
+        json!("d1.target_guard_target_mismatch")
+    );
+    assert_eq!(error["provider_calls"], json!(0));
+    assert_eq!(error["provider_mutations"], json!(0));
+    assert_eq!(error["local_mutations"], json!(0));
+    assert_eq!(snapshot_tree(&root), before);
+
+    drop((guard_a, guard_b));
     fs::remove_dir_all(root).expect("remove fixture root");
 }
 

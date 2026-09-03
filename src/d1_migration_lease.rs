@@ -152,6 +152,7 @@ pub(crate) struct D1MigrationLease {
 #[derive(Debug)]
 pub(crate) struct D1TargetMutationGuard {
     operation: &'static str,
+    canonical_target: D1TargetIdentity,
     #[cfg(target_os = "linux")]
     root_path: PathBuf,
     #[cfg(target_os = "linux")]
@@ -619,6 +620,24 @@ impl D1MigrationLease {
 }
 
 impl D1TargetMutationGuard {
+    /// Prove that the caller's complete canonical account/database identity is
+    /// exactly the target captured when this guard was acquired. This check is
+    /// read-only and must precede every caller-selected custody namespace.
+    pub(crate) fn assert_exact_target(
+        &self,
+        target: &D1TargetIdentity,
+    ) -> Result<(), CallToolResult> {
+        let canonical = normalize_d1_target(&target.account_id, &target.database_id).ok();
+        if canonical.as_ref() != Some(target) || target != &self.canonical_target {
+            return Err(d1_target_guard_target_mismatch_error(
+                self.operation,
+                &self.target_key_sha256,
+                &target.target_key_sha256(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Rebind the complete custody chain immediately before provider dispatch.
     pub(crate) fn revalidate(&self) -> Result<(), CallToolResult> {
         #[cfg(target_os = "linux")]
@@ -2319,6 +2338,28 @@ fn d1_target_guard_error(
             "code": code,
             "message": message,
             "hint": "Use the canonical target identity and wait for or reconcile the current target owner before another provider mutation."
+        }
+    }))
+}
+
+fn d1_target_guard_target_mismatch_error(
+    operation: &'static str,
+    guard_target_key_sha256: &str,
+    supplied_target_key_sha256: &str,
+) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": operation,
+        "status": "blocked",
+        "provider_calls": 0,
+        "provider_mutations": 0,
+        "local_mutations": 0,
+        "target_key_sha256": guard_target_key_sha256,
+        "supplied_target_key_sha256": supplied_target_key_sha256,
+        "error": {
+            "code": "d1.target_guard_target_mismatch",
+            "message": "supplied D1 target did not exactly match the target owned by the held guard",
+            "hint": "Do not inspect or mutate either custody namespace; acquire and use the guard for the exact canonical target."
         }
     }))
 }
@@ -4858,9 +4899,9 @@ mod linux {
     pub(super) fn acquire_d1_target_mutation_guard_at_linux(
         root_path: PathBuf,
         operation: &'static str,
-        target_identity: D1TargetIdentity,
+        canonical_target: D1TargetIdentity,
     ) -> Result<D1TargetMutationGuard, CallToolResult> {
-        let target_hash = target_identity.target_key_sha256();
+        let target_hash = canonical_target.target_key_sha256();
         validate_root_and_ancestors(&root_path).map_err(|message| {
             d1_target_guard_error(
                 operation,
@@ -4998,6 +5039,7 @@ mod linux {
 
         Ok(D1TargetMutationGuard {
             operation,
+            canonical_target,
             root_path,
             root,
             root_identity,

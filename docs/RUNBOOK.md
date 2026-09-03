@@ -146,10 +146,16 @@ reports `implementation_status=not_installed` and
 `provider_dispatch_authority=none`.
 
 The internal target-wide Prepared boundary is now implemented but is not yet
-routed from either curated tool. It hashes pairwise-distinct opaque operation,
+routed from either curated tool. It rederives the exact typed current six-step
+plan and consent from canonical target/change/reason facts and rejects any
+detached or version-drifted plan, binding, digest, or token even when recomputed
+self-consistently. It hashes pairwise-distinct opaque operation,
 execution-attempt, and provider-request identifiers and binds them to the exact
-consent token, complete static plan, normalized target/change, and optional
-reason. Under the held target guard it reuses the fixed sharded layout and the
+current-version consent token, complete static plan, normalized target/change,
+and optional reason. Consent and operation versions are persisted in state,
+binding hashes, receipts, and replay equality. Under the held target guard it
+first asserts the exact captured target before any local namespace access, then
+reuses the fixed sharded layout and the
 three create-once claimant namespaces, converges an exact partial claimant set,
 seals the complete set to one attempt binding, and create-once installs only a
 canonical `Prepared` attempt. Exact replay returns the incumbent bytes; changed,
