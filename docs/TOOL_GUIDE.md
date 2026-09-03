@@ -213,8 +213,16 @@ are added by the graph derivation.
    converge an exact partial local claimant set and install
    only create-once `Prepared` custody under the held target guard. It has no
    public route or provider/readback effect and does not make step 5 complete;
-   owner-aware audit, dispatch reservation, provider execution, and recovery
-   remain required before either live tool can be enabled.
+   a separate internal owner-aware complete audit now rederives the current
+   canonical product, exact physical attempt and three Bound claimants, and
+   permits exactly one Prepared owner only when all surrounding custody is
+   terminal. Its stable hash/count-only receipt is scoped solely to a future
+   local dispatch-reservation CAS, reports zero effects and no provider
+   authority, and must be revalidated immediately before that CAS. Partial,
+   foreign, multiple, malformed, conflicting, restored, scratch, unsafe, or
+   nonterminal products fail closed. The global authorization remains
+   all-terminal and unchanged. Dispatch reservation, provider execution, and
+   recovery remain required before either live tool can be enabled.
    Dry-run is the only enabled lifecycle: it returns the full plan,
    `intended_plan_sha256`, versioned `consent_binding`, confirmation token, and
    unobserved/not-installed/not-dispatched execution evidence with zero effects.

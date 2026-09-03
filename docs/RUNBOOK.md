@@ -161,9 +161,30 @@ seals the complete set to one attempt binding, and create-once installs only a
 canonical `Prepared` attempt. Exact replay returns the incumbent bytes; changed,
 cross-operation, malformed, noncanonical, unsafe, linked, or over-capacity
 evidence fails closed with zero provider calls. `Prepared` is not dispatch
-authority. The owner-aware complete-audit exception, `DispatchReserved`
-transition, provider request, and recovery/readback lifecycle remain separate
-required boundaries, so live rename/delete remain disabled.
+authority. A separate internal owner-aware revalidation now accepts only one
+canonical target-wide `Prepared` attempt with its exact three `Bound`
+claimants, while every other attempt in the stable complete audit is terminal.
+It binds the current consent/operation versions, canonical target, plan,
+operation/attempt/provider-request hashes, attempt and claimant-set bindings,
+and complete surrounding-audit identity into an aggregate-only authorization.
+The authorization scope is only the future local
+`Prepared -> DispatchReserved` compare-and-exchange and explicitly retains
+`provider_dispatch_authority=none`; immediately before that future persistence
+boundary, the exact product must be recomputed and compared. The global
+target-wide audit authority remains unchanged and rejects any `Prepared`,
+`DispatchReserved`, or `ReconciliationRequired` attempt.
+
+The owner-aware negative matrix rejects absent/partial claimants or attempts,
+multiple or foreign Prepared owners, nonterminal surroundings, changed complete
+audit identity, malformed/noncanonical/contradictory restored bytes, unknown or
+misplaced artifacts, unsafe modes or links, CAS scratch, and capacity/budget
+failure. Both claimant-first and attempt-first installation orders authorize
+only after exact convergence; exact replay converges. This policy stays in the
+Cloudflare D1 adapter because it has one D1 caller. It reuses the toolkit's
+provider-neutral private-artifact primitives, but does not uplift a D1 lifecycle
+contract without a second independent caller. `DispatchReserved` persistence,
+provider request, and recovery/readback lifecycle remain separate required
+boundaries, so live rename/delete remain disabled.
 
 Every dry run returns the full plan, `intended_plan_sha256`, a versioned
 `consent_binding`, and `required_confirmation_token`. The consent binding

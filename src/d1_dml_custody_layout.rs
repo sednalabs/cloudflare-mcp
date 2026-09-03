@@ -143,11 +143,14 @@ pub(crate) struct D1DmlCustodyCompleteAuditAuthorization {
 }
 
 impl D1DmlCustodyCompleteAuditReceipt {
-    pub(crate) fn authorize_target_wide_custody(
+    /// Validate the fixed audit identity and a complete, internally matched
+    /// claimant/attempt graph without deciding whether a particular lifecycle
+    /// phase may authorize its next boundary.
+    pub(crate) fn validate_complete_graph(
         &self,
         expected_target_key_sha256: &str,
-    ) -> Result<D1DmlCustodyCompleteAuditAuthorization, &'static str> {
-        let counts_are_clean = self.pending_claimant_count == 0
+    ) -> Result<(), &'static str> {
+        let graph_is_complete = self.pending_claimant_count == 0
             && self.cas_scratch_count == 0
             && self.claimant_count == self.bound_claimant_count
             && self.claimant_count
@@ -159,8 +162,6 @@ impl D1DmlCustodyCompleteAuditReceipt {
             && self.claimant_set_count == self.matched_claimant_set_count
             && self.attempt_count == self.matched_claimant_set_count
             && self.attempt_phase_counts.total() == Some(self.attempt_count)
-            && self.attempt_phase_counts.unresolved() == Some(0)
-            && self.attempt_phase_counts.terminal() == Some(self.attempt_count)
             && self.unmatched_claimant_set_count == 0
             && self.unmatched_attempt_count == 0
             && self.orphan_claimant_set_count == 0
@@ -181,10 +182,28 @@ impl D1DmlCustodyCompleteAuditReceipt {
                 .audit_sha256
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'));
-        if self.reconciliation_required
-            || self.provider_dispatch_authority != D1DmlCustodyAuditProviderAuthority::None
+        let reconciliation_is_exact = self
+            .attempt_phase_counts
+            .unresolved()
+            .is_some_and(|count| self.reconciliation_required == (count != 0));
+        if self.provider_dispatch_authority != D1DmlCustodyAuditProviderAuthority::None
             || !fixed_identity_is_exact
-            || !counts_are_clean
+            || !graph_is_complete
+            || !reconciliation_is_exact
+        {
+            return Err("DML complete custody graph was not exact and complete");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn authorize_target_wide_custody(
+        &self,
+        expected_target_key_sha256: &str,
+    ) -> Result<D1DmlCustodyCompleteAuditAuthorization, &'static str> {
+        self.validate_complete_graph(expected_target_key_sha256)?;
+        if self.reconciliation_required
+            || self.attempt_phase_counts.unresolved() != Some(0)
+            || self.attempt_phase_counts.terminal() != Some(self.attempt_count)
         {
             return Err("DML complete custody is not clean target-wide authority");
         }

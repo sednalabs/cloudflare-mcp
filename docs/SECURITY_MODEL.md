@@ -129,8 +129,16 @@ before any layout, capacity, claimant, or attempt access. It then reuses the
 existing claimant namespaces,
 capacity checks, exclusive creation, CAS sealing, restrictive file policy, and
 exact readback. Its presence is unresolved custody, not provider authority; the
-curated rename/delete routes remain planning-only until independently reviewed
-audit, dispatch, provider, and recovery boundaries are composed.
+global complete-audit authority continues to reject it. A D1-local owner-aware
+read-only boundary may select exactly one canonical Prepared attempt only when
+its exact three Bound claimants are present, every surrounding attempt is
+terminal, and two complete audits plus exact owner readbacks remain stable. Its
+hash/count-only result authorizes only a future local dispatch-reservation CAS,
+must be recomputed immediately before that write, and carries no provider
+authority. Missing, malformed, conflicting, restored, foreign-owner, partial,
+scratch, unsafe-filesystem, or nonterminal surrounding evidence fails closed.
+The curated rename/delete routes remain planning-only until independently
+reviewed dispatch, provider, and recovery boundaries are composed.
 
 ## External Service Bridge
 

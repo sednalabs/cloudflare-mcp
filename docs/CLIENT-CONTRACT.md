@@ -546,6 +546,20 @@ target, reason, plan, consent, identity, restored bytes, or unsafe filesystem
 evidence fails closed. This internal Prepared product has no public route and
 cannot dispatch, read provider state, finalize, recover, or authorize retry.
 
+The internal owner-aware complete-audit product is the next read-only boundary.
+It preserves the global rule that any unresolved attempt blocks clean
+target-wide authority, while deriving a narrower authorization for exactly one
+canonical Prepared owner and no other unresolved custody. The exact physical
+Prepared bytes and all three Bound claimant bytes must match the current typed
+target, plan, consent/version, and opaque-identity product; the complete stable
+audit must contain only terminal surrounding attempts. The result exposes only
+hashes, counts, closed phases, and a `dispatch_reservation_only` scope, with
+zero local/provider mutations and `provider_dispatch_authority=none`. It must
+be recomputed and exactly compared immediately before a later owner performs
+the local Prepared-to-DispatchReserved CAS. It is not routed publicly and does
+not perform or authorize provider dispatch, recovery, terminalization, retry,
+deployment, or configuration changes.
+
 `prepared -> dispatch_reserved` returns only a non-authorizing atomic-CAS
 proposal. Its receipt sets `dispatch_atomic_compare_exchange_required=true` and
 binds the exact expected prior-state and successor-state SHA-256 values. Calling

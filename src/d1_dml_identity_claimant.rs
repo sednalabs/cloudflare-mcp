@@ -96,6 +96,10 @@ pub(crate) struct D1DmlIdentityClaimantSet {
 }
 
 impl D1DmlIdentityClaimantSet {
+    pub(crate) fn claimant_set_sha256(&self) -> &str {
+        &self.claimant_set_sha256
+    }
+
     pub(crate) fn identity_sha256(&self, namespace: D1DmlIdentityNamespace) -> &str {
         self.identities
             .iter()

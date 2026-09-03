@@ -36,6 +36,8 @@ pub(crate) mod d1_reserved_relation_graph;
 pub(crate) mod d1_target;
 pub(crate) mod d1_target_wide_attempt_custody;
 pub(crate) mod d1_target_wide_mutation;
+#[allow(dead_code)] // staged local authorization; dispatch reservation is a separate boundary
+pub(crate) mod d1_target_wide_owner_audit;
 pub mod dns_route;
 pub mod mutation;
 pub(crate) mod pages_deploy;
