@@ -759,32 +759,7 @@ fn read_optional_external(root: &ExternalSealRoot, name: &str) -> Result<Option<
     root.revalidate()?;
     match open_external_relative(root, name, libc::O_RDONLY) {
         Ok(file) => {
-            let metadata = file.metadata().map_err(|_| {
-                error(
-                    "d1.dml_custody_external_artifact_invalid",
-                    "external artifact metadata was unavailable",
-                )
-            })?;
-            if !private_regular_file(&metadata) || metadata.nlink() != 1 {
-                return Err(error(
-                    "d1.dml_custody_external_artifact_invalid",
-                    "external artifact was not one private single-link regular file",
-                ));
-            }
-            let mut bytes = Vec::new();
-            let mut reader = &file;
-            std::io::Read::read_to_end(&mut reader, &mut bytes).map_err(|_| {
-                error(
-                    "d1.dml_custody_external_artifact_invalid",
-                    "external artifact could not be read",
-                )
-            })?;
-            if bytes.len() as u64 > MAX_EXTERNAL_SEAL_ARTIFACT_BYTES {
-                return Err(error(
-                    "d1.dml_custody_external_artifact_invalid",
-                    "external artifact exceeded its bounded size",
-                ));
-            }
+            let bytes = read_external_file_exact(&file)?;
             root.revalidate()?;
             Ok(Some(bytes))
         }
@@ -803,6 +778,12 @@ fn read_required_external(root: &ExternalSealRoot, name: &str) -> Result<Vec<u8>
             "external artifact could not be opened relative to the held seal root",
         )
     })?;
+    let bytes = read_external_file_exact(&file)?;
+    root.revalidate()?;
+    Ok(bytes)
+}
+
+fn read_external_file_exact(file: &File) -> Result<Vec<u8>, Value> {
     let metadata = file.metadata().map_err(|_| {
         error(
             "d1.dml_custody_external_artifact_invalid",
@@ -815,21 +796,32 @@ fn read_required_external(root: &ExternalSealRoot, name: &str) -> Result<Vec<u8>
             "external artifact was not one private single-link regular file",
         ));
     }
+    let identity = file_identity(&metadata);
+    let expected_len = metadata.len();
     let mut bytes = Vec::new();
-    let mut reader = &file;
+    let mut reader = file;
     std::io::Read::read_to_end(&mut reader, &mut bytes).map_err(|_| {
         error(
             "d1.dml_custody_external_artifact_invalid",
             "external artifact could not be read",
         )
     })?;
-    if bytes.len() as u64 > MAX_EXTERNAL_SEAL_ARTIFACT_BYTES {
+    let final_metadata = file.metadata().map_err(|_| {
+        error(
+            "d1.dml_custody_external_artifact_invalid",
+            "external artifact metadata changed during read",
+        )
+    })?;
+    if file_identity(&final_metadata) != identity
+        || final_metadata.len() != expected_len
+        || bytes.len() as u64 != expected_len
+        || bytes.len() as u64 > MAX_EXTERNAL_SEAL_ARTIFACT_BYTES
+    {
         return Err(error(
             "d1.dml_custody_external_artifact_invalid",
-            "external artifact exceeded its bounded size",
+            "external artifact changed during exact readback",
         ));
     }
-    root.revalidate()?;
     Ok(bytes)
 }
 
