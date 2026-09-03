@@ -1527,7 +1527,6 @@ fn preserve_observed_provider_calls(
     mut result: CallToolResult,
     observed_provider_calls: u64,
 ) -> CallToolResult {
-    let mut updated = false;
     if let Some(Value::Object(content)) = result.structured_content.as_mut() {
         let incumbent = content
             .get("provider_calls")
@@ -1535,18 +1534,16 @@ fn preserve_observed_provider_calls(
             .unwrap_or(0);
         if incumbent < observed_provider_calls {
             content.insert("provider_calls".to_string(), json!(observed_provider_calls));
-            updated = true;
         }
     }
-    if updated {
-        synchronize_tool_text_with_structured_content(result)
-    } else {
-        result
-    }
+    result
 }
 
-fn synchronize_tool_text_with_structured_content(mut result: CallToolResult) -> CallToolResult {
-    if let Some(payload) = result.structured_content.as_ref() {
+fn synchronize_tool_text_with_structured_content(
+    mut result: CallToolResult,
+    synchronize_single_text: bool,
+) -> CallToolResult {
+    if synchronize_single_text && let Some(payload) = result.structured_content.as_ref() {
         result.content = vec![ContentBlock::text(payload.to_string())];
     }
     result
@@ -14078,6 +14075,9 @@ fn finalize_mutation_result(
     audit: MutationAuditSession,
     dry_run: bool,
 ) -> CallToolResult {
+    let synchronize_single_text = result.structured_content.is_some()
+        && result.content.len() == 1
+        && result.content[0].as_text().is_some();
     let inferred_error = result
         .structured_content
         .as_ref()
@@ -14121,7 +14121,7 @@ fn finalize_mutation_result(
 
     result.is_error = Some(is_error);
     result.structured_content = Some(payload);
-    result
+    synchronize_tool_text_with_structured_content(result, synchronize_single_text)
 }
 
 fn finalize_d1_target_wide_mutation_result(
@@ -14150,12 +14150,7 @@ fn finalize_d1_target_wide_mutation_result(
         }
         object.insert("execution_evidence".to_string(), json!(execution_evidence));
     }
-    synchronize_tool_text_with_structured_content(finalize_mutation_result(
-        result,
-        &intended_plan.plan,
-        audit,
-        dry_run,
-    ))
+    finalize_mutation_result(result, &intended_plan.plan, audit, dry_run)
 }
 
 fn d1_target_wide_confirmation_required_result(operation: &str) -> CallToolResult {
@@ -14238,7 +14233,7 @@ mod tests {
     use mcp_toolkit_testing::assert_tool_schema_snapshot;
     use rmcp::handler::server::tool::Extension;
     use rmcp::handler::server::wrapper::Parameters;
-    use rmcp::model::CallToolResult;
+    use rmcp::model::{CallToolResult, ContentBlock};
     use rmcp::transport::streamable_http_server::session::local::{
         LocalSessionManager, SessionConfig,
     };
@@ -14254,12 +14249,13 @@ mod tests {
         D1InspectSchemaArgs, D1ListDatabasesArgs, D1MigrationManifestEntry, D1QueryArgs,
         D1ReconcileMigrationManifestArgs, D1ValidateQueryArgs, EmergencyUnpublishArgs,
         EnsureTunnelArgs, FindToolsArgs, GenerateTunnelIngressArgs, GraphqlAnalyticsQueryArgs,
-        LockFirstPublishArgs, MAX_D1_MIGRATION_MANIFEST_BYTES, PagesDeploymentActionArgs,
-        PagesUpdateProjectArgs, PatchWorkerSettingsArgs, PortalAgentRequestArgs, QueueHealthArgs,
-        UpsertAccessAppArgs, UpsertDnsCnameArgs, VerifyHttpGateArgs, WafEventFilterInput,
-        WafSecurityEventsSummaryArgs, WafTimeWindow, WorkersObservabilityListKeysArgs,
-        WorkersObservabilityListValuesArgs, WorkersObservabilityQueryEventsArgs,
-        WorkersObservabilityTimeframe, WorkersUploadScriptArgs, build_waf_security_events_query,
+        LockFirstPublishArgs, MAX_D1_MIGRATION_MANIFEST_BYTES, MutationAuditSession, MutationPlan,
+        PagesDeploymentActionArgs, PagesUpdateProjectArgs, PatchWorkerSettingsArgs,
+        PortalAgentRequestArgs, QueueHealthArgs, UpsertAccessAppArgs, UpsertDnsCnameArgs,
+        VerifyHttpGateArgs, WafEventFilterInput, WafSecurityEventsSummaryArgs, WafTimeWindow,
+        WorkersObservabilityListKeysArgs, WorkersObservabilityListValuesArgs,
+        WorkersObservabilityQueryEventsArgs, WorkersObservabilityTimeframe,
+        WorkersUploadScriptArgs, build_waf_security_events_query, finalize_mutation_result,
         normalize_waf_group_by, normalize_waf_phases, preserve_observed_provider_calls,
         query_mentions_waf, waf_security_events_filter,
     };
@@ -14472,13 +14468,35 @@ mod tests {
     }
 
     #[test]
-    fn observed_provider_call_update_rebuilds_rmcp_text_from_structured_content() {
-        let result = preserve_observed_provider_calls(
+    fn observed_provider_call_update_waits_for_outer_mutation_finalization() {
+        let preserved = preserve_observed_provider_calls(
             CallToolResult::structured_error(json!({
                 "ok": false,
                 "provider_calls": 1,
             })),
             2,
+        );
+        let preserved_text = serde_json::to_value(&preserved.content[0])
+            .expect("serialize preserved RMCP text content")["text"]
+            .as_str()
+            .expect("preserved RMCP content is text JSON")
+            .to_string();
+        assert_eq!(
+            serde_json::from_str::<Value>(&preserved_text).expect("parse preserved RMCP text JSON"),
+            json!({"ok": false, "provider_calls": 1}),
+            "the inner evidence helper must not synchronize outer text"
+        );
+
+        let result = finalize_mutation_result(
+            preserved,
+            &MutationPlan::new("d1_apply_migration_manifest"),
+            MutationAuditSession::start(
+                None,
+                "d1_apply_migration_manifest",
+                json!({"target": "fixture"}),
+                false,
+            ),
+            false,
         );
         let structured = result
             .structured_content
@@ -14495,6 +14513,111 @@ mod tests {
             *structured
         );
         assert_eq!(result.is_error, Some(true));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn manifest_revalidation_failure_uses_provider_update_then_outer_finalization() {
+        let root = d1_migration_test_dir("manifest-revalidation-finalization");
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .expect("make lease root private");
+        prepare_complete_dml_custody_test_root(&root);
+
+        let mut lease = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &"a".repeat(64),
+        )
+        .expect("acquire manifest lease");
+        let active = lease.active_path_for_test().expect("active lease pathname");
+        fs::rename(&active, active.with_extension("displaced"))
+            .expect("displace active lease before outer revalidation");
+
+        let revalidation = lease
+            .revalidate()
+            .expect_err("displaced active lease must fail revalidation");
+        let result = finalize_mutation_result(
+            preserve_observed_provider_calls(revalidation, 2),
+            &MutationPlan::new("d1_apply_migration_manifest"),
+            MutationAuditSession::start(
+                None,
+                "d1_apply_migration_manifest",
+                json!({"target": "fixture"}),
+                false,
+            ),
+            false,
+        );
+        let structured = result
+            .structured_content
+            .as_ref()
+            .expect("finalized revalidation receipt");
+        let serialized_content = serde_json::to_value(&result.content[0])
+            .expect("serialize finalized RMCP text content");
+        let text = serialized_content["text"]
+            .as_str()
+            .expect("finalized RMCP content is text JSON");
+        assert_eq!(structured["provider_calls"], json!(2));
+        assert_eq!(
+            structured["error"]["code"],
+            json!("d1.migration_lease_revalidation_failed")
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(text).expect("parse finalized RMCP text JSON"),
+            *structured,
+            "outer finalization must synchronize the fully augmented revalidation receipt"
+        );
+
+        lease.retain();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mutation_finalization_preserves_nonstructured_and_multi_content_results() {
+        let nonstructured = CallToolResult::success(vec![ContentBlock::text("plain result")]);
+        let original_nonstructured = serde_json::to_value(&nonstructured.content)
+            .expect("serialize original nonstructured content");
+        let finalized_nonstructured = finalize_mutation_result(
+            nonstructured,
+            &MutationPlan::new("test_nonstructured"),
+            MutationAuditSession::start(
+                None,
+                "test_nonstructured",
+                json!({"target": "fixture"}),
+                false,
+            ),
+            false,
+        );
+        assert_eq!(
+            serde_json::to_value(&finalized_nonstructured.content)
+                .expect("serialize finalized nonstructured content"),
+            original_nonstructured,
+            "finalization must not overwrite framework-owned nonstructured content"
+        );
+
+        let mut multi = CallToolResult::structured(json!({"ok": true, "phase": "inner"}));
+        multi.content.push(ContentBlock::text("secondary evidence"));
+        let original_multi =
+            serde_json::to_value(&multi.content).expect("serialize original multi-content result");
+        let finalized_multi = finalize_mutation_result(
+            multi,
+            &MutationPlan::new("test_multi_content"),
+            MutationAuditSession::start(
+                None,
+                "test_multi_content",
+                json!({"target": "fixture"}),
+                false,
+            ),
+            false,
+        );
+        assert_eq!(
+            serde_json::to_value(&finalized_multi.content)
+                .expect("serialize finalized multi-content result"),
+            original_multi,
+            "finalization must preserve multi-content response shape"
+        );
     }
 
     #[tokio::test]

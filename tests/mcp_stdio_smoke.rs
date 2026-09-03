@@ -1596,6 +1596,62 @@ fn spawn_manifest_authority_schedule_api_for_table(
     (format!("http://{addr}"), requests)
 }
 
+fn spawn_blocked_manifest_acquisition_api() -> (
+    String,
+    Arc<Mutex<Vec<Value>>>,
+    mpsc::Receiver<()>,
+    mpsc::Sender<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind blocked acquisition D1 API");
+    let addr = listener
+        .local_addr()
+        .expect("blocked acquisition D1 address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    thread::spawn(move || {
+        for request_index in 0..3 {
+            let mut stream = listener
+                .accept()
+                .expect("accept blocked acquisition request")
+                .0;
+            let (headers, body) = read_http_request(&mut stream);
+            assert!(headers.starts_with(
+                "POST /accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+            ));
+            let body_json: Value =
+                serde_json::from_slice(&body).expect("blocked acquisition request JSON");
+            let sql = body_json["sql"].as_str().unwrap_or_default();
+            requests_for_thread
+                .lock()
+                .expect("blocked acquisition request log")
+                .push(body_json.clone());
+            if request_index == 2 {
+                entered_tx
+                    .send(())
+                    .expect("notify before manifest lease acquisition");
+                resume_rx
+                    .recv()
+                    .expect("release blocked acquisition authority response");
+            }
+            let response = serde_json::to_vec(&if is_manifest_ledger_authority_sql(&sql) {
+                manifest_ledger_authority_response("d1_migrations")
+            } else {
+                assert_eq!(sql, "SELECT * FROM \"d1_migrations\" ORDER BY id");
+                manifest_ledger_response(vec![json!({"id": 1, "name": "0001_initial.sql"})])
+            })
+            .expect("serialize blocked acquisition response");
+            write!(stream, "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n", response.len())
+                .expect("write blocked acquisition response headers");
+            stream
+                .write_all(&response)
+                .expect("write blocked acquisition response");
+        }
+    });
+    (format!("http://{addr}"), requests, entered_rx, resume_tx)
+}
+
 fn spawn_blocked_manifest_preflight_api() -> (
     String,
     Arc<Mutex<Vec<Value>>>,
@@ -10181,29 +10237,8 @@ fn d1_apply_migration_manifest_preserves_prelease_provider_calls_when_activation
         }),
     );
     let content = structured_content(&live);
-    let text_payload: Value = serde_json::from_str(
-        live["result"]["content"][0]["text"]
-            .as_str()
-            .expect("activation failure text payload"),
-    )
-    .expect("decode activation failure text payload");
-    assert_eq!(
-        text_payload,
-        json!({
-            "error": {
-                "code": "d1.migration_lease_upgrade_activation_required",
-                "hint": "Stop predecessor writers, preserve and reconcile the old root separately, then configure every upgraded writer to one new private empty lease root. Do not create the activation marker manually.",
-                "message": "unversioned root contains custody evidence; activate this contract only on a fresh empty root",
-            },
-            "lease_retained": null,
-            "ok": false,
-            "operation": "d1_apply_migration_manifest",
-            "provider_calls": 2,
-            "provider_mutations": 0,
-            "status": "blocked",
-        }),
-        "the text payload must preserve the same physical provider-call count"
-    );
+    assert_eq!(content["provider_calls"], json!(2));
+    assert_tool_text_matches_structured(&live);
     let mut normalized = content.clone();
     let audit = normalized["audit"]
         .as_object_mut()
@@ -10325,6 +10360,102 @@ fn d1_apply_migration_manifest_preserves_prelease_provider_calls_when_activation
         "activation failure must not issue a provider mutation"
     );
     mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[cfg(unix)]
+#[test]
+fn d1_apply_migration_manifest_preserves_prelease_provider_calls_when_acquisition_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (base_url, requests, entered, resume) = spawn_blocked_manifest_acquisition_api();
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-manifest-acquisition-provider-count-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create lease root");
+    fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+        .expect("make lease root private");
+
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let first_sql = "CREATE TABLE submissions(id TEXT);";
+    let second_sql = "ALTER TABLE submissions ADD COLUMN status TEXT;";
+    let manifest = json!([
+        {"name": "0001_initial.sql", "size_bytes": first_sql.len(), "sql_sha256": sha256_hex(first_sql), "sql": first_sql},
+        {"name": "0002_second.sql", "size_bytes": second_sql.len(), "sql_sha256": sha256_hex(second_sql), "sql": second_sql}
+    ]);
+    let dry = mcp.call_tool(
+        1852,
+        "d1_apply_migration_manifest",
+        json!({
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "migration_family": "newsletter-core",
+            "dry_run": true,
+            "manifest": manifest.clone(),
+        }),
+    );
+    let plan = structured_content(&dry)["plan_sha256"]
+        .as_str()
+        .expect("plan digest")
+        .to_string();
+    mcp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1853,
+        "method": "tools/call",
+        "params": {
+            "name": "d1_apply_migration_manifest",
+            "arguments": {
+                "database_id": "123e4567-e89b-42d3-a456-426614174000",
+                "migration_family": "newsletter-core",
+                "manifest": manifest,
+                "approved_plan_sha256": plan,
+            }
+        }
+    }));
+    entered
+        .recv_timeout(Duration::from_secs(10))
+        .expect("live call completed both authority reads before acquisition");
+
+    let guard_path = manifest_target_path(&lease_root).join("guard.lock");
+    let guard = fs::File::options()
+        .read(true)
+        .write(true)
+        .open(&guard_path)
+        .expect("open manifest target guard");
+    guard
+        .lock()
+        .expect("hold manifest target guard before acquisition");
+    resume
+        .send(())
+        .expect("release final authority response into acquisition");
+
+    let live = mcp.response(1853);
+    let content = structured_content(&live);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["provider_calls"], json!(2), "{content}");
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.migration_target_guard_locked")
+    );
+    assert_tool_text_matches_structured(&live);
+    let observed = requests.lock().expect("request log").clone();
+    assert_eq!(observed.len(), 3, "one dry plus two live authority reads");
+    assert!(
+        observed.iter().all(|request| !request["sql"]
+            .as_str()
+            .is_some_and(|sql| sql.contains("INSERT INTO \"d1_migrations\""))),
+        "acquisition failure must not issue a provider mutation"
+    );
+
+    mcp.terminate();
+    drop(guard);
     let _ = fs::remove_dir_all(lease_root);
 }
 

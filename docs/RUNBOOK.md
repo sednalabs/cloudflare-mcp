@@ -386,28 +386,33 @@ cannot reconcile or retire bootstrap-family custody.
 ### Shared existing-target mutation guard
 
 Configure `CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT` for every MCP process that
-can run curated D1 rename, delete, row-write, bootstrap, or manifest mutation.
+can run curated D1 row-write, bootstrap, or manifest mutation, and for every
+future process that will execute a governed target-wide rename/delete lifecycle.
 The name is retained for compatibility, but the directory is now the shared
-account/database target-guard root. Rename, delete and row-write acquire the
-same permanent `guard.lock` as bootstrap and manifest apply immediately before
-provider dispatch. A same-target contention or retained active/retiring lease
-is a stop condition; a different database target is independent. A guard
-failure reports the invoked curated tool as its operation and zero provider
-calls/mutations; preserve that caller-correlated receipt when diagnosing the
-contention.
+account/database target-guard root. The active `d1_execute_write` MCP path
+acquires the same permanent `guard.lock` as bootstrap and manifest apply
+immediately before provider dispatch. A same-target contention or retained
+active/retiring lease is a stop condition; a different database target is
+independent. A guard failure reports the invoked active curated tool as its
+operation and zero provider calls/mutations; preserve that caller-correlated
+receipt when diagnosing the contention.
 
-Fresh rename, delete, manifest, and bootstrap acquisition may create only the
-fixed empty `dml-custody-v1` layout, under the already-held permanent target
-guard and before any complete-audit authorization. Rename/delete previews show
-the complete static live skeleton, recording `ensure_d1_dml_custody_layout` as
+Fresh row-write, manifest, and bootstrap acquisition may create only the fixed
+empty `dml-custody-v1` layout, under the already-held permanent target guard
+and before any complete-audit authorization. Governed MCP rename/delete remain
+six-step planning-only tools: their previews record
+`ensure_d1_dml_custody_layout` as
 `create_if_absent_at_live_guarded_execution`, `local_custody_only`, and
-`provider_dispatch_authority=none`, followed by complete audit, final exact
-revalidation, and the provider request last. The returned
+`provider_dispatch_authority=none`; step 5 is not installed, so it blocks step
+6 and no provider request is dispatched. The returned
 `intended_plan_sha256` is stable across matching dry/live calls; runtime custody
 facts appear only in `execution_evidence`. An existing layout must validate
-exactly; these paths do not replace, flatten, or repair hostile or partial
-evidence. If audit or revalidation fails after ensure, the error preserves the
-observed local outcome while proving zero provider dispatch.
+exactly; active guarded paths do not replace, flatten, or repair hostile or
+partial evidence. If audit or revalidation fails after an active ensure, the
+error preserves the observed local outcome while proving zero provider
+dispatch. The lower-level Cloudflare client adapter remains distinct: it can
+issue direct rename/delete provider requests for internal callers, but that is
+not the governed MCP lifecycle and does not bypass the MCP planning-only stop.
 Retained-evidence reconciliation, terminal receipt persistence, rollback
 restoration, and retirement require the layout to remain present and exact;
 absence is evidence loss, not an empty/default state, and those paths create
