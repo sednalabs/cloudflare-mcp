@@ -1,5 +1,5 @@
 use std::cmp;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt;
 use std::future::Future;
 use std::io::Write;
@@ -641,7 +641,7 @@ struct StrictD1DatabaseDeleteEnvelope {
     messages: Vec<StrictD1DatabaseMutationResponseInfo>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq, Eq, Hash)]
 #[serde(deny_unknown_fields)]
 struct StrictD1DatabaseMutationResponseInfo {
     code: Number,
@@ -661,7 +661,7 @@ struct StrictD1DatabaseMutationResponseInfo {
     _source: Option<StrictD1DatabaseMutationResponseInfoSource>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, PartialEq, Eq, Hash)]
 #[serde(deny_unknown_fields)]
 struct StrictD1DatabaseMutationResponseInfoSource {
     #[serde(
@@ -4446,13 +4446,25 @@ where
             ));
         }
     }
+    for message in &messages {
+        if !message.code.as_u64().is_some_and(|code| code >= 1000) {
+            return Err(AdapterError::new(
+                "cloudflare.d1.database_mutation_malformed_envelope",
+                "Cloudflare D1 database mutation envelope contained an invalid message code",
+                "Treat the database mutation outcome as ambiguous; do not retry this attempt.",
+            ));
+        }
+    }
+    // The complete body is capped before decoding, so this reference set is
+    // bounded without imposing a new provider-visible maximum item count.
+    let mut unique_messages = HashSet::with_capacity(messages.len());
     if messages
         .iter()
-        .any(|message| !message.code.as_f64().is_some_and(|code| code >= 1000.0))
+        .any(|message| !unique_messages.insert(message))
     {
         return Err(AdapterError::new(
             "cloudflare.d1.database_mutation_malformed_envelope",
-            "Cloudflare D1 database mutation envelope contained an invalid message code",
+            "Cloudflare D1 database mutation envelope contained duplicate messages",
             "Treat the database mutation outcome as ambiguous; do not retry this attempt.",
         ));
     }
@@ -5783,6 +5795,36 @@ mod tests {
                 malformed_code,
             ),
             (
+                "message-integral-decimal-code",
+                envelope(
+                    "true",
+                    exact_result,
+                    exact_errors,
+                    r#"[{"code":1000.0,"message":"must-not-return"}]"#,
+                ),
+                malformed_code,
+            ),
+            (
+                "message-fractional-code",
+                envelope(
+                    "true",
+                    exact_result,
+                    exact_errors,
+                    r#"[{"code":1000.5,"message":"must-not-return"}]"#,
+                ),
+                malformed_code,
+            ),
+            (
+                "message-rounding-edge-decimal-code",
+                envelope(
+                    "true",
+                    exact_result,
+                    exact_errors,
+                    r#"[{"code":9007199254740993.0,"message":"must-not-return"}]"#,
+                ),
+                malformed_code,
+            ),
+            (
                 "message-code-below-floor",
                 envelope(
                     "true",
@@ -5894,6 +5936,16 @@ mod tests {
                     exact_result,
                     exact_errors,
                     r#"[{"code":1000,"message":"must-not-return","detail":"hidden"}]"#,
+                ),
+                malformed_code,
+            ),
+            (
+                "duplicate-equal-messages-with-reordered-properties",
+                envelope(
+                    "true",
+                    exact_result,
+                    exact_errors,
+                    r#"[{"code":1000,"message":"must-not-return","documentation_url":"https://example.invalid/info","source":{"pointer":"/result/name"}},{"source":{"pointer":"/result/name"},"documentation_url":"https://example.invalid/info","message":"must-not-return","code":1000}]"#,
                 ),
                 malformed_code,
             ),
@@ -6327,7 +6379,7 @@ mod tests {
             TestD1DatabaseMutation::Delete,
         ] {
             let body = format!(
-                r#"{{"success":true,"result":{},"errors":[],"messages":[{{"code":1000,"message":"informational"}},{{"code":1000.5,"message":"documented","documentation_url":"https://example.invalid/info","source":{{}}}},{{"code":1002,"message":"pointed","source":{{"pointer":"/result/name"}}}}]}}"#,
+                r#"{{"success":true,"result":{},"errors":[],"messages":[{{"code":1000,"message":"informational"}},{{"code":18446744073709551615,"message":"high unsigned integer"}},{{"code":1000,"message":"informational","source":{{}}}},{{"code":1002,"message":"pointed","documentation_url":"https://example.invalid/info","source":{{"pointer":"/result/name"}}}}]}}"#,
                 operation.exact_result_json()
             );
             let (base, calls) = spawn_single_raw_d1_database_mutation_response(Some(

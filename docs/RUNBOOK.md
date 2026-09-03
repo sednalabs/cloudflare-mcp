@@ -155,12 +155,14 @@ count; response stages include only aggregate-safe body state and optional HTTP
 status. No such failure is retried. Immediate success requires one bounded,
 duplicate-free exact Cloudflare operation envelope with literal `success=true`,
 an exact empty `errors` array, and a required `messages` array. Every empty or
-nonempty message must be an exact ResponseInfo object: numeric `code >= 1000`,
-string `message`, optional string `documentation_url`, and optional exact
-`source` object containing only an optional string `pointer`. Rename also
-requires a non-null `result` that decodes as a D1 database. Delete permits an
+nonempty message must be a unique exact ResponseInfo object: JSON unsigned
+integer `code >= 1000`, string `message`, optional string `documentation_url`,
+and optional exact `source` object containing only an optional string `pointer`.
+Semantic duplicates are rejected regardless of object property order. Rename
+also requires a non-null `result` that decodes as a D1 database. Delete permits an
 absent or null result and normalizes either to `{}`; any present non-null JSON
-result is preserved. Missing, null, wrong-type, unknown, duplicate, overdeep,
+result is accepted and returned through the existing `serde_json::Value`
+interface. Missing, null, wrong-type, unknown, duplicate, overdeep,
 contradictory, or structurally invalid envelope evidence remains one dispatched
 call with an unknown mutation; it never becomes confirmed application evidence.
 Only the complete operation-specific product is `succeeded` with one call and

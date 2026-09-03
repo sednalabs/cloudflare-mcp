@@ -18984,6 +18984,18 @@ fn d1_target_wide_database_mutations_keep_strict_envelope_failures_uncertain_and
             "cloudflare.d1.database_mutation_malformed_envelope",
             &["rename", "delete"][..],
         ),
+        (
+            "decimal-response-info-code",
+            br#"{"success":true,"result":{"name":"renamed-db"},"errors":[],"messages":[{"code":1000.0,"message":"must-not-return"}]}"#.as_slice(),
+            "cloudflare.d1.database_mutation_malformed_envelope",
+            &["rename", "delete"][..],
+        ),
+        (
+            "duplicate-equal-response-info",
+            br#"{"success":true,"result":{"name":"renamed-db"},"errors":[],"messages":[{"code":1000,"message":"must-not-return","source":{"pointer":"/result/name"}},{"source":{"pointer":"/result/name"},"message":"must-not-return","code":1000}]}"#.as_slice(),
+            "cloudflare.d1.database_mutation_malformed_envelope",
+            &["rename", "delete"][..],
+        ),
     ];
     for (case, response_body, expected_code, operations) in cases {
         for operation in operations {
@@ -19095,13 +19107,13 @@ fn d1_target_wide_database_mutations_accept_valid_messages_and_operation_specifi
         (
             "rename-valid-message",
             "rename",
-            br#"{"success":true,"result":{"name":"renamed-db"},"errors":[],"messages":[{"code":1000,"message":"informational","documentation_url":"https://example.invalid/info","source":{"pointer":"/result/name"}}]}"#.as_slice(),
+            br#"{"success":true,"result":{"name":"renamed-db"},"errors":[],"messages":[{"code":1000,"message":"informational"},{"code":18446744073709551615,"message":"high unsigned integer"},{"source":{},"message":"informational","code":1000},{"code":1002,"message":"pointed","documentation_url":"https://example.invalid/info","source":{"pointer":"/result/name"}}]}"#.as_slice(),
             json!("renamed-db"),
         ),
         (
             "delete-absent-result-valid-message",
             "delete",
-            br#"{"success":true,"errors":[],"messages":[{"code":1000,"message":"informational","source":{}}]}"#.as_slice(),
+            br#"{"success":true,"errors":[],"messages":[{"code":1000,"message":"informational"},{"code":18446744073709551615,"message":"high unsigned integer"},{"source":{},"message":"informational","code":1000}]}"#.as_slice(),
             json!({}),
         ),
     ];

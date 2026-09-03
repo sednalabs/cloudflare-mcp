@@ -200,10 +200,13 @@ are added by the graph derivation.
    The client performs one no-redirect attempt and never retries an ambiguous
    rename/delete. Confirmed application requires a bounded duplicate-free exact
    operation envelope with literal `success=true`, exact empty `errors`, and a
-   required `messages` array whose empty or nonempty members are exact valid
-   ResponseInfo objects. Rename requires a non-null D1-database `result`.
-   Delete accepts absent or null result as `{}` and preserves any present
-   non-null JSON value. Missing, null, wrong-type, unknown, duplicate, overdeep,
+   required `messages` array whose empty or nonempty members are unique exact
+   ResponseInfo objects with unsigned-integer codes of at least 1000; semantic
+   duplicates are rejected regardless of property order. Rename requires a
+   non-null D1-database `result`. Delete accepts absent or null result as `{}`
+   and accepts and returns any present non-null JSON value through its existing
+   `serde_json::Value` interface. Missing, null, wrong-type, unknown, duplicate,
+   overdeep,
    contradictory, or structurally invalid evidence remains uncertain after the
    one call; only the complete operation-specific product reports one call and
    one mutation. The serialized receipt
