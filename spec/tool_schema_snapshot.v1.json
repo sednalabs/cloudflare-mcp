@@ -1694,7 +1694,7 @@
       "name": "d1_bootstrap_migration_ledger"
     },
     {
-      "description": "Plan a Cloudflare D1 database delete with exact plan-bound consent. Live execution remains disabled until durable reservation and recovery custody is installed.",
+      "description": "Plan or execute one guarded Cloudflare D1 database delete. Live execution binds exact consent and three opaque identities, reserves at most one provider request, and ends in nonterminal acknowledgement or reconciliation custody without automatic retry.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,
@@ -1720,6 +1720,15 @@
             "default": false,
             "type": "boolean"
           },
+          "execution_attempt_id": {
+            "type": "string"
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "provider_request_id": {
+            "type": "string"
+          },
           "reason": {
             "default": null,
             "type": [
@@ -1729,7 +1738,10 @@
           }
         },
         "required": [
-          "database_id"
+          "database_id",
+          "operation_id",
+          "execution_attempt_id",
+          "provider_request_id"
         ],
         "type": "object"
       },
@@ -2707,7 +2719,7 @@
       "name": "d1_reconcile_migration_manifest"
     },
     {
-      "description": "Plan a Cloudflare D1 database rename with exact plan-bound consent. Live execution remains disabled until durable reservation and recovery custody is installed.",
+      "description": "Plan or execute one guarded Cloudflare D1 database rename. Live execution binds exact consent and three opaque identities, reserves at most one provider request, and ends in nonterminal acknowledgement or reconciliation custody without automatic retry.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,
@@ -2733,7 +2745,16 @@
             "default": false,
             "type": "boolean"
           },
+          "execution_attempt_id": {
+            "type": "string"
+          },
           "name": {
+            "type": "string"
+          },
+          "operation_id": {
+            "type": "string"
+          },
+          "provider_request_id": {
             "type": "string"
           },
           "reason": {
@@ -2746,7 +2767,10 @@
         },
         "required": [
           "database_id",
-          "name"
+          "name",
+          "operation_id",
+          "execution_attempt_id",
+          "provider_request_id"
         ],
         "type": "object"
       },
