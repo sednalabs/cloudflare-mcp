@@ -112,7 +112,7 @@ pub(crate) fn d1_target_wide_intended_plan(
             }),
         )
         .step(provider_action, true, provider_request);
-    let plan_sha256 = plan_sha256(&plan);
+    let plan_sha256 = target_wide_plan_sha256(&plan);
     let consent_binding = D1TargetWideConsentBinding {
         consent_version: TARGET_WIDE_CONSENT_VERSION,
         operation,
@@ -130,7 +130,7 @@ pub(crate) fn d1_target_wide_intended_plan(
     }
 }
 
-fn plan_sha256(plan: &MutationPlan) -> String {
+pub(crate) fn target_wide_plan_sha256(plan: &MutationPlan) -> String {
     sha256_bytes_hex(
         &serde_json::to_vec(&json!({
             "version": TARGET_WIDE_PLAN_VERSION,

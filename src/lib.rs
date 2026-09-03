@@ -8,6 +8,7 @@ pub(crate) mod api_permissions;
 pub mod cache;
 pub mod cloudflare;
 pub mod config;
+pub(crate) mod d1_attempt_artifact;
 #[allow(dead_code)] // staged evidence boundary; provider dispatch and graph consumers are separate
 pub(crate) mod d1_catalog_evidence;
 #[allow(dead_code)] // staged pure custody; persistence and provider integration are separate
@@ -15,6 +16,7 @@ pub(crate) mod d1_dml_attempt_custody;
 pub(crate) mod d1_dml_classifier;
 pub(crate) mod d1_dml_custody_layout;
 pub(crate) mod d1_dml_identity_claimant;
+pub(crate) mod d1_dml_identity_reservation;
 #[allow(dead_code)] // staged pure product; route integration and mutation admission are separate
 pub(crate) mod d1_exact_plan_composition;
 pub(crate) mod d1_execute_write;
@@ -32,6 +34,7 @@ pub(crate) mod d1_opaque_identity;
 #[allow(dead_code)] // staged pure graph; DML composition is a later authority boundary
 pub(crate) mod d1_reserved_relation_graph;
 pub(crate) mod d1_target;
+pub(crate) mod d1_target_wide_attempt_custody;
 pub(crate) mod d1_target_wide_mutation;
 pub mod dns_route;
 pub mod mutation;

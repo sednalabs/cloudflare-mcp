@@ -531,6 +531,17 @@ versions, malformed digests, phase/evidence contradictions, and any target,
 plan, composition, or identity drift. There is no permissive predecessor
 fallback. Exact pre-dispatch replay returns the same canonical state.
 
+Target-wide rename/delete have a distinct internal version-1 Prepared product
+in the same private sharded custody layout. It accepts only the current exact
+static consent plan and matching confirmation token plus three pairwise-distinct
+opaque identifiers. Its aggregate receipt exposes hashes, phase, size/cap, and
+zero-effect counters only. The guarded local installer reuses the claimant
+capacity, create-once, CAS-seal, descriptor/path, and exact-readback primitives;
+an exact partial claimant set may converge, while changed intent, operation,
+target, reason, plan, consent, identity, restored bytes, or unsafe filesystem
+evidence fails closed. This internal Prepared product has no public route and
+cannot dispatch, read provider state, finalize, recover, or authorize retry.
+
 `prepared -> dispatch_reserved` returns only a non-authorizing atomic-CAS
 proposal. Its receipt sets `dispatch_atomic_compare_exchange_required=true` and
 binds the exact expected prior-state and successor-state SHA-256 values. Calling

@@ -205,6 +205,13 @@ are added by the graph derivation.
    and only then perform the provider rename or delete. The fifth step is
    explicitly `not_installed` and has no provider-dispatch authority, so the
    sixth step is currently unreachable through these tools.
+   A distinct internal target-wide Prepared product now binds the exact consent
+   token, full static plan, target/change/reason, and three hashed opaque
+   identities. It can converge an exact partial local claimant set and install
+   only create-once `Prepared` custody under the held target guard. It has no
+   public route or provider/readback effect and does not make step 5 complete;
+   owner-aware audit, dispatch reservation, provider execution, and recovery
+   remain required before either live tool can be enabled.
    Dry-run is the only enabled lifecycle: it returns the full plan,
    `intended_plan_sha256`, versioned `consent_binding`, confirmation token, and
    unobserved/not-installed/not-dispatched execution evidence with zero effects.

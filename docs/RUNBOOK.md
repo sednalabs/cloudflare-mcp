@@ -145,6 +145,20 @@ then dispatch the provider operation last. The reservation step explicitly
 reports `implementation_status=not_installed` and
 `provider_dispatch_authority=none`.
 
+The internal target-wide Prepared boundary is now implemented but is not yet
+routed from either curated tool. It hashes pairwise-distinct opaque operation,
+execution-attempt, and provider-request identifiers and binds them to the exact
+consent token, complete static plan, normalized target/change, and optional
+reason. Under the held target guard it reuses the fixed sharded layout and the
+three create-once claimant namespaces, converges an exact partial claimant set,
+seals the complete set to one attempt binding, and create-once installs only a
+canonical `Prepared` attempt. Exact replay returns the incumbent bytes; changed,
+cross-operation, malformed, noncanonical, unsafe, linked, or over-capacity
+evidence fails closed with zero provider calls. `Prepared` is not dispatch
+authority. The owner-aware complete-audit exception, `DispatchReserved`
+transition, provider request, and recovery/readback lifecycle remain separate
+required boundaries, so live rename/delete remain disabled.
+
 Every dry run returns the full plan, `intended_plan_sha256`, a versioned
 `consent_binding`, and `required_confirmation_token`. The consent binding
 contains the normalized account/database target, operation and operation

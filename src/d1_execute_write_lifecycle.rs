@@ -20,8 +20,7 @@ use crate::d1_dml_attempt_custody::{
 };
 use crate::d1_dml_classifier::classify_d1_dml;
 use crate::d1_dml_identity_claimant::{
-    D1DmlIdentityClaimantPhase, D1DmlIdentityClaimantSet, D1DmlIdentityNamespace,
-    derive_d1_dml_identity_claimant_set,
+    D1DmlIdentityClaimantSet, D1DmlIdentityNamespace, derive_d1_dml_identity_claimant_set,
 };
 use crate::d1_exact_plan_composition::compose_d1_exact_write_plan;
 use crate::d1_execute_write::{
@@ -492,70 +491,13 @@ fn install_pending_identity_claimants(
     guard: &D1TargetMutationGuard,
     set: &D1DmlIdentityClaimantSet,
 ) -> Result<(), CallToolResult> {
-    let mut incumbents = Vec::with_capacity(D1DmlIdentityNamespace::ALL.len());
-    for namespace in D1DmlIdentityNamespace::ALL {
-        let identity_sha256 = set.identity_sha256(namespace);
-        let incumbent = guard
-            .read_d1_dml_identity_claimant(namespace, identity_sha256)
-            .map_err(|_| {
-                identity_claimant_error(
-                    "d1.execute_write_identity_claimant_custody_unproven",
-                    "physical identity claimant presence could not be inspected exactly",
-                    "pre_catalog_claimant_inspection",
-                )
-            })?;
-        if let Some(bytes) = incumbent.as_deref() {
-            set.restore_exact(namespace, bytes).map_err(|error| {
-                identity_claimant_error(error.code, error.message, "pre_catalog_claimant_conflict")
-            })?;
-        }
-        incumbents.push((namespace, incumbent));
-    }
-
-    guard.preflight_d1_dml_identity_claimant_set_capacity(set)?;
-
-    for (namespace, incumbent) in incumbents {
-        if incumbent.is_none() {
-            let pending = set.pending(namespace);
-            guard
-                .create_d1_dml_identity_claimant(
-                    namespace,
-                    set.identity_sha256(namespace),
-                    pending.state_bytes(),
-                )
-                .map_err(|_| {
-                    identity_claimant_error(
-                        "d1.execute_write_identity_claimant_custody_unproven",
-                        "one deterministic Pending identity claimant could not be installed exactly",
-                        "pre_catalog_claimant_install",
-                    )
-                })?;
-        }
-    }
-
-    for namespace in D1DmlIdentityNamespace::ALL {
-        let identity_sha256 = set.identity_sha256(namespace);
-        let bytes = guard
-            .read_d1_dml_identity_claimant(namespace, identity_sha256)
-            .map_err(|_| {
-                identity_claimant_error(
-                    "d1.execute_write_identity_claimant_custody_unproven",
-                    "identity claimant set could not be reread after installation",
-                    "pre_catalog_claimant_readback",
-                )
-            })?
-            .ok_or_else(|| {
-                identity_claimant_error(
-                    "d1.execute_write_identity_claimant_custody_unproven",
-                    "one physically required identity claimant was absent after installation",
-                    "pre_catalog_claimant_readback",
-                )
-            })?;
-        set.restore_exact(namespace, &bytes).map_err(|error| {
-            identity_claimant_error(error.code, error.message, "pre_catalog_claimant_readback")
-        })?;
-    }
-    Ok(())
+    crate::d1_dml_identity_reservation::converge_pending_d1_dml_identity_claimants(
+        guard,
+        set,
+        |code, message, phase| {
+            identity_claimant_error(row_identity_claimant_code(code), message, phase)
+        },
+    )
 }
 
 fn seal_identity_claimants(
@@ -563,96 +505,24 @@ fn seal_identity_claimants(
     set: &D1DmlIdentityClaimantSet,
     attempt_binding_sha256: &str,
 ) -> Result<(), CallToolResult> {
-    let mut incumbents = Vec::with_capacity(D1DmlIdentityNamespace::ALL.len());
-    for namespace in D1DmlIdentityNamespace::ALL {
-        let identity_sha256 = set.identity_sha256(namespace);
-        let bytes = guard
-            .read_d1_dml_identity_claimant(namespace, identity_sha256)
-            .map_err(|_| {
-                identity_claimant_error(
-                    "d1.execute_write_identity_claimant_custody_unproven",
-                    "identity claimant could not be inspected before full-binding seal",
-                    "post_catalog_claimant_inspection",
-                )
-            })?
-            .ok_or_else(|| {
-                identity_claimant_error(
-                    "d1.execute_write_identity_claimant_custody_unproven",
-                    "one physically required identity claimant was absent before seal",
-                    "post_catalog_claimant_inspection",
-                )
-            })?;
-        let restored = set.restore_exact(namespace, &bytes).map_err(|error| {
-            identity_claimant_error(error.code, error.message, "post_catalog_claimant_conflict")
-        })?;
-        if restored.receipt().phase == D1DmlIdentityClaimantPhase::Bound
-            && restored.receipt().attempt_binding_sha256.as_deref() != Some(attempt_binding_sha256)
-        {
-            return Err(identity_claimant_error(
-                "d1.execute_write_identity_claimant_conflict",
-                "identity claimant was already sealed to a conflicting full attempt binding",
-                "post_catalog_claimant_conflict",
-            ));
-        }
-        incumbents.push((namespace, restored));
-    }
+    crate::d1_dml_identity_reservation::converge_bound_d1_dml_identity_claimants(
+        guard,
+        set,
+        attempt_binding_sha256,
+        |code, message, phase| {
+            identity_claimant_error(row_identity_claimant_code(code), message, phase)
+        },
+    )
+}
 
-    for (namespace, incumbent) in incumbents {
-        if incumbent.receipt().phase == D1DmlIdentityClaimantPhase::Pending {
-            let bound = set
-                .bound(namespace, attempt_binding_sha256)
-                .map_err(|error| {
-                    identity_claimant_error(error.code, error.message, "post_catalog_claimant_seal")
-                })?;
-            guard
-                .compare_exchange_d1_dml_identity_claimant(
-                    namespace,
-                    set.identity_sha256(namespace),
-                    incumbent.state_bytes(),
-                    bound.state_bytes(),
-                )
-                .map_err(|_| {
-                    identity_claimant_error(
-                        "d1.execute_write_identity_claimant_custody_unproven",
-                        "Pending identity claimant could not be atomically sealed",
-                        "post_catalog_claimant_seal",
-                    )
-                })?;
+fn row_identity_claimant_code(code: &str) -> &str {
+    match code {
+        "d1.dml_identity_claimant_custody_unproven" => {
+            "d1.execute_write_identity_claimant_custody_unproven"
         }
+        "d1.dml_identity_claimant_conflict" => "d1.execute_write_identity_claimant_conflict",
+        _ => code,
     }
-
-    for namespace in D1DmlIdentityNamespace::ALL {
-        let identity_sha256 = set.identity_sha256(namespace);
-        let bytes = guard
-            .read_d1_dml_identity_claimant(namespace, identity_sha256)
-            .map_err(|_| {
-                identity_claimant_error(
-                    "d1.execute_write_identity_claimant_custody_unproven",
-                    "sealed identity claimant set could not be reread exactly",
-                    "post_catalog_claimant_readback",
-                )
-            })?
-            .ok_or_else(|| {
-                identity_claimant_error(
-                    "d1.execute_write_identity_claimant_custody_unproven",
-                    "one sealed identity claimant was physically absent",
-                    "post_catalog_claimant_readback",
-                )
-            })?;
-        let restored = set.restore_exact(namespace, &bytes).map_err(|error| {
-            identity_claimant_error(error.code, error.message, "post_catalog_claimant_readback")
-        })?;
-        if restored.receipt().phase != D1DmlIdentityClaimantPhase::Bound
-            || restored.receipt().attempt_binding_sha256.as_deref() != Some(attempt_binding_sha256)
-        {
-            return Err(identity_claimant_error(
-                "d1.execute_write_identity_claimant_custody_unproven",
-                "provider dispatch requires three exact Bound identity claimants",
-                "post_catalog_claimant_readback",
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn identity_claimant_error(code: &str, message: &str, phase: &str) -> CallToolResult {

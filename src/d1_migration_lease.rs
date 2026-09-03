@@ -804,6 +804,41 @@ impl D1TargetMutationGuard {
         }
     }
 
+    /// Reserve the permanent entry and one CAS scratch slot before any other
+    /// member of a new attempt claimant set is installed.
+    pub(crate) fn preflight_d1_dml_attempt_capacity(
+        &self,
+        attempt_binding_sha256: &str,
+    ) -> Result<(), CallToolResult> {
+        self.revalidate()?;
+        if attempt_binding_sha256.len() != 64
+            || !attempt_binding_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(d1_dml_attempt_store_error(
+                &self.target_key_sha256,
+                "DML attempt capacity preflight received a non-canonical binding",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            linux::preflight_d1_dml_attempt_capacity(
+                &self.target,
+                attempt_binding_sha256,
+                &self.target_key_sha256,
+            )
+            .map_err(|message| d1_dml_attempt_store_error(&self.target_key_sha256, message))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(d1_dml_attempt_store_error(
+                &self.target_key_sha256,
+                "durable DML attempt capacity proof requires Linux dirfd-bound storage",
+            ))
+        }
+    }
+
     /// Install the first canonical Prepared state exactly once.
     pub(crate) fn create_d1_dml_attempt_state(
         &self,
@@ -1021,15 +1056,15 @@ impl D1TargetMutationGuard {
         attempt_binding_sha256: &str,
         state: &[u8],
     ) -> Result<(), CallToolResult> {
-        let product =
-            crate::d1_dml_attempt_custody::inspect_d1_dml_attempt_state(state).map_err(|_| {
+        let receipt =
+            crate::d1_attempt_artifact::inspect_d1_attempt_artifact(state).map_err(|_| {
                 d1_dml_attempt_store_error(
                     &self.target_key_sha256,
                     "DML attempt state was malformed or contradicted the closed custody product",
                 )
             })?;
-        if product.receipt().target_key_sha256 != self.target_key_sha256
-            || product.receipt().attempt_binding_sha256 != attempt_binding_sha256
+        if receipt.target_key_sha256 != self.target_key_sha256
+            || receipt.attempt_binding_sha256 != attempt_binding_sha256
         {
             return Err(d1_dml_attempt_store_error(
                 &self.target_key_sha256,
@@ -2167,6 +2202,35 @@ pub(crate) fn acquire_d1_target_mutation_guard_at(
             &target.target_key_sha256(),
         ))
     }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn acquire_d1_target_mutation_guard_for_test(
+    label: &str,
+    operation: &'static str,
+) -> (PathBuf, D1TargetMutationGuard) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-d1-target-wide-{label}-{}-{}",
+        std::process::id(),
+        D1_MANIFEST_LEASE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&root).expect("create private target-wide fixture root");
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+        .expect("private target-wide fixture root");
+    let root_file = fs::File::open(&root).expect("open target-wide fixture root");
+    let target_key_sha256 = sha256_bytes_hex(b"acct-1\0123e4567-e89b-42d3-a456-426614174000");
+    linux::ensure_target_identity_activation(&root_file, &target_key_sha256)
+        .expect("activate target-wide fixture identity");
+    let guard = acquire_d1_target_mutation_guard_at(
+        root.clone(),
+        operation,
+        "acct-1",
+        "123e4567-e89b-42d3-a456-426614174000",
+    )
+    .expect("acquire target-wide fixture guard");
+    (root, guard)
 }
 
 /// Read-only occupancy check for the permanent target namespace.  This runs
@@ -5422,11 +5486,10 @@ mod linux {
             }
             match kind {
                 DmlLeafKind::Attempt => {
-                    let product =
-                        crate::d1_dml_attempt_custody::inspect_d1_dml_attempt_state(&bytes)
-                            .map_err(|_| "DML attempt state in shard was malformed")?;
-                    if product.receipt().target_key_sha256 != target_key_sha256
-                        || product.receipt().attempt_binding_sha256 != digest
+                    let receipt = crate::d1_attempt_artifact::inspect_d1_attempt_artifact(&bytes)
+                        .map_err(|_| "DML attempt state in shard was malformed")?;
+                    if receipt.target_key_sha256 != target_key_sha256
+                        || receipt.attempt_binding_sha256 != digest
                     {
                         return Err("DML attempt state contradicted its shard placement");
                     }
@@ -5754,14 +5817,10 @@ mod linux {
                             }
                             DmlLeafKind::Attempt => {
                                 let receipt =
-                                    crate::d1_dml_attempt_custody::inspect_d1_dml_attempt_state(
-                                        &bytes,
-                                    )
-                                    .map_err(|_| "DML attempt was malformed during complete audit")?
-                                    .receipt()
-                                    .clone();
-                                crate::d1_dml_attempt_custody::validate_d1_dml_attempt_audit_binding(&receipt)
-                                    .map_err(|_| "DML attempt binding did not rederive during complete audit")?;
+                                    crate::d1_attempt_artifact::inspect_d1_attempt_artifact(&bytes)
+                                        .map_err(
+                                            |_| "DML attempt was malformed during complete audit",
+                                        )?;
                                 budget.retain_cross_shard_entry(attempts.len())?;
                                 if attempts
                                     .insert(receipt.attempt_binding_sha256.clone(), receipt)
@@ -6171,7 +6230,7 @@ mod linux {
         binding: &str,
         state: &[u8],
     ) -> Result<(), &'static str> {
-        let product = crate::d1_dml_attempt_custody::inspect_d1_dml_attempt_state(state)
+        let receipt = crate::d1_attempt_artifact::inspect_d1_attempt_artifact(state)
             .map_err(|_| "DML attempt state was malformed before storage")?;
         let leaf = open_dml_leaf(target, DmlLeafKind::Attempt, binding, true)?
             .ok_or("DML attempt shard could not be installed")?;
@@ -6179,10 +6238,18 @@ mod linux {
             target,
             DmlLeafKind::Attempt,
             binding,
-            &product.receipt().target_key_sha256,
+            &receipt.target_key_sha256,
             1,
         )?;
         create_private_dml_state(&leaf, &d1_dml_attempt_name(binding)?, state)
+    }
+
+    pub(super) fn preflight_d1_dml_attempt_capacity(
+        target: &fs::File,
+        binding: &str,
+        target_key_sha256: &str,
+    ) -> Result<(), &'static str> {
+        preflight_dml_leaf_capacity(target, DmlLeafKind::Attempt, binding, target_key_sha256, 1)
     }
 
     pub(super) fn compare_exchange_d1_dml_attempt_state(

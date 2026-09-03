@@ -119,6 +119,15 @@ guard is process-crash exclusion, not durable outcome evidence; migration and
 bootstrap continue to use their stronger retained-lease/reconciliation
 protocols.
 
+The shared private DML layout also recognizes a separate strict target-wide
+rename/delete attempt schema through `Prepared` only. That schema binds the
+complete plan-bound consent product and three hashed, distinct opaque identities
+before local installation. It reuses the existing claimant namespaces,
+capacity checks, exclusive creation, CAS sealing, restrictive file policy, and
+exact readback. Its presence is unresolved custody, not provider authority; the
+curated rename/delete routes remain planning-only until independently reviewed
+audit, dispatch, provider, and recovery boundaries are composed.
+
 ## External Service Bridge
 
 The optional allowlisted external service bridge lets deployments call approved
