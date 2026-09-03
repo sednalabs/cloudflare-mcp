@@ -410,9 +410,11 @@ facts appear only in `execution_evidence`. An existing layout must validate
 exactly; active guarded paths do not replace, flatten, or repair hostile or
 partial evidence. If audit or revalidation fails after an active ensure, the
 error preserves the observed local outcome while proving zero provider
-dispatch. The lower-level Cloudflare client adapter remains distinct: it can
-issue direct rename/delete provider requests for internal callers, but that is
-not the governed MCP lifecycle and does not bypass the MCP planning-only stop.
+dispatch. The lower-level `CloudflareClient` adapter remains distinct. Every
+direct rename/delete caller must supply its own governed consent and durable
+reservation/recovery wrapper before provider dispatch; that adapter capability
+is not the governed MCP lifecycle and does not bypass the MCP planning-only
+stop.
 Retained-evidence reconciliation, terminal receipt persistence, rollback
 restoration, and retirement require the layout to remain present and exact;
 absence is evidence loss, not an empty/default state, and those paths create
