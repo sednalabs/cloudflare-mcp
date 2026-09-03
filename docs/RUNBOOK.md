@@ -152,10 +152,16 @@ Once the single no-redirect request is attempted, transport loss, HTTP errors,
 body-read loss, and malformed or contradictory responses are
 `uncertain_after_dispatch` with one provider call and an unknown mutation
 count; response stages include only aggregate-safe body state and optional HTTP
-status. No such failure is retried. A decoded successful Cloudflare contract is
-`succeeded` with one call and one mutation. Returned errors contain the existing
-sanitized adapter error plus that typed lifecycle, never request headers,
-tokens, or raw response bodies. Delete consent is derived from the complete
+status. No such failure is retried. Immediate success requires one bounded,
+duplicate-free exact Cloudflare envelope containing only literal
+`success=true`, a non-null operation-typed `result`, and exact empty `errors`
+and `messages` arrays. Missing, null, wrong-type, unknown, duplicate, nonempty,
+overdeep, or contradictory envelope fields remain one dispatched call with an
+unknown mutation; they never become confirmed application evidence. Only that
+strict decoded product is `succeeded` with one call and one mutation. Returned
+errors contain the existing sanitized adapter error plus that typed lifecycle,
+never provider field values, request headers, tokens, or raw response bodies.
+Delete consent is derived from the complete
 static plan, including its reason and provider request, rather than a future
 runtime audit digest. The layout step is local custody maintenance and declares
 no provider-dispatch authority. Retained and recovery workflows never install

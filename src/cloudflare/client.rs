@@ -616,6 +616,21 @@ struct StrictD1DmlEnvelope {
     messages: Value,
 }
 
+/// Rename and delete are target-wide, non-idempotent operations. Their
+/// immediate result is application evidence only when the provider returns
+/// the complete duplicate-free Cloudflare envelope product. Keep this local:
+/// the four-field shape and empty-error/message policy are provider-specific,
+/// while the resulting lifecycle classification uses the toolkit's shared
+/// transport-neutral `MutationApplyStatus`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictD1DatabaseMutationEnvelope {
+    success: bool,
+    result: Value,
+    errors: Value,
+    messages: Value,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct CloudflareApiError {
     code: Option<i64>,
@@ -818,17 +833,8 @@ impl CloudflareClient {
             )
             .await?;
         let status = mutation.lifecycle.http_status.unwrap_or(200);
-        let result = mutation.result.ok_or_else(|| D1DatabaseMutationError {
-            error: AdapterError::new(
-                "cloudflare.empty_result",
-                "Cloudflare returned success without a renamed D1 database result",
-                "Treat the rename outcome as ambiguous; inspect the database before another mutation.",
-            )
-            .with_status(Some(status)),
-            lifecycle: mutation.lifecycle,
-        })?;
         Ok(D1DatabaseMutation {
-            result,
+            result: mutation.result,
             lifecycle: D1DatabaseMutationLifecycle::succeeded(status),
         })
     }
@@ -860,7 +866,7 @@ impl CloudflareClient {
             .await?;
         let status = mutation.lifecycle.http_status.unwrap_or(200);
         Ok(D1DatabaseMutation {
-            result: mutation.result.unwrap_or_else(|| json!({})),
+            result: mutation.result,
             lifecycle: D1DatabaseMutationLifecycle::succeeded(status),
         })
     }
@@ -872,7 +878,7 @@ impl CloudflareClient {
         operation: &'static str,
         method: reqwest::Method,
         body: Option<Value>,
-    ) -> Result<D1DatabaseMutation<Option<T>>, D1DatabaseMutationError>
+    ) -> Result<D1DatabaseMutation<T>, D1DatabaseMutationError>
     where
         T: DeserializeOwned,
     {
@@ -987,15 +993,13 @@ impl CloudflareClient {
                 lifecycle,
             });
         }
-        let envelope =
-            decode_cloudflare_envelope::<T>(body).map_err(|error| D1DatabaseMutationError {
+        let result = decode_strict_d1_database_mutation_envelope::<T>(body).map_err(|error| {
+            D1DatabaseMutationError {
                 error: error.with_status(Some(status_code)).with_retryable(false),
                 lifecycle,
-            })?;
-        Ok(D1DatabaseMutation {
-            result: envelope.result,
-            lifecycle,
-        })
+            }
+        })?;
+        Ok(D1DatabaseMutation { result, lifecycle })
     }
 
     pub async fn query_d1_database(
@@ -4312,6 +4316,85 @@ fn decode_strict_d1_dml_envelope(body: &str) -> Result<CloudflareEnvelope<Value>
     })
 }
 
+fn decode_strict_d1_database_mutation_envelope<T>(body: &str) -> Result<T, AdapterError>
+where
+    T: DeserializeOwned,
+{
+    let value = decode_json_rejecting_duplicate_object_keys(body).map_err(|error| match error {
+        DuplicateSafeJsonError::DuplicateObjectKey => AdapterError::new(
+            "cloudflare.d1.database_mutation_duplicate_object_key",
+            "Cloudflare D1 database mutation response contained a duplicate JSON object key",
+            "Treat the database mutation outcome as ambiguous; do not retry this attempt.",
+        ),
+        DuplicateSafeJsonError::NestingDepthExceeded => AdapterError::new(
+            "cloudflare.d1.database_mutation_malformed_envelope",
+            "Cloudflare D1 database mutation response exceeded the JSON nesting limit",
+            "Treat the database mutation outcome as ambiguous; do not retry this attempt.",
+        ),
+        DuplicateSafeJsonError::Malformed(_) => AdapterError::new(
+            "cloudflare.d1.database_mutation_malformed_envelope",
+            "Cloudflare D1 database mutation response was not valid bounded JSON",
+            "Treat the database mutation outcome as ambiguous; do not retry this attempt.",
+        ),
+    })?;
+    let envelope: StrictD1DatabaseMutationEnvelope =
+        serde_json::from_value(value).map_err(|_| {
+            AdapterError::new(
+                "cloudflare.d1.database_mutation_malformed_envelope",
+                "Cloudflare D1 database mutation response did not match the exact envelope",
+                "Treat the database mutation outcome as ambiguous; do not retry this attempt.",
+            )
+        })?;
+    match envelope.errors {
+        Value::Array(ref errors) if errors.is_empty() => {}
+        Value::Array(_) => {
+            return Err(AdapterError::new(
+                "cloudflare.d1.database_mutation_contradictory_envelope",
+                "Cloudflare D1 database mutation envelope reported a non-empty errors array",
+                "Treat the database mutation outcome as ambiguous; do not retry this attempt.",
+            ));
+        }
+        _ => {
+            return Err(AdapterError::new(
+                "cloudflare.d1.database_mutation_malformed_envelope",
+                "Cloudflare D1 database mutation envelope did not contain one exact empty errors array",
+                "Treat the database mutation outcome as ambiguous; do not retry this attempt.",
+            ));
+        }
+    }
+    match envelope.messages {
+        Value::Array(ref messages) if messages.is_empty() => {}
+        _ => {
+            return Err(AdapterError::new(
+                "cloudflare.d1.database_mutation_malformed_envelope",
+                "Cloudflare D1 database mutation envelope did not contain one exact empty messages array",
+                "Treat the database mutation outcome as ambiguous; do not retry this attempt.",
+            ));
+        }
+    }
+    if !envelope.success {
+        return Err(AdapterError::new(
+            "cloudflare.d1.database_mutation_unsuccessful_envelope",
+            "Cloudflare D1 database mutation envelope did not report success",
+            "Treat the database mutation outcome as ambiguous; do not retry this attempt.",
+        ));
+    }
+    if envelope.result.is_null() {
+        return Err(AdapterError::new(
+            "cloudflare.d1.database_mutation_malformed_envelope",
+            "Cloudflare D1 database mutation envelope supplied a null result",
+            "Treat the database mutation outcome as ambiguous; do not retry this attempt.",
+        ));
+    }
+    serde_json::from_value(envelope.result).map_err(|_| {
+        AdapterError::new(
+            "cloudflare.d1.database_mutation_malformed_envelope",
+            "Cloudflare D1 database mutation result did not match the operation contract",
+            "Treat the database mutation outcome as ambiguous; do not retry this attempt.",
+        )
+    })
+}
+
 const DUPLICATE_JSON_OBJECT_KEY_MARKER: &str = "duplicate JSON object key";
 const JSON_NESTING_DEPTH_EXCEEDED_MARKER: &str = "JSON nesting depth exceeded";
 pub(super) const D1_MIGRATION_JSON_MAX_CONTAINER_DEPTH: usize = 32;
@@ -5174,8 +5257,9 @@ fn http_status_error(status: StatusCode, body: &str) -> AdapterError {
 }
 
 fn d1_database_mutation_http_status_error(status: StatusCode, body: &str) -> AdapterError {
-    let provider_error = serde_json::from_str::<CloudflareEnvelope<Value>>(body)
+    let provider_error = decode_json_rejecting_duplicate_object_keys(body)
         .ok()
+        .and_then(|value| serde_json::from_value::<CloudflareEnvelope<Value>>(value).ok())
         .and_then(|envelope| envelope.errors.first().cloned());
     let message = provider_error
         .as_ref()
@@ -5489,6 +5573,220 @@ mod tests {
         }
     }
 
+    fn strict_d1_database_mutation_failure_bodies() -> Vec<(&'static str, Vec<u8>, &'static str)> {
+        let malformed_code = "cloudflare.d1.database_mutation_malformed_envelope";
+        let duplicate_code = "cloudflare.d1.database_mutation_duplicate_object_key";
+        let contradictory_code = "cloudflare.d1.database_mutation_contradictory_envelope";
+        let unsuccessful_code = "cloudflare.d1.database_mutation_unsuccessful_envelope";
+        let exact_result = r#"{"deleted":true}"#;
+        let exact_errors = "[]";
+        let exact_messages = "[]";
+        let envelope = |success: &str, result: &str, errors: &str, messages: &str| {
+            format!(
+                r#"{{"success":{success},"result":{result},"errors":{errors},"messages":{messages}}}"#
+            )
+            .into_bytes()
+        };
+        vec![
+            ("malformed-json", b"{".to_vec(), "cloudflare.d1.database_mutation_malformed_envelope"),
+            ("non-object-envelope", b"[]".to_vec(), malformed_code),
+            (
+                "missing-success",
+                format!(
+                    r#"{{"result":{exact_result},"errors":{exact_errors},"messages":{exact_messages}}}"#
+                )
+                .into_bytes(),
+                malformed_code,
+            ),
+            (
+                "null-success",
+                envelope("null", exact_result, exact_errors, exact_messages),
+                malformed_code,
+            ),
+            (
+                "wrong-success-type",
+                envelope(r#""true""#, exact_result, exact_errors, exact_messages),
+                malformed_code,
+            ),
+            (
+                "unsuccessful",
+                envelope("false", exact_result, exact_errors, exact_messages),
+                unsuccessful_code,
+            ),
+            (
+                "missing-result",
+                format!(
+                    r#"{{"success":true,"errors":{exact_errors},"messages":{exact_messages}}}"#
+                )
+                .into_bytes(),
+                malformed_code,
+            ),
+            (
+                "null-result",
+                envelope("true", "null", exact_errors, exact_messages),
+                malformed_code,
+            ),
+            (
+                "missing-errors",
+                format!(
+                    r#"{{"success":true,"result":{exact_result},"messages":{exact_messages}}}"#
+                )
+                .into_bytes(),
+                malformed_code,
+            ),
+            (
+                "null-errors",
+                envelope("true", exact_result, "null", exact_messages),
+                malformed_code,
+            ),
+            (
+                "wrong-errors-type",
+                envelope("true", exact_result, "{}", exact_messages),
+                malformed_code,
+            ),
+            (
+                "nonempty-errors",
+                envelope(
+                    "true",
+                    exact_result,
+                    r#"[{"code":9000,"message":"provider detail"}]"#,
+                    exact_messages,
+                ),
+                contradictory_code,
+            ),
+            (
+                "missing-messages",
+                format!(
+                    r#"{{"success":true,"result":{exact_result},"errors":{exact_errors}}}"#
+                )
+                .into_bytes(),
+                malformed_code,
+            ),
+            (
+                "null-messages",
+                envelope("true", exact_result, exact_errors, "null"),
+                malformed_code,
+            ),
+            (
+                "wrong-messages-type",
+                envelope("true", exact_result, exact_errors, "{}"),
+                malformed_code,
+            ),
+            (
+                "nonempty-messages",
+                envelope(
+                    "true",
+                    exact_result,
+                    exact_errors,
+                    r#"[{"code":1000,"message":"provider detail"}]"#,
+                ),
+                malformed_code,
+            ),
+            (
+                "unknown-field",
+                format!(
+                    r#"{{"success":true,"result":{exact_result},"errors":{exact_errors},"messages":{exact_messages},"private-provider-detail":"must-not-return"}}"#
+                )
+                .into_bytes(),
+                malformed_code,
+            ),
+            (
+                "duplicate-success-first-true",
+                format!(
+                    r#"{{"success":true,"result":{exact_result},"errors":{exact_errors},"messages":{exact_messages},"success":false}}"#
+                )
+                .into_bytes(),
+                duplicate_code,
+            ),
+            (
+                "duplicate-success-first-false",
+                format!(
+                    r#"{{"success":false,"result":{exact_result},"errors":{exact_errors},"messages":{exact_messages},"success":true}}"#
+                )
+                .into_bytes(),
+                duplicate_code,
+            ),
+            (
+                "duplicate-result-first-object",
+                format!(
+                    r#"{{"success":true,"result":{exact_result},"errors":{exact_errors},"messages":{exact_messages},"result":null}}"#
+                )
+                .into_bytes(),
+                duplicate_code,
+            ),
+            (
+                "duplicate-result-first-null",
+                format!(
+                    r#"{{"success":true,"result":null,"errors":{exact_errors},"messages":{exact_messages},"result":{exact_result}}}"#
+                )
+                .into_bytes(),
+                duplicate_code,
+            ),
+            (
+                "duplicate-errors-first-empty",
+                format!(
+                    r#"{{"success":true,"result":{exact_result},"errors":[],"messages":{exact_messages},"errors":[{{"code":9000}}]}}"#
+                )
+                .into_bytes(),
+                duplicate_code,
+            ),
+            (
+                "duplicate-errors-first-nonempty",
+                format!(
+                    r#"{{"success":true,"result":{exact_result},"errors":[{{"code":9000}}],"messages":{exact_messages},"errors":[]}}"#
+                )
+                .into_bytes(),
+                duplicate_code,
+            ),
+            (
+                "duplicate-messages-first-empty",
+                format!(
+                    r#"{{"success":true,"result":{exact_result},"errors":{exact_errors},"messages":[],"messages":[{{"code":1000}}]}}"#
+                )
+                .into_bytes(),
+                duplicate_code,
+            ),
+            (
+                "duplicate-messages-first-nonempty",
+                format!(
+                    r#"{{"success":true,"result":{exact_result},"errors":{exact_errors},"messages":[{{"code":1000}}],"messages":[]}}"#
+                )
+                .into_bytes(),
+                duplicate_code,
+            ),
+            (
+                "duplicate-nested-result-field",
+                envelope(
+                    "true",
+                    r#"{"deleted":true,"deleted":false}"#,
+                    exact_errors,
+                    exact_messages,
+                ),
+                duplicate_code,
+            ),
+            (
+                "duplicate-nested-error-field",
+                envelope(
+                    "true",
+                    exact_result,
+                    r#"[{"code":9000,"code":9001}]"#,
+                    exact_messages,
+                ),
+                duplicate_code,
+            ),
+            (
+                "overdeep-result",
+                envelope(
+                    "true",
+                    &nested_array_json(D1_MIGRATION_JSON_MAX_CONTAINER_DEPTH + 1, "0"),
+                    exact_errors,
+                    exact_messages,
+                ),
+                malformed_code,
+            ),
+        ]
+    }
+
     fn raw_http_response(status: u16, body: &[u8]) -> Vec<u8> {
         let mut response = format!(
             "HTTP/1.1 {status} Synthetic\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
@@ -5689,43 +5987,48 @@ mod tests {
             TestD1DatabaseMutation::Rename,
             TestD1DatabaseMutation::Delete,
         ] {
-            let (base, calls) =
-                spawn_single_raw_d1_database_mutation_response(Some(raw_http_response(200, b"{")))
-                    .await;
-            let client = CloudflareClient::new(test_config(base)).expect("mutation client");
-            let error = operation
-                .call(&client)
-                .await
-                .expect_err("malformed response remains ambiguous");
-            assert_eq!(error.error.code, "cloudflare.decode_error", "{operation:?}");
-            assert_eq!(error.error.status, Some(200), "{operation:?}");
-            assert!(!error.error.retryable, "{operation:?}");
-            assert_eq!(
-                error.lifecycle.body_stage, "completely_read",
-                "{operation:?}"
-            );
-            assert_eq!(error.lifecycle.provider_calls(), 1, "{operation:?}");
-            assert_eq!(error.lifecycle.provider_mutations(), None, "{operation:?}");
-            assert_eq!(calls.load(Ordering::SeqCst), 1, "{operation:?}");
+            for (label, body, expected_code) in strict_d1_database_mutation_failure_bodies() {
+                let (base, calls) = spawn_single_raw_d1_database_mutation_response(Some(
+                    raw_http_response(200, &body),
+                ))
+                .await;
+                let client = CloudflareClient::new(test_config(base)).expect("mutation client");
+                let error = match operation.call(&client).await {
+                    Ok(_) => panic!("{operation:?} {label} must remain ambiguous"),
+                    Err(error) => error,
+                };
+                assert_eq!(error.error.code, expected_code, "{operation:?} {label}");
+                assert_eq!(error.error.status, Some(200), "{operation:?} {label}");
+                assert!(!error.error.retryable, "{operation:?} {label}");
+                assert!(
+                    !error.error.message.contains("provider detail")
+                        && !error.error.message.contains("must-not-return"),
+                    "{operation:?} {label} error must remain aggregate-safe"
+                );
+                assert_eq!(
+                    error.lifecycle,
+                    D1DatabaseMutationLifecycle::body_completely_read(200),
+                    "{operation:?} {label}"
+                );
+                assert_eq!(error.lifecycle.provider_calls(), 1, "{operation:?} {label}");
+                assert_eq!(
+                    error.lifecycle.provider_mutations(),
+                    None,
+                    "{operation:?} {label}"
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "{operation:?} {label}");
+            }
 
-            let provider_error = serde_json::to_vec(&json!({
-                "success": false,
-                "errors": [{"code": 9000, "message": "synthetic response error"}],
-                "messages": [],
-                "result": null
-            }))
-            .expect("serialize synthetic response error");
             let (base, calls) = spawn_single_raw_d1_database_mutation_response(Some(
-                raw_http_response(200, &provider_error),
+                raw_http_response(200, &[0xff]),
             ))
             .await;
             let client = CloudflareClient::new(test_config(base)).expect("mutation client");
             let error = operation
                 .call(&client)
                 .await
-                .expect_err("decoded response error remains ambiguous");
-            assert_eq!(error.error.code, "cloudflare.api_error", "{operation:?}");
-            assert_eq!(error.error.status, Some(200), "{operation:?}");
+                .expect_err("invalid UTF-8 remains ambiguous");
+            assert_eq!(error.error.code, "cloudflare.decode_error", "{operation:?}");
             assert!(!error.error.retryable, "{operation:?}");
             assert_eq!(
                 error.lifecycle,
@@ -5736,6 +6039,30 @@ mod tests {
             assert_eq!(error.lifecycle.provider_mutations(), None, "{operation:?}");
             assert_eq!(calls.load(Ordering::SeqCst), 1, "{operation:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn d1_database_rename_rejects_a_well_formed_envelope_with_wrong_result_shape() {
+        let body = br#"{"success":true,"result":{},"errors":[],"messages":[]}"#;
+        let (base, calls) =
+            spawn_single_raw_d1_database_mutation_response(Some(raw_http_response(200, body)))
+                .await;
+        let client = CloudflareClient::new(test_config(base)).expect("mutation client");
+        let error = TestD1DatabaseMutation::Rename
+            .call(&client)
+            .await
+            .expect_err("rename result must match D1 database response shape");
+        assert_eq!(
+            error.error.code,
+            "cloudflare.d1.database_mutation_malformed_envelope"
+        );
+        assert_eq!(
+            error.lifecycle,
+            D1DatabaseMutationLifecycle::body_completely_read(200)
+        );
+        assert_eq!(error.lifecycle.provider_calls(), 1);
+        assert_eq!(error.lifecycle.provider_mutations(), None);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

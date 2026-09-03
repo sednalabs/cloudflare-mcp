@@ -5268,6 +5268,39 @@ fn spawn_fake_d1_database_mutation_disconnect_api(
     (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
 }
 
+fn spawn_fake_d1_database_mutation_raw_response_api(
+    response_body: Vec<u8>,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind raw-response D1 API"); // DevSkim: ignore DS162092 -- loopback-only MCP test fixture
+    let addr = listener.local_addr().expect("raw-response D1 API addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept raw-response D1 request");
+        let (headers, body) = read_http_request(&mut stream);
+        let request_line = headers.lines().next().unwrap_or_default().to_string();
+        let mut request_parts = request_line.split_whitespace();
+        requests_for_thread
+            .lock()
+            .expect("raw-response request log")
+            .push(json!({
+                "method": request_parts.next().unwrap_or_default(),
+                "path": request_parts.next().unwrap_or_default(),
+                "body_present": !body.is_empty(),
+            }));
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+            response_body.len()
+        )
+        .expect("write raw-response headers");
+        stream
+            .write_all(&response_body)
+            .expect("write raw-response body");
+    });
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
+}
+
 fn spawn_fake_d1_database_mutation_api_with_guard_drift(
     expected_requests: usize,
     guard_to_displace_after_second_request: Option<PathBuf>,
@@ -18921,6 +18954,129 @@ fn d1_target_wide_database_mutations_report_disconnect_as_uncertain_without_retr
 
     mcp.terminate();
     fs::remove_dir_all(lease_root).expect("target guard cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn d1_target_wide_database_mutations_keep_strict_envelope_failures_uncertain_and_redacted() {
+    let cases = [
+        (
+            "duplicate-errors",
+            br#"{"success":true,"result":{"name":"renamed-db"},"errors":[],"messages":[],"errors":[{"message":"must-not-return"}]}"#.as_slice(),
+            "cloudflare.d1.database_mutation_duplicate_object_key",
+        ),
+        (
+            "nonempty-errors",
+            br#"{"success":true,"result":{"name":"renamed-db"},"errors":[{"message":"must-not-return"}],"messages":[]}"#.as_slice(),
+            "cloudflare.d1.database_mutation_contradictory_envelope",
+        ),
+        (
+            "missing-result",
+            br#"{"success":true,"errors":[],"messages":[]}"#.as_slice(),
+            "cloudflare.d1.database_mutation_malformed_envelope",
+        ),
+    ];
+    for (case, response_body, expected_code) in cases {
+        for operation in ["rename", "delete"] {
+            let (base_url, requests) =
+                spawn_fake_d1_database_mutation_raw_response_api(response_body.to_vec());
+            let lease_root = PathBuf::from("/tmp").join(format!(
+                "cloudflare-mcp-d1-strict-envelope-{case}-{operation}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system clock after Unix epoch")
+                    .as_nanos()
+            ));
+            install_activated_manifest_root_without_dml_layout(&lease_root);
+            let mut mcp = McpStdioProcess::start_with_env(vec![
+                ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+                (
+                    "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+                    lease_root.to_string_lossy().to_string(),
+                ),
+            ]);
+
+            let response = if operation == "rename" {
+                mcp.call_tool(
+                    2,
+                    "d1_rename_database",
+                    json!({
+                        "database_id": "123e4567-e89b-42d3-a456-426614174000",
+                        "name": "renamed-db",
+                        "dry_run": false
+                    }),
+                )
+            } else {
+                let dry = mcp.call_tool(
+                    2,
+                    "d1_delete_database",
+                    json!({
+                        "database_id": "123e4567-e89b-42d3-a456-426614174000",
+                        "reason": "strict response-envelope fixture",
+                        "dry_run": true
+                    }),
+                );
+                let confirmation = structured_content(&dry)["required_confirmation_token"]
+                    .as_str()
+                    .expect("delete confirmation token")
+                    .to_string();
+                mcp.call_tool(
+                    3,
+                    "d1_delete_database",
+                    json!({
+                        "database_id": "123e4567-e89b-42d3-a456-426614174000",
+                        "reason": "strict response-envelope fixture",
+                        "dry_run": false,
+                        "confirmation_token": confirmation
+                    }),
+                )
+            };
+            let content = structured_content(&response);
+            assert_eq!(content["ok"], json!(false), "{case} {operation}: {content}");
+            assert_eq!(
+                content["error"]["code"],
+                json!(expected_code),
+                "{case} {operation}"
+            );
+            assert_eq!(content["error"]["retryable"], json!(false));
+            assert_eq!(
+                content["execution_evidence"]["provider"],
+                json!({
+                    "outcome": "uncertain_after_dispatch",
+                    "provider_calls": 1,
+                    "provider_mutations": null,
+                    "lifecycle": {
+                        "dispatch_stage": "attempted",
+                        "response_stage": "received",
+                        "body_stage": "completely_read",
+                        "http_status": 200,
+                        "apply_status": "uncertain_after_dispatch"
+                    }
+                }),
+                "{case} {operation}"
+            );
+            assert!(
+                !serde_json::to_string(content)
+                    .expect("serialize strict response denial")
+                    .contains("must-not-return"),
+                "{case} {operation} must not expose provider body fields"
+            );
+            let requests = requests.lock().expect("strict response request log");
+            assert_eq!(requests.len(), 1, "{case} {operation} must not retry");
+            assert_eq!(
+                requests[0]["method"],
+                json!(if operation == "rename" {
+                    "PATCH"
+                } else {
+                    "DELETE"
+                })
+            );
+            drop(requests);
+            mcp.terminate();
+            fs::remove_dir_all(lease_root).expect("strict response target cleanup");
+        }
+    }
 }
 
 #[test]

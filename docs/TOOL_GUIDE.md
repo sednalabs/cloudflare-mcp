@@ -198,8 +198,13 @@ are added by the graph derivation.
    dispatch/response/body stages and optional HTTP status distinguish transport,
    HTTP, body-read, and decoded-contract failures without inspecting error text.
    The client performs one no-redirect attempt and never retries an ambiguous
-   rename/delete; only decoded success reports one call and one mutation. The
-   serialized receipt contains no token, header, or raw response body. Delete
+   rename/delete. Confirmed application requires a bounded duplicate-free exact
+   four-field Cloudflare envelope with literal `success=true`, a non-null
+   operation-typed `result`, and exact empty `errors` and `messages` arrays.
+   Missing, null, wrong-type, unknown, duplicate, nonempty, overdeep, or
+   contradictory fields remain uncertain after the one call; only the strict
+   decoded product reports one call and one mutation. The serialized receipt
+   contains no provider field values, token, header, or raw response body. Delete
    confirmation binds this complete static contract and reviewed reason, never
    an unknown runtime audit hash.
    An existing hostile or partial layout is never repaired. Absent
