@@ -437,6 +437,21 @@ pub(crate) fn synthetic_d1_dml_attempt_for_complete_audit(
     execute_plan_sha256: &str,
     identities: D1DmlAttemptIdentities<'_>,
 ) -> D1DmlAttemptCustodyProduct {
+    synthetic_d1_dml_attempt_for_complete_audit_phase(
+        target_key_sha256,
+        execute_plan_sha256,
+        identities,
+        D1DmlAttemptPhase::TerminalApplied,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn synthetic_d1_dml_attempt_for_complete_audit_phase(
+    target_key_sha256: &str,
+    execute_plan_sha256: &str,
+    identities: D1DmlAttemptIdentities<'_>,
+    phase: D1DmlAttemptPhase,
+) -> D1DmlAttemptCustodyProduct {
     let operation_id_sha256 = hash_bytes(identities.operation_id.as_bytes());
     let execution_attempt_id_sha256 = hash_bytes(identities.execution_attempt_id.as_bytes());
     let provider_request_id_sha256 = hash_bytes(identities.provider_request_id.as_bytes());
@@ -455,32 +470,66 @@ pub(crate) fn synthetic_d1_dml_attempt_for_complete_audit(
         execution_attempt_id_sha256.as_str(),
         provider_request_id_sha256.as_str(),
     ));
-    product(
-        D1DmlAttemptState {
-            version: CUSTODY_VERSION,
-            operation: D1_DML_ATTEMPT_CUSTODY_OPERATION.to_string(),
-            layout_version: D1_DML_CUSTODY_LAYOUT_VERSION,
-            layout_sha256: D1_DML_CUSTODY_LAYOUT_SHA256.to_string(),
-            target_key_sha256: target_key_sha256.to_string(),
-            execute_plan_sha256: execute_plan_sha256.to_string(),
-            composition_sha256,
-            composition_receipt_sha256,
-            operation_id_sha256,
-            execution_attempt_id_sha256,
-            provider_request_id_sha256,
-            attempt_binding_sha256,
-            phase: D1DmlAttemptPhase::Prepared,
-            dispatch_reservations: 0,
-            ambiguity: None,
-            provider_assertion: None,
-            readback_assertion: None,
-            terminal_outcome: None,
-        },
-        D1DmlAttemptTransition::Prepared,
-        None,
-        false,
-    )
-    .expect("synthetic complete-audit attempt is canonical")
+    let mut state = D1DmlAttemptState {
+        version: CUSTODY_VERSION,
+        operation: D1_DML_ATTEMPT_CUSTODY_OPERATION.to_string(),
+        layout_version: D1_DML_CUSTODY_LAYOUT_VERSION,
+        layout_sha256: D1_DML_CUSTODY_LAYOUT_SHA256.to_string(),
+        target_key_sha256: target_key_sha256.to_string(),
+        execute_plan_sha256: execute_plan_sha256.to_string(),
+        composition_sha256,
+        composition_receipt_sha256,
+        operation_id_sha256,
+        execution_attempt_id_sha256,
+        provider_request_id_sha256: provider_request_id_sha256.clone(),
+        attempt_binding_sha256: attempt_binding_sha256.clone(),
+        phase: D1DmlAttemptPhase::Prepared,
+        dispatch_reservations: 0,
+        ambiguity: None,
+        provider_assertion: None,
+        readback_assertion: None,
+        terminal_outcome: None,
+    };
+    match phase {
+        D1DmlAttemptPhase::Prepared => {}
+        D1DmlAttemptPhase::DispatchReserved => state.dispatch_reservations = 1,
+        D1DmlAttemptPhase::ReconciliationRequired => {
+            state.dispatch_reservations = 1;
+            state.ambiguity = Some(D1DmlAttemptAmbiguity::ResponseMissing);
+        }
+        D1DmlAttemptPhase::TerminalApplied | D1DmlAttemptPhase::TerminalNotApplied => {
+            state.dispatch_reservations = 1;
+            let (provider_classification, readback_classification) = match phase {
+                D1DmlAttemptPhase::TerminalApplied => (
+                    D1DmlProviderTerminalClassification::SucceededChanged,
+                    D1DmlReadbackTerminalClassification::ExpectedStateObserved,
+                ),
+                D1DmlAttemptPhase::TerminalNotApplied => (
+                    D1DmlProviderTerminalClassification::RejectedTerminal,
+                    D1DmlReadbackTerminalClassification::ExpectedStateAbsent,
+                ),
+                _ => unreachable!("terminal synthetic phase was matched above"),
+            };
+            state.provider_assertion = Some(D1DmlProviderTerminalAssertionRecord {
+                version: CUSTODY_VERSION,
+                attempt_binding_sha256: attempt_binding_sha256.clone(),
+                provider_request_id_sha256: provider_request_id_sha256.clone(),
+                classification: provider_classification,
+                evidence_sha256: hash_bytes(b"synthetic-complete-audit-provider-evidence"),
+            });
+            state.readback_assertion = Some(D1DmlReadbackTerminalAssertionRecord {
+                version: CUSTODY_VERSION,
+                attempt_binding_sha256,
+                classification: readback_classification,
+                readback_plan_sha256: hash_bytes(b"synthetic-complete-audit-readback-plan"),
+                evidence_sha256: hash_bytes(b"synthetic-complete-audit-readback-evidence"),
+            });
+        }
+    }
+    refresh_derived_state(&mut state).expect("synthetic complete-audit phase is governed");
+    debug_assert_eq!(state.phase, phase);
+    product(state, D1DmlAttemptTransition::Prepared, None, false)
+        .expect("synthetic complete-audit attempt is canonical")
 }
 
 /// Prepare the exact successor for a later atomic compare-and-exchange. This

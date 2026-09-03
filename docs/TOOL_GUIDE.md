@@ -154,10 +154,17 @@ are added by the graph derivation.
    digest, and every attempt binding, then checks both directions of the
    relation. Every attempt requires exactly one complete exact `Bound` set.
    Every claimant set, including a partial set, is classified against its
-   referenced attempt. Attempts without their complete exact set,
+   referenced attempt. Each canonical attempt independently rederives its phase
+   from the complete durable state product. The receipt counts `prepared`,
+   `dispatch_reserved`, `reconciliation_required`, `terminal_applied`, and
+   `terminal_not_applied` attempts and binds the five-count product into its
+   audit digest. Attempts without their complete exact set,
    missing-attempt `Bound` sets, Pending/partial sets, and scratch state return
-   aggregate `reconciliation_required` evidence; malformed, contradictory,
-   duplicate, misplaced, or digest-drift evidence fails closed.
+   aggregate `reconciliation_required` evidence. A matched `Prepared`,
+   `DispatchReserved`, or `ReconciliationRequired` attempt remains unresolved
+   and non-authorizing; only governed `TerminalApplied` and
+   `TerminalNotApplied` attempts may be clean. Malformed, unknown, aliased,
+   contradictory, duplicate, misplaced, or digest-drift evidence fails closed.
    The receipt exposes only bounded counts and hashes and always reports
    `provider_dispatch_authority=none`. Its versioned DML-only traversal budget
    permits at most 16,384 canonical leaves, 65,536 physical leaf artifacts, and
@@ -168,7 +175,8 @@ are added by the graph derivation.
    receipt or audit digest and reveals no artifact path, identity, or bytes.
    The fixed layout marker remains under its separate layout-snapshot cap;
    variable leaf artifacts are the globally budgeted graph. Target-wide
-   authority accepts only the clean fixed-budget projection of this proof.
+   authority accepts only the clean fixed-budget, all-terminal projection of
+   this proof.
    Fresh migration lease acquisition first installs or validates the fixed
    empty layout under its held permanent target guard, then persists the exact
    target/layout/budget/audit identity in `active.lease.json`; retained
@@ -196,8 +204,8 @@ are added by the graph derivation.
    an unknown runtime audit hash.
    An existing hostile or partial layout is never repaired. Absent
    retained/recovery layout, changed, unstable, over-budget, malformed,
-   partial, orphaned, or otherwise reconciliation-required custody stops
-   before provider mutation. The local
+   partial, orphaned, nonterminal, or otherwise reconciliation-required custody
+   stops before provider access with zero calls and mutations. The local
    ensure step and the audit still confer no provider authority, and ordinary
    DML remains affected-leaf scoped.
    A scratch name binds the record digest, exact incumbent-state digest, and

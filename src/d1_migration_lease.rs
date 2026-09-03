@@ -600,7 +600,8 @@ impl D1MigrationLease {
     fn release_failure(&self, message: &'static str) -> CallToolResult {
         CallToolResult::structured_error(json!({
             "ok": false, "operation": "d1_apply_migration_manifest",
-            "status": "reconciliation_required", "lease_retained": true, "lease": self.identity,
+            "status": "reconciliation_required", "provider_calls": 0,
+            "provider_mutations": 0, "lease_retained": true, "lease": self.identity,
             "error": {"code": "d1.migration_lease_release_failed", "message": message,
                 "hint": "Inspect the permanent target custody directory and reconcile the named owner through the governed recovery path before another apply."}
         }))
@@ -609,7 +610,8 @@ impl D1MigrationLease {
     fn revalidation_failure(&self, message: &'static str) -> CallToolResult {
         CallToolResult::structured_error(json!({
             "ok": false, "operation": "d1_apply_migration_manifest",
-            "status": "reconciliation_required", "lease_retained": true, "lease": self.identity,
+            "status": "reconciliation_required", "provider_calls": 0,
+            "provider_mutations": 0, "lease_retained": true, "lease": self.identity,
             "error": {"code": "d1.migration_lease_revalidation_failed", "message": message,
                 "hint": "Do not issue provider SQL. Reconcile the permanent target custody evidence through the governed recovery path first."}
         }))
@@ -737,9 +739,8 @@ impl D1TargetMutationGuard {
         {
             linux::authorize_target_wide_d1_dml_custody(&self.target, &self.target_key_sha256)
                 .map_err(|message| {
-                    d1_target_guard_error(
+                    d1_target_wide_dml_custody_error(
                         self.operation,
-                        "d1.target_wide_dml_custody_unproven",
                         message,
                         &self.target_key_sha256,
                     )
@@ -2250,6 +2251,26 @@ fn d1_target_guard_error(
             "code": code,
             "message": message,
             "hint": "Use the canonical target identity and wait for or reconcile the current target owner before another provider mutation."
+        }
+    }))
+}
+
+fn d1_target_wide_dml_custody_error(
+    operation: &'static str,
+    message: &'static str,
+    target_key_sha256: &str,
+) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": operation,
+        "status": "reconciliation_required",
+        "provider_calls": 0,
+        "provider_mutations": 0,
+        "target_key_sha256": target_key_sha256,
+        "error": {
+            "code": "d1.target_wide_dml_custody_unproven",
+            "message": message,
+            "hint": "Do not issue a provider mutation. Reconcile every nonterminal or malformed DML attempt through its governed recovery path first."
         }
     }))
 }
@@ -5301,6 +5322,7 @@ mod linux {
         target_key_sha256: &'a str,
         claimant_count: usize,
         attempt_count: usize,
+        attempt_phase_counts: crate::d1_dml_custody_layout::D1DmlCustodyAttemptPhaseCounts,
         pending_claimant_count: usize,
         bound_claimant_count: usize,
         cas_scratch_count: usize,
@@ -5863,8 +5885,37 @@ mod linux {
         }
         let unmatched_claimant_set_count = claimant_set_count - matched_claimant_set_count;
         let unmatched_attempt_count = attempts.len() - matched_attempts.len();
-        let reconciliation_required =
-            scratch_count != 0 || unmatched_claimant_set_count != 0 || unmatched_attempt_count != 0;
+        let mut attempt_phase_counts =
+            crate::d1_dml_custody_layout::D1DmlCustodyAttemptPhaseCounts::default();
+        for attempt in attempts.values() {
+            let count = match attempt.phase {
+                crate::d1_dml_attempt_custody::D1DmlAttemptPhase::Prepared => {
+                    &mut attempt_phase_counts.prepared
+                }
+                crate::d1_dml_attempt_custody::D1DmlAttemptPhase::DispatchReserved => {
+                    &mut attempt_phase_counts.dispatch_reserved
+                }
+                crate::d1_dml_attempt_custody::D1DmlAttemptPhase::ReconciliationRequired => {
+                    &mut attempt_phase_counts.reconciliation_required
+                }
+                crate::d1_dml_attempt_custody::D1DmlAttemptPhase::TerminalApplied => {
+                    &mut attempt_phase_counts.terminal_applied
+                }
+                crate::d1_dml_attempt_custody::D1DmlAttemptPhase::TerminalNotApplied => {
+                    &mut attempt_phase_counts.terminal_not_applied
+                }
+            };
+            *count = count
+                .checked_add(1)
+                .ok_or("DML complete audit attempt-phase count overflowed")?;
+        }
+        let unresolved_attempt_count = attempt_phase_counts
+            .unresolved()
+            .ok_or("DML complete audit attempt-phase count overflowed")?;
+        let reconciliation_required = scratch_count != 0
+            || unmatched_claimant_set_count != 0
+            || unmatched_attempt_count != 0
+            || unresolved_attempt_count != 0;
         artifact_evidence.sort();
         let provider_dispatch_authority =
             crate::d1_dml_custody_layout::D1DmlCustodyAuditProviderAuthority::None;
@@ -5883,6 +5934,7 @@ mod linux {
                 target_key_sha256,
                 claimant_count,
                 attempt_count: attempts.len(),
+                attempt_phase_counts,
                 pending_claimant_count,
                 bound_claimant_count,
                 cas_scratch_count: scratch_count,
@@ -5913,6 +5965,7 @@ mod linux {
             target_key_sha256: target_key_sha256.to_string(),
             claimant_count,
             attempt_count: attempts.len(),
+            attempt_phase_counts,
             pending_claimant_count,
             bound_claimant_count,
             cas_scratch_count: scratch_count,
@@ -6529,8 +6582,19 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn dml_complete_audit_fixture(label: &str) -> DmlCompleteAuditFixture {
+        dml_complete_audit_fixture_with_phase(
+            label,
+            crate::d1_dml_attempt_custody::D1DmlAttemptPhase::TerminalApplied,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn dml_complete_audit_fixture_with_phase(
+        label: &str,
+        phase: crate::d1_dml_attempt_custody::D1DmlAttemptPhase,
+    ) -> DmlCompleteAuditFixture {
         use crate::d1_dml_attempt_custody::{
-            D1DmlAttemptIdentities, synthetic_d1_dml_attempt_for_complete_audit,
+            D1DmlAttemptIdentities, synthetic_d1_dml_attempt_for_complete_audit_phase,
         };
         use crate::d1_dml_identity_claimant::derive_d1_dml_identity_claimant_set;
         use crate::d1_target::normalize_d1_target;
@@ -6556,10 +6620,11 @@ mod tests {
         let execute_plan_sha256 = sha256_bytes_hex(label.as_bytes());
         let set = derive_d1_dml_identity_claimant_set(&target, &execute_plan_sha256, identities)
             .expect("derive complete-audit claimant set");
-        let attempt = synthetic_d1_dml_attempt_for_complete_audit(
+        let attempt = synthetic_d1_dml_attempt_for_complete_audit_phase(
             &target.target_key_sha256(),
             &execute_plan_sha256,
             identities,
+            phase,
         );
         DmlCompleteAuditFixture {
             root,
@@ -6615,6 +6680,91 @@ mod tests {
                 fixture.attempt.state_bytes(),
             )
             .expect("install complete-audit attempt");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn install_raw_audit_attempt(fixture: &DmlCompleteAuditFixture, bytes: &[u8]) {
+        let binding = &fixture.attempt.receipt().attempt_binding_sha256;
+        let leaf = linux::open_dml_leaf(
+            &fixture.guard.target,
+            linux::DmlLeafKind::Attempt,
+            binding,
+            true,
+        )
+        .expect("open raw restored-attempt leaf")
+        .expect("raw restored-attempt leaf present");
+        linux::create_private_dml_state(&leaf, &format!("{binding}.json"), bytes)
+            .expect("install raw restored-attempt evidence");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn install_phase_graph_on_target(
+        target_file: &fs::File,
+        target_key_sha256: &str,
+        label: &str,
+        phase: crate::d1_dml_attempt_custody::D1DmlAttemptPhase,
+    ) {
+        use crate::d1_dml_attempt_custody::{
+            D1DmlAttemptIdentities, synthetic_d1_dml_attempt_for_complete_audit_phase,
+        };
+        use crate::d1_dml_identity_claimant::{
+            D1DmlIdentityNamespace, derive_d1_dml_identity_claimant_set,
+        };
+
+        let target =
+            crate::d1_target::normalize_d1_target("acct-1", "123e4567-e89b-42d3-a456-426614174000")
+                .expect("canonical phase-graph target");
+        assert_eq!(target.target_key_sha256(), target_key_sha256);
+        let operation_id = format!("operation-{label}");
+        let execution_attempt_id = format!("attempt-{label}");
+        let provider_request_id = format!("provider-{label}");
+        let identities = D1DmlAttemptIdentities {
+            operation_id: &operation_id,
+            execution_attempt_id: &execution_attempt_id,
+            provider_request_id: &provider_request_id,
+        };
+        let execute_plan_sha256 = sha256_bytes_hex(label.as_bytes());
+        let set = derive_d1_dml_identity_claimant_set(&target, &execute_plan_sha256, identities)
+            .expect("derive phase-graph claimants");
+        let attempt = synthetic_d1_dml_attempt_for_complete_audit_phase(
+            target_key_sha256,
+            &execute_plan_sha256,
+            identities,
+            phase,
+        );
+        linux::preflight_d1_dml_identity_claimant_set_capacity(
+            target_file,
+            &set,
+            target_key_sha256,
+        )
+        .expect("preflight phase-graph claimant set");
+        for namespace in D1DmlIdentityNamespace::ALL {
+            let pending = set.pending(namespace);
+            let bound = set
+                .bound(namespace, &attempt.receipt().attempt_binding_sha256)
+                .expect("derive phase-graph Bound claimant");
+            linux::create_d1_dml_identity_claimant(
+                target_file,
+                namespace,
+                set.identity_sha256(namespace),
+                pending.state_bytes(),
+            )
+            .expect("install phase-graph Pending claimant");
+            linux::compare_exchange_d1_dml_identity_claimant(
+                target_file,
+                namespace,
+                set.identity_sha256(namespace),
+                pending.state_bytes(),
+                bound.state_bytes(),
+            )
+            .expect("seal phase-graph claimant");
+        }
+        linux::create_d1_dml_attempt_state(
+            target_file,
+            &attempt.receipt().attempt_binding_sha256,
+            attempt.state_bytes(),
+        )
+        .expect("install phase-graph attempt");
     }
 
     #[cfg(target_os = "linux")]
@@ -6949,6 +7099,13 @@ mod tests {
             .audit_d1_dml_custody_complete()
             .expect("attempt closes the exact claimant-first product");
         assert_eq!(matched.attempt_count, 1);
+        assert_eq!(
+            matched.attempt_phase_counts,
+            crate::d1_dml_custody_layout::D1DmlCustodyAttemptPhaseCounts {
+                terminal_applied: 1,
+                ..Default::default()
+            }
+        );
         assert_eq!(matched.matched_claimant_set_count, 1);
         assert_eq!(matched.unmatched_claimant_set_count, 0);
         assert_eq!(matched.orphan_claimant_set_count, 0);
@@ -7026,8 +7183,359 @@ mod tests {
         assert_eq!(restored.matched_claimant_set_count, 1);
         assert_eq!(restored.unmatched_claimant_set_count, 0);
         assert_eq!(restored.unmatched_attempt_count, 0);
+        assert_eq!(
+            restored.attempt_phase_counts,
+            crate::d1_dml_custody_layout::D1DmlCustodyAttemptPhaseCounts {
+                terminal_applied: 1,
+                ..Default::default()
+            }
+        );
         assert!(!restored.reconciliation_required);
         fs::remove_dir_all(attempt_first.root).expect("attempt-first cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn complete_dml_audit_binds_every_canonical_attempt_phase_and_authorizes_only_terminal() {
+        use crate::d1_dml_attempt_custody::D1DmlAttemptPhase;
+        use crate::d1_dml_custody_layout::D1DmlCustodyAttemptPhaseCounts;
+        use crate::d1_dml_identity_claimant::D1DmlIdentityNamespace;
+
+        let cases = [
+            (
+                "prepared",
+                D1DmlAttemptPhase::Prepared,
+                D1DmlCustodyAttemptPhaseCounts {
+                    prepared: 1,
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                "dispatch-reserved",
+                D1DmlAttemptPhase::DispatchReserved,
+                D1DmlCustodyAttemptPhaseCounts {
+                    dispatch_reserved: 1,
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                "reconciliation-required",
+                D1DmlAttemptPhase::ReconciliationRequired,
+                D1DmlCustodyAttemptPhaseCounts {
+                    reconciliation_required: 1,
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                "terminal-applied",
+                D1DmlAttemptPhase::TerminalApplied,
+                D1DmlCustodyAttemptPhaseCounts {
+                    terminal_applied: 1,
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                "terminal-not-applied",
+                D1DmlAttemptPhase::TerminalNotApplied,
+                D1DmlCustodyAttemptPhaseCounts {
+                    terminal_not_applied: 1,
+                    ..Default::default()
+                },
+                true,
+            ),
+        ];
+        let case_count = cases.len();
+        let mut audit_digests = BTreeSet::new();
+        for (label, phase, expected_counts, terminal) in cases {
+            let fixture =
+                dml_complete_audit_fixture_with_phase(&format!("dml-phase-{label}"), phase);
+            for namespace in D1DmlIdentityNamespace::ALL {
+                install_pending_audit_claimant(&fixture, namespace);
+                seal_audit_claimant(&fixture, namespace);
+            }
+            install_audit_attempt(&fixture);
+
+            let audit = fixture
+                .guard
+                .audit_d1_dml_custody_complete()
+                .expect("canonical phase remains classifiable");
+            assert_eq!(audit.attempt_count, 1, "{label}");
+            assert_eq!(audit.attempt_phase_counts, expected_counts, "{label}");
+            assert_eq!(audit.attempt_phase_counts.total(), Some(1), "{label}");
+            assert_eq!(
+                audit.reconciliation_required, !terminal,
+                "{label} authority classification"
+            );
+            assert_eq!(
+                audit
+                    .authorize_target_wide_custody(&fixture.guard.target_key_sha256)
+                    .is_ok(),
+                terminal,
+                "{label} target-wide authority"
+            );
+            assert!(
+                audit_digests.insert(audit.audit_sha256),
+                "each phase product must bind a distinct audit digest"
+            );
+            fs::remove_dir_all(fixture.root).expect("phase fixture cleanup");
+        }
+        assert_eq!(audit_digests.len(), case_count);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn complete_dml_audit_rejects_malformed_unknown_and_alias_restored_phases() {
+        use crate::d1_dml_attempt_custody::D1DmlAttemptPhase;
+        use crate::d1_dml_identity_claimant::D1DmlIdentityNamespace;
+
+        let cases = [
+            ("valid-name-contradiction", "\"prepared\""),
+            ("pascal-alias", "\"TerminalApplied\""),
+            ("camel-alias", "\"terminalApplied\""),
+            ("whitespace-alias", "\"terminal_applied \""),
+            ("unknown-future-phase", "\"terminal_confirmed\""),
+            ("null-phase", "null"),
+            ("numeric-phase", "1"),
+            ("array-phase", "[]"),
+            ("object-phase", "{}"),
+            (
+                "duplicate-phase",
+                "\"terminal_applied\",\"phase\":\"terminal_not_applied\"",
+            ),
+        ];
+        for (label, replacement) in cases {
+            let fixture = dml_complete_audit_fixture_with_phase(
+                &format!("dml-restored-phase-{label}"),
+                D1DmlAttemptPhase::TerminalApplied,
+            );
+            for namespace in D1DmlIdentityNamespace::ALL {
+                install_pending_audit_claimant(&fixture, namespace);
+                seal_audit_claimant(&fixture, namespace);
+            }
+            let canonical = std::str::from_utf8(fixture.attempt.state_bytes())
+                .expect("synthetic attempt is UTF-8");
+            let restored = canonical.replace(
+                "\"phase\":\"terminal_applied\"",
+                &format!("\"phase\":{replacement}"),
+            );
+            assert_ne!(
+                restored, canonical,
+                "{label} fixture must change phase bytes"
+            );
+            install_raw_audit_attempt(&fixture, restored.as_bytes());
+
+            let error = fixture
+                .guard
+                .authorize_target_wide_d1_dml_custody()
+                .expect_err("malformed or aliased restored phase cannot authorize")
+                .structured_content
+                .expect("structured phase denial");
+            assert_eq!(
+                error["error"]["code"],
+                json!("d1.target_wide_dml_custody_unproven"),
+                "{label}"
+            );
+            assert_eq!(error["provider_calls"], json!(0), "{label}");
+            assert_eq!(error["provider_mutations"], json!(0), "{label}");
+            assert_eq!(error["status"], json!("reconciliation_required"), "{label}");
+            fs::remove_dir_all(fixture.root).expect("restored-phase cleanup");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_zero_provider_calls(result: CallToolResult, label: &str) -> Value {
+        let content = result
+            .structured_content
+            .unwrap_or_else(|| panic!("{label} must return structured evidence"));
+        assert_eq!(content["provider_calls"], json!(0), "{label}");
+        assert!(
+            content.get("provider_mutations").is_none()
+                || content["provider_mutations"] == json!(0),
+            "{label}"
+        );
+        content
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nonterminal_attempt_blocks_every_migration_custody_consumer_before_provider_access() {
+        use crate::d1_dml_attempt_custody::D1DmlAttemptPhase;
+
+        let acquisition_root = private_test_root("phase-blocks-migration-acquisition");
+        let acquisition_guard = acquire_d1_target_mutation_guard_at(
+            acquisition_root.clone(),
+            "d1_execute_write",
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect("acquire phase fixture guard");
+        install_phase_graph_on_target(
+            &acquisition_guard.target,
+            &acquisition_guard.target_key_sha256,
+            "migration-acquisition-prepared",
+            D1DmlAttemptPhase::Prepared,
+        );
+        drop(acquisition_guard);
+        let acquisition = acquire_d1_migration_lease_at(
+            acquisition_root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &"a".repeat(64),
+        )
+        .expect_err("Prepared evidence must block fresh migration authority");
+        let acquisition = assert_zero_provider_calls(acquisition, "migration acquisition");
+        assert_eq!(
+            acquisition["error"]["code"],
+            json!("d1.migration_dml_custody_unproven")
+        );
+        assert!(
+            !acquisition_root
+                .join(format!(
+                    "d1-migration-target-{}",
+                    sha256_bytes_hex(b"acct-1\0123e4567-e89b-42d3-a456-426614174000")
+                ))
+                .join(ACTIVE_LEASE_NAME)
+                .exists(),
+            "denied acquisition must not persist target-wide authority"
+        );
+        fs::remove_dir_all(acquisition_root).expect("acquisition fixture cleanup");
+
+        let owner_root = private_test_root("phase-blocks-owner-revalidation");
+        let mut owner = acquire_d1_migration_lease_at(
+            owner_root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &"b".repeat(64),
+        )
+        .expect("create clean owner before unresolved restore");
+        install_phase_graph_on_target(
+            &owner.target,
+            &owner.identity.target_key_sha256,
+            "owner-dispatch-reserved",
+            D1DmlAttemptPhase::DispatchReserved,
+        );
+        assert_zero_provider_calls(
+            owner
+                .revalidate()
+                .expect_err("DispatchReserved evidence must block owner revalidation"),
+            "owner revalidation",
+        );
+        assert_zero_provider_calls(
+            owner
+                .release()
+                .expect_err("DispatchReserved evidence must block owner retirement"),
+            "owner retirement",
+        );
+        owner.retain();
+        drop(owner);
+        fs::remove_dir_all(owner_root).expect("owner fixture cleanup");
+
+        let inspection_root = private_test_root("phase-blocks-retained-inspection");
+        let mut inspection_owner = acquire_d1_migration_lease_at(
+            inspection_root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &"c".repeat(64),
+        )
+        .expect("create retained inspection fixture");
+        let inspection_identity = inspection_owner.identity.clone();
+        let inspection_target = inspection_owner
+            .active_path_for_test()
+            .expect("inspection active path")
+            .parent()
+            .expect("inspection target")
+            .to_path_buf();
+        inspection_owner.retain();
+        drop(inspection_owner);
+        let inspection_target_file = fs::File::open(&inspection_target).expect("open target");
+        install_phase_graph_on_target(
+            &inspection_target_file,
+            &inspection_identity.target_key_sha256,
+            "retained-reconciliation-required",
+            D1DmlAttemptPhase::ReconciliationRequired,
+        );
+        drop(inspection_target_file);
+        let inspection = inspect_retained_d1_migration_lease_at(
+            inspection_root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &"c".repeat(64),
+            &inspection_identity.nonce,
+            &inspection_identity.payload_sha256,
+        )
+        .expect_err("unresolved evidence must block retained inspection");
+        assert_zero_provider_calls(inspection, "retained inspection");
+        fs::remove_dir_all(inspection_root).expect("inspection fixture cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nonterminal_attempt_blocks_terminal_persistence_readback_and_retirement_without_mutation() {
+        use crate::d1_dml_attempt_custody::D1DmlAttemptPhase;
+
+        let root = private_test_root("phase-blocks-terminal-consumers");
+        let mut owner = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &"d".repeat(64),
+        )
+        .expect("create terminal-consumer fixture");
+        let identity = owner.identity.clone();
+        owner.retain();
+        drop(owner);
+        let mut retained = inspect_retained_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "newsletter-core",
+            &"d".repeat(64),
+            &identity.nonce,
+            &identity.payload_sha256,
+        )
+        .expect("inspect clean retained fixture");
+        let expected = terminal_receipt(&identity, &"e".repeat(64));
+        let (receipt_evidence, created) = retained
+            .persist_terminal_receipt(&expected)
+            .expect("persist terminal receipt before unresolved restore");
+        assert!(created);
+        install_phase_graph_on_target(
+            &retained.target,
+            &retained.identity.target_key_sha256,
+            "terminal-consumer-prepared",
+            D1DmlAttemptPhase::Prepared,
+        );
+
+        assert_zero_provider_calls(
+            retained
+                .revalidate()
+                .expect_err("Prepared evidence must block retained revalidation"),
+            "retained revalidation",
+        );
+        let persistence = retained
+            .persist_terminal_receipt(&expected)
+            .expect_err("Prepared evidence must block terminal receipt replay");
+        assert_eq!(persistence.local_namespace_mutations, 0);
+        assert_zero_provider_calls(persistence.result, "terminal receipt persistence");
+        let readback = retained.terminal_evidence_readback(&expected, None);
+        assert_eq!(readback.custody, D1TerminalCustodyNamespace::Unverified);
+        assert_eq!(readback.receipt_persisted, None);
+        let retirement = retained
+            .retire_after_terminal_receipt(&receipt_evidence)
+            .expect_err("Prepared evidence must block terminal retirement");
+        assert_eq!(retirement.local_namespace_mutations, 0);
+        assert_zero_provider_calls(retirement.result, "terminal retirement");
+        drop(retained);
+        fs::remove_dir_all(root).expect("terminal-consumer fixture cleanup");
     }
 
     #[cfg(target_os = "linux")]

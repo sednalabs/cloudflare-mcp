@@ -66,6 +66,7 @@ pub(crate) struct D1DmlCustodyCompleteAuditReceipt {
     pub(crate) target_key_sha256: String,
     pub(crate) claimant_count: usize,
     pub(crate) attempt_count: usize,
+    pub(crate) attempt_phase_counts: D1DmlCustodyAttemptPhaseCounts,
     pub(crate) pending_claimant_count: usize,
     pub(crate) bound_claimant_count: usize,
     pub(crate) cas_scratch_count: usize,
@@ -85,6 +86,39 @@ pub(crate) struct D1DmlCustodyCompleteAuditReceipt {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum D1DmlCustodyAuditProviderAuthority {
     None,
+}
+
+/// Closed aggregate product derived from canonical physical attempt states.
+/// These counts expose no attempt identity or state bytes. The complete audit
+/// binds them into `audit_sha256`; target-wide authority accepts only the two
+/// terminal phases already governed by the attempt state machine.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub(crate) struct D1DmlCustodyAttemptPhaseCounts {
+    pub(crate) prepared: usize,
+    pub(crate) dispatch_reserved: usize,
+    pub(crate) reconciliation_required: usize,
+    pub(crate) terminal_applied: usize,
+    pub(crate) terminal_not_applied: usize,
+}
+
+impl D1DmlCustodyAttemptPhaseCounts {
+    pub(crate) fn total(self) -> Option<usize> {
+        self.prepared
+            .checked_add(self.dispatch_reserved)?
+            .checked_add(self.reconciliation_required)?
+            .checked_add(self.terminal_applied)?
+            .checked_add(self.terminal_not_applied)
+    }
+
+    pub(crate) fn unresolved(self) -> Option<usize> {
+        self.prepared
+            .checked_add(self.dispatch_reserved)?
+            .checked_add(self.reconciliation_required)
+    }
+
+    pub(crate) fn terminal(self) -> Option<usize> {
+        self.terminal_applied.checked_add(self.terminal_not_applied)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -124,6 +158,9 @@ impl D1DmlCustodyCompleteAuditReceipt {
             && self.claimant_set_count == self.complete_claimant_set_count
             && self.claimant_set_count == self.matched_claimant_set_count
             && self.attempt_count == self.matched_claimant_set_count
+            && self.attempt_phase_counts.total() == Some(self.attempt_count)
+            && self.attempt_phase_counts.unresolved() == Some(0)
+            && self.attempt_phase_counts.terminal() == Some(self.attempt_count)
             && self.unmatched_claimant_set_count == 0
             && self.unmatched_attempt_count == 0
             && self.orphan_claimant_set_count == 0

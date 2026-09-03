@@ -109,17 +109,27 @@ rederives each claimant intent, every physically complete three-namespace
 claimant-set digest, and every attempt binding. It then proves the relation in
 both directions: each attempt requires exactly one complete exact `Bound` set,
 and each complete or partial claimant set is classified against its referenced
-attempt. Conflicting bindings, duplicate namespaces, digest drift, malformed
+attempt. Every canonical attempt independently rederives its phase from the
+durable reservation, ambiguity, provider-assertion, readback-assertion, and
+terminal-outcome product instead of trusting the stored phase label or
+claimant presence. The receipt counts `prepared`, `dispatch_reserved`,
+`reconciliation_required`, `terminal_applied`, and `terminal_not_applied`
+attempts and binds the complete phase product into `audit_sha256`. Conflicting
+bindings, duplicate namespaces, digest drift, malformed or aliased phase
 bytes, or incorrect placement fails closed. A canonical attempt without its
 complete exact set and a valid `Bound` set whose attempt is absent are explicit
 reconciliation evidence; `Pending`, partial, and CAS-scratch products are also
-`reconciliation_required`. The fixed aggregate receipt reports matched and
+`reconciliation_required`. A matched `Prepared`, `DispatchReserved`, or
+`ReconciliationRequired` attempt remains unresolved and makes the full audit
+reconciliation-required; only the existing governed `TerminalApplied` and
+`TerminalNotApplied` phases can participate in a clean target-wide product.
+The fixed aggregate receipt reports matched and
 unmatched attempts plus matched, unmatched, orphan, complete, and incomplete
-set counts and always declares
+set counts, the five phase counts, and always declares
 `provider_dispatch_authority=none`. Target-wide authority accepts only a clean
 fixed-budget projection of that receipt: no Pending claimant, CAS scratch,
 partial/orphan/unmatched set, unmatched attempt, malformed artifact, or
-nonfixed layout/budget identity. Fresh migration lease acquisition first
+nonterminal attempt, or nonfixed layout/budget identity. Fresh migration lease acquisition first
 installs or validates the fixed empty layout under the already-held permanent
 target guard, then runs that proof before creating `active.lease.json`. It
 persists the exact audit identity in the lease payload and re-runs it at
@@ -150,7 +160,8 @@ static plan, including its reason and provider request, rather than a future
 runtime audit digest. The layout step is local custody maintenance and declares
 no provider-dispatch authority. Retained and recovery workflows never install
 or repair a missing layout: missing, changed, unstable, over-budget, or merely
-reconciliation-required evidence stops with zero provider mutations. The
+reconciliation-required evidence, including any nonterminal attempt phase,
+stops with zero provider calls and mutations. The
 audit alone still performs or authorizes no provider dispatch. The
 complete pass has a fixed, versioned DML-specific global budget: at most 16,384
 canonical leaves, 65,536 physical leaf artifacts, and 268,435,456 total

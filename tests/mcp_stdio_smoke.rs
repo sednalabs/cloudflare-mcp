@@ -63,6 +63,15 @@ fn manifest_target_path(lease_root: &Path) -> PathBuf {
 
 fn empty_dml_custody_authorization(target_key_sha256: &str) -> Value {
     #[derive(Serialize)]
+    struct EmptyAttemptPhaseCounts {
+        prepared: usize,
+        dispatch_reserved: usize,
+        reconciliation_required: usize,
+        terminal_applied: usize,
+        terminal_not_applied: usize,
+    }
+
+    #[derive(Serialize)]
     struct EmptyCompleteAuditDigest<'a> {
         version: u8,
         layout_sha256: &'a str,
@@ -77,6 +86,7 @@ fn empty_dml_custody_authorization(target_key_sha256: &str) -> Value {
         target_key_sha256: &'a str,
         claimant_count: usize,
         attempt_count: usize,
+        attempt_phase_counts: EmptyAttemptPhaseCounts,
         pending_claimant_count: usize,
         bound_claimant_count: usize,
         cas_scratch_count: usize,
@@ -108,6 +118,13 @@ fn empty_dml_custody_authorization(target_key_sha256: &str) -> Value {
         target_key_sha256,
         claimant_count: 0,
         attempt_count: 0,
+        attempt_phase_counts: EmptyAttemptPhaseCounts {
+            prepared: 0,
+            dispatch_reserved: 0,
+            reconciliation_required: 0,
+            terminal_applied: 0,
+            terminal_not_applied: 0,
+        },
         pending_claimant_count: 0,
         bound_claimant_count: 0,
         cas_scratch_count: 0,
@@ -18621,7 +18638,7 @@ fn d1_rename_database_uses_patch_through_stdio_boundary() {
 
 #[cfg(unix)]
 #[test]
-fn d1_rename_database_reports_observed_layout_when_complete_audit_blocks_provider() {
+fn d1_target_wide_database_mutations_make_zero_calls_when_complete_audit_blocks_provider() {
     let (base_url, requests) = spawn_fake_d1_database_mutation_api(0);
     let lease_root = PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-d1-rename-audit-denial-{}-{}",
@@ -18655,6 +18672,7 @@ fn d1_rename_database_reports_observed_layout_when_complete_audit_blocks_provide
         content["error"]["code"],
         json!("d1.target_wide_dml_custody_unproven")
     );
+    assert_eq!(content["status"], json!("reconciliation_required"));
     assert_eq!(
         content["execution_evidence"]["local_layout"],
         json!({
@@ -18676,6 +18694,45 @@ fn d1_rename_database_reports_observed_layout_when_complete_audit_blocks_provide
         json!({"outcome": "not_dispatched", "provider_calls": 0, "provider_mutations": 0})
     );
     assert!(requests.lock().expect("request log lock").is_empty());
+
+    let delete_dry = mcp.call_tool(
+        3,
+        "d1_delete_database",
+        json!({
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "reason": "phase-aware complete-audit fixture",
+            "dry_run": true
+        }),
+    );
+    let confirmation = structured_content(&delete_dry)["required_confirmation_token"]
+        .as_str()
+        .expect("delete dry run confirmation")
+        .to_string();
+    let delete = mcp.call_tool(
+        4,
+        "d1_delete_database",
+        json!({
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "reason": "phase-aware complete-audit fixture",
+            "dry_run": false,
+            "confirmation_token": confirmation
+        }),
+    );
+    let delete_content = structured_content(&delete);
+    assert_eq!(delete_content["ok"], json!(false), "{delete_content}");
+    assert_eq!(
+        delete_content["error"]["code"],
+        json!("d1.target_wide_dml_custody_unproven")
+    );
+    assert_eq!(delete_content["status"], json!("reconciliation_required"));
+    assert_eq!(
+        delete_content["execution_evidence"]["provider"],
+        json!({"outcome": "not_dispatched", "provider_calls": 0, "provider_mutations": 0})
+    );
+    assert!(
+        requests.lock().expect("request log lock").is_empty(),
+        "neither target-wide consumer may reach the provider"
+    );
 
     mcp.terminate();
     fs::remove_dir_all(lease_root).expect("target guard cleanup");
