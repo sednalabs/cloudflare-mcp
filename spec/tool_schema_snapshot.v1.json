@@ -2348,7 +2348,7 @@
       "name": "d1_list_databases"
     },
     {
-      "description": "Plan or explicitly provision one immutable local D1 DML custody genesis and generation-bound layout. This operation performs no Cloudflare provider calls; exact replay converges and conflicts fail closed.",
+      "description": "Plan the external entitlement required to provision one immutable local D1 DML custody genesis and generation-bound layout. The MCP surface is proof-only and has no live provisioning authority.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,
