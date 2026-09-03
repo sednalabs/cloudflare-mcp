@@ -18,6 +18,9 @@ pub(crate) struct D1DatabaseMutation<T> {
 #[derive(Debug, Clone)]
 pub(crate) struct D1DatabaseMutationError {
     pub(crate) error: AdapterError,
+    // Retained for the durable-reservation successor; curated live dispatch is
+    // temporarily gated before the client boundary.
+    #[allow(dead_code)]
     pub(crate) lifecycle: D1DatabaseMutationLifecycle,
 }
 
@@ -95,6 +98,7 @@ impl D1DatabaseMutationLifecycle {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn provider_calls(self) -> u8 {
         match self.apply_status {
             MutationApplyStatus::RejectedBeforeApply => 0,
@@ -104,6 +108,7 @@ impl D1DatabaseMutationLifecycle {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn provider_mutations(self) -> Option<u8> {
         match self.apply_status {
             MutationApplyStatus::RejectedBeforeApply => Some(0),
@@ -112,6 +117,7 @@ impl D1DatabaseMutationLifecycle {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn failed_before_dispatch(self) -> bool {
         matches!(self.apply_status, MutationApplyStatus::RejectedBeforeApply)
     }

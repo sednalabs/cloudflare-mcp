@@ -675,6 +675,7 @@ impl D1TargetMutationGuard {
     /// Install the fixed empty layout only for a fresh target-wide operation.
     /// Retained/recovery callers deliberately do not use this path: absence in
     /// those workflows is evidence loss and must remain fail-closed.
+    #[allow(dead_code)]
     pub(crate) fn ensure_target_wide_d1_dml_custody_layout(
         &self,
     ) -> Result<crate::d1_dml_custody_layout::D1DmlCustodyLayoutEnsureOutcome, CallToolResult> {
@@ -730,6 +731,7 @@ impl D1TargetMutationGuard {
 
     /// Produce the only complete-audit projection accepted by a target-wide
     /// authority workflow. This does not authorize ordinary DML dispatch.
+    #[allow(dead_code)]
     pub(crate) fn authorize_target_wide_d1_dml_custody(
         &self,
     ) -> Result<crate::d1_dml_custody_layout::D1DmlCustodyCompleteAuditAuthorization, CallToolResult>
@@ -759,6 +761,7 @@ impl D1TargetMutationGuard {
 
     /// Re-run the bounded complete audit at the last owned target-wide
     /// boundary and require the exact identity bound into the caller's plan.
+    #[allow(dead_code)]
     pub(crate) fn revalidate_target_wide_d1_dml_custody(
         &self,
         expected: &crate::d1_dml_custody_layout::D1DmlCustodyCompleteAuditAuthorization,
@@ -1990,6 +1993,7 @@ pub(crate) fn inspect_terminal_d1_migration_lease_at(
     }
 }
 
+#[allow(dead_code)]
 fn d1_retained_lease_platform_unsupported() -> CallToolResult {
     d1_retained_lease_error(
         "d1.migration_reconciliation_platform_unsupported",
@@ -2255,6 +2259,7 @@ fn d1_target_guard_error(
     }))
 }
 
+#[allow(dead_code)]
 fn d1_target_wide_dml_custody_error(
     operation: &'static str,
     message: &'static str,
@@ -2311,6 +2316,7 @@ fn d1_migration_target_identity_activation_error(message: &'static str) -> CallT
     }))
 }
 
+#[allow(dead_code)]
 fn d1_lease_platform_unsupported() -> CallToolResult {
     CallToolResult::structured_error(json!({
         "ok": false, "operation": "d1_apply_migration_manifest", "status": "reconciliation_required", "lease_retained": false,

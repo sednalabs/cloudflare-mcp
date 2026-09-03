@@ -228,25 +228,6 @@ fn install_activated_manifest_root(lease_root: &Path) {
 }
 
 #[cfg(unix)]
-fn install_malformed_dml_attempt(lease_root: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-
-    install_activated_manifest_root(lease_root);
-    let digest = sha256_hex("malformed-target-wide-attempt");
-    let shard = manifest_target_path(lease_root)
-        .join("dml-custody-v1/attempt")
-        .join(&digest[..2])
-        .join(&digest[2..4]);
-    fs::create_dir_all(&shard).expect("create malformed-attempt shard");
-    fs::set_permissions(&shard, fs::Permissions::from_mode(0o700))
-        .expect("make malformed-attempt shard private");
-    let attempt = shard.join(format!("{digest}.json"));
-    fs::write(&attempt, b"{}\n").expect("write malformed-attempt fixture");
-    fs::set_permissions(&attempt, fs::Permissions::from_mode(0o600))
-        .expect("make malformed-attempt fixture private");
-}
-
-#[cfg(unix)]
 fn lock_manifest_target_guard(lease_root: &Path) -> fs::File {
     use std::os::unix::fs::PermissionsExt;
 
@@ -5238,67 +5219,6 @@ fn spawn_fake_d1_database_mutation_api(
     expected_requests: usize,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
     spawn_fake_d1_database_mutation_api_with_guard_drift(expected_requests, None)
-}
-
-fn spawn_fake_d1_database_mutation_disconnect_api(
-    expected_requests: usize,
-) -> (String, Arc<Mutex<Vec<Value>>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind disconnecting D1 API"); // DevSkim: ignore DS162092 -- loopback-only MCP test fixture
-    let addr = listener.local_addr().expect("disconnecting D1 API addr");
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let requests_for_thread = requests.clone();
-    thread::spawn(move || {
-        for stream in listener.incoming().take(expected_requests) {
-            let mut stream = stream.expect("disconnecting D1 API stream");
-            let (headers, body) = read_http_request(&mut stream);
-            let request_line = headers.lines().next().unwrap_or_default().to_string();
-            let mut request_parts = request_line.split_whitespace();
-            let method = request_parts.next().unwrap_or_default().to_string();
-            let path = request_parts.next().unwrap_or_default().to_string();
-            requests_for_thread
-                .lock()
-                .expect("disconnect request log")
-                .push(json!({
-                    "method": method,
-                    "path": path,
-                    "body_present": !body.is_empty(),
-                }));
-        }
-    });
-    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
-}
-
-fn spawn_fake_d1_database_mutation_raw_response_api(
-    response_body: Vec<u8>,
-) -> (String, Arc<Mutex<Vec<Value>>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind raw-response D1 API"); // DevSkim: ignore DS162092 -- loopback-only MCP test fixture
-    let addr = listener.local_addr().expect("raw-response D1 API addr");
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let requests_for_thread = requests.clone();
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept raw-response D1 request");
-        let (headers, body) = read_http_request(&mut stream);
-        let request_line = headers.lines().next().unwrap_or_default().to_string();
-        let mut request_parts = request_line.split_whitespace();
-        requests_for_thread
-            .lock()
-            .expect("raw-response request log")
-            .push(json!({
-                "method": request_parts.next().unwrap_or_default(),
-                "path": request_parts.next().unwrap_or_default(),
-                "body_present": !body.is_empty(),
-            }));
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
-            response_body.len()
-        )
-        .expect("write raw-response headers");
-        stream
-            .write_all(&response_body)
-            .expect("write raw-response body");
-    });
-    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only MCP test fixture
 }
 
 fn spawn_fake_d1_database_mutation_api_with_guard_drift(
@@ -18501,865 +18421,323 @@ fn d1_apply_migration_manifest_partial_multi_statement_response_loss_stays_unkno
 }
 
 #[test]
-fn d1_rename_database_uses_patch_through_stdio_boundary() {
-    let (base_url, requests) = spawn_fake_d1_database_mutation_api(2);
-    let lease_root = PathBuf::from("/tmp").join(format!(
-        "cloudflare-mcp-d1-rename-guard-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock after Unix epoch")
-            .as_nanos()
-    ));
-    #[cfg(unix)]
-    install_activated_manifest_root_without_dml_layout(&lease_root);
-    let mut mcp = McpStdioProcess::start_with_env(vec![
-        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
-        (
-            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
-            lease_root.to_string_lossy().to_string(),
-        ),
-    ]);
-    let dry = mcp.call_tool(
+fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_disabled_through_stdio()
+ {
+    let provider = TcpListener::bind("127.0.0.1:0").expect("bind no-call D1 provider witness");
+    provider
+        .set_nonblocking(true)
+        .expect("make D1 provider witness nonblocking");
+    let provider_address = provider.local_addr().expect("D1 provider witness address");
+    let provider_url = format!("http://{provider_address}"); // DevSkim: ignore DS137138 -- loopback-only no-call test witness
+    let mut mcp =
+        McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", provider_url)]);
+
+    let database_id = "123e4567-e89b-42d3-a456-426614174000";
+    let other_database_id = "223e4567-e89b-42d3-a456-426614174000";
+    let rename_reason = "reviewed synthetic rename";
+    let rename_dry = structured_content(&mcp.call_tool(
         2,
         "d1_rename_database",
         json!({
-            "database_id": "123e4567-e89b-42d3-a456-426614174000",
-            "name": "renamed-db",
+            "database_id": database_id,
+            "name": " renamed-db ",
+            "reason": rename_reason,
             "dry_run": true
         }),
-    );
-    let dry_content = structured_content(&dry);
-    assert_eq!(dry_content["ok"], json!(true), "{dry_content}");
+    ))
+    .clone();
+    assert_eq!(rename_dry["ok"], json!(true), "{rename_dry}");
+    assert_eq!(rename_dry["planned"], json!(true));
+    assert_eq!(rename_dry["new_name"], json!("renamed-db"));
     assert_eq!(
-        dry_content["plan"]["steps"].as_array().map(Vec::len),
-        Some(5)
-    );
-    assert_eq!(
-        dry_content["plan"]["steps"][1]["target"]["execution"],
-        json!("create_if_absent_at_live_guarded_execution")
+        rename_dry["plan"]["steps"].as_array().map(Vec::len),
+        Some(6)
     );
     assert_eq!(
-        dry_content["plan"]["steps"][2]["target"]["runtime_identity"],
-        json!("unmaterialized_until_live_guarded_execution")
-    );
-    assert_eq!(
-        dry_content["plan"]["steps"][3]["target"]["execution"],
-        json!("immediately_before_provider_dispatch")
-    );
-    assert_eq!(
-        dry_content["plan"]["steps"][4]["action"],
-        json!("apply_d1_database_patch")
-    );
-    assert_eq!(
-        dry_content["execution_evidence"]["local_layout"]["outcome"],
-        json!("unobserved")
-    );
-    assert_eq!(
-        dry_content["execution_evidence"]["local_layout"]["local_mutations"],
-        json!(0)
-    );
-    assert_eq!(
-        dry_content["execution_evidence"]["complete_audit"]["outcome"],
-        json!("runtime_unmaterialized")
-    );
-    assert_eq!(
-        dry_content["execution_evidence"]["provider"],
-        json!({"outcome": "not_dispatched", "provider_calls": 0, "provider_mutations": 0})
-    );
-    assert_eq!(requests.lock().expect("request log lock").len(), 0);
-
-    let response = mcp.call_tool(
-        3,
-        "d1_rename_database",
+        rename_dry["plan"]["steps"][0],
         json!({
-            "database_id": "123e4567-e89b-42d3-a456-426614174000",
-            "name": "renamed-db",
-            "dry_run": false
-        }),
-    );
-    let content = structured_content(&response);
-    assert_eq!(content["ok"], json!(true), "{content}");
-    assert_eq!(content["database"]["name"], json!("renamed-db"));
-    assert_eq!(content["plan"], dry_content["plan"]);
-    assert_eq!(
-        content["intended_plan_sha256"],
-        dry_content["intended_plan_sha256"]
-    );
-    assert_eq!(
-        content["execution_evidence"]["local_layout"]["outcome"],
-        json!("created")
-    );
-    assert_eq!(
-        content["execution_evidence"]["local_layout"]["local_mutations"],
-        json!(1)
-    );
-    assert_eq!(
-        content["execution_evidence"]["complete_audit"]["outcome"],
-        json!("authorized")
-    );
-    assert_eq!(
-        content["execution_evidence"]["complete_audit"]["identity"]["target_key_sha256"],
-        json!(sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000"))
-    );
-    assert_eq!(
-        content["execution_evidence"]["final_revalidation"]["outcome"],
-        json!("matched")
-    );
-    assert_eq!(
-        content["execution_evidence"]["final_revalidation"]["matched_identity"],
-        content["execution_evidence"]["complete_audit"]["identity"]
-    );
-    assert_eq!(
-        content["execution_evidence"]["provider"],
-        json!({
-            "outcome": "succeeded",
-            "provider_calls": 1,
-            "provider_mutations": 1,
-            "lifecycle": {
-                "dispatch_stage": "attempted",
-                "response_stage": "received",
-                "body_stage": "completely_read",
-                "http_status": 200,
-                "apply_status": "applied"
+            "ordinal": 1,
+            "action": "validate_d1_database_rename",
+            "side_effect": false,
+            "target": {
+                "operation_version": 1,
+                "normalized_target": {
+                    "account_id": "acct-1",
+                    "database_id": database_id
+                },
+                "requested_change": {"new_name": "renamed-db"},
+                "reason": rename_reason
             }
         })
     );
-
-    let second = mcp.call_tool(
-        4,
-        "d1_rename_database",
+    assert_eq!(
+        rename_dry["plan"]["steps"][4],
         json!({
-            "database_id": "123e4567-e89b-42d3-a456-426614174000",
-            "name": "renamed-db",
-            "dry_run": false
-        }),
-    );
-    let second_content = structured_content(&second);
-    assert_eq!(second_content["ok"], json!(true), "{second_content}");
-    assert_eq!(second_content["plan"], dry_content["plan"]);
-    assert_eq!(
-        second_content["execution_evidence"]["local_layout"]["outcome"],
-        json!("already_present")
-    );
-    assert_eq!(
-        second_content["execution_evidence"]["local_layout"]["local_mutations"],
-        json!(0)
+            "ordinal": 5,
+            "action": "install_durable_target_wide_mutation_reservation",
+            "side_effect": true,
+            "target": {
+                "target_key_sha256": sha256_hex(&format!("acct-1\0{database_id}")),
+                "required_before_provider_dispatch": true,
+                "implementation_status": "not_installed",
+                "effect_scope": "local_durable_attempt_custody",
+                "provider_dispatch_authority": "none"
+            }
+        })
     );
     assert_eq!(
-        second_content["execution_evidence"]["provider"]["provider_mutations"],
-        json!(1)
+        rename_dry["plan"]["steps"][5]["action"],
+        json!("apply_d1_database_patch")
     );
-    assert!(
-        manifest_target_path(&lease_root)
-            .join("dml-custody-v1/layout.json")
-            .is_file(),
-        "fresh rename must install the fixed layout before authorization"
-    );
-    let requests = requests.lock().expect("request log lock");
-    assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0]["method"], json!("PATCH"));
     assert_eq!(
-        requests[0]["path"],
-        json!("/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000")
-    );
-    assert_eq!(requests[0]["body"]["name"], json!("renamed-db"));
-    assert_eq!(requests[1], requests[0]);
-    mcp.terminate();
-    fs::remove_dir_all(lease_root).expect("target guard cleanup");
-}
-
-#[cfg(unix)]
-#[test]
-fn d1_target_wide_database_mutations_make_zero_calls_when_complete_audit_blocks_provider() {
-    let (base_url, requests) = spawn_fake_d1_database_mutation_api(0);
-    let lease_root = PathBuf::from("/tmp").join(format!(
-        "cloudflare-mcp-d1-rename-audit-denial-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock after Unix epoch")
-            .as_nanos()
-    ));
-    install_malformed_dml_attempt(&lease_root);
-    let mut mcp = McpStdioProcess::start_with_env(vec![
-        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
-        (
-            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
-            lease_root.to_string_lossy().to_string(),
-        ),
-    ]);
-
-    let response = mcp.call_tool(
-        2,
-        "d1_rename_database",
+        rename_dry["consent_binding"],
         json!({
-            "database_id": "123e4567-e89b-42d3-a456-426614174000",
-            "name": "renamed-db",
-            "dry_run": false
-        }),
+            "consent_version": 1,
+            "operation": "d1_rename_database",
+            "operation_version": 1,
+            "normalized_target": {
+                "account_id": "acct-1",
+                "database_id": database_id
+            },
+            "requested_change": {"new_name": "renamed-db"},
+            "reason": rename_reason,
+            "intended_plan_sha256": rename_dry["intended_plan_sha256"],
+            "plan": rename_dry["plan"]
+        })
     );
-    let content = structured_content(&response);
-    assert_eq!(content["ok"], json!(false), "{content}");
+    let rename_token = rename_dry["required_confirmation_token"]
+        .as_str()
+        .expect("rename confirmation token")
+        .to_string();
+    assert!(rename_token.starts_with("cf-d1-target-wide-"));
     assert_eq!(
-        content["error"]["code"],
-        json!("d1.target_wide_dml_custody_unproven")
-    );
-    assert_eq!(content["status"], json!("reconciliation_required"));
-    assert_eq!(
-        content["execution_evidence"]["local_layout"],
+        rename_dry["execution_evidence"]["durable_reservation"],
         json!({
-            "outcome": "already_present",
+            "outcome": "not_installed",
             "local_mutations": 0,
             "provider_dispatch_authority": "none"
         })
     );
     assert_eq!(
-        content["execution_evidence"]["complete_audit"]["outcome"],
-        json!("failed")
-    );
-    assert_eq!(
-        content["execution_evidence"]["final_revalidation"]["outcome"],
-        json!("runtime_unmaterialized")
-    );
-    assert_eq!(
-        content["execution_evidence"]["provider"],
+        rename_dry["execution_evidence"]["provider"],
         json!({"outcome": "not_dispatched", "provider_calls": 0, "provider_mutations": 0})
     );
-    assert!(requests.lock().expect("request log lock").is_empty());
 
-    let delete_dry = mcp.call_tool(
+    let rename_name_changed = structured_content(&mcp.call_tool(
         3,
-        "d1_delete_database",
+        "d1_rename_database",
         json!({
-            "database_id": "123e4567-e89b-42d3-a456-426614174000",
-            "reason": "phase-aware complete-audit fixture",
+            "database_id": database_id,
+            "name": "different-db",
+            "reason": rename_reason,
             "dry_run": true
         }),
-    );
-    let confirmation = structured_content(&delete_dry)["required_confirmation_token"]
-        .as_str()
-        .expect("delete dry run confirmation")
-        .to_string();
-    let delete = mcp.call_tool(
+    ))
+    .clone();
+    let rename_reason_changed = structured_content(&mcp.call_tool(
         4,
-        "d1_delete_database",
-        json!({
-            "database_id": "123e4567-e89b-42d3-a456-426614174000",
-            "reason": "phase-aware complete-audit fixture",
-            "dry_run": false,
-            "confirmation_token": confirmation
-        }),
-    );
-    let delete_content = structured_content(&delete);
-    assert_eq!(delete_content["ok"], json!(false), "{delete_content}");
-    assert_eq!(
-        delete_content["error"]["code"],
-        json!("d1.target_wide_dml_custody_unproven")
-    );
-    assert_eq!(delete_content["status"], json!("reconciliation_required"));
-    assert_eq!(
-        delete_content["execution_evidence"]["provider"],
-        json!({"outcome": "not_dispatched", "provider_calls": 0, "provider_mutations": 0})
-    );
-    assert!(
-        requests.lock().expect("request log lock").is_empty(),
-        "neither target-wide consumer may reach the provider"
-    );
-
-    mcp.terminate();
-    fs::remove_dir_all(lease_root).expect("target guard cleanup");
-}
-
-#[cfg(unix)]
-#[test]
-fn d1_target_wide_database_mutations_report_pre_dispatch_failure_with_zero_calls() {
-    let lease_root = PathBuf::from("/tmp").join(format!(
-        "cloudflare-mcp-d1-target-wide-pre-dispatch-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock after Unix epoch")
-            .as_nanos()
-    ));
-    install_activated_manifest_root_without_dml_layout(&lease_root);
-    let mut mcp = McpStdioProcess::start_with_env(vec![
-        (
-            "CLOUDFLARE_MCP_API_BASE_URL",
-            "http://127.0.0.1:9".to_string(),
-        ),
-        ("CLOUDFLARE_API_TOKEN", String::new()),
-        ("CLOUDFLARE_MCP_API_TOKEN", String::new()),
-        (
-            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
-            lease_root.to_string_lossy().to_string(),
-        ),
-    ]);
-
-    let rename = structured_content(&mcp.call_tool(
-        2,
         "d1_rename_database",
         json!({
-            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "database_id": database_id,
             "name": "renamed-db",
-            "dry_run": false
+            "reason": "different reviewed reason",
+            "dry_run": true
         }),
     ))
     .clone();
-    assert_eq!(rename["ok"], json!(false), "{rename}");
-    assert_eq!(
-        rename["error"]["code"],
-        json!("cloudflare.config_missing_token")
-    );
-    assert_eq!(
-        rename["execution_evidence"]["provider"],
-        json!({
-            "outcome": "failed_before_dispatch",
-            "provider_calls": 0,
-            "provider_mutations": 0,
-            "lifecycle": {
-                "dispatch_stage": "pre_dispatch",
-                "response_stage": "not_received",
-                "body_stage": "not_read",
-                "http_status": null,
-                "apply_status": "rejected_before_apply"
-            }
-        })
-    );
-
-    let delete_dry = structured_content(&mcp.call_tool(
-        3,
-        "d1_delete_database",
-        json!({
-            "database_id": "123e4567-e89b-42d3-a456-426614174000",
-            "dry_run": true,
-            "reason": "synthetic pre-dispatch proof"
-        }),
-    ))
-    .clone();
-    let token = delete_dry["required_confirmation_token"]
-        .as_str()
-        .expect("delete confirmation token")
-        .to_string();
-    let delete = structured_content(&mcp.call_tool(
-        4,
-        "d1_delete_database",
-        json!({
-            "database_id": "123e4567-e89b-42d3-a456-426614174000",
-            "dry_run": false,
-            "confirmation_token": token,
-            "reason": "synthetic pre-dispatch proof"
-        }),
-    ))
-    .clone();
-    assert_eq!(delete["ok"], json!(false), "{delete}");
-    assert_eq!(
-        delete["error"]["code"],
-        json!("cloudflare.config_missing_token")
-    );
-    assert_eq!(
-        delete["execution_evidence"]["provider"],
-        rename["execution_evidence"]["provider"]
-    );
-
-    mcp.terminate();
-    fs::remove_dir_all(lease_root).expect("target guard cleanup");
-}
-
-#[cfg(unix)]
-#[test]
-fn d1_target_wide_database_mutations_report_disconnect_as_uncertain_without_retry() {
-    let (base_url, requests) = spawn_fake_d1_database_mutation_disconnect_api(2);
-    let lease_root = PathBuf::from("/tmp").join(format!(
-        "cloudflare-mcp-d1-target-wide-disconnect-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock after Unix epoch")
-            .as_nanos()
-    ));
-    install_activated_manifest_root_without_dml_layout(&lease_root);
-    let mut mcp = McpStdioProcess::start_with_env(vec![
-        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
-        (
-            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
-            lease_root.to_string_lossy().to_string(),
-        ),
-    ]);
-
-    let rename = structured_content(&mcp.call_tool(
-        2,
+    let rename_target_changed = structured_content(&mcp.call_tool(
+        5,
         "d1_rename_database",
         json!({
-            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "database_id": other_database_id,
             "name": "renamed-db",
-            "dry_run": false
+            "reason": rename_reason,
+            "dry_run": true
         }),
     ))
     .clone();
-    assert_eq!(rename["ok"], json!(false), "{rename}");
-    assert_eq!(rename["error"]["code"], json!("cloudflare.transport_error"));
-    assert_eq!(rename["error"]["retryable"], json!(false));
-    assert_eq!(
-        rename["execution_evidence"]["provider"],
-        json!({
-            "outcome": "uncertain_after_dispatch",
-            "provider_calls": 1,
-            "provider_mutations": null,
-            "lifecycle": {
-                "dispatch_stage": "attempted",
-                "response_stage": "not_received",
-                "body_stage": "not_read",
-                "http_status": null,
-                "apply_status": "uncertain_after_dispatch"
-            }
-        })
-    );
-
-    let delete_dry = structured_content(&mcp.call_tool(
-        3,
-        "d1_delete_database",
-        json!({
-            "database_id": "123e4567-e89b-42d3-a456-426614174000",
-            "dry_run": true,
-            "reason": "synthetic disconnect proof"
-        }),
-    ))
-    .clone();
-    let token = delete_dry["required_confirmation_token"]
-        .as_str()
-        .expect("delete confirmation token")
-        .to_string();
-    let delete = structured_content(&mcp.call_tool(
-        4,
-        "d1_delete_database",
-        json!({
-            "database_id": "123e4567-e89b-42d3-a456-426614174000",
-            "dry_run": false,
-            "confirmation_token": token,
-            "reason": "synthetic disconnect proof"
-        }),
-    ))
-    .clone();
-    assert_eq!(delete["ok"], json!(false), "{delete}");
-    assert_eq!(delete["error"]["code"], json!("cloudflare.transport_error"));
-    assert_eq!(
-        delete["execution_evidence"]["provider"],
-        rename["execution_evidence"]["provider"]
-    );
-    let requests = requests.lock().expect("disconnect request log");
-    assert_eq!(requests.len(), 2, "exactly one attempt per mutation");
-    assert_eq!(requests[0]["method"], json!("PATCH"));
-    assert_eq!(requests[1]["method"], json!("DELETE"));
-
-    mcp.terminate();
-    fs::remove_dir_all(lease_root).expect("target guard cleanup");
-}
-
-#[cfg(unix)]
-#[test]
-fn d1_target_wide_database_mutations_keep_strict_envelope_failures_uncertain_and_redacted() {
-    let cases = [
-        (
-            "duplicate-errors",
-            br#"{"success":true,"result":{"name":"renamed-db"},"errors":[],"messages":[],"errors":[{"message":"must-not-return"}]}"#.as_slice(),
-            "cloudflare.d1.database_mutation_duplicate_object_key",
-            &["rename", "delete"][..],
-        ),
-        (
-            "nonempty-errors",
-            br#"{"success":true,"result":{"name":"renamed-db"},"errors":[{"message":"must-not-return"}],"messages":[]}"#.as_slice(),
-            "cloudflare.d1.database_mutation_contradictory_envelope",
-            &["rename", "delete"][..],
-        ),
-        (
-            "missing-result",
-            br#"{"success":true,"errors":[],"messages":[]}"#.as_slice(),
-            "cloudflare.d1.database_mutation_malformed_envelope",
-            &["rename"][..],
-        ),
-        (
-            "malformed-response-info",
-            br#"{"success":true,"result":{"name":"renamed-db"},"errors":[],"messages":[{"code":999,"message":"must-not-return"}]}"#.as_slice(),
-            "cloudflare.d1.database_mutation_malformed_envelope",
-            &["rename", "delete"][..],
-        ),
-        (
-            "decimal-response-info-code",
-            br#"{"success":true,"result":{"name":"renamed-db"},"errors":[],"messages":[{"code":1000.0,"message":"must-not-return"}]}"#.as_slice(),
-            "cloudflare.d1.database_mutation_malformed_envelope",
-            &["rename", "delete"][..],
-        ),
-        (
-            "duplicate-equal-response-info",
-            br#"{"success":true,"result":{"name":"renamed-db"},"errors":[],"messages":[{"code":1000,"message":"must-not-return","source":{"pointer":"/result/name"}},{"source":{"pointer":"/result/name"},"message":"must-not-return","code":1000}]}"#.as_slice(),
-            "cloudflare.d1.database_mutation_malformed_envelope",
-            &["rename", "delete"][..],
-        ),
-    ];
-    for (case, response_body, expected_code, operations) in cases {
-        for operation in operations {
-            let (base_url, requests) =
-                spawn_fake_d1_database_mutation_raw_response_api(response_body.to_vec());
-            let lease_root = PathBuf::from("/tmp").join(format!(
-                "cloudflare-mcp-d1-strict-envelope-{case}-{operation}-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .expect("system clock after Unix epoch")
-                    .as_nanos()
-            ));
-            install_activated_manifest_root_without_dml_layout(&lease_root);
-            let mut mcp = McpStdioProcess::start_with_env(vec![
-                ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
-                (
-                    "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
-                    lease_root.to_string_lossy().to_string(),
-                ),
-            ]);
-
-            let response = if *operation == "rename" {
-                mcp.call_tool(
-                    2,
-                    "d1_rename_database",
-                    json!({
-                        "database_id": "123e4567-e89b-42d3-a456-426614174000",
-                        "name": "renamed-db",
-                        "dry_run": false
-                    }),
-                )
-            } else {
-                let dry = mcp.call_tool(
-                    2,
-                    "d1_delete_database",
-                    json!({
-                        "database_id": "123e4567-e89b-42d3-a456-426614174000",
-                        "reason": "strict response-envelope fixture",
-                        "dry_run": true
-                    }),
-                );
-                let confirmation = structured_content(&dry)["required_confirmation_token"]
-                    .as_str()
-                    .expect("delete confirmation token")
-                    .to_string();
-                mcp.call_tool(
-                    3,
-                    "d1_delete_database",
-                    json!({
-                        "database_id": "123e4567-e89b-42d3-a456-426614174000",
-                        "reason": "strict response-envelope fixture",
-                        "dry_run": false,
-                        "confirmation_token": confirmation
-                    }),
-                )
-            };
-            let content = structured_content(&response);
-            assert_eq!(content["ok"], json!(false), "{case} {operation}: {content}");
-            assert_eq!(
-                content["error"]["code"],
-                json!(expected_code),
-                "{case} {operation}"
-            );
-            assert_eq!(content["error"]["retryable"], json!(false));
-            assert_eq!(
-                content["execution_evidence"]["provider"],
-                json!({
-                    "outcome": "uncertain_after_dispatch",
-                    "provider_calls": 1,
-                    "provider_mutations": null,
-                    "lifecycle": {
-                        "dispatch_stage": "attempted",
-                        "response_stage": "received",
-                        "body_stage": "completely_read",
-                        "http_status": 200,
-                        "apply_status": "uncertain_after_dispatch"
-                    }
-                }),
-                "{case} {operation}"
-            );
-            assert!(
-                !serde_json::to_string(content)
-                    .expect("serialize strict response denial")
-                    .contains("must-not-return"),
-                "{case} {operation} must not expose provider body fields"
-            );
-            let requests = requests.lock().expect("strict response request log");
-            assert_eq!(requests.len(), 1, "{case} {operation} must not retry");
-            assert_eq!(
-                requests[0]["method"],
-                json!(if *operation == "rename" {
-                    "PATCH"
-                } else {
-                    "DELETE"
-                })
-            );
-            drop(requests);
-            mcp.terminate();
-            fs::remove_dir_all(lease_root).expect("strict response target cleanup");
-        }
+    for changed in [
+        &rename_name_changed,
+        &rename_reason_changed,
+        &rename_target_changed,
+    ] {
+        assert_ne!(
+            changed["required_confirmation_token"], rename_dry["required_confirmation_token"],
+            "{changed}"
+        );
+        assert_ne!(
+            changed["intended_plan_sha256"], rename_dry["intended_plan_sha256"],
+            "{changed}"
+        );
     }
-}
 
-#[cfg(unix)]
-#[test]
-fn d1_target_wide_database_mutations_accept_valid_messages_and_operation_specific_results() {
-    let cases = [
+    let delete_reason = "reviewed synthetic delete";
+    let delete_dry = structured_content(&mcp.call_tool(
+        6,
+        "d1_delete_database",
+        json!({
+            "database_id": database_id,
+            "reason": delete_reason,
+            "dry_run": true
+        }),
+    ))
+    .clone();
+    assert_eq!(delete_dry["ok"], json!(true), "{delete_dry}");
+    assert_eq!(delete_dry["planned"], json!(true));
+    assert_eq!(
+        delete_dry["consent_binding"],
+        json!({
+            "consent_version": 1,
+            "operation": "d1_delete_database",
+            "operation_version": 1,
+            "normalized_target": {
+                "account_id": "acct-1",
+                "database_id": database_id
+            },
+            "requested_change": {"delete_database": true},
+            "reason": delete_reason,
+            "intended_plan_sha256": delete_dry["intended_plan_sha256"],
+            "plan": delete_dry["plan"]
+        })
+    );
+    let delete_token = delete_dry["required_confirmation_token"]
+        .as_str()
+        .expect("delete confirmation token")
+        .to_string();
+    assert_ne!(
+        delete_token, rename_token,
+        "operation identity must bind consent"
+    );
+
+    let delete_reason_changed = structured_content(&mcp.call_tool(
+        7,
+        "d1_delete_database",
+        json!({
+            "database_id": database_id,
+            "reason": "different reviewed reason",
+            "dry_run": true
+        }),
+    ))
+    .clone();
+    assert_ne!(
+        delete_reason_changed["required_confirmation_token"],
+        delete_dry["required_confirmation_token"]
+    );
+    assert_ne!(
+        delete_reason_changed["intended_plan_sha256"],
+        delete_dry["intended_plan_sha256"]
+    );
+
+    let live_cases = [
         (
-            "rename-valid-message",
-            "rename",
-            br#"{"success":true,"result":{"name":"renamed-db"},"errors":[],"messages":[{"code":1000,"message":"informational"},{"code":18446744073709551615,"message":"high unsigned integer"},{"source":{},"message":"informational","code":1000},{"code":1002,"message":"pointed","documentation_url":"https://example.invalid/info","source":{"pointer":"/result/name"}}]}"#.as_slice(),
-            json!("renamed-db"),
+            8,
+            "d1_rename_database",
+            json!({
+                "database_id": database_id,
+                "name": "renamed-db",
+                "reason": rename_reason,
+                "dry_run": false
+            }),
+            "d1.rename_confirmation_required",
+            "confirmation_required",
         ),
         (
-            "delete-absent-result-valid-message",
-            "delete",
-            br#"{"success":true,"errors":[],"messages":[{"code":1000,"message":"informational"},{"code":18446744073709551615,"message":"high unsigned integer"},{"source":{},"message":"informational","code":1000}]}"#.as_slice(),
-            json!({}),
+            9,
+            "d1_rename_database",
+            json!({
+                "database_id": database_id,
+                "name": "renamed-db",
+                "reason": "different reviewed reason",
+                "confirmation_token": rename_token,
+                "dry_run": false
+            }),
+            "d1.rename_confirmation_required",
+            "confirmation_required",
+        ),
+        (
+            10,
+            "d1_delete_database",
+            json!({
+                "database_id": database_id,
+                "reason": delete_reason,
+                "confirmation_token": rename_dry["required_confirmation_token"],
+                "dry_run": false
+            }),
+            "d1.delete_confirmation_required",
+            "confirmation_required",
+        ),
+        (
+            11,
+            "d1_rename_database",
+            json!({
+                "database_id": database_id,
+                "name": "renamed-db",
+                "reason": rename_reason,
+                "confirmation_token": rename_dry["required_confirmation_token"],
+                "dry_run": false
+            }),
+            "d1.target_wide_durable_reservation_not_installed",
+            "durable_reservation_not_installed",
+        ),
+        (
+            12,
+            "d1_delete_database",
+            json!({
+                "database_id": database_id,
+                "reason": delete_reason,
+                "dry_run": false
+            }),
+            "d1.delete_confirmation_required",
+            "confirmation_required",
+        ),
+        (
+            13,
+            "d1_delete_database",
+            json!({
+                "database_id": database_id,
+                "reason": delete_reason,
+                "confirmation_token": delete_dry["required_confirmation_token"],
+                "dry_run": false
+            }),
+            "d1.target_wide_durable_reservation_not_installed",
+            "durable_reservation_not_installed",
         ),
     ];
-    for (case, operation, response_body, expected_result) in cases {
-        let (base_url, requests) =
-            spawn_fake_d1_database_mutation_raw_response_api(response_body.to_vec());
-        let lease_root = PathBuf::from("/tmp").join(format!(
-            "cloudflare-mcp-d1-operation-envelope-{case}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock after Unix epoch")
-                .as_nanos()
-        ));
-        install_activated_manifest_root_without_dml_layout(&lease_root);
-        let mut mcp = McpStdioProcess::start_with_env(vec![
-            ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
-            (
-                "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
-                lease_root.to_string_lossy().to_string(),
-            ),
-        ]);
-
-        let response = if operation == "rename" {
-            mcp.call_tool(
-                2,
-                "d1_rename_database",
-                json!({
-                    "database_id": "123e4567-e89b-42d3-a456-426614174000",
-                    "name": "renamed-db",
-                    "dry_run": false
-                }),
-            )
-        } else {
-            let dry = mcp.call_tool(
-                2,
-                "d1_delete_database",
-                json!({
-                    "database_id": "123e4567-e89b-42d3-a456-426614174000",
-                    "reason": "operation-specific response-envelope fixture",
-                    "dry_run": true
-                }),
-            );
-            let confirmation = structured_content(&dry)["required_confirmation_token"]
-                .as_str()
-                .expect("delete confirmation token")
-                .to_string();
-            mcp.call_tool(
-                3,
-                "d1_delete_database",
-                json!({
-                    "database_id": "123e4567-e89b-42d3-a456-426614174000",
-                    "reason": "operation-specific response-envelope fixture",
-                    "dry_run": false,
-                    "confirmation_token": confirmation
-                }),
-            )
-        };
-        let content = structured_content(&response);
-        assert_eq!(content["ok"], json!(true), "{case}: {content}");
-        let actual_result = if operation == "rename" {
-            &content["database"]["name"]
-        } else {
-            &content["result"]
-        };
-        assert_eq!(actual_result, &expected_result, "{case}");
+    for (request_id, operation, arguments, expected_code, expected_status) in live_cases {
+        let content = structured_content(&mcp.call_tool(request_id, operation, arguments)).clone();
+        assert_eq!(content["ok"], json!(false), "{operation}: {content}");
+        assert_eq!(content["operation"], json!(operation), "{content}");
+        assert_eq!(content["status"], json!(expected_status), "{content}");
+        assert_eq!(content["error"]["code"], json!(expected_code), "{content}");
+        assert_eq!(content["provider_calls"], json!(0), "{content}");
+        assert_eq!(content["provider_mutations"], json!(0), "{content}");
+        assert!(
+            content.get("required_confirmation_token").is_none(),
+            "only dry-run may emit the confirmation token: {content}"
+        );
+        assert_eq!(
+            content["execution_evidence"]["local_layout"]["outcome"],
+            json!("unobserved"),
+            "{content}"
+        );
+        assert_eq!(
+            content["execution_evidence"]["durable_reservation"]["outcome"],
+            json!("not_installed"),
+            "{content}"
+        );
         assert_eq!(
             content["execution_evidence"]["provider"],
-            json!({
-                "outcome": "succeeded",
-                "provider_calls": 1,
-                "provider_mutations": 1,
-                "lifecycle": {
-                    "dispatch_stage": "attempted",
-                    "response_stage": "received",
-                    "body_stage": "completely_read",
-                    "http_status": 200,
-                    "apply_status": "applied"
-                }
-            }),
-            "{case}"
+            json!({"outcome": "not_dispatched", "provider_calls": 0, "provider_mutations": 0}),
+            "{content}"
         );
-        assert_eq!(requests.lock().expect("response request log").len(), 1);
-        mcp.terminate();
-        fs::remove_dir_all(lease_root).expect("operation envelope target cleanup");
+        assert!(
+            matches!(provider.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "{operation} must deny before opening a provider connection"
+        );
     }
-}
 
-#[test]
-fn d1_delete_database_requires_token_and_deletes_through_stdio_boundary() {
-    let (base_url, requests) = spawn_fake_d1_database_mutation_api(1);
-    let lease_root = PathBuf::from("/tmp").join(format!(
-        "cloudflare-mcp-d1-delete-guard-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock after Unix epoch")
-            .as_nanos()
-    ));
-    #[cfg(unix)]
-    install_activated_manifest_root_without_dml_layout(&lease_root);
-    let mut mcp = McpStdioProcess::start_with_env(vec![
-        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
-        (
-            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
-            lease_root.to_string_lossy().to_string(),
-        ),
-    ]);
-    let dry_run = mcp.call_tool(
-        2,
-        "d1_delete_database",
-        json!({
-            "database_id": "123e4567-e89b-42d3-a456-426614174000",
-            "dry_run": true,
-            "reason": "stdio regression"
-        }),
-    );
-    let dry_run_content = structured_content(&dry_run);
-    assert_eq!(dry_run_content["ok"], json!(true), "{dry_run_content}");
-    assert_eq!(dry_run_content["planned"], json!(true));
-    assert_eq!(requests.lock().expect("request log lock").len(), 0);
-    let token = dry_run_content["required_confirmation_token"]
-        .as_str()
-        .expect("confirmation token")
-        .to_string();
-    assert_eq!(
-        dry_run_content["plan"]["steps"].as_array().map(Vec::len),
-        Some(5)
-    );
-    assert_eq!(
-        dry_run_content["plan"]["steps"][4]["action"],
-        json!("apply_d1_database_delete")
-    );
-    assert_eq!(
-        dry_run_content["execution_evidence"]["provider"],
-        json!({"outcome": "not_dispatched", "provider_calls": 0, "provider_mutations": 0})
-    );
-
-    let changed_reason_dry = mcp.call_tool(
-        3,
-        "d1_delete_database",
-        json!({
-            "database_id": "123e4567-e89b-42d3-a456-426614174000",
-            "dry_run": true,
-            "reason": "changed reviewed reason"
-        }),
-    );
-    let changed_reason_content = structured_content(&changed_reason_dry);
-    assert_ne!(
-        changed_reason_content["required_confirmation_token"],
-        dry_run_content["required_confirmation_token"]
-    );
-    assert_ne!(
-        changed_reason_content["intended_plan_sha256"],
-        dry_run_content["intended_plan_sha256"]
-    );
-
-    let stale_consent = mcp.call_tool(
-        4,
-        "d1_delete_database",
-        json!({
-            "database_id": "123e4567-e89b-42d3-a456-426614174000",
-            "dry_run": false,
-            "confirmation_token": token,
-            "reason": "changed reviewed reason"
-        }),
-    );
-    let stale_consent_content = structured_content(&stale_consent);
-    assert_eq!(stale_consent_content["ok"], json!(false));
-    assert_eq!(
-        stale_consent_content["error"]["code"],
-        json!("d1.delete_confirmation_required")
-    );
-    assert_eq!(
-        stale_consent_content["execution_evidence"]["provider"]["provider_calls"],
-        json!(0)
-    );
-    assert_eq!(requests.lock().expect("request log lock").len(), 0);
-
-    let response = mcp.call_tool(
-        5,
-        "d1_delete_database",
-        json!({
-            "database_id": "123e4567-e89b-42d3-a456-426614174000",
-            "dry_run": false,
-            "confirmation_token": token,
-            "reason": "stdio regression"
-        }),
-    );
-    let content = structured_content(&response);
-    assert_eq!(content["ok"], json!(true), "{content}");
-    assert_eq!(content["result"]["deleted"], json!(true));
-    assert_eq!(content["plan"], dry_run_content["plan"]);
-    assert_eq!(
-        content["intended_plan_sha256"],
-        dry_run_content["intended_plan_sha256"]
-    );
-    assert_eq!(
-        content["execution_evidence"]["local_layout"]["outcome"],
-        json!("created")
-    );
-    assert_eq!(
-        content["execution_evidence"]["complete_audit"]["outcome"],
-        json!("authorized")
-    );
-    assert_eq!(
-        content["execution_evidence"]["final_revalidation"]["outcome"],
-        json!("matched")
-    );
-    assert_eq!(
-        content["execution_evidence"]["final_revalidation"]["matched_identity"],
-        content["execution_evidence"]["complete_audit"]["identity"]
-    );
-    assert_eq!(
-        content["execution_evidence"]["provider"],
-        json!({
-            "outcome": "succeeded",
-            "provider_calls": 1,
-            "provider_mutations": 1,
-            "lifecycle": {
-                "dispatch_stage": "attempted",
-                "response_stage": "received",
-                "body_stage": "completely_read",
-                "http_status": 200,
-                "apply_status": "applied"
-            }
-        })
-    );
-    assert!(
-        manifest_target_path(&lease_root)
-            .join("dml-custody-v1/layout.json")
-            .is_file(),
-        "fresh delete must install the fixed layout before authorization"
-    );
-    let requests = requests.lock().expect("request log lock");
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0]["method"], json!("DELETE"));
-    assert_eq!(
-        requests[0]["path"],
-        json!("/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000")
-    );
-    assert_eq!(requests[0]["body"], Value::Null);
     mcp.terminate();
-    fs::remove_dir_all(lease_root).expect("target guard cleanup");
 }
-
 fn expected_d1_execute_write_mutation_plan(dry_run: bool) -> Value {
     let mut steps = vec![
         json!({"ordinal": 1, "action": "collect_stable_catalog", "side_effect": false, "target": {"observations": 2}}),
@@ -20618,7 +19996,7 @@ fn d1_execute_write_unicode_boundary_denials_are_pre_provider() {
 
 #[cfg(unix)]
 #[test]
-fn curated_d1_guard_denials_are_pre_provider_and_caller_correlated() {
+fn d1_execute_write_guard_denial_is_pre_provider_and_caller_correlated() {
     let provider = TcpListener::bind("127.0.0.1:0").expect("bind no-call D1 provider witness");
     provider
         .set_nonblocking(true)
@@ -20671,66 +20049,33 @@ fn curated_d1_guard_denials_are_pre_provider_and_caller_correlated() {
         "case alias must fail before selecting a guard namespace or contacting the provider"
     );
 
-    let delete_dry_run = mcp.call_tool(
+    let response = mcp.call_tool(
         20,
-        "d1_delete_database",
+        "d1_execute_write",
         json!({
             "database_id": "123e4567-e89b-42d3-a456-426614174000",
-            "dry_run": true,
-            "reason": "guard-denial regression"
+            "sql": "UPDATE example SET enabled = 1 WHERE id = 7",
+            "operation_id": "operation-guard-fixture",
+            "execution_attempt_id": "attempt-guard-fixture",
+            "provider_request_id": "provider-guard-fixture",
+            "approved_composition_sha256": "0".repeat(64),
+            "dry_run": false
         }),
     );
-    let delete_confirmation = structured_content(&delete_dry_run)["required_confirmation_token"]
-        .as_str()
-        .expect("delete confirmation token")
-        .to_string();
-
-    for (request_id, operation, arguments) in [
-        (
-            21,
-            "d1_rename_database",
-            json!({"database_id": "123e4567-e89b-42d3-a456-426614174000", "name": "renamed-db", "dry_run": false}),
-        ),
-        (
-            22,
-            "d1_delete_database",
-            json!({
-                "database_id": "123e4567-e89b-42d3-a456-426614174000",
-                "dry_run": false,
-                "confirmation_token": delete_confirmation,
-                "reason": "guard-denial regression"
-            }),
-        ),
-        (
-            23,
-            "d1_execute_write",
-            json!({
-                "database_id": "123e4567-e89b-42d3-a456-426614174000",
-                "sql": "UPDATE example SET enabled = 1 WHERE id = 7",
-                "operation_id": "operation-guard-fixture",
-                "execution_attempt_id": "attempt-guard-fixture",
-                "provider_request_id": "provider-guard-fixture",
-                "approved_composition_sha256": "0".repeat(64),
-                "dry_run": false
-            }),
-        ),
-    ] {
-        let response = mcp.call_tool(request_id, operation, arguments);
-        let content = structured_content(&response);
-        assert_eq!(content["ok"], json!(false), "{operation}: {content}");
-        assert_eq!(content["operation"], json!(operation), "{content}");
-        assert_eq!(
-            content["error"]["code"],
-            json!("d1.target_guard_locked"),
-            "{operation}: {content}"
-        );
-        assert_eq!(content["provider_calls"], json!(0), "{content}");
-        assert_eq!(content["provider_mutations"], json!(0), "{content}");
-        assert!(
-            matches!(provider.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
-            "{operation} guard denial must occur before any provider connection"
-        );
-    }
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["operation"], json!("d1_execute_write"), "{content}");
+    assert_eq!(
+        content["error"]["code"],
+        json!("d1.target_guard_locked"),
+        "{content}"
+    );
+    assert_eq!(content["provider_calls"], json!(0), "{content}");
+    assert_eq!(content["provider_mutations"], json!(0), "{content}");
+    assert!(
+        matches!(provider.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "guard denial must occur before any provider connection"
+    );
 
     mcp.terminate();
     drop(held_guard);

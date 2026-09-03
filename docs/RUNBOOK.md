@@ -136,50 +136,49 @@ persists the exact audit identity in the lease payload and re-runs it at
 provider, receipt-persistence, restoration, and retirement boundaries. Because
 terminal receipts bind `lease_payload_sha256`, they also bind the exact
 complete-audit identity.
-Curated database rename and delete use the same fresh-only layout step. Before
-dry/live branching they derive one canonical five-step intended plan: validate
-the exact operator intent, conditionally create the fixed layout during live
-guarded execution, require a clean complete audit, require exact final
-revalidation, then dispatch the provider operation last. Dry-run and live
-return the same `intended_plan_sha256` and plan bytes. Runtime
-`execution_evidence` is separate: dry-run reports local custody `unobserved`,
-audit/revalidation unmaterialized, and zero local/provider effects; live reports
-`created` or `already_present`, the aggregate-safe audit identity, exact final
-match, and provider evidence. Rename/delete share one D1-database-only client
-lifecycle. Token, validation, and request-build failures are
-`failed_before_dispatch` with zero provider calls and zero provider mutations.
-Once the single no-redirect request is attempted, transport loss, HTTP errors,
-body-read loss, and malformed or contradictory responses are
-`uncertain_after_dispatch` with one provider call and an unknown mutation
-count; response stages include only aggregate-safe body state and optional HTTP
-status. No such failure is retried. Immediate success requires one bounded,
-duplicate-free exact Cloudflare operation envelope with literal `success=true`,
-an exact empty `errors` array, and a required `messages` array. Every empty or
-nonempty message must be a unique exact ResponseInfo object: JSON unsigned
-integer `code >= 1000`, string `message`, optional string `documentation_url`,
-and optional exact `source` object containing only an optional string `pointer`.
-Semantic duplicates are rejected regardless of object property order. Rename
-also requires a non-null `result` that decodes as a D1 database. Delete permits an
-absent or null result and normalizes either to `{}`; any present non-null JSON
-result is accepted and returned through the existing `serde_json::Value`
-interface. Missing, null, wrong-type, unknown, duplicate, overdeep,
-contradictory, or structurally invalid envelope evidence remains one dispatched
-call with an unknown mutation; it never becomes confirmed application evidence.
-Only the complete operation-specific product is `succeeded` with one call and
-one mutation. Returned
-errors contain the existing sanitized adapter error plus that typed lifecycle,
-never provider field values, request headers, tokens, or raw response bodies.
-Delete consent is derived from the complete
-static plan, including its reason and provider request, rather than a future
-runtime audit digest. The layout step is local custody maintenance and declares
-no provider-dispatch authority. Retained and recovery workflows never install
-or repair a missing layout: missing, changed, unstable, over-budget, or merely
-reconciliation-required evidence, including any nonterminal attempt phase,
-stops with zero provider calls and mutations. The
-audit alone still performs or authorizes no provider dispatch. The
-complete pass has a fixed, versioned DML-specific global budget: at most 16,384
-canonical leaves, 65,536 physical leaf artifacts, and 268,435,456 total
-artifact payload bytes. It reserves leaf capacity before descent, artifact
+Curated database rename and delete are currently read-only planning surfaces.
+Before dry/live branching they derive one canonical six-step static plan:
+validate the exact operator intent, conditionally create the fixed layout during
+a future live guarded execution, require a clean complete audit, require exact
+final revalidation, install durable target-wide provider-attempt reservation,
+then dispatch the provider operation last. The reservation step explicitly
+reports `implementation_status=not_installed` and
+`provider_dispatch_authority=none`.
+
+Every dry run returns the full plan, `intended_plan_sha256`, a versioned
+`consent_binding`, and `required_confirmation_token`. The consent binding
+contains the normalized account/database target, operation and operation
+version, normalized requested change, optional reason, plan digest, and the
+complete plan. Any change to those values changes the token. Dry-run
+`execution_evidence` keeps layout `unobserved`, audit and revalidation
+unmaterialized, durable reservation `not_installed`, and local/provider
+effects at zero.
+
+Every live rename/delete call first recomputes that binding. Missing, altered,
+stale, cross-target, cross-operation, changed-intent, or changed-reason tokens
+return `confirmation_required` before target-guard or provider access. An
+exact token still returns `durable_reservation_not_installed` before target-
+guard or provider access, with `provider_calls=0`,
+`provider_mutations=0`, and `automatic_retry_permitted=false`. Use dry-run
+planning only until the separately reviewed durable reservation and recovery
+contract is installed. The fixed layout and complete-audit plan steps remain
+evidence requirements; neither currently supplies dispatch authority.
+
+Rename/delete retain one D1-database-only client lifecycle for the future
+durably reserved execution boundary, but that client is unreachable from the
+curated live tools while the reservation gate is active. Its strict
+response-envelope contract remains: one bounded duplicate-free exact Cloudflare
+envelope with literal `success=true`, empty `errors`, unique exact
+ResponseInfo `messages`, and the operation-specific result. ResponseInfo codes
+are JSON unsigned integers at least 1000; optional-field presence participates
+in uniqueness, while object property order does not. Rename requires a non-null
+D1 database result. Delete accepts absent/null as `{}` and returns a present
+non-null value through the existing `serde_json::Value` interface. Any future
+post-dispatch uncertainty must remain non-retryable and aggregate-only.
+
+The complete audit pass has a fixed, versioned DML-specific global budget: at
+most 16,384 canonical leaves, 65,536 physical leaf artifacts, and 268,435,456
+total artifact payload bytes. It reserves leaf capacity before descent, artifact
 capacity before any payload read, and remaining bytes from held metadata before
 each read. Every cross-shard retained collection is bounded by the same
 artifact ceiling. The stable second pass starts with a fresh budget and must

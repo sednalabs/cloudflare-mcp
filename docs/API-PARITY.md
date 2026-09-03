@@ -95,7 +95,10 @@ before request construction or provider access: `d1-delete-database`,
 `d1-export-database`, `d1-import-database`, `d1-query-database`,
 `d1-raw-database-query`, `d1-time-travel-restore`, `d1-update-database`, and
 `d1-update-partial-database`. Use `d1_delete_database` for the governed delete
-lifecycle and `d1_query_read_only` for curated read-only SQL. Export, import,
+planning/consent lifecycle and `d1_query_read_only` for curated read-only SQL.
+Rename/delete live execution is temporarily fail-closed before guard/provider
+access until durable provider-attempt reservation and recovery custody is
+installed. Export, import,
 restore, full update, and partial update remain unavailable until each has a
 complete governed curated lifecycle. `d1_rename_database` is a separate narrow
 operation, not a preferred substitute for partial update because that broader

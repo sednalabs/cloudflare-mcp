@@ -95,8 +95,8 @@ identity and one physical target guard namespace:
 
 | Provider mutation surface | Coverage |
 | --- | --- |
-| `d1_rename_database` | shared permanent target guard |
-| `d1_delete_database` | shared permanent target guard |
+| `d1_rename_database` | exact static consent plan; live disabled before guard/provider pending durable reservation/recovery custody |
+| `d1_delete_database` | exact static consent plan; live disabled before guard/provider pending durable reservation/recovery custody |
 | `d1_execute_write` | shared permanent target guard |
 | `d1_bootstrap_migration_ledger` | durable lease under that target guard |
 | `d1_apply_migration_manifest` | durable lease under that target guard |
@@ -109,8 +109,17 @@ mixed-case, compact or braced UUIDs, plus whitespace, NUL, dot, slash,
 backslash, percent-encoded and other alias forms, are rejected before target
 hashing or provider dispatch. Different database targets may proceed
 concurrently; the same account/database target cannot.
-Guard failures retain the invoked curated tool name in `operation` and report
-zero provider calls and mutations, so the blocked caller remains traceable.
+Rename/delete dry runs emit a versioned consent binding and token over the
+normalized target, requested change, reason, operation/version, plan digest,
+and full plan. Missing, stale, cross-target, cross-operation, changed-intent, or
+changed-reason consent fails before guard/provider access. Exact consent is
+also fail-closed before guard/provider access with
+`durable_reservation_not_installed` until the separately reviewed durable
+attempt reservation and recovery contract is installed. These temporary live
+denials retain the operation and report zero provider calls and mutations.
+Other guard failures retain the invoked curated tool name in `operation` and
+report zero provider calls and mutations, so the blocked caller remains
+traceable.
 Local reconcile/finalize/abort tools manipulate retained custody evidence only
 and are not provider D1 mutation surfaces.
 

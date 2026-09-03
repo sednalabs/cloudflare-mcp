@@ -467,14 +467,14 @@ pub const TOOL_DISCOVERY: &[ToolDiscoveryEntry] = &[
         name: "d1_rename_database",
         group: "d1",
         read_only: false,
-        description: "Rename a Cloudflare D1 database using the curated partial-update endpoint.",
+        description: "Plan a consent-bound D1 database rename; live execution is disabled until durable reservation and recovery custody is installed.",
         keywords: &["d1", "database", "rename", "update", "patch", "mutate"],
     },
     ToolDiscoveryEntry {
         name: "d1_delete_database",
         group: "d1",
         read_only: false,
-        description: "Delete a Cloudflare D1 database with dry-run confirmation-token safety.",
+        description: "Plan a consent-bound D1 database delete; live execution is disabled until durable reservation and recovery custody is installed.",
         keywords: &["d1", "database", "delete", "remove", "drop", "high_risk"],
     },
     ToolDiscoveryEntry {

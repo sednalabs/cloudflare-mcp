@@ -16,28 +16,51 @@ use crate::d1_dml_custody_layout::{
 use crate::mutation::MutationPlan;
 use crate::tools::sha256_bytes_hex;
 
-const TARGET_WIDE_PLAN_VERSION: u8 = 1;
+const TARGET_WIDE_PLAN_VERSION: u8 = 2;
+pub(crate) const TARGET_WIDE_OPERATION_VERSION: u8 = 1;
+pub(crate) const TARGET_WIDE_CONSENT_VERSION: u8 = 1;
 
 #[derive(Debug, Clone)]
 pub(crate) struct D1TargetWideIntendedPlan {
     pub(crate) plan: MutationPlan,
     pub(crate) plan_sha256: String,
+    pub(crate) consent_binding: D1TargetWideConsentBinding,
 }
 
 impl D1TargetWideIntendedPlan {
     pub(crate) fn confirmation_token(&self) -> String {
-        confirmation_token_for_plan(&self.plan)
+        confirmation_token_for_binding(&self.consent_binding)
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct D1TargetWideConsentBinding {
+    pub(crate) consent_version: u8,
+    pub(crate) operation: &'static str,
+    pub(crate) operation_version: u8,
+    pub(crate) normalized_target: Value,
+    pub(crate) requested_change: Value,
+    pub(crate) reason: Option<String>,
+    pub(crate) intended_plan_sha256: String,
+    pub(crate) plan: MutationPlan,
 }
 
 pub(crate) fn d1_target_wide_intended_plan(
     operation: &'static str,
     validation_action: &'static str,
-    validation_target: Value,
+    normalized_target: Value,
+    requested_change: Value,
+    reason: Option<String>,
     target_key_sha256: &str,
     provider_action: &'static str,
     provider_request: Value,
 ) -> D1TargetWideIntendedPlan {
+    let validation_target = json!({
+        "operation_version": TARGET_WIDE_OPERATION_VERSION,
+        "normalized_target": normalized_target,
+        "requested_change": requested_change,
+        "reason": reason,
+    });
     let plan = MutationPlan::new(operation)
         .step(validation_action, false, validation_target)
         .step(
@@ -77,9 +100,34 @@ pub(crate) fn d1_target_wide_intended_plan(
                 "runtime_outcome": "unmaterialized_until_live_guarded_execution",
             }),
         )
+        .step(
+            "install_durable_target_wide_mutation_reservation",
+            true,
+            json!({
+                "target_key_sha256": target_key_sha256,
+                "required_before_provider_dispatch": true,
+                "implementation_status": "not_installed",
+                "effect_scope": "local_durable_attempt_custody",
+                "provider_dispatch_authority": "none",
+            }),
+        )
         .step(provider_action, true, provider_request);
     let plan_sha256 = plan_sha256(&plan);
-    D1TargetWideIntendedPlan { plan, plan_sha256 }
+    let consent_binding = D1TargetWideConsentBinding {
+        consent_version: TARGET_WIDE_CONSENT_VERSION,
+        operation,
+        operation_version: TARGET_WIDE_OPERATION_VERSION,
+        normalized_target,
+        requested_change,
+        reason,
+        intended_plan_sha256: plan_sha256.clone(),
+        plan: plan.clone(),
+    };
+    D1TargetWideIntendedPlan {
+        plan,
+        plan_sha256,
+        consent_binding,
+    }
 }
 
 fn plan_sha256(plan: &MutationPlan) -> String {
@@ -93,14 +141,11 @@ fn plan_sha256(plan: &MutationPlan) -> String {
     )
 }
 
-fn confirmation_token_for_plan(plan: &MutationPlan) -> String {
-    let intended_plan_sha256 = plan_sha256(plan);
+fn confirmation_token_for_binding(binding: &D1TargetWideConsentBinding) -> String {
     let digest = sha256_bytes_hex(
         &serde_json::to_vec(&json!({
-            "version": TARGET_WIDE_PLAN_VERSION,
             "contract": "d1_target_wide_mutation_consent",
-            "intended_plan_sha256": intended_plan_sha256,
-            "plan": plan,
+            "binding": binding,
         }))
         .expect("D1 target-wide consent serialization is infallible"),
     );
@@ -109,6 +154,7 @@ fn confirmation_token_for_plan(plan: &MutationPlan) -> String {
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
 pub(crate) enum D1TargetWideRuntimeState {
     Unobserved,
     RuntimeUnmaterialized,
@@ -121,6 +167,7 @@ pub(crate) enum D1TargetWideRuntimeState {
     Succeeded,
     FailedBeforeDispatch,
     UncertainAfterDispatch,
+    NotInstalled,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -155,14 +202,26 @@ pub(crate) struct D1TargetWideProviderEvidence {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct D1TargetWideDurableReservationEvidence {
+    pub(crate) outcome: D1TargetWideRuntimeState,
+    pub(crate) local_mutations: u8,
+    pub(crate) provider_dispatch_authority: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct D1TargetWideExecutionEvidence {
     pub(crate) intended_plan_sha256: String,
     pub(crate) local_layout: D1TargetWideLocalLayoutEvidence,
     pub(crate) complete_audit: D1TargetWideAuditEvidence,
     pub(crate) final_revalidation: D1TargetWideRevalidationEvidence,
+    pub(crate) durable_reservation: D1TargetWideDurableReservationEvidence,
     pub(crate) provider: D1TargetWideProviderEvidence,
 }
 
+// The state transitions remain the exact successor seam for durable provider-
+// attempt reservation. Curated live dispatch is gated before these transitions
+// until that separately reviewed custody implementation is installed.
+#[allow(dead_code)]
 impl D1TargetWideExecutionEvidence {
     pub(crate) fn unobserved(plan: &D1TargetWideIntendedPlan) -> Self {
         Self {
@@ -180,6 +239,11 @@ impl D1TargetWideExecutionEvidence {
                 outcome: D1TargetWideRuntimeState::RuntimeUnmaterialized,
                 exact_authorization_identity_matched: None,
                 matched_identity: None,
+            },
+            durable_reservation: D1TargetWideDurableReservationEvidence {
+                outcome: D1TargetWideRuntimeState::NotInstalled,
+                local_mutations: 0,
+                provider_dispatch_authority: "none",
             },
             provider: D1TargetWideProviderEvidence {
                 outcome: D1TargetWideRuntimeState::NotDispatched,
@@ -269,13 +333,14 @@ mod tests {
             json!({
                 "account_id": "acct-example",
                 "database_id": "123e4567-e89b-42d3-a456-426614174000",
-                "reason": reason,
             }),
+            json!({"delete_database": true}),
+            Some(reason.to_string()),
             &target_key_sha256,
             "apply_d1_database_delete",
             json!({
                 "method": "DELETE",
-                "path": "/accounts/{account_id}/d1/database/{database_id}",
+                "path": "/accounts/acct-example/d1/database/123e4567-e89b-42d3-a456-426614174000",
             }),
         )
     }
@@ -291,8 +356,12 @@ mod tests {
                 "operation": "d1_delete_database",
                 "steps": [
                     {"ordinal": 1, "action": "validate_d1_database_delete", "side_effect": false, "target": {
-                        "account_id": "acct-example",
-                        "database_id": "123e4567-e89b-42d3-a456-426614174000",
+                        "operation_version": TARGET_WIDE_OPERATION_VERSION,
+                        "normalized_target": {
+                            "account_id": "acct-example",
+                            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+                        },
+                        "requested_change": {"delete_database": true},
                         "reason": "retire synthetic fixture",
                     }},
                     {"ordinal": 2, "action": "ensure_d1_dml_custody_layout", "side_effect": true, "target": {
@@ -320,40 +389,82 @@ mod tests {
                         "execution": "immediately_before_provider_dispatch",
                         "runtime_outcome": "unmaterialized_until_live_guarded_execution",
                     }},
-                    {"ordinal": 5, "action": "apply_d1_database_delete", "side_effect": true, "target": {
+                    {"ordinal": 5, "action": "install_durable_target_wide_mutation_reservation", "side_effect": true, "target": {
+                        "target_key_sha256": target_key_sha256,
+                        "required_before_provider_dispatch": true,
+                        "implementation_status": "not_installed",
+                        "effect_scope": "local_durable_attempt_custody",
+                        "provider_dispatch_authority": "none",
+                    }},
+                    {"ordinal": 6, "action": "apply_d1_database_delete", "side_effect": true, "target": {
                         "method": "DELETE",
-                        "path": "/accounts/{account_id}/d1/database/{database_id}",
+                        "path": "/accounts/acct-example/d1/database/123e4567-e89b-42d3-a456-426614174000",
                     }},
                 ],
             })
         );
+        assert_eq!(
+            serde_json::to_value(&baseline.consent_binding).expect("serialize consent binding"),
+            json!({
+                "consent_version": TARGET_WIDE_CONSENT_VERSION,
+                "operation": "d1_delete_database",
+                "operation_version": TARGET_WIDE_OPERATION_VERSION,
+                "normalized_target": {
+                    "account_id": "acct-example",
+                    "database_id": "123e4567-e89b-42d3-a456-426614174000",
+                },
+                "requested_change": {"delete_database": true},
+                "reason": "retire synthetic fixture",
+                "intended_plan_sha256": baseline.plan_sha256,
+                "plan": baseline.plan,
+            })
+        );
 
         let mut variants = Vec::new();
-        let mut reason = baseline.plan.clone();
-        reason.steps[0].target["reason"] = json!("different reviewed reason");
+        let mut reason = baseline.consent_binding.clone();
+        reason.reason = Some("different reviewed reason".to_string());
         variants.push(reason);
-        let mut provider = baseline.plan.clone();
-        provider.steps[4].target["method"] = json!("PATCH");
+        let mut target = baseline.consent_binding.clone();
+        target.normalized_target["database_id"] = json!("223e4567-e89b-42d3-a456-426614174000");
+        variants.push(target);
+        let mut requested_change = baseline.consent_binding.clone();
+        requested_change.requested_change["delete_database"] = json!(false);
+        variants.push(requested_change);
+        let mut provider = baseline.consent_binding.clone();
+        provider.plan.steps[5].target["method"] = json!("PATCH");
         variants.push(provider);
-        let mut layout = baseline.plan.clone();
-        layout.steps[1].target["execution"] = json!("different_local_contract");
+        let mut layout = baseline.consent_binding.clone();
+        layout.plan.steps[1].target["execution"] = json!("different_local_contract");
         variants.push(layout);
-        let mut audit = baseline.plan.clone();
-        audit.steps[2].target["require_clean_complete_audit"] = json!(false);
+        let mut audit = baseline.consent_binding.clone();
+        audit.plan.steps[2].target["require_clean_complete_audit"] = json!(false);
         variants.push(audit);
-        let mut revalidation = baseline.plan.clone();
-        revalidation.steps[3].target["require_exact_authorization_identity"] = json!(false);
+        let mut revalidation = baseline.consent_binding.clone();
+        revalidation.plan.steps[3].target["require_exact_authorization_identity"] = json!(false);
         variants.push(revalidation);
+        let mut reservation = baseline.consent_binding.clone();
+        reservation.plan.steps[4].target["implementation_status"] = json!("installed");
+        variants.push(reservation);
+        let mut version = baseline.consent_binding.clone();
+        version.operation_version += 1;
+        variants.push(version);
+        let mut operation = baseline.consent_binding.clone();
+        operation.operation = "d1_rename_database";
+        variants.push(operation);
+        let mut consent_version = baseline.consent_binding.clone();
+        consent_version.consent_version += 1;
+        variants.push(consent_version);
+        let mut plan_digest = baseline.consent_binding.clone();
+        plan_digest.intended_plan_sha256 = sha256_bytes_hex(b"different static plan");
+        variants.push(plan_digest);
 
         for variant in variants {
-            let digest = plan_sha256(&variant);
-            assert_ne!(digest, baseline.plan_sha256);
-            assert_ne!(confirmation_token_for_plan(&variant), baseline_token);
+            assert_ne!(confirmation_token_for_binding(&variant), baseline_token);
         }
     }
 
     #[test]
-    fn dry_and_live_evidence_are_separate_from_the_static_plan() {
+    fn disabled_live_evidence_is_separate_from_the_static_plan() {
         let plan = delete_plan("retire synthetic fixture");
         let dry = D1TargetWideExecutionEvidence::unobserved(&plan);
         assert_eq!(
@@ -369,38 +480,14 @@ mod tests {
             dry.final_revalidation.outcome,
             D1TargetWideRuntimeState::RuntimeUnmaterialized
         );
+        assert_eq!(
+            dry.durable_reservation.outcome,
+            D1TargetWideRuntimeState::NotInstalled
+        );
+        assert_eq!(dry.durable_reservation.local_mutations, 0);
+        assert_eq!(dry.durable_reservation.provider_dispatch_authority, "none");
         assert_eq!(dry.provider.provider_calls, 0);
         assert_eq!(dry.provider.provider_mutations, Some(0));
-
-        let mut live = dry.clone();
-        live.layout_observed(D1DmlCustodyLayoutEnsureOutcome::Created);
-        let authorization = D1DmlCustodyCompleteAuditAuthorization {
-            version: D1_DML_CUSTODY_LAYOUT_VERSION,
-            target_key_sha256: plan.plan.steps[1].target["target_key_sha256"]
-                .as_str()
-                .expect("target digest")
-                .to_string(),
-            layout_sha256: D1_DML_CUSTODY_LAYOUT_SHA256.to_string(),
-            audit_budget_version: D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_VERSION,
-            audit_budget_sha256: D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_SHA256.to_string(),
-            audit_sha256: sha256_bytes_hex(b"synthetic-clean-audit"),
-        };
-        live.audit_authorized(&authorization);
-        live.revalidation_matched(&authorization);
-        live.provider_succeeded(D1DatabaseMutationLifecycle::succeeded(200));
-
-        assert_eq!(plan.plan_sha256, live.intended_plan_sha256);
-        assert_eq!(live.local_layout.outcome, D1TargetWideRuntimeState::Created);
-        assert_eq!(live.complete_audit.identity.as_ref(), Some(&authorization));
-        assert_eq!(
-            live.final_revalidation.exact_authorization_identity_matched,
-            Some(true)
-        );
-        assert_eq!(
-            live.final_revalidation.matched_identity.as_ref(),
-            Some(&authorization)
-        );
-        assert_eq!(live.provider.provider_mutations, Some(1));
     }
 
     #[test]

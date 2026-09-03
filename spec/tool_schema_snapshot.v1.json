@@ -1694,7 +1694,7 @@
       "name": "d1_bootstrap_migration_ledger"
     },
     {
-      "description": "Delete a Cloudflare D1 database through the curated high-risk endpoint. Dry-run emits a required confirmation token.",
+      "description": "Plan a Cloudflare D1 database delete with exact plan-bound consent. Live execution remains disabled until durable reservation and recovery custody is installed.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
@@ -2706,11 +2706,18 @@
       "name": "d1_reconcile_migration_manifest"
     },
     {
-      "description": "Rename a Cloudflare D1 database through the curated partial-update endpoint. Supports dry-run planning.",
+      "description": "Plan a Cloudflare D1 database rename with exact plan-bound consent. Live execution remains disabled until durable reservation and recovery custody is installed.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
           "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "confirmation_token": {
             "default": null,
             "type": [
               "string",
@@ -2726,6 +2733,13 @@
           },
           "name": {
             "type": "string"
+          },
+          "reason": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
