@@ -199,11 +199,14 @@ are added by the graph derivation.
    HTTP, body-read, and decoded-contract failures without inspecting error text.
    The client performs one no-redirect attempt and never retries an ambiguous
    rename/delete. Confirmed application requires a bounded duplicate-free exact
-   four-field Cloudflare envelope with literal `success=true`, a non-null
-   operation-typed `result`, and exact empty `errors` and `messages` arrays.
-   Missing, null, wrong-type, unknown, duplicate, nonempty, overdeep, or
-   contradictory fields remain uncertain after the one call; only the strict
-   decoded product reports one call and one mutation. The serialized receipt
+   operation envelope with literal `success=true`, exact empty `errors`, and a
+   required `messages` array whose empty or nonempty members are exact valid
+   ResponseInfo objects. Rename requires a non-null D1-database `result`.
+   Delete accepts absent or null result as `{}` and preserves any present
+   non-null JSON value. Missing, null, wrong-type, unknown, duplicate, overdeep,
+   contradictory, or structurally invalid evidence remains uncertain after the
+   one call; only the complete operation-specific product reports one call and
+   one mutation. The serialized receipt
    contains no provider field values, token, header, or raw response body. Delete
    confirmation binds this complete static contract and reviewed reason, never
    an unknown runtime audit hash.

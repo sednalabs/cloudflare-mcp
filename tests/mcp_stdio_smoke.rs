@@ -18964,20 +18964,29 @@ fn d1_target_wide_database_mutations_keep_strict_envelope_failures_uncertain_and
             "duplicate-errors",
             br#"{"success":true,"result":{"name":"renamed-db"},"errors":[],"messages":[],"errors":[{"message":"must-not-return"}]}"#.as_slice(),
             "cloudflare.d1.database_mutation_duplicate_object_key",
+            &["rename", "delete"][..],
         ),
         (
             "nonempty-errors",
             br#"{"success":true,"result":{"name":"renamed-db"},"errors":[{"message":"must-not-return"}],"messages":[]}"#.as_slice(),
             "cloudflare.d1.database_mutation_contradictory_envelope",
+            &["rename", "delete"][..],
         ),
         (
             "missing-result",
             br#"{"success":true,"errors":[],"messages":[]}"#.as_slice(),
             "cloudflare.d1.database_mutation_malformed_envelope",
+            &["rename"][..],
+        ),
+        (
+            "malformed-response-info",
+            br#"{"success":true,"result":{"name":"renamed-db"},"errors":[],"messages":[{"code":999,"message":"must-not-return"}]}"#.as_slice(),
+            "cloudflare.d1.database_mutation_malformed_envelope",
+            &["rename", "delete"][..],
         ),
     ];
-    for (case, response_body, expected_code) in cases {
-        for operation in ["rename", "delete"] {
+    for (case, response_body, expected_code, operations) in cases {
+        for operation in operations {
             let (base_url, requests) =
                 spawn_fake_d1_database_mutation_raw_response_api(response_body.to_vec());
             let lease_root = PathBuf::from("/tmp").join(format!(
@@ -18997,7 +19006,7 @@ fn d1_target_wide_database_mutations_keep_strict_envelope_failures_uncertain_and
                 ),
             ]);
 
-            let response = if operation == "rename" {
+            let response = if *operation == "rename" {
                 mcp.call_tool(
                     2,
                     "d1_rename_database",
@@ -19066,7 +19075,7 @@ fn d1_target_wide_database_mutations_keep_strict_envelope_failures_uncertain_and
             assert_eq!(requests.len(), 1, "{case} {operation} must not retry");
             assert_eq!(
                 requests[0]["method"],
-                json!(if operation == "rename" {
+                json!(if *operation == "rename" {
                     "PATCH"
                 } else {
                     "DELETE"
@@ -19076,6 +19085,108 @@ fn d1_target_wide_database_mutations_keep_strict_envelope_failures_uncertain_and
             mcp.terminate();
             fs::remove_dir_all(lease_root).expect("strict response target cleanup");
         }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn d1_target_wide_database_mutations_accept_valid_messages_and_operation_specific_results() {
+    let cases = [
+        (
+            "rename-valid-message",
+            "rename",
+            br#"{"success":true,"result":{"name":"renamed-db"},"errors":[],"messages":[{"code":1000,"message":"informational","documentation_url":"https://example.invalid/info","source":{"pointer":"/result/name"}}]}"#.as_slice(),
+            json!("renamed-db"),
+        ),
+        (
+            "delete-absent-result-valid-message",
+            "delete",
+            br#"{"success":true,"errors":[],"messages":[{"code":1000,"message":"informational","source":{}}]}"#.as_slice(),
+            json!({}),
+        ),
+    ];
+    for (case, operation, response_body, expected_result) in cases {
+        let (base_url, requests) =
+            spawn_fake_d1_database_mutation_raw_response_api(response_body.to_vec());
+        let lease_root = PathBuf::from("/tmp").join(format!(
+            "cloudflare-mcp-d1-operation-envelope-{case}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos()
+        ));
+        install_activated_manifest_root_without_dml_layout(&lease_root);
+        let mut mcp = McpStdioProcess::start_with_env(vec![
+            ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+            (
+                "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+                lease_root.to_string_lossy().to_string(),
+            ),
+        ]);
+
+        let response = if operation == "rename" {
+            mcp.call_tool(
+                2,
+                "d1_rename_database",
+                json!({
+                    "database_id": "123e4567-e89b-42d3-a456-426614174000",
+                    "name": "renamed-db",
+                    "dry_run": false
+                }),
+            )
+        } else {
+            let dry = mcp.call_tool(
+                2,
+                "d1_delete_database",
+                json!({
+                    "database_id": "123e4567-e89b-42d3-a456-426614174000",
+                    "reason": "operation-specific response-envelope fixture",
+                    "dry_run": true
+                }),
+            );
+            let confirmation = structured_content(&dry)["required_confirmation_token"]
+                .as_str()
+                .expect("delete confirmation token")
+                .to_string();
+            mcp.call_tool(
+                3,
+                "d1_delete_database",
+                json!({
+                    "database_id": "123e4567-e89b-42d3-a456-426614174000",
+                    "reason": "operation-specific response-envelope fixture",
+                    "dry_run": false,
+                    "confirmation_token": confirmation
+                }),
+            )
+        };
+        let content = structured_content(&response);
+        assert_eq!(content["ok"], json!(true), "{case}: {content}");
+        let actual_result = if operation == "rename" {
+            &content["database"]["name"]
+        } else {
+            &content["result"]
+        };
+        assert_eq!(actual_result, &expected_result, "{case}");
+        assert_eq!(
+            content["execution_evidence"]["provider"],
+            json!({
+                "outcome": "succeeded",
+                "provider_calls": 1,
+                "provider_mutations": 1,
+                "lifecycle": {
+                    "dispatch_stage": "attempted",
+                    "response_stage": "received",
+                    "body_stage": "completely_read",
+                    "http_status": 200,
+                    "apply_status": "applied"
+                }
+            }),
+            "{case}"
+        );
+        assert_eq!(requests.lock().expect("response request log").len(), 1);
+        mcp.terminate();
+        fs::remove_dir_all(lease_root).expect("operation envelope target cleanup");
     }
 }
 

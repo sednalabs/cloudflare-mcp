@@ -153,12 +153,18 @@ body-read loss, and malformed or contradictory responses are
 `uncertain_after_dispatch` with one provider call and an unknown mutation
 count; response stages include only aggregate-safe body state and optional HTTP
 status. No such failure is retried. Immediate success requires one bounded,
-duplicate-free exact Cloudflare envelope containing only literal
-`success=true`, a non-null operation-typed `result`, and exact empty `errors`
-and `messages` arrays. Missing, null, wrong-type, unknown, duplicate, nonempty,
-overdeep, or contradictory envelope fields remain one dispatched call with an
-unknown mutation; they never become confirmed application evidence. Only that
-strict decoded product is `succeeded` with one call and one mutation. Returned
+duplicate-free exact Cloudflare operation envelope with literal `success=true`,
+an exact empty `errors` array, and a required `messages` array. Every empty or
+nonempty message must be an exact ResponseInfo object: numeric `code >= 1000`,
+string `message`, optional string `documentation_url`, and optional exact
+`source` object containing only an optional string `pointer`. Rename also
+requires a non-null `result` that decodes as a D1 database. Delete permits an
+absent or null result and normalizes either to `{}`; any present non-null JSON
+result is preserved. Missing, null, wrong-type, unknown, duplicate, overdeep,
+contradictory, or structurally invalid envelope evidence remains one dispatched
+call with an unknown mutation; it never becomes confirmed application evidence.
+Only the complete operation-specific product is `succeeded` with one call and
+one mutation. Returned
 errors contain the existing sanitized adapter error plus that typed lifecycle,
 never provider field values, request headers, tokens, or raw response bodies.
 Delete consent is derived from the complete
