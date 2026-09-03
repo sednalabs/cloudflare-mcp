@@ -147,13 +147,28 @@ and provider calls at zero. A strict
 acknowledgement becomes nonterminal `Acknowledged` custody; response loss,
 malformed or contradictory evidence, and provider/adapter failure become
 `ReconciliationRequired`. Post-provider persistence uncertainty is also
-non-retryable. Exact replay never dispatches; reserved or reconciliation custody
-can perform only two bounded authenticated no-redirect reads. Matching strict
-presence/name or 404 evidence must prove the operation-specific applied/not-applied
-state before one exact terminal CAS and readback. Unstable, malformed, redirected,
-absent where rename requires presence, or otherwise insufficient evidence preserves
-reconciliation custody. Provider bodies and raw identities remain private;
-terminal identities remain permanently bound and terminal replay is read-free.
+non-retryable. Exact replay never dispatches, provider bodies and raw identities
+remain private, and stable recovery/readback/finalization remain a separate
+reviewed authority.
+
+The retained receipt keeps three questions separate: whether dispatch is
+durably evidenced, whether current target state was observed, and whether this
+attempt caused that state. This boundary performs no current-state read and
+therefore always reports `state_observation=not_observed`,
+`causality=unproven`, `current_state_can_authorize=false`, and
+`terminalization_authorized=false`. A bare reservation, a pre-dispatch failure,
+an uncertain post-dispatch result, and an authenticated acknowledgement all
+remain nonterminal. Target-wide restored state rejects terminal phases and any
+terminal-record field.
+
+| Negative state | Retained dispatch status | Causal decision |
+| --- | --- | --- |
+| rename target already had the requested name | reservation or incumbent provider evidence only | unresolved; pre-existing state is not this attempt's effect |
+| delete target was already absent | reservation or incumbent provider evidence only | unresolved; absence is not this attempt's effect |
+| another actor changed the target | incumbent provider evidence only | unresolved; final state does not identify the actor |
+| `DispatchReserved` with no durable call evidence | `reserved_without_durable_call_evidence` | unresolved; retain custody and do not retry |
+| uncertain outcome after dispatch | `uncertain_after_dispatch` | unresolved; retain custody and do not retry |
+| exact replay | unchanged incumbent dispatch status | return retained custody only, with no provider call, read, or state transition |
 
 ## External Service Bridge
 

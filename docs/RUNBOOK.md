@@ -191,8 +191,19 @@ exactly one `Prepared -> DispatchReserved` CAS and exact readback, revalidates
 the held target guard, then permits at most one no-redirect Cloudflare request
 carrying the preallocated provider-request identity. Exact replay of
 `DispatchReserved`, `Acknowledged`, or `ReconciliationRequired` custody never
-redispatches. Reserved or reconciliation replay enters only the two-read
-recovery boundary; terminal replay performs zero provider calls.
+redispatches.
+
+Treat an exact replay as custody readback only. It performs no provider request
+and no target-state observation. Read the receipt's separate
+`causal_authority` fields: a bare reservation is
+`reserved_without_durable_call_evidence`; a pre-dispatch failure is
+`rejected_before_apply`; response uncertainty is `uncertain_after_dispatch`;
+and a strict response is `authenticated_acknowledgement`. Every variant still
+reports `state_observation=not_observed`, `causality=unproven`, and false for
+both current-state and terminalization authority. Do not infer effect from a
+matching rename, an absent delete target, or later state changed by another
+actor. Target-wide terminal observation, classification, record creation, and
+CAS are not implemented in this boundary.
 
 Every dry run returns the full plan, `intended_plan_sha256`, a versioned
 `consent_binding`, and `required_confirmation_token`. The consent binding
@@ -226,14 +237,8 @@ envelopes, and HTTP/provider rejection are immediately retained as
 `ReconciliationRequired` when the local CAS remains provable. If post-provider
 derivation, CAS, or readback is ambiguous, the response still retains bounded
 digest/lifecycle evidence, forbids retry, and requires operator reconciliation.
-Neither immediate outcome is terminal effect proof. Repeating the exact
-consented call performs two strict authenticated no-redirect GETs. Matching
-rename metadata proves applied only when the requested name is present and
-otherwise proves not applied; a missing rename target remains unresolved.
-Matching delete 404 evidence proves applied, while matching exact present
-metadata proves not applied. Only then may one predecessor-bound CAS install
-immutable terminal custody. Any unstable, malformed, redirected, missing,
-contradictory, or insufficient result remains reconciliation-required.
+Neither outcome is terminal effect proof; stable readback and finalization are
+separately reviewed work.
 
 The complete audit pass has a fixed, versioned DML-specific global budget: at
 most 16,384 canonical leaves, 65,536 physical leaf artifacts, and 268,435,456

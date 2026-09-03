@@ -136,6 +136,22 @@ fn classification(
     result.expect_err("fixture must fail closed").classification
 }
 
+fn assert_no_terminal_authority(
+    product: &D1TargetWidePreparedProduct,
+    dispatch_status: D1TargetWideDispatchStatus,
+) {
+    assert_eq!(
+        product.receipt().causal_authority,
+        D1TargetWideCausalAuthority {
+            dispatch_status,
+            state_observation: D1TargetWideStateObservationStatus::NotObserved,
+            causality: D1TargetWideCausalityStatus::Unproven,
+            current_state_can_authorize: false,
+            terminalization_authorized: false,
+        }
+    );
+}
+
 fn state(bytes: &[u8]) -> D1TargetWideAttemptState {
     serde_json::from_slice(bytes).expect("typed target-wide state")
 }
@@ -172,6 +188,7 @@ fn prepared_product_binds_complete_consent_and_distinct_opaque_identities() {
     assert_eq!(replay.receipt().provider_calls, 0);
     assert_eq!(replay.receipt().provider_mutations, Some(0));
     assert!(!replay.receipt().automatic_retry_permitted);
+    assert_no_terminal_authority(&replay, D1TargetWideDispatchStatus::NotReserved);
 
     assert_eq!(
         classification(prepare_d1_target_wide_attempt(
@@ -215,6 +232,10 @@ fn exact_prepared_dispatch_and_acknowledgement_transitions_are_monotonic() {
         D1DmlAttemptPhase::DispatchReserved
     );
     assert_eq!(reserved.receipt().dispatch_reservations, 1);
+    assert_no_terminal_authority(
+        &reserved,
+        D1TargetWideDispatchStatus::ReservedWithoutDurableCallEvidence,
+    );
     validate_d1_target_wide_attempt_successor(prepared.state_bytes(), reserved.state_bytes())
         .expect("Prepared to DispatchReserved CAS");
     assert!(
@@ -246,6 +267,10 @@ fn exact_prepared_dispatch_and_acknowledgement_transitions_are_monotonic() {
     );
     assert_eq!(acknowledged.receipt().provider_calls, 1);
     assert_eq!(acknowledged.receipt().provider_mutations, Some(1));
+    assert_no_terminal_authority(
+        &acknowledged,
+        D1TargetWideDispatchStatus::AuthenticatedAcknowledgement,
+    );
     validate_d1_target_wide_attempt_successor(reserved.state_bytes(), acknowledged.state_bytes())
         .expect("DispatchReserved to acknowledged custody CAS");
     assert!(
@@ -279,10 +304,19 @@ fn response_loss_and_predispatch_failure_become_closed_reconciliation_products()
         prepared.state_bytes(),
     )
     .expect("one dispatch reservation");
-    for lifecycle in [
-        D1DatabaseMutationLifecycle::pre_dispatch(),
-        D1DatabaseMutationLifecycle::attempted_without_response(),
-        D1DatabaseMutationLifecycle::body_read_failed(200, true),
+    for (lifecycle, dispatch_status) in [
+        (
+            D1DatabaseMutationLifecycle::pre_dispatch(),
+            D1TargetWideDispatchStatus::RejectedBeforeApply,
+        ),
+        (
+            D1DatabaseMutationLifecycle::attempted_without_response(),
+            D1TargetWideDispatchStatus::UncertainAfterDispatch,
+        ),
+        (
+            D1DatabaseMutationLifecycle::body_read_failed(200, true),
+            D1TargetWideDispatchStatus::UncertainAfterDispatch,
+        ),
     ] {
         let response_sha = (lifecycle.body_stage == "partially_read").then(|| "b".repeat(64));
         let response_size = response_sha.as_ref().map(|_| 17);
@@ -303,8 +337,152 @@ fn response_loss_and_predispatch_failure_become_closed_reconciliation_products()
             Some(D1TargetWidePostProviderOutcome::ReconciliationRequired)
         );
         assert!(!product.receipt().automatic_retry_permitted);
+        assert_no_terminal_authority(&product, dispatch_status);
         validate_d1_target_wide_attempt_successor(reserved.state_bytes(), product.state_bytes())
             .expect("post-provider reconciliation CAS");
+    }
+}
+
+#[test]
+fn target_final_state_negative_matrix_never_creates_causal_or_terminal_authority() {
+    let rename = rename_plan("already-matching-name", Some("reviewed reason"));
+    let rename_prepared = prepare(&rename);
+    let rename_reserved = prepare_d1_target_wide_dispatch_reservation_cas(
+        &target(),
+        &rename,
+        &rename.confirmation_token(),
+        ids(),
+        rename_prepared.state_bytes(),
+    )
+    .expect("rename reservation");
+    let uncertain = record_d1_target_wide_reconciliation_required(
+        &target(),
+        &rename,
+        &rename.confirmation_token(),
+        ids(),
+        rename_reserved.state_bytes(),
+        D1DatabaseMutationLifecycle::attempted_without_response(),
+        None,
+        None,
+        "cloudflare.synthetic_transport_loss",
+    )
+    .expect("uncertain post-dispatch custody");
+
+    let delete = delete_plan(Some("reviewed reason"));
+    let delete_prepared = prepare(&delete);
+    let delete_reserved = prepare_d1_target_wide_dispatch_reservation_cas(
+        &target(),
+        &delete,
+        &delete.confirmation_token(),
+        ids(),
+        delete_prepared.state_bytes(),
+    )
+    .expect("delete reservation");
+
+    // The named final-state scenarios are deliberately not inputs to this
+    // boundary. A pre-existing rename match, an already-absent delete target,
+    // or an intervening actor therefore cannot change retained custody into
+    // proof that this attempt caused the state.
+    for (scenario, product, dispatch_status) in [
+        (
+            "pre_existing_matching_rename",
+            &rename_reserved,
+            D1TargetWideDispatchStatus::ReservedWithoutDurableCallEvidence,
+        ),
+        (
+            "already_absent_delete",
+            &delete_reserved,
+            D1TargetWideDispatchStatus::ReservedWithoutDurableCallEvidence,
+        ),
+        (
+            "intervening_actor",
+            &uncertain,
+            D1TargetWideDispatchStatus::UncertainAfterDispatch,
+        ),
+        (
+            "no_call_reservation",
+            &rename_reserved,
+            D1TargetWideDispatchStatus::ReservedWithoutDurableCallEvidence,
+        ),
+        (
+            "uncertain_outcome",
+            &uncertain,
+            D1TargetWideDispatchStatus::UncertainAfterDispatch,
+        ),
+    ] {
+        assert_no_terminal_authority(product, dispatch_status);
+        assert!(
+            matches!(
+                product.receipt().phase,
+                D1DmlAttemptPhase::DispatchReserved | D1DmlAttemptPhase::ReconciliationRequired
+            ),
+            "{scenario} must retain unresolved custody"
+        );
+    }
+
+    for (product, plan) in [(&rename_reserved, &rename), (&uncertain, &rename)] {
+        let replay = restore_bound_d1_target_wide_attempt(
+            &target(),
+            plan,
+            &plan.confirmation_token(),
+            ids(),
+            product.state_bytes(),
+        )
+        .expect("exact retained replay");
+        assert_eq!(replay.state_bytes(), product.state_bytes());
+        assert!(replay.receipt().exact_replay);
+        assert!(!replay.receipt().causal_authority.terminalization_authorized);
+        assert_eq!(
+            replay.receipt().provider_calls,
+            product.receipt().provider_calls
+        );
+    }
+}
+
+#[test]
+fn target_wide_terminal_records_and_phases_are_outside_the_closed_state_schema() {
+    let plan = rename_plan("synthetic-name", Some("reviewed reason"));
+    let prepared = prepare(&plan);
+    let reserved = prepare_d1_target_wide_dispatch_reservation_cas(
+        &target(),
+        &plan,
+        &plan.confirmation_token(),
+        ids(),
+        prepared.state_bytes(),
+    )
+    .expect("reservation");
+
+    let mut terminal_record = serde_json::to_value(state(reserved.state_bytes())).expect("state");
+    terminal_record["terminal"] = json!({"outcome": "applied"});
+    let mut terminal_record_bytes = serde_json::to_vec(&terminal_record).expect("terminal record");
+    terminal_record_bytes.push(b'\n');
+    assert_eq!(
+        classification(restore_bound_d1_target_wide_attempt(
+            &target(),
+            &plan,
+            &plan.confirmation_token(),
+            ids(),
+            &terminal_record_bytes,
+        )),
+        D1TargetWidePreparedClassification::RestoredStateMalformed
+    );
+
+    for phase in [
+        D1DmlAttemptPhase::TerminalApplied,
+        D1DmlAttemptPhase::TerminalNotApplied,
+    ] {
+        let mut terminal_phase = state(reserved.state_bytes());
+        terminal_phase.phase = phase;
+        assert_eq!(
+            classification(restore_bound_d1_target_wide_attempt(
+                &target(),
+                &plan,
+                &plan.confirmation_token(),
+                ids(),
+                &unchecked_bytes(&terminal_phase),
+            )),
+            D1TargetWidePreparedClassification::RestoredStateContradictory
+        );
     }
 }
 

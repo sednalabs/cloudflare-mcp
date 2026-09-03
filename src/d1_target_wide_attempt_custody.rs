@@ -2,9 +2,8 @@
 //!
 //! This boundary binds the complete static consent product, three opaque caller
 //! identities, one dispatch reservation, and one aggregate post-provider
-//! outcome into canonical private artifacts. The recovery boundary may add one
-//! predecessor-bound terminal proof; provider dispatch and retry authority live
-//! elsewhere.
+//! outcome into canonical private artifacts. Provider dispatch, stable
+//! recovery/readback, terminal finalization, and retry authority live elsewhere.
 
 use std::collections::BTreeSet;
 
@@ -60,8 +59,6 @@ struct D1TargetWideAttemptState {
     phase: D1DmlAttemptPhase,
     dispatch_reservations: u8,
     post_provider: Option<D1TargetWidePostProviderRecord>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    terminal: Option<D1TargetWideTerminalRecord>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -85,45 +82,39 @@ struct D1TargetWidePostProviderRecord {
     provider_error_sha256: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+/// What the retained local record proves about provider dispatch. This is kept
+/// separate from target-state observation and causal effect authority.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum D1TargetWideTerminalOutcome {
-    Applied,
-    NotApplied,
+pub(crate) enum D1TargetWideDispatchStatus {
+    NotReserved,
+    ReservedWithoutDurableCallEvidence,
+    RejectedBeforeApply,
+    UncertainAfterDispatch,
+    AuthenticatedAcknowledgement,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-struct D1TargetWideTerminalRecord {
-    version: u8,
-    outcome: D1TargetWideTerminalOutcome,
-    apply_status: MutationApplyStatus,
-    predecessor_state_sha256: String,
-    predecessor_phase: D1DmlAttemptPhase,
-    incumbent_provider_evidence_sha256: String,
-    readback_plan_sha256: String,
-    stable_readback_evidence_sha256: String,
-    before_response_sha256: String,
-    before_response_size_bytes: usize,
-    before_http_status: u16,
-    after_response_sha256: String,
-    after_response_size_bytes: usize,
-    after_http_status: u16,
-    provider_calls: u8,
-    provider_mutations: u8,
+/// Target state is deliberately not read by this one-call/no-retry boundary.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum D1TargetWideStateObservationStatus {
+    NotObserved,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct D1TargetWideTerminalEvidence<'a> {
-    pub(crate) outcome: D1TargetWideTerminalOutcome,
-    pub(crate) readback_plan_sha256: &'a str,
-    pub(crate) stable_readback_evidence_sha256: &'a str,
-    pub(crate) before_response_sha256: &'a str,
-    pub(crate) before_response_size_bytes: usize,
-    pub(crate) before_http_status: u16,
-    pub(crate) after_response_sha256: &'a str,
-    pub(crate) after_response_size_bytes: usize,
-    pub(crate) after_http_status: u16,
+/// A final target state cannot by itself establish which actor caused it.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum D1TargetWideCausalityStatus {
+    Unproven,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub(crate) struct D1TargetWideCausalAuthority {
+    pub(crate) dispatch_status: D1TargetWideDispatchStatus,
+    pub(crate) state_observation: D1TargetWideStateObservationStatus,
+    pub(crate) causality: D1TargetWideCausalityStatus,
+    pub(crate) current_state_can_authorize: bool,
+    pub(crate) terminalization_authorized: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -133,7 +124,6 @@ pub(crate) enum D1TargetWidePreparedTransition {
     ExactReplay,
     DispatchReservationPrepared,
     PostProviderOutcomeRecorded,
-    TerminalPrepared,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -173,8 +163,7 @@ pub(crate) struct D1TargetWidePreparedReceipt {
     pub(crate) provider_calls: u8,
     pub(crate) provider_mutations: Option<u8>,
     pub(crate) automatic_retry_permitted: bool,
-    pub(crate) terminal_outcome: Option<D1TargetWideTerminalOutcome>,
-    pub(crate) terminal_evidence_sha256: Option<String>,
+    pub(crate) causal_authority: D1TargetWideCausalAuthority,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,37 +248,6 @@ struct D1TargetWideAttemptBindingMaterial<'a> {
     provider_request_id_sha256: &'a str,
 }
 
-#[derive(Serialize)]
-struct D1TargetWideReadbackPlanMaterial<'a> {
-    version: u8,
-    operation: &'a str,
-    consent_version: u8,
-    operation_version: u8,
-    target_key_sha256: &'a str,
-    intended_plan_sha256: &'a str,
-    attempt_binding_sha256: &'a str,
-    provider_request_id_sha256: &'a str,
-    requested_change_sha256: &'a str,
-    provider_reads: u8,
-    provider_mutations: u8,
-}
-
-pub(crate) fn d1_target_wide_readback_plan_sha256(receipt: &D1TargetWidePreparedReceipt) -> String {
-    hash_serialized(&D1TargetWideReadbackPlanMaterial {
-        version: 1,
-        operation: &receipt.target_operation,
-        consent_version: receipt.consent_version,
-        operation_version: receipt.operation_version,
-        target_key_sha256: &receipt.target_key_sha256,
-        intended_plan_sha256: &receipt.intended_plan_sha256,
-        attempt_binding_sha256: &receipt.attempt_binding_sha256,
-        provider_request_id_sha256: &receipt.provider_request_id_sha256,
-        requested_change_sha256: &receipt.requested_change_sha256,
-        provider_reads: 2,
-        provider_mutations: 0,
-    })
-}
-
 pub(crate) fn prepare_d1_target_wide_attempt(
     target: &D1TargetIdentity,
     intended_plan: &D1TargetWideIntendedPlan,
@@ -343,96 +301,14 @@ pub(crate) fn validate_d1_target_wide_attempt_successor(
         && expected_state.post_provider.is_none()
         && successor_state.phase == D1DmlAttemptPhase::ReconciliationRequired
         && successor_state.dispatch_reservations == 1
-        && successor_state.post_provider.is_some()
-        && successor_state.terminal.is_none();
-    let terminalization = matches!(
-        expected_state.phase,
-        D1DmlAttemptPhase::DispatchReserved | D1DmlAttemptPhase::ReconciliationRequired
-    ) && expected_state.dispatch_reservations == 1
-        && expected_state.terminal.is_none()
-        && matches!(
-            successor_state.phase,
-            D1DmlAttemptPhase::TerminalApplied | D1DmlAttemptPhase::TerminalNotApplied
-        )
-        && successor_state.dispatch_reservations == 1
-        && successor_state.post_provider == expected_state.post_provider
-        && successor_state.terminal.is_some();
-    if !dispatch_reservation && !post_provider_custody && !terminalization {
+        && successor_state.post_provider.is_some();
+    if !dispatch_reservation && !post_provider_custody {
         return Err(prepared_error(
             D1TargetWidePreparedClassification::ReplayConflict,
             "target-wide CAS successor was not one exact monotonic lifecycle transition",
         ));
     }
     Ok(())
-}
-
-pub(crate) fn prepare_d1_target_wide_terminal_cas(
-    target: &D1TargetIdentity,
-    intended_plan: &D1TargetWideIntendedPlan,
-    confirmation_token: &str,
-    identities: D1DmlAttemptIdentities<'_>,
-    incumbent: &[u8],
-    evidence: D1TargetWideTerminalEvidence<'_>,
-) -> Result<D1TargetWidePreparedProduct, D1TargetWidePreparedError> {
-    let binding = derive_binding(target, intended_plan, confirmation_token, identities)?;
-    let mut state = parse_canonical_state(incumbent)?;
-    if !state_matches_binding(&state, &binding)
-        || !matches!(
-            state.phase,
-            D1DmlAttemptPhase::DispatchReserved | D1DmlAttemptPhase::ReconciliationRequired
-        )
-        || state.dispatch_reservations != 1
-        || state.terminal.is_some()
-    {
-        return Err(prepared_error(
-            D1TargetWidePreparedClassification::PhaseInvalid,
-            "target-wide terminalization required one exact unresolved reserved predecessor",
-        ));
-    }
-    let predecessor_state_sha256 = hash_bytes(incumbent);
-    let incumbent_provider_evidence_sha256 = hash_serialized(&state.post_provider);
-    let terminal = D1TargetWideTerminalRecord {
-        version: 1,
-        outcome: evidence.outcome,
-        apply_status: MutationApplyStatus::Proven,
-        predecessor_state_sha256,
-        predecessor_phase: state.phase,
-        incumbent_provider_evidence_sha256,
-        readback_plan_sha256: evidence.readback_plan_sha256.to_string(),
-        stable_readback_evidence_sha256: evidence.stable_readback_evidence_sha256.to_string(),
-        before_response_sha256: evidence.before_response_sha256.to_string(),
-        before_response_size_bytes: evidence.before_response_size_bytes,
-        before_http_status: evidence.before_http_status,
-        after_response_sha256: evidence.after_response_sha256.to_string(),
-        after_response_size_bytes: evidence.after_response_size_bytes,
-        after_http_status: evidence.after_http_status,
-        provider_calls: 2,
-        provider_mutations: 0,
-    };
-    let incumbent_receipt = product(
-        state.clone(),
-        D1TargetWidePreparedTransition::ExactReplay,
-        true,
-    )?;
-    if terminal.readback_plan_sha256
-        != d1_target_wide_readback_plan_sha256(incumbent_receipt.receipt())
-    {
-        return Err(prepared_error(
-            D1TargetWidePreparedClassification::ProviderEvidenceInvalid,
-            "target-wide readback plan did not bind the exact incumbent attempt",
-        ));
-    }
-    validate_terminal(&terminal)?;
-    state.phase = match evidence.outcome {
-        D1TargetWideTerminalOutcome::Applied => D1DmlAttemptPhase::TerminalApplied,
-        D1TargetWideTerminalOutcome::NotApplied => D1DmlAttemptPhase::TerminalNotApplied,
-    };
-    state.terminal = Some(terminal);
-    product(
-        state,
-        D1TargetWidePreparedTransition::TerminalPrepared,
-        false,
-    )
 }
 
 pub(crate) fn restore_bound_d1_target_wide_attempt(
@@ -795,7 +671,6 @@ fn state_from_binding(binding: &PreparedBinding) -> D1TargetWideAttemptState {
         phase: D1DmlAttemptPhase::Prepared,
         dispatch_reservations: 0,
         post_provider: None,
-        terminal: None,
     }
 }
 
@@ -884,17 +759,11 @@ fn validate_state(state: &D1TargetWideAttemptState) -> Result<(), D1TargetWidePr
     }
     match state.phase {
         D1DmlAttemptPhase::Prepared
-            if state.dispatch_reservations == 0
-                && state.post_provider.is_none()
-                && state.terminal.is_none() => {}
+            if state.dispatch_reservations == 0 && state.post_provider.is_none() => {}
         D1DmlAttemptPhase::DispatchReserved
-            if state.dispatch_reservations == 1
-                && state.post_provider.is_none()
-                && state.terminal.is_none() => {}
+            if state.dispatch_reservations == 1 && state.post_provider.is_none() => {}
         D1DmlAttemptPhase::ReconciliationRequired
-            if state.dispatch_reservations == 1
-                && state.post_provider.is_some()
-                && state.terminal.is_none() =>
+            if state.dispatch_reservations == 1 && state.post_provider.is_some() =>
         {
             validate_post_provider(
                 state
@@ -902,58 +771,6 @@ fn validate_state(state: &D1TargetWideAttemptState) -> Result<(), D1TargetWidePr
                     .as_ref()
                     .expect("matched post-provider state has evidence"),
             )?;
-        }
-        D1DmlAttemptPhase::TerminalApplied | D1DmlAttemptPhase::TerminalNotApplied
-            if state.dispatch_reservations == 1 && state.terminal.is_some() =>
-        {
-            let terminal = state
-                .terminal
-                .as_ref()
-                .expect("matched terminal state has evidence");
-            validate_terminal(terminal)?;
-            let phase_matches = matches!(
-                (state.phase, terminal.outcome),
-                (
-                    D1DmlAttemptPhase::TerminalApplied,
-                    D1TargetWideTerminalOutcome::Applied
-                ) | (
-                    D1DmlAttemptPhase::TerminalNotApplied,
-                    D1TargetWideTerminalOutcome::NotApplied
-                )
-            );
-            let predecessor_matches = match terminal.predecessor_phase {
-                D1DmlAttemptPhase::DispatchReserved => state.post_provider.is_none(),
-                D1DmlAttemptPhase::ReconciliationRequired => state.post_provider.is_some(),
-                _ => false,
-            };
-            if !phase_matches
-                || !predecessor_matches
-                || terminal.incumbent_provider_evidence_sha256
-                    != hash_serialized(&state.post_provider)
-            {
-                return Err(prepared_error(
-                    D1TargetWidePreparedClassification::RestoredStateContradictory,
-                    "target-wide terminal state contradicted its exact predecessor evidence",
-                ));
-            }
-            let mut predecessor = state.clone();
-            predecessor.phase = terminal.predecessor_phase;
-            predecessor.terminal = None;
-            let predecessor_bytes = canonical_state_bytes(&predecessor)?;
-            let predecessor_receipt = product(
-                predecessor,
-                D1TargetWidePreparedTransition::ExactReplay,
-                true,
-            )?;
-            if terminal.predecessor_state_sha256 != hash_bytes(&predecessor_bytes)
-                || terminal.readback_plan_sha256
-                    != d1_target_wide_readback_plan_sha256(predecessor_receipt.receipt())
-            {
-                return Err(prepared_error(
-                    D1TargetWidePreparedClassification::RestoredStateContradictory,
-                    "target-wide terminal evidence did not rederive from its predecessor",
-                ));
-            }
         }
         _ => {
             return Err(prepared_error(
@@ -1083,39 +900,6 @@ fn validate_post_provider(
     Ok(())
 }
 
-fn validate_terminal(
-    evidence: &D1TargetWideTerminalRecord,
-) -> Result<(), D1TargetWidePreparedError> {
-    let exact = evidence.version == 1
-        && evidence.apply_status == MutationApplyStatus::Proven
-        && matches!(
-            evidence.predecessor_phase,
-            D1DmlAttemptPhase::DispatchReserved | D1DmlAttemptPhase::ReconciliationRequired
-        )
-        && [
-            &evidence.predecessor_state_sha256,
-            &evidence.incumbent_provider_evidence_sha256,
-            &evidence.readback_plan_sha256,
-            &evidence.stable_readback_evidence_sha256,
-            &evidence.before_response_sha256,
-            &evidence.after_response_sha256,
-        ]
-        .into_iter()
-        .all(|value| valid_sha256(value))
-        && matches!(evidence.before_http_status, 200 | 404)
-        && matches!(evidence.after_http_status, 200 | 404)
-        && evidence.before_http_status == evidence.after_http_status
-        && evidence.provider_calls == 2
-        && evidence.provider_mutations == 0;
-    if !exact {
-        return Err(prepared_error(
-            D1TargetWidePreparedClassification::ProviderEvidenceInvalid,
-            "target-wide terminal evidence contradicted the stable readback contract",
-        ));
-    }
-    Ok(())
-}
-
 fn product(
     state: D1TargetWideAttemptState,
     transition: D1TargetWidePreparedTransition,
@@ -1124,7 +908,32 @@ fn product(
     validate_state(&state)?;
     let state_bytes = canonical_state_bytes(&state)?;
     let post_provider = state.post_provider.as_ref();
-    let terminal = state.terminal.as_ref();
+    let dispatch_status = match (
+        state.phase,
+        post_provider.map(|evidence| evidence.apply_status),
+    ) {
+        (D1DmlAttemptPhase::Prepared, None) => D1TargetWideDispatchStatus::NotReserved,
+        (D1DmlAttemptPhase::DispatchReserved, None) => {
+            D1TargetWideDispatchStatus::ReservedWithoutDurableCallEvidence
+        }
+        (
+            D1DmlAttemptPhase::ReconciliationRequired,
+            Some(MutationApplyStatus::RejectedBeforeApply),
+        ) => D1TargetWideDispatchStatus::RejectedBeforeApply,
+        (
+            D1DmlAttemptPhase::ReconciliationRequired,
+            Some(MutationApplyStatus::UncertainAfterDispatch),
+        ) => D1TargetWideDispatchStatus::UncertainAfterDispatch,
+        (D1DmlAttemptPhase::ReconciliationRequired, Some(MutationApplyStatus::Applied)) => {
+            D1TargetWideDispatchStatus::AuthenticatedAcknowledgement
+        }
+        _ => {
+            return Err(prepared_error(
+                D1TargetWidePreparedClassification::RestoredStateContradictory,
+                "target-wide attempt had no closed dispatch-status projection",
+            ));
+        }
+    };
     let receipt = D1TargetWidePreparedReceipt {
         version: state.version,
         operation: D1_TARGET_WIDE_ATTEMPT_CUSTODY_OPERATION,
@@ -1166,8 +975,13 @@ fn product(
             .map(|evidence| evidence.provider_mutations)
             .unwrap_or(Some(0)),
         automatic_retry_permitted: false,
-        terminal_outcome: terminal.map(|evidence| evidence.outcome),
-        terminal_evidence_sha256: terminal.map(hash_serialized),
+        causal_authority: D1TargetWideCausalAuthority {
+            dispatch_status,
+            state_observation: D1TargetWideStateObservationStatus::NotObserved,
+            causality: D1TargetWideCausalityStatus::Unproven,
+            current_state_can_authorize: false,
+            terminalization_authorized: false,
+        },
     };
     Ok(D1TargetWidePreparedProduct {
         receipt,
