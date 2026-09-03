@@ -108,15 +108,20 @@ component is Cloudflare's canonical lowercase hyphenated UUID. Uppercase,
 mixed-case, compact or braced UUIDs, plus whitespace, NUL, dot, slash,
 backslash, percent-encoded and other alias forms, are rejected before target
 hashing or provider dispatch. Different database targets may proceed
-concurrently; the same account/database target cannot.
-Rename/delete dry runs emit a versioned consent binding and token over the
-normalized target, requested change, reason, operation/version, plan digest,
-and full plan. Missing, stale, cross-target, cross-operation, changed-intent, or
-changed-reason consent fails before guard/provider access. Exact consent is
-also fail-closed before guard/provider access with
+concurrently when a governed surface reaches the target guard; the same
+account/database target cannot. Rename/delete currently stop before that guard.
+Within the governed MCP tools, rename/delete dry runs emit a versioned consent
+binding and token over the normalized target, requested change, reason,
+operation/version, plan digest, and full plan. Missing, stale, cross-target,
+cross-operation, changed-intent, or changed-reason consent fails before
+guard/provider access. Exact consent is also fail-closed before guard/provider
+access with
 `durable_reservation_not_installed` until the separately reviewed durable
 attempt reservation and recovery contract is installed. These temporary live
 denials retain the operation and report zero provider calls and mutations.
+Direct callers of the public Cloudflare client adapter are outside this tool
+gate and must supply their own governed wrapper before allowing target-wide
+mutation.
 Other guard failures retain the invoked curated tool name in `operation` and
 report zero provider calls and mutations, so the blocked caller remains
 traceable.
@@ -192,36 +197,31 @@ are added by the graph derivation.
    recovery, terminal receipt, restoration, and retirement re-audit it at
    their last owned boundary without creating or repairing layout evidence.
    Terminal receipts inherit the binding through `lease_payload_sha256`.
-   Fresh curated database rename/delete derive one static five-step plan before
-   dry/live branching. It records `ensure_d1_dml_custody_layout` as
-   `create_if_absent_at_live_guarded_execution` and local-custody-only, requires
-   the clean complete audit and exact final revalidation, and puts the provider
-   operation last. Matching dry/live calls return identical plan bytes and
-   `intended_plan_sha256`; `execution_evidence` separately reports unobserved
-   dry state or live `created`/`already_present`, aggregate audit identity,
-   final match, and provider result. The shared local D1 database mutation
-   lifecycle maps token/validation/request-build failure to
-   `failed_before_dispatch` (`provider_calls=0`, `provider_mutations=0`) and
-   every attempted request without decoded success to
-   `uncertain_after_dispatch` (`provider_calls=1`, mutation unknown). Its closed
-   dispatch/response/body stages and optional HTTP status distinguish transport,
-   HTTP, body-read, and decoded-contract failures without inspecting error text.
-   The client performs one no-redirect attempt and never retries an ambiguous
-   rename/delete. Confirmed application requires a bounded duplicate-free exact
-   operation envelope with literal `success=true`, exact empty `errors`, and a
-   required `messages` array whose empty or nonempty members are unique exact
-   ResponseInfo objects with unsigned-integer codes of at least 1000; semantic
-   duplicates are rejected regardless of property order. Rename requires a
-   non-null D1-database `result`. Delete accepts absent or null result as `{}`
-   and accepts and returns any present non-null JSON value through its existing
-   `serde_json::Value` interface. Missing, null, wrong-type, unknown, duplicate,
-   overdeep,
-   contradictory, or structurally invalid evidence remains uncertain after the
-   one call; only the complete operation-specific product reports one call and
-   one mutation. The serialized receipt
-   contains no provider field values, token, header, or raw response body. Delete
-   confirmation binds this complete static contract and reviewed reason, never
-   an unknown runtime audit hash.
+   The governed MCP rename/delete tools derive one static six-step plan before
+   dry/live branching: validate the normalized target and requested change;
+   conditionally ensure the local DML custody layout during a future guarded
+   live execution; authorize the complete custody audit; revalidate that exact
+   authorization; install the required durable target-wide attempt reservation;
+   and only then perform the provider rename or delete. The fifth step is
+   explicitly `not_installed` and has no provider-dispatch authority, so the
+   sixth step is currently unreachable through these tools.
+   Dry-run is the only enabled lifecycle: it returns the full plan,
+   `intended_plan_sha256`, versioned `consent_binding`, confirmation token, and
+   unobserved/not-installed/not-dispatched execution evidence with zero effects.
+   Closed input schemas reject unknown fields before the handler, so such a
+   request cannot receive a consent token or handler result. Missing, stale,
+   cross-target, cross-operation, changed-intent, or changed-reason consent
+   fails before guard/provider access. Exact consent also fails before
+   guard/provider access as `durable_reservation_not_installed`; every live
+   denial reports zero provider calls/mutations and forbids automatic retry.
+   RMCP text and structured JSON are whole-payload equivalent after final
+   evidence, plan, and audit insertion.
+   The public Cloudflare client adapter retains its strict one-attempt response
+   parser for direct adapter consumers and a future governed wrapper, including
+   its no-redirect, non-retryable ambiguity, exact envelope, and operation-result
+   checks. It is not protected by the MCP tool gate itself; direct callers must
+   provide their own governed consent/reservation wrapper before permitting a
+   target-wide mutation.
    An existing hostile or partial layout is never repaired. Absent
    retained/recovery layout, changed, unstable, over-budget, malformed,
    partial, orphaned, nonterminal, or otherwise reconciliation-required custody

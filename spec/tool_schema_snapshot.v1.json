@@ -1697,6 +1697,7 @@
       "description": "Plan a Cloudflare D1 database delete with exact plan-bound consent. Live execution remains disabled until durable reservation and recovery custody is installed.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
         "properties": {
           "account_id": {
             "default": null,
@@ -2709,6 +2710,7 @@
       "description": "Plan a Cloudflare D1 database rename with exact plan-bound consent. Live execution remains disabled until durable reservation and recovery custody is installed.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
         "properties": {
           "account_id": {
             "default": null,

@@ -538,6 +538,7 @@ pub struct D1DatabaseArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct D1RenameDatabaseArgs {
     #[serde(default)]
     pub account_id: Option<String>,
@@ -552,6 +553,7 @@ pub struct D1RenameDatabaseArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct D1DeleteDatabaseArgs {
     #[serde(default)]
     pub account_id: Option<String>,
@@ -1537,9 +1539,15 @@ fn preserve_observed_provider_calls(
         }
     }
     if updated {
-        if let Some(payload) = result.structured_content.as_ref() {
-            result.content = vec![ContentBlock::text(payload.to_string())];
-        }
+        synchronize_tool_text_with_structured_content(result)
+    } else {
+        result
+    }
+}
+
+fn synchronize_tool_text_with_structured_content(mut result: CallToolResult) -> CallToolResult {
+    if let Some(payload) = result.structured_content.as_ref() {
+        result.content = vec![ContentBlock::text(payload.to_string())];
     }
     result
 }
@@ -14142,7 +14150,12 @@ fn finalize_d1_target_wide_mutation_result(
         }
         object.insert("execution_evidence".to_string(), json!(execution_evidence));
     }
-    finalize_mutation_result(result, &intended_plan.plan, audit, dry_run)
+    synchronize_tool_text_with_structured_content(finalize_mutation_result(
+        result,
+        &intended_plan.plan,
+        audit,
+        dry_run,
+    ))
 }
 
 fn d1_target_wide_confirmation_required_result(operation: &str) -> CallToolResult {
@@ -14225,6 +14238,7 @@ mod tests {
     use mcp_toolkit_testing::assert_tool_schema_snapshot;
     use rmcp::handler::server::tool::Extension;
     use rmcp::handler::server::wrapper::Parameters;
+    use rmcp::model::CallToolResult;
     use rmcp::transport::streamable_http_server::session::local::{
         LocalSessionManager, SessionConfig,
     };
@@ -14246,8 +14260,8 @@ mod tests {
         WafSecurityEventsSummaryArgs, WafTimeWindow, WorkersObservabilityListKeysArgs,
         WorkersObservabilityListValuesArgs, WorkersObservabilityQueryEventsArgs,
         WorkersObservabilityTimeframe, WorkersUploadScriptArgs, build_waf_security_events_query,
-        normalize_waf_group_by, normalize_waf_phases, query_mentions_waf,
-        waf_security_events_filter,
+        normalize_waf_group_by, normalize_waf_phases, preserve_observed_provider_calls,
+        query_mentions_waf, waf_security_events_filter,
     };
     use crate::cloudflare::CloudflareClient;
     use crate::cloudflare::model::WorkerScript;
@@ -14455,6 +14469,32 @@ mod tests {
         let snapshot_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("spec/tool_schema_snapshot.v1.json");
         assert_tool_schema_snapshot(snapshot_path, &tools);
+    }
+
+    #[test]
+    fn observed_provider_call_update_rebuilds_rmcp_text_from_structured_content() {
+        let result = preserve_observed_provider_calls(
+            CallToolResult::structured_error(json!({
+                "ok": false,
+                "provider_calls": 1,
+            })),
+            2,
+        );
+        let structured = result
+            .structured_content
+            .as_ref()
+            .expect("structured provider-call receipt");
+        let serialized_content = serde_json::to_value(&result.content[0])
+            .expect("serialize RMCP text content for comparison");
+        let text = serialized_content["text"]
+            .as_str()
+            .expect("RMCP content is text JSON");
+        assert_eq!(structured["provider_calls"], json!(2));
+        assert_eq!(
+            serde_json::from_str::<Value>(text).expect("parse RMCP text JSON"),
+            *structured
+        );
+        assert_eq!(result.is_error, Some(true));
     }
 
     #[tokio::test]

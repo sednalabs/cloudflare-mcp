@@ -18434,9 +18434,67 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
 
     let database_id = "123e4567-e89b-42d3-a456-426614174000";
     let other_database_id = "223e4567-e89b-42d3-a456-426614174000";
+    let listed = mcp.request(2, "tools/list", json!({}));
+    for tool_name in ["d1_rename_database", "d1_delete_database"] {
+        let schema = &listed["result"]["tools"]
+            .as_array()
+            .and_then(|tools| tools.iter().find(|tool| tool["name"] == json!(tool_name)))
+            .unwrap_or_else(|| panic!("missing listed schema for {tool_name}"))["inputSchema"];
+        assert_eq!(
+            schema["additionalProperties"],
+            json!(false),
+            "{tool_name} input schema must be closed: {schema}"
+        );
+    }
+
+    let unknown_field_cases = [
+        (
+            3,
+            "d1_rename_database",
+            json!({
+                "database_id": database_id,
+                "name": "renamed-db",
+                "dry_run": true,
+                "unexpected": "must be rejected"
+            }),
+        ),
+        (
+            4,
+            "d1_delete_database",
+            json!({
+                "database_id": database_id,
+                "dry_run": true,
+                "unexpected": "must be rejected"
+            }),
+        ),
+    ];
+    for (request_id, operation, arguments) in unknown_field_cases {
+        let response = mcp.call_tool(request_id, operation, arguments);
+        assert_eq!(response["result"]["isError"], json!(true), "{response}");
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("missing strict-decoding error text: {response}"));
+        assert!(
+            text.contains("unknown field `unexpected`"),
+            "{operation} must reject extra fields at argument decoding: {response}"
+        );
+        assert!(
+            !text.contains("required_confirmation_token") && !text.contains("cf-d1-target-wide-"),
+            "strict argument rejection must not issue consent: {response}"
+        );
+        assert!(
+            response["result"].get("structuredContent").is_none(),
+            "strict argument rejection must not return a handler result: {response}"
+        );
+        assert!(
+            matches!(provider.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "{operation} strict argument rejection must not connect to the provider"
+        );
+    }
+
     let rename_reason = "reviewed synthetic rename";
-    let rename_dry = structured_content(&mcp.call_tool(
-        2,
+    let rename_dry_response = mcp.call_tool(
+        5,
         "d1_rename_database",
         json!({
             "database_id": database_id,
@@ -18444,8 +18502,9 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
             "reason": rename_reason,
             "dry_run": true
         }),
-    ))
-    .clone();
+    );
+    assert_tool_text_matches_structured(&rename_dry_response);
+    let rename_dry = structured_content(&rename_dry_response).clone();
     assert_eq!(rename_dry["ok"], json!(true), "{rename_dry}");
     assert_eq!(rename_dry["planned"], json!(true));
     assert_eq!(rename_dry["new_name"], json!("renamed-db"));
@@ -18524,7 +18583,7 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
     );
 
     let rename_name_changed = structured_content(&mcp.call_tool(
-        3,
+        6,
         "d1_rename_database",
         json!({
             "database_id": database_id,
@@ -18535,7 +18594,7 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
     ))
     .clone();
     let rename_reason_changed = structured_content(&mcp.call_tool(
-        4,
+        7,
         "d1_rename_database",
         json!({
             "database_id": database_id,
@@ -18546,7 +18605,7 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
     ))
     .clone();
     let rename_target_changed = structured_content(&mcp.call_tool(
-        5,
+        8,
         "d1_rename_database",
         json!({
             "database_id": other_database_id,
@@ -18572,16 +18631,17 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
     }
 
     let delete_reason = "reviewed synthetic delete";
-    let delete_dry = structured_content(&mcp.call_tool(
-        6,
+    let delete_dry_response = mcp.call_tool(
+        9,
         "d1_delete_database",
         json!({
             "database_id": database_id,
             "reason": delete_reason,
             "dry_run": true
         }),
-    ))
-    .clone();
+    );
+    assert_tool_text_matches_structured(&delete_dry_response);
+    let delete_dry = structured_content(&delete_dry_response).clone();
     assert_eq!(delete_dry["ok"], json!(true), "{delete_dry}");
     assert_eq!(delete_dry["planned"], json!(true));
     assert_eq!(
@@ -18610,7 +18670,7 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
     );
 
     let delete_reason_changed = structured_content(&mcp.call_tool(
-        7,
+        10,
         "d1_delete_database",
         json!({
             "database_id": database_id,
@@ -18630,7 +18690,7 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
 
     let live_cases = [
         (
-            8,
+            11,
             "d1_rename_database",
             json!({
                 "database_id": database_id,
@@ -18642,7 +18702,7 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
             "confirmation_required",
         ),
         (
-            9,
+            12,
             "d1_rename_database",
             json!({
                 "database_id": database_id,
@@ -18655,7 +18715,7 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
             "confirmation_required",
         ),
         (
-            10,
+            13,
             "d1_delete_database",
             json!({
                 "database_id": database_id,
@@ -18667,7 +18727,7 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
             "confirmation_required",
         ),
         (
-            11,
+            14,
             "d1_rename_database",
             json!({
                 "database_id": database_id,
@@ -18680,7 +18740,7 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
             "durable_reservation_not_installed",
         ),
         (
-            12,
+            15,
             "d1_delete_database",
             json!({
                 "database_id": database_id,
@@ -18691,7 +18751,7 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
             "confirmation_required",
         ),
         (
-            13,
+            16,
             "d1_delete_database",
             json!({
                 "database_id": database_id,
@@ -18704,7 +18764,9 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
         ),
     ];
     for (request_id, operation, arguments, expected_code, expected_status) in live_cases {
-        let content = structured_content(&mcp.call_tool(request_id, operation, arguments)).clone();
+        let response = mcp.call_tool(request_id, operation, arguments);
+        assert_tool_text_matches_structured(&response);
+        let content = structured_content(&response).clone();
         assert_eq!(content["ok"], json!(false), "{operation}: {content}");
         assert_eq!(content["operation"], json!(operation), "{content}");
         assert_eq!(content["status"], json!(expected_status), "{content}");

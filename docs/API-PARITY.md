@@ -96,9 +96,11 @@ before request construction or provider access: `d1-delete-database`,
 `d1-raw-database-query`, `d1-time-travel-restore`, `d1-update-database`, and
 `d1-update-partial-database`. Use `d1_delete_database` for the governed delete
 planning/consent lifecycle and `d1_query_read_only` for curated read-only SQL.
-Rename/delete live execution is temporarily fail-closed before guard/provider
-access until durable provider-attempt reservation and recovery custody is
-installed. Export, import,
+Within these governed MCP tools, rename/delete live execution is temporarily
+fail-closed before guard/provider access until durable provider-attempt
+reservation and recovery custody is installed. Direct callers of the public
+Cloudflare client adapter are outside that tool gate and must supply their own
+governed wrapper before allowing target-wide mutation. Export, import,
 restore, full update, and partial update remain unavailable until each has a
 complete governed curated lifecycle. `d1_rename_database` is a separate narrow
 operation, not a preferred substitute for partial update because that broader
