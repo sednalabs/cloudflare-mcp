@@ -80,11 +80,9 @@ use crate::d1_migration_terminal::{
     finalize_d1_migration_reconciliation,
 };
 use crate::d1_target::normalize_d1_target;
-use crate::d1_target_wide_apply_lifecycle::{
-    D1TargetWideApplyInput, D1TargetWideProviderOperation, execute_d1_target_wide_apply,
-};
+use crate::d1_target_wide_apply_lifecycle::{D1TargetWideApplyInput, execute_d1_target_wide_apply};
 use crate::d1_target_wide_mutation::{
-    D1TargetWideExecutionEvidence, D1TargetWideIntendedPlan, d1_target_wide_intended_plan,
+    D1TargetWideExecutionEvidence, D1TargetWideIntendedPlan, rederive_d1_target_wide_intended_plan,
 };
 use crate::dns_route::{
     DnsRouteConflict, DnsRouteVerificationState, plan_dns_route_reconciliation, verify_dns_route,
@@ -3873,7 +3871,7 @@ impl CloudflareMcp {
 
     #[tool(
         name = "d1_rename_database",
-        description = "Plan or execute one guarded Cloudflare D1 database rename. Live execution binds exact consent and three opaque identities, reserves at most one provider request, and ends in nonterminal acknowledgement or reconciliation custody without automatic retry."
+        description = "Plan or execute one guarded Cloudflare D1 database rename. Live execution derives the exact provider request from the canonical consented plan, binds three opaque identities, reserves at most one request, and ends in nonterminal acknowledgement or reconciliation custody without automatic retry."
     )]
     async fn cloudflare_d1_rename_database(
         &self,
@@ -3900,23 +3898,21 @@ impl CloudflareMcp {
             ));
         }
         let path = format!("/accounts/{account_id}/d1/database/{database_id}");
-        let intended_plan = d1_target_wide_intended_plan(
+        let intended_plan = match rederive_d1_target_wide_intended_plan(
+            &target,
             "d1_rename_database",
-            "validate_d1_database_rename",
-            json!({
-                "account_id": account_id,
-                "database_id": database_id,
-            }),
-            json!({"new_name": name}),
-            args.reason.clone(),
-            &target.target_key_sha256(),
-            "apply_d1_database_patch",
-            json!({
-                "method": "PATCH",
-                "path": path,
-                "body": {"name": name},
-            }),
-        );
+            &json!({"new_name": name}),
+            args.reason.as_deref(),
+        ) {
+            Ok(plan) => plan,
+            Err(message) => {
+                return Ok(invalid_argument_result(
+                    "d1.target_wide_plan_unproven",
+                    message,
+                    "Provide one canonical D1 rename request and generate a fresh plan.",
+                ));
+            }
+        };
         let required_token = intended_plan.confirmation_token();
         let execution_evidence = D1TargetWideExecutionEvidence::unobserved(&intended_plan);
         let audit = MutationAuditSession::start(
@@ -3962,7 +3958,6 @@ impl CloudflareMcp {
                     operation_id: &args.operation_id,
                     execution_attempt_id: &args.execution_attempt_id,
                     provider_request_id: &args.provider_request_id,
-                    provider_operation: D1TargetWideProviderOperation::Rename { name },
                 },
             )
             .await;
@@ -3986,7 +3981,7 @@ impl CloudflareMcp {
 
     #[tool(
         name = "d1_delete_database",
-        description = "Plan or execute one guarded Cloudflare D1 database delete. Live execution binds exact consent and three opaque identities, reserves at most one provider request, and ends in nonterminal acknowledgement or reconciliation custody without automatic retry."
+        description = "Plan or execute one guarded Cloudflare D1 database delete. Live execution derives the exact provider request from the canonical consented plan, binds three opaque identities, reserves at most one request, and ends in nonterminal acknowledgement or reconciliation custody without automatic retry."
     )]
     async fn cloudflare_d1_delete_database(
         &self,
@@ -4018,22 +4013,21 @@ impl CloudflareMcp {
             Ok(path) => path,
             Err(err) => return Ok(api_catalog_error_result(err)),
         };
-        let intended_plan = d1_target_wide_intended_plan(
+        let intended_plan = match rederive_d1_target_wide_intended_plan(
+            &target,
             "d1_delete_database",
-            "validate_d1_database_delete",
-            json!({
-                "account_id": account_id,
-                "database_id": database_id,
-            }),
-            json!({"delete_database": true}),
-            args.reason.clone(),
-            &target.target_key_sha256(),
-            "apply_d1_database_delete",
-            json!({
-                "method": "DELETE",
-                "path": path,
-            }),
-        );
+            &json!({"delete_database": true}),
+            args.reason.as_deref(),
+        ) {
+            Ok(plan) => plan,
+            Err(message) => {
+                return Ok(invalid_argument_result(
+                    "d1.target_wide_plan_unproven",
+                    message,
+                    "Provide one canonical D1 delete request and generate a fresh plan.",
+                ));
+            }
+        };
         let required_token = intended_plan.confirmation_token();
         let execution_evidence = D1TargetWideExecutionEvidence::unobserved(&intended_plan);
         let audit = MutationAuditSession::start(
@@ -4083,7 +4077,6 @@ impl CloudflareMcp {
                     operation_id: &args.operation_id,
                     execution_attempt_id: &args.execution_attempt_id,
                     provider_request_id: &args.provider_request_id,
-                    provider_operation: D1TargetWideProviderOperation::Delete,
                 },
             )
             .await;

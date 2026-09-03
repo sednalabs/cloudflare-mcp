@@ -138,7 +138,12 @@ is recomputed immediately before that write, and carries no provider
 authority. Missing, malformed, conflicting, restored, foreign-owner, partial,
 scratch, unsafe-filesystem, or nonterminal surrounding evidence fails closed.
 After the exact CAS and readback, the curated route may issue one no-redirect
-provider request carrying the preallocated request identity. A strict
+provider request carrying the preallocated request identity. The D1-local live
+boundary rederives the exact current plan before guard acquisition and derives
+the closed rename/delete method, target path, and optional rename body only
+from that plan. It accepts no independent caller-selected provider operation;
+any mismatch or extraction failure leaves layout unobserved, reservation absent,
+and provider calls at zero. A strict
 acknowledgement becomes nonterminal `Acknowledged` custody; response loss,
 malformed or contradictory evidence, and provider/adapter failure become
 `ReconciliationRequired`. Post-provider persistence uncertainty is also

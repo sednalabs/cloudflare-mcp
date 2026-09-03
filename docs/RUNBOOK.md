@@ -171,6 +171,13 @@ boundary, the exact product is recomputed and compared. The global
 target-wide audit authority remains unchanged and rejects any `Prepared`,
 `DispatchReserved`, or `ReconciliationRequired` attempt.
 
+Before acquiring the target guard, the live boundary independently rederives
+the complete current plan and extracts the closed rename or delete request from
+that exact product. There is no separate caller-selected provider-operation
+input. A plan/request mismatch or impossible extraction fails while layout is
+still `unobserved`, reservation is `not_installed`, and provider calls remain
+zero.
+
 The owner-aware negative matrix rejects absent/partial claimants or attempts,
 multiple or foreign Prepared owners, nonterminal surroundings, changed complete
 audit identity, malformed/noncanonical/contradictory restored bytes, unknown or
@@ -452,8 +459,11 @@ authority and one durable reservation before its single permitted provider
 request. The returned
 `intended_plan_sha256` is stable across matching dry/live calls; runtime custody
 facts appear only in `execution_evidence`. An existing layout must validate
-exactly; active guarded paths do not replace, flatten, or repair hostile or
-partial evidence. If audit or revalidation fails after an active ensure, the
+exactly; a fresh successful ensure reports `created` with one local mutation,
+while exact existing custody reports `already_present` with zero local
+mutations. Ensure failure reports failed/unknown local-mutation state and zero
+provider calls. Active guarded paths do not replace, flatten, or repair hostile
+or partial evidence. If audit or revalidation fails after an active ensure, the
 error preserves the observed local outcome while proving zero provider
 dispatch. The lower-level `CloudflareClient` adapter remains distinct. Every
 direct rename/delete caller must supply its own governed consent and durable

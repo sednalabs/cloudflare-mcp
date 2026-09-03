@@ -1694,7 +1694,7 @@
       "name": "d1_bootstrap_migration_ledger"
     },
     {
-      "description": "Plan or execute one guarded Cloudflare D1 database delete. Live execution binds exact consent and three opaque identities, reserves at most one provider request, and ends in nonterminal acknowledgement or reconciliation custody without automatic retry.",
+      "description": "Plan or execute one guarded Cloudflare D1 database delete. Live execution derives the exact provider request from the canonical consented plan, binds three opaque identities, reserves at most one request, and ends in nonterminal acknowledgement or reconciliation custody without automatic retry.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,
@@ -2719,7 +2719,7 @@
       "name": "d1_reconcile_migration_manifest"
     },
     {
-      "description": "Plan or execute one guarded Cloudflare D1 database rename. Live execution binds exact consent and three opaque identities, reserves at most one provider request, and ends in nonterminal acknowledgement or reconciliation custody without automatic retry.",
+      "description": "Plan or execute one guarded Cloudflare D1 database rename. Live execution derives the exact provider request from the canonical consented plan, binds three opaque identities, reserves at most one request, and ends in nonterminal acknowledgement or reconciliation custody without automatic retry.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,

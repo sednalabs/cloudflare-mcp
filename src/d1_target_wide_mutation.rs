@@ -400,11 +400,6 @@ impl D1TargetWideExecutionEvidence {
         self.local_layout.local_mutations = None;
     }
 
-    pub(crate) fn layout_ensured(&mut self) {
-        self.local_layout.outcome = D1TargetWideRuntimeState::AlreadyPresent;
-        self.local_layout.local_mutations = None;
-    }
-
     pub(crate) fn audit_authorized(
         &mut self,
         authorization: &D1DmlCustodyCompleteAuditAuthorization,

@@ -223,6 +223,10 @@ are added by the graph derivation.
    held-guard revalidation, one no-redirect request maximum, then an immediate
    `Acknowledged` or `ReconciliationRequired` custody CAS. Exact replay never
    redispatches. Stable provider readback and terminal recovery remain separate.
+   The provider method, path, and optional rename body are extracted only from
+   the independently rederived canonical plan before guard acquisition; no
+   separate caller-selected provider operation can override the consented
+   effect. A mismatch or impossible extraction is a zero-call denial.
    Dry-run returns the full plan,
    `intended_plan_sha256`, versioned `consent_binding`, confirmation token, and
    unobserved/not-installed/not-dispatched execution evidence with zero effects.
@@ -245,6 +249,9 @@ are added by the graph derivation.
    stops before provider access with zero calls and mutations. The local
    ensure step and the audit still confer no provider authority, and ordinary
    DML remains affected-leaf scoped.
+   A fresh successful target-wide ensure is reported as `created` with one local
+   mutation; an exact incumbent is `already_present` with zero. An ensure
+   failure reports failed/unknown local state and zero provider calls.
    A scratch name binds the record digest, exact incumbent-state digest, and
    canonical successor-state digest. An affected leaf may contain zero or one
    rederived-valid scratch for a record; duplicate successors, a wrong or stale

@@ -19026,7 +19026,7 @@ fn d1_target_wide_rename_dispatches_once_and_exact_replay_never_redispatches() {
             .expect("system clock after Unix epoch")
             .as_nanos()
     ));
-    install_activated_manifest_root(&lease_root);
+    install_activated_manifest_root_without_dml_layout(&lease_root);
     let mut mcp = McpStdioProcess::start_with_env(vec![
         ("CLOUDFLARE_MCP_API_BASE_URL", provider_url),
         (
@@ -19069,6 +19069,14 @@ fn d1_target_wide_rename_dispatches_once_and_exact_replay_never_redispatches() {
     );
     assert_eq!(first["automatic_retry_permitted"], json!(false));
     assert_eq!(
+        first["execution_evidence"]["local_layout"],
+        json!({
+            "outcome": "created",
+            "local_mutations": 1,
+            "provider_dispatch_authority": "none"
+        })
+    );
+    assert_eq!(
         first["execution_evidence"]["durable_reservation"]["outcome"],
         json!("dispatch_reserved")
     );
@@ -19085,9 +19093,13 @@ fn d1_target_wide_rename_dispatches_once_and_exact_replay_never_redispatches() {
         assert!(!first_serialized.contains(private_identity));
     }
     assert_eq!(
-        requests.lock().expect("request log").len(),
-        1,
-        "one reserved attempt may issue only one provider request"
+        requests.lock().expect("request log").as_slice(),
+        &[json!({
+            "method": "PATCH",
+            "path": "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000",
+            "body": {"name": "renamed-db"}
+        })],
+        "the provider request must be derived exactly from the canonical rename plan"
     );
 
     let replay_response = mcp.call_tool(102, "d1_rename_database", live_arguments);
@@ -19101,6 +19113,14 @@ fn d1_target_wide_rename_dispatches_once_and_exact_replay_never_redispatches() {
     );
     assert_eq!(replay["provider_calls"], json!(0));
     assert_eq!(replay["automatic_retry_permitted"], json!(false));
+    assert_eq!(
+        replay["execution_evidence"]["local_layout"],
+        json!({
+            "outcome": "already_present",
+            "local_mutations": 0,
+            "provider_dispatch_authority": "none"
+        })
+    );
     thread::sleep(Duration::from_millis(25));
     assert_eq!(
         requests.lock().expect("request log").len(),
