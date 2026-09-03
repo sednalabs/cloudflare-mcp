@@ -4,7 +4,7 @@
 //! path. This module is reachable only from the explicit offline CLI mode.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path};
@@ -326,14 +326,12 @@ pub fn run_offline_d1_dml_custody_provision(
             ));
         }
         external_root.revalidate()?;
-        write_external_exclusive(&external_root, &consumption_name, &consumption_bytes)?;
-        let readback = read_required_external(&external_root, &consumption_name)?;
-        if readback != consumption_bytes {
-            return Err(error(
-                "d1.dml_custody_consumption_readback_failed",
-                "external consumption did not survive exact private readback",
-            ));
-        }
+        let consumption_writer =
+            write_external_exclusive(&external_root, &consumption_name, &consumption_bytes)?;
+        consumption_writer.exact_readback(&consumption_bytes, "consumption")?;
+        external_root.revalidate()?;
+        consumption_writer.verify_path(&external_root, &consumption_name)?;
+        external_root.revalidate()?;
         false
     };
 
@@ -378,14 +376,11 @@ pub fn run_offline_d1_dml_custody_provision(
         provision.local_readback,
     );
     let receipt_bytes = canonical_bytes(&receipt);
-    write_external_exclusive(&external_root, &receipt_name, &receipt_bytes)?;
-    if read_required_external(&external_root, &receipt_name)? != receipt_bytes {
-        return Err(error(
-            "d1.dml_custody_external_receipt_readback_failed",
-            "external completion receipt did not survive exact private readback",
-        ));
-    }
+    let receipt_writer = write_external_exclusive(&external_root, &receipt_name, &receipt_bytes)?;
+    receipt_writer.exact_readback(&receipt_bytes, "completion receipt")?;
     root_scope.revalidate()?;
+    external_root.revalidate()?;
+    receipt_writer.verify_path(&external_root, &receipt_name)?;
     external_root.revalidate()?;
     Ok(success(
         if resuming {
@@ -724,21 +719,82 @@ fn open_external_lock(root: &ExternalSealRoot, name: &str) -> Result<File, Value
     Ok(file)
 }
 
+#[derive(Debug)]
+struct ExternalCreatedFile {
+    file: File,
+    identity: UnixFileIdentity,
+}
+
+impl ExternalCreatedFile {
+    fn exact_readback(&self, expected: &[u8], label: &str) -> Result<(), Value> {
+        let readback = read_external_file_exact(&self.file)?;
+        if readback != expected {
+            let code = match label {
+                "consumption" => "d1.dml_custody_consumption_readback_failed",
+                _ => "d1.dml_custody_external_receipt_readback_failed",
+            };
+            return Err(error(
+                code,
+                &format!("external {label} did not survive exact private readback"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_path(&self, root: &ExternalSealRoot, name: &str) -> Result<(), Value> {
+        root.revalidate()?;
+        let rebound = open_external_relative(root, name, libc::O_RDONLY).map_err(|_| {
+            error(
+                "d1.dml_custody_external_output_replaced",
+                "external output pathname no longer named the creator inode",
+            )
+        })?;
+        let metadata = rebound.metadata().map_err(|_| {
+            error(
+                "d1.dml_custody_external_output_replaced",
+                "external output creator inode could not be revalidated",
+            )
+        })?;
+        if !private_regular_file(&metadata)
+            || metadata.nlink() != 1
+            || file_identity(&metadata) != self.identity
+        {
+            return Err(error(
+                "d1.dml_custody_external_output_replaced",
+                "external output pathname no longer named the creator inode",
+            ));
+        }
+        root.revalidate()?;
+        Ok(())
+    }
+}
+
 fn write_external_exclusive(
     root: &ExternalSealRoot,
     name: &str,
     bytes: &[u8],
-) -> Result<(), Value> {
+) -> Result<ExternalCreatedFile, Value> {
     root.revalidate()?;
-    let mut file =
-        open_external_relative(root, name, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL).map_err(
-            |_| {
-                error(
-                    "d1.dml_custody_external_cas_failed",
-                    "external receipt could not be created exclusively",
-                )
-            },
-        )?;
+    let mut file = open_external_relative(root, name, libc::O_RDWR | libc::O_CREAT | libc::O_EXCL)
+        .map_err(|_| {
+            error(
+                "d1.dml_custody_external_cas_failed",
+                "external receipt could not be created exclusively",
+            )
+        })?;
+    let metadata = file.metadata().map_err(|_| {
+        error(
+            "d1.dml_custody_external_write_failed",
+            "external output creator metadata was unavailable",
+        )
+    })?;
+    if !private_regular_file(&metadata) || metadata.nlink() != 1 {
+        return Err(error(
+            "d1.dml_custody_external_write_failed",
+            "external output creator was not one private single-link regular file",
+        ));
+    }
+    let identity = file_identity(&metadata);
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
         .map_err(|_| {
@@ -752,7 +808,13 @@ fn write_external_exclusive(
             "d1.dml_custody_external_write_failed",
             "external seal directory could not be synchronized",
         )
-    })
+    })?;
+    let created = ExternalCreatedFile { file, identity };
+    created.exact_readback(bytes, "output")?;
+    root.revalidate()?;
+    created.verify_path(root, name)?;
+    root.revalidate()?;
+    Ok(created)
 }
 
 fn read_optional_external(root: &ExternalSealRoot, name: &str) -> Result<Option<Vec<u8>>, Value> {
@@ -769,18 +831,6 @@ fn read_optional_external(root: &ExternalSealRoot, name: &str) -> Result<Option<
             "external receipt namespace could not be inspected",
         )),
     }
-}
-
-fn read_required_external(root: &ExternalSealRoot, name: &str) -> Result<Vec<u8>, Value> {
-    let file = open_external_relative(root, name, libc::O_RDONLY).map_err(|_| {
-        error(
-            "d1.dml_custody_external_artifact_invalid",
-            "external artifact could not be opened relative to the held seal root",
-        )
-    })?;
-    let bytes = read_external_file_exact(&file)?;
-    root.revalidate()?;
-    Ok(bytes)
 }
 
 fn read_external_file_exact(file: &File) -> Result<Vec<u8>, Value> {
@@ -800,6 +850,12 @@ fn read_external_file_exact(file: &File) -> Result<Vec<u8>, Value> {
     let expected_len = metadata.len();
     let mut bytes = Vec::new();
     let mut reader = file;
+    reader.seek(SeekFrom::Start(0)).map_err(|_| {
+        error(
+            "d1.dml_custody_external_artifact_invalid",
+            "external artifact could not seek for exact readback",
+        )
+    })?;
     std::io::Read::read_to_end(&mut reader, &mut bytes).map_err(|_| {
         error(
             "d1.dml_custody_external_artifact_invalid",
@@ -1262,6 +1318,38 @@ mod tests {
                 .count(),
             1,
             "replacement seal root contains only the copied entitlement"
+        );
+    }
+
+    #[test]
+    fn byte_identical_external_output_replacement_is_rejected_by_creator_identity() {
+        let fixture = Fixture::new("output-replacement");
+        let root = ExternalSealRoot::open(&fixture.seal_root).expect("seal root");
+        let name = "injected-output.json";
+        let bytes = b"{\"state\":\"complete\"}\n";
+        let creator = write_external_exclusive(&root, name, bytes).expect("creator output");
+        let path = fixture.seal_root.join(name);
+        // Keep the creator inode linked while replacing the published name so
+        // inode reuse cannot make this regression nondeterministic.
+        fs::rename(&path, fixture.seal_root.join("creator-held.json")).expect("move creator aside");
+        let mut replacement = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .expect("replacement output");
+        replacement
+            .write_all(bytes)
+            .expect("byte-identical replacement");
+        replacement.sync_all().expect("sync replacement");
+
+        let error = creator
+            .verify_path(&root, name)
+            .expect_err("byte-identical pathname replacement must fail");
+        assert_eq!(error["ok"], false);
+        assert_eq!(
+            error["error"]["code"],
+            "d1.dml_custody_external_output_replaced"
         );
     }
 }
