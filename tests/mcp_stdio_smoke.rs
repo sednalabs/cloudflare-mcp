@@ -18657,7 +18657,7 @@ fn d1_apply_migration_manifest_partial_multi_statement_response_loss_stays_unkno
 
 #[cfg(unix)]
 #[test]
-fn d1_provision_dml_custody_is_provider_free_exact_replay_and_conflict_safe() {
+fn d1_provision_dml_custody_mcp_surface_is_plan_only_and_effect_free() {
     use std::os::unix::fs::PermissionsExt;
 
     let lease_root = PathBuf::from("/tmp").join(format!(
@@ -18671,6 +18671,10 @@ fn d1_provision_dml_custody_is_provider_free_exact_replay_and_conflict_safe() {
     fs::create_dir(&lease_root).expect("create provision root");
     fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
         .expect("make provision root private");
+    let sentinel = lease_root.join("operator-owned.sentinel");
+    fs::write(&sentinel, b"").expect("create no-mutation witness");
+    fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o600))
+        .expect("make no-mutation witness private");
     let mut mcp = McpStdioProcess::start_with_env(vec![(
         "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
         lease_root.to_string_lossy().to_string(),
@@ -18687,38 +18691,33 @@ fn d1_provision_dml_custody_is_provider_free_exact_replay_and_conflict_safe() {
     assert_eq!(dry["ok"], json!(true), "{dry}");
     assert_eq!(dry["provider_calls"], json!(0));
     assert_eq!(dry["provider_mutations"], json!(0));
+    assert_eq!(dry["local_namespace_mutations"], json!(0));
+    assert_eq!(
+        dry["entitlement_requirements"]["mcp_live_apply_authority"],
+        json!(false)
+    );
     let mut live_args = args;
     live_args["dry_run"] = json!(false);
     live_args["approved_plan_sha256"] = dry["plan_sha256"].clone();
-    let replay = mcp.call_tool(81, "d1_provision_dml_custody", live_args.clone());
-    assert_tool_text_matches_structured(&replay);
-    let replay = structured_content(&replay);
-    assert_eq!(replay["ok"], json!(true), "{replay}");
-    assert_eq!(replay["provision"]["apply_status"], json!("proven"));
-    assert_eq!(replay["provision"]["provider_calls"], json!(0));
-    assert_eq!(replay["provision"]["provider_mutations"], json!(0));
-    let target = manifest_target_path(&lease_root);
-    assert!(target.join("dml-custody-genesis-v1.json").is_file());
-    assert!(target.join("dml-custody-v1/layout.json").is_file());
-
-    let mut conflict_args = live_args;
-    conflict_args["custody_generation"] = json!("test-custody-generation-v2");
-    conflict_args["approved_plan_sha256"] = Value::Null;
-    conflict_args["dry_run"] = json!(true);
-    let conflict_dry = mcp.call_tool(82, "d1_provision_dml_custody", conflict_args.clone());
-    let conflict_plan = structured_content(&conflict_dry)["plan_sha256"].clone();
-    conflict_args["dry_run"] = json!(false);
-    conflict_args["approved_plan_sha256"] = conflict_plan;
-    let conflict = mcp.call_tool(83, "d1_provision_dml_custody", conflict_args);
-    assert_tool_text_matches_structured(&conflict);
-    let conflict = structured_content(&conflict);
-    assert_eq!(conflict["ok"], json!(false), "{conflict}");
+    let blocked = mcp.call_tool(81, "d1_provision_dml_custody", live_args);
+    assert_tool_text_matches_structured(&blocked);
+    let blocked = structured_content(&blocked);
+    assert_eq!(blocked["ok"], json!(false), "{blocked}");
     assert_eq!(
-        conflict["error"]["code"],
-        json!("d1.dml_custody_authority_mismatch")
+        blocked["error"]["code"],
+        json!("d1.dml_custody_offline_provisioning_required")
     );
-    assert_eq!(conflict["provider_calls"], json!(0));
-    assert_eq!(conflict["provider_mutations"], json!(0));
+    assert_eq!(blocked["provider_calls"], json!(0));
+    assert_eq!(blocked["provider_mutations"], json!(0));
+    assert_eq!(blocked["local_namespace_mutations"], json!(0));
+    assert_eq!(
+        fs::read_dir(&lease_root)
+            .expect("read no-mutation witness")
+            .count(),
+        1,
+        "the MCP planning surface must not create target, guard, genesis, or layout authority"
+    );
+    assert!(sentinel.is_file());
 
     mcp.terminate();
     let _ = fs::remove_dir_all(lease_root);
@@ -19395,7 +19394,7 @@ fn expected_d1_execute_write_mutation_plan(dry_run: bool) -> Value {
     ];
     if !dry_run {
         steps = vec![
-            json!({"ordinal": 1, "action": "ensure_sharded_dml_custody_and_capacity", "side_effect": true, "target": {"atomic_layout_install": true, "cas_scratch_slots_per_affected_leaf": 1, "claimant_set_capacity_preflight": true, "layout": "dml-custody-v1"}}),
+            json!({"ordinal": 1, "action": "open_existing_sharded_dml_custody_and_capacity", "side_effect": false, "target": {"ordinary_execution_may_create": false, "cas_scratch_slots_per_affected_leaf": 1, "claimant_set_capacity_preflight": true, "layout": "dml-custody-v1"}}),
             json!({"ordinal": 2, "action": "install_pending_identity_claimants", "side_effect": true, "target": {"create_once": true, "namespace_count": 3, "phase": "Pending"}}),
             json!({"ordinal": 3, "action": "collect_stable_catalog", "side_effect": false, "target": {"observations": 2}}),
             json!({"ordinal": 4, "action": "compose_reserved_relation_authority", "side_effect": false, "target": {}}),

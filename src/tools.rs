@@ -4445,7 +4445,7 @@ impl CloudflareMcp {
 
     #[tool(
         name = "d1_provision_dml_custody",
-        description = "Plan or explicitly provision one immutable local D1 DML custody genesis and generation-bound layout. This operation performs no Cloudflare provider calls; exact replay converges and conflicts fail closed."
+        description = "Plan the external entitlement required to provision one immutable local D1 DML custody genesis and generation-bound layout. The MCP surface is proof-only and has no live provisioning authority."
     )]
     async fn cloudflare_d1_provision_dml_custody(
         &self,
@@ -4482,25 +4482,36 @@ impl CloudflareMcp {
                 }),
             )
             .step(
-                "provision_local_d1_dml_custody",
-                true,
+                "prepare_external_custody_entitlement",
+                false,
                 json!({
                     "layout_version": authority.layout_version,
                     "layout_sha256": authority.layout_sha256,
-                    "create_once": true,
-                    "exact_replay_converges": true,
+                    "external_seal_required": true,
+                    "mcp_live_apply_authority": false,
                     "provider_dispatch_authority": "none",
                 }),
             )
             .step(
-                "read_back_exact_genesis_and_layout",
+                "run_separately_privileged_offline_provisioner",
                 false,
-                json!({"stable_descriptor_bound_readback": true}),
+                json!({
+                    "ordinary_mcp_process_can_execute": false,
+                    "consumption_precedes_local_creation": true,
+                    "exact_interrupted_operation_resume_only": true,
+                }),
             );
         let plan_sha256 = sha256_bytes_hex(
             &serde_json::to_vec(&plan)
                 .expect("D1 custody provision plan serialization cannot fail"),
         );
+        let entitlement_requirements =
+            crate::d1_dml_custody_provision::public_entitlement_requirements(
+                &authority.target_key_sha256,
+                &authority.custody_generation_sha256,
+                &authority.authority_sha256,
+                &authority.genesis_sha256,
+            );
         if args.dry_run {
             return Ok(CallToolResult::structured(json!({
                 "ok": true,
@@ -4508,41 +4519,28 @@ impl CloudflareMcp {
                 "status": "planned",
                 "plan": plan,
                 "plan_sha256": plan_sha256,
+                "entitlement_requirements": entitlement_requirements,
                 "provider_calls": 0,
                 "provider_mutations": 0,
+                "local_namespace_mutations": 0,
             })));
         }
-        if args.approved_plan_sha256.as_deref() != Some(plan_sha256.as_str()) {
-            return Ok(CallToolResult::structured_error(json!({
-                "ok": false,
-                "operation": "d1_provision_dml_custody",
-                "status": "blocked",
-                "plan": plan,
-                "plan_sha256": plan_sha256,
-                "provider_calls": 0,
-                "provider_mutations": 0,
-                "error": {
-                    "code": "d1.dml_custody_provision_approval_mismatch",
-                    "message": "live provisioning requires the exact plan_sha256 returned by dry-run",
-                    "hint": "Review the no-provider local custody plan and pass its exact lowercase digest."
-                }
-            })));
-        }
-        match crate::d1_migration_lease::provision_d1_dml_custody(
-            &target.account_id,
-            &target.database_id,
-            &args.custody_generation,
-            &args.authority_sha256,
-        ) {
-            Ok(receipt) => Ok(CallToolResult::structured(json!({
-                "ok": true,
-                "operation": "d1_provision_dml_custody",
-                "status": "provisioned",
-                "plan_sha256": plan_sha256,
-                "provision": receipt,
-            }))),
-            Err(result) => Ok(result),
-        }
+        Ok(CallToolResult::structured_error(json!({
+            "ok": false,
+            "operation": "d1_provision_dml_custody",
+            "status": "offline_provisioning_required",
+            "plan": plan,
+            "plan_sha256": plan_sha256,
+            "entitlement_requirements": entitlement_requirements,
+            "provider_calls": 0,
+            "provider_mutations": 0,
+            "local_namespace_mutations": 0,
+            "error": {
+                "code": "d1.dml_custody_offline_provisioning_required",
+                "message": "the MCP server has no live D1 custody provisioning authority",
+                "hint": "Create the exact external entitlement under operator custody, then run the separately privileged d1-provision-dml-custody-offline command."
+            }
+        })))
     }
 
     #[tool(
@@ -16048,6 +16046,7 @@ mod tests {
             "d1_get_database",
             "d1_inspect_schema",
             "d1_query_read_only",
+            "d1_provision_dml_custody",
             "d1_reconcile_migration_manifest",
         ] {
             assert!(allowed.iter().any(|candidate| candidate == tool), "{tool}");
@@ -16112,7 +16111,6 @@ mod tests {
             "d1_bootstrap_migration_ledger",
             "d1_delete_database",
             "d1_execute_write",
-            "d1_provision_dml_custody",
             "d1_finalize_bootstrap_migration_ledger",
             "d1_finalize_migration_reconciliation",
             "d1_rename_database",
@@ -16124,7 +16122,6 @@ mod tests {
             ("d1_rename_database", "shared_target_guard"),
             ("d1_delete_database", "shared_target_guard"),
             ("d1_execute_write", "shared_target_guard"),
-            ("d1_provision_dml_custody", "local_custody_only"),
             ("d1_bootstrap_migration_ledger", "durable_target_lease"),
             ("d1_apply_migration_manifest", "durable_target_lease"),
         ] {

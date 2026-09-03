@@ -19,7 +19,8 @@ preferred path for safety-sensitive operations.
   envelope and bearer token authentication.
 - Product workflows with curated safety policy remain specialized tools. D1
   workflows use `d1_list_databases`, `d1_get_database`, `d1_inspect_schema`,
-  `d1_query_read_only`, `d1_validate_query`, `d1_provision_dml_custody`,
+  `d1_query_read_only`, `d1_validate_query`, planning-only
+  `d1_provision_dml_custody`,
   `d1_execute_write`,
   `d1_apply_migrations`, `d1_bootstrap_migration_ledger`,
   `d1_reconcile_bootstrap_migration_ledger`,

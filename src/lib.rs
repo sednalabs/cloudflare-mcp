@@ -16,6 +16,7 @@ pub(crate) mod d1_dml_attempt_custody;
 pub(crate) mod d1_dml_classifier;
 pub(crate) mod d1_dml_custody_genesis;
 pub(crate) mod d1_dml_custody_layout;
+pub mod d1_dml_custody_provision;
 pub(crate) mod d1_dml_identity_claimant;
 pub(crate) mod d1_dml_identity_reservation;
 #[allow(dead_code)] // staged pure product; route integration and mutation admission are separate

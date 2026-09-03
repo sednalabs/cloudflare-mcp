@@ -96,7 +96,7 @@ identity and one physical target guard namespace:
 
 | Provider mutation surface | Coverage |
 | --- | --- |
-| `d1_provision_dml_custody` | provider-free create-once genesis/layout provisioning; exact replay converges and conflicts fail closed |
+| `d1_provision_dml_custody` | read-only external-entitlement planning; live MCP apply is permanently denied |
 | `d1_rename_database` | exact eight-step consent plus three opaque identities; one guarded provider request maximum; nonterminal acknowledgement/reconciliation custody; no automatic retry |
 | `d1_delete_database` | same guarded one-call lifecycle for high-risk deletion; exact replay never redispatches; stable recovery/finalization remains separate |
 | `d1_execute_write` | shared permanent target guard |
@@ -136,12 +136,20 @@ and are not provider D1 mutation surfaces.
 Set one canonical opaque `CLOUDFLARE_MCP_D1_CUSTODY_GENERATION` and one
 independently obtained lowercase SHA-256
 `CLOUDFLARE_MCP_D1_CUSTODY_AUTHORITY_SHA256` on every process sharing the
-target guard root. For each exact account/database target, dry-run
-`d1_provision_dml_custody`, review its local-only plan, then repeat the exact
-generation and authority pin with `approved_plan_sha256`. The operation makes
-no Cloudflare request. First application reports `applied`; an exact replay
-reports `proven`. Any changed target, generation, pin, genesis, layout, or
-partial/orphan product fails closed without repair.
+target guard root. For each exact target, call `d1_provision_dml_custody` with
+`dry_run=true` to derive the external-entitlement requirements. The public MCP
+tool never creates custody; a non-dry call is denied even with the returned plan
+digest.
+
+Place the exact operator-created entitlement in a private external seal root
+that is disjoint from the lease root, then invoke
+`cloudflare-mcp d1-provision-dml-custody-offline` with explicit lease-root,
+external-seal-root, and entitlement paths. That separate process consumes the
+entitlement before local creation and emits only aggregate digests. Preserve
+its external in-progress consumption and final consumed receipt. Exact
+interrupted-operation resume is allowed only from the still-virgin root, or to
+seal an already-complete exact local product. A partial product, and any missing
+or replaced evidence after completion, is reconciliation and is never repaired.
 
 All ordinary live D1 mutation paths only open this exact incumbent authority.
 They never create genesis or layout, including after Prepared,

@@ -181,9 +181,9 @@ fn d1_execute_write_mutation_plan(dry_run: bool) -> MutationPlan {
     }
     MutationPlan::new(D1_EXECUTE_WRITE_OPERATION)
     .step(
-        "ensure_sharded_dml_custody_and_capacity",
-        true,
-        json!({"layout": "dml-custody-v1", "atomic_layout_install": true, "claimant_set_capacity_preflight": true, "cas_scratch_slots_per_affected_leaf": 1}),
+        "open_existing_sharded_dml_custody_and_capacity",
+        false,
+        json!({"layout": "dml-custody-v1", "ordinary_execution_may_create": false, "claimant_set_capacity_preflight": true, "cas_scratch_slots_per_affected_leaf": 1}),
     )
     .step(
         "install_pending_identity_claimants",
@@ -1323,7 +1323,7 @@ mod tests {
             json!({
                 "operation": "d1_execute_write",
                 "steps": [
-                    {"ordinal": 1, "action": "ensure_sharded_dml_custody_and_capacity", "side_effect": true, "target": {"atomic_layout_install": true, "cas_scratch_slots_per_affected_leaf": 1, "claimant_set_capacity_preflight": true, "layout": "dml-custody-v1"}},
+                    {"ordinal": 1, "action": "open_existing_sharded_dml_custody_and_capacity", "side_effect": false, "target": {"ordinary_execution_may_create": false, "cas_scratch_slots_per_affected_leaf": 1, "claimant_set_capacity_preflight": true, "layout": "dml-custody-v1"}},
                     {"ordinal": 2, "action": "install_pending_identity_claimants", "side_effect": true, "target": {"create_once": true, "namespace_count": 3, "phase": "Pending"}},
                     {"ordinal": 3, "action": "collect_stable_catalog", "side_effect": false, "target": {"observations": 2}},
                     {"ordinal": 4, "action": "compose_reserved_relation_authority", "side_effect": false, "target": {}},

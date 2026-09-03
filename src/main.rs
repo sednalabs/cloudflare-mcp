@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -90,11 +91,19 @@ enum RuntimeTransport {
     Stdio,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OfflineD1ProvisionOptions {
+    lease_root: PathBuf,
+    external_seal_root: PathBuf,
+    entitlement: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RuntimeOptions {
     transport: RuntimeTransport,
     print_tools: bool,
     help: bool,
+    offline_d1_provision: Option<OfflineD1ProvisionOptions>,
 }
 
 impl Default for RuntimeOptions {
@@ -103,6 +112,7 @@ impl Default for RuntimeOptions {
             transport: RuntimeTransport::Http,
             print_tools: false,
             help: false,
+            offline_d1_provision: None,
         }
     }
 }
@@ -676,8 +686,12 @@ where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
+    let args = args.into_iter().map(Into::into).collect::<Vec<String>>();
+    if args.first().map(String::as_str) == Some("d1-provision-dml-custody-offline") {
+        return parse_offline_d1_provision_options(&args[1..]);
+    }
     let mut options = RuntimeOptions::default();
-    let mut args = args.into_iter().map(Into::into).peekable();
+    let mut args = args.into_iter().peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => options.help = true,
@@ -700,6 +714,39 @@ where
     Ok(options)
 }
 
+fn parse_offline_d1_provision_options(args: &[String]) -> Result<RuntimeOptions> {
+    let mut lease_root = None;
+    let mut external_seal_root = None;
+    let mut entitlement = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        let Some(value) = args.get(index + 1) else {
+            return Err(anyhow!("{flag} requires an absolute path"));
+        };
+        let slot = match flag {
+            "--lease-root" => &mut lease_root,
+            "--external-seal-root" => &mut external_seal_root,
+            "--entitlement" => &mut entitlement,
+            _ => return Err(anyhow!("unsupported offline provisioning option {flag:?}")),
+        };
+        if slot.replace(PathBuf::from(value)).is_some() {
+            return Err(anyhow!("duplicate offline provisioning option {flag}"));
+        }
+        index += 2;
+    }
+    let offline_d1_provision = OfflineD1ProvisionOptions {
+        lease_root: lease_root.ok_or_else(|| anyhow!("--lease-root is required"))?,
+        external_seal_root: external_seal_root
+            .ok_or_else(|| anyhow!("--external-seal-root is required"))?,
+        entitlement: entitlement.ok_or_else(|| anyhow!("--entitlement is required"))?,
+    };
+    Ok(RuntimeOptions {
+        offline_d1_provision: Some(offline_d1_provision),
+        ..RuntimeOptions::default()
+    })
+}
+
 fn parse_transport_mode(value: &str) -> Result<RuntimeTransport> {
     match value.trim().to_lowercase().as_str() {
         "http" | "streamable-http" | "streamable_http" => Ok(RuntimeTransport::Http),
@@ -718,6 +765,7 @@ cloudflare-mcp
 Usage:
   cloudflare-mcp [--transport http|stdio] [--print-tools]
   cloudflare-mcp --stdio
+  cloudflare-mcp d1-provision-dml-custody-offline --lease-root PATH --external-seal-root PATH --entitlement PATH
 
 Options:
   --transport http|stdio  Runtime transport. Defaults to http.
@@ -725,6 +773,11 @@ Options:
   --http                  Run the Streamable HTTP server on CLOUDFLARE_MCP_BIND_ADDR.
   --print-tools           Print registered tool names as JSON and exit.
   --help                  Show this help.
+
+Offline provisioning:
+  Consumes one external operator-controlled entitlement before creating local
+  D1 custody. The external seal root must be disjoint from the lease root and
+  is never read by the MCP server runtime.
 "
     );
 }
@@ -760,6 +813,25 @@ async fn run() -> Result<()> {
     let options = parse_runtime_options()?;
     if options.help {
         print_help();
+        return Ok(());
+    }
+
+    if let Some(offline) = options.offline_d1_provision {
+        let result = cloudflare_mcp::d1_dml_custody_provision::run_offline_d1_dml_custody_provision(
+            &offline.lease_root,
+            &offline.external_seal_root,
+            &offline.entitlement,
+        );
+        let (payload, failed) = match result {
+            Ok(payload) => (payload, false),
+            Err(payload) => (payload, true),
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        if failed {
+            return Err(anyhow!(
+                "offline D1 custody provisioning requires reconciliation"
+            ));
+        }
         return Ok(());
     }
 
@@ -1044,6 +1116,7 @@ fn log_runtime_posture(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1209,6 +1282,37 @@ mod tests {
                 .expect("options");
         assert_eq!(options.transport, RuntimeTransport::Http);
         assert!(options.print_tools);
+    }
+
+    #[test]
+    fn runtime_options_isolate_offline_custody_provisioning_paths() {
+        let options = parse_runtime_options_from([
+            "d1-provision-dml-custody-offline",
+            "--lease-root",
+            "/private/lease",
+            "--external-seal-root",
+            "/private/seal",
+            "--entitlement",
+            "/private/seal/entitlement.json",
+        ])
+        .expect("offline options");
+        let offline = options
+            .offline_d1_provision
+            .expect("offline provisioning mode");
+        assert_eq!(offline.lease_root, PathBuf::from("/private/lease"));
+        assert_eq!(offline.external_seal_root, PathBuf::from("/private/seal"));
+        assert_eq!(
+            offline.entitlement,
+            PathBuf::from("/private/seal/entitlement.json")
+        );
+        assert!(
+            parse_runtime_options_from([
+                "d1-provision-dml-custody-offline",
+                "--lease-root",
+                "/private/lease",
+            ])
+            .is_err()
+        );
     }
 
     async fn test_router_with_auth(auth_enabled: bool) -> Router {

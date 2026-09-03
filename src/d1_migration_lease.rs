@@ -179,7 +179,23 @@ pub(crate) struct D1TargetMutationGuard {
     dml_custody_authority: crate::d1_dml_custody_genesis::D1DmlCustodyAuthority,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct D1DmlCustodyLocalReadback {
+    pub(crate) version: u8,
+    pub(crate) root_identity: D1LeaseFileIdentity,
+    pub(crate) target_identity: D1LeaseFileIdentity,
+    pub(crate) guard_identity: D1LeaseFileIdentity,
+    pub(crate) genesis_identity: D1LeaseFileIdentity,
+    pub(crate) layout_identity: D1LeaseFileIdentity,
+    pub(crate) target_key_sha256: String,
+    pub(crate) layout_sha256: String,
+    pub(crate) custody_generation_sha256: String,
+    pub(crate) authority_sha256: String,
+    pub(crate) genesis_sha256: String,
+    pub(crate) local_readback_sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct D1DmlCustodyProvisionReceipt {
     pub(crate) version: u8,
     pub(crate) operation: &'static str,
@@ -190,8 +206,15 @@ pub(crate) struct D1DmlCustodyProvisionReceipt {
     pub(crate) custody_generation_sha256: String,
     pub(crate) authority_sha256: String,
     pub(crate) genesis_sha256: String,
+    pub(crate) local_readback: D1DmlCustodyLocalReadback,
     pub(crate) provider_calls: u8,
     pub(crate) provider_mutations: u8,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub(crate) struct D1DmlCustodyRootInspection {
+    pub(crate) root_identity: D1LeaseFileIdentity,
+    pub(crate) is_virgin: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2360,52 +2383,62 @@ pub(crate) fn acquire_d1_target_mutation_guard_at_expected(
     }
 }
 
-/// Explicit one-time local provisioning. This operation never constructs or
-/// submits a Cloudflare request; its supplied authority must independently
-/// match the process configuration before any local artifact is created.
-pub(crate) fn provision_d1_dml_custody(
+/// Inspect the configured lease root without creating or repairing custody.
+/// The offline entitlement boundary uses this before it consumes authority.
+pub(crate) fn inspect_d1_dml_custody_provision_root(
+    root: PathBuf,
+    target_key_sha256: &str,
+) -> Result<D1DmlCustodyRootInspection, CallToolResult> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::inspect_d1_dml_custody_provision_root_linux(root, target_key_sha256)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = root;
+        Err(d1_target_guard_error(
+            "d1_provision_dml_custody_offline",
+            "d1.target_guard_platform_unsupported",
+            "offline D1 custody provisioning requires Linux dirfd-bound storage",
+            target_key_sha256,
+        ))
+    }
+}
+
+/// Prove already-complete custody without creating any missing component.
+pub(crate) fn prove_d1_dml_custody_at(
+    root: PathBuf,
     account_id: &str,
     database_id: &str,
     custody_generation: &str,
     authority_sha256: &str,
 ) -> Result<D1DmlCustodyProvisionReceipt, CallToolResult> {
-    let target = normalize_d1_target(account_id, database_id)?;
-    let root = std::env::var(D1_MANIFEST_LEASE_ROOT_ENV)
-        .ok()
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-        .ok_or_else(|| {
-            d1_target_guard_error(
-                "d1_provision_dml_custody",
-                "d1.target_guard_root_unconfigured",
-                "D1 custody provisioning requires the configured shared target guard root",
-                &target.target_key_sha256(),
-            )
-        })?;
-    let configured = crate::d1_dml_custody_genesis::configured_d1_dml_custody_authority_inputs()
-        .map_err(|message| {
-            d1_target_guard_error(
-                "d1_provision_dml_custody",
-                "d1.dml_custody_authority_unconfigured",
-                message,
-                &target.target_key_sha256(),
-            )
-        })?;
-    if configured.0 != custody_generation || configured.1 != authority_sha256 {
-        return Err(d1_target_guard_error(
-            "d1_provision_dml_custody",
-            "d1.dml_custody_authority_mismatch",
-            "supplied custody generation or authority pin did not match independent process configuration",
-            &target.target_key_sha256(),
-        ));
-    }
-    provision_d1_dml_custody_at(
+    let guard = acquire_d1_target_mutation_guard_at_expected(
         root,
-        &target.account_id,
-        &target.database_id,
+        "d1_provision_dml_custody_offline",
+        account_id,
+        database_id,
         custody_generation,
         authority_sha256,
-    )
+    )?;
+    guard.open_existing_d1_dml_custody()?;
+    #[cfg(target_os = "linux")]
+    {
+        linux::d1_dml_custody_provision_receipt(&guard, MutationApplyStatus::Proven).map_err(
+            |message| {
+                d1_target_guard_error(
+                    "d1_provision_dml_custody_offline",
+                    "d1.dml_custody_provision_readback_failed",
+                    message,
+                    &guard.target_key_sha256,
+                )
+            },
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        unreachable!("the target mutation guard is unavailable off Linux")
+    }
 }
 
 pub(crate) fn provision_d1_dml_custody_at(
@@ -2424,7 +2457,7 @@ pub(crate) fn provision_d1_dml_custody_at(
         )
         .map_err(|message| {
             d1_target_guard_error(
-                "d1_provision_dml_custody",
+                "d1_provision_dml_custody_offline",
                 "d1.dml_custody_authority_invalid",
                 message,
                 &target.target_key_sha256(),
@@ -2438,7 +2471,7 @@ pub(crate) fn provision_d1_dml_custody_at(
     {
         let _ = (root, expected_authority, genesis_bytes);
         Err(d1_target_guard_error(
-            "d1_provision_dml_custody",
+            "d1_provision_dml_custody_offline",
             "d1.target_guard_platform_unsupported",
             "D1 custody provisioning requires Linux dirfd-bound storage",
             &target.target_key_sha256(),
@@ -5222,7 +5255,7 @@ mod linux {
         expected_authority: crate::d1_dml_custody_genesis::D1DmlCustodyAuthority,
         genesis_bytes: &[u8],
     ) -> Result<D1DmlCustodyProvisionReceipt, CallToolResult> {
-        let operation = "d1_provision_dml_custody";
+        let operation = "d1_provision_dml_custody_offline";
         let target_hash = canonical_target.target_key_sha256();
         validate_root_and_ancestors(&root_path).map_err(|message| {
             d1_target_guard_error(
@@ -5419,20 +5452,164 @@ mod linux {
                 &target_hash,
             )
         })?;
-        Ok(D1DmlCustodyProvisionReceipt {
-            version: 1,
+        let guard_handle = D1TargetMutationGuard {
             operation,
-            apply_status: if created {
+            canonical_target,
+            root_path,
+            root,
+            root_identity,
+            target_name,
+            target,
+            target_identity,
+            guard,
+            guard_identity,
+            target_key_sha256: target_hash,
+            dml_custody_authority: expected_authority,
+        };
+        d1_dml_custody_provision_receipt(
+            &guard_handle,
+            if created {
                 MutationApplyStatus::Applied
             } else {
                 MutationApplyStatus::Proven
             },
-            target_key_sha256: expected_authority.target_key_sha256.clone(),
-            layout_version: expected_authority.layout_version,
-            layout_sha256: expected_authority.layout_sha256.clone(),
-            custody_generation_sha256: expected_authority.custody_generation_sha256.clone(),
-            authority_sha256: expected_authority.authority_sha256.clone(),
-            genesis_sha256: expected_authority.genesis_sha256.clone(),
+        )
+        .map_err(|message| {
+            d1_target_guard_error(
+                operation,
+                "d1.dml_custody_provision_readback_failed",
+                message,
+                &guard_handle.target_key_sha256,
+            )
+        })
+    }
+
+    pub(super) fn inspect_d1_dml_custody_provision_root_linux(
+        root_path: PathBuf,
+        target_key_sha256: &str,
+    ) -> Result<D1DmlCustodyRootInspection, CallToolResult> {
+        let operation = "d1_provision_dml_custody_offline";
+        validate_root_and_ancestors(&root_path).map_err(|message| {
+            d1_target_guard_error(
+                operation,
+                "d1.target_guard_root_unsafe",
+                message,
+                target_key_sha256,
+            )
+        })?;
+        let root_name = c_string_path(&root_path).map_err(|message| {
+            d1_target_guard_error(
+                operation,
+                "d1.target_guard_root_unsafe",
+                message,
+                target_key_sha256,
+            )
+        })?;
+        let root = open_directory_at(AT_FDCWD, &root_name).map_err(|_| {
+            d1_target_guard_error(
+                operation,
+                "d1.target_guard_root_unsafe",
+                "configured target guard root could not be opened without following a symlink",
+                target_key_sha256,
+            )
+        })?;
+        let metadata = root.metadata().map_err(|_| {
+            d1_target_guard_error(
+                operation,
+                "d1.target_guard_root_unsafe",
+                "configured target guard root metadata is unavailable",
+                target_key_sha256,
+            )
+        })?;
+        if !private_dir(&metadata) {
+            return Err(d1_target_guard_error(
+                operation,
+                "d1.target_guard_root_unsafe",
+                "configured target guard root is not a private current-operator-owned directory",
+                target_key_sha256,
+            ));
+        }
+        let root_identity = identity(&metadata);
+        validate_root_path_binding(&root_path, &root, &root_identity).map_err(|message| {
+            d1_target_guard_error(
+                operation,
+                "d1.target_guard_root_unsafe",
+                message,
+                target_key_sha256,
+            )
+        })?;
+        let is_virgin = directory_entry_names(&root)
+            .map_err(|message| {
+                d1_target_guard_error(
+                    operation,
+                    "d1.target_guard_root_unsafe",
+                    message,
+                    target_key_sha256,
+                )
+            })?
+            .is_empty();
+        Ok(D1DmlCustodyRootInspection {
+            root_identity,
+            is_virgin,
+        })
+    }
+
+    pub(super) fn d1_dml_custody_provision_receipt(
+        guard: &D1TargetMutationGuard,
+        apply_status: MutationApplyStatus,
+    ) -> Result<D1DmlCustodyProvisionReceipt, &'static str> {
+        guard
+            .revalidate()
+            .map_err(|_| "D1 target guard changed during final readback")?;
+        let (genesis, genesis_bytes) = private_custody_file_snapshot(
+            &guard.target,
+            crate::d1_dml_custody_genesis::D1_DML_CUSTODY_GENESIS_NAME,
+        )?;
+        if !crate::d1_dml_custody_genesis::validate_d1_dml_custody_genesis(
+            &genesis_bytes,
+            &guard.dml_custody_authority,
+        ) {
+            return Err("D1 custody genesis contradicted final readback authority");
+        }
+        let layout = d1_dml_layout_snapshot(&guard.target, &guard.dml_custody_authority)?;
+        guard
+            .revalidate()
+            .map_err(|_| "D1 target guard changed after final readback")?;
+        let mut local_readback = D1DmlCustodyLocalReadback {
+            version: 1,
+            root_identity: guard.root_identity,
+            target_identity: guard.target_identity,
+            guard_identity: guard.guard_identity,
+            genesis_identity: genesis.file_identity,
+            layout_identity: layout.file_identity,
+            target_key_sha256: guard.dml_custody_authority.target_key_sha256.clone(),
+            layout_sha256: guard.dml_custody_authority.layout_sha256.clone(),
+            custody_generation_sha256: guard
+                .dml_custody_authority
+                .custody_generation_sha256
+                .clone(),
+            authority_sha256: guard.dml_custody_authority.authority_sha256.clone(),
+            genesis_sha256: guard.dml_custody_authority.genesis_sha256.clone(),
+            local_readback_sha256: String::new(),
+        };
+        local_readback.local_readback_sha256 = sha256_bytes_hex(
+            &serde_json::to_vec(&local_readback)
+                .map_err(|_| "D1 custody local readback could not be serialized")?,
+        );
+        Ok(D1DmlCustodyProvisionReceipt {
+            version: 1,
+            operation: "d1_provision_dml_custody_offline",
+            apply_status,
+            target_key_sha256: guard.dml_custody_authority.target_key_sha256.clone(),
+            layout_version: guard.dml_custody_authority.layout_version,
+            layout_sha256: guard.dml_custody_authority.layout_sha256.clone(),
+            custody_generation_sha256: guard
+                .dml_custody_authority
+                .custody_generation_sha256
+                .clone(),
+            authority_sha256: guard.dml_custody_authority.authority_sha256.clone(),
+            genesis_sha256: guard.dml_custody_authority.genesis_sha256.clone(),
+            local_readback,
             provider_calls: 0,
             provider_mutations: 0,
         })
@@ -8508,7 +8685,10 @@ mod tests {
         .expect_err("hostile layout must not be repaired")
         .structured_content
         .expect("structured hostile-layout error");
-        assert_eq!(error["operation"], json!("d1_provision_dml_custody"));
+        assert_eq!(
+            error["operation"],
+            json!("d1_provision_dml_custody_offline")
+        );
         assert_eq!(
             error["error"]["code"],
             json!("d1.target_guard_upgrade_activation_required")

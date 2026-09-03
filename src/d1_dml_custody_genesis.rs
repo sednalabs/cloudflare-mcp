@@ -2,7 +2,7 @@
 //!
 //! The genesis artifact lives in the target directory, outside the replaceable
 //! `dml-custody-v1` tree.  Ordinary provider workflows may only open and prove
-//! this product; the separately exposed no-provider provisioning boundary is
+//! this product; the separately privileged offline provisioning boundary is
 //! the only caller allowed to create it.
 
 use serde::{Deserialize, Serialize};

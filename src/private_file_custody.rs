@@ -14,7 +14,7 @@ use mcp_toolkit_private_artifact::{
 
 pub(crate) const MAX_TRUSTED_SQL_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub(crate) struct UnixFileIdentity {
     pub(crate) device: u64,
     pub(crate) inode: u64,

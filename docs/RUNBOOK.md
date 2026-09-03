@@ -267,9 +267,9 @@ by exact compare-and-exchange to the one full attempt binding. No provider
 dispatch is permitted until the complete `Bound` set is reread. It then durably
 installs one create-once Prepared state and one DispatchReserved
 compare-and-exchange before the only DML provider request. The live mutation
-plan marks atomic layout/capacity preparation, claimant installation/sealing,
-both attempt-custody writes, and
-provider submission as side effects. It also
+plan marks the existing-layout/capacity open as read-only with
+`ordinary_execution_may_create=false`; claimant installation/sealing, both
+attempt-custody writes, and provider submission remain side effects. It also
 marks the required post-provider custody compare-and-exchange as a side effect:
 authenticated acknowledgement records `ProviderAssertionRecorded`, while a
 missing or ambiguous response records `Ambiguous`. Reached-phase evidence names
@@ -463,13 +463,35 @@ receipt when diagnosing the contention.
 
 Before any live mutation, configure one opaque generation in
 `CLOUDFLARE_MCP_D1_CUSTODY_GENERATION` and an independently obtained lowercase
-SHA-256 authority pin in `CLOUDFLARE_MCP_D1_CUSTODY_AUTHORITY_SHA256`. Run
-`d1_provision_dml_custody` as a separate provider-free dry-run/approved-live
-operation for each exact account/database target. It alone creates immutable
-`dml-custody-genesis-v1.json` outside the recreatable `dml-custody-v1` tree and
-binds target, layout contract/version, unique custody generation, and authority
-pin into both products. Exact replay converges; changed or partial evidence
-conflicts and is never replaced or repaired.
+SHA-256 authority pin in `CLOUDFLARE_MCP_D1_CUSTODY_AUTHORITY_SHA256`. The
+public `d1_provision_dml_custody` tool is planning-only: `dry_run=true` returns
+the exact target/genesis/layout digest requirements, while any live call stops
+with `d1.dml_custody_offline_provisioning_required` and zero local/provider
+effects.
+
+Actual first provisioning uses the separately privileged command
+`cloudflare-mcp d1-provision-dml-custody-offline --lease-root ABSOLUTE_PATH
+--external-seal-root ABSOLUTE_PATH --entitlement ABSOLUTE_PATH`. This mode does
+not load MCP/provider configuration. The operator-prepared, mode-`0600`,
+canonical entitlement is held through the toolkit private-artifact boundary
+and binds contract/version, `state=available`, one 16..128-byte opaque operation
+ID, virgin lease-root device/inode, canonical target plus target digest, custody
+generation and digest, authority pin, and exact genesis/layout versions and
+digests. The mode-`0700` external seal root must be operator-owned and disjoint
+from the lease root. Do not grant the normal MCP process write access to it.
+
+Under a per-operation external lock, the offline process durably creates the
+exact `in_progress` consumption record before any target, guard, genesis, or
+layout. It may resume that byte-identical operation only while the bound root
+is still virgin, or prove an already-complete exact local product. A partial
+local product is never repaired. After
+stable descriptor-bound local readback, it exclusively writes and reopens the
+final external receipt, binding entitlement/consumption digests and identities
+to `consumption_state=consumed`, root, target, guard, genesis, layout,
+generation, and authority. Once that receipt exists, replay is proof-only.
+Missing, replaced, malformed, partial, or
+conflicting local/external evidence requires reconciliation with zero repair
+and zero provider calls.
 
 Ordinary row-write, target-wide, manifest, and bootstrap acquisition opens the
 exact existing genesis and layout and creates neither. Governed MCP
