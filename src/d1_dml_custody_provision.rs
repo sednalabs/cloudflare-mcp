@@ -5,6 +5,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path};
 
@@ -19,7 +20,6 @@ use crate::d1_dml_custody_genesis::{
 use crate::d1_dml_custody_layout::{D1_DML_CUSTODY_LAYOUT_SHA256, D1_DML_CUSTODY_LAYOUT_VERSION};
 use crate::d1_migration_lease::{
     D1DmlCustodyLocalReadback, inspect_d1_dml_custody_provision_root, prove_d1_dml_custody_at,
-    provision_d1_dml_custody_at,
 };
 use crate::d1_opaque_identity::valid_d1_opaque_identity;
 use crate::d1_target::normalize_d1_target;
@@ -47,6 +47,7 @@ struct D1DmlCustodyEntitlement {
     state: String,
     operation_id: String,
     lease_root_identity: UnixFileIdentity,
+    external_seal_root_identity: UnixFileIdentity,
     target: EntitlementTarget,
     custody_generation: String,
     custody_generation_sha256: String,
@@ -67,6 +68,7 @@ struct D1DmlCustodyConsumption {
     entitlement_sha256: String,
     entitlement_identity: UnixFileIdentity,
     lease_root_identity: UnixFileIdentity,
+    external_seal_root_identity: UnixFileIdentity,
     target_key_sha256: String,
     custody_generation_sha256: String,
     authority_sha256: String,
@@ -86,6 +88,7 @@ struct D1DmlCustodyExternalReceipt {
     consumption_sha256: String,
     consumption_state: String,
     lease_root_identity: UnixFileIdentity,
+    external_seal_root_identity: UnixFileIdentity,
     target: EntitlementTarget,
     custody_generation_sha256: String,
     authority_sha256: String,
@@ -119,6 +122,8 @@ pub fn run_offline_d1_dml_custody_provision(
         ));
     }
 
+    let external_root = ExternalSealRoot::open(external_seal_root)?;
+
     let policy = PrivateArtifactPolicy::new(MAX_EXTERNAL_SEAL_ARTIFACT_BYTES)
         .map_err(|failure| artifact_error(failure.code()))?;
     let held_entitlement =
@@ -133,6 +138,12 @@ pub fn run_offline_d1_dml_custody_provision(
         entitlement_read.bytes(),
         "d1.dml_custody_entitlement_invalid",
     )?;
+    if entitlement.external_seal_root_identity != external_root.identity {
+        return Err(error(
+            "d1.dml_custody_external_seal_root_mismatch",
+            "external entitlement did not bind the exact current private seal root identity",
+        ));
+    }
     let target = normalize_d1_target(
         &entitlement.target.account_id,
         &entitlement.target.database_id,
@@ -175,14 +186,19 @@ pub fn run_offline_d1_dml_custody_provision(
             "external entitlement did not bind the exact current virgin-root identity",
         ));
     }
+    // Serialize every offline operation at the lease-root scope.  The
+    // operation-id lock below only serializes exact replay; this descriptor
+    // lock prevents distinct entitlements from both consuming authority for
+    // one virgin root.
+    let root_scope = LeaseRootScopeLock::open(lease_root, entitlement.lease_root_identity)?;
+    root_scope.lock()?;
+    root_scope.revalidate()?;
 
     let operation_sha256 = sha256_hex(entitlement.operation_id.as_bytes());
-    let lock_path = external_seal_root.join(format!("d1-custody-{operation_sha256}.lock"));
-    let consumption_path =
-        external_seal_root.join(format!("d1-custody-{operation_sha256}.consumed.json"));
-    let receipt_path =
-        external_seal_root.join(format!("d1-custody-{operation_sha256}.receipt.json"));
-    let lock = open_external_lock(&lock_path)?;
+    let lock_name = format!("d1-custody-{operation_sha256}.lock");
+    let consumption_name = format!("d1-custody-{operation_sha256}.consumed.json");
+    let receipt_name = format!("d1-custody-{operation_sha256}.receipt.json");
+    let lock = open_external_lock(&external_root, &lock_name)?;
     lock.lock().map_err(|_| {
         error(
             "d1.dml_custody_external_lock_failed",
@@ -208,6 +224,7 @@ pub fn run_offline_d1_dml_custody_provision(
     // obviously unrelated target early. Rebind it after locking so a root
     // replacement or a competing local writer cannot turn the stale
     // pre-lock virginity result into authority for this operation.
+    root_scope.revalidate()?;
     let locked_root = inspect_d1_dml_custody_provision_root(
         lease_root.to_path_buf(),
         &target.target_key_sha256(),
@@ -222,6 +239,7 @@ pub fn run_offline_d1_dml_custody_provision(
         ));
     }
     let root = locked_root;
+    external_root.revalidate()?;
 
     let expected_consumption = D1DmlCustodyConsumption {
         version: 1,
@@ -231,6 +249,7 @@ pub fn run_offline_d1_dml_custody_provision(
         entitlement_sha256: entitlement_sha256.clone(),
         entitlement_identity,
         lease_root_identity: entitlement.lease_root_identity,
+        external_seal_root_identity: external_root.identity,
         target_key_sha256: target.target_key_sha256(),
         custody_generation_sha256: authority.custody_generation_sha256.clone(),
         authority_sha256: authority.authority_sha256.clone(),
@@ -239,8 +258,8 @@ pub fn run_offline_d1_dml_custody_provision(
     };
     let consumption_bytes = canonical_bytes(&expected_consumption);
     let consumption_sha256 = sha256_hex(&consumption_bytes);
-    let existing_consumption = read_optional_external(external_seal_root, &consumption_path)?;
-    let existing_receipt = read_optional_external(external_seal_root, &receipt_path)?;
+    let existing_consumption = read_optional_external(&external_root, &consumption_name)?;
+    let existing_receipt = read_optional_external(&external_root, &receipt_name)?;
 
     if let Some(receipt_bytes) = existing_receipt {
         let Some(consumed_bytes) = existing_consumption else {
@@ -267,6 +286,8 @@ pub fn run_offline_d1_dml_custody_provision(
             &entitlement.authority_sha256,
         )
         .map_err(call_tool_error)?;
+        root_scope.revalidate()?;
+        external_root.revalidate()?;
         let expected = final_receipt(
             &entitlement,
             &entitlement_sha256,
@@ -304,8 +325,9 @@ pub fn run_offline_d1_dml_custody_provision(
                 "first entitlement consumption requires the exact bound custody root to be empty",
             ));
         }
-        write_external_exclusive(external_seal_root, &consumption_path, &consumption_bytes)?;
-        let readback = read_required_external(external_seal_root, &consumption_path)?;
+        external_root.revalidate()?;
+        write_external_exclusive(&external_root, &consumption_name, &consumption_bytes)?;
+        let readback = read_required_external(&external_root, &consumption_name)?;
         if readback != consumption_bytes {
             return Err(error(
                 "d1.dml_custody_consumption_readback_failed",
@@ -315,6 +337,8 @@ pub fn run_offline_d1_dml_custody_provision(
         false
     };
 
+    external_root.revalidate()?;
+    root_scope.revalidate()?;
     let provision = if resuming && !root.is_virgin {
         // Once local creation began, an interrupted operation may only prove a
         // fully complete exact product. Missing or partial local evidence is
@@ -328,12 +352,13 @@ pub fn run_offline_d1_dml_custody_provision(
         )
         .map_err(call_tool_error)?
     } else {
-        provision_d1_dml_custody_at(
+        crate::d1_migration_lease::provision_d1_dml_custody_at_expected_root(
             lease_root.to_path_buf(),
             &target.account_id,
             &target.database_id,
             &entitlement.custody_generation,
             &entitlement.authority_sha256,
+            entitlement.lease_root_identity,
         )
         .map_err(call_tool_error)?
     };
@@ -343,6 +368,8 @@ pub fn run_offline_d1_dml_custody_provision(
             "final local readback did not retain the entitlement-bound root identity",
         ));
     }
+    root_scope.revalidate()?;
+    external_root.revalidate()?;
     let receipt = final_receipt(
         &entitlement,
         &entitlement_sha256,
@@ -351,13 +378,15 @@ pub fn run_offline_d1_dml_custody_provision(
         provision.local_readback,
     );
     let receipt_bytes = canonical_bytes(&receipt);
-    write_external_exclusive(external_seal_root, &receipt_path, &receipt_bytes)?;
-    if read_required_external(external_seal_root, &receipt_path)? != receipt_bytes {
+    write_external_exclusive(&external_root, &receipt_name, &receipt_bytes)?;
+    if read_required_external(&external_root, &receipt_name)? != receipt_bytes {
         return Err(error(
             "d1.dml_custody_external_receipt_readback_failed",
             "external completion receipt did not survive exact private readback",
         ));
     }
+    root_scope.revalidate()?;
+    external_root.revalidate()?;
     Ok(success(
         if resuming {
             "resumed_and_proven"
@@ -388,6 +417,7 @@ fn final_receipt(
         consumption_sha256: consumption_sha256.to_string(),
         consumption_state: "consumed".to_string(),
         lease_root_identity: entitlement.lease_root_identity,
+        external_seal_root_identity: entitlement.external_seal_root_identity,
         target: entitlement.target.clone(),
         custody_generation_sha256: entitlement.custody_generation_sha256.clone(),
         authority_sha256: entitlement.authority_sha256.clone(),
@@ -502,20 +532,183 @@ fn exact_private_file_identity(path: &Path) -> Result<UnixFileIdentity, Value> {
     Ok(file_identity(&metadata))
 }
 
-fn open_external_lock(path: &Path) -> Result<File, Value> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .map_err(|_| {
+#[derive(Debug)]
+struct ExternalSealRoot {
+    path: std::path::PathBuf,
+    file: File,
+    identity: UnixFileIdentity,
+}
+
+impl ExternalSealRoot {
+    fn open(path: &Path) -> Result<Self, Value> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|_| {
+                error(
+                    "d1.dml_custody_external_artifact_invalid",
+                    "external seal root could not be opened without following a symlink",
+                )
+            })?;
+        let metadata = file.metadata().map_err(|_| {
             error(
-                "d1.dml_custody_external_lock_failed",
-                "external entitlement operation lock could not be opened safely",
+                "d1.dml_custody_external_artifact_invalid",
+                "external seal root metadata was unavailable",
             )
         })?;
+        if !private_directory(&metadata) {
+            return Err(error(
+                "d1.dml_custody_external_artifact_invalid",
+                "external seal root was not one private current-operator-owned directory",
+            ));
+        }
+        let identity = file_identity(&metadata);
+        let root = Self {
+            path: path.to_path_buf(),
+            file,
+            identity,
+        };
+        root.revalidate()?;
+        Ok(root)
+    }
+
+    fn revalidate(&self) -> Result<(), Value> {
+        let held = self.file.metadata().map_err(|_| {
+            error(
+                "d1.dml_custody_external_seal_root_changed",
+                "held external seal root metadata was unavailable",
+            )
+        })?;
+        let current = fs::symlink_metadata(&self.path).map_err(|_| {
+            error(
+                "d1.dml_custody_external_seal_root_changed",
+                "external seal root pathname could not be revalidated",
+            )
+        })?;
+        if !private_directory(&held)
+            || !private_directory(&current)
+            || file_identity(&held) != self.identity
+            || file_identity(&current) != self.identity
+        {
+            return Err(error(
+                "d1.dml_custody_external_seal_root_changed",
+                "external seal root identity changed during custody persistence",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct LeaseRootScopeLock {
+    path: std::path::PathBuf,
+    file: File,
+    identity: UnixFileIdentity,
+}
+
+impl LeaseRootScopeLock {
+    fn open(path: &Path, expected: UnixFileIdentity) -> Result<Self, Value> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|_| {
+                error(
+                    "d1.dml_custody_lease_root_changed",
+                    "entitlement-bound lease root could not be opened safely",
+                )
+            })?;
+        let metadata = file.metadata().map_err(|_| {
+            error(
+                "d1.dml_custody_lease_root_changed",
+                "entitlement-bound lease root metadata was unavailable",
+            )
+        })?;
+        let identity = file_identity(&metadata);
+        if !private_directory(&metadata) || identity != expected {
+            return Err(error(
+                "d1.dml_custody_lease_root_changed",
+                "entitlement-bound lease root identity changed before custody creation",
+            ));
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            identity,
+        })
+    }
+
+    fn lock(&self) -> Result<(), Value> {
+        self.file.lock().map_err(|_| {
+            error(
+                "d1.dml_custody_lease_root_lock_failed",
+                "lease root scope lock could not be acquired",
+            )
+        })
+    }
+
+    fn revalidate(&self) -> Result<(), Value> {
+        let held = self.file.metadata().map_err(|_| {
+            error(
+                "d1.dml_custody_lease_root_changed",
+                "held lease root metadata was unavailable",
+            )
+        })?;
+        let current = fs::symlink_metadata(&self.path).map_err(|_| {
+            error(
+                "d1.dml_custody_lease_root_changed",
+                "lease root pathname could not be revalidated",
+            )
+        })?;
+        if !private_directory(&held)
+            || !private_directory(&current)
+            || file_identity(&held) != self.identity
+            || file_identity(&current) != self.identity
+        {
+            return Err(error(
+                "d1.dml_custody_lease_root_changed",
+                "lease root identity changed during custody provisioning",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn private_directory(metadata: &fs::Metadata) -> bool {
+    metadata.is_dir()
+        && metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.mode() & 0o077 == 0
+}
+
+fn open_external_relative(
+    root: &ExternalSealRoot,
+    name: &str,
+    flags: i32,
+) -> std::io::Result<File> {
+    let name = std::ffi::CString::new(name)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "unsafe name"))?;
+    let fd = unsafe {
+        libc::openat(
+            root.file.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn open_external_lock(root: &ExternalSealRoot, name: &str) -> Result<File, Value> {
+    let file = open_external_relative(root, name, libc::O_RDWR | libc::O_CREAT).map_err(|_| {
+        error(
+            "d1.dml_custody_external_lock_failed",
+            "external entitlement operation lock could not be opened safely",
+        )
+    })?;
     let metadata = file.metadata().map_err(|_| {
         error(
             "d1.dml_custody_external_lock_failed",
@@ -531,19 +724,21 @@ fn open_external_lock(path: &Path) -> Result<File, Value> {
     Ok(file)
 }
 
-fn write_external_exclusive(root: &Path, path: &Path, bytes: &[u8]) -> Result<(), Value> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .map_err(|_| {
-            error(
-                "d1.dml_custody_external_cas_failed",
-                "external receipt could not be created exclusively",
-            )
-        })?;
+fn write_external_exclusive(
+    root: &ExternalSealRoot,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), Value> {
+    root.revalidate()?;
+    let mut file =
+        open_external_relative(root, name, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL).map_err(
+            |_| {
+                error(
+                    "d1.dml_custody_external_cas_failed",
+                    "external receipt could not be created exclusively",
+                )
+            },
+        )?;
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
         .map_err(|_| {
@@ -552,19 +747,47 @@ fn write_external_exclusive(root: &Path, path: &Path, bytes: &[u8]) -> Result<()
                 "external receipt could not be durably written",
             )
         })?;
-    File::open(root)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|_| {
-            error(
-                "d1.dml_custody_external_write_failed",
-                "external seal directory could not be synchronized",
-            )
-        })
+    root.file.sync_all().map_err(|_| {
+        error(
+            "d1.dml_custody_external_write_failed",
+            "external seal directory could not be synchronized",
+        )
+    })
 }
 
-fn read_optional_external(root: &Path, path: &Path) -> Result<Option<Vec<u8>>, Value> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => read_required_external(root, path).map(Some),
+fn read_optional_external(root: &ExternalSealRoot, name: &str) -> Result<Option<Vec<u8>>, Value> {
+    root.revalidate()?;
+    match open_external_relative(root, name, libc::O_RDONLY) {
+        Ok(file) => {
+            let metadata = file.metadata().map_err(|_| {
+                error(
+                    "d1.dml_custody_external_artifact_invalid",
+                    "external artifact metadata was unavailable",
+                )
+            })?;
+            if !private_regular_file(&metadata) || metadata.nlink() != 1 {
+                return Err(error(
+                    "d1.dml_custody_external_artifact_invalid",
+                    "external artifact was not one private single-link regular file",
+                ));
+            }
+            let mut bytes = Vec::new();
+            let mut reader = &file;
+            std::io::Read::read_to_end(&mut reader, &mut bytes).map_err(|_| {
+                error(
+                    "d1.dml_custody_external_artifact_invalid",
+                    "external artifact could not be read",
+                )
+            })?;
+            if bytes.len() as u64 > MAX_EXTERNAL_SEAL_ARTIFACT_BYTES {
+                return Err(error(
+                    "d1.dml_custody_external_artifact_invalid",
+                    "external artifact exceeded its bounded size",
+                ));
+            }
+            root.revalidate()?;
+            Ok(Some(bytes))
+        }
         Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(_) => Err(error(
             "d1.dml_custody_external_artifact_invalid",
@@ -573,14 +796,41 @@ fn read_optional_external(root: &Path, path: &Path) -> Result<Option<Vec<u8>>, V
     }
 }
 
-fn read_required_external(root: &Path, path: &Path) -> Result<Vec<u8>, Value> {
-    let policy = PrivateArtifactPolicy::new(MAX_EXTERNAL_SEAL_ARTIFACT_BYTES)
-        .map_err(|failure| artifact_error(failure.code()))?;
-    let held = DescriptorBoundArtifact::open(root, path, policy)
-        .map_err(|failure| artifact_error(failure.code()))?;
-    held.read()
-        .map(|read| read.into_bytes())
-        .map_err(|failure| artifact_error(failure.code()))
+fn read_required_external(root: &ExternalSealRoot, name: &str) -> Result<Vec<u8>, Value> {
+    let file = open_external_relative(root, name, libc::O_RDONLY).map_err(|_| {
+        error(
+            "d1.dml_custody_external_artifact_invalid",
+            "external artifact could not be opened relative to the held seal root",
+        )
+    })?;
+    let metadata = file.metadata().map_err(|_| {
+        error(
+            "d1.dml_custody_external_artifact_invalid",
+            "external artifact metadata was unavailable",
+        )
+    })?;
+    if !private_regular_file(&metadata) || metadata.nlink() != 1 {
+        return Err(error(
+            "d1.dml_custody_external_artifact_invalid",
+            "external artifact was not one private single-link regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    let mut reader = &file;
+    std::io::Read::read_to_end(&mut reader, &mut bytes).map_err(|_| {
+        error(
+            "d1.dml_custody_external_artifact_invalid",
+            "external artifact could not be read",
+        )
+    })?;
+    if bytes.len() as u64 > MAX_EXTERNAL_SEAL_ARTIFACT_BYTES {
+        return Err(error(
+            "d1.dml_custody_external_artifact_invalid",
+            "external artifact exceeded its bounded size",
+        ));
+    }
+    root.revalidate()?;
+    Ok(bytes)
 }
 
 /// Aggregate-safe planning projection used by the public MCP tool.
@@ -595,6 +845,7 @@ pub(crate) fn public_entitlement_requirements(
         "state": "available",
         "operation_id": "operator_preallocated_16_to_128_byte_opaque_identity",
         "lease_root_identity": "operator_proven_virgin_device_and_inode",
+        "external_seal_root_identity": "operator_proven_private_seal_root_device_and_inode",
         "target_key_sha256": target_key_sha256,
         "custody_generation_sha256": custody_generation_sha256,
         "authority_sha256": authority_sha256,
@@ -651,6 +902,8 @@ mod tests {
         fn write_entitlement(&self, operation_id: &str) -> D1DmlCustodyEntitlement {
             let root_identity =
                 file_identity(&fs::symlink_metadata(&self.lease_root).expect("root"));
+            let external_seal_root_identity =
+                file_identity(&fs::symlink_metadata(&self.seal_root).expect("seal root"));
             let target = normalize_d1_target("acct-1", "123e4567-e89b-42d3-a456-426614174000")
                 .expect("target");
             let authority_pin = "73cc578c679ad9a10bba8ca71ef85a1efc39e8edfb46a38516fb61ab08c98548";
@@ -666,6 +919,7 @@ mod tests {
                 state: "available".to_string(),
                 operation_id: operation_id.to_string(),
                 lease_root_identity: root_identity,
+                external_seal_root_identity,
                 target: EntitlementTarget {
                     account_id: target.account_id,
                     database_id: target.database_id,
@@ -697,6 +951,7 @@ mod tests {
                 entitlement_sha256: sha256_hex(&entitlement_bytes),
                 entitlement_identity,
                 lease_root_identity: entitlement.lease_root_identity,
+                external_seal_root_identity: entitlement.external_seal_root_identity,
                 target_key_sha256: entitlement.target.target_key_sha256.clone(),
                 custody_generation_sha256: entitlement.custody_generation_sha256.clone(),
                 authority_sha256: entitlement.authority_sha256.clone(),
@@ -707,8 +962,13 @@ mod tests {
             let path = self
                 .seal_root
                 .join(format!("d1-custody-{operation_sha256}.consumed.json"));
-            write_external_exclusive(&self.seal_root, &path, &canonical_bytes(&consumption))
-                .expect("exact external consumption");
+            let seal_root = ExternalSealRoot::open(&self.seal_root).expect("seal root");
+            write_external_exclusive(
+                &seal_root,
+                path.file_name().unwrap().to_str().unwrap(),
+                &canonical_bytes(&consumption),
+            )
+            .expect("exact external consumption");
         }
     }
 
@@ -907,5 +1167,109 @@ mod tests {
         );
         assert_eq!(first["provider_calls"], 0);
         assert_eq!(second["provider_calls"], 0);
+    }
+
+    #[test]
+    fn lease_root_replacement_is_rejected_before_first_local_create() {
+        let fixture = Fixture::new("lease-root-swap");
+        let entitlement = fixture.write_entitlement("custody-operation-0007");
+        let old_root = fixture.base.join("lease-original");
+        fs::rename(&fixture.lease_root, &old_root).expect("retain original lease root");
+        fs::create_dir(&fixture.lease_root).expect("replacement lease root");
+        fs::set_permissions(&fixture.lease_root, fs::Permissions::from_mode(0o700))
+            .expect("private replacement lease root");
+
+        let error = run_offline_d1_dml_custody_provision(
+            &fixture.lease_root,
+            &fixture.seal_root,
+            &fixture.entitlement,
+        )
+        .expect_err("replacement lease root must fail before creation");
+        assert_eq!(error["ok"], false);
+        assert_eq!(
+            error["error"]["code"],
+            "d1.dml_custody_entitlement_root_mismatch"
+        );
+        let target_path = fixture.lease_root.join(format!(
+            "d1-migration-target-{}",
+            entitlement.target.target_key_sha256
+        ));
+        assert!(!target_path.exists(), "replacement root remained untouched");
+    }
+
+    #[test]
+    fn distinct_operations_cannot_both_consume_one_lease_root() {
+        let fixture = Fixture::new("distinct-operations");
+        let first_entitlement = fixture.write_entitlement("custody-operation-0008");
+        let second_path = fixture.seal_root.join("entitlement-2.json");
+        let mut second_entitlement = first_entitlement.clone();
+        second_entitlement.operation_id = "custody-operation-0009".to_string();
+        fs::write(&second_path, canonical_bytes(&second_entitlement)).expect("second entitlement");
+        fs::set_permissions(&second_path, fs::Permissions::from_mode(0o600))
+            .expect("private second entitlement");
+        let lease_root = fixture.lease_root.clone();
+        let seal_root = fixture.seal_root.clone();
+        let first_path = fixture.entitlement.clone();
+        let first = std::thread::spawn({
+            let lease_root = lease_root.clone();
+            let seal_root = seal_root.clone();
+            move || run_offline_d1_dml_custody_provision(&lease_root, &seal_root, &first_path)
+        });
+        let second = std::thread::spawn(move || {
+            run_offline_d1_dml_custody_provision(&lease_root, &seal_root, &second_path)
+        });
+        let first = first.join().expect("first thread");
+        let second = second.join().expect("second thread");
+        assert_eq!(
+            first.is_ok(),
+            second.is_err(),
+            "exactly one operation may win"
+        );
+        let failure = first.err().or_else(|| second.err()).expect("loser error");
+        assert_eq!(failure["ok"], false);
+        assert_eq!(
+            failure["error"]["code"],
+            "d1.dml_custody_entitlement_root_not_virgin"
+        );
+    }
+
+    #[test]
+    fn external_seal_root_replacement_is_rejected_before_consumption() {
+        let fixture = Fixture::new("seal-root-swap");
+        fixture.write_entitlement("custody-operation-0010");
+        let old_root = fixture.base.join("seal-original");
+        fs::rename(&fixture.seal_root, &old_root).expect("retain original seal root");
+        fs::create_dir(&fixture.seal_root).expect("replacement seal root");
+        fs::set_permissions(&fixture.seal_root, fs::Permissions::from_mode(0o700))
+            .expect("private replacement seal root");
+        fs::copy(
+            old_root.join("entitlement.json"),
+            fixture.seal_root.join("entitlement.json"),
+        )
+        .expect("copy entitlement into replacement namespace");
+        fs::set_permissions(
+            fixture.seal_root.join("entitlement.json"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .expect("private replacement entitlement");
+
+        let error = run_offline_d1_dml_custody_provision(
+            &fixture.lease_root,
+            &fixture.seal_root,
+            &fixture.seal_root.join("entitlement.json"),
+        )
+        .expect_err("replacement seal root must fail closed");
+        assert_eq!(error["ok"], false);
+        assert_eq!(
+            error["error"]["code"],
+            "d1.dml_custody_external_seal_root_mismatch"
+        );
+        assert_eq!(
+            fs::read_dir(&fixture.seal_root)
+                .expect("replacement seal root")
+                .count(),
+            1,
+            "replacement seal root contains only the copied entitlement"
+        );
     }
 }

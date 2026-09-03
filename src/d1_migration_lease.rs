@@ -2448,6 +2448,45 @@ pub(crate) fn provision_d1_dml_custody_at(
     custody_generation: &str,
     authority_sha256: &str,
 ) -> Result<D1DmlCustodyProvisionReceipt, CallToolResult> {
+    provision_d1_dml_custody_at_with_expected_root(
+        root,
+        account_id,
+        database_id,
+        custody_generation,
+        authority_sha256,
+        None,
+    )
+}
+
+/// Provision custody while requiring the opened root directory to retain the
+/// exact identity admitted by an offline entitlement.  The check is performed
+/// before any target, marker, guard, genesis, or layout entry can be created.
+pub(crate) fn provision_d1_dml_custody_at_expected_root(
+    root: PathBuf,
+    account_id: &str,
+    database_id: &str,
+    custody_generation: &str,
+    authority_sha256: &str,
+    expected_root_identity: D1LeaseFileIdentity,
+) -> Result<D1DmlCustodyProvisionReceipt, CallToolResult> {
+    provision_d1_dml_custody_at_with_expected_root(
+        root,
+        account_id,
+        database_id,
+        custody_generation,
+        authority_sha256,
+        Some(expected_root_identity),
+    )
+}
+
+fn provision_d1_dml_custody_at_with_expected_root(
+    root: PathBuf,
+    account_id: &str,
+    database_id: &str,
+    custody_generation: &str,
+    authority_sha256: &str,
+    expected_root_identity: Option<D1LeaseFileIdentity>,
+) -> Result<D1DmlCustodyProvisionReceipt, CallToolResult> {
     let target = normalize_d1_target(account_id, database_id)?;
     let (expected_authority, genesis_bytes) =
         crate::d1_dml_custody_genesis::derive_d1_dml_custody_authority(
@@ -2465,11 +2504,22 @@ pub(crate) fn provision_d1_dml_custody_at(
         })?;
     #[cfg(target_os = "linux")]
     {
-        linux::provision_d1_dml_custody_at_linux(root, target, expected_authority, &genesis_bytes)
+        linux::provision_d1_dml_custody_at_linux(
+            root,
+            target,
+            expected_authority,
+            &genesis_bytes,
+            expected_root_identity,
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (root, expected_authority, genesis_bytes);
+        let _ = (
+            root,
+            expected_authority,
+            genesis_bytes,
+            expected_root_identity,
+        );
         Err(d1_target_guard_error(
             "d1_provision_dml_custody_offline",
             "d1.target_guard_platform_unsupported",
@@ -5254,6 +5304,7 @@ mod linux {
         canonical_target: D1TargetIdentity,
         expected_authority: crate::d1_dml_custody_genesis::D1DmlCustodyAuthority,
         genesis_bytes: &[u8],
+        expected_root_identity: Option<D1LeaseFileIdentity>,
     ) -> Result<D1DmlCustodyProvisionReceipt, CallToolResult> {
         let operation = "d1_provision_dml_custody_offline";
         let target_hash = canonical_target.target_key_sha256();
@@ -5306,6 +5357,16 @@ mod linux {
                 &target_hash,
             )
         })?;
+        if let Some(expected) = expected_root_identity {
+            if expected != root_identity {
+                return Err(d1_target_guard_error(
+                    operation,
+                    "d1.target_guard_root_changed",
+                    "configured target guard root identity differed from the admitted entitlement",
+                    &target_hash,
+                ));
+            }
+        }
         ensure_target_identity_activation(&root, &target_hash).map_err(|message| {
             d1_target_identity_activation_error(operation, message, &target_hash)
         })?;
