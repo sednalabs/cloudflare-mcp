@@ -10417,7 +10417,7 @@ fn d1_apply_migration_manifest_preserves_prelease_provider_calls_when_activation
             "error": {
                 "code": "d1.migration_lease_upgrade_activation_required",
                 "hint": "Stop predecessor writers, preserve and reconcile the old root separately, then configure every upgraded writer to one new private empty lease root. Do not create the activation marker manually.",
-                "message": "unversioned root contains custody evidence; activate this contract only on a fresh empty root",
+                "message": "target-identity activation guard is absent or unavailable",
             },
             "lease_retained": null,
             "ok": false,
@@ -11806,6 +11806,10 @@ fn generic_manifest_tools_reject_the_reserved_bootstrap_family_before_any_effect
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
             .expect("make lease root private");
+        // Establish only the permanent target guard. Genesis and layout must
+        // remain absent so the rejected generic family cannot inherit a
+        // provisioning side effect from the stdio fixture bootstrap.
+        install_activated_manifest_root_without_dml_layout(&lease_root);
     }
 
     let mut mcp = McpStdioProcess::start_with_env(vec![
