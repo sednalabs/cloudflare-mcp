@@ -34,6 +34,7 @@ fn ids() -> D1DmlAttemptIdentities<'static> {
         operation_id: OPERATION_ID,
         execution_attempt_id: ATTEMPT_ID,
         provider_request_id: PROVIDER_ID,
+        custody_generation_sha256: crate::d1_dml_attempt_custody::TEST_CUSTODY_GENERATION_SHA256,
     }
 }
 
@@ -42,6 +43,7 @@ fn alternate_ids() -> D1DmlAttemptIdentities<'static> {
         operation_id: "owner-operation-0002",
         execution_attempt_id: "owner-attempt-000002",
         provider_request_id: "owner-provider-00002",
+        custody_generation_sha256: crate::d1_dml_attempt_custody::TEST_CUSTODY_GENERATION_SHA256,
     }
 }
 
@@ -94,6 +96,7 @@ fn install_surrounding_attempt(
         operation_id: &operation_id,
         execution_attempt_id: &execution_attempt_id,
         provider_request_id: &provider_request_id,
+        custody_generation_sha256: crate::d1_dml_attempt_custody::TEST_CUSTODY_GENERATION_SHA256,
     };
     let execute_plan_sha256 = format!("{:x}", Sha256::digest(label.as_bytes()));
     let set = derive_d1_dml_identity_claimant_set(&target(), &execute_plan_sha256, identities)

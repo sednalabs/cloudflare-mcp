@@ -62,6 +62,7 @@ pub(crate) struct D1DmlIdentityClaimantReceipt {
     pub(crate) layout_sha256: String,
     pub(crate) namespace: D1DmlIdentityNamespace,
     pub(crate) target_key_sha256: String,
+    pub(crate) custody_generation_sha256: String,
     pub(crate) identity_sha256: String,
     pub(crate) claimant_set_sha256: String,
     pub(crate) execute_plan_sha256: String,
@@ -89,6 +90,7 @@ impl D1DmlIdentityClaimantProduct {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct D1DmlIdentityClaimantSet {
     target_key_sha256: String,
+    custody_generation_sha256: String,
     claimant_set_sha256: String,
     execute_plan_sha256: String,
     intent_binding_sha256: String,
@@ -165,6 +167,7 @@ impl D1DmlIdentityClaimantSet {
             layout_sha256: D1_DML_CUSTODY_LAYOUT_SHA256.to_string(),
             namespace,
             target_key_sha256: self.target_key_sha256.clone(),
+            custody_generation_sha256: self.custody_generation_sha256.clone(),
             identity_sha256: self.identity_sha256(namespace).to_string(),
             claimant_set_sha256: self.claimant_set_sha256.clone(),
             execute_plan_sha256: self.execute_plan_sha256.clone(),
@@ -226,6 +229,12 @@ pub(crate) fn derive_d1_dml_identity_claimant_set(
             "execute-plan digest was not canonical SHA-256",
         ));
     }
+    if !valid_sha256(identities.custody_generation_sha256) {
+        return Err(claimant_error(
+            D1DmlIdentityClaimantClassification::ExecutePlanDigestInvalid,
+            "custody generation digest was not canonical SHA-256",
+        ));
+    }
     let opaque = [
         identities.operation_id,
         identities.execution_attempt_id,
@@ -243,6 +252,7 @@ pub(crate) fn derive_d1_dml_identity_claimant_set(
             "preallocated attempt identities were not pairwise distinct",
         ));
     }
+    let custody_generation_sha256 = identities.custody_generation_sha256;
     let identities = [
         (
             D1DmlIdentityNamespace::Operation,
@@ -263,6 +273,7 @@ pub(crate) fn derive_d1_dml_identity_claimant_set(
         D1_DML_IDENTITY_CLAIMANT_OPERATION,
         D1_DML_CUSTODY_LAYOUT_VERSION,
         D1_DML_CUSTODY_LAYOUT_SHA256,
+        custody_generation_sha256,
         &identities,
     ));
     let intent_binding_sha256 = hash_serialized(&(
@@ -271,11 +282,13 @@ pub(crate) fn derive_d1_dml_identity_claimant_set(
         D1_DML_CUSTODY_LAYOUT_VERSION,
         D1_DML_CUSTODY_LAYOUT_SHA256,
         target_key_sha256.as_str(),
+        custody_generation_sha256,
         execute_plan_sha256,
         claimant_set_sha256.as_str(),
     ));
     Ok(D1DmlIdentityClaimantSet {
         target_key_sha256,
+        custody_generation_sha256: custody_generation_sha256.to_string(),
         claimant_set_sha256,
         execute_plan_sha256: execute_plan_sha256.to_string(),
         intent_binding_sha256,
@@ -315,6 +328,7 @@ pub(crate) fn inspect_d1_dml_identity_claimant(
         || receipt.layout_version != D1_DML_CUSTODY_LAYOUT_VERSION
         || receipt.layout_sha256 != D1_DML_CUSTODY_LAYOUT_SHA256
         || !valid_sha256(&receipt.target_key_sha256)
+        || !valid_sha256(&receipt.custody_generation_sha256)
         || !valid_sha256(&receipt.identity_sha256)
         || !valid_sha256(&receipt.claimant_set_sha256)
         || !valid_sha256(&receipt.execute_plan_sha256)
@@ -379,6 +393,7 @@ pub(crate) fn validate_d1_dml_identity_claimant_audit_binding(
         D1_DML_CUSTODY_LAYOUT_VERSION,
         D1_DML_CUSTODY_LAYOUT_SHA256,
         receipt.target_key_sha256.as_str(),
+        receipt.custody_generation_sha256.as_str(),
         receipt.execute_plan_sha256.as_str(),
         receipt.claimant_set_sha256.as_str(),
     ));
@@ -410,6 +425,7 @@ pub(crate) fn validate_complete_d1_dml_identity_claimant_set(
     let first = &receipts[0];
     if receipts.iter().any(|receipt| {
         receipt.target_key_sha256 != first.target_key_sha256
+            || receipt.custody_generation_sha256 != first.custody_generation_sha256
             || receipt.execute_plan_sha256 != first.execute_plan_sha256
             || receipt.claimant_set_sha256 != first.claimant_set_sha256
             || receipt.intent_binding_sha256 != first.intent_binding_sha256
@@ -458,6 +474,7 @@ pub(crate) fn validate_complete_d1_dml_identity_claimant_set(
         D1_DML_IDENTITY_CLAIMANT_OPERATION,
         D1_DML_CUSTODY_LAYOUT_VERSION,
         D1_DML_CUSTODY_LAYOUT_SHA256,
+        first.custody_generation_sha256.as_str(),
         &identities,
     ));
     if first.claimant_set_sha256 != expected {
@@ -517,6 +534,8 @@ mod tests {
                 operation_id: "operation-fixture-0001",
                 execution_attempt_id: "attempt-fixture-0001",
                 provider_request_id: "provider-fixture-0001",
+                custody_generation_sha256:
+                    crate::d1_dml_attempt_custody::TEST_CUSTODY_GENERATION_SHA256,
             },
         )
         .expect("claimant set");
@@ -601,6 +620,8 @@ mod tests {
             operation_id: "operation-fixture-0001",
             execution_attempt_id: "attempt-fixture-0001",
             provider_request_id: "provider-fixture-0001",
+            custody_generation_sha256:
+                crate::d1_dml_attempt_custody::TEST_CUSTODY_GENERATION_SHA256,
         };
         let second = derive_d1_dml_identity_claimant_set(&target, &"b".repeat(64), identities)
             .expect("second set");

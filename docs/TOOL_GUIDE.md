@@ -70,6 +70,7 @@ Use curated D1 tools instead of generic API calls for database workflows:
 - `d1_inspect_schema`
 - `d1_validate_query`
 - `d1_query_read_only`
+- `d1_provision_dml_custody`
 - `d1_execute_write`
 - `d1_apply_migrations` (dry-run inspection only; live mutation is retired)
 - `d1_bootstrap_migration_ledger`
@@ -95,6 +96,7 @@ identity and one physical target guard namespace:
 
 | Provider mutation surface | Coverage |
 | --- | --- |
+| `d1_provision_dml_custody` | provider-free create-once genesis/layout provisioning; exact replay converges and conflicts fail closed |
 | `d1_rename_database` | exact eight-step consent plus three opaque identities; one guarded provider request maximum; nonterminal acknowledgement/reconciliation custody; no automatic retry |
 | `d1_delete_database` | same guarded one-call lifecycle for high-risk deletion; exact replay never redispatches; stable recovery/finalization remains separate |
 | `d1_execute_write` | shared permanent target guard |
@@ -129,6 +131,22 @@ traceable.
 Local reconcile/finalize/abort tools manipulate retained custody evidence only
 and are not provider D1 mutation surfaces.
 
+### Provision immutable D1 DML custody
+
+Set one canonical opaque `CLOUDFLARE_MCP_D1_CUSTODY_GENERATION` and one
+independently obtained lowercase SHA-256
+`CLOUDFLARE_MCP_D1_CUSTODY_AUTHORITY_SHA256` on every process sharing the
+target guard root. For each exact account/database target, dry-run
+`d1_provision_dml_custody`, review its local-only plan, then repeat the exact
+generation and authority pin with `approved_plan_sha256`. The operation makes
+no Cloudflare request. First application reports `applied`; an exact replay
+reports `proven`. Any changed target, generation, pin, genesis, layout, or
+partial/orphan product fails closed without repair.
+
+All ordinary live D1 mutation paths only open this exact incumbent authority.
+They never create genesis or layout, including after Prepared,
+DispatchReserved, or ReconciliationRequired custody exists.
+
 ### Execute one exact D1 row write
 
 Configure `CLOUDFLARE_MCP_D1_RESERVED_RELATIONS` as a comma-separated set of
@@ -150,7 +168,8 @@ are added by the graph derivation.
    `composition_sha256`. Its public mutation plan contains only those read and
    composition steps. No DML provider call or local attempt state is made, and
    the audit outcome is `planned`.
-3. Approve that digest, then repeat the exact target, SQL bytes, params,
+3. Confirm immutable genesis and layout were separately provisioned for this
+   exact target and generation. Approve that digest, then repeat the exact target, SQL bytes, params,
    identities, and row cap with `dry_run=false` and
    `approved_composition_sha256`. Before any provider access, live execution
    create-once installs one `Pending` claimant in each operation,
@@ -192,14 +211,14 @@ are added by the graph derivation.
    variable leaf artifacts are the globally budgeted graph. Target-wide
    authority accepts only the clean fixed-budget, all-terminal projection of
    this proof.
-   Fresh migration lease acquisition first installs or validates the fixed
-   empty layout under its held permanent target guard, then persists the exact
+   Fresh migration lease acquisition first opens the separately provisioned
+   exact genesis and layout under its held permanent target guard, then persists the exact
    target/layout/budget/audit identity in `active.lease.json`; retained
    recovery, terminal receipt, restoration, and retirement re-audit it at
    their last owned boundary without creating or repairing layout evidence.
    Terminal receipts inherit the binding through `lease_payload_sha256`.
    The governed MCP rename/delete tools derive one static eight-step plan before
-   dry/live branching: validate intent, ensure local custody, authorize a clean
+   dry/live branching: validate intent, open exact existing custody, authorize a clean
    audit before fresh state, install `Prepared`, authorize and revalidate its
    exact owner, reserve one dispatch by CAS, perform at most one provider rename
    or delete, and retain one post-provider custody outcome.

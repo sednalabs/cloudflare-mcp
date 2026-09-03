@@ -129,15 +129,15 @@ set counts, the five phase counts, and always declares
 `provider_dispatch_authority=none`. Target-wide authority accepts only a clean
 fixed-budget projection of that receipt: no Pending claimant, CAS scratch,
 partial/orphan/unmatched set, unmatched attempt, malformed artifact, or
-nonterminal attempt, or nonfixed layout/budget identity. Fresh migration lease acquisition first
-installs or validates the fixed empty layout under the already-held permanent
-target guard, then runs that proof before creating `active.lease.json`. It
+nonterminal attempt, or nonfixed genesis/layout/budget identity. Fresh migration
+lease acquisition opens the separately provisioned exact genesis and layout
+under the already-held permanent target guard, then runs that proof before creating `active.lease.json`. It
 persists the exact audit identity in the lease payload and re-runs it at
 provider, receipt-persistence, restoration, and retirement boundaries. Because
 terminal receipts bind `lease_payload_sha256`, they also bind the exact
 complete-audit identity.
 Curated database rename and delete derive one canonical eight-step static plan:
-validate exact intent, ensure fixed local custody, authorize a clean complete
+validate exact intent, open exact existing local custody, authorize a clean complete
 audit before fresh state, install canonical `Prepared` custody, authorize and
 immediately revalidate its exact owner, compare-and-exchange once to
 `DispatchReserved`, issue at most one provider request, then retain one
@@ -461,23 +461,31 @@ independent. A guard failure reports the invoked active curated tool as its
 operation and zero provider calls/mutations; preserve that caller-correlated
 receipt when diagnosing the contention.
 
-Fresh row-write, manifest, and bootstrap acquisition may create only the fixed
-empty `dml-custody-v1` layout, under the already-held permanent target guard
-and before any complete-audit authorization. Governed MCP rename/delete use an
-eight-step consent plan; their previews record `ensure_d1_dml_custody_layout` as
-`create_if_absent_at_live_guarded_execution`, `local_custody_only`, and
+Before any live mutation, configure one opaque generation in
+`CLOUDFLARE_MCP_D1_CUSTODY_GENERATION` and an independently obtained lowercase
+SHA-256 authority pin in `CLOUDFLARE_MCP_D1_CUSTODY_AUTHORITY_SHA256`. Run
+`d1_provision_dml_custody` as a separate provider-free dry-run/approved-live
+operation for each exact account/database target. It alone creates immutable
+`dml-custody-genesis-v1.json` outside the recreatable `dml-custody-v1` tree and
+binds target, layout contract/version, unique custody generation, and authority
+pin into both products. Exact replay converges; changed or partial evidence
+conflicts and is never replaced or repaired.
+
+Ordinary row-write, target-wide, manifest, and bootstrap acquisition opens the
+exact existing genesis and layout and creates neither. Governed MCP
+rename/delete use an eight-step consent plan whose second step is
+`open_existing_d1_dml_custody` with
+`ordinary_execution_may_create=false` and
 `provider_dispatch_authority=none`. Live execution later requires exact owner
 authority and one durable reservation before its single permitted provider
-request. The returned
-`intended_plan_sha256` is stable across matching dry/live calls; runtime custody
-facts appear only in `execution_evidence`. An existing layout must validate
-exactly; a fresh successful ensure reports `created` with one local mutation,
-while exact existing custody reports `already_present` with zero local
-mutations. Ensure failure reports failed/unknown local-mutation state and zero
-provider calls. Active guarded paths do not replace, flatten, or repair hostile
-or partial evidence. If audit or revalidation fails after an active ensure, the
-error preserves the observed local outcome while proving zero provider
-dispatch. The lower-level `CloudflareClient` adapter remains distinct. Every
+request. The returned `intended_plan_sha256` is stable across matching dry/live
+calls; runtime custody facts appear only in `execution_evidence`. Exact existing
+custody reports `already_present` with zero local mutations. Missing, orphaned,
+malformed, replaced, partial, generation-mismatched, or changed evidence fails
+before provider access and remains absent or unchanged. The same rule applies
+after `Prepared`, `DispatchReserved`, or `ReconciliationRequired`; those
+products do not authorize local recreation. The lower-level `CloudflareClient`
+adapter remains distinct. Every
 direct rename/delete caller must supply its own governed consent and durable
 reservation/recovery wrapper before provider dispatch; that adapter capability
 does not bypass the MCP lifecycle.

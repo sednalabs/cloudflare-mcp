@@ -142,11 +142,11 @@ pub(crate) fn authorize_d1_target_wide_prepared_owner(
             })?;
 
     let first = complete_audit(guard)?;
-    validate_owner_eligible_audit(&first, &target.target_key_sha256())?;
+    validate_owner_eligible_audit(&first, guard.dml_custody_authority())?;
     validate_exact_owner(guard, &claimant_set, prepared)?;
 
     let second = complete_audit(guard)?;
-    validate_owner_eligible_audit(&second, &target.target_key_sha256())?;
+    validate_owner_eligible_audit(&second, guard.dml_custody_authority())?;
     if second != first {
         return Err(owner_error(
             D1TargetWideOwnerAuditClassification::CustodyChanged,
@@ -266,7 +266,7 @@ fn complete_audit(
 
 fn validate_owner_eligible_audit(
     audit: &D1DmlCustodyCompleteAuditReceipt,
-    target_key_sha256: &str,
+    authority: &crate::d1_dml_custody_genesis::D1DmlCustodyAuthority,
 ) -> Result<(), CallToolResult> {
     let terminal = audit.attempt_phase_counts.terminal();
     let one_owner = audit.attempt_count > 0
@@ -275,7 +275,7 @@ fn validate_owner_eligible_audit(
         && audit.attempt_phase_counts.dispatch_reserved == 0
         && audit.attempt_phase_counts.reconciliation_required == 0
         && terminal == audit.attempt_count.checked_sub(1);
-    if audit.validate_complete_graph(target_key_sha256).is_err() || !one_owner {
+    if audit.validate_complete_graph(authority).is_err() || !one_owner {
         return Err(owner_error(
             D1TargetWideOwnerAuditClassification::CompleteAuditContradictory,
             "complete D1 custody was not exactly one Prepared owner with clean terminal surroundings",

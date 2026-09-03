@@ -11,7 +11,9 @@ use super::*;
 use crate::d1_dml_identity_claimant::D1DmlIdentityNamespace;
 #[cfg(target_os = "linux")]
 use crate::d1_migration_lease::{
+    TEST_D1_DML_CUSTODY_AUTHORITY_SHA256, TEST_D1_DML_CUSTODY_GENERATION,
     acquire_d1_target_mutation_guard_at, acquire_d1_target_mutation_guard_for_test,
+    provision_d1_dml_custody_at,
 };
 use crate::d1_target::normalize_d1_target;
 use crate::d1_target_wide_mutation::{
@@ -32,6 +34,7 @@ fn ids() -> D1DmlAttemptIdentities<'static> {
         operation_id: OPERATION_ID,
         execution_attempt_id: ATTEMPT_ID,
         provider_request_id: PROVIDER_ID,
+        custody_generation_sha256: crate::d1_dml_attempt_custody::TEST_CUSTODY_GENERATION_SHA256,
     }
 }
 
@@ -859,6 +862,14 @@ fn guard_target_mismatch_precedes_layout_and_preserves_hostile_namespaces_exactl
     let plan_b = rename_plan_for(&target_b, "target-b-name", Some("reviewed target B"));
     let (root, guard_a) =
         acquire_d1_target_mutation_guard_for_test("prepared-guard-mismatch", "d1_rename_database");
+    provision_d1_dml_custody_at(
+        root.clone(),
+        &target_b.account_id,
+        &target_b.database_id,
+        TEST_D1_DML_CUSTODY_GENERATION,
+        TEST_D1_DML_CUSTODY_AUTHORITY_SHA256,
+    )
+    .expect("explicitly provision independent target B custody");
     let guard_b = acquire_d1_target_mutation_guard_at(
         root.clone(),
         "d1_rename_database",

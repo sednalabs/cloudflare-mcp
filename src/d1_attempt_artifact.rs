@@ -16,6 +16,7 @@ use crate::d1_target_wide_attempt_custody::{
 pub(crate) struct D1AttemptArtifactReceipt {
     pub(crate) family: &'static str,
     pub(crate) target_key_sha256: String,
+    pub(crate) custody_generation_sha256: String,
     pub(crate) execute_plan_sha256: String,
     pub(crate) operation_id_sha256: String,
     pub(crate) execution_attempt_id_sha256: String,
@@ -34,6 +35,7 @@ pub(crate) fn inspect_d1_attempt_artifact(
         return Ok(D1AttemptArtifactReceipt {
             family: receipt.operation,
             target_key_sha256: receipt.target_key_sha256.clone(),
+            custody_generation_sha256: receipt.custody_generation_sha256.clone(),
             execute_plan_sha256: receipt.execute_plan_sha256.clone(),
             operation_id_sha256: receipt.operation_id_sha256.clone(),
             execution_attempt_id_sha256: receipt.execution_attempt_id_sha256.clone(),
@@ -47,6 +49,7 @@ pub(crate) fn inspect_d1_attempt_artifact(
         return Ok(D1AttemptArtifactReceipt {
             family: D1_TARGET_WIDE_ATTEMPT_CUSTODY_OPERATION,
             target_key_sha256: receipt.target_key_sha256.clone(),
+            custody_generation_sha256: receipt.custody_generation_sha256.clone(),
             execute_plan_sha256: receipt.intended_plan_sha256.clone(),
             operation_id_sha256: receipt.operation_id_sha256.clone(),
             execution_attempt_id_sha256: receipt.execution_attempt_id_sha256.clone(),

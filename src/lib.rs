@@ -14,6 +14,7 @@ pub(crate) mod d1_catalog_evidence;
 #[allow(dead_code)] // staged pure custody; persistence and provider integration are separate
 pub(crate) mod d1_dml_attempt_custody;
 pub(crate) mod d1_dml_classifier;
+pub(crate) mod d1_dml_custody_genesis;
 pub(crate) mod d1_dml_custody_layout;
 pub(crate) mod d1_dml_identity_claimant;
 pub(crate) mod d1_dml_identity_reservation;

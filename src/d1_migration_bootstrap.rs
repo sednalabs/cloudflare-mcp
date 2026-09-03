@@ -71,13 +71,14 @@ pub(crate) fn d1_bootstrap_mutation_plan(input: &D1BootstrapExecutionInput) -> M
             json!({"initializer_sql_sha256": initializer_sql_sha256}),
         )
         .step(
-            "ensure_d1_dml_custody_layout",
-            true,
+            "open_existing_d1_dml_custody",
+            false,
             json!({
                 "target_key_sha256": sha256_bytes_hex(
                     format!("{}\0{}", input.account_id, input.database_id).as_bytes()
                 ),
-                "effect_scope": "local_custody_only",
+                "requires_immutable_genesis": true,
+                "ordinary_execution_may_create": false,
                 "provider_dispatch_authority": "none",
             }),
         )

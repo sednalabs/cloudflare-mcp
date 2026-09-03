@@ -46,6 +46,7 @@ struct D1TargetWideAttemptState {
     layout_sha256: String,
     target_operation: String,
     target_key_sha256: String,
+    custody_generation_sha256: String,
     intended_plan_sha256: String,
     consent_binding_sha256: String,
     confirmation_token_sha256: String,
@@ -139,6 +140,7 @@ pub(crate) struct D1TargetWidePreparedReceipt {
     pub(crate) transition: D1TargetWidePreparedTransition,
     pub(crate) exact_replay: bool,
     pub(crate) target_key_sha256: String,
+    pub(crate) custody_generation_sha256: String,
     pub(crate) intended_plan_sha256: String,
     pub(crate) consent_binding_sha256: String,
     pub(crate) confirmation_token_sha256: String,
@@ -215,6 +217,7 @@ struct PreparedBinding {
     operation_version: u8,
     target_operation: String,
     target_key_sha256: String,
+    custody_generation_sha256: String,
     intended_plan_sha256: String,
     consent_binding_sha256: String,
     confirmation_token_sha256: String,
@@ -237,6 +240,7 @@ struct D1TargetWideAttemptBindingMaterial<'a> {
     operation_version: u8,
     target_operation: &'a str,
     target_key_sha256: &'a str,
+    custody_generation_sha256: &'a str,
     intended_plan_sha256: &'a str,
     consent_binding_sha256: &'a str,
     confirmation_token_sha256: &'a str,
@@ -459,7 +463,7 @@ pub(crate) fn install_d1_target_wide_prepared_custody(
     let prepared =
         prepare_d1_target_wide_attempt(target, intended_plan, confirmation_token, identities, None)
             .map_err(prepared_error_result)?;
-    guard.ensure_target_wide_d1_dml_custody_layout()?;
+    guard.open_target_wide_d1_dml_custody_layout()?;
     let binding = &prepared.receipt.attempt_binding_sha256;
     let incumbent = guard.read_d1_dml_attempt_state(binding)?;
     if let Some(bytes) = incumbent.as_deref() {
@@ -603,6 +607,12 @@ fn derive_binding(
     }
 
     let target_key_sha256 = target.target_key_sha256();
+    if !valid_sha256(identities.custody_generation_sha256) {
+        return Err(prepared_error(
+            D1TargetWidePreparedClassification::IntendedPlanInvalid,
+            "target-wide custody generation digest was not canonical SHA-256",
+        ));
+    }
     let consent_binding_sha256 = hash_serialized(consent);
     let confirmation_token_sha256 = hash_bytes(confirmation_token.as_bytes());
     let normalized_target_sha256 = hash_serialized(&consent.normalized_target);
@@ -620,6 +630,7 @@ fn derive_binding(
         operation_version: consent.operation_version,
         target_operation,
         target_key_sha256: &target_key_sha256,
+        custody_generation_sha256: identities.custody_generation_sha256,
         intended_plan_sha256: &expected.plan_sha256,
         consent_binding_sha256: &consent_binding_sha256,
         confirmation_token_sha256: &confirmation_token_sha256,
@@ -635,6 +646,7 @@ fn derive_binding(
         operation_version: consent.operation_version,
         target_operation: target_operation.to_string(),
         target_key_sha256,
+        custody_generation_sha256: identities.custody_generation_sha256.to_string(),
         intended_plan_sha256: expected.plan_sha256,
         consent_binding_sha256,
         confirmation_token_sha256,
@@ -658,6 +670,7 @@ fn state_from_binding(binding: &PreparedBinding) -> D1TargetWideAttemptState {
         layout_sha256: D1_DML_CUSTODY_LAYOUT_SHA256.to_string(),
         target_operation: binding.target_operation.clone(),
         target_key_sha256: binding.target_key_sha256.clone(),
+        custody_generation_sha256: binding.custody_generation_sha256.clone(),
         intended_plan_sha256: binding.intended_plan_sha256.clone(),
         consent_binding_sha256: binding.consent_binding_sha256.clone(),
         confirmation_token_sha256: binding.confirmation_token_sha256.clone(),
@@ -738,6 +751,7 @@ fn validate_state(state: &D1TargetWideAttemptState) -> Result<(), D1TargetWidePr
     ) || ![
         &state.layout_sha256,
         &state.target_key_sha256,
+        &state.custody_generation_sha256,
         &state.intended_plan_sha256,
         &state.consent_binding_sha256,
         &state.confirmation_token_sha256,
@@ -788,6 +802,7 @@ fn validate_state(state: &D1TargetWideAttemptState) -> Result<(), D1TargetWidePr
         operation_version: state.operation_version,
         target_operation: &state.target_operation,
         target_key_sha256: &state.target_key_sha256,
+        custody_generation_sha256: &state.custody_generation_sha256,
         intended_plan_sha256: &state.intended_plan_sha256,
         consent_binding_sha256: &state.consent_binding_sha256,
         confirmation_token_sha256: &state.confirmation_token_sha256,
@@ -812,6 +827,7 @@ fn state_matches_binding(state: &D1TargetWideAttemptState, binding: &PreparedBin
         && state.operation_version == binding.operation_version
         && state.target_operation == binding.target_operation
         && state.target_key_sha256 == binding.target_key_sha256
+        && state.custody_generation_sha256 == binding.custody_generation_sha256
         && state.intended_plan_sha256 == binding.intended_plan_sha256
         && state.consent_binding_sha256 == binding.consent_binding_sha256
         && state.confirmation_token_sha256 == binding.confirmation_token_sha256
@@ -836,6 +852,7 @@ fn state_immutable_binding_matches(
         && left.layout_sha256 == right.layout_sha256
         && left.target_operation == right.target_operation
         && left.target_key_sha256 == right.target_key_sha256
+        && left.custody_generation_sha256 == right.custody_generation_sha256
         && left.intended_plan_sha256 == right.intended_plan_sha256
         && left.consent_binding_sha256 == right.consent_binding_sha256
         && left.confirmation_token_sha256 == right.confirmation_token_sha256
@@ -946,6 +963,7 @@ fn product(
         transition,
         exact_replay,
         target_key_sha256: state.target_key_sha256.clone(),
+        custody_generation_sha256: state.custody_generation_sha256.clone(),
         intended_plan_sha256: state.intended_plan_sha256.clone(),
         consent_binding_sha256: state.consent_binding_sha256.clone(),
         confirmation_token_sha256: state.confirmation_token_sha256.clone(),

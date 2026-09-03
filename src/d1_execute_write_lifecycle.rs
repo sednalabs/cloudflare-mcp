@@ -315,6 +315,34 @@ async fn execute_inner(
         input.execution_attempt_id,
         input.provider_request_id,
     ));
+    let (configured_generation, configured_authority_sha256) =
+        match crate::d1_dml_custody_genesis::configured_d1_dml_custody_authority_inputs() {
+            Ok(inputs) => inputs,
+            Err(message) => {
+                return provider.apply(blocked(
+                    "d1.execute_write_custody_authority_unconfigured",
+                    message,
+                    mutation_plan,
+                    None,
+                ));
+            }
+        };
+    let (expected_custody_authority, _) =
+        match crate::d1_dml_custody_genesis::derive_d1_dml_custody_authority(
+            &target.target_key_sha256(),
+            &configured_generation,
+            &configured_authority_sha256,
+        ) {
+            Ok(authority) => authority,
+            Err(message) => {
+                return provider.apply(blocked(
+                    "d1.execute_write_custody_authority_invalid",
+                    message,
+                    mutation_plan,
+                    None,
+                ));
+            }
+        };
     let (execute_plan, execute_plan_sha256) = derive_d1_execute_write_plan(
         &target.account_id,
         &target.database_id,
@@ -329,6 +357,7 @@ async fn execute_inner(
         operation_id: input.operation_id,
         execution_attempt_id: input.execution_attempt_id,
         provider_request_id: input.provider_request_id,
+        custody_generation_sha256: &expected_custody_authority.custody_generation_sha256,
     };
 
     // Live execution acquires the same permanent target guard as every other
@@ -347,7 +376,15 @@ async fn execute_inner(
         }
     };
     let claimant_set = if let Some(guard) = guard.as_ref() {
-        if let Err(result) = guard.ensure_d1_dml_custody_layout() {
+        if guard.dml_custody_authority() != &expected_custody_authority {
+            return provider.apply(blocked(
+                "d1.execute_write_custody_authority_mismatch",
+                "opened D1 custody authority did not match configured genesis authority",
+                mutation_plan,
+                None,
+            ));
+        }
+        if let Err(result) = guard.open_existing_d1_dml_custody() {
             return provider.apply(result);
         }
         let claimant_set =
@@ -629,6 +666,10 @@ async fn execute_reserved_attempt(
         operation_id: input.operation_id,
         execution_attempt_id: input.execution_attempt_id,
         provider_request_id: input.provider_request_id,
+        custody_generation_sha256: guard
+            .dml_custody_authority()
+            .custody_generation_sha256
+            .as_str(),
     };
     let initial = match prepare_d1_dml_attempt(target, &composition, identities, None) {
         Ok(product) => product,

@@ -142,6 +142,9 @@ fn tool_capabilities() -> Vec<ToolCapability> {
         cap("d1_execute_write")
             .with_group("d1")
             .with_read_only(false),
+        cap("d1_provision_dml_custody")
+            .with_group("d1")
+            .with_read_only(false),
         cap("d1_apply_migrations")
             .with_group("d1")
             .with_read_only(true),

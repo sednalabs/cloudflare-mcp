@@ -956,6 +956,22 @@ pub struct D1ExecuteWriteArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct D1ProvisionDmlCustodyArgs {
+    #[serde(default)]
+    pub account_id: Option<String>,
+    pub database_id: String,
+    #[schemars(length(min = 16, max = 128), regex(pattern = r"^[A-Za-z0-9._:-]+$"))]
+    pub custody_generation: String,
+    #[schemars(length(equal = 64), regex(pattern = r"^[a-f0-9]{64}$"))]
+    pub authority_sha256: String,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub approved_plan_sha256: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct D1ApplyMigrationsArgs {
     #[serde(default)]
     pub account_id: Option<String>,
@@ -4428,6 +4444,108 @@ impl CloudflareMcp {
     }
 
     #[tool(
+        name = "d1_provision_dml_custody",
+        description = "Plan or explicitly provision one immutable local D1 DML custody genesis and generation-bound layout. This operation performs no Cloudflare provider calls; exact replay converges and conflicts fail closed."
+    )]
+    async fn cloudflare_d1_provision_dml_custody(
+        &self,
+        Parameters(args): Parameters<D1ProvisionDmlCustodyArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let resolved_account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        let target = match normalize_d1_target(resolved_account_id, &args.database_id) {
+            Ok(target) => target,
+            Err(result) => return Ok(result),
+        };
+        let (authority, _) = match crate::d1_dml_custody_genesis::derive_d1_dml_custody_authority(
+            &target.target_key_sha256(),
+            &args.custody_generation,
+            &args.authority_sha256,
+        ) {
+            Ok(product) => product,
+            Err(message) => {
+                return Ok(invalid_argument_result(
+                    "d1.dml_custody_provision_invalid",
+                    message,
+                    "Provide one canonical generation and independently configured lowercase SHA-256 authority pin.",
+                ));
+            }
+        };
+        let plan = MutationPlan::new("d1_provision_dml_custody")
+            .step(
+                "validate_independent_custody_authority",
+                false,
+                json!({
+                    "target_key_sha256": authority.target_key_sha256,
+                    "custody_generation_sha256": authority.custody_generation_sha256,
+                    "authority_sha256": authority.authority_sha256,
+                    "genesis_sha256": authority.genesis_sha256,
+                }),
+            )
+            .step(
+                "provision_local_d1_dml_custody",
+                true,
+                json!({
+                    "layout_version": authority.layout_version,
+                    "layout_sha256": authority.layout_sha256,
+                    "create_once": true,
+                    "exact_replay_converges": true,
+                    "provider_dispatch_authority": "none",
+                }),
+            )
+            .step(
+                "read_back_exact_genesis_and_layout",
+                false,
+                json!({"stable_descriptor_bound_readback": true}),
+            );
+        let plan_sha256 = sha256_bytes_hex(
+            &serde_json::to_vec(&plan)
+                .expect("D1 custody provision plan serialization cannot fail"),
+        );
+        if args.dry_run {
+            return Ok(CallToolResult::structured(json!({
+                "ok": true,
+                "operation": "d1_provision_dml_custody",
+                "status": "planned",
+                "plan": plan,
+                "plan_sha256": plan_sha256,
+                "provider_calls": 0,
+                "provider_mutations": 0,
+            })));
+        }
+        if args.approved_plan_sha256.as_deref() != Some(plan_sha256.as_str()) {
+            return Ok(CallToolResult::structured_error(json!({
+                "ok": false,
+                "operation": "d1_provision_dml_custody",
+                "status": "blocked",
+                "plan": plan,
+                "plan_sha256": plan_sha256,
+                "provider_calls": 0,
+                "provider_mutations": 0,
+                "error": {
+                    "code": "d1.dml_custody_provision_approval_mismatch",
+                    "message": "live provisioning requires the exact plan_sha256 returned by dry-run",
+                    "hint": "Review the no-provider local custody plan and pass its exact lowercase digest."
+                }
+            })));
+        }
+        match crate::d1_migration_lease::provision_d1_dml_custody(
+            &target.account_id,
+            &target.database_id,
+            &args.custody_generation,
+            &args.authority_sha256,
+        ) {
+            Ok(receipt) => Ok(CallToolResult::structured(json!({
+                "ok": true,
+                "operation": "d1_provision_dml_custody",
+                "status": "provisioned",
+                "plan_sha256": plan_sha256,
+                "provision": receipt,
+            }))),
+            Err(result) => Ok(result),
+        }
+    }
+
+    #[tool(
         name = "d1_execute_write",
         description = "Plan or reserve and dispatch one exact audited D1 row-write. Dry-run performs two stable primary catalog reads and returns the exact composition digest required for live execution. Live execution durably reserves one preallocated attempt before one provider request; replay or ambiguity never redispatches."
     )]
@@ -5274,11 +5392,12 @@ impl CloudflareMcp {
         let target_key_sha256 = sha256_bytes_hex(format!("{account_id}\0{database_id}").as_bytes());
         mutation_plan = mutation_plan
             .step(
-                "ensure_d1_dml_custody_layout",
-                true,
+                "open_existing_d1_dml_custody",
+                false,
                 json!({
                     "target_key_sha256": target_key_sha256,
-                    "effect_scope": "local_custody_only",
+                    "requires_immutable_genesis": true,
+                    "ordinary_execution_may_create": false,
                     "provider_dispatch_authority": "none",
                 }),
             )
@@ -14338,9 +14457,7 @@ mod tests {
     use crate::cloudflare::model::WorkerScript;
     use crate::config::PortalAgentConfig;
     use crate::config::{ApiTokenSource, CloudflareApiConfig, ElicitationConfig, ResumeMode};
-    use crate::d1_migration_lease::{
-        acquire_d1_migration_lease_at, acquire_d1_target_mutation_guard_at,
-    };
+    use crate::d1_migration_lease::acquire_d1_migration_lease_at;
     use crate::d1_migration_manifest::{
         D1ManifestReconciliationEvidence, classify_d1_manifest_ledger,
         d1_manifest_contextualize_failure, d1_manifest_plan_mismatch_result,
@@ -14476,16 +14593,14 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn prepare_complete_dml_custody_test_root(root: &std::path::Path) {
-        let guard = acquire_d1_target_mutation_guard_at(
+        crate::d1_migration_lease::provision_d1_dml_custody_at(
             root.to_path_buf(),
-            "test_fixture",
             "acct-1",
             "123e4567-e89b-42d3-a456-426614174000",
+            crate::d1_migration_lease::TEST_D1_DML_CUSTODY_GENERATION,
+            crate::d1_migration_lease::TEST_D1_DML_CUSTODY_AUTHORITY_SHA256,
         )
-        .expect("acquire fixture target guard");
-        guard
-            .ensure_d1_dml_custody_layout()
-            .expect("install clean complete DML custody layout");
+        .expect("provision clean complete DML custody layout");
     }
 
     async fn spawn_router(router: Router) -> String {
@@ -15997,6 +16112,7 @@ mod tests {
             "d1_bootstrap_migration_ledger",
             "d1_delete_database",
             "d1_execute_write",
+            "d1_provision_dml_custody",
             "d1_finalize_bootstrap_migration_ledger",
             "d1_finalize_migration_reconciliation",
             "d1_rename_database",
@@ -16008,6 +16124,7 @@ mod tests {
             ("d1_rename_database", "shared_target_guard"),
             ("d1_delete_database", "shared_target_guard"),
             ("d1_execute_write", "shared_target_guard"),
+            ("d1_provision_dml_custody", "local_custody_only"),
             ("d1_bootstrap_migration_ledger", "durable_target_lease"),
             ("d1_apply_migration_manifest", "durable_target_lease"),
         ] {

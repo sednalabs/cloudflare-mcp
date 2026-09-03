@@ -66,6 +66,7 @@ fn ids() -> D1DmlAttemptIdentities<'static> {
         operation_id: OPERATION_ID,
         execution_attempt_id: ATTEMPT_ID,
         provider_request_id: REQUEST_ID,
+        custody_generation_sha256: super::TEST_CUSTODY_GENERATION_SHA256,
     }
 }
 

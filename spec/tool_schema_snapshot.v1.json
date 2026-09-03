@@ -2348,6 +2348,55 @@
       "name": "d1_list_databases"
     },
     {
+      "description": "Plan or explicitly provision one immutable local D1 DML custody genesis and generation-bound layout. This operation performs no Cloudflare provider calls; exact replay converges and conflicts fail closed.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "approved_plan_sha256": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "authority_sha256": {
+            "maxLength": 64,
+            "minLength": 64,
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
+          },
+          "custody_generation": {
+            "maxLength": 128,
+            "minLength": 16,
+            "pattern": "^[A-Za-z0-9._:-]+$",
+            "type": "string"
+          },
+          "database_id": {
+            "type": "string"
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "database_id",
+          "custody_generation",
+          "authority_sha256"
+        ],
+        "type": "object"
+      },
+      "name": "d1_provision_dml_custody"
+    },
+    {
       "description": "Run or execute one read-only Cloudflare D1 SQL SELECT/query statement against a database after the shared restricted-SQL classifier approves it, returning rows.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",

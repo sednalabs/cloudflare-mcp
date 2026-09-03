@@ -18,6 +18,7 @@ use std::fs;
 #[cfg(target_os = "linux")]
 use std::io::Write;
 
+use mcp_toolkit_core::response_contract::MutationApplyStatus;
 use rmcp::model::CallToolResult;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -28,6 +29,11 @@ use crate::tools::{invalid_argument_result, sha256_bytes_hex};
 use crate::verification::now_unix_ms;
 
 pub(crate) const D1_MANIFEST_LEASE_ROOT_ENV: &str = "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT";
+#[cfg(test)]
+pub(crate) const TEST_D1_DML_CUSTODY_GENERATION: &str = "test-custody-generation-v1";
+#[cfg(test)]
+pub(crate) const TEST_D1_DML_CUSTODY_AUTHORITY_SHA256: &str =
+    "73cc578c679ad9a10bba8ca71ef85a1efc39e8edfb46a38516fb61ab08c98548"; // DevSkim: ignore DS173237 -- synthetic test authority digest, not a credential
 pub(crate) const D1_BOOTSTRAP_INITIALIZER_DISPATCH_PROTOCOL: &str =
     "bootstrap-initializer-attempt-marker-v1";
 static D1_MANIFEST_LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -170,6 +176,22 @@ pub(crate) struct D1TargetMutationGuard {
     #[cfg(target_os = "linux")]
     guard_identity: D1LeaseFileIdentity,
     pub(crate) target_key_sha256: String,
+    dml_custody_authority: crate::d1_dml_custody_genesis::D1DmlCustodyAuthority,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct D1DmlCustodyProvisionReceipt {
+    pub(crate) version: u8,
+    pub(crate) operation: &'static str,
+    pub(crate) apply_status: MutationApplyStatus,
+    pub(crate) target_key_sha256: String,
+    pub(crate) layout_version: u8,
+    pub(crate) layout_sha256: String,
+    pub(crate) custody_generation_sha256: String,
+    pub(crate) authority_sha256: String,
+    pub(crate) genesis_sha256: String,
+    pub(crate) provider_calls: u8,
+    pub(crate) provider_mutations: u8,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -587,7 +609,7 @@ impl D1MigrationLease {
     fn revalidate_dml_custody_authorization(&self) -> Result<(), CallToolResult> {
         let current = linux::authorize_target_wide_d1_dml_custody(
             &self.target,
-            &self.identity.target_key_sha256,
+            &self.dml_custody_authorization.custody_authority(),
         )
         .map_err(|message| self.revalidation_failure(message))?;
         if current != self.dml_custody_authorization {
@@ -620,6 +642,12 @@ impl D1MigrationLease {
 }
 
 impl D1TargetMutationGuard {
+    pub(crate) fn dml_custody_authority(
+        &self,
+    ) -> &crate::d1_dml_custody_genesis::D1DmlCustodyAuthority {
+        &self.dml_custody_authority
+    }
+
     /// Prove that the caller's complete canonical account/database identity is
     /// exactly the target captured when this guard was acquired. This check is
     /// read-only and must precede every caller-selected custody namespace.
@@ -672,13 +700,13 @@ impl D1TargetMutationGuard {
         }
     }
 
-    /// Install or rebind the one immutable sharded DML custody layout before
-    /// any claimant or attempt artifact is inspected.
-    pub(crate) fn ensure_d1_dml_custody_layout(&self) -> Result<(), CallToolResult> {
+    /// Open and prove the independently provisioned genesis and layout.
+    /// Ordinary provider execution has no creation authority.
+    pub(crate) fn open_existing_d1_dml_custody(&self) -> Result<(), CallToolResult> {
         self.revalidate()?;
         #[cfg(target_os = "linux")]
         {
-            linux::ensure_d1_dml_custody_layout(&self.target, &self.target_key_sha256)
+            linux::open_existing_d1_dml_custody(&self.target, &self.dml_custody_authority)
                 .map_err(|message| d1_dml_attempt_store_error(&self.target_key_sha256, message))?;
             self.revalidate()
         }
@@ -691,28 +719,33 @@ impl D1TargetMutationGuard {
         }
     }
 
-    /// Install the fixed empty layout only for a fresh target-wide operation.
-    /// Retained/recovery callers deliberately do not use this path: absence in
-    /// those workflows is evidence loss and must remain fail-closed.
-    #[allow(dead_code)]
-    pub(crate) fn ensure_target_wide_d1_dml_custody_layout(
+    #[cfg(test)]
+    pub(crate) fn ensure_d1_dml_custody_layout(&self) -> Result<(), CallToolResult> {
+        self.revalidate()?;
+        linux::ensure_d1_dml_custody_layout(&self.target, &self.dml_custody_authority)
+            .map_err(|message| d1_dml_attempt_store_error(&self.target_key_sha256, message))?;
+        self.revalidate()
+    }
+
+    /// Open the exact existing layout for a target-wide operation.
+    /// Provisioning is a separate no-provider product.
+    pub(crate) fn open_target_wide_d1_dml_custody_layout(
         &self,
     ) -> Result<crate::d1_dml_custody_layout::D1DmlCustodyLayoutEnsureOutcome, CallToolResult> {
         self.revalidate()?;
         #[cfg(target_os = "linux")]
         {
-            let outcome =
-                linux::ensure_d1_dml_custody_layout(&self.target, &self.target_key_sha256)
-                    .map_err(|message| {
-                        d1_target_guard_error(
-                            self.operation,
-                            "d1.target_wide_dml_custody_layout_unavailable",
-                            message,
-                            &self.target_key_sha256,
-                        )
-                    })?;
+            linux::open_existing_d1_dml_custody(&self.target, &self.dml_custody_authority)
+                .map_err(|message| {
+                    d1_target_guard_error(
+                        self.operation,
+                        "d1.target_wide_dml_custody_layout_unavailable",
+                        message,
+                        &self.target_key_sha256,
+                    )
+                })?;
             self.revalidate()?;
-            Ok(outcome)
+            Ok(crate::d1_dml_custody_layout::D1DmlCustodyLayoutEnsureOutcome::AlreadyPresent)
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -723,6 +756,25 @@ impl D1TargetMutationGuard {
                 &self.target_key_sha256,
             ))
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ensure_target_wide_d1_dml_custody_layout(
+        &self,
+    ) -> Result<crate::d1_dml_custody_layout::D1DmlCustodyLayoutEnsureOutcome, CallToolResult> {
+        self.revalidate()?;
+        let outcome =
+            linux::ensure_d1_dml_custody_layout(&self.target, &self.dml_custody_authority)
+                .map_err(|message| {
+                    d1_target_guard_error(
+                        self.operation,
+                        "d1.target_wide_dml_custody_layout_unavailable",
+                        message,
+                        &self.target_key_sha256,
+                    )
+                })?;
+        self.revalidate()?;
+        Ok(outcome)
     }
 
     /// Separately owned target-wide audit for restore, activation, and other
@@ -736,7 +788,7 @@ impl D1TargetMutationGuard {
         self.revalidate()?;
         #[cfg(target_os = "linux")]
         {
-            linux::audit_d1_dml_custody_complete(&self.target, &self.target_key_sha256)
+            linux::audit_d1_dml_custody_complete(&self.target, &self.dml_custody_authority)
                 .map_err(|message| d1_dml_attempt_store_error(&self.target_key_sha256, message))
         }
         #[cfg(not(target_os = "linux"))]
@@ -758,7 +810,7 @@ impl D1TargetMutationGuard {
         self.revalidate()?;
         #[cfg(target_os = "linux")]
         {
-            linux::authorize_target_wide_d1_dml_custody(&self.target, &self.target_key_sha256)
+            linux::authorize_target_wide_d1_dml_custody(&self.target, &self.dml_custody_authority)
                 .map_err(|message| {
                     d1_target_wide_dml_custody_error(
                         self.operation,
@@ -945,6 +997,17 @@ impl D1TargetMutationGuard {
         set: &crate::d1_dml_identity_claimant::D1DmlIdentityClaimantSet,
     ) -> Result<(), CallToolResult> {
         self.revalidate()?;
+        let representative =
+            set.pending(crate::d1_dml_identity_claimant::D1DmlIdentityNamespace::Operation);
+        if representative.receipt().target_key_sha256 != self.target_key_sha256
+            || representative.receipt().custody_generation_sha256
+                != self.dml_custody_authority.custody_generation_sha256
+        {
+            return Err(d1_dml_attempt_store_error(
+                &self.target_key_sha256,
+                "DML claimant set contradicted target custody generation authority",
+            ));
+        }
         #[cfg(target_os = "linux")]
         {
             linux::preflight_d1_dml_identity_claimant_set_capacity(
@@ -1059,6 +1122,8 @@ impl D1TargetMutationGuard {
                 )
             })?;
         if product.receipt().target_key_sha256 != self.target_key_sha256
+            || product.receipt().custody_generation_sha256
+                != self.dml_custody_authority.custody_generation_sha256
             || product.receipt().namespace != namespace
             || product.receipt().identity_sha256 != identity_sha256
         {
@@ -1083,6 +1148,8 @@ impl D1TargetMutationGuard {
                 )
             })?;
         if receipt.target_key_sha256 != self.target_key_sha256
+            || receipt.custody_generation_sha256
+                != self.dml_custody_authority.custody_generation_sha256
             || receipt.attempt_binding_sha256 != attempt_binding_sha256
         {
             return Err(d1_dml_attempt_store_error(
@@ -1174,7 +1241,7 @@ impl D1RetainedMigrationLease {
     fn revalidate_dml_custody_authorization(&self) -> Result<(), CallToolResult> {
         let current = linux::authorize_target_wide_d1_dml_custody(
             &self.target,
-            &self.identity.target_key_sha256,
+            &self.dml_custody_authorization.custody_authority(),
         )
         .map_err(d1_retained_lease_revalidation_error)?;
         if current != self.dml_custody_authorization {
@@ -2098,8 +2165,12 @@ pub(crate) fn d1_migration_lease_requirements(
             "layout_sha256": crate::d1_dml_custody_layout::D1_DML_CUSTODY_LAYOUT_SHA256,
             "audit_budget_version": crate::d1_dml_custody_layout::D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_VERSION,
             "audit_budget_sha256": crate::d1_dml_custody_layout::D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_SHA256,
-            "fresh_layout_provisioning": "under_held_target_guard_before_authorization",
-            "fresh_layout_provider_dispatch_authority": "none",
+            "genesis": crate::d1_dml_custody_genesis::D1_DML_CUSTODY_GENESIS_NAME,
+            "generation_environment": crate::d1_dml_custody_genesis::D1_DML_CUSTODY_GENERATION_ENV,
+            "authority_environment": crate::d1_dml_custody_genesis::D1_DML_CUSTODY_AUTHORITY_SHA256_ENV,
+            "provisioning": "explicit_d1_provision_dml_custody_only",
+            "ordinary_execution_may_create": false,
+            "provisioning_provider_dispatch_authority": "none",
             "retained_or_recovery_absence": "reconciliation_required_without_creation",
             "binding": "the exact clean complete-audit identity is persisted in the lease payload and therefore inherited by every terminal receipt through lease_payload_sha256",
             "last_boundary_revalidation": true,
@@ -2170,12 +2241,23 @@ pub(crate) fn acquire_d1_migration_lease(
             "ok": false, "operation": "d1_apply_migration_manifest",
             "error": {"code": "d1.migration_lease_root_unconfigured", "message": "live migration apply requires a configured operator-owned shared lease root", "hint": format!("Set {D1_MANIFEST_LEASE_ROOT_ENV} to a pre-created private directory shared by all MCP processes that can target this D1 database.")}
         })))?;
-    acquire_d1_migration_lease_at(
+    let (custody_generation, authority_sha256) =
+        crate::d1_dml_custody_genesis::configured_d1_dml_custody_authority_inputs().map_err(
+            |message| {
+                d1_migration_dml_custody_error(
+                    "d1.migration_dml_custody_authority_unconfigured",
+                    message,
+                )
+            },
+        )?;
+    acquire_d1_migration_lease_at_expected(
         root,
         &target.account_id,
         &target.database_id,
         family,
         plan_sha256,
+        &custody_generation,
+        &authority_sha256,
     )
 }
 
@@ -2197,27 +2279,168 @@ pub(crate) fn acquire_d1_target_mutation_guard(
                 &target.target_key_sha256(),
             )
         })?;
-    acquire_d1_target_mutation_guard_at(root, operation, &target.account_id, &target.database_id)
+    let (custody_generation, authority_sha256) =
+        crate::d1_dml_custody_genesis::configured_d1_dml_custody_authority_inputs().map_err(
+            |message| {
+                d1_target_guard_error(
+                    operation,
+                    "d1.dml_custody_authority_unconfigured",
+                    message,
+                    &target.target_key_sha256(),
+                )
+            },
+        )?;
+    acquire_d1_target_mutation_guard_at_expected(
+        root,
+        operation,
+        &target.account_id,
+        &target.database_id,
+        &custody_generation,
+        &authority_sha256,
+    )
 }
 
+#[cfg(test)]
 pub(crate) fn acquire_d1_target_mutation_guard_at(
     root: PathBuf,
     operation: &'static str,
     account_id: &str,
     database_id: &str,
 ) -> Result<D1TargetMutationGuard, CallToolResult> {
+    acquire_d1_target_mutation_guard_at_expected(
+        root,
+        operation,
+        account_id,
+        database_id,
+        TEST_D1_DML_CUSTODY_GENERATION,
+        TEST_D1_DML_CUSTODY_AUTHORITY_SHA256,
+    )
+}
+
+pub(crate) fn acquire_d1_target_mutation_guard_at_expected(
+    root: PathBuf,
+    operation: &'static str,
+    account_id: &str,
+    database_id: &str,
+    custody_generation: &str,
+    authority_sha256: &str,
+) -> Result<D1TargetMutationGuard, CallToolResult> {
     let target = normalize_d1_target(account_id, database_id)?;
+    let (expected_authority, _) = crate::d1_dml_custody_genesis::derive_d1_dml_custody_authority(
+        &target.target_key_sha256(),
+        custody_generation,
+        authority_sha256,
+    )
+    .map_err(|message| {
+        d1_target_guard_error(
+            operation,
+            "d1.dml_custody_authority_invalid",
+            message,
+            &target.target_key_sha256(),
+        )
+    })?;
     #[cfg(target_os = "linux")]
     {
-        linux::acquire_d1_target_mutation_guard_at_linux(root, operation, target)
+        linux::acquire_d1_target_mutation_guard_at_linux(
+            root,
+            operation,
+            target,
+            expected_authority,
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = root;
+        let _ = (root, expected_authority);
         Err(d1_target_guard_error(
             operation,
             "d1.target_guard_platform_unsupported",
             "permanent cross-process D1 mutation custody requires the Linux dirfd-bound guard implementation",
+            &target.target_key_sha256(),
+        ))
+    }
+}
+
+/// Explicit one-time local provisioning. This operation never constructs or
+/// submits a Cloudflare request; its supplied authority must independently
+/// match the process configuration before any local artifact is created.
+pub(crate) fn provision_d1_dml_custody(
+    account_id: &str,
+    database_id: &str,
+    custody_generation: &str,
+    authority_sha256: &str,
+) -> Result<D1DmlCustodyProvisionReceipt, CallToolResult> {
+    let target = normalize_d1_target(account_id, database_id)?;
+    let root = std::env::var(D1_MANIFEST_LEASE_ROOT_ENV)
+        .ok()
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| {
+            d1_target_guard_error(
+                "d1_provision_dml_custody",
+                "d1.target_guard_root_unconfigured",
+                "D1 custody provisioning requires the configured shared target guard root",
+                &target.target_key_sha256(),
+            )
+        })?;
+    let configured = crate::d1_dml_custody_genesis::configured_d1_dml_custody_authority_inputs()
+        .map_err(|message| {
+            d1_target_guard_error(
+                "d1_provision_dml_custody",
+                "d1.dml_custody_authority_unconfigured",
+                message,
+                &target.target_key_sha256(),
+            )
+        })?;
+    if configured.0 != custody_generation || configured.1 != authority_sha256 {
+        return Err(d1_target_guard_error(
+            "d1_provision_dml_custody",
+            "d1.dml_custody_authority_mismatch",
+            "supplied custody generation or authority pin did not match independent process configuration",
+            &target.target_key_sha256(),
+        ));
+    }
+    provision_d1_dml_custody_at(
+        root,
+        &target.account_id,
+        &target.database_id,
+        custody_generation,
+        authority_sha256,
+    )
+}
+
+pub(crate) fn provision_d1_dml_custody_at(
+    root: PathBuf,
+    account_id: &str,
+    database_id: &str,
+    custody_generation: &str,
+    authority_sha256: &str,
+) -> Result<D1DmlCustodyProvisionReceipt, CallToolResult> {
+    let target = normalize_d1_target(account_id, database_id)?;
+    let (expected_authority, genesis_bytes) =
+        crate::d1_dml_custody_genesis::derive_d1_dml_custody_authority(
+            &target.target_key_sha256(),
+            custody_generation,
+            authority_sha256,
+        )
+        .map_err(|message| {
+            d1_target_guard_error(
+                "d1_provision_dml_custody",
+                "d1.dml_custody_authority_invalid",
+                message,
+                &target.target_key_sha256(),
+            )
+        })?;
+    #[cfg(target_os = "linux")]
+    {
+        linux::provision_d1_dml_custody_at_linux(root, target, expected_authority, &genesis_bytes)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (root, expected_authority, genesis_bytes);
+        Err(d1_target_guard_error(
+            "d1_provision_dml_custody",
+            "d1.target_guard_platform_unsupported",
+            "D1 custody provisioning requires Linux dirfd-bound storage",
             &target.target_key_sha256(),
         ))
     }
@@ -2238,10 +2461,14 @@ pub(crate) fn acquire_d1_target_mutation_guard_for_test(
     fs::create_dir(&root).expect("create private target-wide fixture root");
     fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
         .expect("private target-wide fixture root");
-    let root_file = fs::File::open(&root).expect("open target-wide fixture root");
-    let target_key_sha256 = sha256_bytes_hex(b"acct-1\0123e4567-e89b-42d3-a456-426614174000");
-    linux::ensure_target_identity_activation(&root_file, &target_key_sha256)
-        .expect("activate target-wide fixture identity");
+    provision_d1_dml_custody_at(
+        root.clone(),
+        "acct-1",
+        "123e4567-e89b-42d3-a456-426614174000",
+        TEST_D1_DML_CUSTODY_GENERATION,
+        TEST_D1_DML_CUSTODY_AUTHORITY_SHA256,
+    )
+    .expect("provision target-wide fixture custody");
     let guard = acquire_d1_target_mutation_guard_at(
         root.clone(),
         operation,
@@ -2296,6 +2523,7 @@ pub(crate) fn preflight_d1_migration_target_custody_at(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn acquire_d1_migration_lease_at(
     root: PathBuf,
     account_id: &str,
@@ -2303,7 +2531,47 @@ pub(crate) fn acquire_d1_migration_lease_at(
     family: &str,
     plan_sha256: &str,
 ) -> Result<D1MigrationLease, CallToolResult> {
+    let root_is_empty = fs::read_dir(&root)
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(false);
+    if root_is_empty {
+        let _ = provision_d1_dml_custody_at(
+            root.clone(),
+            account_id,
+            database_id,
+            TEST_D1_DML_CUSTODY_GENERATION,
+            TEST_D1_DML_CUSTODY_AUTHORITY_SHA256,
+        )?;
+    }
+    acquire_d1_migration_lease_at_expected(
+        root,
+        account_id,
+        database_id,
+        family,
+        plan_sha256,
+        TEST_D1_DML_CUSTODY_GENERATION,
+        TEST_D1_DML_CUSTODY_AUTHORITY_SHA256,
+    )
+}
+
+pub(crate) fn acquire_d1_migration_lease_at_expected(
+    root: PathBuf,
+    account_id: &str,
+    database_id: &str,
+    family: &str,
+    plan_sha256: &str,
+    custody_generation: &str,
+    authority_sha256: &str,
+) -> Result<D1MigrationLease, CallToolResult> {
     let target = normalize_d1_target(account_id, database_id)?;
+    let (expected_authority, _) = crate::d1_dml_custody_genesis::derive_d1_dml_custody_authority(
+        &target.target_key_sha256(),
+        custody_generation,
+        authority_sha256,
+    )
+    .map_err(|message| {
+        d1_migration_dml_custody_error("d1.migration_dml_custody_authority_invalid", message)
+    })?;
     #[cfg(target_os = "linux")]
     {
         acquire_d1_migration_lease_at_linux(
@@ -2312,11 +2580,19 @@ pub(crate) fn acquire_d1_migration_lease_at(
             &target.database_id,
             family,
             plan_sha256,
+            expected_authority,
         )
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (root, account_id, database_id, family, plan_sha256);
+        let _ = (
+            root,
+            account_id,
+            database_id,
+            family,
+            plan_sha256,
+            expected_authority,
+        );
         Err(d1_lease_platform_unsupported())
     }
 }
@@ -2764,6 +3040,24 @@ mod linux {
         Ok((target, identity(&metadata)))
     }
 
+    fn open_existing_target_directory(
+        root: &fs::File,
+        target_name: &str,
+    ) -> Result<(fs::File, D1LeaseFileIdentity), &'static str> {
+        let name = c_string_name(target_name)?;
+        let target = open_directory_at(root.as_raw_fd(), &name)
+            .map_err(|_| "target custody directory is absent or unavailable")?;
+        let metadata = target
+            .metadata()
+            .map_err(|_| "target custody directory metadata is unavailable")?;
+        if !private_dir(&metadata) {
+            return Err(
+                "target custody directory is not a private current-operator-owned directory",
+            );
+        }
+        Ok((target, identity(&metadata)))
+    }
+
     fn open_or_create_private_lock(
         directory: &fs::File,
         lock_name: &str,
@@ -2999,7 +3293,7 @@ mod linux {
 
     fn d1_dml_layout_snapshot(
         target: &fs::File,
-        target_key_sha256: &str,
+        authority: &crate::d1_dml_custody_genesis::D1DmlCustodyAuthority,
     ) -> Result<CustodyFileSnapshot, &'static str> {
         use crate::d1_dml_custody_layout::{
             D1_DML_CUSTODY_LAYOUT_MARKER_NAME, D1_DML_CUSTODY_LAYOUT_NAME, validate_layout_marker,
@@ -3019,7 +3313,7 @@ mod linux {
         }
         let (marker, marker_bytes) =
             private_custody_file_snapshot(&layout, D1_DML_CUSTODY_LAYOUT_MARKER_NAME)?;
-        if !validate_layout_marker(&marker_bytes, target_key_sha256) {
+        if !validate_layout_marker(&marker_bytes, authority) {
             return Err("DML custody layout marker was malformed or contradictory");
         }
         let (claimant, claimant_identity) = open_private_dml_directory(&layout, "claimant")?;
@@ -3059,12 +3353,27 @@ mod linux {
         target: &fs::File,
         expected_target_key_sha256: &str,
     ) -> Result<Vec<CustodyFileSnapshot>, &'static str> {
+        let raw_names = directory_entry_names(target)?;
+        let genesis_name = crate::d1_dml_custody_genesis::D1_DML_CUSTODY_GENESIS_NAME;
+        let genesis_authority = if raw_names
+            .iter()
+            .any(|name| name.as_slice() == genesis_name.as_bytes())
+        {
+            let (_, bytes) = private_custody_file_snapshot(target, genesis_name)?;
+            let authority = crate::d1_dml_custody_genesis::inspect_d1_dml_custody_genesis(&bytes)?;
+            if authority.target_key_sha256 != expected_target_key_sha256 {
+                return Err("D1 custody genesis contradicted its target identity");
+            }
+            Some(authority)
+        } else {
+            None
+        };
         let mut entries = Vec::new();
         let mut guard_present = false;
         let mut active_present = false;
         let mut retiring_present = false;
         let mut retained_lease_nonces = BTreeSet::new();
-        for raw_name in directory_entry_names(target)? {
+        for raw_name in raw_names {
             let name = String::from_utf8(raw_name)
                 .map_err(|_| "target custody namespace contains a non-UTF-8 entry")?;
             if name == GUARD_NAME {
@@ -3079,8 +3388,16 @@ mod linux {
                 entries.push(snapshot);
                 continue;
             }
+            if name == genesis_name {
+                let (snapshot, _) = private_custody_file_snapshot(target, &name)?;
+                entries.push(snapshot);
+                continue;
+            }
             if name == crate::d1_dml_custody_layout::D1_DML_CUSTODY_LAYOUT_NAME {
-                entries.push(d1_dml_layout_snapshot(target, expected_target_key_sha256)?);
+                let authority = genesis_authority
+                    .as_ref()
+                    .ok_or("DML custody layout is orphaned from immutable genesis")?;
+                entries.push(d1_dml_layout_snapshot(target, authority)?);
                 continue;
             }
 
@@ -4469,12 +4786,13 @@ mod linux {
                 ));
             }
         }
-        let current_dml_custody_authorization =
-            authorize_target_wide_d1_dml_custody(&target, &identity.target_key_sha256).map_err(
-                |message| {
-                    d1_migration_dml_custody_error("d1.migration_dml_custody_unproven", message)
-                },
-            )?;
+        let current_dml_custody_authorization = authorize_target_wide_d1_dml_custody(
+            &target,
+            &dml_custody_authorization.custody_authority(),
+        )
+        .map_err(|message| {
+            d1_migration_dml_custody_error("d1.migration_dml_custody_unproven", message)
+        })?;
         if current_dml_custody_authorization != dml_custody_authorization {
             return Err(d1_migration_dml_custody_error(
                 "d1.migration_dml_custody_changed",
@@ -4857,9 +5175,11 @@ mod linux {
                 "retained lease target, family, plan, nonce, or payload digest contradicts the exact caller identity",
             ));
         }
-        let current_dml_custody_authorization =
-            authorize_target_wide_d1_dml_custody(&target, &target_hash)
-                .map_err(d1_retained_lease_revalidation_error)?;
+        let current_dml_custody_authorization = authorize_target_wide_d1_dml_custody(
+            &target,
+            &payload.dml_custody_authorization.custody_authority(),
+        )
+        .map_err(d1_retained_lease_revalidation_error)?;
         if payload.dml_custody_authorization != current_dml_custody_authorization {
             return Err(d1_retained_lease_error(
                 "d1.migration_reconciliation_dml_custody_changed",
@@ -4896,11 +5216,13 @@ mod linux {
         Ok(lease)
     }
 
-    pub(super) fn acquire_d1_target_mutation_guard_at_linux(
+    pub(super) fn provision_d1_dml_custody_at_linux(
         root_path: PathBuf,
-        operation: &'static str,
         canonical_target: D1TargetIdentity,
-    ) -> Result<D1TargetMutationGuard, CallToolResult> {
+        expected_authority: crate::d1_dml_custody_genesis::D1DmlCustodyAuthority,
+        genesis_bytes: &[u8],
+    ) -> Result<D1DmlCustodyProvisionReceipt, CallToolResult> {
+        let operation = "d1_provision_dml_custody";
         let target_hash = canonical_target.target_key_sha256();
         validate_root_and_ancestors(&root_path).map_err(|message| {
             d1_target_guard_error(
@@ -4954,7 +5276,6 @@ mod linux {
         ensure_target_identity_activation(&root, &target_hash).map_err(|message| {
             d1_target_identity_activation_error(operation, message, &target_hash)
         })?;
-
         let target_name = format!("d1-migration-target-{target_hash}");
         let (target, target_identity) =
             ensure_target_directory(&root, &target_name).map_err(|message| {
@@ -4966,6 +5287,234 @@ mod linux {
                 )
             })?;
         let (guard, guard_identity) = open_or_create_guard(&target).map_err(|message| {
+            d1_target_guard_error(operation, "d1.target_guard_unsafe", message, &target_hash)
+        })?;
+        guard.lock().map_err(|_| {
+            d1_target_guard_error(
+                operation,
+                "d1.target_guard_lock_failed",
+                "the permanent account/database target guard could not be locked",
+                &target_hash,
+            )
+        })?;
+        validate_d1_lease_custody(
+            &root_path,
+            &root,
+            &root_identity,
+            &target_name,
+            &target,
+            &target_identity,
+            &guard,
+            &guard_identity,
+        )
+        .map_err(|message| {
+            d1_target_guard_error(
+                operation,
+                "d1.target_guard_custody_changed",
+                message,
+                &target_hash,
+            )
+        })?;
+
+        let genesis_name = crate::d1_dml_custody_genesis::D1_DML_CUSTODY_GENESIS_NAME;
+        let genesis_present = entry_present(&target, genesis_name).map_err(|message| {
+            d1_target_guard_error(
+                operation,
+                "d1.dml_custody_genesis_unproven",
+                message,
+                &target_hash,
+            )
+        })?;
+        let layout_present = entry_present(
+            &target,
+            crate::d1_dml_custody_layout::D1_DML_CUSTODY_LAYOUT_NAME,
+        )
+        .map_err(|message| {
+            d1_target_guard_error(
+                operation,
+                "d1.dml_custody_layout_unproven",
+                message,
+                &target_hash,
+            )
+        })?;
+        if layout_present && !genesis_present {
+            return Err(d1_target_guard_error(
+                operation,
+                "d1.dml_custody_orphan_layout",
+                "D1 custody layout existed without immutable genesis",
+                &target_hash,
+            ));
+        }
+        let mut created = false;
+        if genesis_present {
+            let (_, incumbent) =
+                private_custody_file_snapshot(&target, genesis_name).map_err(|message| {
+                    d1_target_guard_error(
+                        operation,
+                        "d1.dml_custody_genesis_unproven",
+                        message,
+                        &target_hash,
+                    )
+                })?;
+            if incumbent != genesis_bytes
+                || !crate::d1_dml_custody_genesis::validate_d1_dml_custody_genesis(
+                    &incumbent,
+                    &expected_authority,
+                )
+            {
+                return Err(d1_target_guard_error(
+                    operation,
+                    "d1.dml_custody_provision_conflict",
+                    "incumbent D1 custody genesis conflicted with the exact provision request",
+                    &target_hash,
+                ));
+            }
+        } else {
+            create_private_dml_state(&target, genesis_name, genesis_bytes).map_err(|message| {
+                d1_target_guard_error(
+                    operation,
+                    "d1.dml_custody_genesis_create_failed",
+                    message,
+                    &target_hash,
+                )
+            })?;
+            created = true;
+        }
+        let layout_outcome =
+            ensure_d1_dml_custody_layout(&target, &expected_authority).map_err(|message| {
+                d1_target_guard_error(
+                    operation,
+                    "d1.dml_custody_layout_create_failed",
+                    message,
+                    &target_hash,
+                )
+            })?;
+        created |= matches!(
+            layout_outcome,
+            crate::d1_dml_custody_layout::D1DmlCustodyLayoutEnsureOutcome::Created
+        );
+        open_existing_d1_dml_custody(&target, &expected_authority).map_err(|message| {
+            d1_target_guard_error(
+                operation,
+                "d1.dml_custody_provision_readback_failed",
+                message,
+                &target_hash,
+            )
+        })?;
+        validate_d1_lease_custody(
+            &root_path,
+            &root,
+            &root_identity,
+            &target_name,
+            &target,
+            &target_identity,
+            &guard,
+            &guard_identity,
+        )
+        .map_err(|message| {
+            d1_target_guard_error(
+                operation,
+                "d1.dml_custody_provision_readback_failed",
+                message,
+                &target_hash,
+            )
+        })?;
+        Ok(D1DmlCustodyProvisionReceipt {
+            version: 1,
+            operation,
+            apply_status: if created {
+                MutationApplyStatus::Applied
+            } else {
+                MutationApplyStatus::Proven
+            },
+            target_key_sha256: expected_authority.target_key_sha256.clone(),
+            layout_version: expected_authority.layout_version,
+            layout_sha256: expected_authority.layout_sha256.clone(),
+            custody_generation_sha256: expected_authority.custody_generation_sha256.clone(),
+            authority_sha256: expected_authority.authority_sha256.clone(),
+            genesis_sha256: expected_authority.genesis_sha256.clone(),
+            provider_calls: 0,
+            provider_mutations: 0,
+        })
+    }
+
+    pub(super) fn acquire_d1_target_mutation_guard_at_linux(
+        root_path: PathBuf,
+        operation: &'static str,
+        canonical_target: D1TargetIdentity,
+        expected_authority: crate::d1_dml_custody_genesis::D1DmlCustodyAuthority,
+    ) -> Result<D1TargetMutationGuard, CallToolResult> {
+        let target_hash = canonical_target.target_key_sha256();
+        validate_root_and_ancestors(&root_path).map_err(|message| {
+            d1_target_guard_error(
+                operation,
+                "d1.target_guard_root_unsafe",
+                message,
+                &target_hash,
+            )
+        })?;
+        let root_name = c_string_path(&root_path).map_err(|message| {
+            d1_target_guard_error(
+                operation,
+                "d1.target_guard_root_unsafe",
+                message,
+                &target_hash,
+            )
+        })?;
+        let root = open_directory_at(AT_FDCWD, &root_name).map_err(|_| {
+            d1_target_guard_error(
+                operation,
+                "d1.target_guard_root_unsafe",
+                "configured target guard root could not be opened without following a symlink",
+                &target_hash,
+            )
+        })?;
+        let root_metadata = root.metadata().map_err(|_| {
+            d1_target_guard_error(
+                operation,
+                "d1.target_guard_root_unsafe",
+                "configured target guard root metadata is unavailable",
+                &target_hash,
+            )
+        })?;
+        if !private_dir(&root_metadata) {
+            return Err(d1_target_guard_error(
+                operation,
+                "d1.target_guard_root_unsafe",
+                "configured target guard root is not a private current-operator-owned directory",
+                &target_hash,
+            ));
+        }
+        let root_identity = identity(&root_metadata);
+        validate_root_path_binding(&root_path, &root, &root_identity).map_err(|message| {
+            d1_target_guard_error(
+                operation,
+                "d1.target_guard_root_unsafe",
+                message,
+                &target_hash,
+            )
+        })?;
+        validate_target_identity_root(&root).map_err(|message| {
+            d1_target_identity_activation_error(operation, message, &target_hash)
+        })?;
+        validate_target_identity_registration(
+            &root,
+            &target_identity_registration_name(&target_hash),
+            &target_hash,
+        )
+        .map_err(|message| d1_target_identity_activation_error(operation, message, &target_hash))?;
+
+        let target_name = format!("d1-migration-target-{target_hash}");
+        let (target, target_identity) = open_existing_target_directory(&root, &target_name)
+            .map_err(|message| {
+                d1_target_guard_error(
+                    operation,
+                    "d1.target_guard_target_unsafe",
+                    message,
+                    &target_hash,
+                )
+            })?;
+        let (guard, guard_identity) = open_existing_guard(&target).map_err(|message| {
             d1_target_guard_error(operation, "d1.target_guard_unsafe", message, &target_hash)
         })?;
         match guard.try_lock() {
@@ -5006,6 +5555,14 @@ mod linux {
             )
         })?;
         maybe_pause_after_guard_for_test(&root_path);
+        open_existing_d1_dml_custody(&target, &expected_authority).map_err(|message| {
+            d1_target_guard_error(
+                operation,
+                "d1.dml_custody_genesis_unproven",
+                message,
+                &target_hash,
+            )
+        })?;
         for (name, message) in [
             (
                 ACTIVE_LEASE_NAME,
@@ -5049,6 +5606,7 @@ mod linux {
             guard,
             guard_identity,
             target_key_sha256: target_hash,
+            dml_custody_authority: expected_authority,
         })
     }
 
@@ -5058,6 +5616,7 @@ mod linux {
         database_id: &str,
         family: &str,
         plan_sha256: &str,
+        expected_authority: crate::d1_dml_custody_genesis::D1DmlCustodyAuthority,
     ) -> Result<D1MigrationLease, CallToolResult> {
         validate_root_and_ancestors(&root_path)
             .map_err(|message| d1_lease_root_error("d1.migration_lease_root_unsafe", message))?;
@@ -5085,13 +5644,19 @@ mod linux {
         validate_root_path_binding(&root_path, &root, &root_identity)
             .map_err(|message| d1_lease_root_error("d1.migration_lease_root_unsafe", message))?;
         let target_hash = sha256_bytes_hex(format!("{account_id}\0{database_id}").as_bytes());
-        ensure_target_identity_activation(&root, &target_hash)
+        validate_target_identity_root(&root)
             .map_err(d1_migration_target_identity_activation_error)?;
+        validate_target_identity_registration(
+            &root,
+            &target_identity_registration_name(&target_hash),
+            &target_hash,
+        )
+        .map_err(d1_migration_target_identity_activation_error)?;
 
         let target_name = format!("d1-migration-target-{target_hash}");
-        let (target, target_identity) = ensure_target_directory(&root, &target_name)
+        let (target, target_identity) = open_existing_target_directory(&root, &target_name)
             .map_err(|message| d1_lease_root_error("d1.migration_lease_target_unsafe", message))?;
-        let (guard, guard_identity) = open_or_create_guard(&target)
+        let (guard, guard_identity) = open_existing_guard(&target)
             .map_err(|message| d1_lease_root_error("d1.migration_lease_guard_unsafe", message))?;
         match guard.try_lock() {
             Ok(()) => {}
@@ -5122,13 +5687,15 @@ mod linux {
         )
         .map_err(|message| d1_lease_root_error("d1.migration_lease_custody_changed", message))?;
         maybe_pause_after_guard_for_test(&root_path);
-        ensure_d1_dml_custody_layout(&target, &target_hash).map_err(|message| {
+        open_existing_d1_dml_custody(&target, &expected_authority).map_err(|message| {
             d1_migration_dml_custody_error("d1.migration_dml_custody_layout_unavailable", message)
         })?;
-        let dml_custody_authorization = authorize_target_wide_d1_dml_custody(&target, &target_hash)
-            .map_err(|message| {
-                d1_migration_dml_custody_error("d1.migration_dml_custody_unproven", message)
-            })?;
+        let dml_custody_authorization =
+            authorize_target_wide_d1_dml_custody(&target, &expected_authority).map_err(
+                |message| {
+                    d1_migration_dml_custody_error("d1.migration_dml_custody_unproven", message)
+                },
+            )?;
         let nonce = d1_migration_lease_nonce(&target_hash, plan_sha256);
         let bootstrap_initializer_dispatch_protocol = family == "migration-ledger-bootstrap-v1";
         let mut payload = json!({"version": 2, "target_key_sha256": &target_hash, "nonce": &nonce, "approved_plan_sha256": plan_sha256, "migration_family": family, "created_at_unix_ms": now_unix_ms(), "dml_custody_authorization": &dml_custody_authorization});
@@ -5191,10 +5758,10 @@ mod linux {
     fn create_dml_layout_tree(
         target: &fs::File,
         scratch_name: &str,
-        target_key_sha256: &str,
+        authority: &crate::d1_dml_custody_genesis::D1DmlCustodyAuthority,
     ) -> Result<(), &'static str> {
         let layout = create_private_dml_directory(target, scratch_name)?;
-        let marker = crate::d1_dml_custody_layout::canonical_layout_marker_bytes(target_key_sha256);
+        let marker = crate::d1_dml_custody_layout::canonical_layout_marker_bytes(authority);
         create_private_dml_state(
             &layout,
             crate::d1_dml_custody_layout::D1_DML_CUSTODY_LAYOUT_MARKER_NAME,
@@ -5212,27 +5779,51 @@ mod linux {
 
     pub(super) fn ensure_d1_dml_custody_layout(
         target: &fs::File,
-        target_key_sha256: &str,
+        authority: &crate::d1_dml_custody_genesis::D1DmlCustodyAuthority,
     ) -> Result<crate::d1_dml_custody_layout::D1DmlCustodyLayoutEnsureOutcome, &'static str> {
         use crate::d1_dml_custody_layout::{
             D1_DML_CUSTODY_LAYOUT_NAME, D1DmlCustodyLayoutEnsureOutcome,
         };
         if entry_present(target, D1_DML_CUSTODY_LAYOUT_NAME)? {
-            d1_dml_layout_snapshot(target, target_key_sha256)?;
+            d1_dml_layout_snapshot(target, authority)?;
             return Ok(D1DmlCustodyLayoutEnsureOutcome::AlreadyPresent);
         }
         if directory_entry_names(target)?.len() >= MAX_TARGET_CUSTODY_DIRECTORY_ENTRIES {
             return Err("target custody namespace has no capacity for the DML layout");
         }
         let scratch = ".dml-custody-v1.init";
-        create_dml_layout_tree(target, scratch, target_key_sha256)?;
+        create_dml_layout_tree(target, scratch, authority)?;
         rename_at_no_replace(target, scratch, D1_DML_CUSTODY_LAYOUT_NAME)
             .map_err(|_| "DML custody layout could not be installed without replacement")?;
         sync_d1_lease_directory(target).map_err(
             |_| "target custody directory could not be synchronized after DML layout installation",
         )?;
-        d1_dml_layout_snapshot(target, target_key_sha256)?;
+        d1_dml_layout_snapshot(target, authority)?;
         Ok(D1DmlCustodyLayoutEnsureOutcome::Created)
+    }
+
+    pub(super) fn open_existing_d1_dml_custody(
+        target: &fs::File,
+        expected: &crate::d1_dml_custody_genesis::D1DmlCustodyAuthority,
+    ) -> Result<(), &'static str> {
+        let (_, genesis_bytes) = private_custody_file_snapshot(
+            target,
+            crate::d1_dml_custody_genesis::D1_DML_CUSTODY_GENESIS_NAME,
+        )?;
+        if !crate::d1_dml_custody_genesis::validate_d1_dml_custody_genesis(&genesis_bytes, expected)
+        {
+            return Err("D1 custody genesis did not match configured generation authority");
+        }
+        d1_dml_layout_snapshot(target, expected)?;
+        let (_, second_genesis_bytes) = private_custody_file_snapshot(
+            target,
+            crate::d1_dml_custody_genesis::D1_DML_CUSTODY_GENESIS_NAME,
+        )?;
+        if second_genesis_bytes != genesis_bytes {
+            return Err("D1 custody genesis changed while layout authority was opened");
+        }
+        d1_dml_layout_snapshot(target, expected)?;
+        Ok(())
     }
 
     fn d1_dml_attempt_name(binding: &str) -> Result<String, &'static str> {
@@ -5432,6 +6023,9 @@ mod linux {
         physical_artifact_count: usize,
         artifact_payload_bytes: usize,
         target_key_sha256: &'a str,
+        custody_generation_sha256: &'a str,
+        authority_sha256: &'a str,
+        genesis_sha256: &'a str,
         claimant_count: usize,
         attempt_count: usize,
         attempt_phase_counts: crate::d1_dml_custody_layout::D1DmlCustodyAttemptPhaseCounts,
@@ -5772,7 +6366,7 @@ mod linux {
     #[allow(dead_code)]
     fn complete_dml_audit_once(
         target: &fs::File,
-        target_key_sha256: &str,
+        authority: &crate::d1_dml_custody_genesis::D1DmlCustodyAuthority,
         limits: DmlCompleteAuditLimits,
     ) -> Result<crate::d1_dml_custody_layout::D1DmlCustodyCompleteAuditReceipt, &'static str> {
         use crate::d1_dml_custody_layout::{
@@ -5780,7 +6374,8 @@ mod linux {
             D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_VERSION, D1_DML_CUSTODY_LAYOUT_SHA256,
             D1_DML_CUSTODY_LAYOUT_VERSION, D1DmlCustodyCompleteAuditReceipt,
         };
-        d1_dml_layout_snapshot(target, target_key_sha256)?;
+        open_existing_d1_dml_custody(target, authority)?;
+        let target_key_sha256 = authority.target_key_sha256.as_str();
         let audit_budget_sha256 = limits.identity_sha256();
         if limits.leaf_limit
             == crate::d1_dml_custody_layout::D1_DML_CUSTODY_COMPLETE_AUDIT_LEAF_LIMIT
@@ -5845,6 +6440,13 @@ mod linux {
                                     .clone();
                                 crate::d1_dml_identity_claimant::validate_d1_dml_identity_claimant_audit_binding(&receipt)
                                     .map_err(|_| "DML claimant intent binding did not rederive during complete audit")?;
+                                if receipt.custody_generation_sha256
+                                    != authority.custody_generation_sha256
+                                {
+                                    return Err(
+                                        "DML claimant belonged to another custody generation",
+                                    );
+                                }
                                 if !claimant_sets.contains_key(&receipt.claimant_set_sha256) {
                                     budget.retain_cross_shard_entry(claimant_sets.len())?;
                                 }
@@ -5863,6 +6465,13 @@ mod linux {
                                         .map_err(
                                             |_| "DML attempt was malformed during complete audit",
                                         )?;
+                                if receipt.custody_generation_sha256
+                                    != authority.custody_generation_sha256
+                                {
+                                    return Err(
+                                        "DML attempt belonged to another custody generation",
+                                    );
+                                }
                                 budget.retain_cross_shard_entry(attempts.len())?;
                                 if attempts
                                     .insert(receipt.attempt_binding_sha256.clone(), receipt)
@@ -5903,6 +6512,7 @@ mod linux {
                 .expect("claimant-set map entries are never empty");
             if receipts.iter().any(|receipt| {
                 receipt.target_key_sha256 != first.target_key_sha256
+                    || receipt.custody_generation_sha256 != first.custody_generation_sha256
                     || receipt.execute_plan_sha256 != first.execute_plan_sha256
                     || receipt.intent_binding_sha256 != first.intent_binding_sha256
             }) {
@@ -5957,6 +6567,8 @@ mod linux {
             };
             if bound.iter().any(|receipt| {
                 receipt.target_key_sha256 != attempt.target_key_sha256
+                    || receipt.custody_generation_sha256
+                        != attempt.custody_generation_sha256
                     || receipt.execute_plan_sha256 != attempt.execute_plan_sha256
                     || receipt.identity_sha256.as_str()
                         != match receipt.namespace {
@@ -6039,6 +6651,9 @@ mod linux {
                 physical_artifact_count: budget.physical_artifact_count,
                 artifact_payload_bytes: budget.artifact_payload_bytes,
                 target_key_sha256,
+                custody_generation_sha256: &authority.custody_generation_sha256,
+                authority_sha256: &authority.authority_sha256,
+                genesis_sha256: &authority.genesis_sha256,
                 claimant_count,
                 attempt_count: attempts.len(),
                 attempt_phase_counts,
@@ -6070,6 +6685,9 @@ mod linux {
             physical_artifact_count: budget.physical_artifact_count,
             artifact_payload_bytes: budget.artifact_payload_bytes,
             target_key_sha256: target_key_sha256.to_string(),
+            custody_generation_sha256: authority.custody_generation_sha256.clone(),
+            authority_sha256: authority.authority_sha256.clone(),
+            genesis_sha256: authority.genesis_sha256.clone(),
             claimant_count,
             attempt_count: attempts.len(),
             attempt_phase_counts,
@@ -6091,32 +6709,31 @@ mod linux {
 
     pub(super) fn audit_d1_dml_custody_complete(
         target: &fs::File,
-        target_key_sha256: &str,
+        authority: &crate::d1_dml_custody_genesis::D1DmlCustodyAuthority,
     ) -> Result<crate::d1_dml_custody_layout::D1DmlCustodyCompleteAuditReceipt, &'static str> {
         audit_d1_dml_custody_complete_with_limits(
             target,
-            target_key_sha256,
+            authority,
             DmlCompleteAuditLimits::fixed(),
         )
     }
 
     pub(super) fn authorize_target_wide_d1_dml_custody(
         target: &fs::File,
-        target_key_sha256: &str,
+        authority: &crate::d1_dml_custody_genesis::D1DmlCustodyAuthority,
     ) -> Result<crate::d1_dml_custody_layout::D1DmlCustodyCompleteAuditAuthorization, &'static str>
     {
-        audit_d1_dml_custody_complete(target, target_key_sha256)?
-            .authorize_target_wide_custody(target_key_sha256)
+        audit_d1_dml_custody_complete(target, authority)?.authorize_target_wide_custody(authority)
     }
 
     fn audit_d1_dml_custody_complete_with_limits(
         target: &fs::File,
-        target_key_sha256: &str,
+        authority: &crate::d1_dml_custody_genesis::D1DmlCustodyAuthority,
         limits: DmlCompleteAuditLimits,
     ) -> Result<crate::d1_dml_custody_layout::D1DmlCustodyCompleteAuditReceipt, &'static str> {
-        let first = complete_dml_audit_once(target, target_key_sha256, limits)?;
+        let first = complete_dml_audit_once(target, authority, limits)?;
         maybe_pause_complete_dml_audit_after_first_for_test(target);
-        let second = complete_dml_audit_once(target, target_key_sha256, limits)?;
+        let second = complete_dml_audit_once(target, authority, limits)?;
         if first != second {
             return Err("DML custody changed during stable complete audit");
         }
@@ -6131,9 +6748,18 @@ mod linux {
         artifact_limit: usize,
         payload_byte_limit: usize,
     ) -> Result<crate::d1_dml_custody_layout::D1DmlCustodyCompleteAuditReceipt, &'static str> {
+        let (_, genesis_bytes) = private_custody_file_snapshot(
+            target,
+            crate::d1_dml_custody_genesis::D1_DML_CUSTODY_GENESIS_NAME,
+        )?;
+        let authority =
+            crate::d1_dml_custody_genesis::inspect_d1_dml_custody_genesis(&genesis_bytes)?;
+        if authority.target_key_sha256 != target_key_sha256 {
+            return Err("test complete-audit target contradicted custody genesis");
+        }
         audit_d1_dml_custody_complete_with_limits(
             target,
-            target_key_sha256,
+            &authority,
             DmlCompleteAuditLimits {
                 leaf_limit,
                 artifact_limit,
@@ -6730,6 +7356,8 @@ mod tests {
             operation_id: "operation-complete-audit-0001",
             execution_attempt_id: "attempt-complete-audit-0001",
             provider_request_id: "provider-complete-audit-0001",
+            custody_generation_sha256:
+                crate::d1_dml_attempt_custody::TEST_CUSTODY_GENERATION_SHA256,
         };
         let execute_plan_sha256 = sha256_bytes_hex(label.as_bytes());
         let set = derive_d1_dml_identity_claimant_set(&target, &execute_plan_sha256, identities)
@@ -6836,6 +7464,8 @@ mod tests {
             operation_id: &operation_id,
             execution_attempt_id: &execution_attempt_id,
             provider_request_id: &provider_request_id,
+            custody_generation_sha256:
+                crate::d1_dml_attempt_custody::TEST_CUSTODY_GENERATION_SHA256,
         };
         let execute_plan_sha256 = sha256_bytes_hex(label.as_bytes());
         let set = derive_d1_dml_identity_claimant_set(&target, &execute_plan_sha256, identities)
@@ -6907,6 +7537,8 @@ mod tests {
                 operation_id: "operation-scratch-fixture",
                 execution_attempt_id: "attempt-scratch-fixture",
                 provider_request_id: "provider-scratch-fixture",
+                custody_generation_sha256:
+                    crate::d1_dml_attempt_custody::TEST_CUSTODY_GENERATION_SHA256,
             },
         )
         .expect("claimant set");
@@ -6988,6 +7620,8 @@ mod tests {
                 operation_id: "operation-fixture-0001",
                 execution_attempt_id: "attempt-fixture-0001",
                 provider_request_id: "provider-fixture-0001",
+                custody_generation_sha256:
+                    crate::d1_dml_attempt_custody::TEST_CUSTODY_GENERATION_SHA256,
             },
         )
         .expect("claimant set");
@@ -7144,6 +7778,8 @@ mod tests {
                     operation_id: &operation,
                     execution_attempt_id: &attempt,
                     provider_request_id: &provider,
+                    custody_generation_sha256:
+                        crate::d1_dml_attempt_custody::TEST_CUSTODY_GENERATION_SHA256,
                 },
             )
             .expect("derive volume claimant set");
@@ -7386,7 +8022,7 @@ mod tests {
             );
             assert_eq!(
                 audit
-                    .authorize_target_wide_custody(&fixture.guard.target_key_sha256)
+                    .authorize_target_wide_custody(fixture.guard.dml_custody_authority())
                     .is_ok(),
                 terminal,
                 "{label} target-wide authority"
@@ -7658,24 +8294,17 @@ mod tests {
         use crate::d1_dml_identity_claimant::D1DmlIdentityNamespace;
 
         let absent_root = private_unactivated_test_root("dml-authority-absent");
-        let absent_guard = acquire_d1_target_mutation_guard_at(
+        let absent = acquire_d1_target_mutation_guard_at(
             absent_root.clone(),
             "d1_delete_database",
             "acct-1",
             "123e4567-e89b-42d3-a456-426614174000",
         )
-        .expect("acquire target guard without a DML layout");
-        let absent = absent_guard
-            .authorize_target_wide_d1_dml_custody()
-            .expect_err("absent complete custody cannot authorize deletion")
-            .structured_content
-            .expect("structured absent-custody error");
-        assert_eq!(
-            absent["error"]["code"],
-            json!("d1.target_wide_dml_custody_unproven")
-        );
+        .expect_err("ordinary target-wide acquisition cannot create absent custody")
+        .structured_content
+        .expect("structured absent-custody error");
+        assert_eq!(absent["provider_calls"], json!(0));
         assert_eq!(absent["provider_mutations"], json!(0));
-        drop(absent_guard);
         let target_name = format!(
             "d1-migration-target-{}",
             sha256_bytes_hex(b"acct-1\0123e4567-e89b-42d3-a456-426614174000")
@@ -7721,7 +8350,7 @@ mod tests {
         nonfixed_budget.audited_leaf_limit -= 1;
         assert!(
             nonfixed_budget
-                .authorize_target_wide_custody(&clean.guard.target_key_sha256)
+                .authorize_target_wide_custody(clean.guard.dml_custody_authority())
                 .is_err(),
             "a nonfixed or over-budget receipt identity cannot authorize"
         );
@@ -7842,18 +8471,25 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn fresh_target_wide_layout_provisioning_rejects_hostile_evidence_without_repair() {
+    fn explicit_dml_custody_provisioning_rejects_orphan_layout_without_repair() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = private_unactivated_test_root("target-wide-hostile-layout");
-        let guard = acquire_d1_target_mutation_guard_at(
+        provision_d1_dml_custody_at(
             root.clone(),
-            "d1_delete_database",
             "acct-1",
             "123e4567-e89b-42d3-a456-426614174000",
+            TEST_D1_DML_CUSTODY_GENERATION,
+            TEST_D1_DML_CUSTODY_AUTHORITY_SHA256,
         )
-        .expect("acquire fresh target guard");
-        let layout = root.join(&guard.target_name).join("dml-custody-v1");
+        .expect("install exact baseline before orphan fixture");
+        let target_hash = sha256_bytes_hex(b"acct-1\0123e4567-e89b-42d3-a456-426614174000");
+        let target = root.join(format!("d1-migration-target-{target_hash}"));
+        fs::remove_file(target.join(crate::d1_dml_custody_genesis::D1_DML_CUSTODY_GENESIS_NAME))
+            .expect("remove genesis for orphan fixture");
+        fs::remove_dir_all(target.join("dml-custody-v1"))
+            .expect("remove canonical layout for orphan fixture");
+        let layout = target.join("dml-custody-v1");
         fs::create_dir(&layout).expect("install hostile layout directory");
         fs::set_permissions(&layout, fs::Permissions::from_mode(0o700))
             .expect("make hostile layout private");
@@ -7862,30 +8498,248 @@ mod tests {
         fs::set_permissions(&marker, fs::Permissions::from_mode(0o600))
             .expect("make hostile marker private");
 
-        let error = guard
-            .ensure_target_wide_d1_dml_custody_layout()
-            .expect_err("hostile layout must not be repaired")
-            .structured_content
-            .expect("structured hostile-layout error");
-        assert_eq!(error["operation"], json!("d1_delete_database"));
+        let error = provision_d1_dml_custody_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            TEST_D1_DML_CUSTODY_GENERATION,
+            TEST_D1_DML_CUSTODY_AUTHORITY_SHA256,
+        )
+        .expect_err("hostile layout must not be repaired")
+        .structured_content
+        .expect("structured hostile-layout error");
+        assert_eq!(error["operation"], json!("d1_provision_dml_custody"));
         assert_eq!(
             error["error"]["code"],
-            json!("d1.target_guard_custody_changed")
+            json!("d1.target_guard_upgrade_activation_required")
         );
+        assert_eq!(error["provider_calls"], json!(0));
         assert_eq!(error["provider_mutations"], json!(0));
         assert_eq!(
             fs::read(&marker).expect("read unchanged hostile marker"),
             b"{\"version\":1}\n",
             "fresh provisioning must not replace or repair existing evidence"
         );
+        assert!(!target.join(ACTIVE_LEASE_NAME).exists());
+        fs::remove_dir_all(root).expect("hostile-layout cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explicit_dml_custody_provisioning_applies_once_converges_and_rejects_conflict() {
+        let root = private_unactivated_test_root("explicit-dml-genesis");
+        let first = provision_d1_dml_custody_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            TEST_D1_DML_CUSTODY_GENERATION,
+            TEST_D1_DML_CUSTODY_AUTHORITY_SHA256,
+        )
+        .expect("first explicit provision applies");
+        assert_eq!(first.apply_status, MutationApplyStatus::Applied);
+        assert_eq!(first.provider_calls, 0);
+        assert_eq!(first.provider_mutations, 0);
+
+        let replay = provision_d1_dml_custody_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            TEST_D1_DML_CUSTODY_GENERATION,
+            TEST_D1_DML_CUSTODY_AUTHORITY_SHA256,
+        )
+        .expect("exact replay converges");
+        assert_eq!(replay.apply_status, MutationApplyStatus::Proven);
+        assert_eq!(replay.genesis_sha256, first.genesis_sha256);
+
+        let error = provision_d1_dml_custody_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "test-custody-generation-v2",
+            TEST_D1_DML_CUSTODY_AUTHORITY_SHA256,
+        )
+        .expect_err("changed generation conflicts with immutable genesis")
+        .structured_content
+        .expect("structured provision conflict");
+        assert_eq!(
+            error["error"]["code"],
+            json!("d1.dml_custody_provision_conflict")
+        );
+        assert_eq!(error["provider_calls"], json!(0));
+        assert_eq!(error["provider_mutations"], json!(0));
+
+        let exact = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_execute_write",
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect("ordinary execution opens exact incumbent custody");
+        exact
+            .open_existing_d1_dml_custody()
+            .expect("ordinary execution proves existing custody");
+        drop(exact);
+        fs::remove_dir_all(root).expect("explicit provision cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ordinary_dml_guard_never_provisions_an_empty_root() {
+        let root = private_unactivated_test_root("ordinary-open-only");
+        let error = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_execute_write",
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect_err("ordinary execution cannot provision custody")
+        .structured_content
+        .expect("structured open-only denial");
+        assert_eq!(error["provider_calls"], json!(0));
+        assert_eq!(error["provider_mutations"], json!(0));
+        assert_eq!(
+            fs::read_dir(&root).expect("read untouched root").count(),
+            0,
+            "ordinary guard acquisition must create no root or target evidence"
+        );
+        fs::remove_dir_all(root).expect("open-only cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn guard_rejects_attempt_and_claimant_products_from_another_custody_generation() {
+        use crate::d1_dml_attempt_custody::{
+            D1DmlAttemptIdentities, D1DmlAttemptPhase,
+            synthetic_d1_dml_attempt_for_complete_audit_phase,
+        };
+        use crate::d1_dml_identity_claimant::{
+            D1DmlIdentityNamespace, derive_d1_dml_identity_claimant_set,
+        };
+
+        const FOREIGN_GENERATION_SHA256: &str =
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let root = private_test_root("foreign-dml-generation");
+        let guard = acquire_d1_target_mutation_guard_at(
+            root.clone(),
+            "d1_execute_write",
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+        )
+        .expect("acquire exact-generation guard");
+        let target =
+            crate::d1_target::normalize_d1_target("acct-1", "123e4567-e89b-42d3-a456-426614174000")
+                .expect("canonical target");
+        let identities = D1DmlAttemptIdentities {
+            operation_id: "foreign-operation-0001",
+            execution_attempt_id: "foreign-attempt-00001",
+            provider_request_id: "foreign-provider-0001",
+            custody_generation_sha256: FOREIGN_GENERATION_SHA256,
+        };
+        let plan = "a".repeat(64);
+        let set = derive_d1_dml_identity_claimant_set(&target, &plan, identities)
+            .expect("derive foreign-generation claimant set");
+        let preflight = guard
+            .preflight_d1_dml_identity_claimant_set_capacity(&set)
+            .expect_err("foreign-generation set cannot reserve capacity");
+        assert_eq!(
+            preflight.structured_content.expect("preflight error")["provider_calls"],
+            json!(0)
+        );
+        let pending = set.pending(D1DmlIdentityNamespace::Operation);
         assert!(
-            !root
-                .join(&guard.target_name)
-                .join(ACTIVE_LEASE_NAME)
-                .exists()
+            guard
+                .create_d1_dml_identity_claimant(
+                    D1DmlIdentityNamespace::Operation,
+                    set.identity_sha256(D1DmlIdentityNamespace::Operation),
+                    pending.state_bytes(),
+                )
+                .is_err()
+        );
+        let attempt = synthetic_d1_dml_attempt_for_complete_audit_phase(
+            &target.target_key_sha256(),
+            &plan,
+            identities,
+            D1DmlAttemptPhase::Prepared,
+        );
+        assert!(
+            guard
+                .create_d1_dml_attempt_state(
+                    &attempt.receipt().attempt_binding_sha256,
+                    attempt.state_bytes(),
+                )
+                .is_err()
+        );
+        assert_eq!(
+            guard
+                .audit_d1_dml_custody_complete()
+                .expect("foreign products were not persisted")
+                .physical_artifact_count,
+            0
         );
         drop(guard);
-        fs::remove_dir_all(root).expect("hostile-layout cleanup");
+        fs::remove_dir_all(root).expect("foreign-generation cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nonterminal_attempts_fail_closed_on_genesis_or_layout_loss_without_recreation() {
+        use crate::d1_dml_attempt_custody::D1DmlAttemptPhase;
+        use crate::d1_dml_identity_claimant::D1DmlIdentityNamespace;
+
+        for (phase_label, phase) in [
+            ("prepared", D1DmlAttemptPhase::Prepared),
+            ("dispatch-reserved", D1DmlAttemptPhase::DispatchReserved),
+            (
+                "reconciliation-required",
+                D1DmlAttemptPhase::ReconciliationRequired,
+            ),
+        ] {
+            for lost in ["genesis", "layout"] {
+                let fixture = dml_complete_audit_fixture_with_phase(
+                    &format!("dml-{phase_label}-{lost}-loss"),
+                    phase,
+                );
+                for namespace in D1DmlIdentityNamespace::ALL {
+                    install_pending_audit_claimant(&fixture, namespace);
+                    seal_audit_claimant(&fixture, namespace);
+                }
+                install_audit_attempt(&fixture);
+                let root = fixture.root.clone();
+                let target = root.join(&fixture.guard.target_name);
+                drop(fixture.guard);
+                let lost_path = if lost == "genesis" {
+                    target.join(crate::d1_dml_custody_genesis::D1_DML_CUSTODY_GENESIS_NAME)
+                } else {
+                    target.join(crate::d1_dml_custody_layout::D1_DML_CUSTODY_LAYOUT_NAME)
+                };
+                if lost == "genesis" {
+                    fs::remove_file(&lost_path).expect("remove genesis evidence");
+                } else {
+                    fs::remove_dir_all(&lost_path).expect("remove layout evidence");
+                }
+
+                let error = acquire_d1_target_mutation_guard_at(
+                    root.clone(),
+                    "d1_execute_write",
+                    "acct-1",
+                    "123e4567-e89b-42d3-a456-426614174000",
+                )
+                .expect_err("nonterminal custody loss must deny before provider")
+                .structured_content
+                .expect("structured custody-loss denial");
+                assert_eq!(error["provider_calls"], json!(0), "{phase_label}/{lost}");
+                assert_eq!(
+                    error["provider_mutations"],
+                    json!(0),
+                    "{phase_label}/{lost}"
+                );
+                assert!(
+                    !lost_path.exists(),
+                    "ordinary execution must not recreate {lost} after {phase_label}"
+                );
+                fs::remove_dir_all(root).expect("custody-loss cleanup");
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -7895,6 +8749,14 @@ mod tests {
         let plan = "a".repeat(64);
         let account_id = format!("acct-{}", std::process::id());
         let database_id = format!("123e4567-e89b-42d3-a456-{:012x}", std::process::id());
+        provision_d1_dml_custody_at(
+            root.clone(),
+            &account_id,
+            &database_id,
+            TEST_D1_DML_CUSTODY_GENERATION,
+            TEST_D1_DML_CUSTODY_AUTHORITY_SHA256,
+        )
+        .expect("explicitly provision retained-layout target");
         let mut owner = acquire_d1_migration_lease_at(
             root.clone(),
             &account_id,
@@ -8527,6 +9389,8 @@ mod tests {
                 operation_id: "operation-hostile-0001",
                 execution_attempt_id: "attempt-hostile-0001",
                 provider_request_id: "provider-hostile-0001",
+                custody_generation_sha256:
+                    crate::d1_dml_attempt_custody::TEST_CUSTODY_GENERATION_SHA256,
             },
         )
         .expect("set");
@@ -8641,8 +9505,12 @@ mod tests {
                     "layout_sha256": crate::d1_dml_custody_layout::D1_DML_CUSTODY_LAYOUT_SHA256,
                     "audit_budget_version": crate::d1_dml_custody_layout::D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_VERSION,
                     "audit_budget_sha256": crate::d1_dml_custody_layout::D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_SHA256,
-                    "fresh_layout_provisioning": "under_held_target_guard_before_authorization",
-                    "fresh_layout_provider_dispatch_authority": "none",
+                    "genesis": crate::d1_dml_custody_genesis::D1_DML_CUSTODY_GENESIS_NAME,
+                    "generation_environment": crate::d1_dml_custody_genesis::D1_DML_CUSTODY_GENERATION_ENV,
+                    "authority_environment": crate::d1_dml_custody_genesis::D1_DML_CUSTODY_AUTHORITY_SHA256_ENV,
+                    "provisioning": "explicit_d1_provision_dml_custody_only",
+                    "ordinary_execution_may_create": false,
+                    "provisioning_provider_dispatch_authority": "none",
                     "retained_or_recovery_absence": "reconciliation_required_without_creation",
                     "binding": "the exact clean complete-audit identity is persisted in the lease payload and therefore inherited by every terminal receipt through lease_payload_sha256",
                     "last_boundary_revalidation": true,
@@ -8786,21 +9654,14 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn prepare_test_dml_layout(root: &Path) {
-        let root_file = fs::File::open(&root).expect("open private test root");
-        let target_key_sha256 = sha256_bytes_hex(b"acct-1\0123e4567-e89b-42d3-a456-426614174000");
-        linux::ensure_target_identity_activation(&root_file, &target_key_sha256)
-            .expect("activate canonical target identity for existing custody tests");
-        let guard = acquire_d1_target_mutation_guard_at(
+        provision_d1_dml_custody_at(
             root.to_path_buf(),
-            "test_fixture",
             "acct-1",
             "123e4567-e89b-42d3-a456-426614174000",
+            TEST_D1_DML_CUSTODY_GENERATION,
+            TEST_D1_DML_CUSTODY_AUTHORITY_SHA256,
         )
-        .expect("acquire fixture target guard");
-        guard
-            .ensure_d1_dml_custody_layout()
-            .expect("install clean complete-audit fixture layout");
-        drop(guard);
+        .expect("provision clean complete-audit fixture layout");
     }
 
     #[cfg(target_os = "linux")]
@@ -8979,6 +9840,14 @@ mod tests {
     fn clean_root_activation_reuses_one_canonical_namespace_for_the_same_provider_target() {
         let root = private_unactivated_test_root("clean-upgrade");
         let database_id = "123e4567-e89b-42d3-a456-426614174000";
+        provision_d1_dml_custody_at(
+            root.clone(),
+            "acct-1",
+            database_id,
+            TEST_D1_DML_CUSTODY_GENERATION,
+            TEST_D1_DML_CUSTODY_AUTHORITY_SHA256,
+        )
+        .expect("explicit provision activates the fresh canonical target");
         let first = acquire_d1_target_mutation_guard_at(
             root.clone(),
             "d1_execute_write",
@@ -9132,11 +10001,12 @@ mod tests {
         linux::install_activation_marker_pause_hook(target_key_sha256, entered_tx, resume_rx);
         let thread_root = root.clone();
         let first = std::thread::spawn(move || {
-            acquire_d1_target_mutation_guard_at(
+            provision_d1_dml_custody_at(
                 thread_root,
-                "d1_execute_write",
                 account_id,
                 database_id,
+                TEST_D1_DML_CUSTODY_GENERATION,
+                TEST_D1_DML_CUSTODY_AUTHORITY_SHA256,
             )
         });
         entered_rx
@@ -9295,6 +10165,14 @@ mod tests {
     #[test]
     fn shared_target_guard_allows_distinct_databases_concurrently() {
         let root = private_test_root("shared-target-guard-distinct-targets");
+        provision_d1_dml_custody_at(
+            root.clone(),
+            "acct-1",
+            "223e4567-e89b-42d3-a456-426614174000",
+            TEST_D1_DML_CUSTODY_GENERATION,
+            TEST_D1_DML_CUSTODY_AUTHORITY_SHA256,
+        )
+        .expect("explicitly provision distinct target custody");
         let first = acquire_d1_target_mutation_guard_at(
             root.clone(),
             "d1_rename_database",
@@ -10923,8 +11801,8 @@ mod tests {
                 .expect("read initial target directory")
                 .count();
             assert_eq!(
-                existing_entries, 3,
-                "permanent guard, complete DML layout, and retained lease consume three entries"
+                existing_entries, 4,
+                "permanent guard, immutable genesis, complete DML layout, and retained lease consume four entries"
             );
             let mut retained_payload: Value = serde_json::from_slice(
                 &fs::read(target.join(ACTIVE_LEASE_NAME)).expect("read retained payload"),

@@ -6,11 +6,13 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::d1_dml_custody_genesis::D1DmlCustodyAuthority;
+
 pub(crate) const D1_DML_CUSTODY_LAYOUT_NAME: &str = "dml-custody-v1";
 pub(crate) const D1_DML_CUSTODY_LAYOUT_MARKER_NAME: &str = "layout.json";
-pub(crate) const D1_DML_CUSTODY_LAYOUT_VERSION: u8 = 1;
+pub(crate) const D1_DML_CUSTODY_LAYOUT_VERSION: u8 = 2;
 pub(crate) const D1_DML_CUSTODY_LAYOUT_SHA256: &str =
-    "68da1f2248681d61a387f503b370a73ebc848b9c34bec6afd00b24a0bef36b48"; // DevSkim: ignore DS173237 -- public layout specification digest, not a credential
+    "d43e0f08c7220c9d17241495430ce5c7e48b35f210ae4146469f4963c1f174df"; // DevSkim: ignore DS173237 -- public layout specification digest, not a credential
 pub(crate) const D1_DML_CUSTODY_LEAF_ENTRY_LIMIT: usize = 4_096;
 pub(crate) const D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_VERSION: u8 = 1;
 pub(crate) const D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_SHA256: &str =
@@ -26,29 +28,38 @@ pub(crate) struct D1DmlCustodyLayoutMarker {
     pub(crate) layout: String,
     pub(crate) layout_sha256: String,
     pub(crate) target_key_sha256: String,
+    pub(crate) custody_generation_sha256: String,
+    pub(crate) authority_sha256: String,
+    pub(crate) genesis_sha256: String,
 }
 
-pub(crate) fn canonical_layout_marker_bytes(target_key_sha256: &str) -> Vec<u8> {
+pub(crate) fn canonical_layout_marker_bytes(authority: &D1DmlCustodyAuthority) -> Vec<u8> {
     let marker = D1DmlCustodyLayoutMarker {
         version: D1_DML_CUSTODY_LAYOUT_VERSION,
         layout: D1_DML_CUSTODY_LAYOUT_NAME.to_string(),
         layout_sha256: D1_DML_CUSTODY_LAYOUT_SHA256.to_string(),
-        target_key_sha256: target_key_sha256.to_string(),
+        target_key_sha256: authority.target_key_sha256.clone(),
+        custody_generation_sha256: authority.custody_generation_sha256.clone(),
+        authority_sha256: authority.authority_sha256.clone(),
+        genesis_sha256: authority.genesis_sha256.clone(),
     };
     let mut bytes = serde_json::to_vec(&marker).expect("layout marker serialization is infallible");
     bytes.push(b'\n');
     bytes
 }
 
-pub(crate) fn validate_layout_marker(bytes: &[u8], target_key_sha256: &str) -> bool {
+pub(crate) fn validate_layout_marker(bytes: &[u8], authority: &D1DmlCustodyAuthority) -> bool {
     let Ok(marker) = serde_json::from_slice::<D1DmlCustodyLayoutMarker>(bytes) else {
         return false;
     };
     marker.version == D1_DML_CUSTODY_LAYOUT_VERSION
         && marker.layout == D1_DML_CUSTODY_LAYOUT_NAME
         && marker.layout_sha256 == D1_DML_CUSTODY_LAYOUT_SHA256
-        && marker.target_key_sha256 == target_key_sha256
-        && canonical_layout_marker_bytes(target_key_sha256) == bytes
+        && marker.target_key_sha256 == authority.target_key_sha256
+        && marker.custody_generation_sha256 == authority.custody_generation_sha256
+        && marker.authority_sha256 == authority.authority_sha256
+        && marker.genesis_sha256 == authority.genesis_sha256
+        && canonical_layout_marker_bytes(authority) == bytes
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -64,6 +75,9 @@ pub(crate) struct D1DmlCustodyCompleteAuditReceipt {
     pub(crate) physical_artifact_count: usize,
     pub(crate) artifact_payload_bytes: usize,
     pub(crate) target_key_sha256: String,
+    pub(crate) custody_generation_sha256: String,
+    pub(crate) authority_sha256: String,
+    pub(crate) genesis_sha256: String,
     pub(crate) claimant_count: usize,
     pub(crate) attempt_count: usize,
     pub(crate) attempt_phase_counts: D1DmlCustodyAttemptPhaseCounts,
@@ -136,10 +150,27 @@ pub(crate) enum D1DmlCustodyLayoutEnsureOutcome {
 pub(crate) struct D1DmlCustodyCompleteAuditAuthorization {
     pub(crate) version: u8,
     pub(crate) target_key_sha256: String,
+    pub(crate) custody_generation_sha256: String,
+    pub(crate) authority_sha256: String,
+    pub(crate) genesis_sha256: String,
     pub(crate) layout_sha256: String,
     pub(crate) audit_budget_version: u8,
     pub(crate) audit_budget_sha256: String,
     pub(crate) audit_sha256: String,
+}
+
+impl D1DmlCustodyCompleteAuditAuthorization {
+    pub(crate) fn custody_authority(&self) -> D1DmlCustodyAuthority {
+        D1DmlCustodyAuthority {
+            version: 1,
+            target_key_sha256: self.target_key_sha256.clone(),
+            layout_version: self.version,
+            layout_sha256: self.layout_sha256.clone(),
+            custody_generation_sha256: self.custody_generation_sha256.clone(),
+            authority_sha256: self.authority_sha256.clone(),
+            genesis_sha256: self.genesis_sha256.clone(),
+        }
+    }
 }
 
 impl D1DmlCustodyCompleteAuditReceipt {
@@ -148,7 +179,7 @@ impl D1DmlCustodyCompleteAuditReceipt {
     /// phase may authorize its next boundary.
     pub(crate) fn validate_complete_graph(
         &self,
-        expected_target_key_sha256: &str,
+        expected_authority: &D1DmlCustodyAuthority,
     ) -> Result<(), &'static str> {
         let graph_is_complete = self.pending_claimant_count == 0
             && self.cas_scratch_count == 0
@@ -167,7 +198,10 @@ impl D1DmlCustodyCompleteAuditReceipt {
             && self.orphan_claimant_set_count == 0
             && self.incomplete_claimant_set_count == 0;
         let fixed_identity_is_exact = self.version == D1_DML_CUSTODY_LAYOUT_VERSION
-            && self.target_key_sha256 == expected_target_key_sha256
+            && self.target_key_sha256 == expected_authority.target_key_sha256
+            && self.custody_generation_sha256 == expected_authority.custody_generation_sha256
+            && self.authority_sha256 == expected_authority.authority_sha256
+            && self.genesis_sha256 == expected_authority.genesis_sha256
             && self.layout_sha256 == D1_DML_CUSTODY_LAYOUT_SHA256
             && self.audit_budget_version == D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_VERSION
             && self.audit_budget_sha256 == D1_DML_CUSTODY_COMPLETE_AUDIT_BUDGET_SHA256
@@ -198,9 +232,9 @@ impl D1DmlCustodyCompleteAuditReceipt {
 
     pub(crate) fn authorize_target_wide_custody(
         &self,
-        expected_target_key_sha256: &str,
+        expected_authority: &D1DmlCustodyAuthority,
     ) -> Result<D1DmlCustodyCompleteAuditAuthorization, &'static str> {
-        self.validate_complete_graph(expected_target_key_sha256)?;
+        self.validate_complete_graph(expected_authority)?;
         if self.reconciliation_required
             || self.attempt_phase_counts.unresolved() != Some(0)
             || self.attempt_phase_counts.terminal() != Some(self.attempt_count)
@@ -210,6 +244,9 @@ impl D1DmlCustodyCompleteAuditReceipt {
         Ok(D1DmlCustodyCompleteAuditAuthorization {
             version: self.version,
             target_key_sha256: self.target_key_sha256.clone(),
+            custody_generation_sha256: self.custody_generation_sha256.clone(),
+            authority_sha256: self.authority_sha256.clone(),
+            genesis_sha256: self.genesis_sha256.clone(),
             layout_sha256: self.layout_sha256.clone(),
             audit_budget_version: self.audit_budget_version,
             audit_budget_sha256: self.audit_budget_sha256.clone(),

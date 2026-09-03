@@ -33,12 +33,16 @@ pub(crate) const D1_DML_ATTEMPT_CUSTODY_OPERATION: &str = "d1_dml_attempt_custod
 const CUSTODY_VERSION: u8 = 1;
 const REQUIRED_COMPOSITION_VERSION: u8 = 1;
 pub(crate) const D1_DML_ATTEMPT_STATE_BYTE_CAP: usize = 16 * 1024;
+#[cfg(test)]
+pub(crate) const TEST_CUSTODY_GENERATION_SHA256: &str =
+    "739c097f7381fdcad24d177c023c8a90e8f4f752cebb48828ba042c36f7a4900"; // DevSkim: ignore DS173237 -- synthetic test generation digest, not a credential
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct D1DmlAttemptIdentities<'a> {
     pub(crate) operation_id: &'a str,
     pub(crate) execution_attempt_id: &'a str,
     pub(crate) provider_request_id: &'a str,
+    pub(crate) custody_generation_sha256: &'a str,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -130,6 +134,7 @@ struct D1DmlAttemptState {
     layout_version: u8,
     layout_sha256: String,
     target_key_sha256: String,
+    custody_generation_sha256: String,
     execute_plan_sha256: String,
     composition_sha256: String,
     composition_receipt_sha256: String,
@@ -177,6 +182,7 @@ pub(crate) struct D1DmlAttemptCustodyReceipt {
     pub(crate) transition: D1DmlAttemptTransition,
     pub(crate) retry_decision: D1DmlAttemptRetryDecision,
     pub(crate) target_key_sha256: String,
+    pub(crate) custody_generation_sha256: String,
     pub(crate) execute_plan_sha256: String,
     pub(crate) composition_sha256: String,
     pub(crate) composition_receipt_sha256: String,
@@ -249,6 +255,7 @@ pub(crate) struct D1DmlAttemptCustodyError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct D1DmlAttemptBinding {
     target_key_sha256: String,
+    custody_generation_sha256: String,
     execute_plan_sha256: String,
     composition_sha256: String,
     composition_receipt_sha256: String,
@@ -273,6 +280,7 @@ pub(crate) fn prepare_d1_dml_attempt(
                 layout_version: D1_DML_CUSTODY_LAYOUT_VERSION,
                 layout_sha256: D1_DML_CUSTODY_LAYOUT_SHA256.to_string(),
                 target_key_sha256: binding.target_key_sha256.clone(),
+                custody_generation_sha256: binding.custody_generation_sha256.clone(),
                 execute_plan_sha256: binding.execute_plan_sha256.clone(),
                 composition_sha256: binding.composition_sha256.clone(),
                 composition_receipt_sha256: binding.composition_receipt_sha256.clone(),
@@ -350,6 +358,7 @@ pub(crate) fn validate_d1_dml_attempt_successor(
         && expected_state.layout_version == successor_state.layout_version
         && expected_state.layout_sha256 == successor_state.layout_sha256
         && expected_state.target_key_sha256 == successor_state.target_key_sha256
+        && expected_state.custody_generation_sha256 == successor_state.custody_generation_sha256
         && expected_state.execute_plan_sha256 == successor_state.execute_plan_sha256
         && expected_state.composition_sha256 == successor_state.composition_sha256
         && expected_state.composition_receipt_sha256 == successor_state.composition_receipt_sha256
@@ -407,6 +416,7 @@ pub(crate) fn validate_d1_dml_attempt_audit_binding(
         D1_DML_CUSTODY_LAYOUT_VERSION,
         D1_DML_CUSTODY_LAYOUT_SHA256,
         receipt.target_key_sha256.as_str(),
+        receipt.custody_generation_sha256.as_str(),
         receipt.execute_plan_sha256.as_str(),
         receipt.composition_sha256.as_str(),
         receipt.composition_receipt_sha256.as_str(),
@@ -457,12 +467,14 @@ pub(crate) fn synthetic_d1_dml_attempt_for_complete_audit_phase(
     let provider_request_id_sha256 = hash_bytes(identities.provider_request_id.as_bytes());
     let composition_sha256 = hash_bytes(b"synthetic-complete-audit-composition");
     let composition_receipt_sha256 = hash_bytes(b"synthetic-complete-audit-receipt");
+    let custody_generation_sha256 = identities.custody_generation_sha256.to_string();
     let attempt_binding_sha256 = hash_serialized(&(
         CUSTODY_VERSION,
         D1_DML_ATTEMPT_CUSTODY_OPERATION,
         D1_DML_CUSTODY_LAYOUT_VERSION,
         D1_DML_CUSTODY_LAYOUT_SHA256,
         target_key_sha256,
+        custody_generation_sha256.as_str(),
         execute_plan_sha256,
         composition_sha256.as_str(),
         composition_receipt_sha256.as_str(),
@@ -476,6 +488,7 @@ pub(crate) fn synthetic_d1_dml_attempt_for_complete_audit_phase(
         layout_version: D1_DML_CUSTODY_LAYOUT_VERSION,
         layout_sha256: D1_DML_CUSTODY_LAYOUT_SHA256.to_string(),
         target_key_sha256: target_key_sha256.to_string(),
+        custody_generation_sha256,
         execute_plan_sha256: execute_plan_sha256.to_string(),
         composition_sha256,
         composition_receipt_sha256,
@@ -724,6 +737,12 @@ fn derive_attempt_binding(
     let receipt = composition.receipt();
     let plan = composition.plan();
     let target_key_sha256 = target.target_key_sha256();
+    if !valid_sha256(identities.custody_generation_sha256) {
+        return Err(custody_error(
+            D1DmlAttemptCustodyClassification::CompositionProductMismatch,
+            "custody generation digest was not canonical SHA-256",
+        ));
+    }
     if receipt.version != REQUIRED_COMPOSITION_VERSION
         || receipt.operation != D1_EXACT_PLAN_COMPOSITION_OPERATION
         || receipt.target_key_sha256 != target_key_sha256
@@ -769,6 +788,7 @@ fn derive_attempt_binding(
         D1_DML_CUSTODY_LAYOUT_VERSION,
         D1_DML_CUSTODY_LAYOUT_SHA256,
         target_key_sha256.as_str(),
+        identities.custody_generation_sha256,
         receipt.execute_plan_sha256.as_str(),
         receipt.composition_sha256.as_str(),
         composition_receipt_sha256.as_str(),
@@ -778,6 +798,7 @@ fn derive_attempt_binding(
     ));
     Ok(D1DmlAttemptBinding {
         target_key_sha256,
+        custody_generation_sha256: identities.custody_generation_sha256.to_string(),
         execute_plan_sha256: receipt.execute_plan_sha256.clone(),
         composition_sha256: receipt.composition_sha256.clone(),
         composition_receipt_sha256,
@@ -986,6 +1007,7 @@ fn product(
         transition,
         retry_decision,
         target_key_sha256: state.target_key_sha256.clone(),
+        custody_generation_sha256: state.custody_generation_sha256.clone(),
         execute_plan_sha256: state.execute_plan_sha256.clone(),
         composition_sha256: state.composition_sha256.clone(),
         composition_receipt_sha256: state.composition_receipt_sha256.clone(),
@@ -1028,6 +1050,7 @@ fn canonical_state_bytes(state: &D1DmlAttemptState) -> Result<Vec<u8>, D1DmlAtte
 
 fn state_matches_binding(state: &D1DmlAttemptState, binding: &D1DmlAttemptBinding) -> bool {
     state.target_key_sha256 == binding.target_key_sha256
+        && state.custody_generation_sha256 == binding.custody_generation_sha256
         && state.execute_plan_sha256 == binding.execute_plan_sha256
         && state.composition_sha256 == binding.composition_sha256
         && state.composition_receipt_sha256 == binding.composition_receipt_sha256
@@ -1062,6 +1085,7 @@ fn all_state_digests_are_valid(state: &D1DmlAttemptState) -> bool {
     [
         &state.layout_sha256,
         &state.target_key_sha256,
+        &state.custody_generation_sha256,
         &state.execute_plan_sha256,
         &state.composition_sha256,
         &state.composition_receipt_sha256,

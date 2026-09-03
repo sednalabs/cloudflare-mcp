@@ -84,6 +84,9 @@ fn empty_dml_custody_authorization(target_key_sha256: &str) -> Value {
         physical_artifact_count: usize,
         artifact_payload_bytes: usize,
         target_key_sha256: &'a str,
+        custody_generation_sha256: &'a str,
+        authority_sha256: &'a str,
+        genesis_sha256: &'a str,
         claimant_count: usize,
         attempt_count: usize,
         attempt_phase_counts: EmptyAttemptPhaseCounts,
@@ -102,10 +105,18 @@ fn empty_dml_custody_authorization(target_key_sha256: &str) -> Value {
         artifact_evidence: Vec<(String, String)>,
     }
 
-    const LAYOUT_SHA256: &str = "68da1f2248681d61a387f503b370a73ebc848b9c34bec6afd00b24a0bef36b48"; // DevSkim: ignore DS173237 -- public layout specification digest, not a credential
+    const LAYOUT_SHA256: &str = "d43e0f08c7220c9d17241495430ce5c7e48b35f210ae4146469f4963c1f174df"; // DevSkim: ignore DS173237 -- public layout specification digest, not a credential
     const BUDGET_SHA256: &str = "97e3ea422008c9a0e6cbf3749e11d2b2bdbdedc49c29291fe62ea314453dcc49"; // DevSkim: ignore DS173237 -- public audit-budget specification digest, not a credential
+    const GENERATION_SHA256: &str =
+        "739c097f7381fdcad24d177c023c8a90e8f4f752cebb48828ba042c36f7a4900"; // DevSkim: ignore DS173237 -- synthetic generation digest, not a credential
+    const AUTHORITY_SHA256: &str =
+        "73cc578c679ad9a10bba8ca71ef85a1efc39e8edfb46a38516fb61ab08c98548"; // DevSkim: ignore DS173237 -- synthetic authority digest, not a credential
+    let genesis_bytes = format!(
+        "{{\"version\":1,\"contract\":\"d1-dml-custody-genesis-v1\",\"target_key_sha256\":\"{target_key_sha256}\",\"layout_version\":2,\"layout_sha256\":\"{LAYOUT_SHA256}\",\"custody_generation_sha256\":\"{GENERATION_SHA256}\",\"authority_sha256\":\"{AUTHORITY_SHA256}\"}}\n"
+    );
+    let genesis_sha256 = sha256_hex(&genesis_bytes);
     let digest = EmptyCompleteAuditDigest {
-        version: 1,
+        version: 2,
         layout_sha256: LAYOUT_SHA256,
         audit_budget_version: 1,
         audit_budget_sha256: BUDGET_SHA256,
@@ -116,6 +127,9 @@ fn empty_dml_custody_authorization(target_key_sha256: &str) -> Value {
         physical_artifact_count: 0,
         artifact_payload_bytes: 0,
         target_key_sha256,
+        custody_generation_sha256: GENERATION_SHA256,
+        authority_sha256: AUTHORITY_SHA256,
+        genesis_sha256: &genesis_sha256,
         claimant_count: 0,
         attempt_count: 0,
         attempt_phase_counts: EmptyAttemptPhaseCounts {
@@ -143,8 +157,11 @@ fn empty_dml_custody_authorization(target_key_sha256: &str) -> Value {
         &serde_json::to_string(&digest).expect("serialize empty complete-audit fixture"),
     );
     json!({
-        "version": 1,
+        "version": 2,
         "target_key_sha256": target_key_sha256,
+        "custody_generation_sha256": GENERATION_SHA256,
+        "authority_sha256": AUTHORITY_SHA256,
+        "genesis_sha256": genesis_sha256,
         "layout_sha256": LAYOUT_SHA256,
         "audit_budget_version": 1,
         "audit_budget_sha256": BUDGET_SHA256,
@@ -202,6 +219,19 @@ fn install_activated_manifest_root(lease_root: &Path) {
     install_activated_manifest_root_without_dml_layout(lease_root);
     let target = manifest_target_path(lease_root);
     let target_key_sha256 = sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000");
+    const LAYOUT_SHA256: &str = "d43e0f08c7220c9d17241495430ce5c7e48b35f210ae4146469f4963c1f174df"; // DevSkim: ignore DS173237 -- public layout specification digest, not a credential
+    const GENERATION_SHA256: &str =
+        "739c097f7381fdcad24d177c023c8a90e8f4f752cebb48828ba042c36f7a4900"; // DevSkim: ignore DS173237 -- synthetic generation digest, not a credential
+    const AUTHORITY_SHA256: &str =
+        "73cc578c679ad9a10bba8ca71ef85a1efc39e8edfb46a38516fb61ab08c98548"; // DevSkim: ignore DS173237 -- synthetic authority digest, not a credential
+    let genesis_bytes = format!(
+        "{{\"version\":1,\"contract\":\"d1-dml-custody-genesis-v1\",\"target_key_sha256\":\"{target_key_sha256}\",\"layout_version\":2,\"layout_sha256\":\"{LAYOUT_SHA256}\",\"custody_generation_sha256\":\"{GENERATION_SHA256}\",\"authority_sha256\":\"{AUTHORITY_SHA256}\"}}\n"
+    );
+    let genesis_sha256 = sha256_hex(&genesis_bytes);
+    let genesis = target.join("dml-custody-genesis-v1.json");
+    fs::write(&genesis, genesis_bytes).expect("write DML custody genesis fixture");
+    fs::set_permissions(&genesis, fs::Permissions::from_mode(0o600))
+        .expect("make DML custody genesis private");
     let layout = target.join("dml-custody-v1");
     for directory in [
         layout.clone(),
@@ -219,7 +249,7 @@ fn install_activated_manifest_root(lease_root: &Path) {
     fs::write(
         &layout_marker,
         format!(
-            "{{\"version\":1,\"layout\":\"dml-custody-v1\",\"layout_sha256\":\"68da1f2248681d61a387f503b370a73ebc848b9c34bec6afd00b24a0bef36b48\",\"target_key_sha256\":\"{target_key_sha256}\"}}\n"
+            "{{\"version\":2,\"layout\":\"dml-custody-v1\",\"layout_sha256\":\"{LAYOUT_SHA256}\",\"target_key_sha256\":\"{target_key_sha256}\",\"custody_generation_sha256\":\"{GENERATION_SHA256}\",\"authority_sha256\":\"{AUTHORITY_SHA256}\",\"genesis_sha256\":\"{genesis_sha256}\"}}\n"
         ),
     )
     .expect("write complete-audit layout marker");
@@ -550,7 +580,7 @@ impl McpStdioProcess {
                     && metadata.permissions().mode() & 0o777 == 0o700
             }) && fs::read_dir(root).is_ok_and(|mut entries| entries.next().is_none())
             {
-                install_activated_manifest_root_without_dml_layout(root);
+                install_activated_manifest_root(root);
             }
         }
         let exe = env!("CARGO_BIN_EXE_cloudflare-mcp");
@@ -566,6 +596,14 @@ impl McpStdioProcess {
             .env("CLOUDFLARE_ZONE_ID", "zone-1")
             .env("CLOUDFLARE_MCP_DEFAULT_ACCOUNT_ID", "acct-1")
             .env("CLOUDFLARE_MCP_DEFAULT_ZONE_ID", "zone-1")
+            .env(
+                "CLOUDFLARE_MCP_D1_CUSTODY_GENERATION",
+                "test-custody-generation-v1",
+            )
+            .env(
+                "CLOUDFLARE_MCP_D1_CUSTODY_AUTHORITY_SHA256",
+                "73cc578c679ad9a10bba8ca71ef85a1efc39e8edfb46a38516fb61ab08c98548",
+            )
             .env(
                 "CLOUDFLARE_MCP_PORTAL_ALLOWED_URL_PREFIXES",
                 "https://staff.example.com/api/agent/",
@@ -7310,6 +7348,11 @@ fn d1_bootstrap_migration_ledger_dry_run_and_live_prove_one_initializer_only() {
         ),
     ];
     let mut mcp = McpStdioProcess::start_with_env(env);
+    let custody_target = manifest_target_path(&lease_root);
+    let genesis_before = fs::read(custody_target.join("dml-custody-genesis-v1.json"))
+        .expect("read pre-provisioned bootstrap genesis");
+    let layout_before = fs::read(custody_target.join("dml-custody-v1/layout.json"))
+        .expect("read pre-provisioned bootstrap layout");
 
     let invalid = mcp.call_tool(
         30,
@@ -7385,11 +7428,17 @@ fn d1_bootstrap_migration_ledger_dry_run_and_live_prove_one_initializer_only() {
     );
     assert_eq!(dry["response_evidence"].as_array().map(Vec::len), Some(2));
     let plan = dry["plan_sha256"].as_str().expect("bootstrap plan");
-    assert!(
-        !manifest_target_path(&lease_root)
-            .join("dml-custody-v1")
-            .exists(),
-        "dry-run and invalid bootstrap requests must not provision local DML custody"
+    assert_eq!(
+        fs::read(custody_target.join("dml-custody-genesis-v1.json"))
+            .expect("read bootstrap genesis after dry run"),
+        genesis_before,
+        "dry-run and invalid bootstrap requests must not mutate genesis"
+    );
+    assert_eq!(
+        fs::read(custody_target.join("dml-custody-v1/layout.json"))
+            .expect("read bootstrap layout after dry run"),
+        layout_before,
+        "dry-run and invalid bootstrap requests must not mutate layout"
     );
 
     let live = mcp.call_tool(
@@ -7407,7 +7456,7 @@ fn d1_bootstrap_migration_ledger_dry_run_and_live_prove_one_initializer_only() {
     assert_eq!(live["provider_mutations"], json!(1));
     assert_eq!(
         live["plan"]["steps"][3]["action"],
-        json!("ensure_d1_dml_custody_layout")
+        json!("open_existing_d1_dml_custody")
     );
     assert_eq!(
         live["plan"]["steps"][3]["target"]["provider_dispatch_authority"],
@@ -7458,7 +7507,7 @@ fn d1_bootstrap_migration_ledger_dry_run_and_live_prove_one_initializer_only() {
         manifest_target_path(&lease_root)
             .join("dml-custody-v1/layout.json")
             .is_file(),
-        "first live bootstrap must install the fixed layout before authority"
+        "live bootstrap must preserve the separately provisioned fixed layout"
     );
     assert_released_manifest_target_custody(&lease_root);
 
@@ -10116,6 +10165,11 @@ fn d1_apply_migration_manifest_live_rechecks_plan_and_stably_reads_back_before_r
             lease_root.to_string_lossy().to_string(),
         ),
     ]);
+    let custody_target = manifest_target_path(&lease_root);
+    let genesis_before = fs::read(custody_target.join("dml-custody-genesis-v1.json"))
+        .expect("read pre-provisioned manifest genesis");
+    let layout_before = fs::read(custody_target.join("dml-custody-v1/layout.json"))
+        .expect("read pre-provisioned manifest layout");
     let first_sql = "CREATE TABLE submissions(id TEXT);";
     let executed_second_sql = "ALTER TABLE submissions ADD COLUMN status TEXT;";
     let second_sql = format!("PRAGMA foreign_keys = ON;\n\n{executed_second_sql}");
@@ -10139,11 +10193,17 @@ fn d1_apply_migration_manifest_live_rechecks_plan_and_stably_reads_back_before_r
         dry_content["execution_manifest"][1]["executed_sql_sha256"],
         sha256_hex(executed_second_sql)
     );
-    assert!(
-        !manifest_target_path(&lease_root)
-            .join("dml-custody-v1")
-            .exists(),
-        "manifest dry run must not provision local DML custody"
+    assert_eq!(
+        fs::read(custody_target.join("dml-custody-genesis-v1.json"))
+            .expect("read manifest genesis after dry run"),
+        genesis_before,
+        "manifest dry run must not mutate genesis"
+    );
+    assert_eq!(
+        fs::read(custody_target.join("dml-custody-v1/layout.json"))
+            .expect("read manifest layout after dry run"),
+        layout_before,
+        "manifest dry run must not mutate layout"
     );
     let live = mcp.call_tool(
         5,
@@ -10170,12 +10230,13 @@ fn d1_apply_migration_manifest_live_rechecks_plan_and_stably_reads_back_before_r
     );
     assert_eq!(
         content["plan"]["steps"][4]["action"],
-        json!("ensure_d1_dml_custody_layout")
+        json!("open_existing_d1_dml_custody")
     );
     assert_eq!(
-        content["plan"]["steps"][4]["target"]["effect_scope"],
-        json!("local_custody_only")
+        content["plan"]["steps"][4]["target"]["ordinary_execution_may_create"],
+        json!(false)
     );
+    assert_eq!(content["plan"]["steps"][4]["side_effect"], json!(false));
     assert_eq!(
         content["plan"]["steps"][5]["action"],
         json!("authorize_complete_d1_dml_custody")
@@ -10188,7 +10249,7 @@ fn d1_apply_migration_manifest_live_rechecks_plan_and_stably_reads_back_before_r
         manifest_target_path(&lease_root)
             .join("dml-custody-v1/layout.json")
             .is_file(),
-        "first live manifest must install the fixed layout before authority"
+        "live manifest must preserve the separately provisioned fixed layout"
     );
     assert_released_manifest_target_custody(&lease_root);
     let requests = requests.lock().expect("requests lock").clone();
@@ -10368,8 +10429,9 @@ fn d1_apply_migration_manifest_preserves_prelease_provider_calls_when_activation
                     {"action": "read_stable_migration_ledger", "ordinal": 2, "side_effect": false, "target": expected_target},
                     {"action": "preflight_existing_migration_target_custody", "ordinal": 3, "side_effect": false, "target": {"target": "account_database"}},
                     {"action": "preflight_reserved_migration_ledger_authority", "ordinal": 4, "side_effect": false, "target": {"migrations_table": "d1_migrations"}},
-                    {"action": "ensure_d1_dml_custody_layout", "ordinal": 5, "side_effect": true, "target": {
-                        "effect_scope": "local_custody_only",
+                    {"action": "open_existing_d1_dml_custody", "ordinal": 5, "side_effect": false, "target": {
+                        "requires_immutable_genesis": true,
+                        "ordinary_execution_may_create": false,
                         "provider_dispatch_authority": "none",
                         "target_key_sha256": target_key_sha256,
                     }},
@@ -18589,6 +18651,75 @@ fn d1_apply_migration_manifest_partial_multi_statement_response_loss_stays_unkno
     let _ = fs::remove_dir_all(lease_root);
 }
 
+#[cfg(unix)]
+#[test]
+fn d1_provision_dml_custody_is_provider_free_exact_replay_and_conflict_safe() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-d1-provision-custody-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    fs::create_dir(&lease_root).expect("create provision root");
+    fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+        .expect("make provision root private");
+    let mut mcp = McpStdioProcess::start_with_env(vec![(
+        "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+        lease_root.to_string_lossy().to_string(),
+    )]);
+    let args = json!({
+        "database_id": "123e4567-e89b-42d3-a456-426614174000",
+        "custody_generation": "test-custody-generation-v1",
+        "authority_sha256": "73cc578c679ad9a10bba8ca71ef85a1efc39e8edfb46a38516fb61ab08c98548",
+        "dry_run": true
+    });
+    let dry = mcp.call_tool(80, "d1_provision_dml_custody", args.clone());
+    assert_tool_text_matches_structured(&dry);
+    let dry = structured_content(&dry);
+    assert_eq!(dry["ok"], json!(true), "{dry}");
+    assert_eq!(dry["provider_calls"], json!(0));
+    assert_eq!(dry["provider_mutations"], json!(0));
+    let mut live_args = args;
+    live_args["dry_run"] = json!(false);
+    live_args["approved_plan_sha256"] = dry["plan_sha256"].clone();
+    let replay = mcp.call_tool(81, "d1_provision_dml_custody", live_args.clone());
+    assert_tool_text_matches_structured(&replay);
+    let replay = structured_content(&replay);
+    assert_eq!(replay["ok"], json!(true), "{replay}");
+    assert_eq!(replay["provision"]["apply_status"], json!("proven"));
+    assert_eq!(replay["provision"]["provider_calls"], json!(0));
+    assert_eq!(replay["provision"]["provider_mutations"], json!(0));
+    let target = manifest_target_path(&lease_root);
+    assert!(target.join("dml-custody-genesis-v1.json").is_file());
+    assert!(target.join("dml-custody-v1/layout.json").is_file());
+
+    let mut conflict_args = live_args;
+    conflict_args["custody_generation"] = json!("test-custody-generation-v2");
+    conflict_args["approved_plan_sha256"] = Value::Null;
+    conflict_args["dry_run"] = json!(true);
+    let conflict_dry = mcp.call_tool(82, "d1_provision_dml_custody", conflict_args.clone());
+    let conflict_plan = structured_content(&conflict_dry)["plan_sha256"].clone();
+    conflict_args["dry_run"] = json!(false);
+    conflict_args["approved_plan_sha256"] = conflict_plan;
+    let conflict = mcp.call_tool(83, "d1_provision_dml_custody", conflict_args);
+    assert_tool_text_matches_structured(&conflict);
+    let conflict = structured_content(&conflict);
+    assert_eq!(conflict["ok"], json!(false), "{conflict}");
+    assert_eq!(
+        conflict["error"]["code"],
+        json!("d1.dml_custody_authority_mismatch")
+    );
+    assert_eq!(conflict["provider_calls"], json!(0));
+    assert_eq!(conflict["provider_mutations"], json!(0));
+
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
 #[test]
 fn d1_target_wide_database_mutations_require_exact_consent_and_deny_before_provider_without_guard_through_stdio()
  {
@@ -18700,7 +18831,7 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_deny_before_provi
             "action": "validate_d1_database_rename",
             "side_effect": false,
             "target": {
-                "operation_version": 2,
+                "operation_version": 3,
                 "normalized_target": {
                     "account_id": "acct-1",
                     "database_id": database_id
@@ -18733,7 +18864,7 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_deny_before_provi
         json!({
             "consent_version": 1,
             "operation": "d1_rename_database",
-            "operation_version": 2,
+            "operation_version": 3,
             "normalized_target": {
                 "account_id": "acct-1",
                 "database_id": database_id
@@ -18841,7 +18972,7 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_deny_before_provi
         json!({
             "consent_version": 1,
             "operation": "d1_delete_database",
-            "operation_version": 2,
+            "operation_version": 3,
             "normalized_target": {
                 "account_id": "acct-1",
                 "database_id": database_id
@@ -19026,7 +19157,7 @@ fn d1_target_wide_rename_dispatches_once_and_exact_replay_never_redispatches() {
             .expect("system clock after Unix epoch")
             .as_nanos()
     ));
-    install_activated_manifest_root_without_dml_layout(&lease_root);
+    install_activated_manifest_root(&lease_root);
     let mut mcp = McpStdioProcess::start_with_env(vec![
         ("CLOUDFLARE_MCP_API_BASE_URL", provider_url),
         (
@@ -19081,8 +19212,8 @@ fn d1_target_wide_rename_dispatches_once_and_exact_replay_never_redispatches() {
     assert_eq!(
         first["execution_evidence"]["local_layout"],
         json!({
-            "outcome": "created",
-            "local_mutations": 1,
+            "outcome": "already_present",
+            "local_mutations": 0,
             "provider_dispatch_authority": "none"
         })
     );

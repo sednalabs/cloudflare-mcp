@@ -51,11 +51,26 @@ pub(crate) async fn execute_d1_target_wide_apply(
             );
         }
     };
+    let guard = match acquire_d1_target_mutation_guard(
+        input.intended_plan.consent_binding.operation,
+        &target.account_id,
+        &target.database_id,
+    ) {
+        Ok(guard) => guard,
+        Err(result) => return (result, evidence),
+    };
     let identities = D1DmlAttemptIdentities {
         operation_id: input.operation_id,
         execution_attempt_id: input.execution_attempt_id,
         provider_request_id: input.provider_request_id,
+        custody_generation_sha256: &guard.dml_custody_authority().custody_generation_sha256,
     };
+    if let Err(result) = observe_layout_ensure(
+        &mut evidence,
+        guard.open_target_wide_d1_dml_custody_layout(),
+    ) {
+        return (result, evidence);
+    }
     let planned = match prepare_d1_target_wide_attempt(
         target,
         input.intended_plan,
@@ -66,20 +81,6 @@ pub(crate) async fn execute_d1_target_wide_apply(
         Ok(product) => product,
         Err(error) => return (blocked(error.code, error.message), evidence),
     };
-    let guard = match acquire_d1_target_mutation_guard(
-        input.intended_plan.consent_binding.operation,
-        &target.account_id,
-        &target.database_id,
-    ) {
-        Ok(guard) => guard,
-        Err(result) => return (result, evidence),
-    };
-    if let Err(result) = observe_layout_ensure(
-        &mut evidence,
-        guard.ensure_target_wide_d1_dml_custody_layout(),
-    ) {
-        return (result, evidence);
-    }
 
     let binding = planned.receipt().attempt_binding_sha256.clone();
     let incumbent = match guard.read_d1_dml_attempt_state(&binding) {

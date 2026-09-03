@@ -1204,6 +1204,7 @@ mod tests {
             "d1_finalize_migration_reconciliation",
             "d1_delete_database",
             "d1_execute_write",
+            "d1_provision_dml_custody",
             "d1_get_database",
             "d1_inspect_schema",
             "d1_list_databases",

@@ -19,7 +19,8 @@ preferred path for safety-sensitive operations.
   envelope and bearer token authentication.
 - Product workflows with curated safety policy remain specialized tools. D1
   workflows use `d1_list_databases`, `d1_get_database`, `d1_inspect_schema`,
-  `d1_query_read_only`, `d1_validate_query`, `d1_execute_write`,
+  `d1_query_read_only`, `d1_validate_query`, `d1_provision_dml_custody`,
+  `d1_execute_write`,
   `d1_apply_migrations`, `d1_bootstrap_migration_ledger`,
   `d1_reconcile_bootstrap_migration_ledger`,
   `d1_finalize_bootstrap_migration_ledger`,
@@ -96,9 +97,9 @@ before request construction or provider access: `d1-delete-database`,
 `d1-raw-database-query`, `d1-time-travel-restore`, `d1-update-database`, and
 `d1-update-partial-database`. Use `d1_delete_database` for the governed delete
 planning/consent lifecycle and `d1_query_read_only` for curated read-only SQL.
-Within these governed MCP tools, rename/delete live execution is temporarily
-fail-closed before guard/provider access until durable provider-attempt
-reservation and recovery custody is installed. Direct callers of the public
+Within these governed MCP tools, live execution requires separately
+provisioned immutable generation-bound DML custody and opens it without local
+recreation before any provider dispatch. Direct callers of the public
 Cloudflare client adapter are outside that tool gate and must supply their own
 governed wrapper before allowing target-wide mutation. Export, import,
 restore, full update, and partial update remain unavailable until each has a

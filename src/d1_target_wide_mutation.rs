@@ -16,8 +16,8 @@ use crate::d1_dml_custody_layout::{
 use crate::mutation::MutationPlan;
 use crate::tools::sha256_bytes_hex;
 
-const TARGET_WIDE_PLAN_VERSION: u8 = 3;
-pub(crate) const TARGET_WIDE_OPERATION_VERSION: u8 = 2;
+const TARGET_WIDE_PLAN_VERSION: u8 = 4;
+pub(crate) const TARGET_WIDE_OPERATION_VERSION: u8 = 3;
 pub(crate) const TARGET_WIDE_CONSENT_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -145,16 +145,16 @@ pub(crate) fn d1_target_wide_intended_plan(
     let plan = MutationPlan::new(operation)
         .step(validation_action, false, validation_target)
         .step(
-            "ensure_d1_dml_custody_layout",
-            true,
+            "open_existing_d1_dml_custody",
+            false,
             json!({
                 "target_key_sha256": target_key_sha256,
                 "layout": D1_DML_CUSTODY_LAYOUT_NAME,
                 "layout_version": D1_DML_CUSTODY_LAYOUT_VERSION,
                 "layout_sha256": D1_DML_CUSTODY_LAYOUT_SHA256,
-                "conditional": true,
-                "execution": "create_if_absent_at_live_guarded_execution",
-                "effect_scope": "local_custody_only",
+                "requires_immutable_genesis": true,
+                "execution": "open_exact_existing_at_live_guarded_execution",
+                "ordinary_execution_may_create": false,
                 "provider_dispatch_authority": "none",
             }),
         )
@@ -529,14 +529,14 @@ mod tests {
                         "requested_change": {"delete_database": true},
                         "reason": "retire synthetic fixture",
                     }},
-                    {"ordinal": 2, "action": "ensure_d1_dml_custody_layout", "side_effect": true, "target": {
+                    {"ordinal": 2, "action": "open_existing_d1_dml_custody", "side_effect": false, "target": {
                         "target_key_sha256": target_key_sha256,
                         "layout": D1_DML_CUSTODY_LAYOUT_NAME,
                         "layout_version": D1_DML_CUSTODY_LAYOUT_VERSION,
                         "layout_sha256": D1_DML_CUSTODY_LAYOUT_SHA256,
-                        "conditional": true,
-                        "execution": "create_if_absent_at_live_guarded_execution",
-                        "effect_scope": "local_custody_only",
+                        "requires_immutable_genesis": true,
+                        "execution": "open_exact_existing_at_live_guarded_execution",
+                        "ordinary_execution_may_create": false,
                         "provider_dispatch_authority": "none",
                     }},
                     {"ordinal": 3, "action": "authorize_complete_d1_dml_custody", "side_effect": false, "target": {

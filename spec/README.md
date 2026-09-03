@@ -104,7 +104,7 @@ Note on elicitation mode:
   policy behavior.
 
 Preserved curated tool families:
-- D1 read tools (`d1_list_databases`, `d1_get_database`, `d1_inspect_schema`, `d1_query_read_only`, `d1_validate_query`) are first-class contract tools and must remain present even when broad API parity is available.
+- D1 read tools (`d1_list_databases`, `d1_get_database`, `d1_inspect_schema`, `d1_query_read_only`, `d1_validate_query`) and the provider-free `d1_provision_dml_custody` authority boundary are first-class contract tools and must remain present even when broad API parity is available.
   `d1_inspect_schema` supports targeted `include_tables`/`include_table_pattern`
   filtering and must keep Cloudflare internal `_cf_*` objects out of
   application `column_errors`.
