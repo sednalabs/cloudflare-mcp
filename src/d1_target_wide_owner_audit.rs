@@ -220,7 +220,7 @@ pub(crate) fn authorize_d1_target_wide_prepared_owner(
     })
 }
 
-/// Recompute and exactly compare owner authority immediately before the future
+/// Recompute and exactly compare owner authority immediately before the owned
 /// owned local persistence boundary. This function itself never persists.
 pub(crate) fn revalidate_d1_target_wide_prepared_owner(
     guard: &D1TargetMutationGuard,

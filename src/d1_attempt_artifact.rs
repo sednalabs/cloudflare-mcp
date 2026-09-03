@@ -9,6 +9,7 @@ use crate::d1_dml_attempt_custody::{
 };
 use crate::d1_target_wide_attempt_custody::{
     D1_TARGET_WIDE_ATTEMPT_CUSTODY_OPERATION, inspect_d1_target_wide_attempt_state,
+    validate_d1_target_wide_attempt_successor,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,4 +56,26 @@ pub(crate) fn inspect_d1_attempt_artifact(
         });
     }
     Err("attempt artifact matched no supported strict custody schema")
+}
+
+pub(crate) fn validate_d1_attempt_artifact_successor(
+    expected: &[u8],
+    successor: &[u8],
+) -> Result<(), &'static str> {
+    let expected_receipt = inspect_d1_attempt_artifact(expected)?;
+    let successor_receipt = inspect_d1_attempt_artifact(successor)?;
+    if expected_receipt.family != successor_receipt.family {
+        return Err("DML attempt successor changed artifact family");
+    }
+    match expected_receipt.family {
+        crate::d1_dml_attempt_custody::D1_DML_ATTEMPT_CUSTODY_OPERATION => {
+            crate::d1_dml_attempt_custody::validate_d1_dml_attempt_successor(expected, successor)
+                .map_err(|_| "row-DML attempt successor was not the exact incumbent transition")
+        }
+        D1_TARGET_WIDE_ATTEMPT_CUSTODY_OPERATION => validate_d1_target_wide_attempt_successor(
+            expected, successor,
+        )
+        .map_err(|_| "target-wide D1 attempt successor was not the exact incumbent transition"),
+        _ => Err("DML attempt successor used an unsupported artifact family"),
+    }
 }

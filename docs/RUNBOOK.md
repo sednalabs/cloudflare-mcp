@@ -136,17 +136,14 @@ persists the exact audit identity in the lease payload and re-runs it at
 provider, receipt-persistence, restoration, and retirement boundaries. Because
 terminal receipts bind `lease_payload_sha256`, they also bind the exact
 complete-audit identity.
-Curated database rename and delete are currently read-only planning surfaces.
-Before dry/live branching they derive one canonical six-step static plan:
-validate the exact operator intent, conditionally create the fixed layout during
-a future live guarded execution, require a clean complete audit, require exact
-final revalidation, install durable target-wide provider-attempt reservation,
-then dispatch the provider operation last. The reservation step explicitly
-reports `implementation_status=not_installed` and
-`provider_dispatch_authority=none`.
+Curated database rename and delete derive one canonical eight-step static plan:
+validate exact intent, ensure fixed local custody, authorize a clean complete
+audit before fresh state, install canonical `Prepared` custody, authorize and
+immediately revalidate its exact owner, compare-and-exchange once to
+`DispatchReserved`, issue at most one provider request, then retain one
+post-provider custody product.
 
-The internal target-wide Prepared boundary is now implemented but is not yet
-routed from either curated tool. It rederives the exact typed current six-step
+The target-wide custody boundary rederives the exact typed current eight-step
 plan and consent from canonical target/change/reason facts and rejects any
 detached or version-drifted plan, binding, digest, or token even when recomputed
 self-consistently. It hashes pairwise-distinct opaque operation,
@@ -167,10 +164,10 @@ claimants, while every other attempt in the stable complete audit is terminal.
 It binds the current consent/operation versions, canonical target, plan,
 operation/attempt/provider-request hashes, attempt and claimant-set bindings,
 and complete surrounding-audit identity into an aggregate-only authorization.
-The authorization scope is only the future local
+The authorization scope is only the local
 `Prepared -> DispatchReserved` compare-and-exchange and explicitly retains
-`provider_dispatch_authority=none`; immediately before that future persistence
-boundary, the exact product must be recomputed and compared. The global
+`provider_dispatch_authority=none`; immediately before that persistence
+boundary, the exact product is recomputed and compared. The global
 target-wide audit authority remains unchanged and rejects any `Prepared`,
 `DispatchReserved`, or `ReconciliationRequired` attempt.
 
@@ -182,9 +179,12 @@ failure. Both claimant-first and attempt-first installation orders authorize
 only after exact convergence; exact replay converges. This policy stays in the
 Cloudflare D1 adapter because it has one D1 caller. It reuses the toolkit's
 provider-neutral private-artifact primitives, but does not uplift a D1 lifecycle
-contract without a second independent caller. `DispatchReserved` persistence,
-provider request, and recovery/readback lifecycle remain separate required
-boundaries, so live rename/delete remain disabled.
+contract without a second independent caller. The routed lifecycle performs
+exactly one `Prepared -> DispatchReserved` CAS and exact readback, revalidates
+the held target guard, then permits at most one no-redirect Cloudflare request
+carrying the preallocated provider-request identity. Exact replay of
+`DispatchReserved`, `Acknowledged`, or `ReconciliationRequired` custody never
+redispatches.
 
 Every dry run returns the full plan, `intended_plan_sha256`, a versioned
 `consent_binding`, and `required_confirmation_token`. The consent binding
@@ -193,29 +193,33 @@ version, normalized requested change, optional reason, plan digest, and the
 complete plan. Any change to those values changes the token. Dry-run
 `execution_evidence` keeps layout `unobserved`, audit and revalidation
 unmaterialized, durable reservation `not_installed`, and local/provider
-effects at zero.
+effects at zero. Dry-run itself never installs custody or contacts the provider.
 
 Every live rename/delete call first recomputes that binding. Missing, altered,
 stale, cross-target, cross-operation, changed-intent, or changed-reason tokens
 return `confirmation_required` before target-guard or provider access. An
-exact token still returns `durable_reservation_not_installed` before target-
-guard or provider access, with `provider_calls=0`,
-`provider_mutations=0`, and `automatic_retry_permitted=false`. Use dry-run
-planning only until the separately reviewed durable reservation and recovery
-contract is installed. The fixed layout and complete-audit plan steps remain
-evidence requirements; neither currently supplies dispatch authority.
+exact token enters the guarded lifecycle. Any target guard, layout, audit,
+identity, version, capacity, owner-revalidation, or reservation-CAS failure
+before dispatch reports zero provider calls and does not cross the provider
+boundary. `Prepared` authority alone never permits dispatch.
 
-Rename/delete retain one D1-database-only client lifecycle for the future
-durably reserved execution boundary, but that client is unreachable from the
-curated live tools while the reservation gate is active. Its strict
-response-envelope contract remains: one bounded duplicate-free exact Cloudflare
+Rename/delete use one D1-database-only client lifecycle after durable
+reservation. Its strict response-envelope contract is one bounded,
+duplicate-free exact Cloudflare
 envelope with literal `success=true`, empty `errors`, unique exact
 ResponseInfo `messages`, and the operation-specific result. ResponseInfo codes
 are JSON unsigned integers at least 1000; optional-field presence participates
 in uniqueness, while object property order does not. Rename requires a non-null
 D1 database result. Delete accepts absent/null as `{}` and returns a present
-non-null value through the existing `serde_json::Value` interface. Any future
-post-dispatch uncertainty must remain non-retryable and aggregate-only.
+non-null value through the existing `serde_json::Value` interface. A valid
+acknowledgement is immediately retained as aggregate-only `Acknowledged`
+custody. Transport loss, body-read failure, malformed or contradictory
+envelopes, and HTTP/provider rejection are immediately retained as
+`ReconciliationRequired` when the local CAS remains provable. If post-provider
+derivation, CAS, or readback is ambiguous, the response still retains bounded
+digest/lifecycle evidence, forbids retry, and requires operator reconciliation.
+Neither outcome is terminal effect proof; stable readback and finalization are
+separately reviewed work.
 
 The complete audit pass has a fixed, versioned DML-specific global budget: at
 most 16,384 canonical leaves, 65,536 physical leaf artifacts, and 268,435,456
@@ -427,8 +431,8 @@ cannot reconcile or retire bootstrap-family custody.
 ### Shared existing-target mutation guard
 
 Configure `CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT` for every MCP process that
-can run curated D1 row-write, bootstrap, or manifest mutation, and for every
-future process that will execute a governed target-wide rename/delete lifecycle.
+can run curated D1 row-write, target-wide rename/delete, bootstrap, or manifest
+mutation.
 The name is retained for compatibility, but the directory is now the shared
 account/database target-guard root. The active `d1_execute_write` MCP path
 acquires the same permanent `guard.lock` as bootstrap and manifest apply
@@ -440,12 +444,12 @@ receipt when diagnosing the contention.
 
 Fresh row-write, manifest, and bootstrap acquisition may create only the fixed
 empty `dml-custody-v1` layout, under the already-held permanent target guard
-and before any complete-audit authorization. Governed MCP rename/delete remain
-six-step planning-only tools: their previews record
-`ensure_d1_dml_custody_layout` as
+and before any complete-audit authorization. Governed MCP rename/delete use an
+eight-step consent plan; their previews record `ensure_d1_dml_custody_layout` as
 `create_if_absent_at_live_guarded_execution`, `local_custody_only`, and
-`provider_dispatch_authority=none`; step 5 is not installed, so it blocks step
-6 and no provider request is dispatched. The returned
+`provider_dispatch_authority=none`. Live execution later requires exact owner
+authority and one durable reservation before its single permitted provider
+request. The returned
 `intended_plan_sha256` is stable across matching dry/live calls; runtime custody
 facts appear only in `execution_evidence`. An existing layout must validate
 exactly; active guarded paths do not replace, flatten, or repair hostile or
@@ -454,8 +458,7 @@ error preserves the observed local outcome while proving zero provider
 dispatch. The lower-level `CloudflareClient` adapter remains distinct. Every
 direct rename/delete caller must supply its own governed consent and durable
 reservation/recovery wrapper before provider dispatch; that adapter capability
-is not the governed MCP lifecycle and does not bypass the MCP planning-only
-stop.
+does not bypass the MCP lifecycle.
 Retained-evidence reconciliation, terminal receipt persistence, rollback
 restoration, and retirement require the layout to remain present and exact;
 absence is evidence loss, not an empty/default state, and those paths create

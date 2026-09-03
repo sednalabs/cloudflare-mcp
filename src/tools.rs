@@ -80,6 +80,9 @@ use crate::d1_migration_terminal::{
     finalize_d1_migration_reconciliation,
 };
 use crate::d1_target::normalize_d1_target;
+use crate::d1_target_wide_apply_lifecycle::{
+    D1TargetWideApplyInput, D1TargetWideProviderOperation, execute_d1_target_wide_apply,
+};
 use crate::d1_target_wide_mutation::{
     D1TargetWideExecutionEvidence, D1TargetWideIntendedPlan, d1_target_wide_intended_plan,
 };
@@ -544,6 +547,9 @@ pub struct D1RenameDatabaseArgs {
     pub account_id: Option<String>,
     pub database_id: String,
     pub name: String,
+    pub operation_id: String,
+    pub execution_attempt_id: String,
+    pub provider_request_id: String,
     #[serde(default)]
     pub dry_run: bool,
     #[serde(default)]
@@ -558,6 +564,9 @@ pub struct D1DeleteDatabaseArgs {
     #[serde(default)]
     pub account_id: Option<String>,
     pub database_id: String,
+    pub operation_id: String,
+    pub execution_attempt_id: String,
+    pub provider_request_id: String,
     #[serde(default)]
     pub dry_run: bool,
     #[serde(default)]
@@ -3864,7 +3873,7 @@ impl CloudflareMcp {
 
     #[tool(
         name = "d1_rename_database",
-        description = "Plan a Cloudflare D1 database rename with exact plan-bound consent. Live execution remains disabled until durable reservation and recovery custody is installed."
+        description = "Plan or execute one guarded Cloudflare D1 database rename. Live execution binds exact consent and three opaque identities, reserves at most one provider request, and ends in nonterminal acknowledgement or reconciliation custody without automatic retry."
     )]
     async fn cloudflare_d1_rename_database(
         &self,
@@ -3944,7 +3953,26 @@ impl CloudflareMcp {
         } else if args.confirmation_token.as_deref() != Some(required_token.as_str()) {
             d1_target_wide_confirmation_required_result("d1_rename_database")
         } else {
-            d1_target_wide_reservation_not_installed_result("d1_rename_database")
+            let (result, live_evidence) = execute_d1_target_wide_apply(
+                &self.cloudflare,
+                &target,
+                D1TargetWideApplyInput {
+                    intended_plan: &intended_plan,
+                    confirmation_token: &required_token,
+                    operation_id: &args.operation_id,
+                    execution_attempt_id: &args.execution_attempt_id,
+                    provider_request_id: &args.provider_request_id,
+                    provider_operation: D1TargetWideProviderOperation::Rename { name },
+                },
+            )
+            .await;
+            return Ok(finalize_d1_target_wide_mutation_result(
+                result,
+                &intended_plan,
+                &live_evidence,
+                audit,
+                false,
+            ));
         };
 
         Ok(finalize_d1_target_wide_mutation_result(
@@ -3958,7 +3986,7 @@ impl CloudflareMcp {
 
     #[tool(
         name = "d1_delete_database",
-        description = "Plan a Cloudflare D1 database delete with exact plan-bound consent. Live execution remains disabled until durable reservation and recovery custody is installed."
+        description = "Plan or execute one guarded Cloudflare D1 database delete. Live execution binds exact consent and three opaque identities, reserves at most one provider request, and ends in nonterminal acknowledgement or reconciliation custody without automatic retry."
     )]
     async fn cloudflare_d1_delete_database(
         &self,
@@ -4046,7 +4074,26 @@ impl CloudflareMcp {
         } else if args.confirmation_token.as_deref() != Some(required_token.as_str()) {
             d1_target_wide_confirmation_required_result("d1_delete_database")
         } else {
-            d1_target_wide_reservation_not_installed_result("d1_delete_database")
+            let (result, live_evidence) = execute_d1_target_wide_apply(
+                &self.cloudflare,
+                &target,
+                D1TargetWideApplyInput {
+                    intended_plan: &intended_plan,
+                    confirmation_token: &required_token,
+                    operation_id: &args.operation_id,
+                    execution_attempt_id: &args.execution_attempt_id,
+                    provider_request_id: &args.provider_request_id,
+                    provider_operation: D1TargetWideProviderOperation::Delete,
+                },
+            )
+            .await;
+            return Ok(finalize_d1_target_wide_mutation_result(
+                result,
+                &intended_plan,
+                &live_evidence,
+                audit,
+                false,
+            ));
         };
 
         Ok(finalize_d1_target_wide_mutation_result(
@@ -14131,6 +14178,9 @@ fn finalize_d1_target_wide_mutation_result(
     audit: MutationAuditSession,
     dry_run: bool,
 ) -> CallToolResult {
+    let synchronize_single_text = result.structured_content.is_some()
+        && result.content.len() == 1
+        && result.content[0].as_text().is_some();
     if let Some(payload) = result.structured_content.as_mut()
         && let Some(object) = payload.as_object_mut()
     {
@@ -14149,8 +14199,56 @@ fn finalize_d1_target_wide_mutation_result(
             );
         }
         object.insert("execution_evidence".to_string(), json!(execution_evidence));
+        object
+            .entry("automatic_retry_permitted".to_string())
+            .or_insert_with(|| json!(false));
     }
-    finalize_mutation_result(result, &intended_plan.plan, audit, dry_run)
+    let inferred_error = result
+        .structured_content
+        .as_ref()
+        .and_then(|payload| payload.get("ok"))
+        .and_then(Value::as_bool)
+        .map(|ok| !ok)
+        .unwrap_or(false);
+    let is_error = result.is_error.unwrap_or(inferred_error);
+    let mut payload = result
+        .structured_content
+        .take()
+        .unwrap_or_else(|| json!({"ok": !is_error}));
+    let error_code =
+        extract_error_code(&payload).or_else(|| is_error.then_some("unknown_error".to_string()));
+    let nonterminal_provider =
+        payload
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| {
+                matches!(
+                    status,
+                    "provider_acknowledged_reconciliation_required" | "reconciliation_required"
+                )
+            });
+    let outcome = if dry_run {
+        "planned"
+    } else if nonterminal_provider {
+        "reconciliation_required"
+    } else if is_error {
+        "error"
+    } else {
+        "success"
+    };
+    let audit_record = audit.finish(outcome, error_code.as_deref());
+    emit_mutation_audit_log(&audit_record);
+    if let Some(object) = payload.as_object_mut() {
+        object
+            .entry("operation".to_string())
+            .or_insert_with(|| json!(intended_plan.plan.operation));
+        object.insert("dry_run".to_string(), json!(dry_run));
+        object.insert("plan".to_string(), json!(intended_plan.plan));
+        object.insert("audit".to_string(), json!(audit_record));
+    }
+    result.is_error = Some(is_error);
+    result.structured_content = Some(payload);
+    synchronize_tool_text_with_structured_content(result, synchronize_single_text)
 }
 
 fn d1_target_wide_confirmation_required_result(operation: &str) -> CallToolResult {
@@ -14179,22 +14277,6 @@ fn d1_target_wide_confirmation_required_result(operation: &str) -> CallToolResul
             "code": code,
             "message": message,
             "hint": "Run the same operation with dry_run=true, review the complete static plan, and echo required_confirmation_token without modification.",
-        },
-    }))
-}
-
-fn d1_target_wide_reservation_not_installed_result(operation: &str) -> CallToolResult {
-    CallToolResult::structured_error(json!({
-        "ok": false,
-        "operation": operation,
-        "status": "durable_reservation_not_installed",
-        "provider_calls": 0,
-        "provider_mutations": 0,
-        "automatic_retry_permitted": false,
-        "error": {
-            "code": "d1.target_wide_durable_reservation_not_installed",
-            "message": "target-wide D1 live execution is disabled because durable provider-attempt reservation and recovery custody is not installed",
-            "hint": "Use dry-run planning only; do not issue or replay a provider write until the documented durable reservation and recovery contract is available.",
         },
     }))
 }

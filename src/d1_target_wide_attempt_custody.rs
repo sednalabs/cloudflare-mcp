@@ -1,16 +1,19 @@
-//! Exact Prepared custody for curated target-wide D1 rename/delete attempts.
+//! Exact lifecycle custody for curated target-wide D1 rename/delete attempts.
 //!
-//! This boundary binds the complete static consent product and three opaque
-//! caller identities into one canonical private artifact. It deliberately has
-//! no dispatch, provider-response, readback, terminal, recovery, or retry path.
+//! This boundary binds the complete static consent product, three opaque caller
+//! identities, one dispatch reservation, and one aggregate post-provider
+//! outcome into canonical private artifacts. Provider dispatch, stable
+//! recovery/readback, terminal finalization, and retry authority live elsewhere.
 
 use std::collections::BTreeSet;
 
+use mcp_toolkit_core::response_contract::MutationApplyStatus;
 use rmcp::model::CallToolResult;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crate::cloudflare::d1_database_mutation::D1DatabaseMutationLifecycle;
 use crate::d1_dml_attempt_custody::{
     D1_DML_ATTEMPT_STATE_BYTE_CAP, D1DmlAttemptIdentities, D1DmlAttemptPhase,
 };
@@ -30,7 +33,7 @@ use crate::d1_target_wide_mutation::{
 };
 
 pub(crate) const D1_TARGET_WIDE_ATTEMPT_CUSTODY_OPERATION: &str = "d1_target_wide_attempt_custody";
-const TARGET_WIDE_ATTEMPT_VERSION: u8 = 1;
+const TARGET_WIDE_ATTEMPT_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -54,6 +57,29 @@ struct D1TargetWideAttemptState {
     provider_request_id_sha256: String,
     attempt_binding_sha256: String,
     phase: D1DmlAttemptPhase,
+    dispatch_reservations: u8,
+    post_provider: Option<D1TargetWidePostProviderRecord>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum D1TargetWidePostProviderOutcome {
+    Acknowledged,
+    ReconciliationRequired,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct D1TargetWidePostProviderRecord {
+    outcome: D1TargetWidePostProviderOutcome,
+    apply_status: MutationApplyStatus,
+    provider_calls: u8,
+    provider_mutations: Option<u8>,
+    lifecycle_sha256: String,
+    http_status: Option<u16>,
+    response_body_sha256: Option<String>,
+    response_body_size_bytes: Option<usize>,
+    provider_error_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -61,6 +87,8 @@ struct D1TargetWideAttemptState {
 pub(crate) enum D1TargetWidePreparedTransition {
     Prepared,
     ExactReplay,
+    DispatchReservationPrepared,
+    PostProviderOutcomeRecorded,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -86,11 +114,19 @@ pub(crate) struct D1TargetWidePreparedReceipt {
     pub(crate) execution_attempt_id_sha256: String,
     pub(crate) provider_request_id_sha256: String,
     pub(crate) attempt_binding_sha256: String,
+    pub(crate) dispatch_reservations: u8,
+    pub(crate) post_provider_outcome: Option<D1TargetWidePostProviderOutcome>,
+    pub(crate) apply_status: Option<MutationApplyStatus>,
+    pub(crate) lifecycle_sha256: Option<String>,
+    pub(crate) http_status: Option<u16>,
+    pub(crate) response_body_sha256: Option<String>,
+    pub(crate) response_body_size_bytes: Option<usize>,
+    pub(crate) provider_error_sha256: Option<String>,
     pub(crate) state_sha256: String,
     pub(crate) state_size_bytes: usize,
     pub(crate) state_byte_cap: usize,
     pub(crate) provider_calls: u8,
-    pub(crate) provider_mutations: u8,
+    pub(crate) provider_mutations: Option<u8>,
     pub(crate) automatic_retry_permitted: bool,
 }
 
@@ -125,6 +161,8 @@ pub(crate) enum D1TargetWidePreparedClassification {
     RestoredStateUnsupported,
     RestoredStateContradictory,
     ReplayConflict,
+    PhaseInvalid,
+    ProviderEvidenceInvalid,
     StateLimitExceeded,
 }
 
@@ -200,6 +238,178 @@ pub(crate) fn inspect_d1_target_wide_attempt_state(
 ) -> Result<D1TargetWidePreparedProduct, D1TargetWidePreparedError> {
     let state = parse_canonical_state(bytes)?;
     product(state, D1TargetWidePreparedTransition::ExactReplay, true)
+}
+
+/// Validate one exact monotonic target-wide CAS successor. This is local
+/// storage authority only; it grants no provider dispatch or retry authority.
+pub(crate) fn validate_d1_target_wide_attempt_successor(
+    expected: &[u8],
+    successor: &[u8],
+) -> Result<(), D1TargetWidePreparedError> {
+    let expected_state = parse_canonical_state(expected)?;
+    let successor_state = parse_canonical_state(successor)?;
+    if !state_immutable_binding_matches(&expected_state, &successor_state) {
+        return Err(prepared_error(
+            D1TargetWidePreparedClassification::ReplayConflict,
+            "target-wide CAS successor changed immutable attempt binding evidence",
+        ));
+    }
+    let dispatch_reservation = expected_state.phase == D1DmlAttemptPhase::Prepared
+        && expected_state.dispatch_reservations == 0
+        && expected_state.post_provider.is_none()
+        && successor_state.phase == D1DmlAttemptPhase::DispatchReserved
+        && successor_state.dispatch_reservations == 1
+        && successor_state.post_provider.is_none();
+    let post_provider_custody = expected_state.phase == D1DmlAttemptPhase::DispatchReserved
+        && expected_state.dispatch_reservations == 1
+        && expected_state.post_provider.is_none()
+        && successor_state.phase == D1DmlAttemptPhase::ReconciliationRequired
+        && successor_state.dispatch_reservations == 1
+        && successor_state.post_provider.is_some();
+    if !dispatch_reservation && !post_provider_custody {
+        return Err(prepared_error(
+            D1TargetWidePreparedClassification::ReplayConflict,
+            "target-wide CAS successor was not one exact monotonic lifecycle transition",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn restore_bound_d1_target_wide_attempt(
+    target: &D1TargetIdentity,
+    intended_plan: &D1TargetWideIntendedPlan,
+    confirmation_token: &str,
+    identities: D1DmlAttemptIdentities<'_>,
+    bytes: &[u8],
+) -> Result<D1TargetWidePreparedProduct, D1TargetWidePreparedError> {
+    let binding = derive_binding(target, intended_plan, confirmation_token, identities)?;
+    let state = parse_canonical_state(bytes)?;
+    if !state_matches_binding(&state, &binding) {
+        return Err(prepared_error(
+            D1TargetWidePreparedClassification::ReplayConflict,
+            "target-wide attempt replay contradicted the exact consent, plan, target, change, reason, or identities",
+        ));
+    }
+    product(state, D1TargetWidePreparedTransition::ExactReplay, true)
+}
+
+pub(crate) fn prepare_d1_target_wide_dispatch_reservation_cas(
+    target: &D1TargetIdentity,
+    intended_plan: &D1TargetWideIntendedPlan,
+    confirmation_token: &str,
+    identities: D1DmlAttemptIdentities<'_>,
+    incumbent: &[u8],
+) -> Result<D1TargetWidePreparedProduct, D1TargetWidePreparedError> {
+    let binding = derive_binding(target, intended_plan, confirmation_token, identities)?;
+    let mut state = parse_canonical_state(incumbent)?;
+    if !state_matches_binding(&state, &binding)
+        || state.phase != D1DmlAttemptPhase::Prepared
+        || state.dispatch_reservations != 0
+        || state.post_provider.is_some()
+    {
+        return Err(prepared_error(
+            D1TargetWidePreparedClassification::PhaseInvalid,
+            "only the exact canonical Prepared owner may propose one dispatch reservation",
+        ));
+    }
+    state.phase = D1DmlAttemptPhase::DispatchReserved;
+    state.dispatch_reservations = 1;
+    product(
+        state,
+        D1TargetWidePreparedTransition::DispatchReservationPrepared,
+        false,
+    )
+}
+
+pub(crate) fn record_d1_target_wide_acknowledgement(
+    target: &D1TargetIdentity,
+    intended_plan: &D1TargetWideIntendedPlan,
+    confirmation_token: &str,
+    identities: D1DmlAttemptIdentities<'_>,
+    incumbent: &[u8],
+    lifecycle: D1DatabaseMutationLifecycle,
+    response_body_sha256: &str,
+    response_body_size_bytes: usize,
+) -> Result<D1TargetWidePreparedProduct, D1TargetWidePreparedError> {
+    record_post_provider(
+        target,
+        intended_plan,
+        confirmation_token,
+        identities,
+        incumbent,
+        D1TargetWidePostProviderRecord {
+            outcome: D1TargetWidePostProviderOutcome::Acknowledged,
+            apply_status: lifecycle.apply_status,
+            provider_calls: lifecycle.provider_calls(),
+            provider_mutations: lifecycle.provider_mutations(),
+            lifecycle_sha256: hash_serialized(&lifecycle),
+            http_status: lifecycle.http_status,
+            response_body_sha256: Some(response_body_sha256.to_string()),
+            response_body_size_bytes: Some(response_body_size_bytes),
+            provider_error_sha256: None,
+        },
+    )
+}
+
+pub(crate) fn record_d1_target_wide_reconciliation_required(
+    target: &D1TargetIdentity,
+    intended_plan: &D1TargetWideIntendedPlan,
+    confirmation_token: &str,
+    identities: D1DmlAttemptIdentities<'_>,
+    incumbent: &[u8],
+    lifecycle: D1DatabaseMutationLifecycle,
+    response_body_sha256: Option<&str>,
+    response_body_size_bytes: Option<usize>,
+    provider_error_code: &str,
+) -> Result<D1TargetWidePreparedProduct, D1TargetWidePreparedError> {
+    record_post_provider(
+        target,
+        intended_plan,
+        confirmation_token,
+        identities,
+        incumbent,
+        D1TargetWidePostProviderRecord {
+            outcome: D1TargetWidePostProviderOutcome::ReconciliationRequired,
+            apply_status: lifecycle.apply_status,
+            provider_calls: lifecycle.provider_calls(),
+            provider_mutations: lifecycle.provider_mutations(),
+            lifecycle_sha256: hash_serialized(&lifecycle),
+            http_status: lifecycle.http_status,
+            response_body_sha256: response_body_sha256.map(str::to_string),
+            response_body_size_bytes,
+            provider_error_sha256: Some(hash_bytes(provider_error_code.as_bytes())),
+        },
+    )
+}
+
+fn record_post_provider(
+    target: &D1TargetIdentity,
+    intended_plan: &D1TargetWideIntendedPlan,
+    confirmation_token: &str,
+    identities: D1DmlAttemptIdentities<'_>,
+    incumbent: &[u8],
+    post_provider: D1TargetWidePostProviderRecord,
+) -> Result<D1TargetWidePreparedProduct, D1TargetWidePreparedError> {
+    let binding = derive_binding(target, intended_plan, confirmation_token, identities)?;
+    let mut state = parse_canonical_state(incumbent)?;
+    if !state_matches_binding(&state, &binding)
+        || state.phase != D1DmlAttemptPhase::DispatchReserved
+        || state.dispatch_reservations != 1
+        || state.post_provider.is_some()
+    {
+        return Err(prepared_error(
+            D1TargetWidePreparedClassification::PhaseInvalid,
+            "post-provider custody required the exact single DispatchReserved predecessor",
+        ));
+    }
+    validate_post_provider(&post_provider)?;
+    state.phase = D1DmlAttemptPhase::ReconciliationRequired;
+    state.post_provider = Some(post_provider);
+    product(
+        state,
+        D1TargetWidePreparedTransition::PostProviderOutcomeRecorded,
+        false,
+    )
 }
 
 pub(crate) fn install_d1_target_wide_prepared_custody(
@@ -326,7 +536,7 @@ fn derive_binding(
     {
         return Err(prepared_error(
             D1TargetWidePreparedClassification::IntendedPlanInvalid,
-            "target-wide intended plan was not the complete current canonical six-step consent product",
+            "target-wide intended plan was not the complete current canonical eight-step consent product",
         ));
     }
     let expected_token = expected.confirmation_token();
@@ -423,6 +633,8 @@ fn state_from_binding(binding: &PreparedBinding) -> D1TargetWideAttemptState {
         provider_request_id_sha256: binding.provider_request_id_sha256.clone(),
         attempt_binding_sha256: binding.attempt_binding_sha256.clone(),
         phase: D1DmlAttemptPhase::Prepared,
+        dispatch_reservations: 0,
+        post_provider: None,
     }
 }
 
@@ -487,28 +699,49 @@ fn validate_state(state: &D1TargetWideAttemptState) -> Result<(), D1TargetWidePr
     if !matches!(
         state.target_operation.as_str(),
         "d1_rename_database" | "d1_delete_database"
-    ) || state.phase != D1DmlAttemptPhase::Prepared
-        || ![
-            &state.layout_sha256,
-            &state.target_key_sha256,
-            &state.intended_plan_sha256,
-            &state.consent_binding_sha256,
-            &state.confirmation_token_sha256,
-            &state.normalized_target_sha256,
-            &state.requested_change_sha256,
-            &state.reason_sha256,
-            &state.operation_id_sha256,
-            &state.execution_attempt_id_sha256,
-            &state.provider_request_id_sha256,
-            &state.attempt_binding_sha256,
-        ]
-        .into_iter()
-        .all(|value| valid_sha256(value))
+    ) || ![
+        &state.layout_sha256,
+        &state.target_key_sha256,
+        &state.intended_plan_sha256,
+        &state.consent_binding_sha256,
+        &state.confirmation_token_sha256,
+        &state.normalized_target_sha256,
+        &state.requested_change_sha256,
+        &state.reason_sha256,
+        &state.operation_id_sha256,
+        &state.execution_attempt_id_sha256,
+        &state.provider_request_id_sha256,
+        &state.attempt_binding_sha256,
+    ]
+    .into_iter()
+    .all(|value| valid_sha256(value))
     {
         return Err(prepared_error(
             D1TargetWidePreparedClassification::RestoredStateContradictory,
-            "target-wide attempt state contradicted the closed Prepared product",
+            "target-wide attempt state contradicted the closed custody product",
         ));
+    }
+    match state.phase {
+        D1DmlAttemptPhase::Prepared
+            if state.dispatch_reservations == 0 && state.post_provider.is_none() => {}
+        D1DmlAttemptPhase::DispatchReserved
+            if state.dispatch_reservations == 1 && state.post_provider.is_none() => {}
+        D1DmlAttemptPhase::ReconciliationRequired
+            if state.dispatch_reservations == 1 && state.post_provider.is_some() =>
+        {
+            validate_post_provider(
+                state
+                    .post_provider
+                    .as_ref()
+                    .expect("matched post-provider state has evidence"),
+            )?;
+        }
+        _ => {
+            return Err(prepared_error(
+                D1TargetWidePreparedClassification::RestoredStateContradictory,
+                "target-wide attempt phase contradicted its reservation and provider evidence",
+            ));
+        }
     }
     let expected_binding = hash_serialized(&D1TargetWideAttemptBindingMaterial {
         version: state.version,
@@ -538,6 +771,99 @@ fn validate_state(state: &D1TargetWideAttemptState) -> Result<(), D1TargetWidePr
     Ok(())
 }
 
+fn state_matches_binding(state: &D1TargetWideAttemptState, binding: &PreparedBinding) -> bool {
+    state.consent_version == binding.consent_version
+        && state.operation_version == binding.operation_version
+        && state.target_operation == binding.target_operation
+        && state.target_key_sha256 == binding.target_key_sha256
+        && state.intended_plan_sha256 == binding.intended_plan_sha256
+        && state.consent_binding_sha256 == binding.consent_binding_sha256
+        && state.confirmation_token_sha256 == binding.confirmation_token_sha256
+        && state.normalized_target_sha256 == binding.normalized_target_sha256
+        && state.requested_change_sha256 == binding.requested_change_sha256
+        && state.reason_sha256 == binding.reason_sha256
+        && state.operation_id_sha256 == binding.operation_id_sha256
+        && state.execution_attempt_id_sha256 == binding.execution_attempt_id_sha256
+        && state.provider_request_id_sha256 == binding.provider_request_id_sha256
+        && state.attempt_binding_sha256 == binding.attempt_binding_sha256
+}
+
+fn state_immutable_binding_matches(
+    left: &D1TargetWideAttemptState,
+    right: &D1TargetWideAttemptState,
+) -> bool {
+    left.version == right.version
+        && left.operation == right.operation
+        && left.consent_version == right.consent_version
+        && left.operation_version == right.operation_version
+        && left.layout_version == right.layout_version
+        && left.layout_sha256 == right.layout_sha256
+        && left.target_operation == right.target_operation
+        && left.target_key_sha256 == right.target_key_sha256
+        && left.intended_plan_sha256 == right.intended_plan_sha256
+        && left.consent_binding_sha256 == right.consent_binding_sha256
+        && left.confirmation_token_sha256 == right.confirmation_token_sha256
+        && left.normalized_target_sha256 == right.normalized_target_sha256
+        && left.requested_change_sha256 == right.requested_change_sha256
+        && left.reason_sha256 == right.reason_sha256
+        && left.operation_id_sha256 == right.operation_id_sha256
+        && left.execution_attempt_id_sha256 == right.execution_attempt_id_sha256
+        && left.provider_request_id_sha256 == right.provider_request_id_sha256
+        && left.attempt_binding_sha256 == right.attempt_binding_sha256
+}
+
+fn validate_post_provider(
+    evidence: &D1TargetWidePostProviderRecord,
+) -> Result<(), D1TargetWidePreparedError> {
+    let response_pair_is_exact =
+        evidence.response_body_sha256.is_some() == evidence.response_body_size_bytes.is_some();
+    let response_digest_is_exact = evidence
+        .response_body_sha256
+        .as_deref()
+        .is_none_or(valid_sha256);
+    let common = valid_sha256(&evidence.lifecycle_sha256)
+        && response_pair_is_exact
+        && response_digest_is_exact
+        && evidence
+            .provider_error_sha256
+            .as_deref()
+            .is_none_or(valid_sha256);
+    let outcome_is_exact = match evidence.outcome {
+        D1TargetWidePostProviderOutcome::Acknowledged => {
+            evidence.apply_status == MutationApplyStatus::Applied
+                && evidence.provider_calls == 1
+                && evidence.provider_mutations == Some(1)
+                && evidence
+                    .http_status
+                    .is_some_and(|status| (200..300).contains(&status))
+                && evidence.response_body_sha256.is_some()
+                && evidence.provider_error_sha256.is_none()
+        }
+        D1TargetWidePostProviderOutcome::ReconciliationRequired => {
+            evidence.provider_error_sha256.is_some()
+                && match evidence.apply_status {
+                    MutationApplyStatus::RejectedBeforeApply => {
+                        evidence.provider_calls == 0
+                            && evidence.provider_mutations == Some(0)
+                            && evidence.http_status.is_none()
+                            && evidence.response_body_sha256.is_none()
+                    }
+                    MutationApplyStatus::UncertainAfterDispatch => {
+                        evidence.provider_calls == 1 && evidence.provider_mutations.is_none()
+                    }
+                    MutationApplyStatus::Applied | MutationApplyStatus::Proven => false,
+                }
+        }
+    };
+    if !common || !outcome_is_exact {
+        return Err(prepared_error(
+            D1TargetWidePreparedClassification::ProviderEvidenceInvalid,
+            "target-wide provider evidence contradicted its closed apply classification",
+        ));
+    }
+    Ok(())
+}
+
 fn product(
     state: D1TargetWideAttemptState,
     transition: D1TargetWidePreparedTransition,
@@ -545,6 +871,7 @@ fn product(
 ) -> Result<D1TargetWidePreparedProduct, D1TargetWidePreparedError> {
     validate_state(&state)?;
     let state_bytes = canonical_state_bytes(&state)?;
+    let post_provider = state.post_provider.as_ref();
     let receipt = D1TargetWidePreparedReceipt {
         version: state.version,
         operation: D1_TARGET_WIDE_ATTEMPT_CUSTODY_OPERATION,
@@ -567,11 +894,24 @@ fn product(
         execution_attempt_id_sha256: state.execution_attempt_id_sha256.clone(),
         provider_request_id_sha256: state.provider_request_id_sha256.clone(),
         attempt_binding_sha256: state.attempt_binding_sha256.clone(),
+        dispatch_reservations: state.dispatch_reservations,
+        post_provider_outcome: post_provider.map(|evidence| evidence.outcome),
+        apply_status: post_provider.map(|evidence| evidence.apply_status),
+        lifecycle_sha256: post_provider.map(|evidence| evidence.lifecycle_sha256.clone()),
+        http_status: post_provider.and_then(|evidence| evidence.http_status),
+        response_body_sha256: post_provider
+            .and_then(|evidence| evidence.response_body_sha256.clone()),
+        response_body_size_bytes: post_provider
+            .and_then(|evidence| evidence.response_body_size_bytes),
+        provider_error_sha256: post_provider
+            .and_then(|evidence| evidence.provider_error_sha256.clone()),
         state_sha256: hash_bytes(&state_bytes),
         state_size_bytes: state_bytes.len(),
         state_byte_cap: D1_DML_ATTEMPT_STATE_BYTE_CAP,
-        provider_calls: 0,
-        provider_mutations: 0,
+        provider_calls: post_provider.map_or(0, |evidence| evidence.provider_calls),
+        provider_mutations: post_provider
+            .map(|evidence| evidence.provider_mutations)
+            .unwrap_or(Some(0)),
         automatic_retry_permitted: false,
     };
     Ok(D1TargetWidePreparedProduct {

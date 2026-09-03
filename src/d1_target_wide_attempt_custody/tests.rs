@@ -170,7 +170,7 @@ fn prepared_product_binds_complete_consent_and_distinct_opaque_identities() {
         TARGET_WIDE_OPERATION_VERSION
     );
     assert_eq!(replay.receipt().provider_calls, 0);
-    assert_eq!(replay.receipt().provider_mutations, 0);
+    assert_eq!(replay.receipt().provider_mutations, Some(0));
     assert!(!replay.receipt().automatic_retry_permitted);
 
     assert_eq!(
@@ -196,6 +196,116 @@ fn prepared_product_binds_complete_consent_and_distinct_opaque_identities() {
         )),
         D1TargetWidePreparedClassification::OpaqueIdentityDuplicate
     );
+}
+
+#[test]
+fn exact_prepared_dispatch_and_acknowledgement_transitions_are_monotonic() {
+    let plan = rename_plan("synthetic-name", Some("reviewed reason"));
+    let prepared = prepare(&plan);
+    let reserved = prepare_d1_target_wide_dispatch_reservation_cas(
+        &target(),
+        &plan,
+        &plan.confirmation_token(),
+        ids(),
+        prepared.state_bytes(),
+    )
+    .expect("one dispatch reservation");
+    assert_eq!(
+        reserved.receipt().phase,
+        D1DmlAttemptPhase::DispatchReserved
+    );
+    assert_eq!(reserved.receipt().dispatch_reservations, 1);
+    validate_d1_target_wide_attempt_successor(prepared.state_bytes(), reserved.state_bytes())
+        .expect("Prepared to DispatchReserved CAS");
+    assert!(
+        prepare_d1_target_wide_dispatch_reservation_cas(
+            &target(),
+            &plan,
+            &plan.confirmation_token(),
+            ids(),
+            reserved.state_bytes(),
+        )
+        .is_err(),
+        "a reserved attempt cannot reserve again"
+    );
+
+    let acknowledged = record_d1_target_wide_acknowledgement(
+        &target(),
+        &plan,
+        &plan.confirmation_token(),
+        ids(),
+        reserved.state_bytes(),
+        D1DatabaseMutationLifecycle::succeeded(200),
+        &"a".repeat(64),
+        127,
+    )
+    .expect("acknowledgement product");
+    assert_eq!(
+        acknowledged.receipt().post_provider_outcome,
+        Some(D1TargetWidePostProviderOutcome::Acknowledged)
+    );
+    assert_eq!(acknowledged.receipt().provider_calls, 1);
+    assert_eq!(acknowledged.receipt().provider_mutations, Some(1));
+    validate_d1_target_wide_attempt_successor(reserved.state_bytes(), acknowledged.state_bytes())
+        .expect("DispatchReserved to acknowledged custody CAS");
+    assert!(
+        validate_d1_target_wide_attempt_successor(
+            acknowledged.state_bytes(),
+            acknowledged.state_bytes(),
+        )
+        .is_err(),
+        "exact replay is not a second transition"
+    );
+    let replay = restore_bound_d1_target_wide_attempt(
+        &target(),
+        &plan,
+        &plan.confirmation_token(),
+        ids(),
+        acknowledged.state_bytes(),
+    )
+    .expect("bound post-provider replay");
+    assert!(replay.receipt().exact_replay);
+}
+
+#[test]
+fn response_loss_and_predispatch_failure_become_closed_reconciliation_products() {
+    let plan = delete_plan(Some("reviewed reason"));
+    let prepared = prepare(&plan);
+    let reserved = prepare_d1_target_wide_dispatch_reservation_cas(
+        &target(),
+        &plan,
+        &plan.confirmation_token(),
+        ids(),
+        prepared.state_bytes(),
+    )
+    .expect("one dispatch reservation");
+    for lifecycle in [
+        D1DatabaseMutationLifecycle::pre_dispatch(),
+        D1DatabaseMutationLifecycle::attempted_without_response(),
+        D1DatabaseMutationLifecycle::body_read_failed(200, true),
+    ] {
+        let response_sha = (lifecycle.body_stage == "partially_read").then(|| "b".repeat(64));
+        let response_size = response_sha.as_ref().map(|_| 17);
+        let product = record_d1_target_wide_reconciliation_required(
+            &target(),
+            &plan,
+            &plan.confirmation_token(),
+            ids(),
+            reserved.state_bytes(),
+            lifecycle,
+            response_sha.as_deref(),
+            response_size,
+            "cloudflare.synthetic_failure",
+        )
+        .expect("closed reconciliation product");
+        assert_eq!(
+            product.receipt().post_provider_outcome,
+            Some(D1TargetWidePostProviderOutcome::ReconciliationRequired)
+        );
+        assert!(!product.receipt().automatic_retry_permitted);
+        validate_d1_target_wide_attempt_successor(reserved.state_bytes(), product.state_bytes())
+            .expect("post-provider reconciliation CAS");
+    }
 }
 
 #[test]

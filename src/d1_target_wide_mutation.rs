@@ -16,8 +16,8 @@ use crate::d1_dml_custody_layout::{
 use crate::mutation::MutationPlan;
 use crate::tools::sha256_bytes_hex;
 
-const TARGET_WIDE_PLAN_VERSION: u8 = 2;
-pub(crate) const TARGET_WIDE_OPERATION_VERSION: u8 = 1;
+const TARGET_WIDE_PLAN_VERSION: u8 = 3;
+pub(crate) const TARGET_WIDE_OPERATION_VERSION: u8 = 2;
 pub(crate) const TARGET_WIDE_CONSENT_VERSION: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -57,7 +57,7 @@ struct D1DeleteDatabaseChange {
     delete_database: bool,
 }
 
-/// Rebuild the only current six-step target-wide plan from typed canonical
+/// Rebuild the only current eight-step target-wide plan from typed canonical
 /// request facts. Supplied plan steps, digests, consent versions, and tokens
 /// never select or alter the reconstructed product.
 pub(crate) fn rederive_d1_target_wide_intended_plan(
@@ -172,27 +172,47 @@ pub(crate) fn d1_target_wide_intended_plan(
             }),
         )
         .step(
-            "revalidate_complete_d1_dml_custody",
-            false,
-            json!({
-                "target_key_sha256": target_key_sha256,
-                "require_exact_authorization_identity": true,
-                "execution": "immediately_before_provider_dispatch",
-                "runtime_outcome": "unmaterialized_until_live_guarded_execution",
-            }),
-        )
-        .step(
-            "install_durable_target_wide_mutation_reservation",
+            "install_durable_target_wide_prepared_custody",
             true,
             json!({
                 "target_key_sha256": target_key_sha256,
                 "required_before_provider_dispatch": true,
-                "implementation_status": "not_installed",
+                "state": "prepared",
                 "effect_scope": "local_durable_attempt_custody",
                 "provider_dispatch_authority": "none",
             }),
         )
-        .step(provider_action, true, provider_request);
+        .step(
+            "authorize_and_revalidate_prepared_owner",
+            false,
+            json!({
+                "target_key_sha256": target_key_sha256,
+                "require_exact_owner_and_authorization_identity": true,
+                "execution": "immediately_before_dispatch_reservation",
+                "provider_dispatch_authority": "none",
+            }),
+        )
+        .step(
+            "reserve_one_target_wide_provider_dispatch",
+            true,
+            json!({
+                "target_key_sha256": target_key_sha256,
+                "transition": "prepared_to_dispatch_reserved",
+                "compare_and_exchange": true,
+                "maximum_provider_requests_after_reservation": 1,
+            }),
+        )
+        .step(provider_action, true, provider_request)
+        .step(
+            "retain_target_wide_post_provider_custody",
+            true,
+            json!({
+                "target_key_sha256": target_key_sha256,
+                "outcomes": ["acknowledged", "reconciliation_required"],
+                "automatic_retry_permitted": false,
+                "stable_recovery_or_finalization": "separate_reviewed_boundary",
+            }),
+        );
     let plan_sha256 = target_wide_plan_sha256(&plan);
     let consent_binding = D1TargetWideConsentBinding {
         consent_version: TARGET_WIDE_CONSENT_VERSION,
@@ -249,6 +269,10 @@ pub(crate) enum D1TargetWideRuntimeState {
     FailedBeforeDispatch,
     UncertainAfterDispatch,
     NotInstalled,
+    Prepared,
+    DispatchReserved,
+    Acknowledged,
+    ReconciliationRequired,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -271,6 +295,8 @@ pub(crate) struct D1TargetWideRevalidationEvidence {
     pub(crate) exact_authorization_identity_matched: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) matched_identity: Option<D1DmlCustodyCompleteAuditAuthorization>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) owner_authorization_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -280,13 +306,25 @@ pub(crate) struct D1TargetWideProviderEvidence {
     pub(crate) provider_mutations: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) lifecycle: Option<D1DatabaseMutationLifecycle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) response_body_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) response_body_size_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_error_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct D1TargetWideDurableReservationEvidence {
     pub(crate) outcome: D1TargetWideRuntimeState,
-    pub(crate) local_mutations: u8,
+    pub(crate) local_mutations: Option<u8>,
     pub(crate) provider_dispatch_authority: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct D1TargetWidePostProviderCustodyEvidence {
+    pub(crate) outcome: D1TargetWideRuntimeState,
+    pub(crate) local_mutations: Option<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -297,6 +335,7 @@ pub(crate) struct D1TargetWideExecutionEvidence {
     pub(crate) final_revalidation: D1TargetWideRevalidationEvidence,
     pub(crate) durable_reservation: D1TargetWideDurableReservationEvidence,
     pub(crate) provider: D1TargetWideProviderEvidence,
+    pub(crate) post_provider_custody: D1TargetWidePostProviderCustodyEvidence,
 }
 
 // The state transitions remain the exact successor seam for durable provider-
@@ -320,10 +359,11 @@ impl D1TargetWideExecutionEvidence {
                 outcome: D1TargetWideRuntimeState::RuntimeUnmaterialized,
                 exact_authorization_identity_matched: None,
                 matched_identity: None,
+                owner_authorization_sha256: None,
             },
             durable_reservation: D1TargetWideDurableReservationEvidence {
                 outcome: D1TargetWideRuntimeState::NotInstalled,
-                local_mutations: 0,
+                local_mutations: Some(0),
                 provider_dispatch_authority: "none",
             },
             provider: D1TargetWideProviderEvidence {
@@ -331,6 +371,13 @@ impl D1TargetWideExecutionEvidence {
                 provider_calls: 0,
                 provider_mutations: Some(0),
                 lifecycle: None,
+                response_body_sha256: None,
+                response_body_size_bytes: None,
+                provider_error_sha256: None,
+            },
+            post_provider_custody: D1TargetWidePostProviderCustodyEvidence {
+                outcome: D1TargetWideRuntimeState::NotInstalled,
+                local_mutations: Some(0),
             },
         }
     }
@@ -350,6 +397,11 @@ impl D1TargetWideExecutionEvidence {
 
     pub(crate) fn layout_failed(&mut self) {
         self.local_layout.outcome = D1TargetWideRuntimeState::Failed;
+        self.local_layout.local_mutations = None;
+    }
+
+    pub(crate) fn layout_ensured(&mut self) {
+        self.local_layout.outcome = D1TargetWideRuntimeState::AlreadyPresent;
         self.local_layout.local_mutations = None;
     }
 
@@ -379,6 +431,31 @@ impl D1TargetWideExecutionEvidence {
         self.final_revalidation.exact_authorization_identity_matched = Some(false);
     }
 
+    pub(crate) fn owner_revalidation_matched(&mut self, authorization_sha256: &str) {
+        self.final_revalidation.outcome = D1TargetWideRuntimeState::Matched;
+        self.final_revalidation.exact_authorization_identity_matched = Some(true);
+        self.final_revalidation.owner_authorization_sha256 = Some(authorization_sha256.to_string());
+    }
+
+    pub(crate) fn prepared_installed(&mut self) {
+        self.durable_reservation.outcome = D1TargetWideRuntimeState::Prepared;
+        self.durable_reservation.local_mutations = None;
+    }
+
+    pub(crate) fn dispatch_reserved(&mut self) {
+        self.durable_reservation.outcome = D1TargetWideRuntimeState::DispatchReserved;
+        self.durable_reservation.local_mutations = Some(1);
+    }
+
+    pub(crate) fn post_provider_custody(&mut self, acknowledged: bool) {
+        self.post_provider_custody.outcome = if acknowledged {
+            D1TargetWideRuntimeState::Acknowledged
+        } else {
+            D1TargetWideRuntimeState::ReconciliationRequired
+        };
+        self.post_provider_custody.local_mutations = Some(1);
+    }
+
     pub(crate) fn provider_succeeded(&mut self, lifecycle: D1DatabaseMutationLifecycle) {
         self.provider.outcome = D1TargetWideRuntimeState::Succeeded;
         self.provider.provider_calls = lifecycle.provider_calls();
@@ -395,6 +472,18 @@ impl D1TargetWideExecutionEvidence {
         self.provider.provider_calls = lifecycle.provider_calls();
         self.provider.provider_mutations = lifecycle.provider_mutations();
         self.provider.lifecycle = Some(lifecycle);
+    }
+
+    pub(crate) fn provider_response_evidence(
+        &mut self,
+        response_body_sha256: Option<&str>,
+        response_body_size_bytes: Option<usize>,
+        provider_error_code: Option<&str>,
+    ) {
+        self.provider.response_body_sha256 = response_body_sha256.map(str::to_string);
+        self.provider.response_body_size_bytes = response_body_size_bytes;
+        self.provider.provider_error_sha256 =
+            provider_error_code.map(|value| sha256_bytes_hex(value.as_bytes()));
     }
 }
 
@@ -464,22 +553,34 @@ mod tests {
                         "runtime_identity": "unmaterialized_until_live_guarded_execution",
                         "provider_dispatch_authority": "none",
                     }},
-                    {"ordinal": 4, "action": "revalidate_complete_d1_dml_custody", "side_effect": false, "target": {
-                        "target_key_sha256": target_key_sha256,
-                        "require_exact_authorization_identity": true,
-                        "execution": "immediately_before_provider_dispatch",
-                        "runtime_outcome": "unmaterialized_until_live_guarded_execution",
-                    }},
-                    {"ordinal": 5, "action": "install_durable_target_wide_mutation_reservation", "side_effect": true, "target": {
+                    {"ordinal": 4, "action": "install_durable_target_wide_prepared_custody", "side_effect": true, "target": {
                         "target_key_sha256": target_key_sha256,
                         "required_before_provider_dispatch": true,
-                        "implementation_status": "not_installed",
+                        "state": "prepared",
                         "effect_scope": "local_durable_attempt_custody",
                         "provider_dispatch_authority": "none",
                     }},
-                    {"ordinal": 6, "action": "apply_d1_database_delete", "side_effect": true, "target": {
+                    {"ordinal": 5, "action": "authorize_and_revalidate_prepared_owner", "side_effect": false, "target": {
+                        "target_key_sha256": target_key_sha256,
+                        "provider_dispatch_authority": "none",
+                        "require_exact_owner_and_authorization_identity": true,
+                        "execution": "immediately_before_dispatch_reservation",
+                    }},
+                    {"ordinal": 6, "action": "reserve_one_target_wide_provider_dispatch", "side_effect": true, "target": {
+                        "target_key_sha256": target_key_sha256,
+                        "transition": "prepared_to_dispatch_reserved",
+                        "compare_and_exchange": true,
+                        "maximum_provider_requests_after_reservation": 1,
+                    }},
+                    {"ordinal": 7, "action": "apply_d1_database_delete", "side_effect": true, "target": {
                         "method": "DELETE",
                         "path": "/accounts/acct-example/d1/database/123e4567-e89b-42d3-a456-426614174000",
+                    }},
+                    {"ordinal": 8, "action": "retain_target_wide_post_provider_custody", "side_effect": true, "target": {
+                        "target_key_sha256": target_key_sha256,
+                        "outcomes": ["acknowledged", "reconciliation_required"],
+                        "automatic_retry_permitted": false,
+                        "stable_recovery_or_finalization": "separate_reviewed_boundary",
                     }},
                 ],
             })
@@ -558,9 +659,9 @@ mod tests {
             Some("reviewed reason"),
         )
         .expect("typed canonical rename");
-        assert_eq!(rename.plan.steps.len(), 6);
+        assert_eq!(rename.plan.steps.len(), 8);
         assert_eq!(
-            rename.plan.steps[5].target,
+            rename.plan.steps[6].target,
             json!({
                 "method": "PATCH",
                 "path": "/accounts/acct-example/d1/database/123e4567-e89b-42d3-a456-426614174000",
@@ -574,9 +675,9 @@ mod tests {
             None,
         )
         .expect("typed canonical delete");
-        assert_eq!(delete.plan.steps.len(), 6);
+        assert_eq!(delete.plan.steps.len(), 8);
         assert_eq!(
-            delete.plan.steps[5].target,
+            delete.plan.steps[6].target,
             json!({
                 "method": "DELETE",
                 "path": "/accounts/acct-example/d1/database/123e4567-e89b-42d3-a456-426614174000",
@@ -626,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_live_evidence_is_separate_from_the_static_plan() {
+    fn dry_run_evidence_is_separate_from_the_static_plan() {
         let plan = delete_plan("retire synthetic fixture");
         let dry = D1TargetWideExecutionEvidence::unobserved(&plan);
         assert_eq!(
@@ -646,7 +747,7 @@ mod tests {
             dry.durable_reservation.outcome,
             D1TargetWideRuntimeState::NotInstalled
         );
-        assert_eq!(dry.durable_reservation.local_mutations, 0);
+        assert_eq!(dry.durable_reservation.local_mutations, Some(0));
         assert_eq!(dry.durable_reservation.provider_dispatch_authority, "none");
         assert_eq!(dry.provider.provider_calls, 0);
         assert_eq!(dry.provider.provider_mutations, Some(0));

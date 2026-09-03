@@ -120,8 +120,8 @@ bootstrap continue to use their stronger retained-lease/reconciliation
 protocols.
 
 The shared private DML layout also recognizes a separate strict target-wide
-rename/delete attempt schema through `Prepared` only. That schema binds the
-typed rederived current six-step plan-bound consent product, its consent and
+rename/delete attempt schema. That schema binds the typed rederived current
+eight-step plan-bound consent product, its consent and
 operation versions, and three hashed, distinct opaque identities before local
 installation. Detached self-consistent plans, digests, bindings, or tokens do
 not become authority. The held guard must prove its exact canonical target
@@ -130,15 +130,21 @@ existing claimant namespaces,
 capacity checks, exclusive creation, CAS sealing, restrictive file policy, and
 exact readback. Its presence is unresolved custody, not provider authority; the
 global complete-audit authority continues to reject it. A D1-local owner-aware
-read-only boundary may select exactly one canonical Prepared attempt only when
+read-only boundary selects exactly one canonical Prepared attempt only when
 its exact three Bound claimants are present, every surrounding attempt is
 terminal, and two complete audits plus exact owner readbacks remain stable. Its
-hash/count-only result authorizes only a future local dispatch-reservation CAS,
-must be recomputed immediately before that write, and carries no provider
+hash/count-only result authorizes only the local dispatch-reservation CAS,
+is recomputed immediately before that write, and carries no provider
 authority. Missing, malformed, conflicting, restored, foreign-owner, partial,
 scratch, unsafe-filesystem, or nonterminal surrounding evidence fails closed.
-The curated rename/delete routes remain planning-only until independently
-reviewed dispatch, provider, and recovery boundaries are composed.
+After the exact CAS and readback, the curated route may issue one no-redirect
+provider request carrying the preallocated request identity. A strict
+acknowledgement becomes nonterminal `Acknowledged` custody; response loss,
+malformed or contradictory evidence, and provider/adapter failure become
+`ReconciliationRequired`. Post-provider persistence uncertainty is also
+non-retryable. Exact replay never dispatches, provider bodies and raw identities
+remain private, and stable recovery/readback/finalization remain a separate
+reviewed authority.
 
 ## External Service Bridge
 

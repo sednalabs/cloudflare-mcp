@@ -95,8 +95,8 @@ identity and one physical target guard namespace:
 
 | Provider mutation surface | Coverage |
 | --- | --- |
-| `d1_rename_database` | exact static consent plan; live disabled before guard/provider pending durable reservation/recovery custody |
-| `d1_delete_database` | exact static consent plan; live disabled before guard/provider pending durable reservation/recovery custody |
+| `d1_rename_database` | exact eight-step consent plus three opaque identities; one guarded provider request maximum; nonterminal acknowledgement/reconciliation custody; no automatic retry |
+| `d1_delete_database` | same guarded one-call lifecycle for high-risk deletion; exact replay never redispatches; stable recovery/finalization remains separate |
 | `d1_execute_write` | shared permanent target guard |
 | `d1_bootstrap_migration_ledger` | durable lease under that target guard |
 | `d1_apply_migration_manifest` | durable lease under that target guard |
@@ -109,16 +109,17 @@ mixed-case, compact or braced UUIDs, plus whitespace, NUL, dot, slash,
 backslash, percent-encoded and other alias forms, are rejected before target
 hashing or provider dispatch. Different database targets may proceed
 concurrently when a governed surface reaches the target guard; the same
-account/database target cannot. Rename/delete currently stop before that guard.
+account/database target cannot.
 Within the governed MCP tools, rename/delete dry runs emit a versioned consent
 binding and token over the normalized target, requested change, reason,
 operation/version, plan digest, and full plan. Missing, stale, cross-target,
 cross-operation, changed-intent, or changed-reason consent fails before
-guard/provider access. Exact consent is also fail-closed before guard/provider
-access with
-`durable_reservation_not_installed` until the separately reviewed durable
-attempt reservation and recovery contract is installed. These temporary live
-denials retain the operation and report zero provider calls and mutations.
+guard/provider access. Exact consent enters the guarded lifecycle and still
+fails with zero provider calls on any guard, audit, identity, version, capacity,
+owner-revalidation, or reservation-CAS defect. After one exact reservation it
+may issue one request, then retains nonterminal acknowledgement or
+reconciliation custody without automatic retry. These live results retain the
+operation and aggregate provider counts.
 Direct callers of the public Cloudflare client adapter are outside this tool
 gate and must supply their own governed wrapper before allowing target-wide
 mutation.
@@ -197,22 +198,19 @@ are added by the graph derivation.
    recovery, terminal receipt, restoration, and retirement re-audit it at
    their last owned boundary without creating or repairing layout evidence.
    Terminal receipts inherit the binding through `lease_payload_sha256`.
-   The governed MCP rename/delete tools derive one static six-step plan before
-   dry/live branching: validate the normalized target and requested change;
-   conditionally ensure the local DML custody layout during a future guarded
-   live execution; authorize the complete custody audit; revalidate that exact
-   authorization; install the required durable target-wide attempt reservation;
-   and only then perform the provider rename or delete. The fifth step is
-   explicitly `not_installed` and has no provider-dispatch authority, so the
-   sixth step is currently unreachable through these tools.
+   The governed MCP rename/delete tools derive one static eight-step plan before
+   dry/live branching: validate intent, ensure local custody, authorize a clean
+   audit before fresh state, install `Prepared`, authorize and revalidate its
+   exact owner, reserve one dispatch by CAS, perform at most one provider rename
+   or delete, and retain one post-provider custody outcome.
    A distinct internal target-wide Prepared product now binds the exact consent
    token, full static plan, target/change/reason, current consent/operation
    versions, and three hashed opaque identities. It rederives the typed canonical
-   six-step product and rejects detached recomputed substitutes. The held guard
+   eight-step product and rejects detached recomputed substitutes. The held guard
    asserts its exact target before any local namespace access. It can then
    converge an exact partial local claimant set and install
    only create-once `Prepared` custody under the held target guard. It has no
-   public route or provider/readback effect and does not make step 5 complete;
+   provider/readback authority by itself;
    a separate internal owner-aware complete audit now rederives the current
    canonical product, exact physical attempt and three Bound claimants, and
    permits exactly one Prepared owner only when all surrounding custody is
@@ -221,21 +219,22 @@ are added by the graph derivation.
    authority, and must be revalidated immediately before that CAS. Partial,
    foreign, multiple, malformed, conflicting, restored, scratch, unsafe, or
    nonterminal products fail closed. The global authorization remains
-   all-terminal and unchanged. Dispatch reservation, provider execution, and
-   recovery remain required before either live tool can be enabled.
-   Dry-run is the only enabled lifecycle: it returns the full plan,
+   all-terminal and unchanged. The route performs that CAS once, exact readback,
+   held-guard revalidation, one no-redirect request maximum, then an immediate
+   `Acknowledged` or `ReconciliationRequired` custody CAS. Exact replay never
+   redispatches. Stable provider readback and terminal recovery remain separate.
+   Dry-run returns the full plan,
    `intended_plan_sha256`, versioned `consent_binding`, confirmation token, and
    unobserved/not-installed/not-dispatched execution evidence with zero effects.
    Closed input schemas reject unknown fields before the handler, so such a
    request cannot receive a consent token or handler result. Missing, stale,
    cross-target, cross-operation, changed-intent, or changed-reason consent
-   fails before guard/provider access. Exact consent also fails before
-   guard/provider access as `durable_reservation_not_installed`; every live
-   denial reports zero provider calls/mutations and forbids automatic retry.
+   fails before guard/provider access. Every pre-dispatch live denial reports
+   zero provider calls/mutations and forbids automatic retry.
    RMCP text and structured JSON are whole-payload equivalent after final
    evidence, plan, and audit insertion.
    The public Cloudflare client adapter retains its strict one-attempt response
-   parser for direct adapter consumers and a future governed wrapper, including
+   parser for direct adapter consumers and the governed MCP wrapper, including
    its no-redirect, non-retryable ambiguity, exact envelope, and operation-result
    checks. It is not protected by the MCP tool gate itself; direct callers must
    provide their own governed consent/reservation wrapper before permitting a

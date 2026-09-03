@@ -25,6 +25,7 @@ use crate::cloudflare::model::{
 };
 use crate::config::{ApiTokenSource, CloudflareApiConfig};
 use crate::d1_opaque_identity::valid_d1_opaque_identity;
+use crate::tools::sha256_bytes_hex;
 use mcp_toolkit_observability::sanitize_error_message;
 
 use super::d1_database_mutation::{
@@ -866,8 +867,21 @@ impl CloudflareClient {
         database_id: &str,
         name: &str,
     ) -> Result<D1DatabaseMutation<D1Database>, D1DatabaseMutationError> {
+        self.rename_d1_database_once_with_lifecycle(account_id, database_id, name, None)
+            .await
+    }
+
+    pub(crate) async fn rename_d1_database_once_with_lifecycle(
+        &self,
+        account_id: &str,
+        database_id: &str,
+        name: &str,
+        provider_request_id: Option<&str>,
+    ) -> Result<D1DatabaseMutation<D1Database>, D1DatabaseMutationError> {
         let name = require_non_empty("name", name).map_err(|error| D1DatabaseMutationError {
             error,
+            response_body_sha256: None,
+            response_body_size_bytes: None,
             lifecycle: D1DatabaseMutationLifecycle::pre_dispatch(),
         })?;
         let mutation = self
@@ -878,11 +892,14 @@ impl CloudflareClient {
                 reqwest::Method::PATCH,
                 Some(json!({ "name": name })),
                 D1DatabaseMutationEnvelopeContract::Rename,
+                provider_request_id,
             )
             .await?;
         let status = mutation.lifecycle.http_status.unwrap_or(200);
         Ok(D1DatabaseMutation {
             result: mutation.result,
+            response_body_sha256: mutation.response_body_sha256,
+            response_body_size_bytes: mutation.response_body_size_bytes,
             lifecycle: D1DatabaseMutationLifecycle::succeeded(status),
         })
     }
@@ -903,6 +920,16 @@ impl CloudflareClient {
         account_id: &str,
         database_id: &str,
     ) -> Result<D1DatabaseMutation<Value>, D1DatabaseMutationError> {
+        self.delete_d1_database_once_with_lifecycle(account_id, database_id, None)
+            .await
+    }
+
+    pub(crate) async fn delete_d1_database_once_with_lifecycle(
+        &self,
+        account_id: &str,
+        database_id: &str,
+        provider_request_id: Option<&str>,
+    ) -> Result<D1DatabaseMutation<Value>, D1DatabaseMutationError> {
         let mutation = self
             .execute_d1_database_mutation::<Value>(
                 account_id,
@@ -911,11 +938,14 @@ impl CloudflareClient {
                 reqwest::Method::DELETE,
                 None,
                 D1DatabaseMutationEnvelopeContract::Delete,
+                provider_request_id,
             )
             .await?;
         let status = mutation.lifecycle.http_status.unwrap_or(200);
         Ok(D1DatabaseMutation {
             result: mutation.result,
+            response_body_sha256: mutation.response_body_sha256,
+            response_body_size_bytes: mutation.response_body_size_bytes,
             lifecycle: D1DatabaseMutationLifecycle::succeeded(status),
         })
     }
@@ -928,17 +958,27 @@ impl CloudflareClient {
         method: reqwest::Method,
         body: Option<Value>,
         envelope_contract: D1DatabaseMutationEnvelopeContract,
+        provider_request_id: Option<&str>,
     ) -> Result<D1DatabaseMutation<T>, D1DatabaseMutationError>
     where
         T: DeserializeOwned,
     {
         let pre_dispatch = |error: AdapterError| D1DatabaseMutationError {
             error,
+            response_body_sha256: None,
+            response_body_size_bytes: None,
             lifecycle: D1DatabaseMutationLifecycle::pre_dispatch(),
         };
         let account_id = require_non_empty("account_id", account_id).map_err(pre_dispatch)?;
         let database_id = require_non_empty("database_id", database_id).map_err(pre_dispatch)?;
         let token = self.bearer_token().map_err(pre_dispatch)?;
+        if provider_request_id.is_some_and(|value| !valid_d1_opaque_identity(value)) {
+            return Err(pre_dispatch(AdapterError::new(
+                "cloudflare.invalid_argument",
+                "provider_request_id was not one bounded opaque HTTP identity",
+                "Use the exact 16..=128-byte [A-Za-z0-9._:-] identity already bound into attempt custody.",
+            )));
+        }
         let url = self.endpoint(&format!(
             "/accounts/{}/d1/database/{}",
             path_segment(account_id),
@@ -952,6 +992,9 @@ impl CloudflareClient {
             .header(reqwest::header::ACCEPT_ENCODING, "identity");
         if let Some(body) = body {
             request = request.json(&body);
+        }
+        if let Some(provider_request_id) = provider_request_id {
+            request = request.header("x-client-request-id", provider_request_id);
         }
         let request = request.build().map_err(|error| {
             pre_dispatch(AdapterError::new(
@@ -975,6 +1018,8 @@ impl CloudflareClient {
                     "Treat the database mutation outcome as ambiguous; do not retry this attempt.",
                 )
                 .with_retryable(false),
+                response_body_sha256: None,
+                response_body_size_bytes: None,
                 lifecycle: D1DatabaseMutationLifecycle::attempted_without_response(),
             })?;
         let status = response.status();
@@ -990,6 +1035,8 @@ impl CloudflareClient {
                     "Treat the database mutation outcome as ambiguous; do not retry this attempt.",
                 )
                 .with_status(Some(status_code)),
+                response_body_sha256: None,
+                response_body_size_bytes: None,
                 lifecycle: D1DatabaseMutationLifecycle::response_received(status_code),
             });
         }
@@ -1008,6 +1055,8 @@ impl CloudflareClient {
                 )
                 .with_status(Some(status_code))
                 .with_retryable(false),
+                response_body_sha256: (!bytes.is_empty()).then(|| sha256_bytes_hex(&bytes)),
+                response_body_size_bytes: (!bytes.is_empty()).then_some(bytes.len()),
                 lifecycle: D1DatabaseMutationLifecycle::body_read_failed(
                     status_code,
                     !bytes.is_empty(),
@@ -1022,12 +1071,16 @@ impl CloudflareClient {
                         "Treat the database mutation outcome as ambiguous; do not retry this attempt.",
                     )
                     .with_status(Some(status_code)),
+                    response_body_sha256: (!bytes.is_empty()).then(|| sha256_bytes_hex(&bytes)),
+                    response_body_size_bytes: (!bytes.is_empty()).then_some(bytes.len()),
                     lifecycle: D1DatabaseMutationLifecycle::body_read_failed(status_code, true),
                 });
             }
             bytes.extend_from_slice(&chunk);
         }
         let lifecycle = D1DatabaseMutationLifecycle::body_completely_read(status_code);
+        let response_body_sha256 = sha256_bytes_hex(&bytes);
+        let response_body_size_bytes = bytes.len();
         let body = std::str::from_utf8(&bytes).map_err(|error| D1DatabaseMutationError {
             error: AdapterError::new(
                 "cloudflare.decode_error",
@@ -1035,20 +1088,31 @@ impl CloudflareClient {
                 "Treat the database mutation outcome as ambiguous; do not retry this attempt.",
             )
             .with_status(Some(status_code)),
+            response_body_sha256: Some(response_body_sha256.clone()),
+            response_body_size_bytes: Some(response_body_size_bytes),
             lifecycle,
         })?;
         if !status.is_success() {
             return Err(D1DatabaseMutationError {
                 error: d1_database_mutation_http_status_error(status, body),
+                response_body_sha256: Some(response_body_sha256),
+                response_body_size_bytes: Some(response_body_size_bytes),
                 lifecycle,
             });
         }
         let result = decode_strict_d1_database_mutation_envelope::<T>(body, envelope_contract)
             .map_err(|error| D1DatabaseMutationError {
                 error: error.with_status(Some(status_code)).with_retryable(false),
+                response_body_sha256: Some(response_body_sha256.clone()),
+                response_body_size_bytes: Some(response_body_size_bytes),
                 lifecycle,
             })?;
-        Ok(D1DatabaseMutation { result, lifecycle })
+        Ok(D1DatabaseMutation {
+            result,
+            response_body_sha256,
+            response_body_size_bytes,
+            lifecycle,
+        })
     }
 
     pub async fn query_d1_database(

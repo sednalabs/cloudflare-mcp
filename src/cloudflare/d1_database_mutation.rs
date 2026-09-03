@@ -12,15 +12,16 @@ use super::AdapterError;
 #[derive(Debug, Clone)]
 pub(crate) struct D1DatabaseMutation<T> {
     pub(crate) result: T,
+    pub(crate) response_body_sha256: String,
+    pub(crate) response_body_size_bytes: usize,
     pub(crate) lifecycle: D1DatabaseMutationLifecycle,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct D1DatabaseMutationError {
     pub(crate) error: AdapterError,
-    // Retained for the durable-reservation successor; curated live dispatch is
-    // temporarily gated before the client boundary.
-    #[allow(dead_code)]
+    pub(crate) response_body_sha256: Option<String>,
+    pub(crate) response_body_size_bytes: Option<usize>,
     pub(crate) lifecycle: D1DatabaseMutationLifecycle,
 }
 

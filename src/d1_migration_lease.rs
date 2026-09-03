@@ -5583,7 +5583,7 @@ mod linux {
                 .ok_or("DML CAS scratch disappeared during authority validation")?;
             match kind {
                 DmlLeafKind::Attempt => {
-                    crate::d1_dml_attempt_custody::validate_d1_dml_attempt_successor(
+                    crate::d1_attempt_artifact::validate_d1_attempt_artifact_successor(
                         incumbent,
                         &scratch_bytes,
                     )
@@ -6301,10 +6301,9 @@ mod linux {
         successor: &[u8],
     ) -> Result<(), &'static str> {
         let name = d1_dml_attempt_name(binding)?;
-        let product = crate::d1_dml_attempt_custody::inspect_d1_dml_attempt_state(successor)
+        let product = crate::d1_attempt_artifact::inspect_d1_attempt_artifact(successor)
             .map_err(|_| "DML attempt successor was malformed before storage")?;
-        crate::d1_dml_attempt_custody::validate_d1_dml_attempt_successor(expected, successor)
-            .map_err(|_| "DML attempt successor was not the exact incumbent transition")?;
+        crate::d1_attempt_artifact::validate_d1_attempt_artifact_successor(expected, successor)?;
         let leaf = open_dml_leaf(target, DmlLeafKind::Attempt, binding, false)?
             .ok_or("DML attempt compare-and-exchange found no incumbent shard")?;
         let scratch = prepare_dml_cas_scratch(
@@ -6312,7 +6311,7 @@ mod linux {
             &leaf,
             DmlLeafKind::Attempt,
             binding,
-            &product.receipt().target_key_sha256,
+            &product.target_key_sha256,
             expected,
             successor,
         )?;
@@ -6320,7 +6319,7 @@ mod linux {
             &leaf,
             DmlLeafKind::Attempt,
             binding,
-            &product.receipt().target_key_sha256,
+            &product.target_key_sha256,
             &name,
             &scratch,
             successor,

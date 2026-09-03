@@ -5277,6 +5277,44 @@ fn spawn_fake_d1_database_mutation_api(
     spawn_fake_d1_database_mutation_api_with_guard_drift(expected_requests, None)
 }
 
+fn spawn_fake_d1_target_wide_malformed_api() -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind malformed target-wide D1 API");
+    let addr = listener
+        .local_addr()
+        .expect("malformed target-wide D1 API addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        let mut stream = listener
+            .incoming()
+            .next()
+            .expect("one target-wide request")
+            .expect("target-wide stream");
+        let (headers, body) = read_http_request(&mut stream);
+        requests_for_thread
+            .lock()
+            .expect("request log")
+            .push(json!({
+                "request_line": headers.lines().next().unwrap_or_default(),
+                "provider_request_header_present": headers
+                    .to_ascii_lowercase()
+                    .contains("x-client-request-id: target-malformed-provider-0001"),
+                "body": serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null),
+            }));
+        let response = b"{";
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+            response.len()
+        )
+        .expect("write malformed response headers");
+        stream
+            .write_all(response)
+            .expect("write malformed response body");
+    });
+    (format!("http://{addr}"), requests)
+}
+
 fn spawn_fake_d1_database_mutation_api_with_guard_drift(
     expected_requests: usize,
     guard_to_displace_after_second_request: Option<PathBuf>,
@@ -18552,7 +18590,7 @@ fn d1_apply_migration_manifest_partial_multi_statement_response_loss_stays_unkno
 }
 
 #[test]
-fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_disabled_through_stdio()
+fn d1_target_wide_database_mutations_require_exact_consent_and_deny_before_provider_without_guard_through_stdio()
  {
     let provider = TcpListener::bind("127.0.0.1:0").expect("bind no-call D1 provider witness");
     provider
@@ -18565,6 +18603,9 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
 
     let database_id = "123e4567-e89b-42d3-a456-426614174000";
     let other_database_id = "223e4567-e89b-42d3-a456-426614174000";
+    let operation_id = "target-operation-0001";
+    let execution_attempt_id = "target-attempt-000001";
+    let provider_request_id = "target-provider-00001";
     let listed = mcp.request(2, "tools/list", json!({}));
     for tool_name in ["d1_rename_database", "d1_delete_database"] {
         let schema = &listed["result"]["tools"]
@@ -18585,6 +18626,9 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
             json!({
                 "database_id": database_id,
                 "name": "renamed-db",
+                "operation_id": operation_id,
+                "execution_attempt_id": execution_attempt_id,
+                "provider_request_id": provider_request_id,
                 "dry_run": true,
                 "unexpected": "must be rejected"
             }),
@@ -18594,6 +18638,9 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
             "d1_delete_database",
             json!({
                 "database_id": database_id,
+                "operation_id": operation_id,
+                "execution_attempt_id": execution_attempt_id,
+                "provider_request_id": provider_request_id,
                 "dry_run": true,
                 "unexpected": "must be rejected"
             }),
@@ -18630,6 +18677,9 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
         json!({
             "database_id": database_id,
             "name": " renamed-db ",
+            "operation_id": operation_id,
+            "execution_attempt_id": execution_attempt_id,
+            "provider_request_id": provider_request_id,
             "reason": rename_reason,
             "dry_run": true
         }),
@@ -18641,7 +18691,7 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
     assert_eq!(rename_dry["new_name"], json!("renamed-db"));
     assert_eq!(
         rename_dry["plan"]["steps"].as_array().map(Vec::len),
-        Some(6)
+        Some(8)
     );
     assert_eq!(
         rename_dry["plan"]["steps"][0],
@@ -18650,7 +18700,7 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
             "action": "validate_d1_database_rename",
             "side_effect": false,
             "target": {
-                "operation_version": 1,
+                "operation_version": 2,
                 "normalized_target": {
                     "account_id": "acct-1",
                     "database_id": database_id
@@ -18661,22 +18711,21 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
         })
     );
     assert_eq!(
-        rename_dry["plan"]["steps"][4],
+        rename_dry["plan"]["steps"][5],
         json!({
-            "ordinal": 5,
-            "action": "install_durable_target_wide_mutation_reservation",
+            "ordinal": 6,
+            "action": "reserve_one_target_wide_provider_dispatch",
             "side_effect": true,
             "target": {
                 "target_key_sha256": sha256_hex(&format!("acct-1\0{database_id}")),
-                "required_before_provider_dispatch": true,
-                "implementation_status": "not_installed",
-                "effect_scope": "local_durable_attempt_custody",
-                "provider_dispatch_authority": "none"
+                "transition": "prepared_to_dispatch_reserved",
+                "compare_and_exchange": true,
+                "maximum_provider_requests_after_reservation": 1
             }
         })
     );
     assert_eq!(
-        rename_dry["plan"]["steps"][5]["action"],
+        rename_dry["plan"]["steps"][6]["action"],
         json!("apply_d1_database_patch")
     );
     assert_eq!(
@@ -18684,7 +18733,7 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
         json!({
             "consent_version": 1,
             "operation": "d1_rename_database",
-            "operation_version": 1,
+            "operation_version": 2,
             "normalized_target": {
                 "account_id": "acct-1",
                 "database_id": database_id
@@ -18719,6 +18768,9 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
         json!({
             "database_id": database_id,
             "name": "different-db",
+            "operation_id": operation_id,
+            "execution_attempt_id": execution_attempt_id,
+            "provider_request_id": provider_request_id,
             "reason": rename_reason,
             "dry_run": true
         }),
@@ -18730,6 +18782,9 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
         json!({
             "database_id": database_id,
             "name": "renamed-db",
+            "operation_id": operation_id,
+            "execution_attempt_id": execution_attempt_id,
+            "provider_request_id": provider_request_id,
             "reason": "different reviewed reason",
             "dry_run": true
         }),
@@ -18741,6 +18796,9 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
         json!({
             "database_id": other_database_id,
             "name": "renamed-db",
+            "operation_id": operation_id,
+            "execution_attempt_id": execution_attempt_id,
+            "provider_request_id": provider_request_id,
             "reason": rename_reason,
             "dry_run": true
         }),
@@ -18767,6 +18825,9 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
         "d1_delete_database",
         json!({
             "database_id": database_id,
+            "operation_id": operation_id,
+            "execution_attempt_id": execution_attempt_id,
+            "provider_request_id": provider_request_id,
             "reason": delete_reason,
             "dry_run": true
         }),
@@ -18780,7 +18841,7 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
         json!({
             "consent_version": 1,
             "operation": "d1_delete_database",
-            "operation_version": 1,
+            "operation_version": 2,
             "normalized_target": {
                 "account_id": "acct-1",
                 "database_id": database_id
@@ -18805,6 +18866,9 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
         "d1_delete_database",
         json!({
             "database_id": database_id,
+            "operation_id": operation_id,
+            "execution_attempt_id": execution_attempt_id,
+            "provider_request_id": provider_request_id,
             "reason": "different reviewed reason",
             "dry_run": true
         }),
@@ -18826,6 +18890,9 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
             json!({
                 "database_id": database_id,
                 "name": "renamed-db",
+                "operation_id": operation_id,
+                "execution_attempt_id": execution_attempt_id,
+                "provider_request_id": provider_request_id,
                 "reason": rename_reason,
                 "dry_run": false
             }),
@@ -18838,6 +18905,9 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
             json!({
                 "database_id": database_id,
                 "name": "renamed-db",
+                "operation_id": operation_id,
+                "execution_attempt_id": execution_attempt_id,
+                "provider_request_id": provider_request_id,
                 "reason": "different reviewed reason",
                 "confirmation_token": rename_token,
                 "dry_run": false
@@ -18850,6 +18920,9 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
             "d1_delete_database",
             json!({
                 "database_id": database_id,
+                "operation_id": operation_id,
+                "execution_attempt_id": execution_attempt_id,
+                "provider_request_id": provider_request_id,
                 "reason": delete_reason,
                 "confirmation_token": rename_dry["required_confirmation_token"],
                 "dry_run": false
@@ -18863,18 +18936,24 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
             json!({
                 "database_id": database_id,
                 "name": "renamed-db",
+                "operation_id": operation_id,
+                "execution_attempt_id": execution_attempt_id,
+                "provider_request_id": provider_request_id,
                 "reason": rename_reason,
                 "confirmation_token": rename_dry["required_confirmation_token"],
                 "dry_run": false
             }),
-            "d1.target_wide_durable_reservation_not_installed",
-            "durable_reservation_not_installed",
+            "d1.target_guard_root_unconfigured",
+            "blocked",
         ),
         (
             15,
             "d1_delete_database",
             json!({
                 "database_id": database_id,
+                "operation_id": operation_id,
+                "execution_attempt_id": execution_attempt_id,
+                "provider_request_id": provider_request_id,
                 "reason": delete_reason,
                 "dry_run": false
             }),
@@ -18886,12 +18965,15 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
             "d1_delete_database",
             json!({
                 "database_id": database_id,
+                "operation_id": operation_id,
+                "execution_attempt_id": execution_attempt_id,
+                "provider_request_id": provider_request_id,
                 "reason": delete_reason,
                 "confirmation_token": delete_dry["required_confirmation_token"],
                 "dry_run": false
             }),
-            "d1.target_wide_durable_reservation_not_installed",
-            "durable_reservation_not_installed",
+            "d1.target_guard_root_unconfigured",
+            "blocked",
         ),
     ];
     for (request_id, operation, arguments, expected_code, expected_status) in live_cases {
@@ -18931,6 +19013,186 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_remain_provider_d
 
     mcp.terminate();
 }
+
+#[cfg(unix)]
+#[test]
+fn d1_target_wide_rename_dispatches_once_and_exact_replay_never_redispatches() {
+    let (provider_url, requests) = spawn_fake_d1_database_mutation_api(1);
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-d1-target-wide-once-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos()
+    ));
+    install_activated_manifest_root(&lease_root);
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", provider_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let arguments = json!({
+        "database_id": "123e4567-e89b-42d3-a456-426614174000",
+        "name": "renamed-db",
+        "reason": "reviewed synthetic rename",
+        "operation_id": "target-once-operation-0001",
+        "execution_attempt_id": "target-once-attempt-0001",
+        "provider_request_id": "target-once-provider-0001"
+    });
+    let mut dry_arguments = arguments.clone();
+    dry_arguments["dry_run"] = json!(true);
+    let dry_response = mcp.call_tool(100, "d1_rename_database", dry_arguments);
+    let token = structured_content(&dry_response)["required_confirmation_token"]
+        .as_str()
+        .expect("target-wide token")
+        .to_string();
+
+    let mut live_arguments = arguments.clone();
+    live_arguments["confirmation_token"] = json!(token);
+    let first_response = mcp.call_tool(101, "d1_rename_database", live_arguments.clone());
+    assert_tool_text_matches_structured(&first_response);
+    let first = structured_content(&first_response);
+    assert_eq!(first["ok"], json!(true), "{first}");
+    assert_eq!(
+        first["status"],
+        json!("provider_acknowledged_reconciliation_required")
+    );
+    assert_eq!(first["provider_calls"], json!(1));
+    assert_eq!(first["provider_mutations"], json!(1));
+    assert_eq!(first["audit"]["outcome"], json!("reconciliation_required"));
+    assert_eq!(
+        first["custody"]["post_provider_outcome"],
+        json!("acknowledged")
+    );
+    assert_eq!(first["automatic_retry_permitted"], json!(false));
+    assert_eq!(
+        first["execution_evidence"]["durable_reservation"]["outcome"],
+        json!("dispatch_reserved")
+    );
+    assert_eq!(
+        first["execution_evidence"]["post_provider_custody"]["outcome"],
+        json!("acknowledged")
+    );
+    let first_serialized = first.to_string();
+    for private_identity in [
+        "target-once-operation-0001",
+        "target-once-attempt-0001",
+        "target-once-provider-0001",
+    ] {
+        assert!(!first_serialized.contains(private_identity));
+    }
+    assert_eq!(
+        requests.lock().expect("request log").len(),
+        1,
+        "one reserved attempt may issue only one provider request"
+    );
+
+    let replay_response = mcp.call_tool(102, "d1_rename_database", live_arguments);
+    assert_tool_text_matches_structured(&replay_response);
+    let replay = structured_content(&replay_response);
+    assert_eq!(replay["ok"], json!(false), "{replay}");
+    assert_eq!(replay["status"], json!("reconciliation_required"));
+    assert_eq!(
+        replay["error"]["code"],
+        json!("d1.target_wide_attempt_replay")
+    );
+    assert_eq!(replay["provider_calls"], json!(0));
+    assert_eq!(replay["automatic_retry_permitted"], json!(false));
+    thread::sleep(Duration::from_millis(25));
+    assert_eq!(
+        requests.lock().expect("request log").len(),
+        1,
+        "exact replay must never redispatch"
+    );
+
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
+#[cfg(unix)]
+#[test]
+fn d1_target_wide_malformed_response_is_retained_and_never_retried() {
+    let (provider_url, requests) = spawn_fake_d1_target_wide_malformed_api();
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-d1-target-wide-malformed-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos()
+    ));
+    install_activated_manifest_root(&lease_root);
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", provider_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let arguments = json!({
+        "database_id": "123e4567-e89b-42d3-a456-426614174000",
+        "name": "renamed-db",
+        "reason": "reviewed malformed response",
+        "operation_id": "target-malformed-operation-0001",
+        "execution_attempt_id": "target-malformed-attempt-0001",
+        "provider_request_id": "target-malformed-provider-0001"
+    });
+    let mut dry_arguments = arguments.clone();
+    dry_arguments["dry_run"] = json!(true);
+    let dry = mcp.call_tool(110, "d1_rename_database", dry_arguments);
+    let token = structured_content(&dry)["required_confirmation_token"]
+        .as_str()
+        .expect("target-wide token")
+        .to_string();
+    let mut live_arguments = arguments;
+    live_arguments["confirmation_token"] = json!(token);
+
+    let first_response = mcp.call_tool(111, "d1_rename_database", live_arguments.clone());
+    assert_tool_text_matches_structured(&first_response);
+    let first = structured_content(&first_response);
+    assert_eq!(first["ok"], json!(false), "{first}");
+    assert_eq!(first["status"], json!("reconciliation_required"));
+    assert_eq!(first["provider_calls"], json!(1));
+    assert!(first["provider_mutations"].is_null());
+    assert_eq!(first["audit"]["outcome"], json!("reconciliation_required"));
+    assert_eq!(
+        first["custody"]["post_provider_outcome"],
+        json!("reconciliation_required")
+    );
+    assert_eq!(first["custody"]["response_body_size_bytes"], json!(1));
+    assert_eq!(first["automatic_retry_permitted"], json!(false));
+    assert_eq!(
+        first["execution_evidence"]["post_provider_custody"]["outcome"],
+        json!("reconciliation_required")
+    );
+    let first_serialized = first.to_string();
+    for private_identity in [
+        "target-malformed-operation-0001",
+        "target-malformed-attempt-0001",
+        "target-malformed-provider-0001",
+    ] {
+        assert!(!first_serialized.contains(private_identity));
+    }
+    let observed = requests.lock().expect("request log");
+    assert_eq!(observed.len(), 1);
+    assert_eq!(observed[0]["provider_request_header_present"], json!(true));
+    drop(observed);
+
+    let replay = mcp.call_tool(112, "d1_rename_database", live_arguments);
+    assert_eq!(
+        structured_content(&replay)["error"]["code"],
+        json!("d1.target_wide_attempt_replay")
+    );
+    thread::sleep(Duration::from_millis(25));
+    assert_eq!(requests.lock().expect("request log").len(), 1);
+
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
 fn expected_d1_execute_write_mutation_plan(dry_run: bool) -> Value {
     let mut steps = vec![
         json!({"ordinal": 1, "action": "collect_stable_catalog", "side_effect": false, "target": {"observations": 2}}),
@@ -20223,6 +20485,9 @@ fn d1_execute_write_guard_denial_is_pre_provider_and_caller_correlated() {
         json!({
             "database_id": "123E4567-E89B-42D3-A456-426614174000",
             "name": "renamed-db",
+            "operation_id": "curated-guard-operation-19",
+            "execution_attempt_id": "curated-guard-attempt-19",
+            "provider_request_id": "curated-guard-provider-19",
             "dry_run": false
         }),
     );
