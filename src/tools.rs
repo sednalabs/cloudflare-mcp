@@ -18012,7 +18012,7 @@ mod tests {
         .expect_err("same-owner writable non-sticky ancestor must fail closed");
         assert_eq!(
             error.structured_content.expect("unsafe root error")["error"]["code"],
-            json!("d1.migration_lease_root_unsafe")
+            json!("d1.target_guard_root_unsafe")
         );
         fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o700))
             .expect("restore private test parent");
