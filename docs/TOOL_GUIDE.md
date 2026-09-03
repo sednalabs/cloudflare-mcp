@@ -95,8 +95,8 @@ identity and one physical target guard namespace:
 
 | Provider mutation surface | Coverage |
 | --- | --- |
-| `d1_rename_database` | exact eight-step consent plus three opaque identities; one guarded provider request maximum; nonterminal acknowledgement/reconciliation custody; no automatic retry |
-| `d1_delete_database` | same guarded one-call lifecycle for high-risk deletion; exact replay never redispatches; stable recovery/finalization remains separate |
+| `d1_rename_database` | exact eight-step consent plus three opaque identities; one guarded provider request maximum; exact replay never redispatches and uses stable two-read recovery before immutable terminal custody |
+| `d1_delete_database` | same guarded one-call lifecycle for high-risk deletion; strict stable presence/404 recovery; terminal replay performs zero provider calls |
 | `d1_execute_write` | shared permanent target guard |
 | `d1_bootstrap_migration_ledger` | durable lease under that target guard |
 | `d1_apply_migration_manifest` | durable lease under that target guard |
@@ -222,7 +222,8 @@ are added by the graph derivation.
    all-terminal and unchanged. The route performs that CAS once, exact readback,
    held-guard revalidation, one no-redirect request maximum, then an immediate
    `Acknowledged` or `ReconciliationRequired` custody CAS. Exact replay never
-   redispatches. Stable provider readback and terminal recovery remain separate.
+   redispatches. Reserved/reconciliation replay performs two strict authenticated
+   reads and installs terminal custody only after stable applied/not-applied proof.
    The provider method, path, and optional rename body are extracted only from
    the independently rederived canonical plan before guard acquisition; no
    separate caller-selected provider operation can override the consented

@@ -147,9 +147,13 @@ and provider calls at zero. A strict
 acknowledgement becomes nonterminal `Acknowledged` custody; response loss,
 malformed or contradictory evidence, and provider/adapter failure become
 `ReconciliationRequired`. Post-provider persistence uncertainty is also
-non-retryable. Exact replay never dispatches, provider bodies and raw identities
-remain private, and stable recovery/readback/finalization remain a separate
-reviewed authority.
+non-retryable. Exact replay never dispatches; reserved or reconciliation custody
+can perform only two bounded authenticated no-redirect reads. Matching strict
+presence/name or 404 evidence must prove the operation-specific applied/not-applied
+state before one exact terminal CAS and readback. Unstable, malformed, redirected,
+absent where rename requires presence, or otherwise insufficient evidence preserves
+reconciliation custody. Provider bodies and raw identities remain private;
+terminal identities remain permanently bound and terminal replay is read-free.
 
 ## External Service Bridge
 

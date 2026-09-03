@@ -273,6 +273,8 @@ pub(crate) enum D1TargetWideRuntimeState {
     DispatchReserved,
     Acknowledged,
     ReconciliationRequired,
+    TerminalApplied,
+    TerminalNotApplied,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -336,6 +338,21 @@ pub(crate) struct D1TargetWideExecutionEvidence {
     pub(crate) durable_reservation: D1TargetWideDurableReservationEvidence,
     pub(crate) provider: D1TargetWideProviderEvidence,
     pub(crate) post_provider_custody: D1TargetWidePostProviderCustodyEvidence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) recovery: Option<D1TargetWideRecoveryEvidence>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct D1TargetWideRecoveryEvidence {
+    pub(crate) outcome: D1TargetWideRuntimeState,
+    pub(crate) provider_calls: u8,
+    pub(crate) provider_mutations: u8,
+    pub(crate) stable_before_after: bool,
+    pub(crate) terminal_local_mutations: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) readback_evidence_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_error_sha256: Option<String>,
 }
 
 // The state transitions remain the exact successor seam for durable provider-
@@ -379,7 +396,12 @@ impl D1TargetWideExecutionEvidence {
                 outcome: D1TargetWideRuntimeState::NotInstalled,
                 local_mutations: Some(0),
             },
+            recovery: None,
         }
+    }
+
+    pub(crate) fn recovery_evidence(&mut self, evidence: D1TargetWideRecoveryEvidence) {
+        self.recovery = Some(evidence);
     }
 
     pub(crate) fn layout_observed(&mut self, outcome: D1DmlCustodyLayoutEnsureOutcome) {

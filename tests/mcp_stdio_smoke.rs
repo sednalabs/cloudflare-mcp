@@ -5285,32 +5285,44 @@ fn spawn_fake_d1_target_wide_malformed_api() -> (String, Arc<Mutex<Vec<Value>>>)
     let requests = Arc::new(Mutex::new(Vec::new()));
     let requests_for_thread = requests.clone();
     thread::spawn(move || {
-        let mut stream = listener
-            .incoming()
-            .next()
-            .expect("one target-wide request")
-            .expect("target-wide stream");
-        let (headers, body) = read_http_request(&mut stream);
-        requests_for_thread
-            .lock()
-            .expect("request log")
-            .push(json!({
-                "request_line": headers.lines().next().unwrap_or_default(),
-                "provider_request_header_present": headers
-                    .to_ascii_lowercase()
-                    .contains("x-client-request-id: target-malformed-provider-0001"),
-                "body": serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null),
-            }));
-        let response = b"{";
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
-            response.len()
-        )
-        .expect("write malformed response headers");
-        stream
-            .write_all(response)
-            .expect("write malformed response body");
+        for (index, stream) in listener.incoming().take(3).enumerate() {
+            let mut stream = stream.expect("target-wide stream");
+            let (headers, body) = read_http_request(&mut stream);
+            requests_for_thread
+                .lock()
+                .expect("request log")
+                .push(json!({
+                    "request_line": headers.lines().next().unwrap_or_default(),
+                    "provider_request_header_present": headers
+                        .to_ascii_lowercase()
+                        .contains("x-client-request-id: target-malformed-provider-0001"),
+                    "body": serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null),
+                }));
+            let response = if index == 0 {
+                b"{".to_vec()
+            } else {
+                serde_json::to_vec(&json!({
+                    "success": true,
+                    "errors": [],
+                    "messages": [],
+                    "result": {
+                        "uuid": "123e4567-e89b-42d3-a456-426614174000",
+                        "name": "renamed-db",
+                        "version": "production"
+                    }
+                }))
+                .expect("serialize recovery response")
+            };
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                response.len()
+            )
+            .expect("write target-wide response headers");
+            stream
+                .write_all(&response)
+                .expect("write target-wide response body");
+        }
     });
     (format!("http://{addr}"), requests)
 }
@@ -5361,6 +5373,18 @@ fn spawn_fake_d1_database_mutation_api_with_guard_drift(
                         "errors": [],
                         "messages": [],
                         "result": {"id": "123e4567-e89b-42d3-a456-426614174000", "deleted": true},
+                    })
+                }
+                ("GET", "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000") => {
+                    json!({
+                        "success": true,
+                        "errors": [],
+                        "messages": [],
+                        "result": {
+                            "uuid": "123e4567-e89b-42d3-a456-426614174000",
+                            "name": "renamed-db",
+                            "version": "production"
+                        },
                     })
                 }
                 (
@@ -19017,7 +19041,7 @@ fn d1_target_wide_database_mutations_require_exact_consent_and_deny_before_provi
 #[cfg(unix)]
 #[test]
 fn d1_target_wide_rename_dispatches_once_and_exact_replay_never_redispatches() {
-    let (provider_url, requests) = spawn_fake_d1_database_mutation_api(1);
+    let (provider_url, requests) = spawn_fake_d1_database_mutation_api(3);
     let lease_root = PathBuf::from("/tmp").join(format!(
         "cloudflare-mcp-d1-target-wide-once-{}-{}",
         std::process::id(),
@@ -19102,16 +19126,13 @@ fn d1_target_wide_rename_dispatches_once_and_exact_replay_never_redispatches() {
         "the provider request must be derived exactly from the canonical rename plan"
     );
 
-    let replay_response = mcp.call_tool(102, "d1_rename_database", live_arguments);
+    let replay_response = mcp.call_tool(102, "d1_rename_database", live_arguments.clone());
     assert_tool_text_matches_structured(&replay_response);
     let replay = structured_content(&replay_response);
-    assert_eq!(replay["ok"], json!(false), "{replay}");
-    assert_eq!(replay["status"], json!("reconciliation_required"));
-    assert_eq!(
-        replay["error"]["code"],
-        json!("d1.target_wide_attempt_replay")
-    );
-    assert_eq!(replay["provider_calls"], json!(0));
+    assert_eq!(replay["ok"], json!(true), "{replay}");
+    assert_eq!(replay["status"], json!("applied_proven"));
+    assert_eq!(replay["provider_calls"], json!(2));
+    assert_eq!(replay["provider_mutations"], json!(0));
     assert_eq!(replay["automatic_retry_permitted"], json!(false));
     assert_eq!(
         replay["execution_evidence"]["local_layout"],
@@ -19123,10 +19144,31 @@ fn d1_target_wide_rename_dispatches_once_and_exact_replay_never_redispatches() {
     );
     thread::sleep(Duration::from_millis(25));
     assert_eq!(
-        requests.lock().expect("request log").len(),
+        requests
+            .lock()
+            .expect("request log")
+            .iter()
+            .filter(|request| request["method"] == "PATCH")
+            .count(),
         1,
-        "exact replay must never redispatch"
+        "exact replay must never redispatch the mutation"
     );
+    assert_eq!(
+        requests
+            .lock()
+            .expect("request log")
+            .iter()
+            .filter(|request| request["method"] == "GET")
+            .count(),
+        2,
+        "recovery must use exactly two provider reads"
+    );
+
+    let terminal_replay = mcp.call_tool(103, "d1_rename_database", live_arguments);
+    let terminal_replay = structured_content(&terminal_replay);
+    assert_eq!(terminal_replay["status"], json!("applied_proven"));
+    assert_eq!(terminal_replay["provider_calls"], json!(0));
+    assert_eq!(terminal_replay["exact_replay"], json!(true));
 
     mcp.terminate();
     let _ = fs::remove_dir_all(lease_root);
@@ -19202,12 +19244,23 @@ fn d1_target_wide_malformed_response_is_retained_and_never_retried() {
     drop(observed);
 
     let replay = mcp.call_tool(112, "d1_rename_database", live_arguments);
-    assert_eq!(
-        structured_content(&replay)["error"]["code"],
-        json!("d1.target_wide_attempt_replay")
-    );
+    let replay = structured_content(&replay);
+    assert_eq!(replay["ok"], json!(true));
+    assert_eq!(replay["status"], json!("applied_proven"));
+    assert_eq!(replay["provider_calls"], json!(2));
+    assert_eq!(replay["provider_mutations"], json!(0));
     thread::sleep(Duration::from_millis(25));
-    assert_eq!(requests.lock().expect("request log").len(), 1);
+    let observed = requests.lock().expect("request log");
+    assert_eq!(observed.len(), 3);
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|request| request["request_line"]
+                .as_str()
+                .is_some_and(|line| line.starts_with("PATCH ")))
+            .count(),
+        1
+    );
 
     mcp.terminate();
     let _ = fs::remove_dir_all(lease_root);

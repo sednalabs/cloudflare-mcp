@@ -1,8 +1,8 @@
 //! Guarded one-call lifecycle for curated target-wide D1 rename/delete.
 //!
-//! This boundary ends at durable Acknowledged or ReconciliationRequired
-//! custody. Stable recovery, provider readback, and terminal finalization are
-//! intentionally separate authority.
+//! Fresh dispatch ends at durable Acknowledged or ReconciliationRequired
+//! custody. Exact replay can enter the separate read-only stable-recovery
+//! boundary and install one immutable terminal successor; it never redispatches.
 
 use rmcp::model::CallToolResult;
 use serde_json::json;
@@ -22,6 +22,7 @@ use crate::d1_target_wide_mutation::{
 use crate::d1_target_wide_owner_audit::{
     authorize_d1_target_wide_prepared_owner, revalidate_d1_target_wide_prepared_owner,
 };
+use crate::d1_target_wide_recovery::recover_d1_target_wide_attempt;
 
 enum D1TargetWideDerivedProviderRequest {
     Rename { name: String },
@@ -95,16 +96,18 @@ pub(crate) async fn execute_d1_target_wide_apply(
                 Err(error) => return (blocked(error.code, error.message), evidence),
             };
             if restored.receipt().phase != D1DmlAttemptPhase::Prepared {
-                evidence.provider.provider_calls = 0;
-                evidence.provider.provider_mutations = Some(0);
-                return (
-                    reconciliation_required(
-                        "d1.target_wide_attempt_replay",
-                        "the exact attempt already reserved or crossed the provider boundary",
-                        Some(restored.receipt()),
-                    ),
-                    evidence,
-                );
+                let (result, recovery) = recover_d1_target_wide_attempt(
+                    client,
+                    &guard,
+                    target,
+                    input.intended_plan,
+                    input.confirmation_token,
+                    identities,
+                    restored,
+                )
+                .await;
+                evidence.recovery_evidence(recovery);
+                return (result, evidence);
             }
             bytes
         }
