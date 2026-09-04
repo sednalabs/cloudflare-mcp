@@ -6,11 +6,23 @@ import { GENESIS_CONTRACT, PROTOCOL_VERSION } from "../src/index.js";
 import { D1RowWriteCoordinatorObject, PROVISION_PATH, SERVICE_PATH } from "../src/durable-object.js";
 
 class SqliteStorage {
-  constructor(database = new DatabaseSync(":memory:")) { this.database = database; }
+  constructor(database = new DatabaseSync(":memory:"), { failOnReadyUpdate = false } = {}) { this.database = database; this.failOnReadyUpdate = failOnReadyUpdate; }
+  transactionSync(callback) {
+    this.database.exec("BEGIN");
+    try {
+      const result = callback();
+      this.database.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
   exec(query, ...bindings) {
     const statements = query.split(";").map((s) => s.trim()).filter(Boolean);
     let result;
     for (const statement of statements) {
+      if (this.failOnReadyUpdate && /^UPDATE do_identity SET value/i.test(statement)) throw new Error("forced_ready_failure");
       if (/^\s*select\b/i.test(statement)) result = { toArray: () => this.database.prepare(statement).all(...bindings) };
       else { this.database.prepare(statement).run(...bindings); result = { toArray: () => [] }; }
     }
@@ -50,6 +62,7 @@ const env = {
   GENESIS_ENTITLEMENT_AUTHORITY: new EntitlementAuthority(),
 };
 const testEnv = () => ({ ...env, GENESIS_ENTITLEMENT_AUTHORITY: new EntitlementAuthority() });
+const stateFor = (storage, id = objectId) => ({ id: { toString: () => id }, storage: { sql: storage, transactionSync: (callback) => storage.transactionSync(callback) } });
 const genesis = {
   operation: "initialize_genesis", contract: GENESIS_CONTRACT, protocolVersion: PROTOCOL_VERSION,
   targetKeySha256: h("a"), generationSha256: h("9"), authoritySha256: h("c"), genesisSha256: h("d"),
@@ -75,7 +88,7 @@ async function call(object, pathname, body, token) {
 
 test("requires privileged genesis and preserves service-only lifecycle across re-instantiation", async () => {
   const storage = new SqliteStorage();
-  const state = { id: { toString: () => objectId }, storage: { sql: storage } };
+  const state = stateFor(storage);
   const environment = testEnv();
   const object = new D1RowWriteCoordinatorObject(state, environment);
   assert.equal((await call(object, SERVICE_PATH, attempt, environment.COORDINATOR_SERVICE_TOKEN)).status, 409);
@@ -89,7 +102,7 @@ test("requires privileged genesis and preserves service-only lifecycle across re
 
 test("denies public paths, recovery operations, and binding/version mismatches", async () => {
   const storage = new SqliteStorage();
-  const state = { id: { toString: () => objectId }, storage: { sql: storage } };
+  const state = stateFor(storage);
   const environment = testEnv();
   const object = new D1RowWriteCoordinatorObject(state, environment);
   assert.equal((await call(object, "/public", attempt, environment.COORDINATOR_SERVICE_TOKEN)).status, 404);
@@ -105,7 +118,7 @@ test("denies public paths, recovery operations, and binding/version mismatches",
 
 test("serializes two service instances and denies rewind or replacement", async () => {
   const storage = new SqliteStorage();
-  const state = { id: { toString: () => objectId }, storage: { sql: storage } };
+  const state = stateFor(storage);
   const environment = testEnv();
   const first = new D1RowWriteCoordinatorObject(state, environment);
   const second = new D1RowWriteCoordinatorObject(state, environment);
@@ -120,20 +133,20 @@ test("serializes two service instances and denies rewind or replacement", async 
 });
 
 test("rejects a version-overlap object before accepting service requests", async () => {
-  assert.throws(() => new D1RowWriteCoordinatorObject({ id: { toString: () => objectId }, storage: { sql: new SqliteStorage() } }, { ...testEnv(), COORDINATOR_SCHEMA_VERSION: "2" }), /protocol_mismatch/);
+  assert.throws(() => new D1RowWriteCoordinatorObject(stateFor(new SqliteStorage()), { ...testEnv(), COORDINATOR_SCHEMA_VERSION: "2" }), /protocol_mismatch/);
 });
 
 test("empty or replacement object fails closed for ordinary execution", async () => {
   const storage = new SqliteStorage();
   const environment = testEnv();
-  const object = new D1RowWriteCoordinatorObject({ id: { toString: () => objectId }, storage: { sql: storage } }, environment);
+  const object = new D1RowWriteCoordinatorObject(stateFor(storage), environment);
   const response = await call(object, SERVICE_PATH, attempt, environment.COORDINATOR_SERVICE_TOKEN);
   assert.equal(response.status, 409);
   assert.equal(response.body.error, "object_not_initialized");
 });
 
 test("binds service execution to the actual durable-object identity", async () => {
-  const object = new D1RowWriteCoordinatorObject({ id: { toString: () => "opaque-do-object-b" }, storage: { sql: new SqliteStorage() } }, testEnv());
+  const object = new D1RowWriteCoordinatorObject(stateFor(new SqliteStorage(), "opaque-do-object-b"), testEnv());
   const response = await call(object, SERVICE_PATH, attempt, env.COORDINATOR_SERVICE_TOKEN);
   assert.equal(response.status, 409);
   assert.equal(response.body.error, "object_key_mismatch");
@@ -142,10 +155,42 @@ test("binds service execution to the actual durable-object identity", async () =
 test("promotes a matching pending genesis without replaying external entitlement", async () => {
   const storage = new SqliteStorage();
   const environment = testEnv();
-  const object = new D1RowWriteCoordinatorObject({ id: { toString: () => objectId }, storage: { sql: storage } }, environment);
+  const object = new D1RowWriteCoordinatorObject(stateFor(storage), environment);
   assert.equal((await call(object, PROVISION_PATH, genesis, environment.GENESIS_PROVISIONER_TOKEN)).body.decision, "new");
   storage.database.prepare("UPDATE do_identity SET value = replace(value, '\"ready\"', '\"pending\"') WHERE key = 'binding'").run();
-  const restarted = new D1RowWriteCoordinatorObject({ id: { toString: () => objectId }, storage: { sql: storage } }, environment);
+  const restarted = new D1RowWriteCoordinatorObject(stateFor(storage), environment);
   assert.equal((await call(restarted, PROVISION_PATH, genesis, environment.GENESIS_PROVISIONER_TOKEN)).body.decision, "exact_replay");
   assert.equal((await call(restarted, SERVICE_PATH, attempt, environment.COORDINATOR_SERVICE_TOKEN)).body.phase, "prepared");
+});
+
+test("rolls back binding and genesis together on a mid-provision failure", async () => {
+  const storage = new SqliteStorage(undefined, { failOnReadyUpdate: true });
+  const environment = testEnv();
+  const object = new D1RowWriteCoordinatorObject(stateFor(storage), environment);
+  const failed = await call(object, PROVISION_PATH, genesis, environment.GENESIS_PROVISIONER_TOKEN);
+  assert.equal(failed.status, 500);
+  assert.equal(failed.body.error, "forced_ready_failure");
+  assert.equal(storage.database.prepare("SELECT COUNT(*) AS count FROM do_identity").get().count, 0);
+  assert.equal(storage.database.prepare("SELECT COUNT(*) AS count FROM genesis").get().count, 0);
+  const retry = await call(object, PROVISION_PATH, genesis, environment.GENESIS_PROVISIONER_TOKEN);
+  assert.equal(retry.status, 409);
+  assert.equal(retry.body.error, "entitlement_authority_replay");
+  assert.equal(storage.database.prepare("SELECT COUNT(*) AS count FROM do_identity").get().count, 0);
+  assert.equal(storage.database.prepare("SELECT COUNT(*) AS count FROM genesis").get().count, 0);
+});
+
+test("renders non-Error failures safely on both ingress paths", async () => {
+  const storage = new SqliteStorage();
+  const environment = testEnv();
+  const object = new D1RowWriteCoordinatorObject(stateFor(storage), environment);
+  storage.exec = () => { throw "service-string"; };
+  const serviceFailure = await call(object, SERVICE_PATH, attempt, environment.COORDINATOR_SERVICE_TOKEN);
+  assert.equal(serviceFailure.status, 500);
+  assert.equal(serviceFailure.body.error, "service-string");
+
+  class ThrowingAuthority { async fetch() { throw "authority-string"; } }
+  const provisionObject = new D1RowWriteCoordinatorObject(stateFor(new SqliteStorage()), { ...env, GENESIS_ENTITLEMENT_AUTHORITY: new ThrowingAuthority() });
+  const provisionFailure = await call(provisionObject, PROVISION_PATH, genesis, env.GENESIS_PROVISIONER_TOKEN);
+  assert.equal(provisionFailure.status, 500);
+  assert.equal(provisionFailure.body.error, "authority-string");
 });

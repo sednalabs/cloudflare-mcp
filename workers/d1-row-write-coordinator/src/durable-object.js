@@ -66,14 +66,17 @@ function isObject(value) {
 export class D1RowWriteCoordinatorObject {
   #coordinator;
   #sql;
+  #storage;
   #env;
   #objectId;
 
   constructor(state, env) {
     if (!state?.storage?.sql || typeof state.storage.sql.exec !== "function") throw new Error("sqlite_storage_required");
+    if (typeof state.storage.transactionSync !== "function") throw new Error("transaction_sync_required");
     if (!env || typeof env.COORDINATOR_SERVICE_TOKEN !== "string" || env.COORDINATOR_SERVICE_TOKEN.length === 0) throw new Error("service_auth_not_configured");
     if (typeof env.GENESIS_PROVISIONER_TOKEN !== "string" || env.GENESIS_PROVISIONER_TOKEN.length === 0) throw new Error("genesis_auth_not_configured");
     this.#sql = state.storage.sql;
+    this.#storage = state.storage;
     this.#env = env;
     requireHash(env.COORDINATOR_NAMESPACE_SHA256, "coordinator_namespace_sha256");
     requireHash(env.COORDINATOR_BINDING_SHA256, "coordinator_binding_sha256");
@@ -227,14 +230,17 @@ export class D1RowWriteCoordinatorObject {
         } else {
           if (!this.#genesisExists(input)) throw new Error("recovery_denied");
           this.#assertStoredBinding(input, "pending");
-          this.#markBindingReady(input);
+          this.#storage.transactionSync(() => this.#markBindingReady(input));
           return jsonResponse(200, { protocolVersion: PROTOCOL_VERSION, decision: "exact_replay" });
         }
       }
       await this.#verifyEntitlement(input);
-      if (rows.length === 0) this.#storeBinding(input, "pending");
-      const result = this.#coordinator.initializeGenesis(input);
-      this.#markBindingReady(input);
+      const result = this.#storage.transactionSync(() => {
+        this.#storeBinding(input);
+        const initialized = this.#coordinator.initializeGenesis(input);
+        this.#markBindingReady(input);
+        return initialized;
+      });
       return jsonResponse(200, result);
     } catch (error) {
       return jsonResponse(errorStatus(error), { error: error instanceof Error ? error.message : String(error ?? "unknown_error") });

@@ -41,8 +41,12 @@ recipient, SQL, or provider identifiers.
 `initializeGenesis` is only an inert core primitive. The provisioning path
 additionally requires a valid Ed25519 entitlement signature and a
 `decision: "new"` response from the separately privileged entitlement-authority
-service. Binding is written as one canonical pending record and promoted to
-ready only after exact genesis readback; a pending or ready object is never
-replaced or rewound. Activation remains blocked until a separately governed
+service. External verification happens before the synchronous storage
+transaction; binding insertion, genesis initialization, and ready promotion
+then share one `transactionSync` boundary and roll back together on failure.
+A pending state with matching genesis is a narrowly bounded recovery case and
+can promote to ready without replaying the consumed entitlement; a pending
+state without matching genesis, or a ready object with missing/replaced genesis,
+fails closed. Activation remains blocked until a separately governed
 authenticated execution/provisioning split proves ordinary open-existing
 execution, deletion/rewind/replacement denial, and recovery authority.
