@@ -12,12 +12,13 @@ use serde_json::Value;
 use crate::d1_execute_write::{
     D1ExecuteWritePlan, D1WriteStatementKind, derive_d1_execute_write_plan,
 };
-use crate::d1_target::D1TargetIdentity;
+use crate::d1_target::{D1TargetIdentity, normalize_d1_target};
 
 const D1_ROW_WRITE_PLAN_MAX_ROWS: usize = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum D1RowWritePlanError {
+    TargetIdentityNotCanonical,
     InvalidExecutionSessionIdentity,
     InvalidRowLimit,
 }
@@ -46,7 +47,10 @@ impl D1RowWritePlan {
 }
 
 fn canonical_hash(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 /// Derive one immutable plan from the already-classified statement kind.
@@ -63,6 +67,11 @@ pub(crate) fn derive_d1_row_write_plan(
     params: &[Value],
     max_rows: usize,
 ) -> Result<D1RowWritePlan, D1RowWritePlanError> {
+    let normalized = normalize_d1_target(&target.account_id, &target.database_id)
+        .map_err(|_| D1RowWritePlanError::TargetIdentityNotCanonical)?;
+    if normalized != *target {
+        return Err(D1RowWritePlanError::TargetIdentityNotCanonical);
+    }
     if !canonical_hash(execution_session_sha256) {
         return Err(D1RowWritePlanError::InvalidExecutionSessionIdentity);
     }
@@ -152,6 +161,17 @@ mod tests {
         assert_eq!(
             derive_d1_row_write_plan(
                 &target(),
+                &"A".repeat(64),
+                D1WriteStatementKind::Delete,
+                "DELETE FROM t",
+                &[],
+                1,
+            ),
+            Err(D1RowWritePlanError::InvalidExecutionSessionIdentity)
+        );
+        assert_eq!(
+            derive_d1_row_write_plan(
+                &target(),
                 &"a".repeat(64),
                 D1WriteStatementKind::Delete,
                 "DELETE FROM t",
@@ -159,6 +179,25 @@ mod tests {
                 0,
             ),
             Err(D1RowWritePlanError::InvalidRowLimit)
+        );
+    }
+
+    #[test]
+    fn plan_rejects_forged_target_identity() {
+        let forged = D1TargetIdentity {
+            account_id: " acct-1".to_string(),
+            database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
+        };
+        assert_eq!(
+            derive_d1_row_write_plan(
+                &forged,
+                &"a".repeat(64),
+                D1WriteStatementKind::Update,
+                "UPDATE t SET enabled = ?",
+                &[json!(true)],
+                1,
+            ),
+            Err(D1RowWritePlanError::TargetIdentityNotCanonical)
         );
     }
 }

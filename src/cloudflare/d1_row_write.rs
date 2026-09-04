@@ -16,7 +16,7 @@ use crate::d1_execute_write::{
     D1ExecuteWriteOutcome, D1WriteResultClassification, classify_d1_execute_write_result,
 };
 use crate::d1_row_write_plan::D1RowWritePlan;
-use crate::d1_target::D1TargetIdentity;
+use crate::d1_target::{D1TargetIdentity, normalize_d1_target};
 use crate::tools::sha256_bytes_hex;
 
 const MAX_D1_ROW_WRITE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
@@ -127,7 +127,10 @@ pub(super) struct D1RowWriteCausalWitness {
 }
 
 fn valid_opaque_identity(value: &str) -> bool {
-    (1..=256).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_graphic())
+    (16..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
 }
 
 fn decode_strict_provider_outcome(
@@ -197,7 +200,9 @@ pub(super) fn causal_witness_from_adapter_evidence(
     if !lifecycle.is_complete_success() {
         return Err(D1RowWriteEvidenceError::LifecycleIncomplete);
     }
-    if target.target_key_sha256() != *plan.target_key_sha256() {
+    let normalized = normalize_d1_target(&target.account_id, &target.database_id)
+        .map_err(|_| D1RowWriteEvidenceError::TargetPlanMismatch)?;
+    if normalized != *target || target.target_key_sha256() != *plan.target_key_sha256() {
         return Err(D1RowWriteEvidenceError::TargetPlanMismatch);
     }
     validate_identities(operation_id, execution_attempt_id, provider_request_id)?;
@@ -273,9 +278,9 @@ mod tests {
         causal_witness_from_adapter_evidence(
             &target(),
             &plan(),
-            "operation-1",
-            "attempt-1",
-            "provider-request-1",
+            "operation-000000001",
+            "attempt-000000001",
+            "provider-request-001",
             &body(),
             D1RowWriteLifecycle::applied(200),
         )
@@ -307,9 +312,9 @@ mod tests {
                 causal_witness_from_adapter_evidence(
                     &target(),
                     &plan(),
-                    "operation-1",
-                    "attempt-1",
-                    "provider-request-1",
+                    "operation-000000001",
+                    "attempt-000000001",
+                    "provider-request-001",
                     &body(),
                     lifecycle,
                 ),
@@ -343,9 +348,9 @@ mod tests {
                 causal_witness_from_adapter_evidence(
                     &target(),
                     &plan(),
-                    "operation-1",
-                    "attempt-1",
-                    "provider-request-1",
+                    "operation-000000001",
+                    "attempt-000000001",
+                    "provider-request-001",
                     &body,
                     D1RowWriteLifecycle::applied(200),
                 ),
@@ -365,9 +370,9 @@ mod tests {
             causal_witness_from_adapter_evidence(
                 &target(),
                 &plan(),
-                "operation-1",
-                "attempt-1",
-                "provider-request-1",
+                "operation-000000001",
+                "attempt-000000001",
+                "provider-request-001",
                 &failure,
                 D1RowWriteLifecycle::applied(200),
             ),
@@ -381,9 +386,9 @@ mod tests {
             causal_witness_from_adapter_evidence(
                 &target(),
                 &plan(),
-                "operation-1",
-                "attempt-1",
-                "provider-request-1",
+                "operation-000000001",
+                "attempt-000000001",
+                "provider-request-001",
                 contradictory,
                 D1RowWriteLifecycle::applied(200),
             ),
@@ -399,9 +404,9 @@ mod tests {
             causal_witness_from_adapter_evidence(
                 &target(),
                 &plan(),
-                "same",
-                "same",
-                "provider-request-1",
+                "operation-000000001",
+                "operation-000000001",
+                "provider-request-001",
                 &body(),
                 D1RowWriteLifecycle::applied(200),
             ),
@@ -412,8 +417,8 @@ mod tests {
                 &target(),
                 &plan(),
                 "operation\n",
-                "attempt-1",
-                "provider-request-1",
+                "attempt-000000001",
+                "provider-request-001",
                 &body(),
                 D1RowWriteLifecycle::applied(200),
             ),
@@ -424,9 +429,9 @@ mod tests {
             causal_witness_from_adapter_evidence(
                 &other,
                 &plan(),
-                "operation-1",
-                "attempt-1",
-                "provider-request-1",
+                "operation-000000001",
+                "attempt-000000001",
+                "provider-request-001",
                 &body(),
                 D1RowWriteLifecycle::applied(200),
             ),
@@ -442,9 +447,9 @@ mod tests {
         let second = causal_witness_from_adapter_evidence(
             &target(),
             &plan(),
-            "operation-1",
-            "attempt-1",
-            "provider-request-1",
+            "operation-000000001",
+            "attempt-000000001",
+            "provider-request-001",
             &changed_body,
             D1RowWriteLifecycle::applied(200),
         )
