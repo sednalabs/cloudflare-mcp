@@ -115,13 +115,13 @@ export class D1RowWriteCoordinatorObject {
     if (input.objectKeySha256 !== await this.#actualObjectKeySha256()) throw new Error("object_key_mismatch");
   }
 
-  #assertStoredBinding(input) {
+  #assertStoredBinding(input, expectedState = "ready") {
     const rows = this.#identityRows();
     if (rows.length === 0) throw new Error("object_not_initialized");
     if (rows.length !== 1 || rows[0].key !== "binding") throw new Error("binding_mismatch");
     let values;
     try { values = JSON.parse(rows[0].value); } catch { throw new Error("binding_mismatch"); }
-    if (rows[0].value !== canonicalBinding(input, values?.state) || values.state !== "ready" || values.entitlementSha256 !== this.#env.GENESIS_ENTITLEMENT_SHA256) throw new Error("object_not_initialized");
+    if (rows[0].value !== canonicalBinding(input, values?.state) || values.state !== expectedState || values.entitlementSha256 !== this.#env.GENESIS_ENTITLEMENT_SHA256) throw new Error("object_not_initialized");
   }
 
   #storeBinding(input) {
@@ -217,8 +217,14 @@ export class D1RowWriteCoordinatorObject {
         if (existingState.state === "ready") {
           if (!this.#genesisExists(input)) throw new Error("recovery_denied");
           this.#assertStoredBinding(input);
+          return jsonResponse(200, { protocolVersion: PROTOCOL_VERSION, decision: "exact_replay" });
         } else if (existingState.state !== "pending" || rows[0].value !== canonicalBinding(input, "pending")) {
           throw new Error("binding_mismatch");
+        } else {
+          if (!this.#genesisExists(input)) throw new Error("recovery_denied");
+          this.#assertStoredBinding(input, "pending");
+          this.#markBindingReady(input);
+          return jsonResponse(200, { protocolVersion: PROTOCOL_VERSION, decision: "exact_replay" });
         }
       }
       if (input.operation !== "initialize_genesis" || input.contract !== GENESIS_CONTRACT || input.protocolVersion !== PROTOCOL_VERSION) throw new Error("unsupported_operation");

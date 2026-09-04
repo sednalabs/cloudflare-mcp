@@ -83,6 +83,7 @@ test("requires privileged genesis and preserves service-only lifecycle across re
   assert.equal((await call(object, SERVICE_PATH, attempt, environment.COORDINATOR_SERVICE_TOKEN)).body.phase, "prepared");
   const restarted = new D1RowWriteCoordinatorObject(state, environment);
   assert.equal((await call(restarted, SERVICE_PATH, attempt, environment.COORDINATOR_SERVICE_TOKEN)).body.decision, "exact_replay");
+  assert.equal((await call(restarted, PROVISION_PATH, genesis, environment.GENESIS_PROVISIONER_TOKEN)).body.decision, "exact_replay");
 });
 
 test("denies public paths, recovery operations, and binding/version mismatches", async () => {
@@ -135,4 +136,15 @@ test("binds service execution to the actual durable-object identity", async () =
   const response = await call(object, SERVICE_PATH, attempt, env.COORDINATOR_SERVICE_TOKEN);
   assert.equal(response.status, 409);
   assert.equal(response.body.error, "object_key_mismatch");
+});
+
+test("promotes a matching pending genesis without replaying external entitlement", async () => {
+  const storage = new SqliteStorage();
+  const environment = testEnv();
+  const object = new D1RowWriteCoordinatorObject({ id: { toString: () => objectId }, storage: { sql: storage } }, environment);
+  assert.equal((await call(object, PROVISION_PATH, genesis, environment.GENESIS_PROVISIONER_TOKEN)).body.decision, "new");
+  storage.database.prepare("UPDATE do_identity SET value = replace(value, '\"ready\"', '\"pending\"') WHERE key = 'binding'").run();
+  const restarted = new D1RowWriteCoordinatorObject({ id: { toString: () => objectId }, storage: { sql: storage } }, environment);
+  assert.equal((await call(restarted, PROVISION_PATH, genesis, environment.GENESIS_PROVISIONER_TOKEN)).body.decision, "exact_replay");
+  assert.equal((await call(restarted, SERVICE_PATH, attempt, environment.COORDINATOR_SERVICE_TOKEN)).body.phase, "prepared");
 });
