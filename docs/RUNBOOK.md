@@ -1509,3 +1509,8 @@ cargo test tools::tests::tool_schema_snapshot_contract_is_stable
 
 CodeQL and static checks are useful guardrails, but MCP stdio/runtime tests are
 the source of truth for tool callability.
+
+The inert D1 row-write Durable Object coordination core is documented in
+[`D1-COORDINATION-DO.md`](D1-COORDINATION-DO.md). It has no route, binding,
+provider capability, or live deployment; do not treat its focused tests as
+proof of a deployed Durable Object.

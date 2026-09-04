@@ -1,0 +1,8 @@
+{
+  "name": "cloudflare-d1-row-write-coordinator",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/coordinator.test.js"
+  }
+}
