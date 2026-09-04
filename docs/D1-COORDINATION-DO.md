@@ -3,9 +3,12 @@
 The D1 mutation safety work needs a narrow architectural reset at the custody
 boundary. Host-local descriptors cannot provide mutual exclusion across MCP
 processes, workstations, restarts, or operators. The reset is deliberately not
-a replacement of D1: D1 remains the relational operational store for audience,
-preferences and exact ledgers; R2 remains durable private evidence custody;
-Analytics Engine remains the measurement plane.
+a mandated replacement of D1: existing relational state remains supported in
+this slice; R2 remains durable private evidence custody; Analytics Engine
+remains the measurement plane. This generic surviving-D1/migration capability
+does not decide whether newsletter audience coordination later moves to an
+Audience Durable Object. Any AudienceDO replacement is a separate architecture
+decision and must not be inferred from this implementation.
 
 This repository contains an inert route-less coordination core and an
 undeployed Durable Object wrapper in `workers/d1-row-write-coordinator`. The
@@ -24,6 +27,23 @@ core of a later Durable Object, with these invariants:
   `applied`, and `applied`/`reconciled` require an adapter witness;
 * every write is immediately checked by stable SQLite readback.
 
+The wrapper's `execute_d1` service operation is the first complete provider
+lifecycle seam. It requires an exact versioned plan, separate consent digest,
+and pairwise-distinct operation/attempt/request identities. It commits
+`dispatch_reserved` in `transactionSync()` before invoking `D1_DATABASE` once,
+with at most 100 bound parameters using a closed type-tagged canonical
+encoding,
+then re-reads durable state after the awaited provider and private
+`D1_EVIDENCE_BUCKET` R2 custody write. Only a strict primary-served D1 result
+with derived response and evidence digests plus terminal compare-and-readback
+can become `applied` (or `not_applied` for a primary zero-change response).
+Documented optional D1 metadata is accepted only through an explicit closed
+whitelist and type checks; unknown metadata remains ambiguous. Provider errors, response loss, incomplete or malformed
+evidence, R2 failure, state drift and CAS uncertainty become
+`reconciliation_required`. Exact replay returns the stored aggregate result
+without redispatch or another evidence write. `providerCalls` and
+`providerEffect` retain zero/one/unknown accounting.
+
 The core does not make an external D1 operation atomic. A lost or ambiguous
 provider response must remain reconciliation-required and must never trigger an
 automatic retry. A future adapter must persist dispatch reservation before
@@ -39,6 +59,13 @@ use the current official API and a reviewed `new_sqlite_classes` migration:
 
 No Worker version, binding, route, credential, provider, or live resource is
 created by this slice.
+
+The lifecycle bindings are intentionally not wired into the Rust MCP tool in
+this slice. The existing generic `d1_execute_write` MCP operation remains
+retired until a separately reviewed authenticated MCP-to-internal-DO adapter,
+deployment, and live readback exist. This implementation proves the DO-to-D1/
+R2 boundary with synthetic bindings only; it does not authorize a provider
+mutation, audience change, recipient operation, or send.
 
 `initializeGenesis` is an inert protocol primitive, not an entitlement issuer.
 The future activation cutline must separately provide authenticated execution
