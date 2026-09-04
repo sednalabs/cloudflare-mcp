@@ -9,7 +9,7 @@ import {
 
 class SqliteStorage {
   constructor(database = new DatabaseSync(":memory:")) { this.database = database; }
-  exec(query, bindings = []) {
+  exec(query, ...bindings) {
     const statements = query.split(";").map((s) => s.trim()).filter(Boolean);
     let result;
     for (const statement of statements) {
