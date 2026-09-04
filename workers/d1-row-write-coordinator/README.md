@@ -5,6 +5,20 @@ Durable Object backed by SQLite. It deliberately has no `fetch` handler,
 Wrangler configuration, binding, authentication ingress, provider capability,
 queue, workflow, R2, Analytics Engine, D1, recipient data, or MCP wiring.
 
+`src/durable-object.js` provides the next, still undeployed, Durable Object
+class. Its two internal-only paths require separate bearer credentials: the
+ordinary service path can open an existing binding and advance non-terminal
+coordination states, while the privileged provisioning path alone may establish
+genesis. There is no default Worker export or public route.
+
+The class requires deployment-time configuration for opaque namespace, binding,
+class, object-key, recovery-epoch, and genesis-entitlement SHA-256 values, plus
+separate service and provisioner credentials. These values are intentionally
+not supplied here. Every request must carry the matching opaque binding tuple;
+an empty/replacement object, stale recovery epoch, version mismatch, unknown
+operation, deletion, rewind, replacement, reset, or recovery request fails
+closed. Ordinary service requests never call `initializeGenesis`.
+
 The core records only opaque SHA-256 identities and a versioned genesis. It
 serializes one active attempt per target and generation, distinguishes exact
 replay from conflicting replay, and requires an adapter witness before an

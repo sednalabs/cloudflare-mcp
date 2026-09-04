@@ -7,9 +7,11 @@ a replacement of D1: D1 remains the relational operational store for audience,
 preferences and exact ledgers; R2 remains durable private evidence custody;
 Analytics Engine remains the measurement plane.
 
-This repository contains an inert route-less coordination core in
-`workers/d1-row-write-coordinator`. It is intended to be the SQLite state core
-of a later Durable Object, with these invariants:
+This repository contains an inert route-less coordination core and an
+undeployed Durable Object wrapper in `workers/d1-row-write-coordinator`. The
+wrapper has separate ordinary-service and privileged-genesis paths, but no
+default Worker export or public route. It is intended to be the SQLite state
+core of a later Durable Object, with these invariants:
 
 * an externally authorised target generation is initialized exactly once;
 * target and generation are represented only by opaque SHA-256 values;
@@ -45,3 +47,14 @@ open-existing only, and must deny deletion, rewind, replacement, and
 unauthorised recovery. Until those gates are independently reviewed and
 read-backed, this core remains development-only and cannot authorize a live
 mutation.
+
+The undeployed wrapper requires two separate authenticated paths. The ordinary
+service path accepts only non-terminal coordination operations against an
+already-bound object. A distinct provisioner credential and an externally
+entitled opaque receipt are required before genesis can be established. Both
+paths require exact opaque class, namespace, binding, object-key, recovery-epoch
+and schema-version bindings. Missing or replaced state, stale epoch, PITR or
+recovery ambiguity, deletion, rewind, replacement and unknown operations fail
+closed. The package contains no default Worker export or public route; a future
+deployment must add a reviewed internal service binding and `new_sqlite_classes`
+migration separately.
