@@ -6,6 +6,8 @@ pub mod client;
 pub(crate) mod d1_catalog;
 #[allow(dead_code)] // staged low-level boundary; lifecycle consumers are intentionally out of scope
 pub(crate) mod d1_import_upload;
+#[allow(dead_code)] // staged strict response/witness boundary; no provider call or route yet
+pub(crate) mod d1_row_write;
 mod email_routing;
 pub mod model;
 mod pages;
