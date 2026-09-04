@@ -213,11 +213,12 @@ cannot reconcile or retire bootstrap-family custody.
 ### Shared existing-target mutation guard
 
 Configure `CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT` for every MCP process that
-can run curated D1 rename, delete, row-write, bootstrap, or manifest mutation.
+can run curated D1 rename, delete, bootstrap, or manifest mutation.
 The name is retained for compatibility, but the directory is now the shared
-account/database target-guard root. Rename, delete and row-write acquire the
-same permanent `guard.lock` as bootstrap and manifest apply immediately before
-provider dispatch. A same-target contention or retained active/retiring lease
+account/database target-guard root. Rename and delete acquire the same
+permanent `guard.lock` as bootstrap and manifest apply immediately before
+provider dispatch. Generic row-write execution is retired before guard access.
+A same-target contention or retained active/retiring lease
 is a stop condition; a different database target is independent. A guard
 failure reports the invoked curated tool as its operation and zero provider
 calls/mutations; preserve that caller-correlated receipt when diagnosing the

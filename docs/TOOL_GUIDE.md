@@ -70,7 +70,7 @@ Use curated D1 tools instead of generic API calls for database workflows:
 - `d1_inspect_schema`
 - `d1_validate_query`
 - `d1_query_read_only`
-- `d1_execute_write`
+- `d1_execute_write` (dry-run planning only; live execution is retired)
 - `d1_apply_migrations` (dry-run inspection only; live mutation is retired)
 - `d1_bootstrap_migration_ledger`
 - `d1_reconcile_bootstrap_migration_ledger`
@@ -83,7 +83,9 @@ Use curated D1 tools instead of generic API calls for database workflows:
 - `d1_delete_database`
 
 Read/query tools use restricted SQL checks. Write and migration tools preserve
-dry-run discipline and fail closed on unsafe or ambiguous state. Use
+dry-run discipline and fail closed on unsafe or ambiguous state. The generic
+`d1_execute_write` tool refuses live execution until its complete guarded
+lifecycle is commissioned. Use
 `d1_apply_migration_manifest` for every live migration; the legacy
 directory-backed `d1_apply_migrations` tool refuses live mutation.
 The exact family `migration-ledger-bootstrap-v1` belongs only to the dedicated
@@ -97,7 +99,7 @@ identity and one physical target guard namespace:
 | --- | --- |
 | `d1_rename_database` | shared permanent target guard |
 | `d1_delete_database` | shared permanent target guard |
-| `d1_execute_write` | shared permanent target guard |
+| `d1_execute_write` | dry-run planning only; live execution retired before guard/provider access |
 | `d1_bootstrap_migration_ledger` | durable lease under that target guard |
 | `d1_apply_migration_manifest` | durable lease under that target guard |
 | `d1_apply_migrations` live mode | denied/retired |
