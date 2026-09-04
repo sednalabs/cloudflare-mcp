@@ -19,6 +19,7 @@ const DENIED_OPERATIONS = new Set([
   "recover",
   "reset",
 ]);
+const RECOVERY_OPERATIONS = new Set(["delete", "rewind", "replace", "recover", "reset"]);
 
 function requireHash(value, name) {
   if (typeof value !== "string" || !HASH.test(value)) throw new Error(`${name}_must_be_opaque_sha256`);
@@ -209,6 +210,8 @@ export class D1RowWriteCoordinatorObject {
       await this.#assertRequestBinding(input);
       requireHash(input.entitlementSha256, "entitlement_sha256");
       if (input.entitlementSha256 !== this.#env.GENESIS_ENTITLEMENT_SHA256) throw new Error("entitlement_mismatch");
+      if (RECOVERY_OPERATIONS.has(input.operation)) throw new Error("recovery_denied");
+      if (input.operation !== "initialize_genesis" || input.contract !== GENESIS_CONTRACT || input.protocolVersion !== PROTOCOL_VERSION) throw new Error("unsupported_operation");
       const rows = this.#identityRows();
       let existingState = null;
       if (rows.length !== 0) {
@@ -227,7 +230,6 @@ export class D1RowWriteCoordinatorObject {
           return jsonResponse(200, { protocolVersion: PROTOCOL_VERSION, decision: "exact_replay" });
         }
       }
-      if (input.operation !== "initialize_genesis" || input.contract !== GENESIS_CONTRACT || input.protocolVersion !== PROTOCOL_VERSION) throw new Error("unsupported_operation");
       await this.#verifyEntitlement(input);
       if (rows.length === 0) this.#storeBinding(input, "pending");
       const result = this.#coordinator.initializeGenesis(input);

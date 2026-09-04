@@ -84,6 +84,7 @@ test("requires privileged genesis and preserves service-only lifecycle across re
   const restarted = new D1RowWriteCoordinatorObject(state, environment);
   assert.equal((await call(restarted, SERVICE_PATH, attempt, environment.COORDINATOR_SERVICE_TOKEN)).body.decision, "exact_replay");
   assert.equal((await call(restarted, PROVISION_PATH, genesis, environment.GENESIS_PROVISIONER_TOKEN)).body.decision, "exact_replay");
+  assert.equal((await call(restarted, PROVISION_PATH, { ...genesis, operation: "delete" }, environment.GENESIS_PROVISIONER_TOKEN)).body.error, "recovery_denied");
 });
 
 test("denies public paths, recovery operations, and binding/version mismatches", async () => {
