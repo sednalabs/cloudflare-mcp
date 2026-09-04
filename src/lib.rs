@@ -43,6 +43,8 @@ pub(crate) mod d1_target_wide_mutation;
 pub(crate) mod d1_target_wide_observation;
 #[allow(dead_code)] // staged local authorization; dispatch reservation is a separate boundary
 pub(crate) mod d1_target_wide_owner_audit;
+#[allow(dead_code)] // staged pure eligibility; CAS/terminal install is a later boundary
+pub(crate) mod d1_target_wide_terminal_eligibility;
 pub mod dns_route;
 pub mod mutation;
 pub(crate) mod pages_deploy;
