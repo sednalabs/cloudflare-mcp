@@ -5321,6 +5321,90 @@
       "description": "Query Workers Observability events.",
       "inputSchema": {
         "$defs": {
+          "WorkersObservabilityFilter": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WorkersObservabilityFilterGroup"
+              },
+              {
+                "$ref": "#/$defs/WorkersObservabilityFilterLeaf"
+              }
+            ],
+            "description": "A documented Workers Observability filter expression.\n\nCloudflare accepts either a leaf comparison or a nested logical group.  Keep\nthis typed at the MCP boundary so callers supply JSON objects, not a JSON\nstring that happens to contain an object."
+          },
+          "WorkersObservabilityFilterGroup": {
+            "properties": {
+              "filterCombination": {
+                "type": "string"
+              },
+              "filters": {
+                "items": {
+                  "$ref": "#/$defs/WorkersObservabilityFilter"
+                },
+                "type": "array"
+              },
+              "kind": {
+                "description": "Cloudflare's discriminator for a nested logical group.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "filterCombination",
+              "filters"
+            ],
+            "type": "object"
+          },
+          "WorkersObservabilityFilterLeaf": {
+            "properties": {
+              "key": {
+                "type": "string"
+              },
+              "kind": {
+                "default": null,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "operation": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              },
+              "value": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/WorkersObservabilityFilterValue"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null
+              }
+            },
+            "required": [
+              "key",
+              "operation",
+              "type"
+            ],
+            "type": "object"
+          },
+          "WorkersObservabilityFilterValue": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              }
+            ]
+          },
           "WorkersObservabilityTimeframe": {
             "properties": {
               "from": {
@@ -5366,7 +5450,9 @@
           },
           "filters": {
             "default": [],
-            "items": true,
+            "items": {
+              "$ref": "#/$defs/WorkersObservabilityFilter"
+            },
             "type": "array"
           },
           "limit": {
