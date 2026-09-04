@@ -52,9 +52,10 @@ function jsonResponse(status, body) {
 }
 
 function errorStatus(error) {
-  if (/^(invalid_|.*_required|.*_must_|attempt_input_required)/.test(error.message)) return 400;
-  if (/^(genesis_not_authorized|object_not_initialized|binding_mismatch|protocol_mismatch|namespace_mismatch|object_key_mismatch|class_mismatch|recovery_epoch_mismatch|recovery_sequence_mismatch|entitlement_mismatch|entitlement_invalid|entitlement_authority_|unsupported_operation|recovery_denied|adapter_witness_required)/.test(error.message)) return 409;
-  if (/conflict|active_attempt|replay|transition/.test(error.message)) return 409;
+  const message = error instanceof Error ? error.message : String(error ?? "unknown_error");
+  if (/^(invalid_|.*_required|.*_must_|attempt_input_required)/.test(message)) return 400;
+  if (/^(genesis_not_authorized|object_not_initialized|binding_mismatch|protocol_mismatch|namespace_mismatch|object_key_mismatch|class_mismatch|recovery_epoch_mismatch|recovery_sequence_mismatch|entitlement_mismatch|entitlement_invalid|entitlement_authority_|unsupported_operation|recovery_denied|adapter_witness_required)/.test(message)) return 409;
+  if (/conflict|active_attempt|replay|transition/.test(message)) return 409;
   return 500;
 }
 
@@ -199,7 +200,7 @@ export class D1RowWriteCoordinatorObject {
       if (input.operation === "reserve_dispatch") return jsonResponse(200, this.#coordinator.reserveDispatch(input));
       return jsonResponse(200, this.#coordinator.observeResponse(input));
     } catch (error) {
-      return jsonResponse(errorStatus(error), { error: error.message });
+      return jsonResponse(errorStatus(error), { error: error instanceof Error ? error.message : String(error ?? "unknown_error") });
     }
   }
 
@@ -236,7 +237,7 @@ export class D1RowWriteCoordinatorObject {
       this.#markBindingReady(input);
       return jsonResponse(200, result);
     } catch (error) {
-      return jsonResponse(errorStatus(error), { error: error.message });
+      return jsonResponse(errorStatus(error), { error: error instanceof Error ? error.message : String(error ?? "unknown_error") });
     }
   }
 
