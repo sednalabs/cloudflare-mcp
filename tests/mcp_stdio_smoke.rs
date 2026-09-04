@@ -18049,7 +18049,7 @@ fn d1_delete_database_requires_token_and_deletes_through_stdio_boundary() {
 }
 
 #[test]
-fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
+fn d1_execute_write_dry_run_stays_useful_and_live_is_retired_pre_provider() {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     let (base_url, requests) = spawn_fake_d1_database_mutation_api(1);
@@ -18072,8 +18072,30 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
             lease_root.to_string_lossy().to_string(),
         ),
     ]);
-    let response = mcp.call_tool(
+    let dry_run = mcp.call_tool(
         2,
+        "d1_execute_write",
+        json!({
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "sql": "UPDATE example SET enabled = 1 WHERE id = 7",
+            "dry_run": true
+        }),
+    );
+    let dry_content = structured_content(&dry_run);
+    assert_eq!(dry_content["ok"], json!(true), "{dry_content}");
+    assert_eq!(
+        dry_content["plan"]["database_id"],
+        json!("123e4567-e89b-42d3-a456-426614174000")
+    );
+    assert_eq!(
+        dry_content["plan"]["target_key_sha256"],
+        json!(sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000"))
+    );
+    assert_eq!(dry_content["plan"]["statement_kind"], json!("UPDATE"));
+    assert_eq!(requests.lock().expect("request log lock").len(), 0);
+
+    let response = mcp.call_tool(
+        3,
         "d1_execute_write",
         json!({
             "database_id": "123e4567-e89b-42d3-a456-426614174000",
@@ -18082,25 +18104,25 @@ fn d1_execute_write_uses_shared_target_guard_through_stdio_boundary() {
         }),
     );
     let content = structured_content(&response);
-    assert_eq!(content["ok"], json!(true), "{content}");
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["status"], json!("retired"), "{content}");
+    assert_eq!(
+        content["capability_state"],
+        json!("unavailable"),
+        "{content}"
+    );
+    assert_eq!(content["error"]["code"], json!("d1.execute_write_retired"));
+    assert_eq!(content["provider_calls"], json!(0));
+    assert_eq!(content["provider_mutations"], json!(0));
+    assert_eq!(content["request_constructed"], json!(false));
     assert_eq!(
         content["plan"]["database_id"],
         json!("123e4567-e89b-42d3-a456-426614174000")
     );
-    assert_eq!(
-        content["plan"]["target_key_sha256"],
-        json!(sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000"))
-    );
     let requests = requests.lock().expect("request log lock");
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0]["method"], json!("POST"));
-    assert_eq!(
-        requests[0]["path"],
-        json!("/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query")
-    );
-    assert_eq!(
-        requests[0]["body"]["sql"],
-        json!("UPDATE example SET enabled = 1 WHERE id = 7")
+    assert!(
+        requests.is_empty(),
+        "retired live path must not contact provider"
     );
     drop(requests);
     mcp.terminate();
@@ -18204,9 +18226,14 @@ fn curated_d1_guard_denials_are_pre_provider_and_caller_correlated() {
         let content = structured_content(&response);
         assert_eq!(content["ok"], json!(false), "{operation}: {content}");
         assert_eq!(content["operation"], json!(operation), "{content}");
+        let expected_code = if operation == "d1_execute_write" {
+            "d1.execute_write_retired"
+        } else {
+            "d1.target_guard_locked"
+        };
         assert_eq!(
             content["error"]["code"],
-            json!("d1.target_guard_locked"),
+            json!(expected_code),
             "{operation}: {content}"
         );
         assert_eq!(content["provider_calls"], json!(0), "{content}");

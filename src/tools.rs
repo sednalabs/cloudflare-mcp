@@ -4438,37 +4438,28 @@ impl CloudflareMcp {
                 },
             })));
         }
-        let guard =
-            match acquire_d1_target_mutation_guard("d1_execute_write", account_id, database_id) {
-                Ok(guard) => guard,
-                Err(result) => return Ok(result),
-            };
-        if let Err(result) = guard.revalidate() {
-            return Ok(result);
-        }
-        match self
-            .cloudflare
-            .execute_d1_database_write(account_id, database_id, &args.sql, &args.params)
-            .await
-        {
-            Ok(result) => {
-                let (result, truncated) = limit_d1_result_rows(result, max_rows);
-                Ok(CallToolResult::structured(json!({
-                    "ok": true,
-                    "operation": "d1_execute_write",
-                    "plan": plan,
-                    "policy": {
-                        "d1_write_sql": true,
-                        "allowed_statement_kinds": D1_WRITE_ALLOWED_KINDS,
-                        "single_statement": true,
-                        "max_rows": max_rows,
-                    },
-                    "truncated": truncated,
-                    "result": result,
-                })))
+
+        // This generic row-write route has no complete guarded lifecycle for
+        // admission, custody, reconciliation, and terminal proof. Keep the
+        // deterministic dry-run plan useful, but retire live execution before
+        // acquiring a guard or touching the provider so callers cannot mistake
+        // the old target lock for authorization to mutate D1.
+        Ok(CallToolResult::structured_error(json!({
+            "ok": false,
+            "operation": "d1_execute_write",
+            "status": "retired",
+            "capability_state": "unavailable",
+            "dry_run": false,
+            "plan": plan,
+            "provider_calls": 0,
+            "provider_mutations": 0,
+            "request_constructed": false,
+            "error": {
+                "code": "d1.execute_write_retired",
+                "message": "the complete guarded D1 row-write lifecycle is not yet commissioned; no provider request was issued",
+                "hint": "Use dry_run=true to produce a deterministic plan. Use a governed curated D1 lifecycle for live writes; do not use this generic row-write surface."
             }
-            Err(err) => Ok(adapter_error_result(err)),
-        }
+        })))
     }
 
     #[tool(
