@@ -39,6 +39,8 @@ pub(crate) mod d1_target;
 pub(crate) mod d1_target_wide_apply_lifecycle;
 pub(crate) mod d1_target_wide_attempt_custody;
 pub(crate) mod d1_target_wide_mutation;
+#[allow(dead_code)] // staged non-causal observation; terminal eligibility is a later boundary
+pub(crate) mod d1_target_wide_observation;
 #[allow(dead_code)] // staged local authorization; dispatch reservation is a separate boundary
 pub(crate) mod d1_target_wide_owner_audit;
 pub mod dns_route;

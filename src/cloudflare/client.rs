@@ -642,6 +642,63 @@ struct StrictD1DatabaseDeleteEnvelope {
     messages: Vec<StrictD1DatabaseMutationResponseInfo>,
 }
 
+/// Strict aggregate state observed by the target-wide observation boundary.  It
+/// deliberately carries no mutation or terminal authority.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) enum D1DatabaseObservationState {
+    Present {
+        uuid: String,
+        name: String,
+        version: Option<String>,
+    },
+    Absent,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct D1DatabaseObservationRead {
+    pub(crate) state: D1DatabaseObservationState,
+    pub(crate) response_body_sha256: String,
+    pub(crate) response_body_size_bytes: usize,
+    pub(crate) lifecycle: D1MigrationReconciliationReadLifecycle,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct D1DatabaseObservationReadError {
+    pub(crate) error: AdapterErrorPayload,
+    pub(crate) response_body_sha256: Option<String>,
+    pub(crate) response_body_size_bytes: Option<usize>,
+    pub(crate) lifecycle: D1MigrationReconciliationReadLifecycle,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictD1DatabaseObservationEnvelope {
+    success: bool,
+    result: Option<Value>,
+    errors: Value,
+    messages: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StrictD1DatabaseObservationResult {
+    uuid: String,
+    name: String,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    file_size: Option<f64>,
+    #[serde(default)]
+    num_tables: Option<f64>,
+    #[serde(default)]
+    jurisdiction: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "read_replication")]
+    _read_replication: Option<Value>,
+}
+
 #[derive(Debug, Deserialize, PartialEq, Eq, Hash)]
 #[serde(deny_unknown_fields)]
 struct StrictD1DatabaseMutationResponseInfo {
@@ -846,6 +903,179 @@ impl CloudflareClient {
                 "Cloudflare returned success without a D1 database result",
                 "Verify D1 database response schema.",
             )
+        })
+    }
+
+    /// Read one target-wide database state through the bounded, authenticated,
+    /// no-redirect reconciliation client.  A complete present response or the
+    /// exact 7404 absence envelope is observation evidence only; no mutation or
+    /// terminal authority is implied.
+    pub(crate) async fn read_d1_database_for_observation(
+        &self,
+        account_id: &str,
+        database_id: &str,
+    ) -> Result<D1DatabaseObservationRead, D1DatabaseObservationReadError> {
+        let pre_dispatch = |error: AdapterError| D1DatabaseObservationReadError {
+            error: error.payload(),
+            response_body_sha256: None,
+            response_body_size_bytes: None,
+            lifecycle: D1MigrationReconciliationReadLifecycle::pre_dispatch(),
+        };
+        let account_id = require_non_empty("account_id", account_id).map_err(pre_dispatch)?;
+        let database_id = require_non_empty("database_id", database_id).map_err(pre_dispatch)?;
+        let token = self.bearer_token().map_err(pre_dispatch)?;
+        let url = self.endpoint(&format!(
+            "/accounts/{}/d1/database/{}",
+            path_segment(account_id),
+            path_segment(database_id),
+        ));
+        let request = self
+            .reconciliation_http
+            .get(url)
+            .bearer_auth(&token)
+            .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone())
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .build()
+            .map_err(|error| {
+                pre_dispatch(AdapterError::new(
+                    "cloudflare.request_build_failed",
+                    format!("Cloudflare D1 observation read request build failed: {error}"),
+                    "Retain observation as unavailable; no provider request was dispatched.",
+                ))
+            })?;
+        let response = self
+            .reconciliation_http
+            .execute(request)
+            .await
+            .map_err(|error| D1DatabaseObservationReadError {
+                error: AdapterError::new(
+                    if error.is_timeout() {
+                        "cloudflare.timeout"
+                    } else {
+                        "cloudflare.transport_error"
+                    },
+                    format!("Cloudflare D1 observation read failed: {error}"),
+                    "Retain observation as unavailable; provider state was not observed exactly.",
+                )
+                .with_retryable(false)
+                .payload(),
+                response_body_sha256: None,
+                response_body_size_bytes: None,
+                lifecycle: D1MigrationReconciliationReadLifecycle::attempted_without_response(),
+            })?;
+        let status = response.status();
+        let status_code = status.as_u16();
+        let identity_encoded = response
+            .headers()
+            .get_all(reqwest::header::CONTENT_ENCODING)
+            .iter()
+            .all(|value| {
+                value.to_str().ok().is_some_and(|value| {
+                    value
+                        .split(',')
+                        .all(|encoding| encoding.trim().eq_ignore_ascii_case("identity"))
+                })
+            });
+        if !identity_encoded {
+            return Err(D1DatabaseObservationReadError {
+                error: AdapterError::new(
+                    "cloudflare.d1.database_observation_unsupported_content_encoding",
+                    "Cloudflare D1 observation read used a non-identity content encoding",
+                    "Retain observation as unavailable; provider state was not observed exactly.",
+                )
+                .with_status(Some(status_code))
+                .payload(),
+                response_body_sha256: None,
+                response_body_size_bytes: None,
+                lifecycle: D1MigrationReconciliationReadLifecycle::response_received(status_code),
+            });
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > D1_MIGRATION_RESPONSE_MAX_BYTES as u64)
+        {
+            return Err(D1DatabaseObservationReadError {
+                error: AdapterError::new(
+                    "cloudflare.d1.database_observation_response_too_large",
+                    "Cloudflare D1 observation response exceeded the exact-evidence byte limit",
+                    "Retain observation as unavailable; provider state was not observed exactly.",
+                )
+                .with_status(Some(status_code))
+                .payload(),
+                response_body_sha256: None,
+                response_body_size_bytes: response
+                    .content_length()
+                    .map(|length| usize::try_from(length).unwrap_or(usize::MAX)),
+                lifecycle: D1MigrationReconciliationReadLifecycle::response_received(status_code),
+            });
+        }
+        let mut bytes = Vec::with_capacity(
+            response
+                .content_length()
+                .map(|length| cmp::min(length as usize, D1_MIGRATION_RESPONSE_MAX_BYTES))
+                .unwrap_or(0),
+        );
+        let mut hasher = Sha256::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| D1DatabaseObservationReadError {
+                error: AdapterError::new(
+                    "cloudflare.response_read_failed",
+                    format!("failed reading Cloudflare D1 observation response: {error}"),
+                    "Retain observation as unavailable; provider state was not observed exactly.",
+                )
+                .with_status(Some(status_code))
+                .with_retryable(false)
+                .payload(),
+                response_body_sha256: None,
+                response_body_size_bytes: Some(bytes.len()),
+                lifecycle: D1MigrationReconciliationReadLifecycle::body_read_failed(
+                    status_code,
+                    bytes.len(),
+                ),
+            })?;
+            let observed_size = bytes.len().saturating_add(chunk.len());
+            if observed_size > D1_MIGRATION_RESPONSE_MAX_BYTES {
+                return Err(D1DatabaseObservationReadError {
+                    error: AdapterError::new(
+                        "cloudflare.d1.database_observation_response_too_large",
+                        "Cloudflare D1 observation response exceeded the exact-evidence byte limit",
+                        "Retain observation as unavailable; provider state was not observed exactly.",
+                    )
+                    .with_status(Some(status_code))
+                    .payload(),
+                    response_body_sha256: None,
+                    response_body_size_bytes: Some(observed_size),
+                    lifecycle: D1MigrationReconciliationReadLifecycle::body_partially_read(
+                        status_code,
+                    ),
+                });
+            }
+            hasher.update(&chunk);
+            bytes.extend_from_slice(&chunk);
+        }
+        let response_body_sha256 = format!("{:x}", hasher.finalize());
+        let response_body_size_bytes = bytes.len();
+        let evidence_error = |error: AdapterError| D1DatabaseObservationReadError {
+            error: error.with_retryable(false).payload(),
+            response_body_sha256: Some(response_body_sha256.clone()),
+            response_body_size_bytes: Some(response_body_size_bytes),
+            lifecycle: D1MigrationReconciliationReadLifecycle::body_completely_read(status_code),
+        };
+        let body = std::str::from_utf8(&bytes).map_err(|_| {
+            evidence_error(AdapterError::new(
+                "cloudflare.d1.database_observation_malformed_utf8",
+                "Cloudflare D1 observation response was not valid UTF-8",
+                "Retain observation as unavailable; provider evidence was malformed.",
+            ))
+        })?;
+        let state = decode_strict_d1_database_observation_envelope(body, status, database_id)
+            .map_err(evidence_error)?;
+        Ok(D1DatabaseObservationRead {
+            state,
+            response_body_sha256,
+            response_body_size_bytes,
+            lifecycle: D1MigrationReconciliationReadLifecycle::body_completely_read(status_code),
         })
     }
 
@@ -4762,6 +4992,75 @@ fn classify_d1_migration_provider_error(
         category,
         location,
     })
+}
+
+fn decode_strict_d1_database_observation_envelope(
+    body: &str,
+    status: StatusCode,
+    expected_database_id: &str,
+) -> Result<D1DatabaseObservationState, AdapterError> {
+    let malformed = || {
+        AdapterError::new(
+            "cloudflare.d1.database_observation_malformed_envelope",
+            "Cloudflare D1 observation response did not match the exact readback envelope",
+            "Retain observation as unavailable; provider evidence was malformed or insufficient.",
+        )
+        .with_status(Some(status.as_u16()))
+    };
+    let value = decode_json_rejecting_duplicate_object_keys(body).map_err(|_| malformed())?;
+    let envelope: StrictD1DatabaseObservationEnvelope =
+        serde_json::from_value(value).map_err(|_| malformed())?;
+    if !matches!(&envelope.messages, Value::Array(values) if values.is_empty()) {
+        return Err(malformed());
+    }
+    if status.is_success() {
+        if !envelope.success
+            || !matches!(&envelope.errors, Value::Array(values) if values.is_empty())
+        {
+            return Err(malformed());
+        }
+        let result: StrictD1DatabaseObservationResult =
+            serde_json::from_value(envelope.result.ok_or_else(malformed)?)
+                .map_err(|_| malformed())?;
+        if result.uuid != expected_database_id
+            || result.name.is_empty()
+            || result.name.trim() != result.name
+            || result.created_at.as_deref().is_some_and(str::is_empty)
+            || result.version.as_deref().is_some_and(str::is_empty)
+            || result
+                .file_size
+                .is_some_and(|value| !value.is_finite() || value < 0.0)
+            || result
+                .num_tables
+                .is_some_and(|value| !value.is_finite() || value < 0.0)
+            || result.jurisdiction.as_deref().is_some_and(str::is_empty)
+        {
+            return Err(malformed());
+        }
+        return Ok(D1DatabaseObservationState::Present {
+            uuid: result.uuid,
+            name: result.name,
+            version: result.version,
+        });
+    }
+    if status == StatusCode::NOT_FOUND && !envelope.success && envelope.result.is_none() {
+        let errors =
+            serde_json::from_value::<Vec<StrictD1DatabaseMutationResponseInfo>>(envelope.errors)
+                .map_err(|_| malformed())?;
+        let mut unique = HashSet::with_capacity(errors.len());
+        if errors.len() == 1
+            && errors.iter().all(|error| error.code.as_u64() == Some(7404))
+            && errors.iter().all(|error| unique.insert(error))
+        {
+            return Ok(D1DatabaseObservationState::Absent);
+        }
+    }
+    Err(AdapterError::new(
+        "cloudflare.d1.database_observation_unavailable",
+        "Cloudflare D1 observation read did not prove present or exact 7404 absence",
+        "Retain observation as unavailable; do not infer target state from this response.",
+    )
+    .with_status(Some(status.as_u16())))
 }
 
 const D1_MIGRATION_PROVIDER_ERROR_MESSAGE_SCAN_MAX_BYTES: usize = 4 * 1024;
