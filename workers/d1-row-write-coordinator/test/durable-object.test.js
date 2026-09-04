@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { generateKeyPairSync, sign } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { GENESIS_CONTRACT, PROTOCOL_VERSION } from "../src/index.js";
@@ -18,6 +19,8 @@ class SqliteStorage {
 }
 
 const h = (character) => character.repeat(64);
+const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+const publicKeyBytes = publicKey.export({ type: "spki", format: "der" }).subarray(-32);
 const env = {
   COORDINATOR_SERVICE_TOKEN: "service-test-token",
   GENESIS_PROVISIONER_TOKEN: "provisioner-test-token",
@@ -27,13 +30,21 @@ const env = {
   COORDINATOR_CLASS_SHA256: h("1"),
   COORDINATOR_RECOVERY_EPOCH_SHA256: h("2"),
   GENESIS_ENTITLEMENT_SHA256: h("3"),
+  GENESIS_ENTITLEMENT_PUBLIC_KEY: publicKeyBytes.toString("base64"),
+  COORDINATOR_RECOVERY_SEQUENCE: "1",
   COORDINATOR_SCHEMA_VERSION: "1",
 };
 const genesis = {
   operation: "initialize_genesis", contract: GENESIS_CONTRACT, protocolVersion: PROTOCOL_VERSION,
   targetKeySha256: h("a"), generationSha256: h("9"), authoritySha256: h("c"), genesisSha256: h("d"),
-  namespaceSha256: h("e"), bindingSha256: h("b"), objectKeySha256: h("f"), classSha256: h("1"), recoveryEpochSha256: h("2"), entitlementSha256: h("3"),
+  namespaceSha256: h("e"), bindingSha256: h("b"), objectKeySha256: h("f"), classSha256: h("1"), recoveryEpochSha256: h("2"), recoverySequence: 1, entitlementSha256: h("3"),
 };
+genesis.entitlementSignature = sign(null, Buffer.from([
+  GENESIS_CONTRACT, PROTOCOL_VERSION, genesis.targetKeySha256, genesis.generationSha256,
+  genesis.authoritySha256, genesis.genesisSha256, genesis.namespaceSha256,
+  genesis.bindingSha256, genesis.objectKeySha256, genesis.classSha256,
+  genesis.recoveryEpochSha256, genesis.recoverySequence, genesis.entitlementSha256,
+].join("|")), privateKey).toString("base64");
 const attempt = {
   ...genesis, operation: "prepare", planSha256: h("8"), operationIdSha256: h("1"),
   executionAttemptIdSha256: h("2"), providerRequestIdSha256: h("3"),
@@ -64,6 +75,7 @@ test("denies public paths, recovery operations, and binding/version mismatches",
   assert.equal((await call(object, "/public", attempt, env.COORDINATOR_SERVICE_TOKEN)).status, 404);
   assert.equal((await call(object, SERVICE_PATH, { ...attempt, operation: "delete" }, env.COORDINATOR_SERVICE_TOKEN)).status, 409);
   assert.equal((await call(object, PROVISION_PATH, { ...genesis, namespaceSha256: h("0") }, env.GENESIS_PROVISIONER_TOKEN)).status, 409);
+  assert.equal((await call(object, PROVISION_PATH, { ...genesis, entitlementSignature: Buffer.alloc(64).toString("base64") }, env.GENESIS_PROVISIONER_TOKEN)).body.error, "entitlement_invalid");
   assert.equal((await call(object, PROVISION_PATH, genesis, env.COORDINATOR_SERVICE_TOKEN)).status, 401);
   assert.equal((await call(object, SERVICE_PATH, { ...attempt, namespaceSha256: h("0") }, env.COORDINATOR_SERVICE_TOKEN)).status, 409);
   assert.equal((await call(object, SERVICE_PATH, { ...attempt, classSha256: h("0") }, env.COORDINATOR_SERVICE_TOKEN)).status, 409);
@@ -81,6 +93,8 @@ test("serializes two service instances and denies rewind or replacement", async 
   for (const operation of ["rewind", "replace", "recover", "reset"]) {
     assert.equal((await call(second, SERVICE_PATH, { ...attempt, operation }, env.COORDINATOR_SERVICE_TOKEN)).body.error, "recovery_denied");
   }
+  storage.database.prepare("DELETE FROM genesis").run();
+  assert.equal((await call(second, PROVISION_PATH, genesis, env.GENESIS_PROVISIONER_TOKEN)).body.error, "recovery_denied");
 });
 
 test("rejects a version-overlap object before accepting service requests", async () => {
