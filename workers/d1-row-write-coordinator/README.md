@@ -12,12 +12,15 @@ coordination states, while the privileged provisioning path alone may establish
 genesis. There is no default Worker export or public route.
 
 The class requires deployment-time configuration for opaque namespace, binding,
-class, object-key, recovery-epoch, and genesis-entitlement SHA-256 values, plus
-separate service and provisioner credentials. These values are intentionally
-not supplied here. Every request must carry the matching opaque binding tuple;
-an empty/replacement object, stale recovery epoch, version mismatch, unknown
-operation, deletion, rewind, replacement, reset, or recovery request fails
-closed. Ordinary service requests never call `initializeGenesis`.
+class, object-key, recovery-epoch, and genesis-entitlement SHA-256 values, a
+recovery sequence, an Ed25519 entitlement-verification key, an external
+entitlement-authority service binding, and separate service and provisioner
+credentials. These values are intentionally not supplied here. Every request
+must carry the matching opaque binding tuple and the actual Durable Object id
+must hash to the configured object key; an empty/replacement object, stale
+recovery epoch, version mismatch, unknown operation, deletion, rewind,
+replacement, reset, or recovery request fails closed. Ordinary service
+requests never call `initializeGenesis`.
 
 The core records only opaque SHA-256 identities and a versioned genesis. It
 serializes one active attempt per target and generation, distinguishes exact
@@ -35,7 +38,11 @@ Any later deployment must use a separately reviewed Wrangler migration with a
 names must be derived from opaque target-generation material, never raw target,
 recipient, SQL, or provider identifiers.
 
-`initializeGenesis` is only an inert core primitive. It does not issue or prove
-external entitlement. Activation remains blocked until a separately governed
+`initializeGenesis` is only an inert core primitive. The provisioning path
+additionally requires a valid Ed25519 entitlement signature and a
+`decision: "new"` response from the separately privileged entitlement-authority
+service. Binding is written as one canonical pending record and promoted to
+ready only after exact genesis readback; a pending or ready object is never
+replaced or rewound. Activation remains blocked until a separately governed
 authenticated execution/provisioning split proves ordinary open-existing
 execution, deletion/rewind/replacement denial, and recovery authority.

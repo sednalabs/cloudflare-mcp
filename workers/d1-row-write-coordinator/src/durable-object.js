@@ -36,7 +36,7 @@ function decodeBase64(value, name) {
 }
 
 function canonicalBinding(input, state) {
-  return JSON.stringify({ bindingSha256: input.bindingSha256, classSha256: input.classSha256, entitlementSha256: input.entitlementSha256, objectKeySha256: input.objectKeySha256, recoveryEpochSha256: input.recoveryEpochSha256, recoverySequence: input.recoverySequence, schemaVersion: SCHEMA_VERSION, state, namespaceSha256: input.namespaceSha256 });
+  return JSON.stringify({ authoritySha256: input.authoritySha256, bindingSha256: input.bindingSha256, classSha256: input.classSha256, entitlementSha256: input.entitlementSha256, generationSha256: input.generationSha256, genesisSha256: input.genesisSha256, objectKeySha256: input.objectKeySha256, recoveryEpochSha256: input.recoveryEpochSha256, recoverySequence: input.recoverySequence, schemaVersion: SCHEMA_VERSION, state, namespaceSha256: input.namespaceSha256, targetKeySha256: input.targetKeySha256 });
 }
 
 function entitlementMessage(input) {
@@ -52,7 +52,7 @@ function jsonResponse(status, body) {
 
 function errorStatus(error) {
   if (/^(invalid_|.*_required|.*_must_|attempt_input_required)/.test(error.message)) return 400;
-  if (/^(genesis_not_authorized|object_not_initialized|binding_mismatch|protocol_mismatch|namespace_mismatch|object_key_mismatch|class_mismatch|recovery_epoch_mismatch|entitlement_mismatch|entitlement_invalid|unsupported_operation|recovery_denied|adapter_witness_required)/.test(error.message)) return 409;
+  if (/^(genesis_not_authorized|object_not_initialized|binding_mismatch|protocol_mismatch|namespace_mismatch|object_key_mismatch|class_mismatch|recovery_epoch_mismatch|recovery_sequence_mismatch|entitlement_mismatch|entitlement_invalid|entitlement_authority_|unsupported_operation|recovery_denied|adapter_witness_required)/.test(error.message)) return 409;
   if (/conflict|active_attempt|replay|transition/.test(error.message)) return 409;
   return 500;
 }
@@ -65,6 +65,7 @@ export class D1RowWriteCoordinatorObject {
   #coordinator;
   #sql;
   #env;
+  #objectId;
 
   constructor(state, env) {
     if (!state?.storage?.sql || typeof state.storage.sql.exec !== "function") throw new Error("sqlite_storage_required");
@@ -81,6 +82,9 @@ export class D1RowWriteCoordinatorObject {
     const publicKey = decodeBase64(env.GENESIS_ENTITLEMENT_PUBLIC_KEY, "genesis_entitlement_public_key");
     if (publicKey.length !== 32) throw new Error("genesis_entitlement_public_key_length");
     requireRecoverySequence(Number(env.COORDINATOR_RECOVERY_SEQUENCE), "coordinator_recovery_sequence");
+    if (typeof state.id?.toString !== "function") throw new Error("durable_object_id_required");
+    if (typeof env.GENESIS_ENTITLEMENT_AUTHORITY?.fetch !== "function") throw new Error("genesis_authority_not_configured");
+    this.#objectId = state.id.toString();
     if (String(env.COORDINATOR_SCHEMA_VERSION ?? SCHEMA_VERSION) !== String(SCHEMA_VERSION)) throw new Error("protocol_mismatch");
     this.#sql.exec("CREATE TABLE IF NOT EXISTS do_identity (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID");
     this.#coordinator = new D1RowWriteCoordinator({ sql: this.#sql });
@@ -90,7 +94,12 @@ export class D1RowWriteCoordinatorObject {
     return this.#sql.exec("SELECT key, value FROM do_identity ORDER BY key").toArray();
   }
 
-  #assertRequestBinding(input) {
+  async #actualObjectKeySha256() {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(this.#objectId));
+    return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  }
+
+  async #assertRequestBinding(input) {
     requireHash(input.namespaceSha256, "namespace_sha256");
     requireHash(input.bindingSha256, "binding_sha256");
     requireHash(input.objectKeySha256, "object_key_sha256");
@@ -103,6 +112,7 @@ export class D1RowWriteCoordinatorObject {
     if (input.classSha256 !== this.#env.COORDINATOR_CLASS_SHA256) throw new Error("class_mismatch");
     if (input.recoveryEpochSha256 !== this.#env.COORDINATOR_RECOVERY_EPOCH_SHA256) throw new Error("recovery_epoch_mismatch");
     if (input.recoverySequence !== Number(this.#env.COORDINATOR_RECOVERY_SEQUENCE)) throw new Error("recovery_sequence_mismatch");
+    if (input.objectKeySha256 !== await this.#actualObjectKeySha256()) throw new Error("object_key_mismatch");
   }
 
   #assertStoredBinding(input) {
@@ -129,7 +139,8 @@ export class D1RowWriteCoordinatorObject {
   }
 
   #genesisExists(input) {
-    return this.#sql.exec("SELECT 1 FROM genesis WHERE target_key_sha256 = ? AND generation_sha256 = ?", input.targetKeySha256, input.generationSha256).toArray().length === 1;
+    const rows = this.#sql.exec("SELECT * FROM genesis WHERE target_key_sha256 = ? AND generation_sha256 = ?", input.targetKeySha256, input.generationSha256).toArray();
+    return rows.length === 1 && rows[0].authority_sha256 === input.authoritySha256 && rows[0].genesis_sha256 === input.genesisSha256 && rows[0].protocol_version === PROTOCOL_VERSION && rows[0].schema_version === SCHEMA_VERSION;
   }
 
   async #verifyEntitlement(input) {
@@ -139,6 +150,26 @@ export class D1RowWriteCoordinatorObject {
     const key = await crypto.subtle.importKey("raw", publicKey, { name: "Ed25519" }, false, ["verify"]);
     const valid = await crypto.subtle.verify({ name: "Ed25519" }, key, signature, new TextEncoder().encode(entitlementMessage(input)));
     if (!valid) throw new Error("entitlement_invalid");
+    const authorityResponse = await this.#env.GENESIS_ENTITLEMENT_AUTHORITY.fetch(new Request("https://genesis-authority/verify", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        contract: GENESIS_CONTRACT,
+        targetKeySha256: input.targetKeySha256,
+        generationSha256: input.generationSha256,
+        authoritySha256: input.authoritySha256,
+        genesisSha256: input.genesisSha256,
+        objectKeySha256: input.objectKeySha256,
+        recoveryEpochSha256: input.recoveryEpochSha256,
+        recoverySequence: input.recoverySequence,
+        entitlementSha256: input.entitlementSha256,
+        entitlementSignature: input.entitlementSignature,
+      }),
+    }));
+    if (!authorityResponse.ok) throw new Error("entitlement_authority_denied");
+    let authorityResult;
+    try { authorityResult = await authorityResponse.json(); } catch { throw new Error("entitlement_authority_invalid"); }
+    if (!authorityResult || authorityResult.decision !== "new") throw new Error("entitlement_authority_replay");
   }
 
   async #body(request) {
@@ -159,7 +190,7 @@ export class D1RowWriteCoordinatorObject {
     if (!this.#authorized(request, this.#env.COORDINATOR_SERVICE_TOKEN)) return jsonResponse(401, { error: "unauthorized" });
     try {
       const input = await this.#body(request);
-      this.#assertRequestBinding(input);
+      await this.#assertRequestBinding(input);
       this.#assertStoredBinding(input);
       if (DENIED_OPERATIONS.has(input.operation)) throw new Error("recovery_denied");
       if (!SERVICE_OPERATIONS.has(input.operation)) throw new Error("unsupported_operation");
@@ -175,7 +206,7 @@ export class D1RowWriteCoordinatorObject {
     if (!this.#authorized(request, this.#env.GENESIS_PROVISIONER_TOKEN)) return jsonResponse(401, { error: "unauthorized" });
     try {
       const input = await this.#body(request);
-      this.#assertRequestBinding(input);
+      await this.#assertRequestBinding(input);
       requireHash(input.entitlementSha256, "entitlement_sha256");
       if (input.entitlementSha256 !== this.#env.GENESIS_ENTITLEMENT_SHA256) throw new Error("entitlement_mismatch");
       const rows = this.#identityRows();

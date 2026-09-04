@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { generateKeyPairSync, sign } from "node:crypto";
+import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { GENESIS_CONTRACT, PROTOCOL_VERSION } from "../src/index.js";
@@ -19,25 +19,41 @@ class SqliteStorage {
 }
 
 const h = (character) => character.repeat(64);
+const objectId = "opaque-do-object-a";
+const objectKey = createHash("sha256").update(objectId).digest("hex");
 const { privateKey, publicKey } = generateKeyPairSync("ed25519");
 const publicKeyBytes = publicKey.export({ type: "spki", format: "der" }).subarray(-32);
+
+class EntitlementAuthority {
+  #seen = new Set();
+  async fetch(request) {
+    const body = await request.json();
+    const receiptKey = `${body.entitlementSignature}:${body.objectKeySha256}:${body.recoverySequence}`;
+    if (this.#seen.has(receiptKey)) return new Response(JSON.stringify({ decision: "replay" }), { status: 200 });
+    this.#seen.add(receiptKey);
+    return new Response(JSON.stringify({ decision: "new" }), { status: 200 });
+  }
+}
+
 const env = {
   COORDINATOR_SERVICE_TOKEN: "service-test-token",
   GENESIS_PROVISIONER_TOKEN: "provisioner-test-token",
   COORDINATOR_NAMESPACE_SHA256: h("e"),
   COORDINATOR_BINDING_SHA256: h("b"),
-  COORDINATOR_OBJECT_KEY_SHA256: h("f"),
+  COORDINATOR_OBJECT_KEY_SHA256: objectKey,
   COORDINATOR_CLASS_SHA256: h("1"),
   COORDINATOR_RECOVERY_EPOCH_SHA256: h("2"),
   GENESIS_ENTITLEMENT_SHA256: h("3"),
   GENESIS_ENTITLEMENT_PUBLIC_KEY: publicKeyBytes.toString("base64"),
   COORDINATOR_RECOVERY_SEQUENCE: "1",
   COORDINATOR_SCHEMA_VERSION: "1",
+  GENESIS_ENTITLEMENT_AUTHORITY: new EntitlementAuthority(),
 };
+const testEnv = () => ({ ...env, GENESIS_ENTITLEMENT_AUTHORITY: new EntitlementAuthority() });
 const genesis = {
   operation: "initialize_genesis", contract: GENESIS_CONTRACT, protocolVersion: PROTOCOL_VERSION,
   targetKeySha256: h("a"), generationSha256: h("9"), authoritySha256: h("c"), genesisSha256: h("d"),
-  namespaceSha256: h("e"), bindingSha256: h("b"), objectKeySha256: h("f"), classSha256: h("1"), recoveryEpochSha256: h("2"), recoverySequence: 1, entitlementSha256: h("3"),
+  namespaceSha256: h("e"), bindingSha256: h("b"), objectKeySha256: objectKey, classSha256: h("1"), recoveryEpochSha256: h("2"), recoverySequence: 1, entitlementSha256: h("3"),
 };
 genesis.entitlementSignature = sign(null, Buffer.from([
   GENESIS_CONTRACT, PROTOCOL_VERSION, genesis.targetKeySha256, genesis.generationSha256,
@@ -59,52 +75,64 @@ async function call(object, pathname, body, token) {
 
 test("requires privileged genesis and preserves service-only lifecycle across re-instantiation", async () => {
   const storage = new SqliteStorage();
-  const state = { storage: { sql: storage } };
-  const object = new D1RowWriteCoordinatorObject(state, env);
-  assert.equal((await call(object, SERVICE_PATH, attempt, env.COORDINATOR_SERVICE_TOKEN)).status, 409);
-  assert.equal((await call(object, PROVISION_PATH, genesis, env.GENESIS_PROVISIONER_TOKEN)).body.decision, "new");
-  assert.equal((await call(object, SERVICE_PATH, attempt, env.COORDINATOR_SERVICE_TOKEN)).body.phase, "prepared");
-  const restarted = new D1RowWriteCoordinatorObject(state, env);
-  assert.equal((await call(restarted, SERVICE_PATH, attempt, env.COORDINATOR_SERVICE_TOKEN)).body.decision, "exact_replay");
+  const state = { id: { toString: () => objectId }, storage: { sql: storage } };
+  const environment = testEnv();
+  const object = new D1RowWriteCoordinatorObject(state, environment);
+  assert.equal((await call(object, SERVICE_PATH, attempt, environment.COORDINATOR_SERVICE_TOKEN)).status, 409);
+  assert.equal((await call(object, PROVISION_PATH, genesis, environment.GENESIS_PROVISIONER_TOKEN)).body.decision, "new");
+  assert.equal((await call(object, SERVICE_PATH, attempt, environment.COORDINATOR_SERVICE_TOKEN)).body.phase, "prepared");
+  const restarted = new D1RowWriteCoordinatorObject(state, environment);
+  assert.equal((await call(restarted, SERVICE_PATH, attempt, environment.COORDINATOR_SERVICE_TOKEN)).body.decision, "exact_replay");
 });
 
 test("denies public paths, recovery operations, and binding/version mismatches", async () => {
   const storage = new SqliteStorage();
-  const state = { storage: { sql: storage } };
-  const object = new D1RowWriteCoordinatorObject(state, env);
-  assert.equal((await call(object, "/public", attempt, env.COORDINATOR_SERVICE_TOKEN)).status, 404);
-  assert.equal((await call(object, SERVICE_PATH, { ...attempt, operation: "delete" }, env.COORDINATOR_SERVICE_TOKEN)).status, 409);
-  assert.equal((await call(object, PROVISION_PATH, { ...genesis, namespaceSha256: h("0") }, env.GENESIS_PROVISIONER_TOKEN)).status, 409);
-  assert.equal((await call(object, PROVISION_PATH, { ...genesis, entitlementSignature: Buffer.alloc(64).toString("base64") }, env.GENESIS_PROVISIONER_TOKEN)).body.error, "entitlement_invalid");
-  assert.equal((await call(object, PROVISION_PATH, genesis, env.COORDINATOR_SERVICE_TOKEN)).status, 401);
-  assert.equal((await call(object, SERVICE_PATH, { ...attempt, namespaceSha256: h("0") }, env.COORDINATOR_SERVICE_TOKEN)).status, 409);
-  assert.equal((await call(object, SERVICE_PATH, { ...attempt, classSha256: h("0") }, env.COORDINATOR_SERVICE_TOKEN)).status, 409);
-  assert.equal((await call(object, SERVICE_PATH, { ...attempt, recoveryEpochSha256: h("0") }, env.COORDINATOR_SERVICE_TOKEN)).status, 409);
+  const state = { id: { toString: () => objectId }, storage: { sql: storage } };
+  const environment = testEnv();
+  const object = new D1RowWriteCoordinatorObject(state, environment);
+  assert.equal((await call(object, "/public", attempt, environment.COORDINATOR_SERVICE_TOKEN)).status, 404);
+  assert.equal((await call(object, SERVICE_PATH, { ...attempt, operation: "delete" }, environment.COORDINATOR_SERVICE_TOKEN)).status, 409);
+  assert.equal((await call(object, PROVISION_PATH, { ...genesis, namespaceSha256: h("0") }, environment.GENESIS_PROVISIONER_TOKEN)).status, 409);
+  assert.equal((await call(object, PROVISION_PATH, { ...genesis, entitlementSignature: Buffer.alloc(64).toString("base64") }, environment.GENESIS_PROVISIONER_TOKEN)).body.error, "entitlement_invalid");
+  assert.equal((await call(object, PROVISION_PATH, genesis, environment.COORDINATOR_SERVICE_TOKEN)).status, 401);
+  assert.equal((await call(object, SERVICE_PATH, { ...attempt, namespaceSha256: h("0") }, environment.COORDINATOR_SERVICE_TOKEN)).status, 409);
+  assert.equal((await call(object, SERVICE_PATH, { ...attempt, classSha256: h("0") }, environment.COORDINATOR_SERVICE_TOKEN)).status, 409);
+  assert.equal((await call(object, SERVICE_PATH, { ...attempt, recoveryEpochSha256: h("0") }, environment.COORDINATOR_SERVICE_TOKEN)).status, 409);
+  assert.equal((await call(object, SERVICE_PATH, { ...attempt, recoverySequence: 2 }, environment.COORDINATOR_SERVICE_TOKEN)).status, 409);
 });
 
 test("serializes two service instances and denies rewind or replacement", async () => {
   const storage = new SqliteStorage();
-  const state = { storage: { sql: storage } };
-  const first = new D1RowWriteCoordinatorObject(state, env);
-  const second = new D1RowWriteCoordinatorObject(state, env);
-  assert.equal((await call(first, PROVISION_PATH, genesis, env.GENESIS_PROVISIONER_TOKEN)).body.decision, "new");
-  assert.equal((await call(first, SERVICE_PATH, attempt, env.COORDINATOR_SERVICE_TOKEN)).status, 200);
-  assert.equal((await call(second, SERVICE_PATH, { ...attempt, operationIdSha256: h("4") }, env.COORDINATOR_SERVICE_TOKEN)).status, 409);
+  const state = { id: { toString: () => objectId }, storage: { sql: storage } };
+  const environment = testEnv();
+  const first = new D1RowWriteCoordinatorObject(state, environment);
+  const second = new D1RowWriteCoordinatorObject(state, environment);
+  assert.equal((await call(first, PROVISION_PATH, genesis, environment.GENESIS_PROVISIONER_TOKEN)).body.decision, "new");
+  assert.equal((await call(first, SERVICE_PATH, attempt, environment.COORDINATOR_SERVICE_TOKEN)).status, 200);
+  assert.equal((await call(second, SERVICE_PATH, { ...attempt, operationIdSha256: h("4") }, environment.COORDINATOR_SERVICE_TOKEN)).status, 409);
   for (const operation of ["rewind", "replace", "recover", "reset"]) {
-    assert.equal((await call(second, SERVICE_PATH, { ...attempt, operation }, env.COORDINATOR_SERVICE_TOKEN)).body.error, "recovery_denied");
+    assert.equal((await call(second, SERVICE_PATH, { ...attempt, operation }, environment.COORDINATOR_SERVICE_TOKEN)).body.error, "recovery_denied");
   }
   storage.database.prepare("DELETE FROM genesis").run();
-  assert.equal((await call(second, PROVISION_PATH, genesis, env.GENESIS_PROVISIONER_TOKEN)).body.error, "recovery_denied");
+  assert.equal((await call(second, PROVISION_PATH, genesis, environment.GENESIS_PROVISIONER_TOKEN)).body.error, "recovery_denied");
 });
 
 test("rejects a version-overlap object before accepting service requests", async () => {
-  assert.throws(() => new D1RowWriteCoordinatorObject({ storage: { sql: new SqliteStorage() } }, { ...env, COORDINATOR_SCHEMA_VERSION: "2" }), /protocol_mismatch/);
+  assert.throws(() => new D1RowWriteCoordinatorObject({ id: { toString: () => objectId }, storage: { sql: new SqliteStorage() } }, { ...testEnv(), COORDINATOR_SCHEMA_VERSION: "2" }), /protocol_mismatch/);
 });
 
 test("empty or replacement object fails closed for ordinary execution", async () => {
   const storage = new SqliteStorage();
-  const object = new D1RowWriteCoordinatorObject({ storage: { sql: storage } }, env);
-  const response = await call(object, SERVICE_PATH, attempt, env.COORDINATOR_SERVICE_TOKEN);
+  const environment = testEnv();
+  const object = new D1RowWriteCoordinatorObject({ id: { toString: () => objectId }, storage: { sql: storage } }, environment);
+  const response = await call(object, SERVICE_PATH, attempt, environment.COORDINATOR_SERVICE_TOKEN);
   assert.equal(response.status, 409);
   assert.equal(response.body.error, "object_not_initialized");
+});
+
+test("binds service execution to the actual durable-object identity", async () => {
+  const object = new D1RowWriteCoordinatorObject({ id: { toString: () => "opaque-do-object-b" }, storage: { sql: new SqliteStorage() } }, testEnv());
+  const response = await call(object, SERVICE_PATH, attempt, env.COORDINATOR_SERVICE_TOKEN);
+  assert.equal(response.status, 409);
+  assert.equal(response.body.error, "object_key_mismatch");
 });
