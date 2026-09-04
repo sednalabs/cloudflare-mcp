@@ -37,3 +37,11 @@ use the current official API and a reviewed `new_sqlite_classes` migration:
 
 No Worker version, binding, route, credential, provider, or live resource is
 created by this slice.
+
+`initializeGenesis` is an inert protocol primitive, not an entitlement issuer.
+The future activation cutline must separately provide authenticated execution
+and provisioning authorities. It must prove ordinary execution is
+open-existing only, and must deny deletion, rewind, replacement, and
+unauthorised recovery. Until those gates are independently reviewed and
+read-backed, this core remains development-only and cannot authorize a live
+mutation.

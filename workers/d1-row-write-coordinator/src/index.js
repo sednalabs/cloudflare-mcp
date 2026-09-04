@@ -105,7 +105,7 @@ export class D1RowWriteCoordinator {
     }
     this.#sql.exec("INSERT INTO genesis(target_key_sha256, generation_sha256, authority_sha256, genesis_sha256, protocol_version, schema_version) VALUES (?, ?, ?, ?, ?, ?)", g.targetKeySha256, g.generationSha256, g.authoritySha256, g.genesisSha256, PROTOCOL_VERSION, SCHEMA_VERSION);
     const read = this.#rows("SELECT * FROM genesis WHERE target_key_sha256 = ?", [g.targetKeySha256])[0];
-    if (!read || read.generation_sha256 !== g.generationSha256 || read.authority_sha256 !== g.authoritySha256 || read.genesis_sha256 !== g.genesisSha256) throw new Error("sqlite_readback_mismatch");
+    if (!read || read.generation_sha256 !== g.generationSha256 || read.authority_sha256 !== g.authoritySha256 || read.genesis_sha256 !== g.genesisSha256 || read.protocol_version !== PROTOCOL_VERSION || read.schema_version !== SCHEMA_VERSION) throw new Error("sqlite_readback_mismatch");
     return { protocolVersion: PROTOCOL_VERSION, decision: "new" };
   }
 
@@ -121,7 +121,7 @@ export class D1RowWriteCoordinator {
     if (this.#rows("SELECT 1 FROM attempts WHERE target_key_sha256 = ? AND generation_sha256 = ? AND phase IN ('prepared', 'dispatch_reserved', 'response_observed', 'reconciliation_required')", [a.targetKeySha256, a.generationSha256]).length) throw new Error("conflicting_active_attempt");
     this.#sql.exec("INSERT INTO attempts(target_key_sha256, generation_sha256, operation_id_sha256, execution_attempt_id_sha256, provider_request_id_sha256, plan_sha256, phase, adapter_witness_present) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", a.targetKeySha256, a.generationSha256, a.operationIdSha256, a.executionAttemptIdSha256, a.providerRequestIdSha256, a.planSha256, "prepared", 0);
     const row = this.#rows("SELECT * FROM attempts WHERE target_key_sha256 = ? AND generation_sha256 = ? AND operation_id_sha256 = ?", [a.targetKeySha256, a.generationSha256, a.operationIdSha256])[0];
-    if (!row || row.phase !== "prepared") throw new Error("sqlite_readback_mismatch");
+    if (!row || row.target_key_sha256 !== a.targetKeySha256 || row.generation_sha256 !== a.generationSha256 || row.operation_id_sha256 !== a.operationIdSha256 || row.execution_attempt_id_sha256 !== a.executionAttemptIdSha256 || row.provider_request_id_sha256 !== a.providerRequestIdSha256 || row.plan_sha256 !== a.planSha256 || row.phase !== "prepared" || row.adapter_witness_present !== 0) throw new Error("sqlite_readback_mismatch");
     return { protocolVersion: PROTOCOL_VERSION, decision: "new", phase: "prepared", adapterWitnessPresent: false };
   }
 
@@ -144,5 +144,9 @@ export class D1RowWriteCoordinator {
 
   reserveDispatch(input) { return this.#transition(input, "dispatch_reserved", false); }
   observeResponse(input) { return this.#transition(input, "response_observed", false); }
-  closeAttempt(input) { return this.#transition(input, input.phase, input.adapterWitnessPresent === true); }
+  closeAttempt(input) {
+    if (!input) throw new Error("attempt_input_required");
+    if (!TERMINAL_PHASES.has(input.phase)) throw new Error("invalid_phase");
+    return this.#transition(input, input.phase, input.adapterWitnessPresent === true);
+  }
 }

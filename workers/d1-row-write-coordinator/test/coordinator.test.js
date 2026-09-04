@@ -68,6 +68,8 @@ test("denies conflicting replays, duplicate identities, and active contenders", 
 
 test("requires observed response and witness before terminal success", () => {
   const { coordinator } = initialized();
+  assert.throws(() => coordinator.closeAttempt(null), /attempt_input_required/);
+  assert.throws(() => coordinator.closeAttempt({ ...attempt, phase: "dispatch_reserved" }), /invalid_phase/);
   assert.equal(coordinator.prepareAttempt(attempt).phase, "prepared");
   assert.throws(() => coordinator.closeAttempt({ ...attempt, phase: "applied", adapterWitnessPresent: true }), /invalid_transition/);
   coordinator.reserveDispatch(attempt);
