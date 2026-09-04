@@ -88,6 +88,9 @@ pub(crate) async fn observe_d1_target_wide_attempt(
     identities: D1DmlAttemptIdentities<'_>,
     incumbent: &D1TargetWidePreparedProduct,
 ) -> (CallToolResult, D1TargetWideObservationEvidence) {
+    if let Err(error) = guard.assert_exact_target(target) {
+        return (error, D1TargetWideObservationEvidence::unbound());
+    }
     let receipt = incumbent.receipt();
     let mut evidence = observation_context(target, intended_plan, identities, receipt);
     if !matches!(
@@ -172,6 +175,36 @@ pub(crate) async fn observe_d1_target_wide_attempt(
         "automatic_retry_permitted": false,
     }));
     (result, evidence)
+}
+
+impl D1TargetWideObservationEvidence {
+    /// No target-derived evidence is created when the held guard rejects the
+    /// supplied target. The returned value is an unbound failure sentinel and
+    /// must never be interpreted as an observation.
+    fn unbound() -> Self {
+        Self {
+            version: OBSERVATION_VERSION,
+            target_key_sha256: String::new(),
+            intended_plan_sha256: String::new(),
+            consent_binding_sha256: String::new(),
+            consent_version: 0,
+            operation_version: 0,
+            operation_id_sha256: String::new(),
+            execution_attempt_id_sha256: String::new(),
+            provider_request_id_sha256: String::new(),
+            attempt_binding_sha256: String::new(),
+            incumbent_provider_evidence_sha256: String::new(),
+            before: None,
+            after: None,
+            error_response_body_sha256: None,
+            error_response_body_size_bytes: None,
+            stable_before_after: false,
+            causality: "unproven",
+            terminal_eligibility: "none",
+            provider_dispatch_authority: "none",
+            local_mutations: 0,
+        }
+    }
 }
 
 fn observation_context(
@@ -593,6 +626,59 @@ mod tests {
             json!(0)
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(guard);
+        std::fs::remove_dir_all(root).expect("remove observation fixture");
+    }
+
+    #[tokio::test]
+    async fn mismatched_guard_rejects_before_observation_or_provider_read() {
+        let (guard_target, guard_plan) = rename_fixture();
+        let (root, guard) = acquire_d1_target_mutation_guard_for_test(
+            "guard-mismatch-observation",
+            "d1_rename_database",
+        );
+        let reserved = reserved_attempt(&guard, &guard_target, &guard_plan);
+        let binding = reserved.receipt().attempt_binding_sha256.clone();
+        let incumbent = reserved.state_bytes().to_vec();
+        let wrong_target = normalize_d1_target("acct-2", DATABASE_ID).expect("wrong target");
+        let wrong_plan = rederive_d1_target_wide_intended_plan(
+            &wrong_target,
+            "d1_rename_database",
+            &json!({"new_name": "wrong-db"}),
+            None,
+        )
+        .expect("wrong target plan");
+        let (client, calls) = client_with_states(vec![FixtureState::Present("wrong-db"); 2]).await;
+        let (result, evidence) = observe_d1_target_wide_attempt(
+            &client,
+            &guard,
+            &wrong_target,
+            &wrong_plan,
+            ids(),
+            &reserved,
+        )
+        .await;
+        let content = result.structured_content.expect("guard mismatch result");
+        assert_eq!(content["status"], json!("blocked"));
+        assert_eq!(
+            content["error"]["code"],
+            json!("d1.target_guard_target_mismatch")
+        );
+        assert_eq!(content["provider_calls"], json!(0));
+        assert_eq!(content["provider_mutations"], json!(0));
+        assert_eq!(content["local_mutations"], json!(0));
+        assert!(content.get("observation").is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(evidence.before, None);
+        assert_eq!(evidence.after, None);
+        assert_eq!(evidence.local_mutations, 0);
+        assert_eq!(
+            guard
+                .read_d1_dml_attempt_state(&binding)
+                .expect("custody readback")
+                .expect("custody state"),
+            incumbent
+        );
         drop(guard);
         std::fs::remove_dir_all(root).expect("remove observation fixture");
     }
