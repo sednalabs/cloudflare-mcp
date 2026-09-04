@@ -4,9 +4,10 @@ import { DatabaseSync } from "node:sqlite";
 import { test } from "node:test";
 import { GENESIS_CONTRACT, PROTOCOL_VERSION } from "../src/index.js";
 import { D1RowWriteCoordinatorObject, PROVISION_PATH, SERVICE_PATH } from "../src/durable-object.js";
+import { canonicalParameterEncoding } from "../src/provider-lifecycle.js";
 
 class SqliteStorage {
-  constructor(database = new DatabaseSync(":memory:"), { failOnReadyUpdate = false } = {}) { this.database = database; this.failOnReadyUpdate = failOnReadyUpdate; }
+  constructor(database = new DatabaseSync(":memory:"), { failOnReadyUpdate = false, failOnAppliedUpdate = false } = {}) { this.database = database; this.failOnReadyUpdate = failOnReadyUpdate; this.failOnAppliedUpdate = failOnAppliedUpdate; }
   transactionSync(callback) {
     this.database.exec("BEGIN");
     try {
@@ -23,6 +24,7 @@ class SqliteStorage {
     let result;
     for (const statement of statements) {
       if (this.failOnReadyUpdate && /^UPDATE do_identity SET value/i.test(statement)) throw new Error("forced_ready_failure");
+      if (this.failOnAppliedUpdate && /^UPDATE provider_lifecycle_attempts SET phase = \?/i.test(statement)) throw new Error("forced_applied_failure");
       if (/^\s*select\b/i.test(statement)) result = { toArray: () => this.database.prepare(statement).all(...bindings) };
       else { this.database.prepare(statement).run(...bindings); result = { toArray: () => [] }; }
     }
@@ -78,6 +80,40 @@ const attempt = {
   ...genesis, operation: "prepare", planSha256: h("8"), operationIdSha256: h("1"),
   executionAttemptIdSha256: h("2"), providerRequestIdSha256: h("3"),
 };
+
+async function sha256(value) {
+  const bytes = typeof value === "string" ? new TextEncoder().encode(value) : value;
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function lifecycleAttempt(overrides = {}) {
+  const sql = "UPDATE newsletter_state SET enabled = ?";
+  const params = [true];
+  const plan = {
+    version: 1, operation: "d1_execute_write", targetKeySha256: h("a"), generationSha256: h("9"),
+    statementKind: "UPDATE", sqlSha256: await sha256(sql), paramsSha256: await sha256(canonicalParameterEncoding(params)), maxRows: 100,
+  };
+  return {
+    ...genesis, operation: "execute_d1", planSha256: await sha256(JSON.stringify(plan)), consentSha256: h("f"),
+    operationIdSha256: h("5"), executionAttemptIdSha256: h("6"), providerRequestIdSha256: h("7"), plan, sql, params,
+    ...overrides,
+  };
+}
+
+test("uses a closed, collision-resistant D1 parameter encoding", () => {
+  assert.notEqual(canonicalParameterEncoding([null]), canonicalParameterEncoding(["null"]));
+  assert.notEqual(canonicalParameterEncoding([0]), canonicalParameterEncoding([-0]));
+  assert.notEqual(canonicalParameterEncoding([true]), canonicalParameterEncoding([1]));
+  assert.throws(() => canonicalParameterEncoding(new Array(101).fill(1)), /bounded_array/);
+  assert.throws(() => canonicalParameterEncoding([undefined]), /type_invalid/);
+  assert.throws(() => canonicalParameterEncoding([Number.NaN]), /number_invalid/);
+  assert.throws(() => canonicalParameterEncoding([Number.POSITIVE_INFINITY]), /number_invalid/);
+  assert.throws(() => canonicalParameterEncoding([[1]]), /type_invalid/);
+  const sparse = [];
+  sparse.length = 1;
+  assert.throws(() => canonicalParameterEncoding(sparse), /hole_invalid/);
+});
 
 async function call(object, pathname, body, token) {
   const response = await object.fetch(new Request(`https://internal${pathname}`, {
@@ -193,4 +229,152 @@ test("renders non-Error failures safely on both ingress paths", async () => {
   const provisionFailure = await call(provisionObject, PROVISION_PATH, genesis, env.GENESIS_PROVISIONER_TOKEN);
   assert.equal(provisionFailure.status, 500);
   assert.equal(provisionFailure.body.error, "authority-string");
+});
+
+test("executes one strict D1 request after durable reservation and keeps private R2 evidence", async () => {
+  const storage = new SqliteStorage();
+  const d1 = {
+    calls: 0,
+    prepare(sql) {
+      this.calls += 1;
+      assert.equal(sql, "UPDATE newsletter_state SET enabled = ?");
+      return { bind: () => ({ run: async () => ({ success: true, results: [], meta: { served_by_primary: true, changed_db: true, changes: 1, rows_written: 1, duration: 1.25, last_row_id: 2, rows_read: 1, served_by_colo: "SFO", served_by_region: "WNAM", size_after: 123, timings: { sql_duration_ms: 1.1 } } }) }) };
+    },
+  };
+  const evidence = { writes: [], async put(key, body, options) { this.writes.push({ key, body: new Uint8Array(body), options }); } };
+  const environment = { ...testEnv(), D1_DATABASE: d1, D1_EVIDENCE_BUCKET: evidence };
+  const object = new D1RowWriteCoordinatorObject(stateFor(storage), environment);
+  assert.equal((await call(object, PROVISION_PATH, genesis, environment.GENESIS_PROVISIONER_TOKEN)).body.decision, "new");
+  const input = await lifecycleAttempt();
+  const first = await call(object, SERVICE_PATH, input, environment.COORDINATOR_SERVICE_TOKEN);
+  assert.equal(first.status, 200, JSON.stringify(first.body));
+  assert.equal(first.body.status, "applied");
+  assert.equal(first.body.providerCalls, 1);
+  assert.equal(first.body.providerEffect, "one");
+  assert.equal(first.body.evidenceCustody, "private_r2");
+  assert.equal(d1.calls, 1);
+  assert.equal(evidence.writes.length, 1);
+  const replay = await call(object, SERVICE_PATH, input, environment.COORDINATOR_SERVICE_TOKEN);
+  assert.equal(replay.body.status, "applied");
+  assert.equal(replay.body.exactReplay, true);
+  assert.equal(d1.calls, 1);
+});
+
+test("classifies a strict primary no-op as not_applied and rejects unknown metadata", async () => {
+  const storage = new SqliteStorage();
+  let response = { success: true, results: [], meta: { served_by_primary: true, changed_db: false, changes: 0, rows_written: 0 } };
+  const d1 = { calls: 0, prepare() { this.calls += 1; return { bind: () => ({ run: async () => response }) }; } };
+  const evidence = { writes: [], async put(key, body, options) { this.writes.push({ key, body, options }); } };
+  const environment = { ...testEnv(), D1_DATABASE: d1, D1_EVIDENCE_BUCKET: evidence };
+  const object = new D1RowWriteCoordinatorObject(stateFor(storage), environment);
+  await call(object, PROVISION_PATH, genesis, environment.GENESIS_PROVISIONER_TOKEN);
+  const input = await lifecycleAttempt();
+  const noOp = await call(object, SERVICE_PATH, input, environment.COORDINATOR_SERVICE_TOKEN);
+  assert.equal(noOp.body.status, "not_applied");
+  assert.equal(noOp.body.providerEffect, "zero");
+  assert.equal(noOp.body.providerCalls, 1);
+  assert.equal((await call(object, SERVICE_PATH, input, environment.COORDINATOR_SERVICE_TOKEN)).body.exactReplay, true);
+  assert.equal(d1.calls, 1);
+
+  const unknownStorage = new SqliteStorage();
+  const unknownD1 = { calls: 0, prepare() { this.calls += 1; return { bind: () => ({ run: async () => ({ success: true, results: [], meta: { served_by_primary: true, changed_db: true, changes: 1, rows_written: 1, untrusted: true } }) }) }; } };
+  const unknownEvidence = { async put() { throw new Error("not_reached"); } };
+  const unknownObject = new D1RowWriteCoordinatorObject(stateFor(unknownStorage), { ...testEnv(), D1_DATABASE: unknownD1, D1_EVIDENCE_BUCKET: unknownEvidence });
+  await call(unknownObject, PROVISION_PATH, genesis, environment.GENESIS_PROVISIONER_TOKEN);
+  const unknown = await call(unknownObject, SERVICE_PATH, await lifecycleAttempt(), environment.COORDINATOR_SERVICE_TOKEN);
+  assert.equal(unknown.body.status, "reconciliation_required");
+  assert.equal(unknownD1.calls, 1);
+});
+
+test("does not terminalize a provider response beyond the approved row bound", async () => {
+  const storage = new SqliteStorage();
+  const d1 = { calls: 0, prepare() { this.calls += 1; return { bind: () => ({ run: async () => ({ success: true, results: [], meta: { served_by_primary: true, changed_db: true, changes: 2, rows_written: 2 } }) }) }; } };
+  const evidence = { writes: [], async put() { this.writes.push(true); } };
+  const environment = { ...testEnv(), D1_DATABASE: d1, D1_EVIDENCE_BUCKET: evidence };
+  const object = new D1RowWriteCoordinatorObject(stateFor(storage), environment);
+  await call(object, PROVISION_PATH, genesis, environment.GENESIS_PROVISIONER_TOKEN);
+  const base = await lifecycleAttempt();
+  const plan = { ...base.plan, maxRows: 1 };
+  const input = { ...base, plan, planSha256: await sha256(JSON.stringify(plan)) };
+  const result = await call(object, SERVICE_PATH, input, environment.COORDINATOR_SERVICE_TOKEN);
+  assert.equal(result.body.status, "reconciliation_required");
+  assert.equal(result.body.providerEffect, "unknown");
+  assert.equal(result.body.providerCalls, 1);
+  assert.equal(evidence.writes.length, 0);
+  assert.equal(d1.calls, 1);
+});
+
+test("turns provider response loss into reconciliation_required and never redispatches", async () => {
+  const storage = new SqliteStorage();
+  const d1 = { calls: 0, prepare() { this.calls += 1; return { bind: () => ({ run: async () => { throw new Error("transport_lost"); } }) }; } };
+  const evidence = { async put() { throw new Error("not reached"); } };
+  const environment = { ...testEnv(), D1_DATABASE: d1, D1_EVIDENCE_BUCKET: evidence };
+  const object = new D1RowWriteCoordinatorObject(stateFor(storage), environment);
+  assert.equal((await call(object, PROVISION_PATH, genesis, environment.GENESIS_PROVISIONER_TOKEN)).body.decision, "new");
+  const input = await lifecycleAttempt();
+  const first = await call(object, SERVICE_PATH, input, environment.COORDINATOR_SERVICE_TOKEN);
+  assert.equal(first.body.status, "reconciliation_required");
+  assert.equal(first.body.providerCalls, 1);
+  assert.equal(first.body.retryDecision, "reconciliation_only");
+  const replay = await call(object, SERVICE_PATH, input, environment.COORDINATOR_SERVICE_TOKEN);
+  assert.equal(replay.body.status, "reconciliation_required");
+  assert.equal(replay.body.exactReplay, true);
+  assert.equal(d1.calls, 1);
+});
+
+test("turns R2 custody failure into reconciliation_required without leaving a reservation", async () => {
+  const storage = new SqliteStorage();
+  const d1 = { calls: 0, prepare() { this.calls += 1; return { bind: () => ({ run: async () => ({ success: true, results: [], meta: { served_by_primary: true, changed_db: true, changes: 1, rows_written: 1 } }) }) }; } };
+  const evidence = { async put() { throw new Error("r2_unavailable"); } };
+  const environment = { ...testEnv(), D1_DATABASE: d1, D1_EVIDENCE_BUCKET: evidence };
+  const object = new D1RowWriteCoordinatorObject(stateFor(storage), environment);
+  await call(object, PROVISION_PATH, genesis, environment.GENESIS_PROVISIONER_TOKEN);
+  const input = await lifecycleAttempt();
+  const response = await call(object, SERVICE_PATH, input, environment.COORDINATOR_SERVICE_TOKEN);
+  assert.equal(response.status, 200);
+  assert.equal(response.body.status, "reconciliation_required");
+  assert.equal(response.body.providerCalls, 1);
+  assert.equal(response.body.evidenceCustody, "not_available");
+  assert.equal(d1.calls, 1);
+  const replay = await call(object, SERVICE_PATH, input, environment.COORDINATOR_SERVICE_TOKEN);
+  assert.equal(replay.body.exactReplay, true);
+  assert.equal(d1.calls, 1);
+});
+
+test("preserves response and custody digests when terminal CAS fails after R2", async () => {
+  const storage = new SqliteStorage(undefined, { failOnAppliedUpdate: true });
+  const d1 = { calls: 0, prepare() { this.calls += 1; return { bind: () => ({ run: async () => ({ success: true, results: [], meta: { served_by_primary: true, changed_db: true, changes: 1, rows_written: 1 } }) }) }; } };
+  const evidence = { writes: [], async put(key, body, options) { this.writes.push({ key, body, options }); } };
+  const environment = { ...testEnv(), D1_DATABASE: d1, D1_EVIDENCE_BUCKET: evidence };
+  const object = new D1RowWriteCoordinatorObject(stateFor(storage), environment);
+  await call(object, PROVISION_PATH, genesis, environment.GENESIS_PROVISIONER_TOKEN);
+  const input = await lifecycleAttempt();
+  const result = await call(object, SERVICE_PATH, input, environment.COORDINATOR_SERVICE_TOKEN);
+  assert.equal(result.body.status, "reconciliation_required");
+  assert.equal(result.body.providerCalls, 1);
+  assert.match(result.body.responseSha256, /^[0-9a-f]{64}$/);
+  assert.match(result.body.evidenceKeySha256, /^[0-9a-f]{64}$/);
+  assert.match(result.body.witnessSha256, /^[0-9a-f]{64}$/);
+  assert.equal(result.body.evidenceCustody, "private_r2");
+  assert.equal(d1.calls, 1);
+  assert.equal(evidence.writes.length, 1);
+  const replay = await call(object, SERVICE_PATH, input, environment.COORDINATOR_SERVICE_TOKEN);
+  assert.equal(replay.body.exactReplay, true);
+  assert.equal(d1.calls, 1);
+  assert.equal(evidence.writes.length, 1);
+});
+
+test("denies a conflicting replay before any D1 request", async () => {
+  const storage = new SqliteStorage();
+  const d1 = { calls: 0, prepare() { this.calls += 1; return { bind: () => ({ run: async () => ({ success: true, results: [], meta: { served_by_primary: true, changed_db: false, changes: 0, rows_written: 0 } }) }) }; } };
+  const evidence = { async put() {} };
+  const environment = { ...testEnv(), D1_DATABASE: d1, D1_EVIDENCE_BUCKET: evidence };
+  const object = new D1RowWriteCoordinatorObject(stateFor(storage), environment);
+  await call(object, PROVISION_PATH, genesis, environment.GENESIS_PROVISIONER_TOKEN);
+  const input = await lifecycleAttempt();
+  assert.equal((await call(object, SERVICE_PATH, input, environment.COORDINATOR_SERVICE_TOKEN)).body.status, "not_applied");
+  const conflict = await call(object, SERVICE_PATH, { ...input, consentSha256: h("0") }, environment.COORDINATOR_SERVICE_TOKEN);
+  assert.equal(conflict.status, 409);
+  assert.equal(conflict.body.error, "conflicting_replay");
+  assert.equal(d1.calls, 1);
 });

@@ -4,13 +4,14 @@ import {
   PROTOCOL_VERSION,
   SCHEMA_VERSION,
 } from "./index.js";
+import { D1ProviderLifecycle } from "./provider-lifecycle.js";
 
 export const SERVICE_PATH = "/_internal/coordinate";
 export const PROVISION_PATH = "/_internal/provision-genesis";
 
 const HASH = /^[0-9a-f]{64}$/;
 const BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
-const SERVICE_OPERATIONS = new Set(["prepare", "reserve_dispatch", "observe_response"]);
+const SERVICE_OPERATIONS = new Set(["prepare", "reserve_dispatch", "observe_response", "execute_d1"]);
 const DENIED_OPERATIONS = new Set([
   "initialize_genesis",
   "delete",
@@ -69,6 +70,7 @@ export class D1RowWriteCoordinatorObject {
   #storage;
   #env;
   #objectId;
+  #lifecycle;
 
   constructor(state, env) {
     if (!state?.storage?.sql || typeof state.storage.sql.exec !== "function") throw new Error("sqlite_storage_required");
@@ -93,6 +95,12 @@ export class D1RowWriteCoordinatorObject {
     if (String(env.COORDINATOR_SCHEMA_VERSION ?? SCHEMA_VERSION) !== String(SCHEMA_VERSION)) throw new Error("protocol_mismatch");
     this.#sql.exec("CREATE TABLE IF NOT EXISTS do_identity (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID");
     this.#coordinator = new D1RowWriteCoordinator({ sql: this.#sql });
+    this.#lifecycle = new D1ProviderLifecycle({
+      sql: this.#sql,
+      transactionSync: (callback) => this.#storage.transactionSync(callback),
+      coordinator: this.#coordinator,
+      env: this.#env,
+    });
   }
 
   #identityRows() {
@@ -201,6 +209,7 @@ export class D1RowWriteCoordinatorObject {
       if (!SERVICE_OPERATIONS.has(input.operation)) throw new Error("unsupported_operation");
       if (input.operation === "prepare") return jsonResponse(200, this.#coordinator.prepareAttempt(input));
       if (input.operation === "reserve_dispatch") return jsonResponse(200, this.#coordinator.reserveDispatch(input));
+      if (input.operation === "execute_d1") return jsonResponse(200, await this.#lifecycle.execute(input));
       return jsonResponse(200, this.#coordinator.observeResponse(input));
     } catch (error) {
       return jsonResponse(errorStatus(error), { error: error instanceof Error ? error.message : String(error ?? "unknown_error") });
