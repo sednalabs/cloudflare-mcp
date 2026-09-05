@@ -4858,6 +4858,8 @@ fn spawn_fake_cloudflare_api() -> String {
                     && body_json.get("queryId").is_some()
                     && body_json.get("limit").is_some()
                     && body_json.get("parameters").is_some()
+                    && body_json.get("view") == Some(&json!("events"))
+                    && body_json["parameters"].get("view").is_none()
                 {
                     json!({
                         "success": true,
@@ -18683,7 +18685,13 @@ fn workers_observability_query_events_work_through_stdio_boundary() {
         2,
         "workers_observability_query_events",
         json!({
-            "limit": 20
+            "limit": 20,
+            "filters": [{
+                "key": "$metadata.trigger",
+                "operation": "eq",
+                "type": "string",
+                "value": "scheduled"
+            }]
         }),
     );
     let content = structured_content(&response);

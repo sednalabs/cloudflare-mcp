@@ -1035,7 +1035,7 @@ pub struct WorkersObservabilityQueryEventsArgs {
     #[serde(default)]
     pub datasets: Vec<String>,
     #[serde(default)]
-    pub filters: Vec<Value>,
+    pub filters: Vec<WorkersObservabilityFilter>,
     #[serde(default)]
     pub limit: Option<u32>,
     #[serde(default)]
@@ -1050,6 +1050,47 @@ pub struct WorkersObservabilityQueryEventsArgs {
     pub view: Option<String>,
     #[serde(default)]
     pub needle: Option<Value>,
+}
+
+/// A documented Workers Observability filter expression.
+///
+/// Cloudflare accepts either a leaf comparison or a nested logical group.  Keep
+/// this typed at the MCP boundary so callers supply JSON objects, not a JSON
+/// string that happens to contain an object.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum WorkersObservabilityFilter {
+    Group(WorkersObservabilityFilterGroup),
+    Leaf(WorkersObservabilityFilterLeaf),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct WorkersObservabilityFilterGroup {
+    /// Cloudflare's discriminator for a nested logical group.
+    pub kind: String,
+    #[serde(rename = "filterCombination")]
+    pub filter_combination: String,
+    pub filters: Vec<WorkersObservabilityFilter>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct WorkersObservabilityFilterLeaf {
+    pub key: String,
+    pub operation: String,
+    #[serde(rename = "type")]
+    pub value_type: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub value: Option<WorkersObservabilityFilterValue>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum WorkersObservabilityFilterValue {
+    String(String),
+    Number(serde_json::Number),
+    Boolean(bool),
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -12669,10 +12710,21 @@ fn workers_observability_filters(script_name: Option<&str>, filters: &[Value]) -
     all_filters
 }
 
+fn workers_observability_query_filters(
+    script_name: Option<&str>,
+    filters: &[WorkersObservabilityFilter],
+) -> Vec<Value> {
+    let filters = filters
+        .iter()
+        .map(|filter| serde_json::to_value(filter).expect("observability filter serializes"))
+        .collect::<Vec<_>>();
+    workers_observability_filters(script_name, &filters)
+}
+
 fn workers_observability_query_body(
     script_name: Option<&str>,
     datasets: &[String],
-    filters: &[Value],
+    filters: &[WorkersObservabilityFilter],
     limit: u32,
     timeframe: Value,
     query_id: Option<&str>,
@@ -12691,18 +12743,10 @@ fn workers_observability_query_body(
     );
     parameters.insert(
         "filters".to_string(),
-        Value::Array(workers_observability_filters(script_name, filters)),
+        Value::Array(workers_observability_query_filters(script_name, filters)),
     );
     parameters.insert("filterCombination".to_string(), json!("and"));
     parameters.insert("limit".to_string(), json!(limit.min(1000)));
-    parameters.insert(
-        "view".to_string(),
-        json!(
-            view.map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("events")
-        ),
-    );
     if let Some(needle) = needle {
         parameters.insert("needle".to_string(), needle);
     }
@@ -12712,6 +12756,9 @@ fn workers_observability_query_body(
         "timeframe": timeframe,
         "dry": dry,
         "limit": limit.min(1000),
+        "view": view.map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("events"),
         "parameters": parameters,
     })
 }
@@ -14210,11 +14257,12 @@ mod tests {
         LockFirstPublishArgs, MAX_D1_MIGRATION_MANIFEST_BYTES, PagesDeploymentActionArgs,
         PagesUpdateProjectArgs, PatchWorkerSettingsArgs, PortalAgentRequestArgs, QueueHealthArgs,
         UpsertAccessAppArgs, UpsertDnsCnameArgs, VerifyHttpGateArgs, WafEventFilterInput,
-        WafSecurityEventsSummaryArgs, WafTimeWindow, WorkersObservabilityListKeysArgs,
-        WorkersObservabilityListValuesArgs, WorkersObservabilityQueryEventsArgs,
-        WorkersObservabilityTimeframe, WorkersUploadScriptArgs, build_waf_security_events_query,
-        normalize_waf_group_by, normalize_waf_phases, query_mentions_waf,
-        waf_security_events_filter,
+        WafSecurityEventsSummaryArgs, WafTimeWindow, WorkersObservabilityFilter,
+        WorkersObservabilityFilterLeaf, WorkersObservabilityFilterValue,
+        WorkersObservabilityListKeysArgs, WorkersObservabilityListValuesArgs,
+        WorkersObservabilityQueryEventsArgs, WorkersObservabilityTimeframe,
+        WorkersUploadScriptArgs, build_waf_security_events_query, normalize_waf_group_by,
+        normalize_waf_phases, query_mentions_waf, waf_security_events_filter,
     };
     use crate::cloudflare::CloudflareClient;
     use crate::cloudflare::model::WorkerScript;
@@ -19407,7 +19455,17 @@ mod tests {
                     account_id: None,
                     script_name: Some("pages-worker".to_string()),
                     datasets: Vec::new(),
-                    filters: Vec::new(),
+                    filters: vec![WorkersObservabilityFilter::Leaf(
+                        WorkersObservabilityFilterLeaf {
+                            key: "$metadata.trigger".to_string(),
+                            operation: "eq".to_string(),
+                            value_type: "string".to_string(),
+                            kind: Some("filter".to_string()),
+                            value: Some(WorkersObservabilityFilterValue::String(
+                                "scheduled".to_string(),
+                            )),
+                        },
+                    )],
                     limit: Some(20),
                     timeframe: Some(WorkersObservabilityTimeframe { from: 1, to: 2 }),
                     lookback_minutes: None,
@@ -19430,10 +19488,37 @@ mod tests {
             body["parameters"]["filters"][0]["value"],
             json!("pages-worker")
         );
+        assert_eq!(
+            body["parameters"]["filters"][1]["key"],
+            json!("$metadata.trigger")
+        );
+        assert_eq!(
+            body["parameters"]["filters"][1]["value"],
+            json!("scheduled")
+        );
         assert_eq!(body["parameters"]["datasets"], json!(["workers"]));
         assert_eq!(body["parameters"]["filterCombination"], json!("and"));
-        assert_eq!(body["parameters"]["view"], json!("events"));
+        assert_eq!(body["view"], json!("events"));
+        assert!(body["parameters"].get("view").is_none());
         assert_eq!(body["parameters"]["limit"], json!(20));
+    }
+
+    #[test]
+    fn workers_observability_query_filters_require_structured_objects() {
+        let parsed = serde_json::from_value::<WorkersObservabilityQueryEventsArgs>(json!({
+            "filters": [{
+                "key": "$metadata.trigger",
+                "operation": "eq",
+                "type": "string",
+                "value": "scheduled"
+            }]
+        }));
+        assert!(parsed.is_ok(), "structured filter object must parse");
+
+        let stringified = serde_json::from_value::<WorkersObservabilityQueryEventsArgs>(json!({
+            "filters": ["{\\\"key\\\":\\\"$metadata.trigger\\\"}"]
+        }));
+        assert!(stringified.is_err(), "stringified filter object must fail");
     }
 
     #[tokio::test]
