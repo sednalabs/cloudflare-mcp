@@ -1445,6 +1445,15 @@ tools/call name=r2_put_object arguments='{
 }'
 ```
 
+## Pages Project Settings
+
+For `pages_update_project` and generic `api_mutate` using
+`pages-project-update-project`, pass only the exact settings that change. The
+tools accept an object or escaped JSON-object string, redact `secret_text`
+values in plans and responses, reject masked or empty secret replacements, and
+retain a per-variable `null` only for the documented Pages deletion operation.
+Never replay a project GET or a dry-run response as an update payload.
+
 ## External Service Bridge Workflow
 
 The optional external service bridge is for deployments that need to call
