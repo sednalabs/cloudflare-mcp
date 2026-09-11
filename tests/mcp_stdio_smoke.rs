@@ -5868,6 +5868,48 @@ fn spawn_fake_pages_direct_upload_project_api() -> (String, Arc<Mutex<Vec<String
     (format!("http://{addr}"), requests)
 }
 
+fn spawn_fake_pages_project_update_api(
+    expected_requests: usize,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake Pages update API");
+    let addr = listener.local_addr().expect("fake Pages update API addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().take(expected_requests) {
+            let mut stream = stream.expect("fake Pages update API stream");
+            let (headers, body) = read_http_request(&mut stream);
+            let request_line = headers.lines().next().unwrap_or_default();
+            assert_eq!(
+                request_line,
+                "PATCH /accounts/acct-1/pages/projects/site HTTP/1.1"
+            );
+            let body: Value = serde_json::from_slice(&body).expect("Pages update JSON body");
+            requests_for_thread
+                .lock()
+                .expect("Pages update request log lock")
+                .push(body);
+            let response = serde_json::to_vec(&json!({
+                "success": true,
+                "errors": [],
+                "messages": [],
+                "result": {"id": "project-1", "name": "site", "production_branch": "main"},
+            }))
+            .expect("serialize Pages update response");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                response.len()
+            )
+            .expect("write Pages update response headers");
+            stream
+                .write_all(&response)
+                .expect("write Pages update response body");
+        }
+    });
+    (format!("http://{addr}"), requests)
+}
+
 #[test]
 fn stdio_tool_calls_cover_context_and_body_normalization_edges() {
     let mut mcp = McpStdioProcess::start();
@@ -6040,6 +6082,226 @@ fn stdio_tool_calls_cover_context_and_body_normalization_edges() {
             && result_names.contains(&"d1_abort_bootstrap_migration_ledger"),
         "find_tools should expose the bootstrap-specific recovery boundary: {tools_content}"
     );
+}
+
+#[test]
+fn pages_project_updates_normalize_secret_inputs_redact_dry_runs_and_dispatch_exact_payloads_through_stdio()
+ {
+    let secret_value = "known-pages-secret-for-fixture";
+    let settings = json!({
+        "deployment_configs": {
+            "production": {
+                "env_vars": {
+                    "ONLY_CHANGED_SECRET": {"type": "secret_text", "value": secret_value},
+                    "EXPLICIT_DELETE": null,
+                }
+            }
+        }
+    });
+    let settings_string =
+        serde_json::to_string(&settings).expect("serialize Pages update settings");
+    let (base_url, requests) = spawn_fake_pages_project_update_api(2);
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+
+    let curated_dry_run = mcp.call_tool(
+        2,
+        "pages_update_project",
+        json!({"project_name": "site", "settings": settings_string, "dry_run": true}),
+    );
+    let curated_content = structured_content(&curated_dry_run);
+    assert_eq!(curated_content["ok"], json!(true));
+    assert_eq!(
+        curated_content["settings_normalized_from_json_string"],
+        json!(true)
+    );
+    assert_eq!(
+        curated_content["settings"]["deployment_configs"]["production"]["env_vars"]["ONLY_CHANGED_SECRET"]
+            ["value"],
+        json!("<redacted-secret>")
+    );
+    assert!(
+        !curated_dry_run.to_string().contains(secret_value),
+        "dry-run response must not echo a Pages secret"
+    );
+    assert!(requests.lock().expect("request log lock").is_empty());
+
+    let curated_apply = mcp.call_tool(
+        3,
+        "pages_update_project",
+        json!({"project_name": "site", "settings": settings_string, "dry_run": false}),
+    );
+    assert_eq!(structured_content(&curated_apply)["ok"], json!(true));
+
+    let generic_dry_run = mcp.call_tool(
+        4,
+        "api_mutate",
+        json!({
+            "operation_id": "pages-project-update-project",
+            "path_params": {"account_id": "acct-1", "project_name": "site"},
+            "body": settings_string,
+            "dry_run": true,
+            "reason": "fixture Pages secret replacement",
+        }),
+    );
+    let generic_content = structured_content(&generic_dry_run);
+    assert_eq!(generic_content["ok"], json!(true));
+    assert_eq!(
+        generic_content["request_plan"]["body_normalized_from_json_string"],
+        json!(true)
+    );
+    assert_eq!(
+        generic_content["request_plan"]["body"]["deployment_configs"]["production"]["env_vars"]["ONLY_CHANGED_SECRET"]
+            ["value"],
+        json!("<redacted-secret>")
+    );
+    assert!(
+        !generic_dry_run.to_string().contains(secret_value),
+        "generic dry-run response must not echo a Pages secret"
+    );
+    let confirmation_token = generic_content["request_plan"]["required_confirmation_token"]
+        .as_str()
+        .expect("generic Pages confirmation token")
+        .to_string();
+    assert_eq!(requests.lock().expect("request log lock").len(), 1);
+
+    let generic_apply = mcp.call_tool(
+        5,
+        "api_mutate",
+        json!({
+            "operation_id": "pages-project-update-project",
+            "path_params": {"account_id": "acct-1", "project_name": "site"},
+            "body": settings_string,
+            "dry_run": false,
+            "confirmation_token": confirmation_token,
+            "reason": "fixture Pages secret replacement",
+        }),
+    );
+    assert_eq!(structured_content(&generic_apply)["ok"], json!(true));
+
+    let requests = requests.lock().expect("request log lock");
+    assert_eq!(requests.len(), 2);
+    for payload in requests.iter() {
+        assert_eq!(
+            payload, &settings,
+            "apply must dispatch the exact change only"
+        );
+        assert!(
+            payload["deployment_configs"]["preview"].is_null(),
+            "untouched environment settings must never be round-tripped"
+        );
+    }
+}
+
+#[test]
+fn pages_project_update_rejects_unsafe_or_malformed_inputs_before_any_provider_call_through_stdio()
+{
+    let provider = TcpListener::bind("127.0.0.1:0").expect("bind no-call Pages provider witness");
+    provider
+        .set_nonblocking(true)
+        .expect("make no-call Pages provider witness nonblocking");
+    let base_url = format!(
+        "http://{}",
+        provider
+            .local_addr()
+            .expect("no-call Pages provider address")
+    );
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let unsafe_settings = json!({
+        "deployment_configs": {
+            "production": {
+                "env_vars": {
+                    "MASKED_SECRET": {"type": "secret_text", "value": "********"}
+                }
+            }
+        }
+    });
+
+    for (id, dry_run) in [(2, true), (3, false)] {
+        let response = mcp.call_tool(
+            id,
+            "pages_update_project",
+            json!({"project_name": "site", "settings": unsafe_settings, "dry_run": dry_run}),
+        );
+        let content = structured_content(&response);
+        assert_eq!(
+            content["error"]["code"],
+            json!("pages_project_update.masked_secret_value")
+        );
+        assert_eq!(content["provider_calls"], json!(0));
+        assert_eq!(content["provider_mutations"], json!(0));
+    }
+
+    let invalid_bodies = [
+        (json!(null), "pages_project_update.missing_settings"),
+        (
+            json!(["not", "an", "object"]),
+            "pages_project_update.invalid_settings_shape",
+        ),
+        (json!(7), "pages_project_update.invalid_settings_shape"),
+        (
+            json!("{bad json"),
+            "pages_project_update.invalid_settings_json",
+        ),
+    ];
+    for (offset, (body, code)) in invalid_bodies.into_iter().enumerate() {
+        let response = mcp.call_tool(
+            10 + offset as u64,
+            "api_mutate",
+            json!({
+                "operation_id": "pages-project-update-project",
+                "path_params": {"account_id": "acct-1", "project_name": "site"},
+                "body": body,
+                "dry_run": offset % 2 == 0,
+            }),
+        );
+        let content = structured_content(&response);
+        assert_eq!(content["error"]["code"], json!(code));
+        assert_eq!(content["provider_calls"], json!(0));
+        assert_eq!(content["provider_mutations"], json!(0));
+    }
+
+    let missing_body = mcp.call_tool(
+        19,
+        "api_mutate",
+        json!({
+            "operation_id": "pages-project-update-project",
+            "path_params": {"account_id": "acct-1", "project_name": "site"},
+            "dry_run": false,
+        }),
+    );
+    let missing_content = structured_content(&missing_body);
+    assert_eq!(
+        missing_content["error"]["code"],
+        json!("pages_project_update.missing_settings")
+    );
+    assert_eq!(missing_content["provider_calls"], json!(0));
+    assert_eq!(missing_content["provider_mutations"], json!(0));
+
+    for (id, dry_run) in [(20, true), (21, false)] {
+        let response = mcp.call_tool(
+            id,
+            "api_mutate",
+            json!({
+                "operation_id": "pages-project-update-project",
+                "path_params": {"account_id": "acct-1", "project_name": "site"},
+                "body": unsafe_settings,
+                "dry_run": dry_run,
+            }),
+        );
+        let content = structured_content(&response);
+        assert_eq!(
+            content["error"]["code"],
+            json!("pages_project_update.masked_secret_value")
+        );
+        assert_eq!(content["provider_calls"], json!(0));
+        assert_eq!(content["provider_mutations"], json!(0));
+    }
+
+    assert!(
+        matches!(provider.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "invalid Pages inputs must make zero provider connections"
+    );
+    mcp.terminate();
 }
 
 #[test]

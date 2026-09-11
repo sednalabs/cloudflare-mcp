@@ -88,6 +88,10 @@ use crate::pages_deploy::{
     MAX_PAGES_ASSET_COUNT_DEFAULT, PagesDirectoryInspectOptions,
     inspect_pages_directory_with_options,
 };
+use crate::pages_project_update::{
+    NormalizedPagesProjectUpdateSettings, PagesProjectUpdateInputError,
+    normalize_pages_project_update_settings, redact_pages_project_update_settings,
+};
 use crate::policy::{
     AllowlistMutationMode, build_managed_allowlist_policy, canonicalize_requested_principals,
     evaluate_mutation_invariants, extract_allowlist_principals, plan_target_principals,
@@ -2890,6 +2894,27 @@ impl CloudflareMcp {
                 "provider_mutations": 0,
             })));
         }
+        let pages_project_update = operation.operation_id == "pages-project-update-project";
+        let normalized_body = if pages_project_update {
+            match normalize_pages_project_update_settings(args.body.clone()) {
+                Ok(NormalizedPagesProjectUpdateSettings {
+                    settings,
+                    normalized_from_json_string,
+                }) => NormalizedJsonBody {
+                    value: Some(settings),
+                    normalized: normalized_from_json_string,
+                },
+                Err(error) => {
+                    return Ok(pages_project_update_input_error_result(
+                        "api_mutate",
+                        args.dry_run,
+                        error,
+                    ));
+                }
+            }
+        } else {
+            normalize_json_string_body(args.body.clone())
+        };
         let path = match render_path(
             operation,
             &args.path_params,
@@ -2916,7 +2941,6 @@ impl CloudflareMcp {
                 ));
             }
         };
-        let normalized_body = normalize_json_string_body(args.body.clone());
         let permission_preflight =
             mutation_permission_preflight(operation.operation_id.as_str(), &args.token_permissions);
         let required_token = mutation_confirmation_token(operation, &path, &normalized_body.value);
@@ -2971,7 +2995,14 @@ impl CloudflareMcp {
             "method": operation.method,
             "path": path,
             "query": args.query.clone(),
-            "body": normalized_body.value.clone(),
+            "body": if pages_project_update {
+                normalized_body
+                    .value
+                    .as_ref()
+                    .map(redact_pages_project_update_settings)
+            } else {
+                normalized_body.value.clone()
+            },
             "body_normalized_from_json_string": normalized_body.normalized,
             "headers": {
                 "authorization": "Bearer <redacted>",
@@ -6205,6 +6236,19 @@ impl CloudflareMcp {
         &self,
         Parameters(args): Parameters<PagesUpdateProjectArgs>,
     ) -> Result<CallToolResult, crate::McpError> {
+        let NormalizedPagesProjectUpdateSettings {
+            settings,
+            normalized_from_json_string,
+        } = match normalize_pages_project_update_settings(Some(args.settings)) {
+            Ok(settings) => settings,
+            Err(error) => {
+                return Ok(pages_project_update_input_error_result(
+                    "pages_update_project",
+                    args.dry_run,
+                    error,
+                ));
+            }
+        };
         let account_id = resolve_account_id(self, args.account_id.as_deref())?;
         if args.dry_run {
             return Ok(CallToolResult::structured(json!({
@@ -6213,13 +6257,14 @@ impl CloudflareMcp {
                 "dry_run": true,
                 "account_id": account_id,
                 "project_name": args.project_name,
-                "settings": args.settings,
+                "settings": redact_pages_project_update_settings(&settings),
+                "settings_normalized_from_json_string": normalized_from_json_string,
                 "deployment_snapshot_note": pages_project_update_snapshot_note(),
             })));
         }
         match self
             .cloudflare
-            .update_pages_project(account_id, &args.project_name, &args.settings)
+            .update_pages_project(account_id, &args.project_name, &settings)
             .await
         {
             Ok(project) => Ok(CallToolResult::structured(json!({
@@ -10167,6 +10212,29 @@ fn pages_project_update_snapshot_note() -> Value {
         "message": "Pages project settings/env updates do not mutate an already-live deployment snapshot.",
         "next_step": "Create a new deployment after updating project settings. For direct-upload projects, use pages_deploy_directory with the build output directory so env/bindings are resnapshotted.",
     })
+}
+
+fn pages_project_update_input_error_result(
+    operation: &str,
+    dry_run: bool,
+    error: PagesProjectUpdateInputError,
+) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": operation,
+        "dry_run": dry_run,
+        "error": {
+            "code": error.code,
+            "message": error.message,
+            "hint": error.hint,
+            "field": error.field,
+            "actual_shape": error.actual_shape,
+        },
+        "request_constructed": false,
+        "raw_body_dispatched": false,
+        "provider_calls": 0,
+        "provider_mutations": 0,
+    }))
 }
 
 fn is_pages_direct_upload_retry_error(err: &crate::cloudflare::AdapterError) -> bool {

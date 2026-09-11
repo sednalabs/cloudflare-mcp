@@ -32,6 +32,7 @@ pub(crate) mod d1_target;
 pub mod dns_route;
 pub mod mutation;
 pub(crate) mod pages_deploy;
+pub(crate) mod pages_project_update;
 pub mod policy;
 pub mod portal;
 #[allow(dead_code)] // staged low-level boundary; lifecycle consumers are intentionally out of scope
