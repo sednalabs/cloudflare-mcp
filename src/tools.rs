@@ -3096,7 +3096,11 @@ impl CloudflareMcp {
                         "risk": operation.risk,
                         "preferred_tool": operation.preferred_tool,
                     },
-                    "result": result,
+                    "result": if pages_project_update {
+                        redact_pages_project_update_settings(&result)
+                    } else {
+                        result
+                    },
                 })),
                 Err(err) if err.status == Some(403) && permission_preflight.is_some() => {
                     let preflight = permission_preflight
@@ -6270,7 +6274,10 @@ impl CloudflareMcp {
             Ok(project) => Ok(CallToolResult::structured(json!({
                 "ok": true,
                 "account_id": account_id,
-                "project": project,
+                "project": redact_pages_project_update_settings(
+                    &serde_json::to_value(project)
+                        .expect("Pages project response must serialize for redaction"),
+                ),
                 "deployment_snapshot_note": pages_project_update_snapshot_note(),
             }))),
             Err(err) => Ok(adapter_error_result(err)),

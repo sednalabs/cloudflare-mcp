@@ -84,20 +84,7 @@ pub(crate) fn normalize_pages_project_update_settings(
 
 pub(crate) fn redact_pages_project_update_settings(settings: &Value) -> Value {
     let mut redacted = settings.clone();
-    let Some(root) = redacted.as_object_mut() else {
-        return redacted;
-    };
-    redact_environment_variable_map(root.get_mut("env_vars"));
-    if let Some(deployment_configs) = root
-        .get_mut("deployment_configs")
-        .and_then(Value::as_object_mut)
-    {
-        for config in deployment_configs.values_mut() {
-            if let Some(config) = config.as_object_mut() {
-                redact_environment_variable_map(config.get_mut("env_vars"));
-            }
-        }
-    }
+    redact_secret_text_values(&mut redacted);
     redacted
 }
 
@@ -201,19 +188,25 @@ fn validate_environment_variable_map(
     Ok(())
 }
 
-fn redact_environment_variable_map(env_vars: Option<&mut Value>) {
-    let Some(env_vars) = env_vars.and_then(Value::as_object_mut) else {
-        return;
-    };
-    for entry in env_vars.values_mut() {
-        if entry.get("type").and_then(Value::as_str) == Some("secret_text") {
-            if let Some(entry) = entry.as_object_mut() {
-                entry.insert(
+fn redact_secret_text_values(value: &mut Value) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                redact_secret_text_values(value);
+            }
+        }
+        Value::Object(values) => {
+            if values.get("type").and_then(Value::as_str) == Some("secret_text") {
+                values.insert(
                     "value".to_string(),
                     Value::String(REDACTED_SECRET_VALUE.into()),
                 );
             }
+            for value in values.values_mut() {
+                redact_secret_text_values(value);
+            }
         }
+        _ => {}
     }
 }
 
@@ -223,7 +216,13 @@ fn is_obviously_masked_secret(value: &str) -> bool {
         && (value.chars().all(|character| character == '*')
             || matches!(
                 value.to_ascii_lowercase().as_str(),
-                "redacted" | "masked" | "<redacted>" | "<masked>" | "[redacted]" | "[masked]"
+                "redacted"
+                    | "masked"
+                    | "<redacted>"
+                    | "<masked>"
+                    | "[redacted]"
+                    | "[masked]"
+                    | REDACTED_SECRET_VALUE
             ))
 }
 

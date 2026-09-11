@@ -41,6 +41,10 @@ restored, hidden, or behaviorally changed, add or update MCP stdio smoke
 coverage so the executable is called through JSON-RPC and rmcp extraction errors
 cannot hide behind direct Rust handler tests.
 
+Pages project update input normalization and secret preservation are behavioral
+contracts, not schema-field changes: keep the snapshot unchanged unless the
+tool schema changes, and cover curated plus generic update paths through stdio.
+
 When changing tool argument shape or required fields, update both:
 - `spec/tool_schema_snapshot.v1.json` (machine contract),
 - `../docs/CLIENT-CONTRACT.md` (human-readable client contract).

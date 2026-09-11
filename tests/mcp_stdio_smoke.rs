@@ -5870,11 +5870,13 @@ fn spawn_fake_pages_direct_upload_project_api() -> (String, Arc<Mutex<Vec<String
 
 fn spawn_fake_pages_project_update_api(
     expected_requests: usize,
+    provider_secret: &str,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake Pages update API");
     let addr = listener.local_addr().expect("fake Pages update API addr");
     let requests = Arc::new(Mutex::new(Vec::new()));
     let requests_for_thread = requests.clone();
+    let provider_secret = provider_secret.to_string();
     thread::spawn(move || {
         for stream in listener.incoming().take(expected_requests) {
             let mut stream = stream.expect("fake Pages update API stream");
@@ -5893,7 +5895,34 @@ fn spawn_fake_pages_project_update_api(
                 "success": true,
                 "errors": [],
                 "messages": [],
-                "result": {"id": "project-1", "name": "site", "production_branch": "main"},
+                "result": {
+                    "id": "project-1",
+                    "name": "site",
+                    "production_branch": "main",
+                    "deployment_configs": {
+                        "production": {
+                            "env_vars": {
+                                "RESPONSE_SECRET": {"type": "secret_text", "value": provider_secret.as_str()}
+                            }
+                        }
+                    },
+                    "latest_deployment": {
+                        "id": "latest-1",
+                        "deployment_trigger": {
+                            "env_vars": {
+                                "LATEST_SECRET": {"type": "secret_text", "value": provider_secret.as_str()}
+                            }
+                        }
+                    },
+                    "canonical_deployment": {
+                        "id": "canonical-1",
+                        "deployment_trigger": {
+                            "env_vars": {
+                                "CANONICAL_SECRET": {"type": "secret_text", "value": provider_secret.as_str()}
+                            }
+                        }
+                    }
+                },
             }))
             .expect("serialize Pages update response");
             write!(
@@ -6088,6 +6117,7 @@ fn stdio_tool_calls_cover_context_and_body_normalization_edges() {
 fn pages_project_updates_normalize_secret_inputs_redact_dry_runs_and_dispatch_exact_payloads_through_stdio()
  {
     let secret_value = "known-pages-secret-for-fixture";
+    let provider_secret = "provider-returned-secret-for-fixture";
     let settings = json!({
         "deployment_configs": {
             "production": {
@@ -6100,7 +6130,7 @@ fn pages_project_updates_normalize_secret_inputs_redact_dry_runs_and_dispatch_ex
     });
     let settings_string =
         serde_json::to_string(&settings).expect("serialize Pages update settings");
-    let (base_url, requests) = spawn_fake_pages_project_update_api(2);
+    let (base_url, requests) = spawn_fake_pages_project_update_api(2, provider_secret);
     let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
 
     let curated_dry_run = mcp.call_tool(
@@ -6125,12 +6155,35 @@ fn pages_project_updates_normalize_secret_inputs_redact_dry_runs_and_dispatch_ex
     );
     assert!(requests.lock().expect("request log lock").is_empty());
 
+    let curated_redacted_settings = curated_content["settings"].clone();
+    let curated_sentinel_replay = mcp.call_tool(
+        21,
+        "pages_update_project",
+        json!({"project_name": "site", "settings": curated_redacted_settings, "dry_run": false}),
+    );
+    let curated_sentinel_content = structured_content(&curated_sentinel_replay);
+    assert_eq!(
+        curated_sentinel_content["error"]["code"],
+        json!("pages_project_update.masked_secret_value")
+    );
+    assert_eq!(curated_sentinel_content["provider_calls"], json!(0));
+    assert!(requests.lock().expect("request log lock").is_empty());
+
     let curated_apply = mcp.call_tool(
         3,
         "pages_update_project",
         json!({"project_name": "site", "settings": settings_string, "dry_run": false}),
     );
     assert_eq!(structured_content(&curated_apply)["ok"], json!(true));
+    assert!(
+        !curated_apply.to_string().contains(provider_secret),
+        "curated apply response must not echo a Pages provider secret"
+    );
+    assert_eq!(
+        structured_content(&curated_apply)["project"]["deployment_configs"]["production"]["env_vars"]
+            ["RESPONSE_SECRET"]["value"],
+        json!("<redacted-secret>")
+    );
 
     let generic_dry_run = mcp.call_tool(
         4,
@@ -6164,6 +6217,25 @@ fn pages_project_updates_normalize_secret_inputs_redact_dry_runs_and_dispatch_ex
         .to_string();
     assert_eq!(requests.lock().expect("request log lock").len(), 1);
 
+    let generic_sentinel_replay = mcp.call_tool(
+        22,
+        "api_mutate",
+        json!({
+            "operation_id": "pages-project-update-project",
+            "path_params": {"account_id": "acct-1", "project_name": "site"},
+            "body": generic_content["request_plan"]["body"],
+            "dry_run": false,
+            "confirmation_token": confirmation_token.clone(),
+        }),
+    );
+    let generic_sentinel_content = structured_content(&generic_sentinel_replay);
+    assert_eq!(
+        generic_sentinel_content["error"]["code"],
+        json!("pages_project_update.masked_secret_value")
+    );
+    assert_eq!(generic_sentinel_content["provider_calls"], json!(0));
+    assert_eq!(requests.lock().expect("request log lock").len(), 1);
+
     let generic_apply = mcp.call_tool(
         5,
         "api_mutate",
@@ -6177,6 +6249,20 @@ fn pages_project_updates_normalize_secret_inputs_redact_dry_runs_and_dispatch_ex
         }),
     );
     assert_eq!(structured_content(&generic_apply)["ok"], json!(true));
+    assert!(
+        !generic_apply.to_string().contains(provider_secret),
+        "generic apply response must not echo a Pages provider secret"
+    );
+    assert_eq!(
+        structured_content(&generic_apply)["result"]["latest_deployment"]["deployment_trigger"]["env_vars"]
+            ["LATEST_SECRET"]["value"],
+        json!("<redacted-secret>")
+    );
+    assert_eq!(
+        structured_content(&generic_apply)["result"]["canonical_deployment"]["deployment_trigger"]
+            ["env_vars"]["CANONICAL_SECRET"]["value"],
+        json!("<redacted-secret>")
+    );
 
     let requests = requests.lock().expect("request log lock");
     assert_eq!(requests.len(), 2);
@@ -6206,11 +6292,11 @@ fn pages_project_update_rejects_unsafe_or_malformed_inputs_before_any_provider_c
             .expect("no-call Pages provider address")
     );
     let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
-    let unsafe_settings = json!({
+    let replayed_redacted_settings = json!({
         "deployment_configs": {
             "production": {
                 "env_vars": {
-                    "MASKED_SECRET": {"type": "secret_text", "value": "********"}
+                    "REPLAYED_SECRET": {"type": "secret_text", "value": "<redacted-secret>"}
                 }
             }
         }
@@ -6220,7 +6306,7 @@ fn pages_project_update_rejects_unsafe_or_malformed_inputs_before_any_provider_c
         let response = mcp.call_tool(
             id,
             "pages_update_project",
-            json!({"project_name": "site", "settings": unsafe_settings, "dry_run": dry_run}),
+            json!({"project_name": "site", "settings": replayed_redacted_settings, "dry_run": dry_run}),
         );
         let content = structured_content(&response);
         assert_eq!(
@@ -6284,7 +6370,7 @@ fn pages_project_update_rejects_unsafe_or_malformed_inputs_before_any_provider_c
             json!({
                 "operation_id": "pages-project-update-project",
                 "path_params": {"account_id": "acct-1", "project_name": "site"},
-                "body": unsafe_settings,
+                "body": replayed_redacted_settings,
                 "dry_run": dry_run,
             }),
         );
