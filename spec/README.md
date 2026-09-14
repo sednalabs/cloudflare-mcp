@@ -274,4 +274,16 @@ Preserved curated tool families:
   and full convergence ends exactly at it. Every rejected outcome/prefix or
   out-of-bounds product has zero provider and local namespace mutations.
 - Workers Analytics Engine read tools (`analytics_engine_list_datasets`, `analytics_engine_query`, `analytics_engine_describe_schema`, `analytics_engine_validate_query`) are first-class contract tools for Account Analytics Read workflows and must remain present even when broad API parity is available.
+- Worker version upload approval is a distinct private local authority. Keep
+  side-effect-free preview, explicit create-only preparation, opaque random
+  handles, exact complete-candidate apply binding, at-most-once consumption,
+  expiry/restart/corruption/concurrency failure, and downstream provider-attempt
+  custody aligned across schema, stdio proof, client contract, and runbook.
+  Never reintroduce public candidate-derived digests or byte sizes as an
+  approval surface for metadata that may contain low-entropy secret values.
+- Worker version response lifecycle distinguishes receipt of headers/status
+  (`provider_response_received`) from complete-body custody
+  (`provider_response_body_complete`). Incomplete responses expose neither a
+  complete-body digest nor size. Complete invalid bodies retain custody evidence
+  without implying provider success or permission to retry an upload.
 - Queues readback tools (`queues_list`, `queues_get`, `queues_get_metrics`, `queues_list_consumers`, `queues_health`) are first-class contract tools and must remain present for operational backlog/DLQ/consumer diagnostics.

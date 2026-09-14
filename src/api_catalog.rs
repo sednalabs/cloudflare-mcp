@@ -760,6 +760,19 @@ mod tests {
     }
 
     #[test]
+    fn generic_worker_version_upload_is_denied_and_prefers_guarded_version_tool() {
+        let operation = find_operation("worker-versions-upload-version")
+            .expect("Worker version upload operation");
+
+        assert_eq!(operation.risk, ApiRisk::DeniedByDefault);
+        assert!(!operation_allowed_by_default(operation));
+        assert_eq!(
+            operation.preferred_tool.as_deref(),
+            Some("workers_upload_version")
+        );
+    }
+
+    #[test]
     fn generic_existing_target_d1_mutator_inventory_is_closed_and_denied_by_default() {
         let discovered = catalog()
             .operations

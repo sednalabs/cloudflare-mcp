@@ -275,6 +275,15 @@ fn tool_capabilities() -> Vec<ToolCapability> {
         cap("workers_upload_script")
             .with_group("workers")
             .with_read_only(false),
+        cap("workers_capture_version_evidence")
+            .with_group("workers")
+            .with_read_only(true),
+        cap("workers_upload_version")
+            .with_group("workers")
+            .with_read_only(false),
+        cap("workers_reconcile_version_upload")
+            .with_group("workers")
+            .with_read_only(true),
         cap("workers_list_tails")
             .with_group("workers")
             .with_read_only(true),
