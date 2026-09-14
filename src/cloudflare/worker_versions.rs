@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -103,13 +103,15 @@ pub(crate) struct WorkerRuntimeVerification {
     pub(crate) matched: bool,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WorkerDeploymentVersion {
     pub(crate) version_id: String,
     pub(crate) percentage: f64,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WorkerDeploymentProjection {
     pub(crate) deployment_id: String,
     pub(crate) strategy: String,
@@ -2032,7 +2034,41 @@ pub(crate) fn validate_worker_deployment_projection(
     script_name: &str,
     deployments: &Value,
 ) -> Result<(Vec<WorkerDeploymentProjection>, String), WorkerVersionOperationError> {
-    let projected = sanitize_deployments(&json!({"deployments": deployments}))?;
+    let rows = deployments.as_array().ok_or_else(|| {
+        operation_error(
+            "workers.version_deployment_projection_invalid",
+            "saved deployment projection was not an array",
+            "Use the exact deployment projection returned by evidence capture.",
+        )
+    })?;
+    if rows.len() > MAX_DEPLOYMENTS {
+        return Err(operation_error(
+            "workers.version_deployments_over_cap",
+            "saved deployment projection exceeded the 100-deployment safety cap",
+            "Use complete bounded evidence; never truncate a saved projection.",
+        ));
+    }
+    // Capture emits deployment_id, not the provider's raw id field. Decode
+    // that closed public shape before reusing the provider semantic validator.
+    let saved: Vec<WorkerDeploymentProjection> = serde_json::from_value(deployments.clone())
+        .map_err(|_| {
+            operation_error(
+                "workers.version_deployment_projection_invalid",
+                "saved deployment projection did not match the captured evidence shape",
+                "Use the exact deployment projection returned by evidence capture.",
+            )
+        })?;
+    let provider_rows = saved
+        .iter()
+        .map(|deployment| {
+            json!({
+                "id": deployment.deployment_id,
+                "strategy": deployment.strategy,
+                "versions": deployment.versions,
+            })
+        })
+        .collect::<Vec<_>>();
+    let projected = sanitize_deployments(&json!({"deployments": provider_rows}))?;
     let digest = deployment_snapshot_sha256(script_name, &projected);
     Ok((projected, digest))
 }
@@ -2626,15 +2662,56 @@ mod tests {
                 .map(|deployment| deployment.deployment_id.as_str()),
             Some("22222222-2222-4222-8222-222222222222")
         );
-        let (_, first_digest) = validate_worker_deployment_projection(
+        let captured = serde_json::to_value(&ordered).expect("serialize captured projection");
+        let (roundtrip, first_digest) =
+            validate_worker_deployment_projection("worker-a", &captured)
+                .expect("first ordered digest");
+        assert_eq!(roundtrip, ordered);
+        assert_eq!(
+            first_digest,
+            super::deployment_snapshot_sha256("worker-a", &ordered)
+        );
+        let legacy_digest = super::sha256_json(&json!({
+            "schema_version":1, "script_name":"worker-a", "deployments":ordered
+        }));
+        assert_ne!(first_digest, legacy_digest);
+        let mut swapped = ordered.clone();
+        swapped.reverse();
+        let (_, swapped_digest) = validate_worker_deployment_projection(
             "worker-a",
-            &json!([first.clone(), second.clone()]),
+            &serde_json::to_value(swapped).unwrap(),
         )
-        .expect("first ordered digest");
-        let (_, swapped_digest) =
-            validate_worker_deployment_projection("worker-a", &json!([second, first]))
-                .expect("swapped ordered digest");
+        .expect("swapped ordered digest");
         assert_ne!(first_digest, swapped_digest);
+    }
+
+    #[test]
+    fn saved_deployment_projection_rejects_raw_or_malformed_shapes() {
+        let valid = json!([{
+            "deployment_id":"22222222-2222-4222-8222-222222222222",
+            "strategy":"percentage",
+            "versions":[{"version_id":"11111111-1111-4111-8111-111111111111","percentage":100}]
+        }]);
+        for malformed in [Value::Null, json!({}), json!([null]), json!([7])] {
+            assert!(validate_worker_deployment_projection("worker-a", &malformed).is_err());
+        }
+        let mut raw = valid.clone();
+        let row = raw[0].as_object_mut().unwrap();
+        let id = row.remove("deployment_id").unwrap();
+        row.insert("id".to_string(), id);
+        assert!(validate_worker_deployment_projection("worker-a", &raw).is_err());
+        let mut extra = valid.clone();
+        extra[0]["id"] = json!("33333333-3333-4333-8333-333333333333");
+        assert!(validate_worker_deployment_projection("worker-a", &extra).is_err());
+        let mut unknown_weight = valid.clone();
+        unknown_weight[0]["versions"][0]["future_weight"] = json!(true);
+        assert!(validate_worker_deployment_projection("worker-a", &unknown_weight).is_err());
+        let mut bad_weight = valid.clone();
+        bad_weight[0]["versions"][0]["percentage"] = json!(0);
+        assert!(validate_worker_deployment_projection("worker-a", &bad_weight).is_err());
+        let mut bad_identity = valid;
+        bad_identity[0]["deployment_id"] = json!("invalid");
+        assert!(validate_worker_deployment_projection("worker-a", &bad_identity).is_err());
     }
 
     #[test]

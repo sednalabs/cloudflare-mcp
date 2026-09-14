@@ -1422,6 +1422,11 @@ random-handle preparation lifecycle.
    `percentage` strategy, an order-sensitive version-2 snapshot digest, and
    `candidate_absent:true`. Any claimed pagination is unsupported and fails
    closed; do not infer the active deployment from an incomplete list.
+   For read-only reconciliation, pass the captured `deployments` projection
+   unchanged: its identity field is `deployment_id`, not the provider's raw
+   `id`. The closed saved-projection decoder revalidates identities, weights
+   and ordering before comparing the pinned version-2 digest; raw provider
+   rows and unknown saved fields are rejected.
    `candidate_created_private_exact_candidate` means a disabled candidate exists and the
    provider-visible identity/runtime/binding/deployment projections match. It
    public result deliberately omits all deterministic candidate/request hashes

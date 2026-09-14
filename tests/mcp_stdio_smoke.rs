@@ -19760,7 +19760,11 @@ fn workers_reconcile_version_upload_never_attributes_a_sole_new_candidate() {
     );
     let content = structured_content(&response);
     assert_eq!(content["ok"], json!(false), "{content}");
-    assert_eq!(content["status"], json!("reconciliation_required"));
+    assert_eq!(
+        content["status"],
+        json!("reconciliation_required"),
+        "{content}"
+    );
     assert_eq!(content["attribution_state"], json!("unattributed"));
     assert_eq!(
         content["candidate_relationship"],
