@@ -5183,6 +5183,20 @@ fn spawn_fake_worker_version_api_with_response_fault(
     initially_uploaded: bool,
     incomplete_upload_response: bool,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
+    spawn_fake_worker_version_api_with_faults(
+        expected_requests,
+        initially_uploaded,
+        incomplete_upload_response,
+        false,
+    )
+}
+
+fn spawn_fake_worker_version_api_with_faults(
+    expected_requests: usize,
+    initially_uploaded: bool,
+    incomplete_upload_response: bool,
+    deployment_order_drift: bool,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0") // DevSkim: ignore DS162092 -- loopback-only test fixture listener.
         .expect("bind fake Worker version API");
     let addr = listener.local_addr().expect("fake Worker version API addr");
@@ -5192,6 +5206,7 @@ fn spawn_fake_worker_version_api_with_response_fault(
         let base_id = "11111111-1111-4111-8111-111111111111";
         let candidate_id = "22222222-2222-4222-8222-222222222222";
         let mut uploaded = initially_uploaded;
+        let mut deployment_reads = 0;
         for stream in listener.incoming().take(expected_requests) {
             let mut stream = stream.expect("fake Worker version API stream");
             let (headers, body) = read_http_request(&mut stream);
@@ -5282,11 +5297,36 @@ fn spawn_fake_worker_version_api_with_response_fault(
             } else if method == "GET"
                 && path_without_query == "/accounts/acct-1/workers/scripts/worker-a/deployments"
             {
+                deployment_reads += 1;
+                let mut deployment_ids = [
+                    "44444444-4444-4444-8444-444444444444",
+                    "33333333-3333-4333-8333-333333333333",
+                ];
+                if deployment_order_drift && deployment_reads > 1 {
+                    deployment_ids.reverse();
+                }
                 json!({
                     "success": true,
                     "errors": [],
                     "messages": [],
-                    "result": {"deployments": []},
+                    "result": {"deployments": [
+                        {
+                            "id": deployment_ids[0],
+                            "strategy": "percentage",
+                            "versions": [{
+                                "version_id": base_id,
+                                "percentage": 100
+                            }]
+                        },
+                        {
+                            "id": deployment_ids[1],
+                            "strategy": "percentage",
+                            "versions": [{
+                                "version_id": base_id,
+                                "percentage": 100
+                            }]
+                        }
+                    ]},
                 })
             } else if method == "POST"
                 && path_without_query == "/accounts/acct-1/workers/scripts/worker-a/versions"
@@ -19405,8 +19445,6 @@ fn workers_upload_version_stdio_body_loss_preserves_reconciliation_without_retry
 }
 
 fn assert_worker_version_stdio_apply(incomplete_upload_response: bool) {
-    use std::os::unix::fs::PermissionsExt;
-
     let expected_requests = if incomplete_upload_response { 16 } else { 21 };
     let (base_url, requests) = spawn_fake_worker_version_api_with_response_fault(
         expected_requests,
@@ -19417,13 +19455,7 @@ fn assert_worker_version_stdio_apply(incomplete_upload_response: bool) {
         .duration_since(UNIX_EPOCH)
         .expect("clock after epoch")
         .as_nanos();
-    let attempt_root = std::env::temp_dir().join(format!(
-        "cloudflare-mcp-version-attempt-{}-{suffix}",
-        std::process::id()
-    ));
-    fs::create_dir(&attempt_root).expect("create attempt root");
-    fs::set_permissions(&attempt_root, fs::Permissions::from_mode(0o700))
-        .expect("make attempt root private");
+    let attempt_root = private_worker_approval_fixture("attempt", suffix);
     let approval_root = private_worker_approval_fixture("apply", suffix);
     let mut mcp = McpStdioProcess::start_with_env(vec![
         ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
@@ -19460,6 +19492,10 @@ fn assert_worker_version_stdio_apply(incomplete_upload_response: bool) {
             .as_str()
             .expect("deployment snapshot pin")
             .to_string();
+    assert_eq!(
+        preflight_content["evidence"]["deployments"]["active_deployment_id"],
+        json!("44444444-4444-4444-8444-444444444444")
+    );
 
     let upload_args = json!({
         "script_name":"worker-a",
@@ -19650,6 +19686,33 @@ fn assert_worker_version_stdio_apply(incomplete_upload_response: bool) {
     mcp.terminate();
     fs::remove_dir_all(attempt_root).expect("remove attempt root");
     fs::remove_dir_all(approval_root).expect("remove approval root");
+}
+
+#[test]
+fn workers_capture_version_evidence_rejects_same_set_active_order_drift() {
+    let (base_url, requests) = spawn_fake_worker_version_api_with_faults(4, false, false, true);
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let response = mcp.call_tool(
+        2,
+        "workers_capture_version_evidence",
+        json!({"script_name":"worker-a", "per_page":100}),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(
+        content["error"]["code"],
+        json!("workers.version_evidence_deployment_drift"),
+        "{content}"
+    );
+    let calls = requests.lock().expect("request log lock");
+    assert_eq!(calls.len(), 4);
+    assert!(
+        calls
+            .iter()
+            .all(|request| request["method"] == json!("GET"))
+    );
+    drop(calls);
+    mcp.terminate();
 }
 
 #[test]

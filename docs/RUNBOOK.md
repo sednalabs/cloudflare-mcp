@@ -1417,8 +1417,11 @@ random-handle preparation lifecycle.
    contains an `inherit` binding, stop: this ceremony deliberately rejects it
    rather than pretending to prove an uncaptured recursive inheritance chain.
    It also requires an
-   unchanged sorted two-pass deployment projection with an explicit known
-   `percentage` strategy and `candidate_absent:true`.
+   unchanged provider-ordered two-pass deployment projection with the first
+   deployment explicitly bound as `active_deployment_id`, an explicit known
+   `percentage` strategy, an order-sensitive version-2 snapshot digest, and
+   `candidate_absent:true`. Any claimed pagination is unsupported and fails
+   closed; do not infer the active deployment from an incomplete list.
    `candidate_created_private_exact_candidate` means a disabled candidate exists and the
    provider-visible identity/runtime/binding/deployment projections match. It
    public result deliberately omits all deterministic candidate/request hashes

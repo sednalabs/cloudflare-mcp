@@ -118,6 +118,10 @@ pub(crate) struct WorkerDeploymentProjection {
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct WorkerDeploymentReadEvidence {
+    /// Cloudflare returns deployments newest-first; the first item is the
+    /// deployment actively serving traffic. Keep this identity explicit
+    /// rather than asking consumers to infer it from a sorted projection.
+    pub(crate) active_deployment_id: Option<String>,
     pub(crate) deployments: Vec<WorkerDeploymentProjection>,
     pub(crate) projection_sha256: String,
     pub(crate) provider_proof: WorkerProviderProof,
@@ -125,6 +129,7 @@ pub(crate) struct WorkerDeploymentReadEvidence {
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub(crate) struct WorkerDeploymentSnapshot {
+    pub(crate) active_deployment_id: Option<String>,
     pub(crate) first_read: WorkerDeploymentReadEvidence,
     pub(crate) second_read: WorkerDeploymentReadEvidence,
     pub(crate) deployments: Vec<WorkerDeploymentProjection>,
@@ -293,7 +298,9 @@ impl CloudflareClient {
         let second_read = self
             .get_worker_deployments_evidence(account_id, script_name)
             .await?;
-        if first_read.deployments != second_read.deployments {
+        if first_read.active_deployment_id != second_read.active_deployment_id
+            || first_read.deployments != second_read.deployments
+        {
             return Err(operation_error(
                 "workers.version_evidence_deployment_drift",
                 "Worker deployments changed between the two complete reads",
@@ -303,12 +310,7 @@ impl CloudflareClient {
         let candidate_absent = match candidate_must_be_absent {
             Some(candidate) => {
                 let candidate = canonical_uuid(candidate, "candidate version ID")?;
-                let absent = first_read.deployments.iter().all(|deployment| {
-                    deployment
-                        .versions
-                        .iter()
-                        .all(|version| version.version_id != candidate)
-                });
+                let absent = deployment_candidate_absent(&first_read.deployments, &candidate);
                 if !absent {
                     return Err(operation_error(
                         "workers.version_evidence_candidate_deployed",
@@ -320,14 +322,12 @@ impl CloudflareClient {
             }
             None => None,
         };
-        let semantic_snapshot_sha256 = sha256_json(&json!({
-            "schema_version": 1,
-            "script_name": script_name,
-            "deployments": first_read.deployments,
-        }));
+        let semantic_snapshot_sha256 =
+            deployment_snapshot_sha256(script_name, &first_read.deployments);
         let provider_proof_manifest_sha256 =
             proof_manifest_sha256([&first_read.provider_proof, &second_read.provider_proof]);
         let deployments = WorkerDeploymentSnapshot {
+            active_deployment_id: first_read.active_deployment_id.clone(),
             deployments: first_read.deployments.clone(),
             first_read,
             second_read,
@@ -541,8 +541,12 @@ impl CloudflareClient {
             .exact_worker_exchange(reqwest::Method::GET, &path, &[], None, None, false)
             .await?;
         let deployments = sanitize_deployments(&exchange.result)?;
+        let active_deployment_id = deployments
+            .first()
+            .map(|deployment| deployment.deployment_id.clone());
         Ok(WorkerDeploymentReadEvidence {
-            projection_sha256: sha256_json(&deployments),
+            active_deployment_id,
+            projection_sha256: ordered_deployment_projection_sha256(&deployments),
             deployments,
             provider_proof: exchange.proof,
         })
@@ -1802,9 +1806,42 @@ pub(crate) fn verify_worker_candidate_runtime(
 fn sanitize_deployments(
     result: &Value,
 ) -> Result<Vec<WorkerDeploymentProjection>, WorkerVersionOperationError> {
+    let result = result.as_object().ok_or_else(|| {
+        operation_error(
+            "workers.version_deployments_invalid",
+            "deployment-list result was not an object",
+            "Treat the provider deployment evidence as malformed.",
+        )
+    })?;
+    let pagination_fields = [
+        "pagination",
+        "result_info",
+        "page_info",
+        "has_more",
+        "next_page",
+        "next_cursor",
+        "continuation",
+        "cursor",
+    ];
+    if result
+        .keys()
+        .any(|key| pagination_fields.contains(&key.as_str()))
+    {
+        return Err(operation_error(
+            "workers.version_deployments_pagination_unsupported",
+            "deployment-list result claimed pagination that this bounded endpoint does not support",
+            "Treat the deployment evidence as incomplete; do not infer the active deployment or continue with a partial list.",
+        ));
+    }
+    if result.keys().any(|key| key != "deployments") {
+        return Err(operation_error(
+            "workers.version_deployments_unknown_field",
+            "deployment-list result contained a field outside the closed evidence projection",
+            "Treat the provider deployment evidence as malformed.",
+        ));
+    }
     let deployments = result
-        .as_object()
-        .and_then(|result| result.get("deployments"))
+        .get("deployments")
         .and_then(Value::as_array)
         .ok_or_else(|| {
             operation_error(
@@ -1931,8 +1968,40 @@ fn sanitize_deployments(
             versions: projected_versions,
         });
     }
-    projections.sort_by(|left, right| left.deployment_id.cmp(&right.deployment_id));
     Ok(projections)
+}
+
+fn ordered_deployment_projection_sha256(deployments: &[WorkerDeploymentProjection]) -> String {
+    sha256_json(&json!({
+        "schema_version": 2,
+        "domain": "workers.deployment_ordered_projection",
+        "deployments": deployments,
+    }))
+}
+
+fn deployment_snapshot_sha256(
+    script_name: &str,
+    deployments: &[WorkerDeploymentProjection],
+) -> String {
+    sha256_json(&json!({
+        "schema_version": 2,
+        "domain": "workers.deployment_ordered_snapshot",
+        "script_name": script_name,
+        "active_deployment_id": deployments.first().map(|deployment| &deployment.deployment_id),
+        "deployments": deployments,
+    }))
+}
+
+fn deployment_candidate_absent(
+    deployments: &[WorkerDeploymentProjection],
+    candidate_version_id: &str,
+) -> bool {
+    deployments.iter().all(|deployment| {
+        deployment
+            .versions
+            .iter()
+            .all(|version| version.version_id != candidate_version_id)
+    })
 }
 
 pub(crate) fn validate_worker_version_ids(
@@ -1964,11 +2033,7 @@ pub(crate) fn validate_worker_deployment_projection(
     deployments: &Value,
 ) -> Result<(Vec<WorkerDeploymentProjection>, String), WorkerVersionOperationError> {
     let projected = sanitize_deployments(&json!({"deployments": deployments}))?;
-    let digest = sha256_json(&json!({
-        "schema_version": 1,
-        "script_name": script_name,
-        "deployments": projected,
-    }));
+    let digest = deployment_snapshot_sha256(script_name, &projected);
     Ok((projected, digest))
 }
 
@@ -2184,8 +2249,9 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{
-        WorkerProviderProof, prepare_worker_binding_expectation, sanitize_deployments,
-        sanitize_version_detail, verify_worker_candidate_bindings, verify_worker_candidate_runtime,
+        WorkerProviderProof, deployment_candidate_absent, prepare_worker_binding_expectation,
+        sanitize_deployments, sanitize_version_detail, validate_worker_deployment_projection,
+        verify_worker_candidate_bindings, verify_worker_candidate_runtime,
     };
     use crate::cloudflare::CloudflareClient;
     use crate::config::{ApiTokenSource, CloudflareApiConfig};
@@ -2530,6 +2596,149 @@ mod tests {
                 .expect_err("strategy must fail closed");
             assert_eq!(error.code, "workers.version_deployment_strategy_invalid");
         }
+    }
+
+    #[test]
+    fn deployment_projection_preserves_provider_order_and_binds_active_identity() {
+        let first = json!({
+            "id":"22222222-2222-4222-8222-222222222222",
+            "strategy":"percentage",
+            "versions":[{
+                "version_id":"11111111-1111-4111-8111-111111111111",
+                "percentage":100
+            }]
+        });
+        let second = json!({
+            "id":"33333333-3333-4333-8333-333333333333",
+            "strategy":"percentage",
+            "versions":[{
+                "version_id":"11111111-1111-4111-8111-111111111111",
+                "percentage":100
+            }]
+        });
+        let ordered = sanitize_deployments(&json!({
+            "deployments":[first.clone(), second.clone()]
+        }))
+        .expect("ordered deployment projection");
+        assert_eq!(
+            ordered
+                .first()
+                .map(|deployment| deployment.deployment_id.as_str()),
+            Some("22222222-2222-4222-8222-222222222222")
+        );
+        let (_, first_digest) = validate_worker_deployment_projection(
+            "worker-a",
+            &json!([first.clone(), second.clone()]),
+        )
+        .expect("first ordered digest");
+        let (_, swapped_digest) =
+            validate_worker_deployment_projection("worker-a", &json!([second, first]))
+                .expect("swapped ordered digest");
+        assert_ne!(first_digest, swapped_digest);
+    }
+
+    #[test]
+    fn deployment_projection_accepts_empty_state_without_active_identity() {
+        let deployments =
+            sanitize_deployments(&json!({"deployments": []})).expect("empty deployment state");
+        assert!(deployments.is_empty());
+        let (_, digest) = validate_worker_deployment_projection("worker-a", &json!([]))
+            .expect("empty ordered digest");
+        assert_eq!(digest.len(), 64);
+    }
+
+    #[test]
+    fn deployment_projection_rejects_claimed_pagination() {
+        let error = sanitize_deployments(&json!({
+            "deployments": [],
+            "pagination": {"has_more": true}
+        }))
+        .expect_err("unsupported pagination must fail closed");
+        assert_eq!(
+            error.code,
+            "workers.version_deployments_pagination_unsupported"
+        );
+    }
+
+    #[test]
+    fn deployment_projection_rejects_duplicate_or_missing_identity() {
+        let deployment = json!({
+            "id":"22222222-2222-4222-8222-222222222222",
+            "strategy":"percentage",
+            "versions":[{
+                "version_id":"11111111-1111-4111-8111-111111111111",
+                "percentage":100
+            }]
+        });
+        let duplicate = sanitize_deployments(&json!({
+            "deployments":[deployment.clone(), deployment]
+        }))
+        .expect_err("duplicate deployment IDs must fail closed");
+        assert_eq!(duplicate.code, "workers.version_deployment_duplicate");
+        let missing = sanitize_deployments(&json!({
+            "deployments":[{"strategy":"percentage","versions":[]}]
+        }))
+        .expect_err("missing deployment ID must fail closed");
+        assert_eq!(missing.code, "workers.version_deployment_invalid");
+    }
+
+    #[test]
+    fn deployment_candidate_exclusion_checks_every_provider_position() {
+        let candidate = "99999999-9999-4999-8999-999999999999";
+        let deployments = sanitize_deployments(&json!({
+            "deployments":[
+                {
+                    "id":"22222222-2222-4222-8222-222222222222",
+                    "strategy":"percentage",
+                    "versions":[{
+                        "version_id":"11111111-1111-4111-8111-111111111111",
+                        "percentage":100
+                    }]
+                },
+                {
+                    "id":"33333333-3333-4333-8333-333333333333",
+                    "strategy":"percentage",
+                    "versions":[{
+                        "version_id":candidate,
+                        "percentage":100
+                    }]
+                }
+            ]
+        }))
+        .expect("valid ordered deployments");
+        assert!(!deployment_candidate_absent(&deployments, candidate));
+    }
+
+    #[test]
+    fn deployment_projection_enforces_cap_and_identity_grammar() {
+        let over_cap = (0..=super::MAX_DEPLOYMENTS)
+            .map(|index| {
+                json!({
+                    "id": format!("{index:08x}-0000-4000-8000-000000000000"),
+                    "strategy":"percentage",
+                    "versions":[{
+                        "version_id":"11111111-1111-4111-8111-111111111111",
+                        "percentage":100
+                    }]
+                })
+            })
+            .collect::<Vec<_>>();
+        let error = sanitize_deployments(&json!({"deployments": over_cap}))
+            .expect_err("deployment cap must fail closed");
+        assert_eq!(error.code, "workers.version_deployments_over_cap");
+
+        let error = sanitize_deployments(&json!({
+            "deployments":[{
+                "id":"not-a-uuid",
+                "strategy":"percentage",
+                "versions":[{
+                    "version_id":"11111111-1111-4111-8111-111111111111",
+                    "percentage":100
+                }]
+            }]
+        }))
+        .expect_err("malformed deployment identity must fail closed");
+        assert_eq!(error.code, "workers.version_identity_invalid");
     }
 
     #[test]

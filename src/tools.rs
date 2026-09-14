@@ -9184,6 +9184,8 @@ impl CloudflareMcp {
             && post_ids.len() == pre_ids.len() + 1;
         let deployments_unchanged = pre_state.deployments.semantic_snapshot_sha256
             == post_state.deployments.semantic_snapshot_sha256
+            && pre_state.deployments.active_deployment_id
+                == post_state.deployments.active_deployment_id
             && post_state.deployments.candidate_absent == Some(true);
         if !exact_candidate
             || !post_detail_matches
@@ -9364,6 +9366,10 @@ impl CloudflareMcp {
             .as_ref()
             .is_none_or(|detail| detail.script_etag != args.base_version_etag)
             || current.deployments.deployments != pre_deployments
+            || current.deployments.active_deployment_id
+                != pre_deployments
+                    .first()
+                    .map(|deployment| deployment.deployment_id.clone())
         {
             return Ok(worker_version_simple_error_result(
                 "workers_reconcile_version_upload",
@@ -9418,6 +9424,10 @@ impl CloudflareMcp {
         };
         if candidate.versions.version_ids != current.versions.version_ids
             || candidate.deployments.deployments != pre_deployments
+            || candidate.deployments.active_deployment_id
+                != pre_deployments
+                    .first()
+                    .map(|deployment| deployment.deployment_id.clone())
         {
             return Ok(worker_version_simple_error_result(
                 "workers_reconcile_version_upload",
