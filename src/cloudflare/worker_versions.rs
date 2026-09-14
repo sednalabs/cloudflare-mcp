@@ -186,18 +186,28 @@ pub(crate) struct WorkerVersionOperationError {
 pub(crate) struct WorkerRequestLifecycle {
     pub(crate) request_prepared: bool,
     pub(crate) dispatch_attempted: bool,
+    /// Compatibility field: true once the provider response headers/status
+    /// have been received. This does not imply that the response body was
+    /// captured completely.
     pub(crate) provider_response_received: bool,
+    /// True only after the response byte stream reaches its natural end. A
+    /// complete body may still be empty or fail envelope/UTF-8 validation;
+    /// those are distinct from an incomplete body and retain their custody
+    /// evidence for reconciliation.
+    pub(crate) provider_response_body_complete: bool,
 }
 
 fn worker_request_lifecycle(
     request_prepared: bool,
     dispatch_attempted: bool,
     provider_response_received: bool,
+    provider_response_body_complete: bool,
 ) -> WorkerRequestLifecycle {
     WorkerRequestLifecycle {
         request_prepared,
         dispatch_attempted,
         provider_response_received,
+        provider_response_body_complete,
     }
 }
 
@@ -383,7 +393,7 @@ impl CloudflareClient {
             .map_err(|mut error| {
                 error.outcome_ambiguous = true;
                 error.retryable = false;
-                error.provider_request_lifecycle = worker_request_lifecycle(true, true, true);
+                error.provider_request_lifecycle = worker_request_lifecycle(true, true, true, true);
                 error.request_artifact_sha256 =
                     Some(exchange.proof.request_artifact_sha256.clone());
                 error.response_artifact_sha256 =
@@ -599,7 +609,7 @@ impl CloudflareClient {
                 },
                 retryable: !non_idempotent,
                 outcome_ambiguous: non_idempotent,
-                provider_request_lifecycle: worker_request_lifecycle(true, true, false),
+                provider_request_lifecycle: worker_request_lifecycle(true, true, false, false),
                 request_artifact_sha256: Some(request_artifact_sha256.clone()),
                 response_artifact_sha256: None,
                 response_body_sha256: None,
@@ -619,7 +629,7 @@ impl CloudflareClient {
                 },
                 retryable: !non_idempotent,
                 outcome_ambiguous: non_idempotent,
-                provider_request_lifecycle: worker_request_lifecycle(true, true, true),
+                provider_request_lifecycle: worker_request_lifecycle(true, true, true, false),
                 request_artifact_sha256: Some(request_artifact_sha256),
                 response_artifact_sha256: None,
                 response_body_sha256: None,
@@ -642,11 +652,14 @@ impl CloudflareClient {
                 },
                 retryable: false,
                 outcome_ambiguous: non_idempotent,
-                provider_request_lifecycle: worker_request_lifecycle(true, true, true),
+                provider_request_lifecycle: worker_request_lifecycle(true, true, true, false),
                 request_artifact_sha256: Some(request_artifact_sha256),
                 response_artifact_sha256: None,
                 response_body_sha256: None,
-                response_body_size_bytes: response.content_length().map(|value| value as usize),
+                // A declared Content-Length is not custody of the body. The
+                // stream was never captured, so do not report the declared
+                // size as an observed complete-body size.
+                response_body_size_bytes: None,
                 http_status: Some(status),
             });
         }
@@ -663,11 +676,13 @@ impl CloudflareClient {
                 },
                 retryable: !non_idempotent,
                 outcome_ambiguous: non_idempotent,
-                provider_request_lifecycle: worker_request_lifecycle(true, true, true),
+                provider_request_lifecycle: worker_request_lifecycle(true, true, true, false),
                 request_artifact_sha256: Some(request_artifact_sha256.clone()),
                 response_artifact_sha256: None,
                 response_body_sha256: None,
-                response_body_size_bytes: Some(bytes.len()),
+                // A failed stream leaves only partial/unknown custody; the
+                // accumulated byte count is not a complete body size.
+                response_body_size_bytes: None,
                 http_status: Some(status),
             })?;
             if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
@@ -682,11 +697,13 @@ impl CloudflareClient {
                     },
                     retryable: false,
                     outcome_ambiguous: non_idempotent,
-                    provider_request_lifecycle: worker_request_lifecycle(true, true, true),
+                    provider_request_lifecycle: worker_request_lifecycle(true, true, true, false),
                     request_artifact_sha256: Some(request_artifact_sha256),
                     response_artifact_sha256: None,
                     response_body_sha256: None,
-                    response_body_size_bytes: Some(bytes.len().saturating_add(chunk.len())),
+                    // The chunk crossed the cap, so the complete body is not
+                    // captured and no partial count is exposed as its size.
+                    response_body_size_bytes: None,
                     http_status: Some(status),
                 });
             }
@@ -716,7 +733,7 @@ impl CloudflareClient {
                 // provider rejection into permission to repeat the POST; the
                 // pinned version snapshot is the only reconciliation basis.
                 outcome_ambiguous: non_idempotent,
-                provider_request_lifecycle: worker_request_lifecycle(true, true, true),
+                provider_request_lifecycle: worker_request_lifecycle(true, true, true, true),
                 request_artifact_sha256: Some(request_artifact_sha256),
                 response_artifact_sha256: Some(response_artifact_sha256),
                 response_body_sha256: Some(response_body_sha256),
@@ -735,7 +752,7 @@ impl CloudflareClient {
                 },
                 retryable: false,
                 outcome_ambiguous: non_idempotent,
-                provider_request_lifecycle: worker_request_lifecycle(true, true, true),
+                provider_request_lifecycle: worker_request_lifecycle(true, true, true, true),
                 request_artifact_sha256: Some(request_artifact_sha256.clone()),
                 response_artifact_sha256: Some(response_artifact_sha256.clone()),
                 response_body_sha256: Some(response_body_sha256.clone()),
@@ -756,7 +773,7 @@ impl CloudflareClient {
                 },
                 retryable: false,
                 outcome_ambiguous: non_idempotent,
-                provider_request_lifecycle: worker_request_lifecycle(true, true, true),
+                provider_request_lifecycle: worker_request_lifecycle(true, true, true, true),
                 request_artifact_sha256: Some(request_artifact_sha256.clone()),
                 response_artifact_sha256: Some(response_artifact_sha256.clone()),
                 response_body_sha256: Some(response_body_sha256.clone()),
@@ -767,7 +784,7 @@ impl CloudflareClient {
         let result = valid_envelope_result(&envelope).map_err(|mut error| {
             error.outcome_ambiguous = non_idempotent;
             error.retryable = false;
-            error.provider_request_lifecycle = worker_request_lifecycle(true, true, true);
+            error.provider_request_lifecycle = worker_request_lifecycle(true, true, true, true);
             error.request_artifact_sha256 = Some(request_artifact_sha256);
             error.response_artifact_sha256 = Some(response_artifact_sha256);
             error.response_body_sha256 = Some(response_body_sha256);
@@ -2120,7 +2137,7 @@ fn adapter_pre_dispatch_error(error: AdapterError) -> WorkerVersionOperationErro
         hint: error.hint,
         retryable: false,
         outcome_ambiguous: false,
-        provider_request_lifecycle: worker_request_lifecycle(false, false, false),
+        provider_request_lifecycle: worker_request_lifecycle(false, false, false, false),
         request_artifact_sha256: None,
         response_artifact_sha256: None,
         response_body_sha256: None,
@@ -2140,7 +2157,7 @@ fn operation_error(
         hint,
         retryable: false,
         outcome_ambiguous: false,
-        provider_request_lifecycle: worker_request_lifecycle(false, false, false),
+        provider_request_lifecycle: worker_request_lifecycle(false, false, false, false),
         request_artifact_sha256: None,
         response_artifact_sha256: None,
         response_body_sha256: None,
@@ -2152,6 +2169,7 @@ fn operation_error(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::convert::Infallible;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -2162,6 +2180,7 @@ mod tests {
     use axum::routing::{get, post};
     use axum::{Json, Router};
     use serde_json::{Value, json};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     use super::{
@@ -2838,8 +2857,286 @@ mod tests {
         assert!(error.response_artifact_sha256.is_some());
         assert_eq!(
             error.provider_request_lifecycle,
-            super::worker_request_lifecycle(true, true, true)
+            super::worker_request_lifecycle(true, true, true, true)
         );
+    }
+
+    fn assert_incomplete_response(error: &super::WorkerVersionOperationError, code: &str) {
+        assert_eq!(error.code, code);
+        assert!(error.outcome_ambiguous);
+        assert!(!error.retryable);
+        assert!(error.provider_request_lifecycle.provider_response_received);
+        assert!(
+            !error
+                .provider_request_lifecycle
+                .provider_response_body_complete
+        );
+        assert_eq!(error.response_artifact_sha256, None);
+        assert_eq!(error.response_body_sha256, None);
+        assert_eq!(error.response_body_size_bytes, None);
+        assert!(error.http_status.is_some());
+    }
+
+    fn assert_complete_response(
+        error: &super::WorkerVersionOperationError,
+        code: &str,
+        expected_size: usize,
+    ) {
+        assert_eq!(error.code, code);
+        assert!(error.outcome_ambiguous);
+        assert!(!error.retryable);
+        assert!(error.provider_request_lifecycle.provider_response_received);
+        assert!(
+            error
+                .provider_request_lifecycle
+                .provider_response_body_complete
+        );
+        assert!(error.response_artifact_sha256.is_some());
+        assert!(error.response_body_sha256.is_some());
+        assert_eq!(error.response_body_size_bytes, Some(expected_size));
+        assert!(error.http_status.is_some());
+    }
+
+    async fn spawn_raw_worker_response(response: Vec<u8>) -> String {
+        // DevSkim: ignore DS162092 -- loopback-only test fixture listener.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind partial worker response fixture");
+        let addr = listener
+            .local_addr()
+            .expect("partial worker response address");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept worker request");
+            // Drain the tiny known request before closing so unread request
+            // data cannot cause a reset that hides the response headers.
+            let mut request = Vec::new();
+            while !request.ends_with(b"reviewed-multipart") {
+                let mut chunk = [0u8; 1024];
+                let count = stream.read(&mut chunk).await.expect("read fixture request");
+                assert!(count > 0 && request.len() + count <= 16 * 1024);
+                request.extend_from_slice(&chunk[..count]);
+            }
+            stream
+                .write_all(&response)
+                .await
+                .expect("write raw worker response");
+            stream.shutdown().await.expect("close raw response");
+        });
+        // DevSkim: ignore DS137138 -- loopback-only test fixture URL.
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn response_lifecycle_distinguishes_headers_from_complete_body_custody() {
+        // DevSkim: ignore DS162092 -- loopback-only test fixture listener.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind no-response fixture");
+        let refused_addr = listener.local_addr().expect("no-response fixture address");
+        drop(listener);
+        // DevSkim: ignore DS137138 -- loopback-only test fixture URL.
+        let error = CloudflareClient::new(test_config(format!("http://{refused_addr}")))
+            .expect("client")
+            .upload_worker_version_once(
+                "acct-1",
+                "worker-a",
+                "multipart/form-data; boundary=fixture",
+                b"reviewed-multipart".to_vec(),
+            )
+            .await
+            .expect_err("response loss before headers must fail closed");
+        assert!(error.outcome_ambiguous);
+        assert!(!error.retryable);
+        assert!(!error.provider_request_lifecycle.provider_response_received);
+        assert!(
+            !error
+                .provider_request_lifecycle
+                .provider_response_body_complete
+        );
+        assert_eq!(error.response_body_sha256, None);
+        assert_eq!(error.response_body_size_bytes, None);
+        assert_eq!(error.http_status, None);
+
+        let encoded = Router::new().route(
+            "/accounts/acct-1/workers/scripts/worker-a/versions",
+            post(|| async {
+                axum::response::Response::builder()
+                    .status(200)
+                    .header("content-encoding", "gzip")
+                    .body(Body::from(r#"{"success":true,"errors":[],"result":{}}"#))
+                    .expect("encoded response")
+            }),
+        );
+        let error = CloudflareClient::new(test_config(spawn_router(encoded).await))
+            .expect("client")
+            .upload_worker_version_once(
+                "acct-1",
+                "worker-a",
+                "multipart/form-data; boundary=fixture",
+                b"reviewed-multipart".to_vec(),
+            )
+            .await
+            .expect_err("unsupported encoding must fail closed");
+        assert_incomplete_response(&error, "workers.version_response_encoding_unsupported");
+
+        let declared_over_cap = format!(
+            "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
+            super::MAX_RESPONSE_BYTES + 1
+        );
+        let error = CloudflareClient::new(test_config(
+            spawn_raw_worker_response(declared_over_cap.into_bytes()).await,
+        ))
+        .expect("client")
+        .upload_worker_version_once(
+            "acct-1",
+            "worker-a",
+            "multipart/form-data; boundary=fixture",
+            b"reviewed-multipart".to_vec(),
+        )
+        .await
+        .expect_err("declared over-cap response must fail closed");
+        assert_incomplete_response(&error, "workers.version_response_over_cap");
+
+        let streamed_over_cap = Router::new().route(
+            "/accounts/acct-1/workers/scripts/worker-a/versions",
+            post(|| async {
+                let body = Body::from_stream(futures::stream::iter([
+                    Ok::<Bytes, Infallible>(Bytes::from(vec![b'x'; super::MAX_RESPONSE_BYTES])),
+                    Ok::<Bytes, Infallible>(Bytes::from_static(b"x")),
+                ]));
+                axum::response::Response::builder()
+                    .status(200)
+                    .body(body)
+                    .expect("streamed over-cap response")
+            }),
+        );
+        let error = CloudflareClient::new(test_config(spawn_router(streamed_over_cap).await))
+            .expect("client")
+            .upload_worker_version_once(
+                "acct-1",
+                "worker-a",
+                "multipart/form-data; boundary=fixture",
+                b"reviewed-multipart".to_vec(),
+            )
+            .await
+            .expect_err("streamed over-cap response must fail closed");
+        assert_incomplete_response(&error, "workers.version_response_over_cap");
+
+        let error = CloudflareClient::new(test_config(
+            spawn_raw_worker_response(
+                b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 64\r\n\r\n{".to_vec(),
+            )
+            .await,
+        ))
+        .expect("client")
+        .upload_worker_version_once(
+            "acct-1",
+            "worker-a",
+            "multipart/form-data; boundary=fixture",
+            b"reviewed-multipart".to_vec(),
+        )
+        .await
+        .expect_err("partial response stream must fail closed");
+        assert_incomplete_response(&error, "workers.version_response_read_failed");
+
+        for body_started in [false, true] {
+            let router = Router::new().route(
+                "/accounts/acct-1/workers/scripts/worker-a/versions",
+                post(move || async move {
+                    if !body_started {
+                        return std::future::pending::<axum::response::Response>().await;
+                    }
+                    let stream =
+                        futures::stream::iter([Ok::<Bytes, Infallible>(Bytes::from_static(b"{"))]);
+                    let stream = futures::StreamExt::chain(
+                        stream,
+                        futures::stream::pending::<Result<Bytes, Infallible>>(),
+                    );
+                    axum::response::Response::new(Body::from_stream(stream))
+                }),
+            );
+            let mut config = test_config(spawn_router(router).await);
+            config.request_timeout = Duration::from_millis(500);
+            let error = CloudflareClient::new(config)
+                .expect("timeout fixture client")
+                .upload_worker_version_once(
+                    "acct-1",
+                    "worker-a",
+                    "multipart/form-data; boundary=fixture",
+                    b"reviewed-multipart".to_vec(),
+                )
+                .await
+                .expect_err("timeout never proves body custody");
+            if body_started {
+                assert_incomplete_response(&error, "workers.version_response_read_failed");
+            } else {
+                assert_eq!(error.code, "workers.version_request_timeout");
+                assert_eq!(
+                    error.provider_request_lifecycle,
+                    super::worker_request_lifecycle(true, true, false, false)
+                );
+                assert!(error.outcome_ambiguous);
+                assert!(!error.retryable);
+                assert_eq!(error.response_artifact_sha256, None);
+                assert_eq!(error.response_body_sha256, None);
+                assert_eq!(error.response_body_size_bytes, None);
+            }
+        }
+
+        for (status, body, expected_code) in [
+            (200u16, Vec::new(), "workers.version_response_invalid"),
+            (200u16, b"{\"success\":true".to_vec(), "workers.version_response_invalid"),
+            (
+                200u16,
+                br#"{"success":true,"success":false,"errors":[],"result":{}}"#.to_vec(),
+                "workers.version_response_invalid",
+            ),
+            (200u16, vec![0xff], "workers.version_response_invalid"),
+            (
+                400u16,
+                br#"{"success":false,"errors":[{"code":1000}],"result":null}"#.to_vec(),
+                "workers.version_provider_rejected",
+            ),
+            (
+                200u16,
+                br#"{"success":true,"errors":[],"result":{"id":"11111111-1111-4111-8111-111111111111","resources":{"script":{"etag":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"script_runtime":{"compatibility_date":"2026-07-10","compatibility_flags":[]},"bindings":[]}}}"#.to_vec(),
+                "valid",
+            ),
+        ] {
+            let response_size = body.len();
+            let response_body = body.clone();
+            let router = Router::new().route(
+                "/accounts/acct-1/workers/scripts/worker-a/versions",
+                post(move || {
+                    let response_body = response_body.clone();
+                    async move {
+                        axum::response::Response::builder()
+                            .status(status)
+                            .body(Body::from(response_body))
+                            .expect("complete worker response")
+                    }
+                }),
+            );
+            let result = CloudflareClient::new(test_config(spawn_router(router).await))
+                .expect("client")
+                .upload_worker_version_once(
+                    "acct-1",
+                    "worker-a",
+                    "multipart/form-data; boundary=fixture",
+                    b"reviewed-multipart".to_vec(),
+                )
+                .await;
+            if expected_code == "valid" {
+                let evidence = result.expect("valid complete response");
+                assert_eq!(
+                    evidence.provider_proof.response_body_size_bytes,
+                    response_size
+                );
+            } else {
+                let error = result.expect_err("complete invalid/rejected response");
+                assert_complete_response(&error, expected_code, response_size);
+            }
+        }
     }
 
     #[tokio::test]
@@ -2880,7 +3177,7 @@ mod tests {
         assert!(!error.retryable);
         assert_eq!(
             error.provider_request_lifecycle,
-            super::worker_request_lifecycle(true, true, true)
+            super::worker_request_lifecycle(true, true, true, true)
         );
     }
 
@@ -2921,7 +3218,7 @@ mod tests {
         assert!(!error.retryable);
         assert_eq!(
             error.provider_request_lifecycle,
-            super::worker_request_lifecycle(true, true, true)
+            super::worker_request_lifecycle(true, true, true, true)
         );
         assert!(error.request_artifact_sha256.is_some());
         assert!(error.response_artifact_sha256.is_some());

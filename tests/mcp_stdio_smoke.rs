@@ -19,6 +19,39 @@ fn sha256_hex(value: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn private_worker_approval_fixture(label: &str, suffix: u128) -> PathBuf {
+    use std::ffi::{CStr, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::DirBuilderExt;
+
+    // Approval custody rejects world-writable ancestors, including /tmp.
+    // Resolve the effective user's home without process-global environment edits.
+    let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
+    let mut buffer = vec![0u8; 16 * 1024];
+    let mut result = std::ptr::null_mut();
+    let status = unsafe {
+        libc::getpwuid_r(
+            libc::geteuid(),
+            entry.as_mut_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    assert_eq!(status, 0, "resolve effective user's home");
+    assert!(!result.is_null(), "effective user has no passwd entry");
+    let home = unsafe { CStr::from_ptr((*result).pw_dir) };
+    let root = PathBuf::from(OsStr::from_bytes(home.to_bytes())).join(format!(
+        ".cloudflare-mcp-stdio-approval-{label}-{}-{suffix}",
+        std::process::id()
+    ));
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&root)
+        .expect("create unique private approval fixture");
+    root
+}
+
 fn expected_d1_reconciliation_semantic_error(code: &str, message: &str, hint: &str) -> Value {
     json!({
         "ok": false,
@@ -5010,6 +5043,14 @@ fn spawn_fake_worker_version_api_with_initial_state(
     expected_requests: usize,
     initially_uploaded: bool,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
+    spawn_fake_worker_version_api_with_response_fault(expected_requests, initially_uploaded, false)
+}
+
+fn spawn_fake_worker_version_api_with_response_fault(
+    expected_requests: usize,
+    initially_uploaded: bool,
+    incomplete_upload_response: bool,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0") // DevSkim: ignore DS162092 -- loopback-only test fixture listener.
         .expect("bind fake Worker version API");
     let addr = listener.local_addr().expect("fake Worker version API addr");
@@ -5122,6 +5163,12 @@ fn spawn_fake_worker_version_api_with_initial_state(
                 assert!(content_type.starts_with("multipart/form-data;"));
                 assert!(!body.is_empty());
                 uploaded = true;
+                if incomplete_upload_response {
+                    stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: 64\r\n\r\n{",
+                    ).expect("write incomplete upload response");
+                    continue;
+                }
                 json!({
                     "success": true,
                     "errors": [],
@@ -17993,13 +18040,7 @@ fn workers_upload_version_supported_sources_prepare_opaque_private_plans() {
     );
     fs::write(artifact_root.join("candidate.multipart"), multipart)
         .expect("write multipart fixture");
-    let approval_root = std::env::temp_dir().join(format!(
-        "cloudflare-mcp-version-approval-source-matrix-{}-{suffix}",
-        std::process::id()
-    ));
-    fs::create_dir(&approval_root).expect("create approval root");
-    fs::set_permissions(&approval_root, fs::Permissions::from_mode(0o700))
-        .expect("make approval root private");
+    let approval_root = private_worker_approval_fixture("source-matrix", suffix);
 
     let (base_url, requests) = spawn_fake_worker_upload_api(0);
     let mut mcp = McpStdioProcess::start_with_env(vec![
@@ -18432,9 +18473,23 @@ fn workers_upload_version_oversized_private_artifact_error_withholds_exact_size(
 
 #[test]
 fn workers_upload_version_stdio_applies_once_and_proves_disabled_candidate() {
+    assert_worker_version_stdio_apply(false);
+}
+
+#[test]
+fn workers_upload_version_stdio_body_loss_preserves_reconciliation_without_retry() {
+    assert_worker_version_stdio_apply(true);
+}
+
+fn assert_worker_version_stdio_apply(incomplete_upload_response: bool) {
     use std::os::unix::fs::PermissionsExt;
 
-    let (base_url, requests) = spawn_fake_worker_version_api(21);
+    let expected_requests = if incomplete_upload_response { 16 } else { 21 };
+    let (base_url, requests) = spawn_fake_worker_version_api_with_response_fault(
+        expected_requests,
+        false,
+        incomplete_upload_response,
+    );
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock after epoch")
@@ -18446,13 +18501,7 @@ fn workers_upload_version_stdio_applies_once_and_proves_disabled_candidate() {
     fs::create_dir(&attempt_root).expect("create attempt root");
     fs::set_permissions(&attempt_root, fs::Permissions::from_mode(0o700))
         .expect("make attempt root private");
-    let approval_root = std::env::temp_dir().join(format!(
-        "cloudflare-mcp-version-approval-{}-{suffix}",
-        std::process::id()
-    ));
-    fs::create_dir(&approval_root).expect("create approval root");
-    fs::set_permissions(&approval_root, fs::Permissions::from_mode(0o700))
-        .expect("make approval root private");
+    let approval_root = private_worker_approval_fixture("apply", suffix);
     let mut mcp = McpStdioProcess::start_with_env(vec![
         ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
         (
@@ -18532,6 +18581,53 @@ fn workers_upload_version_stdio_applies_once_and_proves_disabled_candidate() {
     let replay_args = apply_args.clone();
     let apply = mcp.call_tool(5, "workers_upload_version", apply_args);
     let apply_content = structured_content(&apply);
+    if incomplete_upload_response {
+        assert_eq!(apply_content["ok"], json!(false), "{apply_content}");
+        assert_eq!(
+            apply_content["error"]["code"],
+            json!("workers.version_response_read_failed")
+        );
+        assert_eq!(
+            apply_content["provider_request_lifecycle"],
+            json!({
+                "request_prepared": true,
+                "dispatch_attempted": true,
+                "provider_response_received": true,
+                "provider_response_body_complete": false,
+            })
+        );
+        assert_eq!(apply_content["error"]["outcome_ambiguous"], json!(true));
+        assert_eq!(apply_content["error"]["retryable"], json!(false));
+        assert_eq!(apply_content["deployment_created"], json!(false));
+        let outward = apply_content.to_string();
+        for forbidden in [
+            "private-fixture-value",
+            "never-surface",
+            "body_sha256",
+            "size_bytes",
+        ] {
+            assert!(!outward.contains(forbidden), "{outward}");
+        }
+        let replay = mcp.call_tool(6, "workers_upload_version", replay_args);
+        assert_eq!(
+            structured_content(&replay)["error"]["code"],
+            json!("workers.version_upload_approval_consumed")
+        );
+        let calls = requests.lock().expect("request log lock");
+        assert_eq!(calls.len(), expected_requests);
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|r| r["method"] == json!("POST"))
+                .count(),
+            1
+        );
+        drop(calls);
+        mcp.terminate();
+        fs::remove_dir_all(attempt_root).expect("remove attempt root");
+        fs::remove_dir_all(approval_root).expect("remove approval root");
+        return;
+    }
     assert_eq!(apply_content["ok"], json!(true), "{apply_content}");
     assert_eq!(
         apply_content["status"],
@@ -18574,6 +18670,7 @@ fn workers_upload_version_stdio_applies_once_and_proves_disabled_candidate() {
             "request_prepared": true,
             "dispatch_attempted": true,
             "provider_response_received": true,
+            "provider_response_body_complete": true,
         })
     );
     assert_eq!(apply_content["binding_verification_matched"], json!(true));

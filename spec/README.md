@@ -260,4 +260,9 @@ Preserved curated tool families:
   custody aligned across schema, stdio proof, client contract, and runbook.
   Never reintroduce public candidate-derived digests or byte sizes as an
   approval surface for metadata that may contain low-entropy secret values.
+- Worker version response lifecycle distinguishes receipt of headers/status
+  (`provider_response_received`) from complete-body custody
+  (`provider_response_body_complete`). Incomplete responses expose neither a
+  complete-body digest nor size. Complete invalid bodies retain custody evidence
+  without implying provider success or permission to retry an upload.
 - Queues readback tools (`queues_list`, `queues_get`, `queues_get_metrics`, `queues_list_consumers`, `queues_health`) are first-class contract tools and must remain present for operational backlog/DLQ/consumer diagnostics.

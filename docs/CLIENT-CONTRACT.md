@@ -310,6 +310,15 @@ equal to or greater than the dispatched SQL byte length is impossible evidence
 and is omitted while the allowlisted provider code/category, complete-body
 digest, custody, and no-retry semantics remain unchanged.
 
+For `workers_upload_version`, `provider_request_lifecycle.provider_response_received`
+means that response headers/status were received; the separate
+`provider_response_body_complete` field is true only after the response byte
+stream reaches its natural end. Unsupported encoding, declared or streamed
+over-cap, and stream failure therefore keep body completeness false and expose
+no declared or partial body size/digest. A complete body that is empty,
+rejected, invalid UTF-8, or malformed remains distinct from an incomplete body
+and retains complete-body digest/size evidence.
+
 ## Structured payload details for complex tools
 
 For `effect_assertion_id=schema_create_objects_additive_seed_rows_v1` or its

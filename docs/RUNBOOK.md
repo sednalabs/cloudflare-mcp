@@ -1171,6 +1171,16 @@ random-handle preparation lifecycle.
    results intentionally do not provide request/response digests or byte sizes
    that could become confirmation oracles for low-entropy secret bindings.
 
+The upload lifecycle records two separate response facts. In
+`provider_request_lifecycle`, `provider_response_received` is the compatibility
+indicator that response headers/status arrived; `provider_response_body_complete`
+becomes true only when the response byte stream reaches its natural end. An
+unsupported encoding, declared or streamed over-cap, or stream failure is
+therefore not a complete-body capture and must not report a declared or partial
+body size/digest. Empty, rejected, invalid-UTF-8, or malformed envelopes can
+still be complete-body captures: their complete digest/size is evidence, while
+envelope acceptance remains a separate result.
+
 If the upload response is lost before or after provider visibility, rejected,
 malformed, oversized, unexpectedly encoded, or followed by
 failed/contradictory readback, never repeat the POST. The durable attempt state
