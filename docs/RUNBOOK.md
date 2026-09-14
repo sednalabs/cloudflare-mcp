@@ -29,6 +29,10 @@ Before using the server for production-like changes:
 - Enable MCP auth before any non-loopback bind. Set both
   `CLOUDFLARE_MCP_AUTH_RESOURCE_URL` and `CLOUDFLARE_MCP_AUTH_AUDIENCE` to
   explicit HTTPS URLs; non-loopback binds do not derive or accept HTTP values.
+- The current HTTP auth surface is Bearer-only. Ordinary Bearer tokens remain
+  supported, but any token carrying a `cnf` confirmation claim is rejected as
+  sender-constrained rather than accepted without proof of possession. Do not
+  present DPoP-bound tokens to this surface; DPoP is not implemented here.
 - Use least-privilege Cloudflare API tokens.
 - Keep secrets in environment variables or protected files outside the
   repository.
@@ -206,6 +210,56 @@ cannot reconcile or retire bootstrap-family custody.
 
 ## Exact-byte D1 migration manifests
 
+### Shared existing-target mutation guard
+
+Configure `CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT` for every MCP process that
+can run curated D1 rename, delete, bootstrap, or manifest mutation.
+The name is retained for compatibility, but the directory is now the shared
+account/database target-guard root. Rename and delete acquire the same
+permanent `guard.lock` as bootstrap and manifest apply immediately before
+provider dispatch. Generic row-write execution is retired before guard access.
+A same-target contention or retained active/retiring lease
+is a stop condition; a different database target is independent. A guard
+failure reports the invoked curated tool as its operation and zero provider
+calls/mutations; preserve that caller-correlated receipt when diagnosing the
+contention.
+
+Generic `api_mutate` is not a fallback for an existing D1 target. Delete,
+export, import, query/raw query, time-travel restore, full update and partial
+update are denied before request construction. Use the curated guarded tool
+where one exists; otherwise defer to a separately governed lifecycle. Always
+copy account and database IDs exactly from Cloudflare. Existing D1 database IDs
+must be canonical lowercase hyphenated UUIDs; uppercase, mixed-case, compact or
+braced variants are aliases, not independent targets. Do not trim, recase,
+encode or otherwise repair a rejected identity.
+
+### Private SQL artifact and upload boundary
+
+The reusable private-artifact boundary is intentionally lower-level than any D1
+import workflow. Generic descriptor-bound read custody comes from the pinned
+`mcp-toolkit-private-artifact` crate; the Cloudflare adapter retains the
+non-empty SQL and stable D1 error-code contract. It opens a local SQL artifact
+through held Linux descriptors,
+applies the migration custody root/ancestor/owner/mode/hardlink policy, including
+root-or-current-operator ownership for every external ancestor, hashes
+the exact stable descriptor bytes, and re-proves the descriptor-to-path binding
+before a later caller may upload those bytes.
+
+The upload adapter requires the exact account and database context that produced
+the D1 import-init response. It accepts only the corresponding canonical
+Cloudflare R2 account hostname over HTTPS, never follows redirects, and disables
+automatic HTTP retries. Errors
+and receipts omit the local path, SQL, presigned URL, account ID, and database
+ID. This boundary alone is not an operational import procedure and provides no
+admission, retry, ingest, poll, reconciliation, or terminal authority.
+
+The provider contract is documented by Cloudflare's
+[D1 import API](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/import/)
+and [R2 presigned URL guidance](https://developers.cloudflare.com/r2/api/s3/presigned-urls/).
+The presigned hostname binds the account, while the initiating D1 request
+context must independently bind the database; the URL alone is not database
+authority.
+
 Use `d1_apply_migration_manifest` for an approval-gated D1 migration family.
 Never pass the reserved exact family `migration-ledger-bootstrap-v1` to this
 generic tool or to generic reconciliation/finalization. Only the dedicated
@@ -236,6 +290,35 @@ redirect it into a replacement directory. It revalidates root, ancestors,
 directory, guard, identity and mode before every provider boundary. Do not use
 a shared writable directory or manually rename or remove any lease evidence by
 pathname.
+
+For the canonical UUID target-identity upgrade, do not reuse a root containing
+any predecessor custody. Stop every predecessor write-capable MCP process,
+preserve its old root without deleting or moving retained evidence, reconcile
+any active or retiring operation through its governed recovery path, and
+provision one new private empty `0700` root for all upgraded writers. On the
+first canonical target guard, the upgraded MCP holds
+`target-identity-v2.guard.lock`, exhaustively enumerates the root up to the
+finite custody limit, creates the target's exact create-only
+`target-identity-v2.<target-key-sha256>.receipt.json` registration, and creates
+the exact `target-identity-v2.activation.json` marker only after the root was
+proved empty before activation. After activation, every target must have its
+matching canonical registration. A stable bounded audit validates the marker,
+all registrations, all target directories, and every allowed custody entry;
+that audit is repeated at guard/lease revalidation, provider, persistence, and
+release boundaries.
+Canonical incumbent directories are intentionally rejected along with alias,
+active, retiring, retired, terminal, malformed, unreadable, symlink, and
+over-limit evidence: predecessor payloads contain only a target hash and cannot
+prove the UUID spelling that produced it. A failed activation does not clean up
+or migrate evidence. Do not manually create the marker, reuse the blocked root,
+or allow an older binary to open the activated root. Draining every predecessor
+writer before cutover is an independent deployment prerequisite, not a
+substitute for these runtime audits. This local activation has zero provider
+calls; it does not itself approve a D1 mutation.
+Rollback is also a whole-generation operation: drain every upgraded writer,
+preserve the activated root without manual edits, and return all writers
+together to the preserved predecessor root and predecessor binary generation.
+Never run mixed roots or binary generations during cutover or rollback.
 
 The exact-byte manifest boundary accepts at most 16 MiB of aggregate SQL and
 moves the supplied manifest into validation without cloning its SQL strings.
@@ -833,6 +916,188 @@ the `Rust Validation` workflow at `.github/workflows/rust-validation.yml`. Do
 not replace this check with a PR run, a branch-name inference, or a manually
 reconstructed commit identity.
 
+## Staged Stable D1 Catalog Evidence
+
+The internal catalog-evidence boundary is deliberately not an operator tool.
+It is a pure prerequisite for a later guarded composition path and performs no
+local/provider mutation. Its separate provider-custody adapter owns the only
+Cloudflare reads that may construct catalog observation frames.
+
+The adapter preallocates four distinct bounded dispatch/read identities before
+I/O, then dispatches the fixed plan query twice for the canonical normalized
+target. Each read makes one no-redirect HTTP attempt with no adapter retry. The
+request/response custody binding covers the exact target, query and query
+digest, plan digest, and 1,001-row/4 MiB caps. The raw provider body must reach
+EOF within the byte cap before the shared duplicate-key-rejecting JSON decoder
+accepts it under the 32-container nesting bound. Following Cloudflare's [D1
+Query API response
+contract](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/query/),
+the envelope must include explicitly present, typed, empty `errors` and
+`messages` arrays, while its one successful result set has only `meta`,
+`results`, and `success`. ResponseInfo entries use the closed official `code`,
+`message`, optional `documentation_url`, and optional `source.pointer` shape;
+any non-empty array is terminal and its text is omitted from custody errors and
+receipts. The result metadata must prove primary service plus
+`changed_db=false`, `changes=0`, and `rows_written=0`. Only then does the adapter
+normalize the fixed projection and construct a frame. Do not feed generic
+`d1_query_read_only` JSON into this boundary.
+
+Network ambiguity, redirects or non-success status, incomplete or oversized
+bodies, duplicate keys, unknown envelope or ResponseInfo fields, excessive JSON
+nesting, missing/malformed/non-empty envelope errors or messages, malformed
+envelopes, non-primary or mutating metadata, response-binding drift, identity
+reuse, a cap change, and the 1,001st row are
+terminal unavailable evidence for that attempt. A first-read failure stops
+before the second request; a second-read failure preserves the truthful
+aggregate count and does not retry.
+
+The success receipt binds each body completed at EOF by SHA-256 and byte size,
+but retains neither body bytes nor private dispatch/read identities. Treat that
+digest as comparison evidence only: without separately authorized exact bytes
+it cannot replay the decode, and it never independently authenticates provider
+origin or EOF outside the trusted HTTP adapter lifecycle. Errors remain
+content-free and omit request/provider bodies and private identities.
+
+This contract only establishes that two adapter-issued frames contain one
+stable canonical typed version-5 catalog projection. The fixed query first
+enumerates every physical `sqlite_schema` row with rowid, storage classes, and
+exact hex bytes for type/name/owner. It does not filter malformed type rows or
+erase TEXT/BLOB/integer distinctions with an unmarked cast. Only unique,
+printable-ASCII TEXT table names whose catalog fields are structurally valid may
+reach the `pragma_foreign_key_list()` table-valued function; all other schema
+rows remain ordered explicit blockers.
+
+Foreign-key facts contain child/parent, native typed id/sequence, `from`, `to`,
+update/delete actions, and match mode with their exact storage classes and bytes.
+Treat `to=NULL` and an empty TEXT target as different evidence. Composite
+constraints require contiguous sequence cardinality and stable shared
+parent/action/match facts. The projection retains SQL bytes only for valid table
+relations and permits only bounded ASCII token classification. It records and
+independently re-verifies case-insensitive `VIRTUAL` and `REPLACE` hits within
+64 KiB. A virtual hit blocks because a module may mutate schema-table shadow
+relations. A REPLACE hit blocks because a table or constraint conflict policy
+can make plain INSERT or UPDATE delete an incumbent and run ON DELETE effects.
+The scans may conservatively match identifiers or comments. Oversized sources
+block before classification. View SQL and trigger bodies are excluded.
+Unresolved parents or owners, malformed or aliased catalog rows, and
+structurally unproven REPLACE/virtual/view/trigger write semantics remain
+conservative blockers.
+The row sentinel covers schema and foreign-key/blocker facts together.
+
+The internal opaque verifier product may be handed only to later pure
+consumers. Its aggregate-safe receipt counts fact families and blockers but
+contains no relation names or SQL. It is not a full CREATE TABLE parser, trigger
+parser, view interpreter, graph traversal, or authority decision. Physical read
+independence/EOF, execution, custody, provider admission, DML composition,
+mutation, deployment, and public routing must not infer authority from the
+catalog receipt or projection alone.
+
+The internal reserved-relation graph stage accepts only the opaque version-5
+product, never caller JSON or a generic D1 response. Supply one non-empty set of
+at most 64 configured reserved relation identities. They must be printable
+ASCII, distinct under SQLite ASCII case folding, outside the automatic
+`sqlite_`/`_cf_` families, and physically present as verified relations. The
+stage adds every present automatic-family relation as a root. Missing roots and
+all schema/foreign-key blocker facts are terminal unavailable evidence; do not
+drop blocker rows and retry graph derivation.
+
+The stage creates INSERT, UPDATE, and DELETE nodes only for verified table/view
+relations. Valid index facts are linked and counted as non-addressable schema
+auxiliaries. FK CASCADE, SET NULL, and SET DEFAULT create only their documented
+operation-specific child-write edges; RESTRICT and NO ACTION create none.
+Composite constraints contribute one edge group after the projection's exact
+sequence/cardinality proof. The only SQL-byte classification is a conservative
+case-insensitive search for `AUTOINCREMENT` within a 64-KiB table source. Any
+match requires `sqlite_sequence` and adds table-insert to sequence-update; the
+classifier intentionally prefers a false-positive denial over parsing DDL.
+Any bounded `REPLACE` hit blocks the complete graph before a plain INSERT or
+UPDATE decision can become `Allow`. Unavailable or oversized token sources also
+block; do not infer a conflict policy from missing evidence.
+
+For a future DML composer, use the graph module's closed internal expansion
+contract and require every returned primitive decision to be `Allow`: REPLACE
+and INSERT OR REPLACE are DELETE plus INSERT; UPSERT DO UPDATE is INSERT plus
+UPDATE; UPDATE OR REPLACE is UPDATE plus DELETE. Unsupported compound forms
+deny. This stage still performs no statement parsing, composition, admission,
+execution, provider call, or mutation.
+
+Do not parse trigger or view SQL to reopen a decision. All operations on a view
+deny. All operations on, or FK paths reaching, a relation that owns any trigger
+deny. Paths reaching a reserved root deny with higher precedence. Cycle-safe
+traversal is limited to 1,000 relations, 3,000 nodes, and 4,096 edges. Any
+unknown/malformed fact, missing relation/owner, unavailable table SQL token
+source, unsupported action, or cap breach denies the complete product.
+
+The success receipt is aggregate-safe: target/catalog/root/graph/decision
+digests and counts only. It exposes no names, columns, SQL, account, or database
+identity. This staged module has no public tool, provider call, DML composition,
+admission, mutation, deployment, or live effect. Do not treat a graph receipt as
+write authority; later composition must bind an exact classified DML operation
+and relation to the opaque graph product.
+
+The internal exact-plan composer is the next pure boundary. Supply only the
+verified canonical target, exact version-2 DML plan plus its canonical digest,
+the already classified exact lowercase relation and closed compound form, the
+opaque version-5 catalog product, and the opaque version-3 graph product. Never
+substitute caller JSON, a generic query response, or a serialized receipt for
+either opaque product. The statement kind and form must agree. The composer
+uses the graph module's exact primitive order and requires every primitive to
+have a present `Allow` decision; missing, denied, duplicated, reordered,
+unsupported, malformed, version-drifted, or cross-product-contradictory
+evidence denies the complete composition.
+
+The serializable receipt is aggregate-only and digest-binds the plan, target,
+catalog, graph, classified relation/form, effective primitive set, and selected
+decisions. It exposes none of those private names or bytes. This module does
+not parse SQL, issue provider requests, admit or execute D1 writes, expose a
+tool route, hold custody, or authorize dispatch. A later reviewed route may
+consume the opaque product only after its exact classifier has bound the SQL
+bytes to the supplied relation and compound form; a composition receipt by
+itself is never execution authority.
+
+The internal D1 DML attempt-custody stage is the next pure handoff. Supply only
+the verified canonical target, opaque exact-plan composition product, and three
+preallocated pairwise-distinct opaque identities for the operation,
+execution-attempt, and provider request. Each identity must already satisfy the
+closed 16-to-128-byte ASCII grammar. The stage hashes all three and binds them
+to the target, exact execution plan, composition, and complete composition
+receipt. Never substitute caller JSON, a serialized composition receipt, SQL,
+or a generic provider response.
+
+Persist the returned canonical private state only through the future reviewed
+durable compare-and-exchange boundary. Its version-1 bytes are capped at 16 KiB and include one
+trailing newline. On restore, require exact canonical bytes and reject missing,
+oversized, malformed, duplicate-keyed, unknown-field, incomplete, predecessor,
+digest-drifted, or internally contradictory evidence. An exact prepared replay
+converges without changing state. A conflicting target, plan, composition, or
+identity replay denies.
+
+`prepared -> dispatch_reserved` is a non-authorizing atomic-CAS proposal. It
+binds the exact prior-state and successor-state digests and explicitly requires
+the later durable adapter to compare the exact current bytes and install that
+successor atomically. Repeating the pure call with stale prepared bytes returns
+the same proposal, never fresh dispatch authority. Only the adapter's one
+successful compare-and-exchange may consume the reservation and permit the
+provider call; a stale compare failure must stop before provider access. Once
+the successor is durably installed, the same attempt is permanently
+`do_not_redispatch_same_attempt`; a repeated reservation, transport uncertainty,
+or missing/incomplete/malformed/contradictory response becomes
+`reconciliation_required`. Do not infer that an unobserved response means the
+provider did not accept the request.
+
+The provider-terminal and readback inputs at this stage are typed caller
+assertions, not authenticated evidence. Canonical digest syntax proves neither
+artifact bytes nor provider/readback provenance. The later adapter must derive
+the assertions from authenticated provider and independently executed readback
+lifecycles before storing them in their separate slots. Either insertion order
+must converge on the same canonical proposed terminal classification. Provider
+success plus expected-state observation proposes `applied`; terminal provider
+rejection plus absent-state readback proposes `not_applied`. One slot alone is
+nonterminal, and a crossed pair stays under reconciliation. Receipts and errors
+are aggregate/content-free and do not authorize persistence, provider/D1
+access, artifact authentication, readback, retry, routing, admission,
+deployment, or configuration.
+
 ## Safety Profiles
 
 ### Read-Only
@@ -1334,6 +1599,15 @@ tools/call name=r2_put_object arguments='{
 }'
 ```
 
+## Pages Project Settings
+
+For `pages_update_project` and generic `api_mutate` using
+`pages-project-update-project`, pass only the exact settings that change. The
+tools accept an object or escaped JSON-object string, redact `secret_text`
+values in plans and responses, reject masked or empty secret replacements, and
+retain a per-variable `null` only for the documented Pages deletion operation.
+Never replay a project GET or a dry-run response as an update payload.
+
 ## External Service Bridge Workflow
 
 The optional external service bridge is for deployments that need to call
@@ -1398,3 +1672,8 @@ cargo test tools::tests::tool_schema_snapshot_contract_is_stable
 
 CodeQL and static checks are useful guardrails, but MCP stdio/runtime tests are
 the source of truth for tool callability.
+
+The inert D1 row-write Durable Object coordination core is documented in
+[`D1-COORDINATION-DO.md`](D1-COORDINATION-DO.md). It has no route, binding,
+provider capability, or live deployment; do not treat its focused tests as
+proof of a deployed Durable Object.

@@ -116,7 +116,7 @@ impl AdapterError {
 pub struct CloudflareClient {
     pub(crate) cfg: CloudflareApiConfig,
     pub(crate) http: reqwest::Client,
-    reconciliation_http: reqwest::Client,
+    pub(super) reconciliation_http: reqwest::Client,
     migration_write_http: reqwest::Client,
     pub(crate) worker_version_http: reqwest::Client,
 }
@@ -3825,7 +3825,7 @@ fn validate_strict_d1_migration_manifest_envelope(
 
 const DUPLICATE_JSON_OBJECT_KEY_MARKER: &str = "duplicate JSON object key";
 const JSON_NESTING_DEPTH_EXCEEDED_MARKER: &str = "JSON nesting depth exceeded";
-const D1_MIGRATION_JSON_MAX_CONTAINER_DEPTH: usize = 32;
+pub(super) const D1_MIGRATION_JSON_MAX_CONTAINER_DEPTH: usize = 32;
 
 struct DuplicateSafeJsonValue(Value);
 
@@ -4898,7 +4898,7 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
         ] {
             let router = Router::new().route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 post(move || async move {
                     let oversized_body = vec![b'x'; 16 * 1024 * 1024 + 1];
                     Response::builder()
@@ -4911,7 +4911,11 @@ mod tests {
             let base = spawn_router(router).await;
             let client = CloudflareClient::new(test_config(base)).expect("client");
             let error = client
-                .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+                .query_d1_migration_reconciliation_batch(
+                    "acct-1",
+                    "123e4567-e89b-42d3-a456-426614174000",
+                    "SELECT 1",
+                )
                 .await
                 .expect_err("oversized reconciliation response must fail closed");
             assert_eq!(
@@ -4932,7 +4936,7 @@ mod tests {
     async fn reconciliation_http_error_surfaces_only_allowlisted_code_and_category() {
         let private_message = "SQL SELECT * FROM private_table at /private/path";
         let router = Router::new().route(
-            "/accounts/acct-1/d1/database/db-1/query",
+            "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
             post(move || async move {
                 (
                     StatusCode::BAD_REQUEST,
@@ -4948,7 +4952,11 @@ mod tests {
         let base = spawn_router(router).await;
         let client = CloudflareClient::new(test_config(base)).expect("client");
         let error = client
-            .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+            .query_d1_migration_reconciliation_batch(
+                "acct-1",
+                "123e4567-e89b-42d3-a456-426614174000",
+                "SELECT 1",
+            )
             .await
             .expect_err("HTTP error must fail closed");
         assert_eq!(
@@ -4985,7 +4993,7 @@ mod tests {
         let expected_body_sha256 = format!("{:x}", Sha256::digest(response_body.as_bytes()));
         let expected_body_size_bytes = response_body.len();
         let router = Router::new().route(
-            "/accounts/acct-1/d1/database/db-1/query",
+            "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
             post(move || {
                 let response_body = response_body.clone();
                 async move {
@@ -5002,7 +5010,7 @@ mod tests {
         let error = client
             .execute_d1_migration_manifest_write(
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "CREATE TABLE guarded(id INTEGER PRIMARY KEY)",
                 &[],
             )
@@ -5042,7 +5050,7 @@ mod tests {
         );
         let expected_body_sha256 = format!("{:x}", Sha256::digest(body.as_bytes()));
         let router = Router::new().route(
-            "/accounts/acct-1/d1/database/db-1/query",
+            "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
             post(move || async move {
                 Response::builder()
                     .status(StatusCode::BAD_REQUEST)
@@ -5054,7 +5062,11 @@ mod tests {
         let base = spawn_router(router).await;
         let client = CloudflareClient::new(test_config(base)).expect("client");
         let error = client
-            .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+            .query_d1_migration_reconciliation_batch(
+                "acct-1",
+                "123e4567-e89b-42d3-a456-426614174000",
+                "SELECT 1",
+            )
             .await
             .expect_err("deeply nested HTTP error must fail closed without aborting");
         assert_eq!(error.provider_error, None);
@@ -5073,7 +5085,11 @@ mod tests {
         cfg.api_token = None;
         let client = CloudflareClient::new(cfg).expect("client");
         let error = client
-            .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+            .query_d1_migration_reconciliation_batch(
+                "acct-1",
+                "123e4567-e89b-42d3-a456-426614174000",
+                "SELECT 1",
+            )
             .await
             .expect_err("missing token must fail before dispatch");
         assert_eq!(error.error.code, "cloudflare.config_missing_token");
@@ -5091,7 +5107,11 @@ mod tests {
         cfg.api_token = Some("invalid\nheader".to_string());
         let client = CloudflareClient::new(cfg).expect("client");
         let error = client
-            .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+            .query_d1_migration_reconciliation_batch(
+                "acct-1",
+                "123e4567-e89b-42d3-a456-426614174000",
+                "SELECT 1",
+            )
             .await
             .expect_err("invalid authorization header must fail before dispatch");
         assert_eq!(error.error.code, "cloudflare.request_build_failed");
@@ -5110,7 +5130,11 @@ mod tests {
         let client =
             CloudflareClient::new(test_config(refused_loopback_url("attempted"))).expect("client");
         let error = client
-            .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+            .query_d1_migration_reconciliation_batch(
+                "acct-1",
+                "123e4567-e89b-42d3-a456-426614174000",
+                "SELECT 1",
+            )
             .await
             .expect_err("closed loopback port must fail after dispatch attempt");
         assert_eq!(error.error.status, None);
@@ -5190,7 +5214,11 @@ mod tests {
             let base = spawn_truncated_response(prefix, calls.clone()).await;
             let client = CloudflareClient::new(test_config(base)).expect("client");
             let error = client
-                .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+                .query_d1_migration_reconciliation_batch(
+                    "acct-1",
+                    "123e4567-e89b-42d3-a456-426614174000",
+                    "SELECT 1",
+                )
                 .await
                 .expect_err("incomplete response stream must fail closed");
 
@@ -5209,7 +5237,7 @@ mod tests {
     async fn reconciliation_redirect_is_not_followed() {
         let redirect_location = refused_loopback_url("must-not-be-followed");
         let router = Router::new().route(
-            "/accounts/acct-1/d1/database/db-1/query",
+            "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
             post(move || {
                 let redirect_location = redirect_location.clone();
                 async move {
@@ -5224,7 +5252,11 @@ mod tests {
         let base = spawn_router(router).await;
         let client = CloudflareClient::new(test_config(base)).expect("client");
         let error = client
-            .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+            .query_d1_migration_reconciliation_batch(
+                "acct-1",
+                "123e4567-e89b-42d3-a456-426614174000",
+                "SELECT 1",
+            )
             .await
             .expect_err("redirect is contradictory evidence");
         assert_eq!(error.error.status, Some(302));
@@ -5247,7 +5279,7 @@ mod tests {
             let target_calls_for_route = target_calls.clone();
             let router = Router::new()
                 .route(
-                    "/accounts/acct-1/d1/database/db-1/query",
+                    "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                     post(move |headers: HeaderMap| {
                         let source_calls = source_calls_for_route.clone();
                         async move {
@@ -5285,7 +5317,7 @@ mod tests {
             let error = client
                 .execute_d1_migration_manifest_write(
                     "acct-1",
-                    "db-1",
+                    "123e4567-e89b-42d3-a456-426614174000",
                     "CREATE TABLE guarded(id INTEGER PRIMARY KEY)",
                     &[],
                 )
@@ -5311,7 +5343,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_route = calls.clone();
         let router = Router::new().route(
-            "/accounts/acct-1/d1/database/db-1/query",
+            "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
             post(move |headers: HeaderMap| {
                 let calls = calls_for_route.clone();
                 async move {
@@ -5342,7 +5374,7 @@ mod tests {
         let error = client
             .execute_d1_migration_manifest_write(
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "CREATE TABLE guarded(id INTEGER PRIMARY KEY)",
                 &[],
             )
@@ -5417,7 +5449,7 @@ mod tests {
         let error = client
             .execute_d1_migration_manifest_write(
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "CREATE TABLE guarded(id INTEGER PRIMARY KEY)",
                 &[],
             )
@@ -5475,7 +5507,7 @@ mod tests {
             let calls = Arc::new(AtomicUsize::new(0));
             let calls_for_route = calls.clone();
             let router = Router::new().route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 post(move || {
                     let calls = calls_for_route.clone();
                     let body = body.clone();
@@ -5498,7 +5530,7 @@ mod tests {
             let error = client
                 .execute_d1_migration_manifest_write(
                     "acct-1",
-                    "db-1",
+                    "123e4567-e89b-42d3-a456-426614174000",
                     "CREATE TABLE guarded(id INTEGER PRIMARY KEY)",
                     &[],
                 )
@@ -5536,7 +5568,7 @@ mod tests {
         let error = client
             .execute_d1_migration_manifest_write(
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "CREATE TABLE guarded(id INTEGER PRIMARY KEY)",
                 &[],
             )
@@ -5561,7 +5593,7 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
         ] {
             let router = Router::new().route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 post(move || async move {
                     Response::builder()
                         .status(status)
@@ -5572,7 +5604,11 @@ mod tests {
             let base = spawn_router(router).await;
             let client = CloudflareClient::new(test_config(base)).expect("client");
             let error = client
-                .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+                .query_d1_migration_reconciliation_batch(
+                    "acct-1",
+                    "123e4567-e89b-42d3-a456-426614174000",
+                    "SELECT 1",
+                )
                 .await
                 .expect_err("malformed UTF-8 must fail closed");
             assert_eq!(
@@ -5587,7 +5623,7 @@ mod tests {
         }
 
         let router = Router::new().route(
-            "/accounts/acct-1/d1/database/db-1/query",
+            "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
             post(|| async {
                 Response::builder()
                     .status(StatusCode::OK)
@@ -5598,7 +5634,11 @@ mod tests {
         let base = spawn_router(router).await;
         let client = CloudflareClient::new(test_config(base)).expect("client");
         let error = client
-            .query_d1_migration_reconciliation_batch("acct-1", "db-1", "SELECT 1")
+            .query_d1_migration_reconciliation_batch(
+                "acct-1",
+                "123e4567-e89b-42d3-a456-426614174000",
+                "SELECT 1",
+            )
             .await
             .expect_err("malformed JSON must fail closed");
         assert_eq!(error.error.status, Some(200));

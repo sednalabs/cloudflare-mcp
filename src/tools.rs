@@ -8,7 +8,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::CallToolResult;
+use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::tool;
 use rmcp::tool_router;
 use schemars::JsonSchema;
@@ -56,7 +56,7 @@ use crate::d1_migration_bootstrap_recovery::{
     reconcile_bootstrap_migration_ledger,
 };
 use crate::d1_migration_lease::{
-    acquire_d1_migration_lease, d1_migration_lease_requirements,
+    acquire_d1_migration_lease, acquire_d1_target_mutation_guard, d1_migration_lease_requirements,
     preflight_d1_migration_target_custody,
 };
 use crate::d1_migration_manifest::{
@@ -66,8 +66,8 @@ use crate::d1_migration_manifest::{
     d1_manifest_plan_mismatch_result, d1_manifest_plan_sha256,
     d1_manifest_reconciliation_custody_lost_result, d1_manifest_reconciliation_required_result,
     d1_manifest_summaries, d1_manifest_unknown_ledger_result, d1_migration_execution_provider_sql,
-    d1_migrations_table_init_sql, derive_d1_manifest_execution_plan, normalize_d1_manifest_target,
-    normalize_d1_migration_family, parse_d1_migration_ledger, read_stable_d1_migration_ledger,
+    d1_migrations_table_init_sql, derive_d1_manifest_execution_plan, normalize_d1_migration_family,
+    parse_d1_migration_ledger, read_stable_d1_migration_ledger,
     read_stable_d1_migration_ledger_authority, validate_d1_manifest_write_result,
     validate_d1_migration_manifest, validate_generic_d1_migration_family,
 };
@@ -79,6 +79,7 @@ use crate::d1_migration_terminal::{
     D1FinalizeMigrationReconciliationArgs, contextualize_terminal_semantic_error,
     finalize_d1_migration_reconciliation,
 };
+use crate::d1_target::normalize_d1_target;
 use crate::dns_route::{
     DnsRouteConflict, DnsRouteVerificationState, plan_dns_route_reconciliation, verify_dns_route,
 };
@@ -92,6 +93,10 @@ use crate::mutation::{
 use crate::pages_deploy::{
     MAX_PAGES_ASSET_COUNT_DEFAULT, PagesDirectoryInspectOptions,
     inspect_pages_directory_with_options,
+};
+use crate::pages_project_update::{
+    NormalizedPagesProjectUpdateSettings, PagesProjectUpdateInputError,
+    normalize_pages_project_update_settings, redact_pages_project_update_settings,
 };
 use crate::policy::{
     AllowlistMutationMode, build_managed_allowlist_policy, canonicalize_requested_principals,
@@ -1302,7 +1307,7 @@ pub struct WorkersObservabilityQueryEventsArgs {
     #[serde(default)]
     pub datasets: Vec<String>,
     #[serde(default)]
-    pub filters: Vec<Value>,
+    pub filters: Vec<WorkersObservabilityFilter>,
     #[serde(default)]
     pub limit: Option<u32>,
     #[serde(default)]
@@ -1317,6 +1322,47 @@ pub struct WorkersObservabilityQueryEventsArgs {
     pub view: Option<String>,
     #[serde(default)]
     pub needle: Option<Value>,
+}
+
+/// A documented Workers Observability filter expression.
+///
+/// Cloudflare accepts either a leaf comparison or a nested logical group.  Keep
+/// this typed at the MCP boundary so callers supply JSON objects, not a JSON
+/// string that happens to contain an object.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum WorkersObservabilityFilter {
+    Group(WorkersObservabilityFilterGroup),
+    Leaf(WorkersObservabilityFilterLeaf),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct WorkersObservabilityFilterGroup {
+    /// Cloudflare's discriminator for a nested logical group.
+    pub kind: String,
+    #[serde(rename = "filterCombination")]
+    pub filter_combination: String,
+    pub filters: Vec<WorkersObservabilityFilter>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct WorkersObservabilityFilterLeaf {
+    pub key: String,
+    pub operation: String,
+    #[serde(rename = "type")]
+    pub value_type: String,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub value: Option<WorkersObservabilityFilterValue>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum WorkersObservabilityFilterValue {
+    String(String),
+    Number(serde_json::Number),
+    Boolean(bool),
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1761,6 +1807,29 @@ fn missing_upstream_oauth_principal_result() -> CallToolResult {
             "hint": "Reconnect through the configured MCP authentication surface and retry."
         }
     }))
+}
+
+fn preserve_observed_provider_calls(
+    mut result: CallToolResult,
+    observed_provider_calls: u64,
+) -> CallToolResult {
+    let mut updated = false;
+    if let Some(Value::Object(content)) = result.structured_content.as_mut() {
+        let incumbent = content
+            .get("provider_calls")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if incumbent < observed_provider_calls {
+            content.insert("provider_calls".to_string(), json!(observed_provider_calls));
+            updated = true;
+        }
+    }
+    if updated {
+        if let Some(payload) = result.structured_content.as_ref() {
+            result.content = vec![ContentBlock::text(payload.to_string())];
+        }
+    }
+    result
 }
 
 #[tool_router(router = tool_router_cloudflare, vis = "pub")]
@@ -3093,6 +3162,27 @@ impl CloudflareMcp {
                 "provider_mutations": 0,
             })));
         }
+        let pages_project_update = operation.operation_id == "pages-project-update-project";
+        let normalized_body = if pages_project_update {
+            match normalize_pages_project_update_settings(args.body.clone()) {
+                Ok(NormalizedPagesProjectUpdateSettings {
+                    settings,
+                    normalized_from_json_string,
+                }) => NormalizedJsonBody {
+                    value: Some(settings),
+                    normalized: normalized_from_json_string,
+                },
+                Err(error) => {
+                    return Ok(pages_project_update_input_error_result(
+                        "api_mutate",
+                        args.dry_run,
+                        error,
+                    ));
+                }
+            }
+        } else {
+            normalize_json_string_body(args.body.clone())
+        };
         let path = match render_path(
             operation,
             &args.path_params,
@@ -3119,7 +3209,6 @@ impl CloudflareMcp {
                 ));
             }
         };
-        let normalized_body = normalize_json_string_body(args.body.clone());
         let permission_preflight =
             mutation_permission_preflight(operation.operation_id.as_str(), &args.token_permissions);
         let required_token = mutation_confirmation_token(operation, &path, &normalized_body.value);
@@ -3174,7 +3263,14 @@ impl CloudflareMcp {
             "method": operation.method,
             "path": path,
             "query": args.query.clone(),
-            "body": normalized_body.value.clone(),
+            "body": if pages_project_update {
+                normalized_body
+                    .value
+                    .as_ref()
+                    .map(redact_pages_project_update_settings)
+            } else {
+                normalized_body.value.clone()
+            },
             "body_normalized_from_json_string": normalized_body.normalized,
             "headers": {
                 "authorization": "Bearer <redacted>",
@@ -3268,7 +3364,11 @@ impl CloudflareMcp {
                         "risk": operation.risk,
                         "preferred_tool": operation.preferred_tool,
                     },
-                    "result": result,
+                    "result": if pages_project_update {
+                        redact_pages_project_update_settings(&result)
+                    } else {
+                        result
+                    },
                 })),
                 Err(err) if err.status == Some(403) && permission_preflight.is_some() => {
                     let preflight = permission_preflight
@@ -4084,7 +4184,18 @@ impl CloudflareMcp {
         &self,
         Parameters(args): Parameters<D1RenameDatabaseArgs>,
     ) -> Result<CallToolResult, crate::McpError> {
-        let account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        if let Some(account_id) = args.account_id.as_deref()
+            && let Err(result) = normalize_d1_target(account_id, &args.database_id)
+        {
+            return Ok(result);
+        }
+        let resolved_account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        let target = match normalize_d1_target(resolved_account_id, &args.database_id) {
+            Ok(target) => target,
+            Err(result) => return Ok(result),
+        };
+        let account_id = target.account_id.as_str();
+        let database_id = target.database_id.as_str();
         let name = args.name.trim();
         if name.is_empty() {
             return Ok(invalid_argument_result(
@@ -4099,7 +4210,7 @@ impl CloudflareMcp {
                 false,
                 json!({
                     "account_id": account_id,
-                    "database_id": &args.database_id,
+                    "database_id": database_id,
                     "new_name": name,
                 }),
             )
@@ -4117,7 +4228,7 @@ impl CloudflareMcp {
             "d1_rename_database",
             json!({
                 "account_id": account_id,
-                "database_id": &args.database_id,
+                "database_id": database_id,
                 "new_name": name,
             }),
             args.dry_run,
@@ -4129,21 +4240,32 @@ impl CloudflareMcp {
                 "operation": "d1_rename_database",
                 "planned": true,
                 "account_id": account_id,
-                "database_id": &args.database_id,
+                "database_id": database_id,
                 "new_name": name,
                 "dry_run_note": "No D1 database rename applied.",
             }))
         } else {
+            let guard = match acquire_d1_target_mutation_guard(
+                "d1_rename_database",
+                account_id,
+                database_id,
+            ) {
+                Ok(guard) => guard,
+                Err(result) => return Ok(finalize_mutation_result(result, &plan, audit, false)),
+            };
+            if let Err(result) = guard.revalidate() {
+                return Ok(finalize_mutation_result(result, &plan, audit, false));
+            }
             match self
                 .cloudflare
-                .rename_d1_database(account_id, &args.database_id, name)
+                .rename_d1_database(account_id, database_id, name)
                 .await
             {
                 Ok(database) => CallToolResult::structured(json!({
                     "ok": true,
                     "operation": "d1_rename_database",
                     "account_id": account_id,
-                    "database_id": &args.database_id,
+                    "database_id": database_id,
                     "new_name": name,
                     "database": database,
                 })),
@@ -4162,11 +4284,22 @@ impl CloudflareMcp {
         &self,
         Parameters(args): Parameters<D1DeleteDatabaseArgs>,
     ) -> Result<CallToolResult, crate::McpError> {
-        let account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        if let Some(account_id) = args.account_id.as_deref()
+            && let Err(result) = normalize_d1_target(account_id, &args.database_id)
+        {
+            return Ok(result);
+        }
+        let resolved_account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        let target = match normalize_d1_target(resolved_account_id, &args.database_id) {
+            Ok(target) => target,
+            Err(result) => return Ok(result),
+        };
+        let account_id = target.account_id.as_str();
+        let database_id = target.database_id.as_str();
         let operation = find_operation("d1-delete-database").expect("D1 delete catalog operation");
         let path_params = BTreeMap::from([
             ("account_id".to_string(), account_id.to_string()),
-            ("database_id".to_string(), args.database_id.clone()),
+            ("database_id".to_string(), database_id.to_string()),
         ]);
         let path = match render_path(
             operation,
@@ -4184,7 +4317,7 @@ impl CloudflareMcp {
                 false,
                 json!({
                     "account_id": account_id,
-                    "database_id": &args.database_id,
+                    "database_id": database_id,
                     "reason": args.reason.clone(),
                 }),
             )
@@ -4201,7 +4334,7 @@ impl CloudflareMcp {
             "d1_delete_database",
             json!({
                 "account_id": account_id,
-                "database_id": &args.database_id,
+                "database_id": database_id,
                 "reason": args.reason.clone(),
             }),
             args.dry_run,
@@ -4224,7 +4357,7 @@ impl CloudflareMcp {
                 "operation": "d1_delete_database",
                 "planned": true,
                 "account_id": account_id,
-                "database_id": &args.database_id,
+                "database_id": database_id,
                 "request_plan": request_plan,
                 "required_confirmation_token": required_token,
                 "dry_run_note": "No D1 database delete applied.",
@@ -4242,16 +4375,27 @@ impl CloudflareMcp {
                 "request_plan": request_plan,
             }))
         } else {
+            let guard = match acquire_d1_target_mutation_guard(
+                "d1_delete_database",
+                account_id,
+                database_id,
+            ) {
+                Ok(guard) => guard,
+                Err(result) => return Ok(finalize_mutation_result(result, &plan, audit, false)),
+            };
+            if let Err(result) = guard.revalidate() {
+                return Ok(finalize_mutation_result(result, &plan, audit, false));
+            }
             match self
                 .cloudflare
-                .delete_d1_database(account_id, &args.database_id)
+                .delete_d1_database(account_id, database_id)
                 .await
             {
                 Ok(result) => CallToolResult::structured(json!({
                     "ok": true,
                     "operation": "d1_delete_database",
                     "account_id": account_id,
-                    "database_id": &args.database_id,
+                    "database_id": database_id,
                     "result": result,
                 })),
                 Err(err) => adapter_error_result(err),
@@ -4598,7 +4742,19 @@ impl CloudflareMcp {
         &self,
         Parameters(args): Parameters<D1ExecuteWriteArgs>,
     ) -> Result<CallToolResult, crate::McpError> {
-        let account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        if let Some(account_id) = args.account_id.as_deref()
+            && let Err(result) = normalize_d1_target(account_id, &args.database_id)
+        {
+            return Ok(result);
+        }
+        let resolved_account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        let target = match normalize_d1_target(resolved_account_id, &args.database_id) {
+            Ok(target) => target,
+            Err(result) => return Ok(result),
+        };
+        let target_key_sha256 = target.target_key_sha256();
+        let account_id = target.account_id.as_str();
+        let database_id = target.database_id.as_str();
         let statement_kind = match classify_d1_write_sql(&args.sql) {
             Ok(kind) => kind,
             Err(result) => return Ok(result),
@@ -4607,7 +4763,8 @@ impl CloudflareMcp {
         let plan = json!({
             "operation": "d1_execute_write",
             "account_id": account_id,
-            "database_id": &args.database_id,
+            "database_id": database_id,
+            "target_key_sha256": target_key_sha256,
             "statement_kind": statement_kind,
             "sql_sha256": sha256_hex(args.sql.trim()),
             "dry_run": args.dry_run,
@@ -4625,29 +4782,28 @@ impl CloudflareMcp {
                 },
             })));
         }
-        match self
-            .cloudflare
-            .execute_d1_database_write(account_id, &args.database_id, &args.sql, &args.params)
-            .await
-        {
-            Ok(result) => {
-                let (result, truncated) = limit_d1_result_rows(result, max_rows);
-                Ok(CallToolResult::structured(json!({
-                    "ok": true,
-                    "operation": "d1_execute_write",
-                    "plan": plan,
-                    "policy": {
-                        "d1_write_sql": true,
-                        "allowed_statement_kinds": D1_WRITE_ALLOWED_KINDS,
-                        "single_statement": true,
-                        "max_rows": max_rows,
-                    },
-                    "truncated": truncated,
-                    "result": result,
-                })))
+
+        // This generic row-write route has no complete guarded lifecycle for
+        // admission, custody, reconciliation, and terminal proof. Keep the
+        // deterministic dry-run plan useful, but retire live execution before
+        // acquiring a guard or touching the provider so callers cannot mistake
+        // the old target lock for authorization to mutate D1.
+        Ok(CallToolResult::structured_error(json!({
+            "ok": false,
+            "operation": "d1_execute_write",
+            "status": "retired",
+            "capability_state": "unavailable",
+            "dry_run": false,
+            "plan": plan,
+            "provider_calls": 0,
+            "provider_mutations": 0,
+            "request_constructed": false,
+            "error": {
+                "code": "d1.execute_write_retired",
+                "message": "the complete guarded D1 row-write lifecycle is not yet commissioned; no provider request was issued",
+                "hint": "Use dry_run=true to produce a deterministic plan. Use a governed curated D1 lifecycle for live writes; do not use this generic row-write surface."
             }
-            Err(err) => Ok(adapter_error_result(err)),
-        }
+        })))
     }
 
     #[tool(
@@ -4872,13 +5028,12 @@ impl CloudflareMcp {
         };
 
         if let Some(account_id) = requested_account_id.as_deref() {
-            if let Err(result) = normalize_d1_manifest_target(account_id, &requested_database_id) {
+            if let Err(result) = normalize_d1_target(account_id, &requested_database_id) {
                 return Ok(zero_call_error(result));
             }
         }
         let resolved_account_id = resolve_account_id(self, requested_account_id.as_deref())?;
-        let target = match normalize_d1_manifest_target(resolved_account_id, &requested_database_id)
-        {
+        let target = match normalize_d1_target(resolved_account_id, &requested_database_id) {
             Ok(target) => target,
             Err(result) => return Ok(zero_call_error(result)),
         };
@@ -4946,7 +5101,7 @@ impl CloudflareMcp {
             }))
         };
         if let Some(account_id) = requested_account_id.as_deref() {
-            if let Err(result) = normalize_d1_manifest_target(account_id, &requested_database_id) {
+            if let Err(result) = normalize_d1_target(account_id, &requested_database_id) {
                 return Ok(zero_call_error(result));
             }
         }
@@ -4954,14 +5109,13 @@ impl CloudflareMcp {
             Ok(account_id) => account_id,
             Err(_) => {
                 return Ok(zero_call_error(invalid_argument_result(
-                    "d1.invalid_manifest_target_identity",
+                    "d1.invalid_target_identity",
                     "account_id must be supplied or configured as a canonical identifier",
                     "Use the exact account_id read from the intended Cloudflare resource.",
                 )));
             }
         };
-        let target = match normalize_d1_manifest_target(resolved_account_id, &requested_database_id)
-        {
+        let target = match normalize_d1_target(resolved_account_id, &requested_database_id) {
             Ok(target) => target,
             Err(result) => return Ok(zero_call_error(result)),
         };
@@ -5023,7 +5177,7 @@ impl CloudflareMcp {
             }))
         };
         if let Some(account_id) = requested_account_id.as_deref() {
-            if let Err(result) = normalize_d1_manifest_target(account_id, &requested_database_id) {
+            if let Err(result) = normalize_d1_target(account_id, &requested_database_id) {
                 return Ok(zero_call_error(result));
             }
         }
@@ -5031,14 +5185,13 @@ impl CloudflareMcp {
             Ok(account_id) => account_id,
             Err(_) => {
                 return Ok(zero_call_error(invalid_argument_result(
-                    "d1.invalid_manifest_target_identity",
+                    "d1.invalid_target_identity",
                     "account_id must be supplied or configured as a canonical identifier",
                     "Use the exact account_id read from the intended Cloudflare resource.",
                 )));
             }
         };
-        let target = match normalize_d1_manifest_target(resolved_account_id, &requested_database_id)
-        {
+        let target = match normalize_d1_target(resolved_account_id, &requested_database_id) {
             Ok(target) => target,
             Err(result) => return Ok(zero_call_error(result)),
         };
@@ -5146,7 +5299,7 @@ impl CloudflareMcp {
             }))
         };
         if let Some(account_id) = requested_account_id.as_deref() {
-            if let Err(result) = normalize_d1_manifest_target(account_id, &requested_database_id) {
+            if let Err(result) = normalize_d1_target(account_id, &requested_database_id) {
                 return Ok(zero_call_error(result));
             }
         }
@@ -5154,14 +5307,13 @@ impl CloudflareMcp {
             Ok(account_id) => account_id,
             Err(_) => {
                 return Ok(zero_call_error(invalid_argument_result(
-                    "d1.invalid_manifest_target_identity",
+                    "d1.invalid_target_identity",
                     "account_id must be supplied or configured as a canonical identifier",
                     "Use the exact account_id read from the intended Cloudflare resource.",
                 )));
             }
         };
-        let target = match normalize_d1_manifest_target(resolved_account_id, &requested_database_id)
-        {
+        let target = match normalize_d1_target(resolved_account_id, &requested_database_id) {
             Ok(target) => target,
             Err(result) => return Ok(zero_call_error(result)),
         };
@@ -5249,15 +5401,12 @@ impl CloudflareMcp {
         // supplied account alias must not be silently trimmed before it is
         // bound into the reviewed plan and lease key.
         if let Some(requested_account_id) = requested_account_id.as_deref() {
-            if let Err(result) =
-                normalize_d1_manifest_target(requested_account_id, &requested_database_id)
-            {
+            if let Err(result) = normalize_d1_target(requested_account_id, &requested_database_id) {
                 return Ok(result);
             }
         }
         let resolved_account_id = resolve_account_id(self, requested_account_id.as_deref())?;
-        let target = match normalize_d1_manifest_target(resolved_account_id, &requested_database_id)
-        {
+        let target = match normalize_d1_target(resolved_account_id, &requested_database_id) {
             Ok(target) => target,
             Err(result) => return Ok(result),
         };
@@ -5442,10 +5591,10 @@ impl CloudflareMcp {
             args.approved_plan_sha256.as_deref(),
         ) {
             Ok(lease) => lease,
-            Err(result) => finish_manifest!(result),
+            Err(result) => finish_manifest!(preserve_observed_provider_calls(result, 2)),
         };
         if let Err(result) = lease.revalidate() {
-            finish_manifest!(result);
+            finish_manifest!(preserve_observed_provider_calls(result, 2));
         }
 
         let ledger = match read_stable_d1_migration_ledger(
@@ -5967,9 +6116,7 @@ impl CloudflareMcp {
             state_expectations,
         } = args;
         if let Some(requested_account_id) = requested_account_id.as_deref() {
-            if let Err(result) =
-                normalize_d1_manifest_target(requested_account_id, &requested_database_id)
-            {
+            if let Err(result) = normalize_d1_target(requested_account_id, &requested_database_id) {
                 return Ok(contextualize_d1_reconciliation_semantic_error(result));
             }
         }
@@ -5978,15 +6125,14 @@ impl CloudflareMcp {
             Err(_) => {
                 return Ok(contextualize_d1_reconciliation_semantic_error(
                     invalid_argument_result(
-                        "d1.invalid_manifest_target_identity",
+                        "d1.invalid_target_identity",
                         "account_id must be supplied or configured as a canonical identifier",
                         "Use the exact account_id read from the intended Cloudflare resource.",
                     ),
                 ));
             }
         };
-        let target = match normalize_d1_manifest_target(resolved_account_id, &requested_database_id)
-        {
+        let target = match normalize_d1_target(resolved_account_id, &requested_database_id) {
             Ok(target) => target,
             Err(result) => {
                 return Ok(contextualize_d1_reconciliation_semantic_error(result));
@@ -6062,9 +6208,7 @@ impl CloudflareMcp {
             approved_terminal_plan_sha256,
         } = args;
         if let Some(requested_account_id) = requested_account_id.as_deref() {
-            if let Err(result) =
-                normalize_d1_manifest_target(requested_account_id, &requested_database_id)
-            {
+            if let Err(result) = normalize_d1_target(requested_account_id, &requested_database_id) {
                 return Ok(contextualize_terminal_semantic_error(result));
             }
         }
@@ -6073,15 +6217,14 @@ impl CloudflareMcp {
             Err(_) => {
                 return Ok(contextualize_terminal_semantic_error(
                     invalid_argument_result(
-                        "d1.invalid_manifest_target_identity",
+                        "d1.invalid_target_identity",
                         "account_id must be supplied or configured as a canonical identifier",
                         "Use the exact account_id read from the intended Cloudflare resource.",
                     ),
                 ));
             }
         };
-        let target = match normalize_d1_manifest_target(resolved_account_id, &requested_database_id)
-        {
+        let target = match normalize_d1_target(resolved_account_id, &requested_database_id) {
             Ok(target) => target,
             Err(result) => return Ok(contextualize_terminal_semantic_error(result)),
         };
@@ -6365,6 +6508,19 @@ impl CloudflareMcp {
         &self,
         Parameters(args): Parameters<PagesUpdateProjectArgs>,
     ) -> Result<CallToolResult, crate::McpError> {
+        let NormalizedPagesProjectUpdateSettings {
+            settings,
+            normalized_from_json_string,
+        } = match normalize_pages_project_update_settings(Some(args.settings)) {
+            Ok(settings) => settings,
+            Err(error) => {
+                return Ok(pages_project_update_input_error_result(
+                    "pages_update_project",
+                    args.dry_run,
+                    error,
+                ));
+            }
+        };
         let account_id = resolve_account_id(self, args.account_id.as_deref())?;
         if args.dry_run {
             return Ok(CallToolResult::structured(json!({
@@ -6373,19 +6529,23 @@ impl CloudflareMcp {
                 "dry_run": true,
                 "account_id": account_id,
                 "project_name": args.project_name,
-                "settings": args.settings,
+                "settings": redact_pages_project_update_settings(&settings),
+                "settings_normalized_from_json_string": normalized_from_json_string,
                 "deployment_snapshot_note": pages_project_update_snapshot_note(),
             })));
         }
         match self
             .cloudflare
-            .update_pages_project(account_id, &args.project_name, &args.settings)
+            .update_pages_project(account_id, &args.project_name, &settings)
             .await
         {
             Ok(project) => Ok(CallToolResult::structured(json!({
                 "ok": true,
                 "account_id": account_id,
-                "project": project,
+                "project": redact_pages_project_update_settings(
+                    &serde_json::to_value(project)
+                        .expect("Pages project response must serialize for redaction"),
+                ),
                 "deployment_snapshot_note": pages_project_update_snapshot_note(),
             }))),
             Err(err) => Ok(adapter_error_result(err)),
@@ -11287,6 +11447,29 @@ fn pages_project_update_snapshot_note() -> Value {
     })
 }
 
+fn pages_project_update_input_error_result(
+    operation: &str,
+    dry_run: bool,
+    error: PagesProjectUpdateInputError,
+) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "operation": operation,
+        "dry_run": dry_run,
+        "error": {
+            "code": error.code,
+            "message": error.message,
+            "hint": error.hint,
+            "field": error.field,
+            "actual_shape": error.actual_shape,
+        },
+        "request_constructed": false,
+        "raw_body_dispatched": false,
+        "provider_calls": 0,
+        "provider_mutations": 0,
+    }))
+}
+
 fn is_pages_direct_upload_retry_error(err: &crate::cloudflare::AdapterError) -> bool {
     let message = err
         .cloudflare_api_error_message()
@@ -14015,10 +14198,21 @@ fn workers_observability_filters(script_name: Option<&str>, filters: &[Value]) -
     all_filters
 }
 
+fn workers_observability_query_filters(
+    script_name: Option<&str>,
+    filters: &[WorkersObservabilityFilter],
+) -> Vec<Value> {
+    let filters = filters
+        .iter()
+        .map(|filter| serde_json::to_value(filter).expect("observability filter serializes"))
+        .collect::<Vec<_>>();
+    workers_observability_filters(script_name, &filters)
+}
+
 fn workers_observability_query_body(
     script_name: Option<&str>,
     datasets: &[String],
-    filters: &[Value],
+    filters: &[WorkersObservabilityFilter],
     limit: u32,
     timeframe: Value,
     query_id: Option<&str>,
@@ -14037,18 +14231,10 @@ fn workers_observability_query_body(
     );
     parameters.insert(
         "filters".to_string(),
-        Value::Array(workers_observability_filters(script_name, filters)),
+        Value::Array(workers_observability_query_filters(script_name, filters)),
     );
     parameters.insert("filterCombination".to_string(), json!("and"));
     parameters.insert("limit".to_string(), json!(limit.min(1000)));
-    parameters.insert(
-        "view".to_string(),
-        json!(
-            view.map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or("events")
-        ),
-    );
     if let Some(needle) = needle {
         parameters.insert("needle".to_string(), needle);
     }
@@ -14058,6 +14244,9 @@ fn workers_observability_query_body(
         "timeframe": timeframe,
         "dry": dry,
         "limit": limit.min(1000),
+        "view": view.map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("events"),
         "parameters": parameters,
     })
 }
@@ -15556,11 +15745,12 @@ mod tests {
         LockFirstPublishArgs, MAX_D1_MIGRATION_MANIFEST_BYTES, PagesDeploymentActionArgs,
         PagesUpdateProjectArgs, PatchWorkerSettingsArgs, PortalAgentRequestArgs, QueueHealthArgs,
         UpsertAccessAppArgs, UpsertDnsCnameArgs, VerifyHttpGateArgs, WafEventFilterInput,
-        WafSecurityEventsSummaryArgs, WafTimeWindow, WorkersObservabilityListKeysArgs,
-        WorkersObservabilityListValuesArgs, WorkersObservabilityQueryEventsArgs,
-        WorkersObservabilityTimeframe, WorkersUploadScriptArgs, build_waf_security_events_query,
-        normalize_waf_group_by, normalize_waf_phases, query_mentions_waf,
-        waf_security_events_filter,
+        WafSecurityEventsSummaryArgs, WafTimeWindow, WorkersObservabilityFilter,
+        WorkersObservabilityFilterLeaf, WorkersObservabilityFilterValue,
+        WorkersObservabilityListKeysArgs, WorkersObservabilityListValuesArgs,
+        WorkersObservabilityQueryEventsArgs, WorkersObservabilityTimeframe,
+        WorkersUploadScriptArgs, build_waf_security_events_query, normalize_waf_group_by,
+        normalize_waf_phases, query_mentions_waf, waf_security_events_filter,
     };
     use crate::cloudflare::CloudflareClient;
     use crate::cloudflare::model::WorkerScript;
@@ -15570,8 +15760,9 @@ mod tests {
     use crate::d1_migration_manifest::{
         D1ManifestReconciliationEvidence, classify_d1_manifest_ledger,
         d1_manifest_contextualize_failure, d1_manifest_plan_mismatch_result,
-        normalize_d1_manifest_target, parse_d1_migration_ledger, validate_d1_migration_manifest,
+        parse_d1_migration_ledger, validate_d1_migration_manifest,
     };
+    use crate::d1_target::normalize_d1_target;
     use crate::mutation::MutationApprovalAudit;
     use crate::portal::PortalAgentClient;
 
@@ -17035,7 +17226,7 @@ mod tests {
         let server = test_server("http://127.0.0.1:9".to_string());
         let result = server
             .cloudflare_find_tools(Parameters(FindToolsArgs {
-                query: Some("d1 database".to_string()),
+                query: Some("d1".to_string()),
                 group: Some("d1".to_string()),
                 read_only: Some(false),
                 limit: Some(20),
@@ -17047,14 +17238,43 @@ mod tests {
         let allowed = payload["openai_allowed_tools"]
             .as_array()
             .expect("allowed tools");
-        for tool in [
-            "d1_rename_database",
+        let mut actual = allowed.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+        actual.sort_unstable();
+        let mut expected = vec![
+            "d1_abort_bootstrap_migration_ledger",
+            "d1_apply_migration_manifest",
+            "d1_bootstrap_migration_ledger",
             "d1_delete_database",
             "d1_execute_write",
-            "d1_apply_migration_manifest",
+            "d1_finalize_bootstrap_migration_ledger",
+            "d1_finalize_migration_reconciliation",
+            "d1_rename_database",
+        ];
+        expected.sort_unstable();
+        assert_eq!(actual, expected, "closed curated D1 mutation inventory");
+
+        for (tool, provider_boundary) in [
+            ("d1_rename_database", "shared_target_guard"),
+            ("d1_delete_database", "shared_target_guard"),
+            ("d1_execute_write", "shared_target_guard"),
+            ("d1_bootstrap_migration_ledger", "durable_target_lease"),
+            ("d1_apply_migration_manifest", "durable_target_lease"),
         ] {
-            assert!(allowed.iter().any(|candidate| candidate == tool), "{tool}");
+            assert!(
+                allowed.iter().any(|candidate| candidate == tool),
+                "{tool} must retain {provider_boundary} coverage"
+            );
             assert!(payload["schemas"][tool].is_object(), "{tool} schema");
+        }
+        for local_only in [
+            "d1_finalize_bootstrap_migration_ledger",
+            "d1_abort_bootstrap_migration_ledger",
+            "d1_finalize_migration_reconciliation",
+        ] {
+            assert!(
+                allowed.iter().any(|candidate| candidate == local_only),
+                "{local_only} is local custody finalization, not a provider D1 mutation"
+            );
         }
         assert!(
             !allowed
@@ -17116,7 +17336,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_find_operations_prefers_curated_d1_delete_and_rename_tools() {
+    async fn api_find_operations_prefers_only_complete_curated_d1_mutation_tools() {
         let server = test_server("http://127.0.0.1:9".to_string());
         let result = server
             .cloudflare_api_find_operations(Parameters(ApiFindOperationsArgs {
@@ -17139,7 +17359,7 @@ mod tests {
         }));
         assert!(results.iter().any(|result| {
             result["operation_id"] == json!("d1-update-partial-database")
-                && result["preferred_tool"] == json!("d1_rename_database")
+                && result["preferred_tool"].is_null()
         }));
     }
 
@@ -17861,7 +18081,7 @@ mod tests {
                         "accounts": [{
                             "d1AnalyticsAdaptiveGroups": [{
                                 "sum": {"rowsRead": 10, "rowsWritten": 4},
-                                "dimensions": {"date": "2026-06-02", "databaseId": "db-1"}
+                                "dimensions": {"date": "2026-06-02", "databaseId": "123e4567-e89b-42d3-a456-426614174000"}
                             }]
                         }]
                     }
@@ -18478,7 +18698,7 @@ mod tests {
                 "errors": [],
                 "messages": [],
                 "result": [{
-                    "uuid": "db-1",
+                    "uuid": "123e4567-e89b-42d3-a456-426614174000",
                     "name": "staff-db",
                     "created_at": "2026-05-01T00:00:00Z"
                 }],
@@ -18591,7 +18811,7 @@ mod tests {
         ) -> D1ReconcileMigrationManifestArgs {
             D1ReconcileMigrationManifestArgs {
                 account_id: account_id.map(str::to_string),
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 migration_family: migration_family.to_string(),
                 migrations_table: migrations_table.map(str::to_string),
                 manifest,
@@ -18617,9 +18837,9 @@ mod tests {
                 "target precedes every later invalid field",
                 args(Some(" acct-1"), Some("bad-name"), Vec::new(), "bad family"),
                 expected_d1_reconciliation_semantic_error(
-                    "d1.invalid_manifest_target_identity",
-                    "account_id must be a non-empty canonical identifier, not a dot path segment, and without surrounding whitespace",
-                    "Use the exact account_id and database_id read from the intended Cloudflare resource.",
+                    "d1.invalid_target_identity",
+                    "account_id must be an exact 1..=256 byte ASCII identifier containing only letters, digits, '_' or '-'",
+                    "Use the exact account_id and database_id returned by Cloudflare; whitespace, NUL, dot, path, percent-encoded and other equivalent aliases are rejected.",
                 ),
             ),
             (
@@ -18688,7 +18908,7 @@ mod tests {
                 .structured_content
                 .expect("structured missing-account error"),
             expected_d1_reconciliation_semantic_error(
-                "d1.invalid_manifest_target_identity",
+                "d1.invalid_target_identity",
                 "account_id must be supplied or configured as a canonical identifier",
                 "Use the exact account_id read from the intended Cloudflare resource.",
             ),
@@ -18702,7 +18922,7 @@ mod tests {
             .cloudflare_d1_apply_migration_manifest(
                 Parameters(D1ApplyMigrationManifestArgs {
                     account_id: Some(" acct-1".to_string()),
-                    database_id: "db-1".to_string(),
+                    database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                     migration_family: "audience".to_string(),
                     migrations_table: None,
                     manifest: vec![D1MigrationManifestEntry {
@@ -18721,7 +18941,7 @@ mod tests {
             .expect("MCP result");
         assert_eq!(
             result.structured_content.expect("error")["error"]["code"],
-            json!("d1.invalid_manifest_target_identity")
+            json!("d1.invalid_target_identity")
         );
     }
 
@@ -18729,8 +18949,16 @@ mod tests {
     async fn d1_manifest_rejects_dot_segments_before_provider_url_construction() {
         let sql = "CREATE TABLE t(id TEXT);".to_string();
         for (account_id, database_id, label) in [
-            (".", "db-1", "account current-directory segment"),
-            ("..", "db-1", "account parent-directory segment"),
+            (
+                ".",
+                "123e4567-e89b-42d3-a456-426614174000",
+                "account current-directory segment",
+            ),
+            (
+                "..",
+                "123e4567-e89b-42d3-a456-426614174000",
+                "account parent-directory segment",
+            ),
             ("acct-1", ".", "database current-directory segment"),
             ("acct-1", "..", "database parent-directory segment"),
         ] {
@@ -18757,7 +18985,7 @@ mod tests {
                 .expect("MCP result");
             assert_eq!(
                 result.structured_content.expect("error")["error"]["code"],
-                json!("d1.invalid_manifest_target_identity"),
+                json!("d1.invalid_target_identity"),
                 "{label} must be rejected before the URL parser sees it"
             );
         }
@@ -18774,12 +19002,22 @@ mod tests {
                 .expect("make lease root private");
         }
         let digest = "a".repeat(64);
-        let mut first =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "audience", &digest)
-                .expect("first family lease");
-        let second =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "control", &digest)
-                .expect_err("family must not split one target lease");
+        let mut first = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "audience",
+            &digest,
+        )
+        .expect("first family lease");
+        let second = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "control",
+            &digest,
+        )
+        .expect_err("family must not split one target lease");
         assert_eq!(
             second.structured_content.expect("structured error")["error"]["code"],
             json!("d1.migration_target_guard_locked")
@@ -18814,7 +19052,7 @@ mod tests {
         let mut lease = acquire_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "audience",
             &"a".repeat(64),
         )
@@ -18825,7 +19063,7 @@ mod tests {
         let payload = d1_manifest_contextualize_failure(
             prefix,
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "audience",
             "d1_migrations",
             &manifest,
@@ -18847,7 +19085,7 @@ mod tests {
         let payload = d1_manifest_contextualize_failure(
             d1_manifest_plan_mismatch_result(
                 "acct-1",
-                "db-1",
+                "123e4567-e89b-42d3-a456-426614174000",
                 "audience",
                 "d1_migrations",
                 &manifest,
@@ -18855,7 +19093,7 @@ mod tests {
                 &computed,
             ),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "audience",
             "d1_migrations",
             &manifest,
@@ -18894,9 +19132,14 @@ mod tests {
         fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o770))
             .expect("make same-owner ancestor writable");
 
-        let error =
-            acquire_d1_migration_lease_at(root, "acct-1", "db-1", "audience", &"a".repeat(64))
-                .expect_err("same-owner writable non-sticky ancestor must fail closed");
+        let error = acquire_d1_migration_lease_at(
+            root,
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "audience",
+            &"a".repeat(64),
+        )
+        .expect_err("same-owner writable non-sticky ancestor must fail closed");
         assert_eq!(
             error.structured_content.expect("unsafe root error")["error"]["code"],
             json!("d1.migration_lease_root_unsafe")
@@ -18909,17 +19152,17 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn d1_manifest_target_rejects_aliases_and_preserves_replacement_lease() {
-        let error = normalize_d1_manifest_target(" acct-1", "db-1")
+        let error = normalize_d1_target(" acct-1", "123e4567-e89b-42d3-a456-426614174000")
             .expect_err("account whitespace alias must fail");
         assert_eq!(
             error.structured_content.expect("error")["error"]["code"],
-            json!("d1.invalid_manifest_target_identity")
+            json!("d1.invalid_target_identity")
         );
-        let error = normalize_d1_manifest_target("acct-1", "db-1 ")
+        let error = normalize_d1_target("acct-1", "123e4567-e89b-42d3-a456-426614174000 ")
             .expect_err("database whitespace alias must fail");
         assert_eq!(
             error.structured_content.expect("error")["error"]["code"],
-            json!("d1.invalid_manifest_target_identity")
+            json!("d1.invalid_target_identity")
         );
         let root = d1_migration_test_dir("d1-manifest-lease-replacement");
         #[cfg(unix)]
@@ -18928,9 +19171,14 @@ mod tests {
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
                 .expect("make lease root private");
         }
-        let mut first =
-            acquire_d1_migration_lease_at(root.clone(), "acct-1", "db-1", "first", &"a".repeat(64))
-                .expect("first lease");
+        let mut first = acquire_d1_migration_lease_at(
+            root.clone(),
+            "acct-1",
+            "123e4567-e89b-42d3-a456-426614174000",
+            "first",
+            &"a".repeat(64),
+        )
+        .expect("first lease");
         #[cfg(unix)]
         assert_eq!(
             std::os::unix::fs::MetadataExt::mode(
@@ -18953,7 +19201,7 @@ mod tests {
         let mut replacement = acquire_d1_migration_lease_at(
             root.clone(),
             "acct-1",
-            "db-1",
+            "123e4567-e89b-42d3-a456-426614174000",
             "second",
             &"b".repeat(64),
         )
@@ -18995,7 +19243,10 @@ mod tests {
             bodies: Arc::new(Mutex::new(Vec::new())),
         };
         let router = Router::new()
-            .route("/accounts/acct-1/d1/database/db-1/query", post(query_d1))
+            .route(
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
+                post(query_d1),
+            )
             .with_state(state.clone());
         let server = test_server(spawn_router(router).await);
         let first_sql = "CREATE TABLE submissions(id TEXT);".to_string();
@@ -19018,7 +19269,7 @@ mod tests {
             .cloudflare_d1_apply_migration_manifest(
                 Parameters(D1ApplyMigrationManifestArgs {
                     account_id: None,
-                    database_id: "db-1".to_string(),
+                    database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                     migration_family: "newsletter-core".to_string(),
                     migrations_table: None,
                     manifest,
@@ -19108,7 +19359,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -19117,7 +19368,7 @@ mod tests {
         let result = server
             .cloudflare_d1_apply_migrations(Parameters(D1ApplyMigrationsArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 migrations_directory: dir.to_string_lossy().to_string(),
                 migrations_table: None,
                 dry_run: true,
@@ -19211,7 +19462,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -19220,7 +19471,7 @@ mod tests {
         let result = server
             .cloudflare_d1_apply_migrations(Parameters(D1ApplyMigrationsArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 migrations_directory: dir.to_string_lossy().to_string(),
                 migrations_table: Some("custom_migrations".to_string()),
                 dry_run: false,
@@ -19283,7 +19534,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -19292,7 +19543,7 @@ mod tests {
         let result = server
             .cloudflare_d1_apply_migrations(Parameters(D1ApplyMigrationsArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 migrations_directory: dir.to_string_lossy().to_string(),
                 migrations_table: None,
                 dry_run: false,
@@ -19338,7 +19589,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -19348,7 +19599,7 @@ mod tests {
         let result = server
             .cloudflare_d1_query_read_only(Parameters(D1QueryArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 sql: "INSERT INTO users VALUES (1)".to_string(),
                 params: Vec::new(),
                 max_rows: None,
@@ -19391,7 +19642,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -19401,7 +19652,7 @@ mod tests {
         let result = server
             .cloudflare_d1_query_read_only(Parameters(D1QueryArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 sql: "SELECT id FROM users WHERE id > ?".to_string(),
                 params: vec![json!(0)],
                 max_rows: Some(2),
@@ -19459,7 +19710,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -19468,7 +19719,7 @@ mod tests {
         let result = server
             .cloudflare_d1_query_read_only(Parameters(D1QueryArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 sql: "SELECT type, name, tbl_name, sql FROM sqlite_master".to_string(),
                 params: vec![],
                 max_rows: None,
@@ -19510,7 +19761,7 @@ mod tests {
         }
 
         let router = Router::new().route(
-            "/accounts/acct-1/d1/database/db-1/query",
+            "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
             axum::routing::post(query_d1),
         );
         let server = test_server(spawn_router(router).await);
@@ -19518,7 +19769,7 @@ mod tests {
         let result = server
             .cloudflare_d1_query_read_only(Parameters(D1QueryArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 sql: "SELECT id FROM submissions".to_string(),
                 params: vec![],
                 max_rows: None,
@@ -19546,7 +19797,7 @@ mod tests {
         }
 
         let router = Router::new().route(
-            "/accounts/acct-1/d1/database/db-1/query",
+            "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
             axum::routing::post(query_d1),
         );
         let server = test_server(spawn_router(router).await);
@@ -19554,7 +19805,7 @@ mod tests {
         let result = server
             .cloudflare_d1_query_read_only(Parameters(D1QueryArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 sql: "SELECT source_type FROM submissions".to_string(),
                 params: vec![],
                 max_rows: None,
@@ -19599,7 +19850,7 @@ mod tests {
         }
 
         let router = Router::new().route(
-            "/accounts/acct-1/d1/database/db-1/query",
+            "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
             axum::routing::post(query_d1),
         );
         let server = test_server(spawn_router(router).await);
@@ -19607,7 +19858,7 @@ mod tests {
         let result = server
             .cloudflare_d1_query_read_only(Parameters(D1QueryArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 sql: "SELECT id FROM missing_table".to_string(),
                 params: vec![],
                 max_rows: None,
@@ -19664,7 +19915,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -19673,7 +19924,7 @@ mod tests {
         let result = server
             .cloudflare_d1_validate_query(Parameters(D1ValidateQueryArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 sql: "SELECT id FROM missing_table".to_string(),
                 include_query_plan: true,
             }))
@@ -19745,7 +19996,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -19754,7 +20005,7 @@ mod tests {
         let missing_column = server
             .cloudflare_d1_validate_query(Parameters(D1ValidateQueryArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 sql: "SELECT missing_col FROM open_submissions".to_string(),
                 include_query_plan: false,
             }))
@@ -19775,7 +20026,7 @@ mod tests {
         let valid = server
             .cloudflare_d1_validate_query(Parameters(D1ValidateQueryArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 sql: "SELECT id FROM open_submissions".to_string(),
                 include_query_plan: true,
             }))
@@ -19843,7 +20094,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -19852,7 +20103,7 @@ mod tests {
         let result = server
             .cloudflare_d1_inspect_schema(Parameters(D1InspectSchemaArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 include_columns: true,
                 include_tables: Vec::new(),
                 include_table_pattern: None,
@@ -19953,7 +20204,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -19962,7 +20213,7 @@ mod tests {
         let result = server
             .cloudflare_d1_inspect_schema(Parameters(D1InspectSchemaArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 include_columns: true,
                 include_tables: Vec::new(),
                 include_table_pattern: None,
@@ -20086,7 +20337,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -20095,7 +20346,7 @@ mod tests {
         let result = server
             .cloudflare_d1_inspect_schema(Parameters(D1InspectSchemaArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 include_columns: true,
                 include_tables: Vec::new(),
                 include_table_pattern: None,
@@ -20194,7 +20445,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -20203,7 +20454,7 @@ mod tests {
         let result = server
             .cloudflare_d1_inspect_schema(Parameters(D1InspectSchemaArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 include_columns: true,
                 include_tables: Vec::new(),
                 include_table_pattern: None,
@@ -20297,7 +20548,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -20306,7 +20557,7 @@ mod tests {
         let result = server
             .cloudflare_d1_inspect_schema(Parameters(D1InspectSchemaArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 include_columns: true,
                 include_tables: vec!["Submissions".to_string()],
                 include_table_pattern: Some("submission_*".to_string()),
@@ -20381,7 +20632,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -20390,7 +20641,7 @@ mod tests {
         let result = server
             .cloudflare_d1_inspect_schema(Parameters(D1InspectSchemaArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 include_columns: false,
                 include_tables: Vec::new(),
                 include_table_pattern: None,
@@ -20458,7 +20709,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -20467,7 +20718,7 @@ mod tests {
         let result = server
             .cloudflare_d1_inspect_schema(Parameters(D1InspectSchemaArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 include_columns: true,
                 include_tables: Vec::new(),
                 include_table_pattern: None,
@@ -20515,7 +20766,7 @@ mod tests {
         };
         let router = Router::new()
             .route(
-                "/accounts/acct-1/d1/database/db-1/query",
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
                 axum::routing::post(query_d1),
             )
             .with_state(state.clone());
@@ -20524,7 +20775,7 @@ mod tests {
         let result = server
             .cloudflare_d1_inspect_schema(Parameters(D1InspectSchemaArgs {
                 account_id: None,
-                database_id: "db-1".to_string(),
+                database_id: "123e4567-e89b-42d3-a456-426614174000".to_string(),
                 include_columns: false,
                 include_tables: Vec::new(),
                 include_table_pattern: None,
@@ -20692,7 +20943,17 @@ mod tests {
                     account_id: None,
                     script_name: Some("pages-worker".to_string()),
                     datasets: Vec::new(),
-                    filters: Vec::new(),
+                    filters: vec![WorkersObservabilityFilter::Leaf(
+                        WorkersObservabilityFilterLeaf {
+                            key: "$metadata.trigger".to_string(),
+                            operation: "eq".to_string(),
+                            value_type: "string".to_string(),
+                            kind: Some("filter".to_string()),
+                            value: Some(WorkersObservabilityFilterValue::String(
+                                "scheduled".to_string(),
+                            )),
+                        },
+                    )],
                     limit: Some(20),
                     timeframe: Some(WorkersObservabilityTimeframe { from: 1, to: 2 }),
                     lookback_minutes: None,
@@ -20715,10 +20976,37 @@ mod tests {
             body["parameters"]["filters"][0]["value"],
             json!("pages-worker")
         );
+        assert_eq!(
+            body["parameters"]["filters"][1]["key"],
+            json!("$metadata.trigger")
+        );
+        assert_eq!(
+            body["parameters"]["filters"][1]["value"],
+            json!("scheduled")
+        );
         assert_eq!(body["parameters"]["datasets"], json!(["workers"]));
         assert_eq!(body["parameters"]["filterCombination"], json!("and"));
-        assert_eq!(body["parameters"]["view"], json!("events"));
+        assert_eq!(body["view"], json!("events"));
+        assert!(body["parameters"].get("view").is_none());
         assert_eq!(body["parameters"]["limit"], json!(20));
+    }
+
+    #[test]
+    fn workers_observability_query_filters_require_structured_objects() {
+        let parsed = serde_json::from_value::<WorkersObservabilityQueryEventsArgs>(json!({
+            "filters": [{
+                "key": "$metadata.trigger",
+                "operation": "eq",
+                "type": "string",
+                "value": "scheduled"
+            }]
+        }));
+        assert!(parsed.is_ok(), "structured filter object must parse");
+
+        let stringified = serde_json::from_value::<WorkersObservabilityQueryEventsArgs>(json!({
+            "filters": ["{\\\"key\\\":\\\"$metadata.trigger\\\"}"]
+        }));
+        assert!(stringified.is_err(), "stringified filter object must fail");
     }
 
     #[tokio::test]
@@ -20728,7 +21016,7 @@ mod tests {
                 "success": true,
                 "errors": [],
                 "messages": [],
-                "result": [{"uuid": "db-1", "name": "staff"}],
+                "result": [{"uuid": "123e4567-e89b-42d3-a456-426614174000", "name": "staff"}],
                 "result_info": {"page": 1, "per_page": 100, "count": 1, "total_count": 1}
             }))
         }

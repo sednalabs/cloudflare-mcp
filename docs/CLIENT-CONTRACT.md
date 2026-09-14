@@ -140,6 +140,40 @@ contains the current template plus a read-only-only optional approval override.
 
 For `d1_bootstrap_migration_ledger` and `d1_apply_migration_manifest`, a live `approved_plan_sha256` is the exact lowercase 64-character `plan_sha256` returned by that tool's dry run. Case changes and surrounding whitespace are rejected so apply and retained recovery bind one canonical approval identity. The bootstrap plan is valid only for the same exact account, database, ledger-table identity, canonical initializer bytes, and primary-served empty schema observed by the live preflight. Manifest names may be current Wrangler relative POSIX paths such as `0001_init/migration.sql`, not only flat basenames. They must be canonical and are ordered with Wrangler's segment-wise leading-number comparison and lexical tie-breaking; absolute paths, backslashes, empty segments, `.`/`..`, and NUL are rejected.
 
+Every curated provider mutation for an existing D1 database requires the exact
+account identifier and a canonical lowercase hyphenated UUID `database_id`.
+Uppercase, mixed-case, compact, braced and other database UUID aliases fail
+before target hashing, planning, custody lookup or provider dispatch; callers
+must not normalize a rejected identifier themselves.
+
+The canonical target-identity contract has a one-way local custody activation
+boundary. Before either a migration lease or another existing-target mutation
+guard can be created, the configured lease root must contain the exact
+`target-identity-v2.activation.json` marker and one exact create-only
+`target-identity-v2.<target-key-sha256>.receipt.json` registration for the
+canonical target. An upgraded process may create the first registration and
+marker only while holding the permanent root activation guard and only after a
+bounded, descriptor-relative enumeration proves the root was empty before the
+guard was created. Any unversioned target directory or other entry blocks,
+including an otherwise canonical incumbent and active, retiring, retired,
+terminal, malformed, unreadable, or alias custody. The MCP never deletes,
+migrates, or blesses that evidence. This is necessary because predecessor
+lease payloads retain the derived target hash but cannot prove which UUID
+spelling produced it. Upgrade by stopping every predecessor writer, preserving
+and governing its old root separately, and configuring all upgraded writers to
+one newly provisioned private empty root. Never point a predecessor binary at
+an activated root. That complete predecessor drain is a separate deployment
+prerequisite; it does not replace runtime enforcement. Marker-present calls
+perform a stable bounded audit of the marker, every registration, and every
+registered target's complete allowed custody namespace. The same audit is
+revalidated at guard, lease, provider, persistence, and release boundaries, so
+an alias, malformed entry, unknown entry, contradictory lease state, or target
+without registration fails closed even if it appears after activation.
+Rollback is generation-wide: stop every upgraded writer, preserve the
+activated root without manual edits, and return all writers together to the
+preserved predecessor root and predecessor binary generation. Mixed roots or
+binary generations are unsupported during cutover or rollback.
+
 The exact family `migration-ledger-bootstrap-v1` is reserved to `d1_bootstrap_migration_ledger` and its dedicated reconcile, finalize, and abort tools. Generic manifest apply, read-only reconciliation, and terminal finalization reject that family before provider access, custody inspection or creation, receipt access, or local namespace mutation; similarly prefixed family labels are not reserved.
 
 Cloudflare D1 already enforces foreign keys and runs each query or migration in
@@ -169,7 +203,7 @@ prefix retain the existing version-1 plan digest.
 | `api_get_operation` | `operation_id` | none | Shows parameters, risk, call template, executor, and preferred curated tool when one exists. |
 | `api_prepare_call` | `operation_id` or enough search filters | `query`, `tag`, `method`, `scope`, `risk`, `include_deprecated`, `path_params`, `query_params`, `body`, `limit` | Resolves an operation and returns exact `api_read`/`api_mutate` arguments. Ambiguous searches return candidates instead of guessing; mutating operations are prepared as `dry_run=true`. Path parameters are derived from the URL template as well as catalog metadata, so stale catalog `path_params` cannot leave literal `{account_id}` placeholders in prepared paths. The returned `resolved_path_params` and `call.arguments.path_params` include configured account/zone defaults, making the prepared call self-contained. |
 | `api_read` | `operation_id` | `path_params`, `query`, `max_bytes` | Executes catalog `GET` operations only; uses configured account/zone defaults for matching path params. Path parameters are derived from the URL template as well as catalog metadata. |
-| `api_mutate` | `operation_id` | `path_params`, `query`, `body`, `dry_run`, `confirmation_token`, `reason`, `token_permissions` | Executes catalog `POST`/`PUT`/`PATCH`/`DELETE` operations through dry-run confirmation; high-risk and denied-by-default operations fail closed before request construction or provider access. `token_permissions` carries permission-group names from a fresh `account_api_tokens action=get` readback for operations with an explicit multi-permission preflight. The Bot Management zone update requires both `Bot Management Write` and `Zone Settings Write`; its dry-run withholds the confirmation token until both are reported, and returns guarded MCP token-repair calls when either is unverified or missing. The generic `worker-script-put-content` upload is denied; use `workers_upload_script` for its digest-bound upload, confirmation, and readback contract. Generic `d1-query-database`, `d1-raw-database-query`, `d1-import-database`, and `d1-time-travel-restore` calls are also denied because they can bypass curated existing-target D1 write and migration policy. Use curated D1 read, row-write, bootstrap, and migration-manifest tools where applicable; import and restore require a separately governed curated lifecycle rather than a nonexistent preferred tool. Create, get, list, export, and metadata operations retain their existing catalog policy, while delete retains its separate curated high-risk lifecycle. Valid escaped JSON-string `body` values are normalized into real JSON and reported with `body_normalized_from_json_string`. |
+| `api_mutate` | `operation_id` | `path_params`, `query`, `body`, `dry_run`, `confirmation_token`, `reason`, `token_permissions` | Executes catalog `POST`/`PUT`/`PATCH`/`DELETE` operations through dry-run confirmation; high-risk and denied-by-default operations fail closed before request construction or provider access. `token_permissions` carries permission-group names from a fresh `account_api_tokens action=get` readback for operations with an explicit multi-permission preflight. The Bot Management zone update requires both `Bot Management Write` and `Zone Settings Write`; its dry-run withholds the confirmation token until both are reported, and returns guarded MCP token-repair calls when either is unverified or missing. The generic `worker-script-put-content` upload is denied; use `workers_upload_script` for its digest-bound upload, confirmation, and readback contract. Every generic non-GET D1 operation whose path contains an existing `database_id` is denied: delete, export, import, query/raw query, time-travel restore, full update and partial update. Use curated D1 read, rename, delete, bootstrap, and migration-manifest tools only where their narrower contract applies; the generic row-write tool is dry-run-only and its live path is retired. The rename-only tool is not a preferred substitute for the broader partial-update operation. Surfaces without a complete guarded curated lifecycle remain unavailable through `api_mutate`. D1 create is not an existing-target operation, and GET operations retain their read policy. Valid escaped JSON-string `body` values are normalized into real JSON and reported with `body_normalized_from_json_string`. |
 | `account_billing_usage` | none if default account configured | `account_id`, `mode`, `from`, `to`, `metric`, `max_bytes` | Read-only account usage helper for billing investigations. `mode=paygo` calls `/accounts/{account_id}/paygo-usage`; `mode=billable_usage` calls `/accounts/{account_id}/billable/usage` and requires `metric`. Use this for billable usage records before using analytics to explain attribution. |
 | `graphql_analytics_query` | `query` | `variables`, `max_bytes` | Runs a read-only Cloudflare Analytics GraphQL query against `/client/v4/graphql`. Mutations and subscriptions are rejected before HTTP. Use this for product analytics such as D1 `d1AnalyticsAdaptiveGroups` and `d1QueriesAdaptiveGroups`; Cloudflare documents GraphQL analytics as attribution/analytics data, not a billing-record replacement. When the MCP can distinguish likely authz cause classes, responses include `diagnostics.authz_classification` with a stable `code` and next-step guidance. |
 | `waf_ruleset_summary` | none if default zone or account configured | `account_id`, `zone_id`, `scope`, `phases`, `include_rules`, `include_raw`, `max_bytes` | Reads WAF Ruleset Engine entrypoints for custom rules, managed rules, and rate limiting rules. `scope=auto` prefers zone scope, then account scope. `phases` accepts aliases such as `custom`, `managed`, and `ratelimit`; defaults to `http_request_firewall_custom`, `http_request_firewall_managed`, and `http_ratelimit`. |
@@ -192,7 +226,7 @@ prefix retain the existing version-1 plan digest.
 | `d1_inspect_schema` | `database_id`; `account_id` unless default account configured | `include_columns`, `include_tables`, `include_table_pattern` | Curated D1 schema inspection using Cloudflare-compatible `sqlite_master`/PRAGMA read-only queries. `include_tables` is an exact-name allowlist and `include_table_pattern` is a simple `*`/`?` glob, both applied before column PRAGMAs. Cloudflare internal `_cf_*` objects are returned under `skipped_internal_tables` instead of `column_errors`; `summary.message` states whether application schema was returned, internal tables were skipped, or no application tables matched. If D1 denies an application table/view column PRAGMA, the tool still returns schema objects plus readable columns and reports `column_errors`/`column_discovery_fidelity`. View columns are marked with `object_type=view` and `derived=true`. Does not require Wrangler. |
 | `d1_query_read_only` | `database_id`, `sql`; `account_id` unless default account configured | `params`, `max_rows` | Curated Cloudflare D1 SQL read/execute path for returning rows from read-only SELECT/query statements. SQL is checked by the shared restricted-SQL classifier before Cloudflare is contacted; catalog discovery reads fall back to the schema-inspection path when D1 returns `SQLITE_AUTH`. A `no such column` failure returns `d1.no_such_column`, and a `no such table` failure returns `d1.no_such_table`, with guidance to run `d1_validate_query` on the exact SQL or inspect only the suspected table/view with `d1_inspect_schema` include filters rather than sweeping the full database schema. |
 | `d1_validate_query` | `database_id`, `sql`; `account_id` unless default account configured | `include_query_plan` | Validates one read-only D1 SQL statement against application schema metadata without executing that statement. Returns distinct `not_allowed`, `not_application_schema`, and `column_does_not_exist` style failures; the SQL reference parser reports function calls separately from column references so expressions such as `coalesce(...)`, `toDateTime(...)`, and aggregate helpers do not become false missing-column errors. When requested and validation passes, fetches `EXPLAIN QUERY PLAN` as plan metadata without running the user query. |
-| `d1_execute_write` | `database_id`, `sql`; `account_id` unless default account configured | `params`, `dry_run`, `max_rows` | Executes one audited D1 row-write statement after dry-run planning. Allows only single-statement `INSERT`, `UPDATE`, `DELETE`, or `REPLACE`; schema-changing migration SQL belongs in `d1_apply_migration_manifest`. |
+| `d1_execute_write` | `database_id`, `sql`; `account_id` unless default account configured | `params`, `dry_run`, `max_rows` | Dry-run only: plans one audited single-statement `INSERT`, `UPDATE`, `DELETE`, or `REPLACE`. `dry_run=false` is permanently retired and fails before guard/provider access because the complete guarded row-write lifecycle is not yet commissioned; schema-changing migration SQL belongs in `d1_apply_migration_manifest`. |
 | `d1_apply_migrations` | `database_id`, `migrations_directory`; `account_id` unless default account configured | `migrations_table`, `dry_run`, `max_rows` | Legacy directory-backed migration surface. `dry_run=true` performs remote ledger readback without writes and returns `already_applied`, `skipped_migrations`, `pending_migrations`, and `unknown_ledger`. Live mutation is retired and returns `d1.legacy_migration_apply_retired` with zero provider calls; use `d1_apply_migration_manifest` for every provider migration write. |
 | `d1_bootstrap_migration_ledger` | `database_id`; `account_id` unless default account configured | `migrations_table`, `dry_run`, `approved_plan_sha256` | Narrow first-ledger bootstrap for an independently selected empty D1 target. Dry run requires two identical, bounded, primary-served `sqlite_master` reads proving that no application-owned object exists; SQLite internals and Cloudflare's reserved `_cf_*` family are excluded by object and parent identity, and custom ledger names in either reserved family are rejected before provider access. Every bootstrap inventory or ledger read uses the bounded recovery HTTP boundary: exactly one attempt, no redirects, a 16 MiB response cap, strict envelope decoding, exact complete-body digest/size when available, and explicit dispatch/response/body/status lifecycle evidence. Every chronological lifecycle/response entry retains its bounded `dry_run_preflight`, `live_predispatch`, `ambiguous_write_reconciliation`, or `post_write_proof` window plus `inventory.first`/`inventory.second`/`ledger.first`/`ledger.second` read identity and query digest even when no response bytes exist. `provider_calls` therefore counts physical attempted requests; token/config/request-builder rejection is pre-dispatch and counts zero. HTTP errors, transport loss, truncated/oversized/malformed/invalid-UTF-8 bodies, non-boolean or absent primary markers, and unstable paired results fail closed without adapter retry. Nested provider causes, including the one non-idempotent initializer failure, contain safe code/status plus `retryable=false` and `operator_guidance=reconciliation_only`. A completely read, duplicate-free authenticated initializer HTTP error may additionally expose only the allowlisted provider code/category pair and a bounded numeric SQL byte offset when the provider message ends in the recognized form. Generic messages, hints, arbitrary adapter classifications, SQL, and provider-body excerpts remain omitted; complete-body digest and size remain evidence. It emits a digest bound to the exact target, table, empty state, and canonical Wrangler-compatible initializer. Live apply uses the same account/database target lease as manifest apply, repeats the stable empty proof under custody, and dispatches exactly one non-idempotent ledger-table initializer. It never executes migration SQL and never converts an existing or partially initialized database. The DDL acknowledgement must be one clean primary-served result with `changed_db=true` and typed non-negative counts; zero row counts are valid for this DDL-only call, while the stable canonical-schema and empty-ledger post-readback proves the effect. A lost or ambiguous write response triggers only the same exact bounded read boundary, retains custody when provable, reports one provider mutation plus chronological ambiguity evidence, and never authorizes automatic retry. |
 | `d1_reconcile_bootstrap_migration_ledger` | `database_id`, `approved_bootstrap_plan_sha256`, `lease_nonce`, `lease_payload_sha256`; `account_id` unless default account configured | `migrations_table` | Bootstrap-only read-only recovery for exact retained `migration-ledger-bootstrap-v1` custody. It rederives the plan from the exact target, table and canonical initializer, validates the exact lease family/nonce/payload, and performs two stable primary proof windows. Each window contains two bounded schema inventory reads and two empty-ledger reads. Every read is exactly one HTTP attempt through the no-redirect recovery client; exact response-byte digest/size and dispatch/response/body/status lifecycle are retained, while `provider_calls` counts only actual dispatches and pre-dispatch failures count zero. Only the exact installed initializer schema as the sole application-owned object with zero ledger rows in both matching windows returns `terminal_proof_ready`. It reports eight provider calls, zero provider/local mutations, exact initializer/query/snapshot/reconciliation digests, unknown effect attribution, retained custody, and a permanent no-retry decision. Ledger absence, extra/drifted schema, or a non-empty ledger is explicit conflict; malformed, non-primary, unreadable, unstable, or custody-drifted evidence is unknown. No manifest input or caller SQL is accepted. |
@@ -212,7 +246,7 @@ prefix retain the existing version-1 plan digest.
 | `pages_trigger_deployment` | `project_name`; `account_id` unless default account configured | `branch`, `commit_hash`, `commit_message`, `commit_dirty`, `dry_run` | Triggers Git-backed Pages projects only. Direct-upload projects should use `pages_deploy_directory`; manifest-required Cloudflare errors are normalized to a Pages-specific MCP error. |
 | `pages_list_projects` | `account_id` unless default account configured | `page`, `per_page` | Lists Pages projects for the account. |
 | `pages_get_project` | `project_name`; `account_id` unless default account configured | none | Reads one Pages project. |
-| `pages_update_project` | `project_name`, `settings`; `account_id` unless default account configured | `dry_run` | Updates Pages project settings through a guarded dry-run/apply path. |
+| `pages_update_project` | `project_name`, `settings`; `account_id` unless default account configured | `dry_run` | Updates Pages project settings through a guarded dry-run/apply path. `settings` accepts one non-empty object or escaped JSON-object string. Dry-run normalizes that shape and redacts `secret_text` values. Send only exact changed settings: unchanged environment variables must be omitted, a `secret_text` replacement needs an exact non-empty non-masked value, and an explicit `null` environment-variable entry retains the upstream deletion contract. The same checks protect generic `api_mutate` for `pages-project-update-project`. |
 | `pages_list_deployments` | `project_name`; `account_id` unless default account configured | `environment`, `page`, `per_page` | Lists deployments for a Pages project. |
 | `pages_get_deployment` | `project_name`, `deployment_id`; `account_id` unless default account configured | none | Reads one Pages deployment. |
 | `pages_retry_deployment` | `project_name`, `deployment_id`; `account_id` unless default account configured | `dry_run` | Retries a Pages deployment through a guarded action path. |
@@ -240,7 +274,7 @@ prefix retain the existing version-1 plan digest.
 | `workers_list_tails` | `script_name`; `account_id` unless default account configured | none | Lists configured Worker tail consumers for a script. |
 | `patch_worker_settings` | `script_name`, `settings_patch`; `account_id` unless default account configured | `expect_binding`, `dry_run` | Patches Worker settings, reads back, and can verify a named binding/value. If Cloudflare reports that a Pages-generated Worker has no versions/versioned settings, the MCP returns `workers.pages_generated_worker_settings_immutable` and points the operator to update Pages project settings followed by a fresh `pages_deploy_directory` deployment. |
 | `bindings_discover` | `account_id` unless default account configured | `include_workers`, `include_pages`, `name_contains` | Discovers Workers, Pages projects, and binding/resource references for wiring audits. |
-| `workers_observability_query_events` | `account_id` unless default account configured | `script_name`, `datasets`, `filters`, `limit`, `timeframe`, `lookback_minutes`, `query_id`, `dry`, `view`, `needle` | Queries Workers Observability events using Cloudflare's documented `queryId`, `timeframe`, `dry`, top-level `limit`, and `parameters` body shape. `script_name` is optional and becomes a `$workers.scriptName` filter when provided; `datasets` defaults to `["workers"]`, `dry` defaults to `true`, and `view` defaults to `events`. |
+| `workers_observability_query_events` | `account_id` unless default account configured | `script_name`, `datasets`, `filters`, `limit`, `timeframe`, `lookback_minutes`, `query_id`, `dry`, `view`, `needle` | Queries Workers Observability events using Cloudflare's documented `queryId`, `timeframe`, `dry`, top-level `limit` and `view`, plus `parameters`. `script_name` is optional and becomes a `$workers.scriptName` filter when provided; `filters` are JSON filter objects (leaf comparisons or nested logical groups), never stringified JSON; `datasets` defaults to `["workers"]`, `dry` defaults to `true`, and `view` defaults to `events`. |
 | `workers_observability_list_keys` | `account_id` unless default account configured | `script_name`, `datasets`, `filters`, `limit`, `timeframe`, `lookback_minutes`, `needle`, `keyNeedle` | Lists Workers Observability telemetry keys with Cloudflare's documented top-level `from`/`to` time bounds rather than a nested `timeframe` object. `script_name` and `filters` are additive filters; `datasets` defaults to `["workers"]`. |
 | `workers_observability_list_values` | `key`; `account_id` unless default account configured | `script_name`, `datasets`, `filters`, `limit`, `type`, `timeframe`, `lookback_minutes`, `needle` | Lists values for a telemetry key using `datasets`, `key`, `type`, and nested `timeframe`. `type` defaults to `string`, `datasets` defaults to `["workers"]`, and `script_name` is an optional additive filter. |
 | `queues_list` | `account_id` unless default account configured | none | Lists Cloudflare Queues. |
@@ -318,6 +352,220 @@ over-cap, and stream failure therefore keep body completeness false and expose
 no declared or partial body size/digest. A complete body that is empty,
 rejected, invalid UTF-8, or malformed remains distinct from an incomplete body
 and retains complete-body digest/size evidence.
+
+## Staged D1 catalog evidence contract
+
+The crate contains a side-effect-free, non-routed catalog evidence boundary for
+future guarded D1 write composition. Projection version 5 derives one immutable,
+target-bound structured fact set from `sqlite_schema` and the
+`pragma_foreign_key_list()` table-valued function rather than accepting caller
+SQL or a generic provider envelope. Its internal provider-custody adapter
+normalizes two physical observations into that exact versioned projection
+payload and binds each one to the same canonical target and rederived plan using
+four distinct dispatch/read identities preallocated before either request. The
+pure verifier cannot authenticate physical dispatch or response EOF by itself
+and accepts frames constructed only from this retained adapter custody.
+
+Each provider read is exactly one POST through the existing no-redirect
+Cloudflare client. The adapter binds the canonical account/database target,
+fixed query and its digest, plan digest, and exact row/byte caps to the request
+and response. It reads the raw provider body to EOF under the 4 MiB cap before
+the same duplicate-key-rejecting, 32-container JSON decoder used by high-custody
+migration reads. In accordance with Cloudflare's [D1 Query API response
+contract](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/query/),
+it requires explicitly present, typed, empty top-level `errors` and `messages`
+arrays and one successful result set shaped as `{meta, results, success}`. The
+closed ResponseInfo decoder accepts the official `code`, `message`, optional
+`documentation_url`, and optional `source.pointer` shape, but any non-empty
+array fails terminally without copying provider text into custody errors or
+receipts. It rejects duplicate keys, unknown envelope or ResponseInfo fields,
+excessive nesting, missing or malformed envelope arrays, network ambiguity,
+partial or oversized bodies, non-2xx status, malformed types, response-binding
+drift, identity reuse, and the 1,001-row sentinel without a second attempt or
+retry.
+
+Each observation must prove a complete body under the exact 4 MiB byte cap, a
+literal `results_truncated=false` under the exact 1,001-row provider cap, and
+typed successful primary read-only metadata (`changed_db=false`, `changes=0`,
+and `rows_written=0`). The 1,001st row is a completeness sentinel, not catalog
+content. Projection rows are a closed typed union of relation, trigger-owner,
+schema-auxiliary, schema-blocker, foreign-key, and foreign-key-blocker facts.
+The query enumerates every physical `sqlite_schema` row before classification.
+It retains the SQLite storage class and uppercase hexadecimal bytes of schema
+type, name, and owner fields, plus the SQL storage class. A non-TEXT or otherwise
+malformed field therefore becomes an explicit blocker row instead of being
+normalized by a cast or omitted by a type predicate. Only unique printable-ASCII
+TEXT table names with structurally valid catalog fields are eligible inputs to
+`pragma_foreign_key_list()`; blocker names never reach that function.
+
+Foreign-key rows retain native typed id and sequence plus the storage class and
+exact bytes of referenced table, `from`, `to`, update action, delete action, and
+match mode. `to=NULL` and `to=''` remain distinct. Composite rows require one
+parent/action/match identity, unique contiguous sequences beginning at zero,
+and exact from/to evidence at every sequence. This matches the semantic field
+set used by migration reconciliation without coupling the two implementations.
+Relation rows retain SQL bytes only for structurally valid tables and permit
+only bounded ASCII token classification. The fixed query records typed bits for
+case-insensitive `VIRTUAL` and `REPLACE` occurrences within 64 KiB; the verifier
+independently re-derives both bits from the retained bytes. A virtual hit is an
+exact `table_virtual_semantics_unproven` blocker because SQLite reports virtual
+and shadow relations as schema tables while the module may write its shadow
+tables. A REPLACE hit is an exact `table_replace_semantics_unproven` blocker
+because a table or constraint-level conflict policy can make a plain INSERT or
+UPDATE delete an incumbent and run ON DELETE effects. Token scans may
+conservatively match identifiers or comments, but never reopen ambiguous
+semantics. An oversized source blocks before token classification. View SQL and
+trigger bodies are never projected or interpreted. Missing owners or parents,
+malformed storage classes, ambiguous schema identities, unavailable or
+oversized table token sources, and unproven REPLACE/virtual/view/trigger write
+semantics remain exact conservative blockers.
+
+Rows are keyed by physical schema rowid and fact order and must be strictly
+ordered exactly as the fixed query specifies. The 1,001-row sentinel applies to
+the complete union, so a late blocker cannot be silently dropped within the
+accepted bound. The two payloads must deserialize to equal typed row vectors.
+The snapshot digest covers canonical JSON reserialization of that typed vector;
+equality of the original provider JSON bytes is neither required nor claimed.
+
+The adapter receipt contains only target/plan/query digests, the SHA-256 and
+size of each body completed at EOF, and aggregate counts and caps; raw request
+or response content and private dispatch/read identities are omitted. The
+adapter does not retain raw provider bodies. Its completed-body digest permits
+comparison only when separately authorized bytes are available; it cannot by
+itself reauthenticate provider origin or prove EOF independently of the trusted
+HTTP adapter lifecycle that issued the receipt. The owned result exposes two
+borrowed frames for the pure verifier only after both complete primary read-only
+reads pass custody checks. The verifier receipt contains only
+target/plan/query/snapshot and observation-pair digests, counts, caps, and body
+sizes. The verifier additionally returns an internal opaque product containing
+the accepted typed rows; its aggregate-safe receipt counts physical schema rows,
+each fact/blocker family, and all conservative blockers without exposing names
+or SQL. Neither receipt nor product parses CREATE TABLE text, view SQL, or
+trigger bodies; traverses a graph; authorizes DDL, DML, foreign-key effects,
+implicit writes, provider admission, custody outside these exact reads, or any
+mutation. No public MCP tool currently exposes this staged contract.
+
+The next internal staged boundary consumes only that opaque version-5 product
+and derives a conservative reserved-relation write graph. Its configured root
+set is non-empty, ASCII-case closed, duplicate-free, limited to 64 identities,
+and must name relations present in the verified snapshot. Relations whose
+canonical identity begins with `sqlite_` or `_cf_` are automatic roots and may
+not be reintroduced as configured aliases. Index facts remain validated,
+counted non-addressable schema auxiliaries; they are not writable graph nodes.
+
+Each table or view has INSERT, UPDATE, and DELETE nodes. Foreign-key CASCADE
+adds the corresponding parent-update to child-update or parent-delete to
+child-delete edge; SET NULL and SET DEFAULT add child-update edges; RESTRICT
+and NO ACTION add no write edge. Composite rows form one edge group only after
+the catalog verifier has proven contiguous sequence/cardinality and stable
+parent/action/match facts. Table SQL is not parsed. A bounded 64-KiB,
+ASCII-case-insensitive byte scan classifies any `AUTOINCREMENT` occurrence
+conservatively; a match adds only table-insert to `sqlite_sequence`-update and
+requires that exact physical table fact. This may over-classify quoted or
+commented occurrences, but cannot turn ambiguous text into permission.
+Any bounded table-source `REPLACE` hit blocks the complete graph before an
+INSERT or UPDATE decision can become `Allow`; unavailable or oversized sources
+remain blockers. This is conservative token evidence, not CREATE TABLE parsing.
+
+The module also owns a closed internal statement-shape expansion contract for
+future composition, but performs no composition or admission itself. Primitive
+INSERT, UPDATE, and DELETE each require their corresponding graph decision.
+REPLACE and INSERT OR REPLACE require DELETE then INSERT; UPSERT DO UPDATE
+requires INSERT then UPDATE; UPDATE OR REPLACE requires UPDATE then DELETE.
+Every effective primitive must independently be `Allow`; an unsupported
+compound form denies instead of defaulting to one primitive.
+
+View writes always deny because view definitions are unavailable. Every write
+to, or foreign-key traversal reaching, a trigger-owned relation denies because
+trigger bodies and events are unavailable. Reserved reachability has higher
+deny precedence than those uncertainty classifications. A schema blocker,
+foreign-key blocker, unresolved parent, unavailable table token source,
+unknown fact family, malformed consumer text, missing auxiliary/trigger owner,
+or unsupported action denies the complete graph derivation. Traversal uses a
+visited set and exact limits of 1,000 relations, 3,000 operation nodes, and
+4,096 edges.
+
+The opaque graph product contains internal per-relation decisions. Its
+serializable receipt binds the catalog target/snapshot, closed-root digest,
+graph and decision digests, and aggregate counts only; it contains no relation,
+column, SQL, account, or database identity. This boundary still performs no
+caller-DML composition, provider request, public routing, admission, custody,
+mutation, deployment, or authorization. A later separately reviewed composer
+must bind an exact DML target and operation to this product before provider
+dispatch.
+
+The following internal pure composition stage accepts only the verified
+canonical target, the exact version-2 DML plan and its canonical digest, the
+opaque version-5 catalog product, and the opaque version-3 graph product. The
+classified relation must already be one exact lowercase bounded ASCII SQLite
+identity, and the classified operation form must agree with the plan's closed
+statement kind. The composer rebinds the target across all three products,
+checks the catalog/graph aggregate relationship, expands the operation form by
+the graph module's closed contract, and requires an explicit `Allow` decision
+for every effective primitive in its defined order. Missing, denied,
+duplicated, reordered, unsupported, malformed, version-drifted, or
+contradictory evidence fails closed.
+
+Only the aggregate-safe composition receipt is serializable. It binds the
+exact plan, target, catalog receipt/snapshot, graph receipt/graph/decision,
+classified relation, classified form, ordered primitive set, and selected
+decision evidence by SHA-256 plus primitive/allow counts. It contains no SQL,
+parameters, relation, account, or database identity. The opaque product retains
+the exact classified plan and relation for a later consumer. This stage does
+not parse SQL or create classifier authority: its relation and compound form
+must come from the separately reviewed exact classifier. It exposes no public
+tool, provider call, D1 execution, mutation admission, custody, deployment, or
+configuration effect, and the receipt alone never authorizes dispatch.
+
+The next internal recoverable-attempt boundary consumes only the verified
+canonical target and opaque exact-plan composition product. Before any later
+provider adapter exists, the caller preallocates pairwise-distinct opaque
+operation, execution-attempt, and provider-request identities under the closed
+16-to-128-byte ASCII grammar. Custody hashes those identities immediately and
+binds them to the exact target, execute-plan digest, composition digest, and
+complete composition-receipt digest. Raw identities, SQL, parameters, relation,
+account, and database values never enter the serializable receipt or errors.
+
+The pure version-1 state artifact is exact canonical JSON with one trailing
+newline under a 16-KiB cap. It is a private compare-and-exchange input for a
+later separately reviewed durable boundary, not provider or execution
+authority. Restore
+rejects absence where a state is required, oversized bytes, malformed JSON,
+duplicate or unknown fields, missing fields, noncanonical encoding, unsupported
+versions, malformed digests, phase/evidence contradictions, and any target,
+plan, composition, or identity drift. There is no permissive predecessor
+fallback. Exact pre-dispatch replay returns the same canonical state.
+
+`prepared -> dispatch_reserved` returns only a non-authorizing atomic-CAS
+proposal. Its receipt sets `dispatch_atomic_compare_exchange_required=true` and
+binds the exact expected prior-state and successor-state SHA-256 values. Calling
+the pure function twice with the same stale prepared bytes deliberately returns
+the same proposal; neither result proves freshness or authorizes dispatch. The
+later durable adapter must compare the exact current bytes and install the exact
+successor atomically. Only one successful compare-and-exchange may consume the
+reservation and permit one provider call; a stale compare failure must stop
+without provider access. The installed successor records one reservation and
+`do_not_redispatch_same_attempt`. A second reservation request from that
+successor is quarantined as `reconciliation_required`. Transport uncertainty
+and missing, incomplete, malformed, or contradictory responses enter the same
+no-redispatch state. Conflicting replay or incumbent evidence denies rather than
+replacing custody.
+
+Provider terminal and independent readback inputs are separate typed caller
+assertions and may arrive in either order. Their hashes are checked only for
+canonical SHA-256 syntax and exact replay binding; this stage does not
+authenticate an artifact, provider origin, completed response, readback query,
+or the supplied classifications. A later adapter must derive both assertions
+from its authenticated provider and readback lifecycles. Within this pure
+combination classifier, successful changed/unchanged plus expected-state
+observation proposes terminal `applied`, while terminal rejection plus
+absent-state readback proposes terminal `not_applied`; crossed pairs remain
+`reconciliation_required`. These proposed terminal classifications are not
+provider or persistence authority. The aggregate receipt exposes only phase,
+transition, retry decision, booleans, counts, classifications, caps, and exact
+digests. This stage owns no filesystem persistence, public tool route, provider
+or D1 request, artifact authentication, readback query, automatic retry,
+admission, deployment, or configuration.
 
 ## Structured payload details for complex tools
 

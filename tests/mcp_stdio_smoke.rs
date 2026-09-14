@@ -90,8 +90,68 @@ fn fixture_material(label: &str) -> String {
 fn manifest_target_path(lease_root: &Path) -> PathBuf {
     lease_root.join(format!(
         "d1-migration-target-{}",
-        sha256_hex("acct-1\0db-1")
+        sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000")
     ))
+}
+
+#[cfg(unix)]
+fn install_activated_manifest_root(lease_root: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::create_dir_all(lease_root).expect("create private target guard root");
+    fs::set_permissions(lease_root, fs::Permissions::from_mode(0o700))
+        .expect("make target guard root private");
+    let activation_guard = lease_root.join("target-identity-v2.guard.lock");
+    fs::write(&activation_guard, b"").expect("write activated-root guard fixture");
+    fs::set_permissions(&activation_guard, fs::Permissions::from_mode(0o600))
+        .expect("make activated-root guard fixture private");
+    let activation_marker = lease_root.join("target-identity-v2.activation.json");
+    fs::write(
+        &activation_marker,
+        br#"{"root_audit":"registered_namespaces_v2","target_identity_contract":"lowercase_hyphenated_uuid_v1","version":2}"#,
+    )
+    .expect("write activated-root fixture marker");
+    fs::set_permissions(&activation_marker, fs::Permissions::from_mode(0o600))
+        .expect("make activated-root fixture marker private");
+    let target_key_sha256 = sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000");
+    let registration = lease_root.join(format!(
+        "target-identity-v2.{target_key_sha256}.receipt.json"
+    ));
+    fs::write(
+        &registration,
+        format!(
+            "{{\"version\":1,\"target_identity_contract\":\"lowercase_hyphenated_uuid_v1\",\"target_key_sha256\":\"{target_key_sha256}\"}}"
+        ),
+    )
+    .expect("write activated-root target registration");
+    fs::set_permissions(&registration, fs::Permissions::from_mode(0o600))
+        .expect("make activated-root target registration private");
+}
+
+#[cfg(unix)]
+fn lock_manifest_target_guard(lease_root: &Path) -> fs::File {
+    use std::os::unix::fs::PermissionsExt;
+
+    install_activated_manifest_root(lease_root);
+    let target = manifest_target_path(lease_root);
+    fs::create_dir(&target).expect("create permanent target directory");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o700))
+        .expect("make permanent target directory private");
+    let guard_path = target.join("guard.lock");
+    let guard = fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(guard_path)
+        .expect("open permanent target guard");
+    fs::set_permissions(
+        &target.join("guard.lock"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("make permanent target guard private");
+    guard.lock().expect("hold permanent target guard");
+    guard
 }
 
 fn assert_private_regular_active_lease(lease_root: &Path) -> PathBuf {
@@ -203,6 +263,8 @@ fn create_retained_reconciliation_fixture(
         ledger: Vec<Value>,
     }
 
+    #[cfg(unix)]
+    install_activated_manifest_root(lease_root);
     let target = manifest_target_path(lease_root);
     fs::create_dir(&target).expect("create retained target");
     #[cfg(unix)]
@@ -271,7 +333,7 @@ fn create_retained_reconciliation_fixture(
                 version: 2,
                 operation: "d1_apply_migration_manifest",
                 account_id: "acct-1",
-                database_id: "db-1",
+                database_id: "123e4567-e89b-42d3-a456-426614174000",
                 migration_family: "newsletter-core",
                 migrations_table: "d1_migrations",
                 manifest: &manifest_summary,
@@ -284,7 +346,7 @@ fn create_retained_reconciliation_fixture(
                 version: 1,
                 operation: "d1_apply_migration_manifest",
                 account_id: "acct-1",
-                database_id: "db-1",
+                database_id: "123e4567-e89b-42d3-a456-426614174000",
                 migration_family: "newsletter-core",
                 migrations_table: "d1_migrations",
                 manifest: &manifest_summary,
@@ -298,7 +360,7 @@ fn create_retained_reconciliation_fixture(
     };
     let payload = json!({
         "version": 2,
-        "target_key_sha256": sha256_hex("acct-1\0db-1"),
+        "target_key_sha256": sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000"),
         "nonce": nonce,
         "approved_plan_sha256": approved_plan_sha256,
         "migration_family": "newsletter-core",
@@ -335,7 +397,7 @@ fn assert_fresh_process_blocked_without_provider_request(
         900,
         "d1_apply_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "fresh-caller",
             "manifest": manifest.clone(),
             "approved_plan_sha256": plan,
@@ -697,7 +759,10 @@ fn spawn_fake_d1_migrations_api(
             let path = request_parts.next().unwrap_or_default().to_string();
             let body_json: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
             assert_eq!(method, "POST");
-            assert_eq!(path, "/accounts/acct-1/d1/database/db-1/query");
+            assert_eq!(
+                path,
+                "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+            );
             requests_for_thread
                 .lock()
                 .expect("request log lock")
@@ -920,7 +985,9 @@ fn spawn_fake_bootstrap_api_with_initializer_http_error(
         for stream in listener.incoming().take(expected_requests) {
             let mut stream = stream.expect("bootstrap D1 stream");
             let (headers, body) = read_http_request(&mut stream);
-            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            assert!(headers.starts_with(
+                "POST /accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+            ));
             let body_json: Value = serde_json::from_slice(&body).expect("bootstrap request JSON");
             requests_for_thread
                 .lock()
@@ -1032,7 +1099,9 @@ fn spawn_fake_bootstrap_read_fault_api(
         for (index, stream) in listener.incoming().take(expected_calls).enumerate() {
             let mut stream = stream.expect("bootstrap read-fault stream");
             let (headers, body) = read_http_request(&mut stream);
-            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            assert!(headers.starts_with(
+                "POST /accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+            ));
             let request: Value =
                 serde_json::from_slice(&body).expect("bootstrap read-fault request JSON");
             assert!(is_bootstrap_inventory_sql(
@@ -1136,7 +1205,9 @@ fn spawn_fake_initialized_bootstrap_recovery_api(
         for (index, stream) in listener.incoming().take(expected_requests).enumerate() {
             let mut stream = stream.expect("initialized bootstrap recovery stream");
             let (headers, body) = read_http_request(&mut stream);
-            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            assert!(headers.starts_with(
+                "POST /accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+            ));
             let body_json: Value =
                 serde_json::from_slice(&body).expect("bootstrap recovery request JSON");
             requests_for_thread
@@ -1194,7 +1265,9 @@ fn spawn_fake_bootstrap_recovery_http_failure_api() -> (String, Arc<Mutex<Vec<Va
             .accept()
             .expect("bootstrap recovery failure stream");
         let (headers, body) = read_http_request(&mut stream);
-        assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+        assert!(headers.starts_with(
+            "POST /accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+        ));
         let body_json: Value =
             serde_json::from_slice(&body).expect("bootstrap recovery failure request JSON");
         requests_for_thread
@@ -1234,7 +1307,9 @@ fn spawn_manifest_authority_rejection_api(
         {
             let mut stream = stream.expect("authority rejection request");
             let (headers, body) = read_http_request(&mut stream);
-            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            assert!(headers.starts_with(
+                "POST /accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+            ));
             let body_json: Value = serde_json::from_slice(&body).expect("authority request JSON");
             requests_for_thread
                 .lock()
@@ -1268,7 +1343,9 @@ fn spawn_fake_manifest_apply_api() -> (String, Arc<Mutex<Vec<Value>>>) {
         for stream in listener.incoming().take(12) {
             let mut stream = stream.expect("fake manifest D1 stream");
             let (headers, body) = read_http_request(&mut stream);
-            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            assert!(headers.starts_with(
+                "POST /accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+            ));
             let body_json: Value = serde_json::from_slice(&body).expect("manifest request JSON");
             requests_for_thread
                 .lock()
@@ -1341,7 +1418,9 @@ fn spawn_manifest_authority_schedule_api_for_table(
         for stream in listener.incoming().take(expected_requests) {
             let mut stream = stream.expect("authority schedule request");
             let (headers, body) = read_http_request(&mut stream);
-            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            assert!(headers.starts_with(
+                "POST /accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+            ));
             let body_json: Value = serde_json::from_slice(&body).expect("authority schedule JSON");
             let sql = body_json["sql"].as_str().unwrap_or_default();
             requests_for_thread
@@ -1402,7 +1481,9 @@ fn spawn_blocked_manifest_preflight_api() -> (
                 .expect("accept blocked manifest request")
                 .0;
             let (headers, body) = read_http_request(&mut stream);
-            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            assert!(headers.starts_with(
+                "POST /accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+            ));
             let body_json: Value = serde_json::from_slice(&body).expect("blocked request JSON");
             let sql = body_json["sql"].as_str().unwrap_or_default();
             let is_authority = is_manifest_ledger_authority_sql(sql);
@@ -1443,7 +1524,9 @@ fn spawn_fake_manifest_malformed_ledger_api(result_set: Value) -> (String, Arc<M
         for stream in listener.incoming().take(3) {
             let mut stream = stream.expect("fake malformed ledger D1 stream");
             let (headers, body) = read_http_request(&mut stream);
-            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            assert!(headers.starts_with(
+                "POST /accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+            ));
             let body_json: Value =
                 serde_json::from_slice(&body).expect("malformed ledger request JSON");
             requests_for_thread
@@ -1488,7 +1571,9 @@ fn spawn_fake_manifest_outer_error_api(
         for stream in listener.incoming().take(expected_requests) {
             let mut stream = stream.expect("fake outer-error manifest D1 stream");
             let (headers, body) = read_http_request(&mut stream);
-            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            assert!(headers.starts_with(
+                "POST /accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+            ));
             let body_json: Value =
                 serde_json::from_slice(&body).expect("outer-error manifest request JSON");
             requests_for_thread
@@ -1568,7 +1653,9 @@ fn spawn_fake_manifest_http_error_api(
         for stream in listener.incoming().take(10) {
             let mut stream = stream.expect("fake ambiguous manifest D1 stream");
             let (headers, body) = read_http_request(&mut stream);
-            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            assert!(headers.starts_with(
+                "POST /accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+            ));
             let body_json: Value = serde_json::from_slice(&body).expect("ambiguous request JSON");
             requests_for_thread
                 .lock()
@@ -1638,7 +1725,9 @@ fn spawn_fake_manifest_oversized_write_api() -> (String, Arc<Mutex<Vec<Value>>>)
         for stream in listener.incoming().take(10) {
             let mut stream = stream.expect("oversized manifest D1 stream");
             let (headers, body) = read_http_request(&mut stream);
-            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            assert!(headers.starts_with(
+                "POST /accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+            ));
             let body_json: Value =
                 serde_json::from_slice(&body).expect("oversized manifest request JSON");
             requests_for_thread
@@ -1686,7 +1775,9 @@ fn spawn_fake_manifest_deep_write_api(private_message: &str) -> (String, Arc<Mut
         for stream in listener.incoming().take(10) {
             let mut stream = stream.expect("deep manifest D1 stream");
             let (headers, body) = read_http_request(&mut stream);
-            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            assert!(headers.starts_with(
+                "POST /accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+            ));
             let body_json: Value =
                 serde_json::from_slice(&body).expect("deep manifest request JSON");
             requests_for_thread
@@ -1745,7 +1836,9 @@ fn spawn_blocked_ambiguous_manifest_api() -> (
                 .expect("accept blocked ambiguous request")
                 .0;
             let (headers, body) = read_http_request(&mut stream);
-            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            assert!(headers.starts_with(
+                "POST /accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+            ));
             let body_json: Value = serde_json::from_slice(&body).expect("blocked ambiguous JSON");
             requests_for_thread
                 .lock()
@@ -2636,7 +2729,7 @@ fn terminal_request_args(
     lease_payload_sha256: &str,
 ) -> Value {
     json!({
-        "database_id": "db-1",
+        "database_id": "123e4567-e89b-42d3-a456-426614174000",
         "migration_family": "newsletter-core",
         "manifest": manifest,
         "approved_plan_sha256": approved_plan_sha256,
@@ -2740,8 +2833,8 @@ fn historical_v2_two_table_reconciliation_plan_sha256(
     let plan = json!({
         "version": 1,
         "operation": "d1_reconcile_migration_manifest",
-        "target_key_sha256": sha256_hex("acct-1\0db-1"),
-        "database_id": "db-1",
+        "target_key_sha256": sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000"),
+        "database_id": "123e4567-e89b-42d3-a456-426614174000",
         "migration_family": "newsletter-core",
         "migrations_table": "d1_migrations",
         "manifest": manifest_summary,
@@ -2806,7 +2899,9 @@ fn spawn_fake_reconciliation_api_with_fault_and_calls(
         for (request_index, stream) in listener.incoming().take(call_count).enumerate() {
             let mut stream = stream.expect("fake reconciliation stream");
             let (headers, body) = read_http_request(&mut stream);
-            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            assert!(headers.starts_with(
+                "POST /accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+            ));
             let body_json: Value =
                 serde_json::from_slice(&body).expect("reconciliation request JSON");
             let markers = reconciliation_statement_markers(
@@ -3117,7 +3212,9 @@ fn spawn_fake_predecessor_query_compatibility_api(
         for (request_index, stream) in listener.incoming().take(call_count).enumerate() {
             let mut stream = stream.expect("predecessor-query compatibility stream");
             let (headers, body) = read_http_request(&mut stream);
-            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            assert!(headers.starts_with(
+                "POST /accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+            ));
             let body_json: Value =
                 serde_json::from_slice(&body).expect("predecessor-query request JSON");
             let sql = body_json["sql"].as_str().expect("predecessor-query SQL");
@@ -3272,7 +3369,9 @@ fn spawn_fake_canonical_seed_reconciliation_api(
         for stream in listener.incoming().take(call_count) {
             let mut stream = stream.expect("canonical seed reconciliation stream");
             let (headers, body) = read_http_request(&mut stream);
-            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            assert!(headers.starts_with(
+                "POST /accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+            ));
             let body_json: Value =
                 serde_json::from_slice(&body).expect("canonical seed request JSON");
             let sql = body_json["sql"]
@@ -3439,7 +3538,9 @@ fn spawn_fake_null_seed_reconciliation_api(
         for stream in listener.incoming().take(call_count) {
             let mut stream = stream.expect("NULL seed reconciliation stream");
             let (headers, body) = read_http_request(&mut stream);
-            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            assert!(headers.starts_with(
+                "POST /accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+            ));
             let body_json: Value = serde_json::from_slice(&body).expect("NULL seed request JSON");
             let sql = body_json["sql"]
                 .as_str()
@@ -3576,7 +3677,9 @@ fn spawn_fake_case_variant_seed_reconciliation_api(
         for stream in listener.incoming().take(3) {
             let mut stream = stream.expect("case-variant seed stream");
             let (headers, body) = read_http_request(&mut stream);
-            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            assert!(headers.starts_with(
+                "POST /accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+            ));
             let body_json: Value =
                 serde_json::from_slice(&body).expect("case-variant seed request JSON");
             let sql = body_json["sql"].as_str().expect("case-variant seed SQL");
@@ -3711,7 +3814,9 @@ fn spawn_fake_seed_prefix_reconciliation_api(
         for (request_index, stream) in listener.incoming().take(6).enumerate() {
             let mut stream = stream.expect("seed-prefix stream");
             let (headers, body) = read_http_request(&mut stream);
-            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            assert!(headers.starts_with(
+                "POST /accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+            ));
             let body_json: Value = serde_json::from_slice(&body).expect("seed-prefix request JSON");
             let sql = body_json["sql"].as_str().expect("seed-prefix SQL");
             let markers = reconciliation_statement_markers(sql);
@@ -3823,7 +3928,9 @@ fn spawn_fake_seed_ledger_sequence_api(
         for (stream, ledger_prefix) in listener.incoming().zip(ledger_prefixes) {
             let mut stream = stream.expect("seed-ledger stream");
             let (headers, body) = read_http_request(&mut stream);
-            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            assert!(headers.starts_with(
+                "POST /accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+            ));
             let body_json: Value = serde_json::from_slice(&body).expect("seed-ledger request JSON");
             let sql = body_json["sql"].as_str().expect("seed-ledger SQL");
             let markers = reconciliation_statement_markers(sql);
@@ -4054,7 +4161,9 @@ fn spawn_fake_premature_manifest_fact_api(
         for (call_index, stream) in listener.incoming().take(call_count).enumerate() {
             let mut stream = stream.expect("premature-manifest-fact stream");
             let (headers, body) = read_http_request(&mut stream);
-            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            assert!(headers.starts_with(
+                "POST /accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+            ));
             let body_json: Value =
                 serde_json::from_slice(&body).expect("premature-manifest-fact request JSON");
             let sql = body_json["sql"]
@@ -4265,7 +4374,9 @@ fn spawn_fake_custom_schema_reconciliation_api(
         for stream in listener.incoming().take(call_count) {
             let mut stream = stream.expect("schema-object reconciliation stream");
             let (headers, body) = read_http_request(&mut stream);
-            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            assert!(headers.starts_with(
+                "POST /accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+            ));
             let body_json: Value =
                 serde_json::from_slice(&body).expect("schema-object reconciliation request JSON");
             let markers = reconciliation_statement_markers(
@@ -4396,7 +4507,9 @@ fn spawn_fake_manifest_ambiguous_result_api(
         for stream in listener.incoming().take(expected_requests) {
             let mut stream = stream.expect("fake ambiguous result manifest D1 stream");
             let (headers, body) = read_http_request(&mut stream);
-            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            assert!(headers.starts_with(
+                "POST /accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+            ));
             let body_json: Value =
                 serde_json::from_slice(&body).expect("ambiguous result request JSON");
             requests_for_thread
@@ -4450,7 +4563,9 @@ fn spawn_fake_partial_manifest_ambiguous_api() -> (String, Arc<Mutex<Vec<Value>>
         for stream in listener.incoming().take(13) {
             let mut stream = stream.expect("fake partial ambiguous manifest D1 stream");
             let (headers, body) = read_http_request(&mut stream);
-            assert!(headers.starts_with("POST /accounts/acct-1/d1/database/db-1/query"));
+            assert!(headers.starts_with(
+                "POST /accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query"
+            ));
             let body_json: Value =
                 serde_json::from_slice(&body).expect("partial ambiguous request JSON");
             requests_for_thread
@@ -4626,7 +4741,7 @@ fn spawn_fake_cloudflare_api() -> String {
                                 "accounts": [{
                                     "d1AnalyticsAdaptiveGroups": [{
                                         "sum": {"rowsRead": 10, "rowsWritten": 4},
-                                        "dimensions": {"date": "2026-06-02", "databaseId": "db-1"}
+                                        "dimensions": {"date": "2026-06-02", "databaseId": "123e4567-e89b-42d3-a456-426614174000"}
                                     }]
                                 }]
                             }
@@ -4777,6 +4892,8 @@ fn spawn_fake_cloudflare_api() -> String {
                     && body_json.get("queryId").is_some()
                     && body_json.get("limit").is_some()
                     && body_json.get("parameters").is_some()
+                    && body_json.get("view") == Some(&json!("events"))
+                    && body_json["parameters"].get("view").is_none()
                 {
                     json!({
                         "success": true,
@@ -4992,24 +5109,39 @@ fn spawn_fake_d1_database_mutation_api(
                 }));
 
             let response = match (method.as_str(), path.as_str()) {
-                ("PATCH", "/accounts/acct-1/d1/database/db-1") => {
+                ("PATCH", "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000") => {
                     assert_eq!(body_json["name"], json!("renamed-db"));
                     json!({
                         "success": true,
                         "errors": [],
                         "messages": [],
                         "result": {
-                            "uuid": "db-1",
+                            "uuid": "123e4567-e89b-42d3-a456-426614174000",
                             "name": "renamed-db",
                             "created_at": "2026-05-22T00:00:00Z"
                         },
                     })
                 }
-                ("DELETE", "/accounts/acct-1/d1/database/db-1") => json!({
+                ("DELETE", "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000") => {
+                    json!({
+                        "success": true,
+                        "errors": [],
+                        "messages": [],
+                        "result": {"id": "123e4567-e89b-42d3-a456-426614174000", "deleted": true},
+                    })
+                }
+                (
+                    "POST",
+                    "/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000/query",
+                ) => json!({
                     "success": true,
                     "errors": [],
                     "messages": [],
-                    "result": {"id": "db-1", "deleted": true},
+                    "result": [{
+                        "success": true,
+                        "results": [],
+                        "meta": {"changed_db": true, "changes": 1}
+                    }],
                 }),
                 _ => json!({
                     "success": false,
@@ -5941,6 +6073,77 @@ fn spawn_fake_pages_direct_upload_project_api() -> (String, Arc<Mutex<Vec<String
     (format!("http://{addr}"), requests)
 }
 
+fn spawn_fake_pages_project_update_api(
+    expected_requests: usize,
+    provider_secret: &str,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake Pages update API");
+    let addr = listener.local_addr().expect("fake Pages update API addr");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_thread = requests.clone();
+    let provider_secret = provider_secret.to_string();
+    thread::spawn(move || {
+        for stream in listener.incoming().take(expected_requests) {
+            let mut stream = stream.expect("fake Pages update API stream");
+            let (headers, body) = read_http_request(&mut stream);
+            let request_line = headers.lines().next().unwrap_or_default();
+            assert_eq!(
+                request_line,
+                "PATCH /accounts/acct-1/pages/projects/site HTTP/1.1"
+            );
+            let body: Value = serde_json::from_slice(&body).expect("Pages update JSON body");
+            requests_for_thread
+                .lock()
+                .expect("Pages update request log lock")
+                .push(body);
+            let response = serde_json::to_vec(&json!({
+                "success": true,
+                "errors": [],
+                "messages": [],
+                "result": {
+                    "id": "project-1",
+                    "name": "site",
+                    "production_branch": "main",
+                    "deployment_configs": {
+                        "production": {
+                            "env_vars": {
+                                "RESPONSE_SECRET": {"type": "secret_text", "value": provider_secret.as_str()}
+                            }
+                        }
+                    },
+                    "latest_deployment": {
+                        "id": "latest-1",
+                        "deployment_trigger": {
+                            "env_vars": {
+                                "LATEST_SECRET": {"type": "secret_text", "value": provider_secret.as_str()}
+                            }
+                        }
+                    },
+                    "canonical_deployment": {
+                        "id": "canonical-1",
+                        "deployment_trigger": {
+                            "env_vars": {
+                                "CANONICAL_SECRET": {"type": "secret_text", "value": provider_secret.as_str()}
+                            }
+                        }
+                    }
+                },
+            }))
+            .expect("serialize Pages update response");
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                response.len()
+            )
+            .expect("write Pages update response headers");
+            stream
+                .write_all(&response)
+                .expect("write Pages update response body");
+        }
+    });
+    (format!("http://{addr}"), requests)
+}
+
 #[test]
 fn stdio_tool_calls_cover_context_and_body_normalization_edges() {
     let mut mcp = McpStdioProcess::start();
@@ -6113,6 +6316,283 @@ fn stdio_tool_calls_cover_context_and_body_normalization_edges() {
             && result_names.contains(&"d1_abort_bootstrap_migration_ledger"),
         "find_tools should expose the bootstrap-specific recovery boundary: {tools_content}"
     );
+}
+
+#[test]
+fn pages_project_updates_normalize_secret_inputs_redact_dry_runs_and_dispatch_exact_payloads_through_stdio()
+ {
+    let secret_value = "known-pages-secret-for-fixture";
+    let provider_secret = "provider-returned-secret-for-fixture";
+    let settings = json!({
+        "deployment_configs": {
+            "production": {
+                "env_vars": {
+                    "ONLY_CHANGED_SECRET": {"type": "secret_text", "value": secret_value},
+                    "EXPLICIT_DELETE": null,
+                }
+            }
+        }
+    });
+    let settings_string =
+        serde_json::to_string(&settings).expect("serialize Pages update settings");
+    let (base_url, requests) = spawn_fake_pages_project_update_api(2, provider_secret);
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+
+    let curated_dry_run = mcp.call_tool(
+        2,
+        "pages_update_project",
+        json!({"project_name": "site", "settings": settings_string, "dry_run": true}),
+    );
+    let curated_content = structured_content(&curated_dry_run);
+    assert_eq!(curated_content["ok"], json!(true));
+    assert_eq!(
+        curated_content["settings_normalized_from_json_string"],
+        json!(true)
+    );
+    assert_eq!(
+        curated_content["settings"]["deployment_configs"]["production"]["env_vars"]["ONLY_CHANGED_SECRET"]
+            ["value"],
+        json!("<redacted-secret>")
+    );
+    assert!(
+        !curated_dry_run.to_string().contains(secret_value),
+        "dry-run response must not echo a Pages secret"
+    );
+    assert!(requests.lock().expect("request log lock").is_empty());
+
+    let curated_redacted_settings = curated_content["settings"].clone();
+    let curated_sentinel_replay = mcp.call_tool(
+        21,
+        "pages_update_project",
+        json!({"project_name": "site", "settings": curated_redacted_settings, "dry_run": false}),
+    );
+    let curated_sentinel_content = structured_content(&curated_sentinel_replay);
+    assert_eq!(
+        curated_sentinel_content["error"]["code"],
+        json!("pages_project_update.masked_secret_value")
+    );
+    assert_eq!(curated_sentinel_content["provider_calls"], json!(0));
+    assert!(requests.lock().expect("request log lock").is_empty());
+
+    let curated_apply = mcp.call_tool(
+        3,
+        "pages_update_project",
+        json!({"project_name": "site", "settings": settings_string, "dry_run": false}),
+    );
+    assert_eq!(structured_content(&curated_apply)["ok"], json!(true));
+    assert!(
+        !curated_apply.to_string().contains(provider_secret),
+        "curated apply response must not echo a Pages provider secret"
+    );
+    assert_eq!(
+        structured_content(&curated_apply)["project"]["deployment_configs"]["production"]["env_vars"]
+            ["RESPONSE_SECRET"]["value"],
+        json!("<redacted-secret>")
+    );
+
+    let generic_dry_run = mcp.call_tool(
+        4,
+        "api_mutate",
+        json!({
+            "operation_id": "pages-project-update-project",
+            "path_params": {"account_id": "acct-1", "project_name": "site"},
+            "body": settings_string,
+            "dry_run": true,
+            "reason": "fixture Pages secret replacement",
+        }),
+    );
+    let generic_content = structured_content(&generic_dry_run);
+    assert_eq!(generic_content["ok"], json!(true));
+    assert_eq!(
+        generic_content["request_plan"]["body_normalized_from_json_string"],
+        json!(true)
+    );
+    assert_eq!(
+        generic_content["request_plan"]["body"]["deployment_configs"]["production"]["env_vars"]["ONLY_CHANGED_SECRET"]
+            ["value"],
+        json!("<redacted-secret>")
+    );
+    assert!(
+        !generic_dry_run.to_string().contains(secret_value),
+        "generic dry-run response must not echo a Pages secret"
+    );
+    let confirmation_token = generic_content["request_plan"]["required_confirmation_token"]
+        .as_str()
+        .expect("generic Pages confirmation token")
+        .to_string();
+    assert_eq!(requests.lock().expect("request log lock").len(), 1);
+
+    let generic_sentinel_replay = mcp.call_tool(
+        22,
+        "api_mutate",
+        json!({
+            "operation_id": "pages-project-update-project",
+            "path_params": {"account_id": "acct-1", "project_name": "site"},
+            "body": generic_content["request_plan"]["body"],
+            "dry_run": false,
+            "confirmation_token": confirmation_token.clone(),
+        }),
+    );
+    let generic_sentinel_content = structured_content(&generic_sentinel_replay);
+    assert_eq!(
+        generic_sentinel_content["error"]["code"],
+        json!("pages_project_update.masked_secret_value")
+    );
+    assert_eq!(generic_sentinel_content["provider_calls"], json!(0));
+    assert_eq!(requests.lock().expect("request log lock").len(), 1);
+
+    let generic_apply = mcp.call_tool(
+        5,
+        "api_mutate",
+        json!({
+            "operation_id": "pages-project-update-project",
+            "path_params": {"account_id": "acct-1", "project_name": "site"},
+            "body": settings_string,
+            "dry_run": false,
+            "confirmation_token": confirmation_token,
+            "reason": "fixture Pages secret replacement",
+        }),
+    );
+    assert_eq!(structured_content(&generic_apply)["ok"], json!(true));
+    assert!(
+        !generic_apply.to_string().contains(provider_secret),
+        "generic apply response must not echo a Pages provider secret"
+    );
+    assert_eq!(
+        structured_content(&generic_apply)["result"]["latest_deployment"]["deployment_trigger"]["env_vars"]
+            ["LATEST_SECRET"]["value"],
+        json!("<redacted-secret>")
+    );
+    assert_eq!(
+        structured_content(&generic_apply)["result"]["canonical_deployment"]["deployment_trigger"]
+            ["env_vars"]["CANONICAL_SECRET"]["value"],
+        json!("<redacted-secret>")
+    );
+
+    let requests = requests.lock().expect("request log lock");
+    assert_eq!(requests.len(), 2);
+    for payload in requests.iter() {
+        assert_eq!(
+            payload, &settings,
+            "apply must dispatch the exact change only"
+        );
+        assert!(
+            payload["deployment_configs"]["preview"].is_null(),
+            "untouched environment settings must never be round-tripped"
+        );
+    }
+}
+
+#[test]
+fn pages_project_update_rejects_unsafe_or_malformed_inputs_before_any_provider_call_through_stdio()
+{
+    let provider = TcpListener::bind("127.0.0.1:0").expect("bind no-call Pages provider witness");
+    provider
+        .set_nonblocking(true)
+        .expect("make no-call Pages provider witness nonblocking");
+    let base_url = format!(
+        "http://{}",
+        provider
+            .local_addr()
+            .expect("no-call Pages provider address")
+    );
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let replayed_redacted_settings = json!({
+        "deployment_configs": {
+            "production": {
+                "env_vars": {
+                    "REPLAYED_SECRET": {"type": "secret_text", "value": "<redacted-secret>"}
+                }
+            }
+        }
+    });
+
+    for (id, dry_run) in [(2, true), (3, false)] {
+        let response = mcp.call_tool(
+            id,
+            "pages_update_project",
+            json!({"project_name": "site", "settings": replayed_redacted_settings, "dry_run": dry_run}),
+        );
+        let content = structured_content(&response);
+        assert_eq!(
+            content["error"]["code"],
+            json!("pages_project_update.masked_secret_value")
+        );
+        assert_eq!(content["provider_calls"], json!(0));
+        assert_eq!(content["provider_mutations"], json!(0));
+    }
+
+    let invalid_bodies = [
+        (json!(null), "pages_project_update.missing_settings"),
+        (
+            json!(["not", "an", "object"]),
+            "pages_project_update.invalid_settings_shape",
+        ),
+        (json!(7), "pages_project_update.invalid_settings_shape"),
+        (
+            json!("{bad json"),
+            "pages_project_update.invalid_settings_json",
+        ),
+    ];
+    for (offset, (body, code)) in invalid_bodies.into_iter().enumerate() {
+        let response = mcp.call_tool(
+            10 + offset as u64,
+            "api_mutate",
+            json!({
+                "operation_id": "pages-project-update-project",
+                "path_params": {"account_id": "acct-1", "project_name": "site"},
+                "body": body,
+                "dry_run": offset % 2 == 0,
+            }),
+        );
+        let content = structured_content(&response);
+        assert_eq!(content["error"]["code"], json!(code));
+        assert_eq!(content["provider_calls"], json!(0));
+        assert_eq!(content["provider_mutations"], json!(0));
+    }
+
+    let missing_body = mcp.call_tool(
+        19,
+        "api_mutate",
+        json!({
+            "operation_id": "pages-project-update-project",
+            "path_params": {"account_id": "acct-1", "project_name": "site"},
+            "dry_run": false,
+        }),
+    );
+    let missing_content = structured_content(&missing_body);
+    assert_eq!(
+        missing_content["error"]["code"],
+        json!("pages_project_update.missing_settings")
+    );
+    assert_eq!(missing_content["provider_calls"], json!(0));
+    assert_eq!(missing_content["provider_mutations"], json!(0));
+
+    for (id, dry_run) in [(20, true), (21, false)] {
+        let response = mcp.call_tool(
+            id,
+            "api_mutate",
+            json!({
+                "operation_id": "pages-project-update-project",
+                "path_params": {"account_id": "acct-1", "project_name": "site"},
+                "body": replayed_redacted_settings,
+                "dry_run": dry_run,
+            }),
+        );
+        let content = structured_content(&response);
+        assert_eq!(
+            content["error"]["code"],
+            json!("pages_project_update.masked_secret_value")
+        );
+        assert_eq!(content["provider_calls"], json!(0));
+        assert_eq!(content["provider_mutations"], json!(0));
+    }
+
+    assert!(
+        matches!(provider.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "invalid Pages inputs must make zero provider connections"
+    );
+    mcp.terminate();
 }
 
 #[test]
@@ -6693,7 +7173,7 @@ fn d1_inspect_schema_works_through_stdio_boundary() {
         2,
         "d1_inspect_schema",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "include_columns": true
         }),
     );
@@ -6718,7 +7198,7 @@ fn d1_inspect_schema_skips_internal_and_filters_through_stdio_boundary() {
         2,
         "d1_inspect_schema",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "include_columns": true,
             "include_tables": ["submissions"]
         }),
@@ -6757,7 +7237,7 @@ fn d1_validate_query_works_through_stdio_boundary_without_executing_user_query()
         2,
         "d1_validate_query",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "sql": "SELECT id FROM submissions",
             "include_query_plan": true
         }),
@@ -6791,7 +7271,7 @@ fn d1_apply_migrations_retires_live_mutation_through_stdio_boundary() {
         2,
         "d1_apply_migrations",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migrations_directory": dir.to_string_lossy(),
             "dry_run": false
         }),
@@ -6830,7 +7310,7 @@ fn d1_apply_migrations_retires_before_any_ledger_or_provider_access() {
         2,
         "d1_apply_migrations",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migrations_directory": dir.to_string_lossy(),
             "dry_run": false
         }),
@@ -6877,7 +7357,7 @@ fn d1_bootstrap_migration_ledger_dry_run_and_live_prove_one_initializer_only() {
         30,
         "d1_bootstrap_migration_ledger",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migrations_table": " d1_migrations",
             "dry_run": true,
         }),
@@ -6893,7 +7373,7 @@ fn d1_bootstrap_migration_ledger_dry_run_and_live_prove_one_initializer_only() {
             id,
             "d1_bootstrap_migration_ledger",
             json!({
-                "database_id": "db-1",
+                "database_id": "123e4567-e89b-42d3-a456-426614174000",
                 "migrations_table": migrations_table,
                 "dry_run": true,
             }),
@@ -6912,7 +7392,7 @@ fn d1_bootstrap_migration_ledger_dry_run_and_live_prove_one_initializer_only() {
     let dry = mcp.call_tool(
         33,
         "d1_bootstrap_migration_ledger",
-        json!({"database_id": "db-1", "dry_run": true}),
+        json!({"database_id": "123e4567-e89b-42d3-a456-426614174000", "dry_run": true}),
     );
     let dry = structured_content(&dry);
     assert_eq!(dry["ok"], json!(true), "{dry}");
@@ -6952,7 +7432,7 @@ fn d1_bootstrap_migration_ledger_dry_run_and_live_prove_one_initializer_only() {
         34,
         "d1_bootstrap_migration_ledger",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "approved_plan_sha256": plan,
         }),
     );
@@ -7126,7 +7606,7 @@ fn d1_bootstrap_reads_are_one_attempt_bounded_and_report_exact_lifecycle() {
         let content = structured_content(&mcp.call_tool(
             500 + index as u64,
             "d1_bootstrap_migration_ledger",
-            json!({"database_id": "db-1", "dry_run": true}),
+            json!({"database_id": "123e4567-e89b-42d3-a456-426614174000", "dry_run": true}),
         ))
         .clone();
         assert_eq!(content["ok"], json!(false), "case {index}: {content}");
@@ -7266,7 +7746,7 @@ fn d1_bootstrap_reads_are_one_attempt_bounded_and_report_exact_lifecycle() {
     let content = structured_content(&pre_dispatch.call_tool(
         599,
         "d1_bootstrap_migration_ledger",
-        json!({"database_id": "db-1", "dry_run": true}),
+        json!({"database_id": "123e4567-e89b-42d3-a456-426614174000", "dry_run": true}),
     ))
     .clone();
     assert_eq!(content["ok"], json!(false), "{content}");
@@ -7314,7 +7794,7 @@ fn d1_bootstrap_reads_are_one_attempt_bounded_and_report_exact_lifecycle() {
     let content = structured_content(&builder_failure.call_tool(
         600,
         "d1_bootstrap_migration_ledger",
-        json!({"database_id": "db-1", "dry_run": true}),
+        json!({"database_id": "123e4567-e89b-42d3-a456-426614174000", "dry_run": true}),
     ))
     .clone();
     assert_eq!(content["ok"], json!(false), "{content}");
@@ -7359,7 +7839,7 @@ fn d1_bootstrap_migration_ledger_rejects_application_objects_without_write() {
     let response = mcp.call_tool(
         33,
         "d1_bootstrap_migration_ledger",
-        json!({"database_id": "db-1", "dry_run": true}),
+        json!({"database_id": "123e4567-e89b-42d3-a456-426614174000", "dry_run": true}),
     );
     let content = structured_content(&response);
     assert_eq!(content["ok"], json!(false), "{content}");
@@ -7404,7 +7884,7 @@ fn d1_bootstrap_migration_ledger_rejects_stale_plan_after_fresh_empty_preflight(
         34,
         "d1_bootstrap_migration_ledger",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "approved_plan_sha256": "a".repeat(64),
         }),
     );
@@ -7451,7 +7931,7 @@ fn d1_bootstrap_zero_dispatch_abort_retires_only_exact_marker_aware_custody() {
     let preview = dry.call_tool(
         340,
         "d1_bootstrap_migration_ledger",
-        json!({"database_id": "db-1", "dry_run": true}),
+        json!({"database_id": "123e4567-e89b-42d3-a456-426614174000", "dry_run": true}),
     );
     let plan = structured_content(&preview)["plan_sha256"]
         .as_str()
@@ -7473,7 +7953,7 @@ fn d1_bootstrap_zero_dispatch_abort_retires_only_exact_marker_aware_custody() {
     let blocked = bootstrap.call_tool(
         341,
         "d1_bootstrap_migration_ledger",
-        json!({"database_id": "db-1", "approved_plan_sha256": plan}),
+        json!({"database_id": "123e4567-e89b-42d3-a456-426614174000", "approved_plan_sha256": plan}),
     );
     let blocked = structured_content(&blocked);
     assert_eq!(blocked["ok"], json!(false), "{blocked}");
@@ -7501,7 +7981,7 @@ fn d1_bootstrap_zero_dispatch_abort_retires_only_exact_marker_aware_custody() {
     let terminal_attempt = "8".repeat(64);
     let abort_args = |attempt: &str, dry_run: bool, approved: Option<&str>| {
         let mut args = json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "approved_bootstrap_plan_sha256": plan,
             "lease_nonce": nonce,
             "lease_payload_sha256": payload,
@@ -7563,7 +8043,7 @@ fn d1_bootstrap_zero_dispatch_abort_retires_only_exact_marker_aware_custody() {
     assert_eq!(malformed["ok"], json!(false), "{malformed}");
     assert_eq!(
         malformed["error"]["code"],
-        json!("d1.bootstrap_abort_dispatch_not_absent")
+        json!("d1.migration_reconciliation_custody_changed")
     );
     fs::remove_file(&marker).expect("remove malformed test fixture");
 
@@ -7690,7 +8170,7 @@ fn d1_bootstrap_migration_ledger_ambiguous_inner_results_preserve_write_evidence
         let dry = mcp.call_tool(
             380 + index as u64 * 3,
             "d1_bootstrap_migration_ledger",
-            json!({"database_id": "db-1", "dry_run": true}),
+            json!({"database_id": "123e4567-e89b-42d3-a456-426614174000", "dry_run": true}),
         );
         let plan = structured_content(&dry)["plan_sha256"]
             .as_str()
@@ -7699,7 +8179,7 @@ fn d1_bootstrap_migration_ledger_ambiguous_inner_results_preserve_write_evidence
         let live = mcp.call_tool(
             381 + index as u64 * 3,
             "d1_bootstrap_migration_ledger",
-            json!({"database_id": "db-1", "approved_plan_sha256": plan}),
+            json!({"database_id": "123e4567-e89b-42d3-a456-426614174000", "approved_plan_sha256": plan}),
         );
         let content = structured_content(&live);
         assert_eq!(content["ok"], json!(false), "{label}: {content}");
@@ -7767,7 +8247,7 @@ fn d1_bootstrap_migration_ledger_ambiguous_inner_results_preserve_write_evidence
         let blocked = fresh.call_tool(
             382 + index as u64 * 3,
             "d1_bootstrap_migration_ledger",
-            json!({"database_id": "db-1", "approved_plan_sha256": "a".repeat(64)}),
+            json!({"database_id": "123e4567-e89b-42d3-a456-426614174000", "approved_plan_sha256": "a".repeat(64)}),
         );
         let blocked = structured_content(&blocked);
         assert_eq!(
@@ -7811,7 +8291,7 @@ fn d1_bootstrap_migration_ledger_response_loss_retains_custody_and_never_retries
     let dry = mcp.call_tool(
         34,
         "d1_bootstrap_migration_ledger",
-        json!({"database_id": "db-1", "dry_run": true}),
+        json!({"database_id": "123e4567-e89b-42d3-a456-426614174000", "dry_run": true}),
     );
     let plan = structured_content(&dry)["plan_sha256"]
         .as_str()
@@ -7820,7 +8300,7 @@ fn d1_bootstrap_migration_ledger_response_loss_retains_custody_and_never_retries
     let live = mcp.call_tool(
         35,
         "d1_bootstrap_migration_ledger",
-        json!({"database_id": "db-1", "approved_plan_sha256": plan}),
+        json!({"database_id": "123e4567-e89b-42d3-a456-426614174000", "approved_plan_sha256": plan}),
     );
     let content = structured_content(&live);
     assert_eq!(content["ok"], json!(false), "{content}");
@@ -7923,7 +8403,7 @@ fn d1_bootstrap_migration_ledger_response_loss_retains_custody_and_never_retries
     let blocked = fresh.call_tool(
         36,
         "d1_bootstrap_migration_ledger",
-        json!({"database_id": "db-1", "approved_plan_sha256": "a".repeat(64)}),
+        json!({"database_id": "123e4567-e89b-42d3-a456-426614174000", "approved_plan_sha256": "a".repeat(64)}),
     );
     let blocked = structured_content(&blocked);
     assert_eq!(blocked["ok"], json!(false), "{blocked}");
@@ -7937,7 +8417,7 @@ fn d1_bootstrap_migration_ledger_response_loss_retains_custody_and_never_retries
         37,
         "d1_abort_bootstrap_migration_ledger",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "approved_bootstrap_plan_sha256": plan,
             "lease_nonce": content["lease"]["nonce"],
             "lease_payload_sha256": content["lease"]["payload_sha256"],
@@ -8008,7 +8488,7 @@ fn assert_bootstrap_provider_error_location(offset_bytes: u64, expect_location: 
     let dry = mcp.call_tool(
         1772,
         "d1_bootstrap_migration_ledger",
-        json!({"database_id": "db-1", "dry_run": true}),
+        json!({"database_id": "123e4567-e89b-42d3-a456-426614174000", "dry_run": true}),
     );
     let plan = structured_content(&dry)["plan_sha256"]
         .as_str()
@@ -8017,7 +8497,7 @@ fn assert_bootstrap_provider_error_location(offset_bytes: u64, expect_location: 
     let live = mcp.call_tool(
         1773,
         "d1_bootstrap_migration_ledger",
-        json!({"database_id": "db-1", "approved_plan_sha256": plan}),
+        json!({"database_id": "123e4567-e89b-42d3-a456-426614174000", "approved_plan_sha256": plan}),
     );
     let content = structured_content(&live);
     assert_eq!(content["ok"], json!(false), "{content}");
@@ -8107,7 +8587,7 @@ fn assert_bootstrap_provider_error_location(offset_bytes: u64, expect_location: 
     let blocked = fresh.call_tool(
         1774,
         "d1_bootstrap_migration_ledger",
-        json!({"database_id": "db-1", "approved_plan_sha256": "a".repeat(64)}),
+        json!({"database_id": "123e4567-e89b-42d3-a456-426614174000", "approved_plan_sha256": "a".repeat(64)}),
     );
     let blocked = structured_content(&blocked);
     assert_eq!(
@@ -8156,7 +8636,7 @@ fn d1_bootstrap_response_loss_reconciles_and_retires_without_retrying_initialize
     let dry = mcp.call_tool(
         200,
         "d1_bootstrap_migration_ledger",
-        json!({"database_id": "db-1", "dry_run": true}),
+        json!({"database_id": "123e4567-e89b-42d3-a456-426614174000", "dry_run": true}),
     );
     let bootstrap_plan = structured_content(&dry)["plan_sha256"]
         .as_str()
@@ -8166,7 +8646,7 @@ fn d1_bootstrap_response_loss_reconciles_and_retires_without_retrying_initialize
         201,
         "d1_bootstrap_migration_ledger",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "approved_plan_sha256": bootstrap_plan,
         }),
     );
@@ -8186,7 +8666,7 @@ fn d1_bootstrap_response_loss_reconciles_and_retires_without_retrying_initialize
         202,
         "d1_reconcile_bootstrap_migration_ledger",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "approved_bootstrap_plan_sha256": bootstrap_plan,
             "lease_nonce": lease_nonce,
             "lease_payload_sha256": lease_payload_sha256,
@@ -8247,7 +8727,7 @@ fn d1_bootstrap_response_loss_reconciles_and_retires_without_retrying_initialize
     let terminal_attempt = "8".repeat(64);
     let terminal_args = |snapshot: &str, dry_run: bool, approved: Option<&str>| {
         let mut args = json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "approved_bootstrap_plan_sha256": bootstrap_plan,
             "lease_nonce": lease_nonce,
             "lease_payload_sha256": lease_payload_sha256,
@@ -8420,7 +8900,7 @@ fn d1_bootstrap_terminal_custody_drift_never_claims_stale_retention() {
         let dry = bootstrap.call_tool(
             220,
             "d1_bootstrap_migration_ledger",
-            json!({"database_id": "db-1", "dry_run": true}),
+            json!({"database_id": "123e4567-e89b-42d3-a456-426614174000", "dry_run": true}),
         );
         let bootstrap_plan = structured_content(&dry)["plan_sha256"]
             .as_str()
@@ -8430,7 +8910,7 @@ fn d1_bootstrap_terminal_custody_drift_never_claims_stale_retention() {
             221,
             "d1_bootstrap_migration_ledger",
             json!({
-                "database_id": "db-1",
+                "database_id": "123e4567-e89b-42d3-a456-426614174000",
                 "approved_plan_sha256": bootstrap_plan,
             }),
         );
@@ -8459,7 +8939,7 @@ fn d1_bootstrap_terminal_custody_drift_never_claims_stale_retention() {
             222,
             "d1_reconcile_bootstrap_migration_ledger",
             json!({
-                "database_id": "db-1",
+                "database_id": "123e4567-e89b-42d3-a456-426614174000",
                 "approved_bootstrap_plan_sha256": bootstrap_plan,
                 "lease_nonce": lease_nonce,
                 "lease_payload_sha256": lease_payload_sha256,
@@ -8487,7 +8967,7 @@ fn d1_bootstrap_terminal_custody_drift_never_claims_stale_retention() {
         let terminal_attempt = "8".repeat(64);
         let terminal_arguments = |dry_run: bool, approved: Option<&str>| {
             let mut args = json!({
-                "database_id": "db-1",
+                "database_id": "123e4567-e89b-42d3-a456-426614174000",
                 "approved_bootstrap_plan_sha256": bootstrap_plan,
                 "lease_nonce": lease_nonce,
                 "lease_payload_sha256": lease_payload_sha256,
@@ -8621,7 +9101,7 @@ fn d1_bootstrap_retirement_failure_preserves_persisted_receipt_accounting() {
     let dry = bootstrap.call_tool(
         240,
         "d1_bootstrap_migration_ledger",
-        json!({"database_id": "db-1", "dry_run": true}),
+        json!({"database_id": "123e4567-e89b-42d3-a456-426614174000", "dry_run": true}),
     );
     let bootstrap_plan = structured_content(&dry)["plan_sha256"]
         .as_str()
@@ -8631,7 +9111,7 @@ fn d1_bootstrap_retirement_failure_preserves_persisted_receipt_accounting() {
         241,
         "d1_bootstrap_migration_ledger",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "approved_plan_sha256": bootstrap_plan,
         }),
     );
@@ -8659,7 +9139,7 @@ fn d1_bootstrap_retirement_failure_preserves_persisted_receipt_accounting() {
         242,
         "d1_reconcile_bootstrap_migration_ledger",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "approved_bootstrap_plan_sha256": bootstrap_plan,
             "lease_nonce": lease_nonce,
             "lease_payload_sha256": lease_payload_sha256,
@@ -8687,7 +9167,7 @@ fn d1_bootstrap_retirement_failure_preserves_persisted_receipt_accounting() {
     let terminal_attempt = "8".repeat(64);
     let terminal_arguments = |dry_run: bool, approved: Option<&str>| {
         let mut args = json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "approved_bootstrap_plan_sha256": bootstrap_plan,
             "lease_nonce": lease_nonce,
             "lease_payload_sha256": lease_payload_sha256,
@@ -8784,7 +9264,7 @@ fn d1_bootstrap_reconciliation_reports_provider_conflict_and_keeps_custody() {
     let dry = bootstrap.call_tool(
         210,
         "d1_bootstrap_migration_ledger",
-        json!({"database_id": "db-1", "dry_run": true}),
+        json!({"database_id": "123e4567-e89b-42d3-a456-426614174000", "dry_run": true}),
     );
     let plan = structured_content(&dry)["plan_sha256"]
         .as_str()
@@ -8793,7 +9273,7 @@ fn d1_bootstrap_reconciliation_reports_provider_conflict_and_keeps_custody() {
     let ambiguous = bootstrap.call_tool(
         211,
         "d1_bootstrap_migration_ledger",
-        json!({"database_id": "db-1", "approved_plan_sha256": plan}),
+        json!({"database_id": "123e4567-e89b-42d3-a456-426614174000", "approved_plan_sha256": plan}),
     );
     let ambiguous = structured_content(&ambiguous);
     let nonce = ambiguous["lease"]["nonce"]
@@ -8818,7 +9298,7 @@ fn d1_bootstrap_reconciliation_reports_provider_conflict_and_keeps_custody() {
         212,
         "d1_reconcile_bootstrap_migration_ledger",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "approved_bootstrap_plan_sha256": plan,
             "lease_nonce": nonce,
             "lease_payload_sha256": payload,
@@ -8869,7 +9349,7 @@ fn d1_bootstrap_reconciliation_provider_failure_is_one_attempt_and_nonterminal()
     let dry = bootstrap.call_tool(
         230,
         "d1_bootstrap_migration_ledger",
-        json!({"database_id": "db-1", "dry_run": true}),
+        json!({"database_id": "123e4567-e89b-42d3-a456-426614174000", "dry_run": true}),
     );
     let plan = structured_content(&dry)["plan_sha256"]
         .as_str()
@@ -8878,7 +9358,7 @@ fn d1_bootstrap_reconciliation_provider_failure_is_one_attempt_and_nonterminal()
     let ambiguous = bootstrap.call_tool(
         231,
         "d1_bootstrap_migration_ledger",
-        json!({"database_id": "db-1", "approved_plan_sha256": plan}),
+        json!({"database_id": "123e4567-e89b-42d3-a456-426614174000", "approved_plan_sha256": plan}),
     );
     let ambiguous = structured_content(&ambiguous);
     let nonce = ambiguous["lease"]["nonce"]
@@ -8904,7 +9384,7 @@ fn d1_bootstrap_reconciliation_provider_failure_is_one_attempt_and_nonterminal()
         232,
         "d1_reconcile_bootstrap_migration_ledger",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "approved_bootstrap_plan_sha256": plan,
             "lease_nonce": nonce,
             "lease_payload_sha256": payload,
@@ -8964,7 +9444,7 @@ fn d1_bootstrap_reconciliation_provider_failure_is_one_attempt_and_nonterminal()
         233,
         "d1_reconcile_bootstrap_migration_ledger",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "approved_bootstrap_plan_sha256": plan,
             "lease_nonce": nonce,
             "lease_payload_sha256": payload,
@@ -8998,7 +9478,7 @@ fn d1_bootstrap_reconciliation_provider_failure_is_one_attempt_and_nonterminal()
         234,
         "d1_reconcile_bootstrap_migration_ledger",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "approved_bootstrap_plan_sha256": plan,
             "lease_nonce": nonce,
             "lease_payload_sha256": payload,
@@ -9031,7 +9511,7 @@ fn d1_apply_migration_manifest_dry_run_reaches_stdio_and_never_sends_sql_bytes()
         3,
         "d1_apply_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "dry_run": true,
             "manifest": [
@@ -9148,7 +9628,7 @@ fn d1_manifest_execution_transform_rejects_noncanonical_pragma_before_provider()
             3000 + index as u64,
             "d1_apply_migration_manifest",
             json!({
-                "database_id": "db-1",
+                "database_id": "123e4567-e89b-42d3-a456-426614174000",
                 "migration_family": "newsletter-core",
                 "dry_run": true,
                 "manifest": [{
@@ -9248,7 +9728,7 @@ fn d1_apply_migration_manifest_rejects_malformed_ledger_before_any_provider_writ
             40 + index as u64,
             "d1_apply_migration_manifest",
             json!({
-                "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest,
+                "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "manifest": manifest,
                 "approved_plan_sha256": "a".repeat(64),
             }),
         );
@@ -9361,7 +9841,7 @@ fn d1_apply_migration_manifest_rejects_unproven_reserved_ledger_authority_before
             "name": "0001_initial.sql", "size_bytes": sql.len(), "sql_sha256": sha256_hex(sql), "sql": sql,
         }]);
         let dry = mcp.call_tool(1500 + index as u64 * 2, "d1_apply_migration_manifest", json!({
-            "database_id": "db-1", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
+            "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
         }));
         let plan = structured_content(&dry)["plan_sha256"]
             .as_str()
@@ -9371,7 +9851,7 @@ fn d1_apply_migration_manifest_rejects_unproven_reserved_ledger_authority_before
             1501 + index as u64 * 2,
             "d1_apply_migration_manifest",
             json!({
-                "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest,
+                "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "manifest": manifest,
                 "approved_plan_sha256": plan,
             }),
         );
@@ -9456,7 +9936,7 @@ fn d1_apply_migration_manifest_outer_ledger_errors_release_pre_write_lease() {
             50 + index as u64 * 2,
             "d1_apply_migration_manifest",
             json!({
-                "database_id": "db-1", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
+                "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
             }),
         );
         let plan = structured_content(&dry)["plan_sha256"]
@@ -9467,7 +9947,7 @@ fn d1_apply_migration_manifest_outer_ledger_errors_release_pre_write_lease() {
             51 + index as u64 * 2,
             "d1_apply_migration_manifest",
             json!({
-                "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest,
+                "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "manifest": manifest,
                 "approved_plan_sha256": plan,
             }),
         );
@@ -9539,7 +10019,7 @@ fn d1_apply_migration_manifest_outer_write_errors_remain_unknown_and_retain_leas
             60 + index as u64 * 2,
             "d1_apply_migration_manifest",
             json!({
-                "database_id": "db-1", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
+                "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
             }),
         );
         let plan = structured_content(&dry)["plan_sha256"]
@@ -9550,7 +10030,7 @@ fn d1_apply_migration_manifest_outer_write_errors_remain_unknown_and_retain_leas
             61 + index as u64 * 2,
             "d1_apply_migration_manifest",
             json!({
-                "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest.clone(),
+                "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "manifest": manifest.clone(),
                 "approved_plan_sha256": plan.clone(),
             }),
         );
@@ -9659,7 +10139,7 @@ fn d1_apply_migration_manifest_live_rechecks_plan_and_stably_reads_back_before_r
         {"name": "0002_second.sql", "size_bytes": second_sql.len(), "sql_sha256": sha256_hex(&second_sql), "sql": second_sql}
     ]);
     let dry = mcp.call_tool(4, "d1_apply_migration_manifest", json!({
-        "database_id": "db-1", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
+        "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
     }));
     let dry_content = structured_content(&dry);
     let plan = dry_content["plan_sha256"]
@@ -9678,7 +10158,7 @@ fn d1_apply_migration_manifest_live_rechecks_plan_and_stably_reads_back_before_r
         5,
         "d1_apply_migration_manifest",
         json!({
-            "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest,
+            "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "manifest": manifest,
             "approved_plan_sha256": plan,
         }),
     );
@@ -9723,6 +10203,203 @@ fn d1_apply_migration_manifest_live_rechecks_plan_and_stably_reads_back_before_r
     let _ = fs::remove_dir_all(lease_root);
 }
 
+#[cfg(unix)]
+#[test]
+fn d1_apply_migration_manifest_preserves_prelease_provider_calls_when_activation_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (base_url, requests) = spawn_fake_manifest_apply_api();
+    let lease_root = std::path::PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-manifest-activation-provider-count-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&lease_root);
+    fs::create_dir_all(&lease_root).expect("create lease root");
+    fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+        .expect("make lease root private");
+
+    let legacy_target_hash = sha256_hex("acct-1\0123E4567-E89B-42D3-A456-426614174000");
+    let legacy_target = lease_root.join(format!("d1-migration-target-{legacy_target_hash}"));
+    fs::create_dir(&legacy_target).expect("install legacy alias target");
+    fs::set_permissions(&legacy_target, fs::Permissions::from_mode(0o700))
+        .expect("make legacy alias target private");
+
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let first_sql = "CREATE TABLE submissions(id TEXT);";
+    let second_sql = "ALTER TABLE submissions ADD COLUMN status TEXT;";
+    let manifest = json!([
+        {"name": "0001_initial.sql", "size_bytes": first_sql.len(), "sql_sha256": sha256_hex(first_sql), "sql": first_sql},
+        {"name": "0002_second.sql", "size_bytes": second_sql.len(), "sql_sha256": sha256_hex(second_sql), "sql": second_sql}
+    ]);
+    let dry = mcp.call_tool(
+        1850,
+        "d1_apply_migration_manifest",
+        json!({
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "migration_family": "newsletter-core",
+            "dry_run": true,
+            "manifest": manifest.clone(),
+        }),
+    );
+    let plan = structured_content(&dry)["plan_sha256"]
+        .as_str()
+        .expect("plan digest")
+        .to_string();
+    let live = mcp.call_tool(
+        1851,
+        "d1_apply_migration_manifest",
+        json!({
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "migration_family": "newsletter-core",
+            "manifest": manifest,
+            "approved_plan_sha256": plan.clone(),
+        }),
+    );
+    let content = structured_content(&live);
+    let text_payload: Value = serde_json::from_str(
+        live["result"]["content"][0]["text"]
+            .as_str()
+            .expect("activation failure text payload"),
+    )
+    .expect("decode activation failure text payload");
+    assert_eq!(
+        text_payload,
+        json!({
+            "error": {
+                "code": "d1.migration_lease_upgrade_activation_required",
+                "hint": "Stop predecessor writers, preserve and reconcile the old root separately, then configure every upgraded writer to one new private empty lease root. Do not create the activation marker manually.",
+                "message": "unversioned root contains custody evidence; activate this contract only on a fresh empty root",
+            },
+            "lease_retained": null,
+            "ok": false,
+            "operation": "d1_apply_migration_manifest",
+            "provider_calls": 2,
+            "provider_mutations": 0,
+            "status": "blocked",
+        }),
+        "the text payload must preserve the same physical provider-call count"
+    );
+    let mut normalized = content.clone();
+    let audit = normalized["audit"]
+        .as_object_mut()
+        .expect("activation failure audit");
+    let started = audit["started_at_unix_ms"]
+        .as_u64()
+        .expect("audit start time");
+    let completed = audit["completed_at_unix_ms"]
+        .as_u64()
+        .expect("audit completion time");
+    assert!(completed >= started);
+    audit.insert("started_at_unix_ms".to_string(), json!(0));
+    audit.insert("completed_at_unix_ms".to_string(), json!(0));
+    let correlation = audit["correlation"]
+        .as_object_mut()
+        .expect("audit correlation");
+    assert!(
+        correlation["correlation_id"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("cfmcp-")),
+        "{content}"
+    );
+    correlation.insert("correlation_id".to_string(), json!("<dynamic>"));
+
+    let target_key_sha256 = sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000");
+    let expected_target = json!({
+        "computed_plan_sha256": null,
+        "execution_manifest": [
+            {
+                "executed_size_bytes": 34,
+                "executed_sql_sha256": sha256_hex(first_sql),
+                "provider_statement_sha256": "958a306391e71977329fb06f900a7a53d37288ac61a894a6d6f05ce85031a30b",
+                "source_name": "0001_initial.sql",
+                "source_sql_sha256": sha256_hex(first_sql),
+                "transform_id": "identity-v1",
+                "transform_version": 1,
+            },
+            {
+                "executed_size_bytes": 47,
+                "executed_sql_sha256": sha256_hex(second_sql),
+                "provider_statement_sha256": "1e18e5eb9bd93d0b6b10c0082cc3f28102c632abdef3c92f6895817518896d3f",
+                "source_name": "0002_second.sql",
+                "source_sql_sha256": sha256_hex(second_sql),
+                "transform_id": "identity-v1",
+                "transform_version": 1,
+            }
+        ],
+        "manifest": [
+            {"name": "0001_initial.sql", "size_bytes": 34, "sql_sha256": sha256_hex(first_sql)},
+            {"name": "0002_second.sql", "size_bytes": 47, "sql_sha256": sha256_hex(second_sql)},
+        ],
+        "migration_family": "newsletter-core",
+        "migrations_table": "d1_migrations",
+        "supplied_plan_sha256": plan,
+        "target_key_sha256": target_key_sha256,
+    });
+    assert_eq!(
+        normalized,
+        json!({
+            "audit": {
+                "action": "d1_apply_migration_manifest",
+                "actor": "unknown",
+                "approval": null,
+                "completed_at_unix_ms": 0,
+                "correlation": {
+                    "correlation_id": "<dynamic>",
+                    "request_id": null,
+                    "session_id": null,
+                },
+                "dry_run": false,
+                "error_code": "d1.migration_lease_upgrade_activation_required",
+                "outcome": "error",
+                "started_at_unix_ms": 0,
+                "target": expected_target.clone(),
+            },
+            "dry_run": false,
+            "error": {
+                "code": "d1.migration_lease_upgrade_activation_required",
+                "hint": "Stop predecessor writers, preserve and reconcile the old root separately, then configure every upgraded writer to one new private empty lease root. Do not create the activation marker manually.",
+                "message": "unversioned root contains custody evidence; activate this contract only on a fresh empty root",
+            },
+            "lease_retained": null,
+            "ok": false,
+            "operation": "d1_apply_migration_manifest",
+            "plan": {
+                "operation": "d1_apply_migration_manifest",
+                "steps": [
+                    {"action": "validate_exact_manifest", "ordinal": 1, "side_effect": false, "target": expected_target.clone()},
+                    {"action": "read_stable_migration_ledger", "ordinal": 2, "side_effect": false, "target": expected_target},
+                    {"action": "preflight_existing_migration_target_custody", "ordinal": 3, "side_effect": false, "target": {"target": "account_database"}},
+                    {"action": "preflight_reserved_migration_ledger_authority", "ordinal": 4, "side_effect": false, "target": {"migrations_table": "d1_migrations"}},
+                ],
+            },
+            "provider_calls": 2,
+            "provider_mutations": 0,
+            "status": "blocked",
+        }),
+        "the full activation-failure payload must preserve its two physical pre-lease provider reads"
+    );
+    let observed = requests.lock().expect("request log").clone();
+    assert_eq!(
+        observed.len(),
+        3,
+        "one dry read plus two live authority reads"
+    );
+    assert!(
+        observed.iter().all(|request| !request["sql"]
+            .as_str()
+            .is_some_and(|sql| sql.contains("INSERT INTO \"d1_migrations\""))),
+        "activation failure must not issue a provider mutation"
+    );
+    mcp.terminate();
+    let _ = fs::remove_dir_all(lease_root);
+}
+
 #[test]
 fn d1_apply_migration_manifest_accepts_wrangler_custom_case_preserving_ledger_authority() {
     for (index, migrations_table) in ["custom_migrations", "CasePreserving_Ledger"]
@@ -9762,7 +10439,7 @@ fn d1_apply_migration_manifest_accepts_wrangler_custom_case_preserving_ledger_au
             {"name": "0002_second.sql", "size_bytes": second_sql.len(), "sql_sha256": sha256_hex(second_sql), "sql": second_sql}
         ]);
         let dry = mcp.call_tool(900 + index as u64 * 2, "d1_apply_migration_manifest", json!({
-            "database_id": "db-1", "migration_family": "newsletter-core", "migrations_table": migrations_table,
+            "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "migrations_table": migrations_table,
             "dry_run": true, "manifest": manifest.clone(),
         }));
         let plan = structured_content(&dry)["plan_sha256"]
@@ -9770,7 +10447,7 @@ fn d1_apply_migration_manifest_accepts_wrangler_custom_case_preserving_ledger_au
             .expect("plan digest")
             .to_string();
         let live = mcp.call_tool(901 + index as u64 * 2, "d1_apply_migration_manifest", json!({
-            "database_id": "db-1", "migration_family": "newsletter-core", "migrations_table": migrations_table,
+            "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "migrations_table": migrations_table,
             "manifest": manifest, "approved_plan_sha256": plan,
         }));
         let content = structured_content(&live);
@@ -9828,7 +10505,7 @@ fn d1_apply_migration_manifest_rejects_valid_first_invalid_second_authority_read
         {"name": "0002_second.sql", "size_bytes": sql.len(), "sql_sha256": sha256_hex(sql), "sql": sql}
     ]);
     let dry = mcp.call_tool(801, "d1_apply_migration_manifest", json!({
-        "database_id": "db-1", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
+        "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
     }));
     let plan = structured_content(&dry)["plan_sha256"]
         .as_str()
@@ -9838,7 +10515,7 @@ fn d1_apply_migration_manifest_rejects_valid_first_invalid_second_authority_read
         802,
         "d1_apply_migration_manifest",
         json!({
-            "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest,
+            "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "manifest": manifest,
             "approved_plan_sha256": plan,
         }),
     );
@@ -9915,7 +10592,7 @@ fn d1_apply_migration_manifest_retains_custody_when_second_migration_authority_d
         {"name": "0002_second.sql", "size_bytes": second_sql.len(), "sql_sha256": sha256_hex(second_sql), "sql": second_sql}
     ]);
     let dry = mcp.call_tool(803, "d1_apply_migration_manifest", json!({
-        "database_id": "db-1", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
+        "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
     }));
     let plan = structured_content(&dry)["plan_sha256"]
         .as_str()
@@ -9925,7 +10602,7 @@ fn d1_apply_migration_manifest_retains_custody_when_second_migration_authority_d
         804,
         "d1_apply_migration_manifest",
         json!({
-            "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest,
+            "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "manifest": manifest,
             "approved_plan_sha256": plan,
         }),
     );
@@ -10010,7 +10687,7 @@ fn d1_apply_migration_manifest_retains_custody_when_final_release_authority_drif
         {"name": "0002_second.sql", "size_bytes": second_sql.len(), "sql_sha256": sha256_hex(second_sql), "sql": second_sql}
     ]);
     let dry = mcp.call_tool(805, "d1_apply_migration_manifest", json!({
-        "database_id": "db-1", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
+        "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
     }));
     let plan = structured_content(&dry)["plan_sha256"]
         .as_str()
@@ -10020,7 +10697,7 @@ fn d1_apply_migration_manifest_retains_custody_when_final_release_authority_drif
         806,
         "d1_apply_migration_manifest",
         json!({
-            "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest,
+            "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "manifest": manifest,
             "approved_plan_sha256": plan,
         }),
     );
@@ -10091,7 +10768,7 @@ fn d1_manifest_crashed_stdio_holder_retains_active_evidence_and_contender_never_
     ]);
     let mut holder = McpStdioProcess::start_with_env(env.clone());
     let dry = holder.call_tool(70, "d1_apply_migration_manifest", json!({
-        "database_id": "db-1", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
+        "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
     }));
     let plan = structured_content(&dry)["plan_sha256"]
         .as_str()
@@ -10100,7 +10777,7 @@ fn d1_manifest_crashed_stdio_holder_retains_active_evidence_and_contender_never_
     holder.send(json!({
         "jsonrpc": "2.0", "id": 71, "method": "tools/call",
         "params": {"name": "d1_apply_migration_manifest", "arguments": {
-            "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest.clone(), "approved_plan_sha256": plan.clone()
+            "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "manifest": manifest.clone(), "approved_plan_sha256": plan.clone()
         }}
     }));
     entered
@@ -10109,7 +10786,7 @@ fn d1_manifest_crashed_stdio_holder_retains_active_evidence_and_contender_never_
 
     let mut contender = McpStdioProcess::start_with_env(env.clone());
     let response = contender.call_tool(72, "d1_apply_migration_manifest", json!({
-        "database_id": "db-1", "migration_family": "different-family", "manifest": manifest.clone(), "approved_plan_sha256": plan.clone(),
+        "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "different-family", "manifest": manifest.clone(), "approved_plan_sha256": plan.clone(),
     }));
     let content = structured_content(&response);
     assert_eq!(content["ok"], json!(false), "{content}");
@@ -10127,7 +10804,7 @@ fn d1_manifest_crashed_stdio_holder_retains_active_evidence_and_contender_never_
 
     let mut recovered_contender = McpStdioProcess::start_with_env(env);
     let response = recovered_contender.call_tool(73, "d1_apply_migration_manifest", json!({
-        "database_id": "db-1", "migration_family": "different-family", "manifest": manifest, "approved_plan_sha256": plan,
+        "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "different-family", "manifest": manifest, "approved_plan_sha256": plan,
     }));
     let content = structured_content(&response);
     assert_eq!(content["ok"], json!(false), "{content}");
@@ -10180,7 +10857,7 @@ fn d1_apply_migration_manifest_response_loss_stops_without_retry_and_next_proces
         {"name": "0002_second.sql", "size_bytes": second_sql.len(), "sql_sha256": sha256_hex(second_sql), "sql": second_sql}
     ]);
     let dry = mcp.call_tool(6, "d1_apply_migration_manifest", json!({
-        "database_id": "db-1", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
+        "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
     }));
     let plan = structured_content(&dry)["plan_sha256"]
         .as_str()
@@ -10190,7 +10867,7 @@ fn d1_apply_migration_manifest_response_loss_stops_without_retry_and_next_proces
         7,
         "d1_apply_migration_manifest",
         json!({
-            "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest.clone(),
+            "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "manifest": manifest.clone(),
             "approved_plan_sha256": plan.clone(),
         }),
     );
@@ -10306,7 +10983,7 @@ fn assert_manifest_provider_error_location(
         1770,
         "d1_apply_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "dry_run": true,
             "manifest": manifest.clone(),
@@ -10320,7 +10997,7 @@ fn assert_manifest_provider_error_location(
         1771,
         "d1_apply_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest.clone(),
             "approved_plan_sha256": plan.clone(),
@@ -10467,7 +11144,7 @@ fn d1_apply_migration_manifest_oversized_write_response_retains_custody_without_
         74,
         "d1_apply_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "dry_run": true,
             "manifest": manifest.clone(),
@@ -10481,7 +11158,7 @@ fn d1_apply_migration_manifest_oversized_write_response_retains_custody_without_
         75,
         "d1_apply_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest.clone(),
             "approved_plan_sha256": plan.clone(),
@@ -10586,7 +11263,7 @@ fn d1_apply_migration_manifest_over_depth_acknowledgement_is_ambiguous_and_retai
         1765,
         "d1_apply_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "dry_run": true,
             "manifest": manifest.clone(),
@@ -10600,7 +11277,7 @@ fn d1_apply_migration_manifest_over_depth_acknowledgement_is_ambiguous_and_retai
         1766,
         "d1_apply_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest.clone(),
             "approved_plan_sha256": plan.clone(),
@@ -10715,7 +11392,7 @@ fn d1_apply_migration_manifest_ambiguous_apply_never_claims_retained_custody_aft
         ]);
         let mut mcp = McpStdioProcess::start_with_env(env);
         let dry = mcp.call_tool(100, "d1_apply_migration_manifest", json!({
-            "database_id": "db-1", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
+            "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
         }));
         let plan = structured_content(&dry)["plan_sha256"]
             .as_str()
@@ -10724,7 +11401,7 @@ fn d1_apply_migration_manifest_ambiguous_apply_never_claims_retained_custody_aft
         mcp.send(json!({
             "jsonrpc": "2.0", "id": 101, "method": "tools/call",
             "params": {"name": "d1_apply_migration_manifest", "arguments": {
-                "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest,
+                "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "manifest": manifest,
                 "approved_plan_sha256": plan,
             }}
         }));
@@ -10816,7 +11493,7 @@ fn d1_reconcile_migration_manifest_stdio_wraps_semantic_validation_in_fixed_orde
     fn args(manifest: Value, migration_family: &str) -> Value {
         json!({
             "account_id": "acct-1",
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": migration_family,
             "manifest": manifest,
             "approved_plan_sha256": "a".repeat(64),
@@ -10847,9 +11524,9 @@ fn d1_reconcile_migration_manifest_stdio_wraps_semantic_validation_in_fixed_orde
             "target precedes every later invalid field",
             invalid_target,
             expected_d1_reconciliation_semantic_error(
-                "d1.invalid_manifest_target_identity",
-                "account_id must be a non-empty canonical identifier, not a dot path segment, and without surrounding whitespace",
-                "Use the exact account_id and database_id read from the intended Cloudflare resource.",
+                "d1.invalid_target_identity",
+                "account_id must be an exact 1..=256 byte ASCII identifier containing only letters, digits, '_' or '-'",
+                "Use the exact account_id and database_id returned by Cloudflare; whitespace, NUL, dot, path, percent-encoded and other equivalent aliases are rejected.",
             ),
         ),
         (
@@ -10941,7 +11618,7 @@ fn d1_reconcile_migration_manifest_stdio_wraps_semantic_validation_in_fixed_orde
     assert_eq!(
         structured_content(&response),
         &expected_d1_reconciliation_semantic_error(
-            "d1.invalid_manifest_target_identity",
+            "d1.invalid_target_identity",
             "account_id must be supplied or configured as a canonical identifier",
             "Use the exact account_id read from the intended Cloudflare resource.",
         ),
@@ -10986,7 +11663,7 @@ fn generic_manifest_tools_reject_the_reserved_bootstrap_family_before_any_effect
         "d1_apply_migration_manifest",
         json!({
             "account_id": "acct-1",
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": reserved_family,
             "manifest": manifest.clone(),
             "approved_plan_sha256": "a".repeat(64),
@@ -10998,7 +11675,7 @@ fn generic_manifest_tools_reject_the_reserved_bootstrap_family_before_any_effect
         "d1_reconcile_migration_manifest",
         json!({
             "account_id": "acct-1",
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": reserved_family,
             "manifest": manifest.clone(),
             "approved_plan_sha256": "a".repeat(64),
@@ -11096,7 +11773,7 @@ fn d1_reconcile_migration_manifest_proves_stable_full_state_without_retry_or_mut
         740,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest,
             "approved_plan_sha256": approved_plan_sha256,
@@ -11251,7 +11928,7 @@ fn d1_reconciliation_and_terminal_finalize_share_view_trigger_effect_proof() {
         ),
     ]);
     let reconciliation_args = json!({
-        "database_id": "db-1",
+        "database_id": "123e4567-e89b-42d3-a456-426614174000",
         "migration_family": "newsletter-core",
         "manifest": manifest,
         "approved_plan_sha256": approved_plan_sha256,
@@ -11419,7 +12096,7 @@ fn d1_reconciliation_and_terminal_finalize_share_additive_effect_proof() {
         ),
     ]);
     let reconciliation_args = json!({
-        "database_id": "db-1",
+        "database_id": "123e4567-e89b-42d3-a456-426614174000",
         "migration_family": "newsletter-core",
         "manifest": manifest,
         "approved_plan_sha256": approved_plan_sha256,
@@ -11618,7 +12295,7 @@ fn d1_canonical_five_seed_rows_bind_reconciliation_terminal_receipt_and_replay()
         ),
     ]);
     let reconciliation_args = json!({
-        "database_id": "db-1",
+        "database_id": "123e4567-e89b-42d3-a456-426614174000",
         "migration_family": "newsletter-core",
         "manifest": manifest,
         "approved_plan_sha256": approved_plan_sha256,
@@ -11838,7 +12515,7 @@ fn d1_v2_seven_null_seed_literals_bind_reconciliation_terminal_receipt_and_repla
         900,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest.clone(),
             "approved_plan_sha256": "a".repeat(64),
@@ -11910,7 +12587,7 @@ fn d1_v2_seven_null_seed_literals_bind_reconciliation_terminal_receipt_and_repla
         905,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": rowid_manifest,
             "approved_plan_sha256": "a".repeat(64),
@@ -11956,7 +12633,7 @@ fn d1_v2_seven_null_seed_literals_bind_reconciliation_terminal_receipt_and_repla
         ),
     ]);
     let reconciliation_args = json!({
-        "database_id": "db-1",
+        "database_id": "123e4567-e89b-42d3-a456-426614174000",
         "migration_family": "newsletter-core",
         "manifest": manifest,
         "approved_plan_sha256": approved_plan_sha256,
@@ -12098,7 +12775,7 @@ fn d1_seed_projection_registry_proves_zero_create_only_and_full_prefixes() {
             ),
         ]);
         let args = json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest.clone(),
             "approved_plan_sha256": approved_plan_sha256,
@@ -12238,7 +12915,7 @@ fn d1_seed_complete_proofs_bind_the_exact_selected_ledger_in_reconcile_and_termi
             870 + case_index as u64,
             "d1_reconcile_migration_manifest",
             json!({
-                "database_id": "db-1",
+                "database_id": "123e4567-e89b-42d3-a456-426614174000",
                 "migration_family": "newsletter-core",
                 "manifest": manifest.clone(),
                 "approved_plan_sha256": approved_plan_sha256,
@@ -12314,7 +12991,7 @@ fn d1_seed_complete_proofs_bind_the_exact_selected_ledger_in_reconcile_and_termi
         ),
     ]);
     let args = json!({
-        "database_id": "db-1",
+        "database_id": "123e4567-e89b-42d3-a456-426614174000",
         "migration_family": "newsletter-core",
         "manifest": manifest.clone(),
         "approved_plan_sha256": approved_plan_sha256,
@@ -12462,7 +13139,7 @@ fn d1_seed_complete_proofs_reject_every_premature_manifest_fact_in_reconcile_and
             ),
         ]);
         let args = json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest.clone(),
             "approved_plan_sha256": approved_plan_sha256,
@@ -12528,7 +13205,7 @@ fn d1_seed_complete_proofs_reject_every_premature_manifest_fact_in_reconcile_and
             ),
         ]);
         let args = json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest.clone(),
             "approved_plan_sha256": approved_plan_sha256,
@@ -12699,7 +13376,7 @@ fn d1_case_variant_parents_and_identity_stable_mixed_seed_storage_converge() {
         845,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest.clone(),
             "approved_plan_sha256": approved_plan_sha256,
@@ -12755,7 +13432,7 @@ fn d1_case_variant_parents_and_identity_stable_mixed_seed_storage_converge() {
         846,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest,
             "approved_plan_sha256": mismatch_plan,
@@ -12825,7 +13502,7 @@ fn d1_additive_reconciliation_proves_five_prefixes_with_bounded_checks() {
         835,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest,
             "approved_plan_sha256": approved_plan_sha256,
@@ -12882,7 +13559,7 @@ fn d1_terminal_plan_rejects_effect_assertion_change_after_approval_for_identical
         ),
     ]);
     let reconciliation_args = json!({
-        "database_id": "db-1",
+        "database_id": "123e4567-e89b-42d3-a456-426614174000",
         "migration_family": "newsletter-core",
         "manifest": manifest,
         "approved_plan_sha256": approved_plan_sha256,
@@ -12983,7 +13660,7 @@ fn d1_terminal_equal_query_sha_preserves_historical_v2_chronology_across_custody
         938,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest,
             "approved_plan_sha256": approved_plan_sha256,
@@ -12999,8 +13676,8 @@ fn d1_terminal_equal_query_sha_preserves_historical_v2_chronology_across_custody
     let historical_v2_plan = json!({
         "version": 1,
         "operation": "d1_reconcile_migration_manifest",
-        "target_key_sha256": sha256_hex("acct-1\0db-1"),
-        "database_id": "db-1",
+        "target_key_sha256": sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000"),
+        "database_id": "123e4567-e89b-42d3-a456-426614174000",
         "migration_family": "newsletter-core",
         "migrations_table": "d1_migrations",
         "manifest": reconciled["manifest"],
@@ -13167,7 +13844,7 @@ fn d1_terminal_historical_v2_distinct_full_union_finalizes_and_replays_from_acti
         940,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest,
             "approved_plan_sha256": approved_plan_sha256,
@@ -13329,7 +14006,7 @@ fn d1_terminal_historical_v2_distinct_full_union_resumes_from_retiring_custody()
         945,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest,
             "approved_plan_sha256": approved_plan_sha256,
@@ -13476,7 +14153,7 @@ fn d1_terminal_replays_canonical_v1_retirement_as_legacy_and_rejects_extended_re
     let (manifest, state_expectations) = one_table_reconciliation_case();
     let (approved_plan_sha256, lease_nonce, lease_payload_sha256) =
         create_retained_reconciliation_fixture(&lease_root, &manifest);
-    let target_key_sha256 = sha256_hex("acct-1\0db-1");
+    let target_key_sha256 = sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000");
     // The proof hashes the typed expectation structs in declaration order, not
     // the alphabetically keyed input Value used by this stdio fixture.
     let expectation_proof_sha256 =
@@ -13501,7 +14178,7 @@ fn d1_terminal_replays_canonical_v1_retirement_as_legacy_and_rejects_extended_re
         "version": 1,
         "operation": "d1_reconcile_migration_manifest",
         "target_key_sha256": target_key_sha256,
-        "database_id": "db-1",
+        "database_id": "123e4567-e89b-42d3-a456-426614174000",
         "migration_family": "newsletter-core",
         "migrations_table": "d1_migrations",
         "manifest": manifest_summary,
@@ -13789,7 +14466,7 @@ fn d1_terminal_preserves_equal_query_v1_chronology_from_active_through_retiring(
         822,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest,
             "approved_plan_sha256": approved_plan_sha256,
@@ -13804,8 +14481,8 @@ fn d1_terminal_preserves_equal_query_v1_chronology_from_active_through_retiring(
     let legacy_reconciliation_plan = json!({
         "version": 1,
         "operation": "d1_reconcile_migration_manifest",
-        "target_key_sha256": sha256_hex("acct-1\0db-1"),
-        "database_id": "db-1",
+        "target_key_sha256": sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000"),
+        "database_id": "123e4567-e89b-42d3-a456-426614174000",
         "migration_family": "newsletter-core",
         "migrations_table": "d1_migrations",
         "manifest": reconciled["manifest"],
@@ -13828,7 +14505,7 @@ fn d1_terminal_preserves_equal_query_v1_chronology_from_active_through_retiring(
     let legacy_terminal_plan = json!({
         "version": 1,
         "operation": "d1_finalize_migration_reconciliation",
-        "target_key_sha256": sha256_hex("acct-1\0db-1"),
+        "target_key_sha256": sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000"),
         "lease_nonce": lease_nonce,
         "lease_payload_sha256": lease_payload_sha256,
         "approved_apply_plan_sha256": approved_plan_sha256,
@@ -13867,7 +14544,7 @@ fn d1_terminal_preserves_equal_query_v1_chronology_from_active_through_retiring(
     let active_dry_content = structured_content(&active_dry);
     assert_eq!(active_dry_content["ok"], true, "{active_dry_content}");
     assert_eq!(active_dry_content["provider_calls"], 2);
-    let target_key_sha256 = sha256_hex("acct-1\0db-1");
+    let target_key_sha256 = sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000");
     let receipt = LegacyReceipt {
         version: 1,
         operation: "d1_finalize_migration_reconciliation",
@@ -13976,7 +14653,7 @@ fn d1_reconciliation_stdio_rejects_view_trigger_effects_outside_the_explicit_reg
             request_id,
             "d1_reconcile_migration_manifest",
             json!({
-                "database_id": "db-1",
+                "database_id": "123e4567-e89b-42d3-a456-426614174000",
                 "migration_family": "newsletter-core",
                 "manifest": candidate,
                 "approved_plan_sha256": "a".repeat(64),
@@ -14027,7 +14704,7 @@ fn d1_finalize_migration_reconciliation_stdio_requires_preapproval_and_retires_a
         746,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest,
             "approved_plan_sha256": approved_plan_sha256,
@@ -14041,7 +14718,7 @@ fn d1_finalize_migration_reconciliation_stdio_requires_preapproval_and_retires_a
     assert_eq!(reconciled["ok"], json!(true), "{reconciled}");
 
     let terminal_args = json!({
-        "database_id": "db-1",
+        "database_id": "123e4567-e89b-42d3-a456-426614174000",
         "migration_family": "newsletter-core",
         "manifest": manifest,
         "approved_plan_sha256": approved_plan_sha256,
@@ -14196,7 +14873,7 @@ fn d1_finalize_migration_reconciliation_resumes_exact_receipt_from_retiring_name
         750,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest,
             "approved_plan_sha256": approved_plan_sha256,
@@ -14209,7 +14886,7 @@ fn d1_finalize_migration_reconciliation_resumes_exact_receipt_from_retiring_name
     let reconciled = structured_content(&reconciliation).clone();
     assert_eq!(reconciled["ok"], json!(true), "{reconciled}");
     let terminal_args = json!({
-        "database_id": "db-1",
+        "database_id": "123e4567-e89b-42d3-a456-426614174000",
         "migration_family": "newsletter-core",
         "manifest": manifest,
         "approved_plan_sha256": approved_plan_sha256,
@@ -14525,7 +15202,7 @@ fn d1_terminal_restored_v1_v2_semantic_contradictions_fail_read_only_in_every_na
             lease_root.to_string_lossy().to_string(),
         ),
     ]);
-    let target_key_sha256 = sha256_hex("acct-1\0db-1");
+    let target_key_sha256 = sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000");
     let reconciliation_plan_sha256 = "1".repeat(64);
     let expectation_proof_sha256 = "2".repeat(64);
     let query_sha256 = "3".repeat(64);
@@ -14603,7 +15280,7 @@ fn d1_terminal_restored_v1_v2_semantic_contradictions_fail_read_only_in_every_na
                 let content = structured_content(&rejected);
                 assert_eq!(content["ok"], false, "{content}");
                 assert_eq!(
-                    content["error"]["code"], "d1.migration_terminal_evidence_invalid",
+                    content["error"]["code"], "d1.migration_reconciliation_custody_changed",
                     "v{receipt_version} {namespace} {outcome} {original_prefix_length}->{current_prefix_length}"
                 );
                 assert_eq!(content["provider_calls"], 0, "{content}");
@@ -14679,10 +15356,11 @@ fn d1_finalize_migration_reconciliation_stdio_distinguishes_verified_retained_an
             "ok": false,
             "operation": "d1_finalize_migration_reconciliation",
             "dry_run": true,
+            "read_only": true,
             "status": "reconciliation_required",
             "retry_decision": "do_not_retry_same_attempt",
             "lease_retained": null,
-            "custody_status": "retained_evidence_unverified",
+            "custody_status": "inspection_failed",
             "receipt_persisted": null,
             "provider_calls": 0,
             "provider_read_lifecycle": [],
@@ -14690,9 +15368,9 @@ fn d1_finalize_migration_reconciliation_stdio_distinguishes_verified_retained_an
             "provider_mutations": 0,
             "local_namespace_mutations": 0,
             "error": {
-                "code": "d1.migration_terminal_evidence_invalid",
+                "code": "d1.migration_reconciliation_custody_changed",
                 "message": "terminal reconciliation receipt is malformed, duplicate-keyed, or structurally unexpected",
-                "hint": "Preserve the exact target custody directory and reconcile its receipt and lease namespaces before another terminal attempt."
+                "hint": "Retain the exact custody evidence and resolve this boundary before any provider read or migration retry."
             }
         }),
     );
@@ -14799,7 +15477,7 @@ fn d1_finalize_migration_reconciliation_stdio_does_not_claim_retention_after_cus
         759,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest,
             "approved_plan_sha256": approved_plan_sha256,
@@ -14878,7 +15556,7 @@ fn d1_finalize_migration_reconciliation_stdio_does_not_claim_retention_after_cus
             "local_namespace_mutations": 0,
             "error": {
                 "code": "d1.migration_reconciliation_lease_changed",
-                "message": "retained lease payload digest changed",
+                "message": "retained lease payload is malformed, duplicate-keyed, or structurally unexpected",
                 "hint": "Retain the exact custody evidence and resolve this boundary before any provider read or migration retry."
             }
         }),
@@ -14921,7 +15599,7 @@ fn d1_post_parse_custody_release_overrides_parse_failure_in_reconcile_and_termin
         884,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest.clone(),
             "approved_plan_sha256": approved_plan_sha256,
@@ -14992,7 +15670,7 @@ fn d1_post_parse_custody_release_overrides_parse_failure_in_reconcile_and_termin
         885,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest.clone(),
             "approved_plan_sha256": approved_plan_sha256,
@@ -15129,7 +15807,7 @@ fn d1_reconcile_migration_manifest_stdio_rejects_unproven_effects_and_incomplete
         741,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": data_manifest,
             "approved_plan_sha256": "a".repeat(64),
@@ -15184,7 +15862,7 @@ fn d1_reconcile_migration_manifest_stdio_rejects_unproven_effects_and_incomplete
         742,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": schema_manifest.clone(),
             "approved_plan_sha256": "a".repeat(64),
@@ -15232,7 +15910,7 @@ fn d1_reconcile_migration_manifest_stdio_rejects_unproven_effects_and_incomplete
         743,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": schema_manifest,
             "approved_plan_sha256": "a".repeat(64),
@@ -15353,7 +16031,7 @@ fn d1_canonical_seed_table_case_aliases_fail_before_custody_or_provider_access()
             757 + offset as u64,
             "d1_reconcile_migration_manifest",
             json!({
-                "database_id": "db-1",
+                "database_id": "123e4567-e89b-42d3-a456-426614174000",
                 "migration_family": "newsletter-core",
                 "manifest": manifest,
                 "approved_plan_sha256": "a".repeat(64),
@@ -15380,7 +16058,7 @@ fn d1_canonical_seed_table_case_aliases_fail_before_custody_or_provider_access()
         760,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": [{
                 "name": "0001.sql",
@@ -15409,7 +16087,7 @@ fn d1_canonical_seed_table_case_aliases_fail_before_custody_or_provider_access()
         761,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": [{
                 "name": "0001.sql",
@@ -15435,7 +16113,7 @@ fn d1_canonical_seed_table_case_aliases_fail_before_custody_or_provider_access()
         762,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": [{
                 "name": "0001.sql",
@@ -15489,7 +16167,7 @@ fn d1_canonical_seed_table_case_aliases_fail_before_custody_or_provider_access()
         763,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": [{
                 "name": "0001.sql",
@@ -15607,7 +16285,7 @@ fn d1_additive_reconciliation_rejects_unsupported_and_drifted_state_before_custo
             840 + index as u64,
             "d1_reconcile_migration_manifest",
             json!({
-                "database_id": "db-1",
+                "database_id": "123e4567-e89b-42d3-a456-426614174000",
                 "migration_family": "newsletter-core",
                 "manifest": manifest,
                 "approved_plan_sha256": "a".repeat(64),
@@ -15635,7 +16313,7 @@ fn d1_additive_reconciliation_rejects_unsupported_and_drifted_state_before_custo
         860,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest.clone(),
             "approved_plan_sha256": "a".repeat(64),
@@ -15658,7 +16336,7 @@ fn d1_additive_reconciliation_rejects_unsupported_and_drifted_state_before_custo
         861,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest,
             "approved_plan_sha256": "a".repeat(64),
@@ -15892,7 +16570,7 @@ fn d1_reconciliation_reserves_the_migrations_table_before_custody() {
             862 + index as u64,
             "d1_reconcile_migration_manifest",
             json!({
-                "database_id": "db-1",
+                "database_id": "123e4567-e89b-42d3-a456-426614174000",
                 "migration_family": "newsletter-core",
                 "migrations_table": migrations_table,
                 "manifest": manifest,
@@ -15925,7 +16603,7 @@ fn d1_reconciliation_reserves_the_migrations_table_before_custody() {
         899,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "migrations_table": "d1_migrations",
             "manifest": [{
@@ -15963,7 +16641,7 @@ fn d1_reconciliation_reserves_the_migrations_table_before_custody() {
         900,
         "d1_finalize_migration_reconciliation",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": terminal_manifest,
             "approved_plan_sha256": "a".repeat(64),
@@ -16043,7 +16721,7 @@ fn d1_reconcile_migration_manifest_stdio_requires_primary_current_evidence_for_e
             730 + index as u64,
             "d1_reconcile_migration_manifest",
             json!({
-                "database_id": "db-1",
+                "database_id": "123e4567-e89b-42d3-a456-426614174000",
                 "migration_family": "newsletter-core",
                 "manifest": manifest.clone(),
                 "approved_plan_sha256": approved_plan_sha256,
@@ -16118,7 +16796,7 @@ fn d1_reconcile_migration_manifest_stdio_reports_pre_dispatch_without_provider_c
         738,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest,
             "approved_plan_sha256": approved_plan_sha256,
@@ -16207,7 +16885,7 @@ fn d1_reconcile_migration_manifest_stdio_does_not_follow_redirects() {
         739,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest,
             "approved_plan_sha256": approved_plan_sha256,
@@ -16319,7 +16997,7 @@ fn d1_reconcile_migration_manifest_stdio_rejects_marker_metadata_and_oversized_p
             750 + index as u64,
             "d1_reconcile_migration_manifest",
             json!({
-                "database_id": "db-1",
+                "database_id": "123e4567-e89b-42d3-a456-426614174000",
                 "migration_family": "newsletter-core",
                 "manifest": manifest.clone(),
                 "approved_plan_sha256": approved_plan_sha256,
@@ -16376,7 +17054,7 @@ fn d1_reconcile_migration_manifest_stdio_keeps_drifted_custody_unverified() {
         760,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest,
             "approved_plan_sha256": approved_plan_sha256,
@@ -16438,7 +17116,7 @@ fn d1_reconcile_migration_manifest_stdio_preserves_identical_reads_after_second_
         766,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest,
             "approved_plan_sha256": approved_plan_sha256,
@@ -16481,7 +17159,7 @@ fn d1_reconcile_migration_manifest_stdio_preserves_identical_reads_after_second_
             "local_namespace_mutations": 0,
             "error": {
                 "code": "d1.migration_reconciliation_lease_changed",
-                "message": "retained lease payload digest changed",
+                "message": "retained lease payload is malformed, duplicate-keyed, or structurally unexpected",
                 "hint": "Retain the exact custody evidence and resolve this boundary before any provider read or migration retry.",
             },
         }),
@@ -16527,7 +17205,7 @@ fn d1_reconcile_migration_manifest_stdio_revalidates_custody_after_provider_erro
         762,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest,
             "approved_plan_sha256": approved_plan_sha256,
@@ -16609,7 +17287,7 @@ fn d1_reconcile_migration_manifest_stdio_keeps_post_read_contradictions_verified
             761 + index as u64,
             "d1_reconcile_migration_manifest",
             json!({
-                "database_id": "db-1",
+                "database_id": "123e4567-e89b-42d3-a456-426614174000",
                 "migration_family": "newsletter-core",
                 "manifest": manifest.clone(),
                 "approved_plan_sha256": approved_plan_sha256,
@@ -16732,7 +17410,7 @@ fn d1_reconcile_migration_manifest_stdio_preserves_both_batches_when_second_call
         763,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest,
             "approved_plan_sha256": approved_plan_sha256,
@@ -16835,7 +17513,7 @@ fn d1_reconcile_migration_manifest_stdio_reports_safe_allowlisted_second_error()
         1763,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest,
             "approved_plan_sha256": approved_plan_sha256,
@@ -16929,7 +17607,7 @@ fn d1_reconcile_migration_manifest_stdio_deep_error_is_generic_with_custody_reta
         1764,
         "d1_reconcile_migration_manifest",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "migration_family": "newsletter-core",
             "manifest": manifest,
             "approved_plan_sha256": approved_plan_sha256,
@@ -17034,7 +17712,7 @@ fn d1_reconcile_migration_manifest_stdio_preserves_second_transport_invocation_w
             764 + index as u64,
             "d1_reconcile_migration_manifest",
             json!({
-                "database_id": "db-1",
+                "database_id": "123e4567-e89b-42d3-a456-426614174000",
                 "migration_family": "newsletter-core",
                 "manifest": manifest.clone(),
                 "approved_plan_sha256": approved_plan_sha256,
@@ -17100,7 +17778,7 @@ fn d1_reconcile_migration_manifest_stdio_preserves_second_transport_invocation_w
                 "custody_cause".to_string(),
                 json!({
                     "code": "d1.migration_reconciliation_lease_changed",
-                    "message": "retained lease payload digest changed",
+                    "message": "retained lease payload is malformed, duplicate-keyed, or structurally unexpected",
                     "hint": "Retain the exact custody evidence and resolve this boundary before any provider read or migration retry.",
                 }),
             );
@@ -17154,7 +17832,7 @@ fn d1_reconcile_migration_manifest_stdio_rejects_recursive_duplicate_keys_in_bot
             766 + index as u64,
             "d1_reconcile_migration_manifest",
             json!({
-                "database_id": "db-1",
+                "database_id": "123e4567-e89b-42d3-a456-426614174000",
                 "migration_family": "newsletter-core",
                 "manifest": manifest.clone(),
                 "approved_plan_sha256": approved_plan_sha256,
@@ -17319,7 +17997,7 @@ fn d1_reconcile_migration_manifest_stdio_treats_auth_rate_limit_and_5xx_evidence
             770 + status as u64,
             "d1_reconcile_migration_manifest",
             json!({
-                "database_id": "db-1",
+                "database_id": "123e4567-e89b-42d3-a456-426614174000",
                 "migration_family": "newsletter-core",
                 "manifest": manifest.clone(),
                 "approved_plan_sha256": approved_plan_sha256,
@@ -17425,7 +18103,7 @@ fn d1_apply_migration_manifest_same_name_after_response_loss_stays_unknown_and_r
         {"name": "0002_second.sql", "size_bytes": second_sql.len(), "sql_sha256": sha256_hex(second_sql), "sql": second_sql}
     ]);
     let dry = mcp.call_tool(8, "d1_apply_migration_manifest", json!({
-        "database_id": "db-1", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
+        "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
     }));
     let plan = structured_content(&dry)["plan_sha256"]
         .as_str()
@@ -17435,7 +18113,7 @@ fn d1_apply_migration_manifest_same_name_after_response_loss_stays_unknown_and_r
         9,
         "d1_apply_migration_manifest",
         json!({
-            "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest.clone(),
+            "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "manifest": manifest.clone(),
             "approved_plan_sha256": plan.clone(),
         }),
     );
@@ -17572,7 +18250,7 @@ fn d1_apply_migration_manifest_ambiguous_inner_result_shapes_retain_lease_withou
             {"name": "0002_second.sql", "size_bytes": sql.len(), "sql_sha256": sha256_hex(sql), "sql": sql}
         ]);
         let dry = mcp.call_tool(12 + index as u64 * 2, "d1_apply_migration_manifest", json!({
-            "database_id": "db-1", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
+            "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
         }));
         let plan = structured_content(&dry)["plan_sha256"]
             .as_str()
@@ -17582,7 +18260,7 @@ fn d1_apply_migration_manifest_ambiguous_inner_result_shapes_retain_lease_withou
             13 + index as u64 * 2,
             "d1_apply_migration_manifest",
             json!({
-                "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest.clone(),
+                "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "manifest": manifest.clone(),
                 "approved_plan_sha256": plan.clone(),
             }),
         );
@@ -17704,7 +18382,7 @@ fn d1_apply_migration_manifest_multiple_successful_query_results_apply_once() {
         {"name": "0002_second.sql", "size_bytes": sql.len(), "sql_sha256": sha256_hex(sql), "sql": sql}
     ]);
     let dry = mcp.call_tool(30, "d1_apply_migration_manifest", json!({
-        "database_id": "db-1", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
+        "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
     }));
     let plan = structured_content(&dry)["plan_sha256"]
         .as_str()
@@ -17714,7 +18392,7 @@ fn d1_apply_migration_manifest_multiple_successful_query_results_apply_once() {
         31,
         "d1_apply_migration_manifest",
         json!({
-            "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest,
+            "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "manifest": manifest,
             "approved_plan_sha256": plan,
         }),
     );
@@ -17759,7 +18437,7 @@ fn d1_apply_migration_manifest_partial_multi_statement_response_loss_stays_unkno
         {"name": "0002_second.sql", "size_bytes": second_sql.len(), "sql_sha256": sha256_hex(second_sql), "sql": second_sql}
     ]);
     let dry = mcp.call_tool(10, "d1_apply_migration_manifest", json!({
-        "database_id": "db-1", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
+        "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "dry_run": true, "manifest": manifest.clone(),
     }));
     let plan = structured_content(&dry)["plan_sha256"]
         .as_str()
@@ -17769,7 +18447,7 @@ fn d1_apply_migration_manifest_partial_multi_statement_response_loss_stays_unkno
         11,
         "d1_apply_migration_manifest",
         json!({
-            "database_id": "db-1", "migration_family": "newsletter-core", "manifest": manifest.clone(),
+            "database_id": "123e4567-e89b-42d3-a456-426614174000", "migration_family": "newsletter-core", "manifest": manifest.clone(),
             "approved_plan_sha256": plan.clone(),
         }),
     );
@@ -17812,13 +18490,33 @@ fn d1_apply_migration_manifest_partial_multi_statement_response_loss_stays_unkno
 
 #[test]
 fn d1_rename_database_uses_patch_through_stdio_boundary() {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     let (base_url, requests) = spawn_fake_d1_database_mutation_api(1);
-    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-d1-rename-guard-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos()
+    ));
+    fs::create_dir(&lease_root).expect("create private target guard root");
+    #[cfg(unix)]
+    fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+        .expect("make target guard root private");
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
     let response = mcp.call_tool(
         2,
         "d1_rename_database",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "name": "renamed-db",
             "dry_run": false
         }),
@@ -17831,20 +18529,42 @@ fn d1_rename_database_uses_patch_through_stdio_boundary() {
     assert_eq!(requests[0]["method"], json!("PATCH"));
     assert_eq!(
         requests[0]["path"],
-        json!("/accounts/acct-1/d1/database/db-1")
+        json!("/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000")
     );
     assert_eq!(requests[0]["body"]["name"], json!("renamed-db"));
+    mcp.terminate();
+    fs::remove_dir_all(lease_root).expect("target guard cleanup");
 }
 
 #[test]
 fn d1_delete_database_requires_token_and_deletes_through_stdio_boundary() {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     let (base_url, requests) = spawn_fake_d1_database_mutation_api(1);
-    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-d1-delete-guard-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos()
+    ));
+    fs::create_dir(&lease_root).expect("create private target guard root");
+    #[cfg(unix)]
+    fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+        .expect("make target guard root private");
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
     let dry_run = mcp.call_tool(
         2,
         "d1_delete_database",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "dry_run": true,
             "reason": "stdio regression"
         }),
@@ -17862,7 +18582,7 @@ fn d1_delete_database_requires_token_and_deletes_through_stdio_boundary() {
         3,
         "d1_delete_database",
         json!({
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "dry_run": false,
             "confirmation_token": token,
             "reason": "stdio regression"
@@ -17876,9 +18596,212 @@ fn d1_delete_database_requires_token_and_deletes_through_stdio_boundary() {
     assert_eq!(requests[0]["method"], json!("DELETE"));
     assert_eq!(
         requests[0]["path"],
-        json!("/accounts/acct-1/d1/database/db-1")
+        json!("/accounts/acct-1/d1/database/123e4567-e89b-42d3-a456-426614174000")
     );
     assert_eq!(requests[0]["body"], Value::Null);
+    mcp.terminate();
+    fs::remove_dir_all(lease_root).expect("target guard cleanup");
+}
+
+#[test]
+fn d1_execute_write_dry_run_stays_useful_and_live_is_retired_pre_provider() {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    let (base_url, requests) = spawn_fake_d1_database_mutation_api(1);
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-d1-write-guard-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos()
+    ));
+    fs::create_dir(&lease_root).expect("create private target guard root");
+    #[cfg(unix)]
+    fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700))
+        .expect("make target guard root private");
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let dry_run = mcp.call_tool(
+        2,
+        "d1_execute_write",
+        json!({
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "sql": "UPDATE example SET enabled = 1 WHERE id = 7",
+            "dry_run": true
+        }),
+    );
+    let dry_content = structured_content(&dry_run);
+    assert_eq!(dry_content["ok"], json!(true), "{dry_content}");
+    assert_eq!(
+        dry_content["plan"]["database_id"],
+        json!("123e4567-e89b-42d3-a456-426614174000")
+    );
+    assert_eq!(
+        dry_content["plan"]["target_key_sha256"],
+        json!(sha256_hex("acct-1\0123e4567-e89b-42d3-a456-426614174000"))
+    );
+    assert_eq!(dry_content["plan"]["statement_kind"], json!("UPDATE"));
+    assert_eq!(requests.lock().expect("request log lock").len(), 0);
+
+    let response = mcp.call_tool(
+        3,
+        "d1_execute_write",
+        json!({
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "sql": "UPDATE example SET enabled = 1 WHERE id = 7",
+            "dry_run": false
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["status"], json!("retired"), "{content}");
+    assert_eq!(
+        content["capability_state"],
+        json!("unavailable"),
+        "{content}"
+    );
+    assert_eq!(content["error"]["code"], json!("d1.execute_write_retired"));
+    assert_eq!(content["provider_calls"], json!(0));
+    assert_eq!(content["provider_mutations"], json!(0));
+    assert_eq!(content["request_constructed"], json!(false));
+    assert_eq!(
+        content["plan"]["database_id"],
+        json!("123e4567-e89b-42d3-a456-426614174000")
+    );
+    let requests = requests.lock().expect("request log lock");
+    assert!(
+        requests.is_empty(),
+        "retired live path must not contact provider"
+    );
+    drop(requests);
+    mcp.terminate();
+    fs::remove_dir_all(lease_root).expect("target guard cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn curated_d1_guard_denials_are_pre_provider_and_caller_correlated() {
+    let provider = TcpListener::bind("127.0.0.1:0").expect("bind no-call D1 provider witness");
+    provider
+        .set_nonblocking(true)
+        .expect("make D1 provider witness nonblocking");
+    let provider_url = format!(
+        "http://{}",
+        provider.local_addr().expect("D1 provider witness address")
+    );
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-d1-curated-guard-denial-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos()
+    ));
+    let held_guard = lock_manifest_target_guard(&lease_root);
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", provider_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+
+    let alias = mcp.call_tool(
+        19,
+        "d1_rename_database",
+        json!({
+            "database_id": "123E4567-E89B-42D3-A456-426614174000",
+            "name": "renamed-db",
+            "dry_run": false
+        }),
+    );
+    assert_eq!(
+        structured_content(&alias),
+        &json!({
+            "ok": false,
+            "error": {
+                "code": "d1.invalid_target_identity",
+                "message": "database_id must be a canonical lowercase hyphenated UUID",
+                "hint": "Use the exact lowercase database_id returned by Cloudflare; uppercase, mixed-case, compact, braced, whitespace, path and percent-encoded aliases are rejected."
+            }
+        })
+    );
+    assert!(
+        matches!(provider.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "case alias must fail before selecting a guard namespace or contacting the provider"
+    );
+
+    let delete_dry_run = mcp.call_tool(
+        20,
+        "d1_delete_database",
+        json!({
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "dry_run": true,
+            "reason": "guard-denial regression"
+        }),
+    );
+    let delete_confirmation = structured_content(&delete_dry_run)["required_confirmation_token"]
+        .as_str()
+        .expect("delete confirmation token")
+        .to_string();
+
+    for (request_id, operation, arguments) in [
+        (
+            21,
+            "d1_rename_database",
+            json!({"database_id": "123e4567-e89b-42d3-a456-426614174000", "name": "renamed-db", "dry_run": false}),
+        ),
+        (
+            22,
+            "d1_delete_database",
+            json!({
+                "database_id": "123e4567-e89b-42d3-a456-426614174000",
+                "dry_run": false,
+                "confirmation_token": delete_confirmation,
+                "reason": "guard-denial regression"
+            }),
+        ),
+        (
+            23,
+            "d1_execute_write",
+            json!({
+                "database_id": "123e4567-e89b-42d3-a456-426614174000",
+                "sql": "UPDATE example SET enabled = 1 WHERE id = 7",
+                "dry_run": false
+            }),
+        ),
+    ] {
+        let response = mcp.call_tool(request_id, operation, arguments);
+        let content = structured_content(&response);
+        assert_eq!(content["ok"], json!(false), "{operation}: {content}");
+        assert_eq!(content["operation"], json!(operation), "{content}");
+        let expected_code = if operation == "d1_execute_write" {
+            "d1.execute_write_retired"
+        } else {
+            "d1.target_guard_locked"
+        };
+        assert_eq!(
+            content["error"]["code"],
+            json!(expected_code),
+            "{operation}: {content}"
+        );
+        assert_eq!(content["provider_calls"], json!(0), "{content}");
+        assert_eq!(content["provider_mutations"], json!(0), "{content}");
+        assert!(
+            matches!(provider.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "{operation} guard denial must occur before any provider connection"
+        );
+    }
+
+    mcp.terminate();
+    drop(held_guard);
+    fs::remove_dir_all(lease_root).expect("target guard cleanup");
 }
 
 #[test]
@@ -19151,7 +20074,13 @@ fn workers_observability_query_events_work_through_stdio_boundary() {
         2,
         "workers_observability_query_events",
         json!({
-            "limit": 20
+            "limit": 20,
+            "filters": [{
+                "key": "$metadata.trigger",
+                "operation": "eq",
+                "type": "string",
+                "value": "scheduled"
+            }]
         }),
     );
     let content = structured_content(&response);
@@ -20001,10 +20930,14 @@ fn api_mutate_denies_existing_target_d1_schema_mutations_before_request_construc
         McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", provider_url)]);
 
     for (index, operation_id) in [
+        "d1-delete-database",
+        "d1-export-database",
+        "d1-import-database",
         "d1-query-database",
         "d1-raw-database-query",
-        "d1-import-database",
         "d1-time-travel-restore",
+        "d1-update-database",
+        "d1-update-partial-database",
     ]
     .into_iter()
     .enumerate()
@@ -20018,7 +20951,7 @@ fn api_mutate_denies_existing_target_d1_schema_mutations_before_request_construc
                 "operation_id": operation_id,
                 "path_params": {
                     "account_id": "acct-1",
-                    "database_id": "db-1"
+                    "database_id": "123e4567-e89b-42d3-a456-426614174000"
                 },
                 "body": {"sql": mutation_payload_marker},
                 "dry_run": false,
@@ -20040,7 +20973,12 @@ fn api_mutate_denies_existing_target_d1_schema_mutations_before_request_construc
         assert_eq!(content["api_operation"]["risk"], json!("denied_by_default"));
         let expected_preferred_tool = match operation_id {
             "d1-query-database" | "d1-raw-database-query" => Some("d1_query_read_only"),
-            "d1-import-database" | "d1-time-travel-restore" => None,
+            "d1-delete-database" => Some("d1_delete_database"),
+            "d1-export-database"
+            | "d1-import-database"
+            | "d1-time-travel-restore"
+            | "d1-update-database"
+            | "d1-update-partial-database" => None,
             _ => unreachable!(),
         };
         assert_eq!(content["preferred_tool"], json!(expected_preferred_tool));
@@ -20064,7 +21002,7 @@ fn api_mutate_denies_existing_target_d1_schema_mutations_before_request_construc
     }
 
     let discovery = mcp.call_tool(
-        24,
+        40,
         "find_tools",
         json!({"group": "d1", "limit": 100, "include_schema": true}),
     );
@@ -20097,11 +21035,11 @@ fn api_mutate_denies_existing_target_d1_schema_mutations_before_request_construc
     }
 
     let curated_read = mcp.call_tool(
-        25,
+        41,
         "d1_query_read_only",
         json!({
             "account_id": "acct-1",
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "sql": "CREATE TABLE curated_read_guard(id INTEGER PRIMARY KEY)"
         }),
     );
@@ -20111,11 +21049,11 @@ fn api_mutate_denies_existing_target_d1_schema_mutations_before_request_construc
         "curated read tool remains callable and guarded"
     );
     let curated_write = mcp.call_tool(
-        26,
+        42,
         "d1_execute_write",
         json!({
             "account_id": "acct-1",
-            "database_id": "db-1",
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
             "sql": "CREATE TABLE curated_write_guard(id INTEGER PRIMARY KEY)",
             "dry_run": true
         }),

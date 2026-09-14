@@ -111,6 +111,17 @@ committed OpenAPI-derived catalog.
 
 Use curated tools first when `api_get_operation` reports a preferred tool.
 
+All generic D1 operations whose non-GET path contains an existing
+`{database_id}` are denied by default. This is a closed catalog inventory, not
+an operation-name prefix heuristic. Curated rename, delete and row-write calls
+normalize the exact account/database target and hold the same descriptor-bound
+`guard.lock` used by bootstrap and manifest leases across provider dispatch.
+The identity grammar rejects alternate path spellings rather than hashing or
+percent-encoding two aliases into separate custody namespaces. The ordinary
+guard is process-crash exclusion, not durable outcome evidence; migration and
+bootstrap continue to use their stronger retained-lease/reconciliation
+protocols.
+
 ## External Service Bridge
 
 The optional allowlisted external service bridge lets deployments call approved
@@ -138,6 +149,33 @@ Do not commit:
 
 Prefer environment variables or protected files outside the repository. On Unix
 systems, secret files should be regular owner-only files.
+
+## Private D1 SQL Artifact Transport
+
+Private SQL upload preparation delegates generic descriptor-bound read custody
+to the pinned `mcp-toolkit-private-artifact` crate, while the local adapter
+retains D1-specific non-empty and error-code policy. It uses the same Unix
+custody policy as retained D1 migration evidence: a current-operator-owned
+private root, root- or
+current-operator-owned safe external
+ancestors, descriptor-relative traversal without symlink following, private
+single-link regular files, and stable device/inode/size/content readback. A held
+descriptor is revalidated against the complete pathname immediately before its
+bytes can enter the upload adapter. Replacement, ancestor substitution,
+hardlinking, growth, truncation, metadata drift, and equal-size content changes
+fail closed.
+
+Cloudflare's D1 import-init response supplies an R2 presigned URL. The URL does
+not independently identify a D1 database, so the adapter accepts it only inside
+the exact account/database context of the init response. It separately requires
+an HTTPS R2 hostname whose canonical account label equals that exact Cloudflare
+account, rejects ambiguous authorities and encoded hostnames, and uses a
+dedicated no-redirect, no-automatic-retry client. SQL bytes, local paths,
+presigned URLs, account identifiers, and database identifiers are absent from
+errors and receipts.
+
+This low-level boundary does not authorize import initialization, upload retry,
+ingest, polling, reconciliation, or any other lifecycle transition.
 
 ## Hosted Upstream OAuth
 
