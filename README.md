@@ -104,6 +104,9 @@ CLOUDFLARE_MCP_DEFAULT_ZONE_ID=<zone_id> \
 cargo run -- --stdio
 ```
 
+The default executable is the MCP server. Maintenance utilities require an
+explicit `cargo run --bin <utility-name>` invocation.
+
 In stdio mode, MCP JSON-RPC uses stdin/stdout and logs go to stderr. Auth
 defaults to `off` unless `CLOUDFLARE_MCP_AUTH_MODE` is set.
 
