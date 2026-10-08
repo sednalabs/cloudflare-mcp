@@ -764,6 +764,15 @@ pub const TOOL_DISCOVERY: &[ToolDiscoveryEntry] = &[
         ],
     },
     ToolDiscoveryEntry {
+        name: "workers_get_script_content",
+        group: "workers",
+        read_only: true,
+        description: "Retain bounded Worker source privately with content-free integrity metadata; active-version equivalence remains unverified.",
+        keywords: &[
+            "worker", "workers", "script", "content", "source", "private", "download",
+        ],
+    },
+    ToolDiscoveryEntry {
         name: "workers_upload_script",
         group: "workers",
         read_only: false,

@@ -35,6 +35,7 @@ jq \
     elif ($id|test("dns-records-for-a-zone-(create|update|overwrite)-dns-record")) then "upsert_dns_cname"
     elif ($path|test("/access/apps")) and $method == "get" then "list_access_apps"
     elif ($path|test("/access/apps/.*/policies")) and $method == "get" then "list_access_policies"
+    elif $id == "worker-script-get-content" then "workers_get_script_content"
     elif ($tag == "Worker Script") and $method == "get" then "list_workers"
     elif ($path|test("/workers/scripts/.*/settings")) and $method == "get" then "get_worker_settings"
     elif ($path|test("/workers/scripts/.*/settings")) and ($method|test("put|patch")) then "patch_worker_settings"

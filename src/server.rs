@@ -1264,6 +1264,7 @@ mod tests {
             "waf_security_events_summary",
             "workers_get_script_settings",
             "workers_list_scripts",
+            "workers_get_script_content",
             "workers_list_tails",
             "workers_observability_list_keys",
             "workers_observability_list_values",
