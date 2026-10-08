@@ -27,7 +27,7 @@ impl PrivateRoot {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!(
+        let path = PathBuf::from("/tmp").join(format!(
             "content-read-fixture-{}-{nonce}",
             std::process::id()
         ));
@@ -240,7 +240,12 @@ fn private_content_success_is_complete_exact_and_never_active_version_proof() {
                 "custody":"verified_private_file", "representation":"exact_response_body"},
             "source_generation":"unversioned_endpoint_content", "active_version_equivalence":"unverified",
             "syntax_validated":false, "max_bytes":bytes.len(), "deadline_ms":5000}));
-        let path = root.0.join(name);
+        // Observe the actual private namespace, not an output-directed file path.
+        let mut entries = fs::read_dir(&root.0).unwrap();
+        let entry = entries.next().unwrap().unwrap();
+        assert!(entries.next().is_none());
+        assert_eq!(entry.file_name().to_str().unwrap(), name);
+        let path = entry.path();
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(root.count(), 1);
