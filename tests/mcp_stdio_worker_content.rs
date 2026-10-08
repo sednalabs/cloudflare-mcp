@@ -2,9 +2,12 @@
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::ffi::CString;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -245,9 +248,23 @@ fn private_content_success_is_complete_exact_and_never_active_version_proof() {
         let entry = entries.next().unwrap().unwrap();
         assert!(entries.next().is_none());
         assert_eq!(entry.file_name().to_str().unwrap(), name);
-        let path = entry.path();
-        assert_eq!(fs::read(&path).unwrap(), bytes);
-        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        let directory = fs::File::open(&root.0).unwrap();
+        let basename = CString::new(entry.file_name().as_bytes()).unwrap();
+        // SAFETY: the directory and C string remain live; openat returns a new
+        // owned descriptor. A single basename and NOFOLLOW prevent redirection.
+        let descriptor = unsafe {
+            libc::openat(directory.as_raw_fd(), basename.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        };
+        assert!(descriptor >= 0, "private artifact open failed");
+        // SAFETY: openat succeeded and this is the descriptor's only owner.
+        let artifact = unsafe { fs::File::from_raw_fd(descriptor) };
+        let metadata = artifact.metadata().unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let mut retained = Vec::new();
+        artifact.take(bytes.len() as u64 + 1).read_to_end(&mut retained).unwrap();
+        assert_eq!(retained, bytes);
         assert_eq!(root.count(), 1);
         assert_request(&handle.join().unwrap());
         process.finish(&root);
