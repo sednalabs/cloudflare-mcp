@@ -190,8 +190,13 @@ fn validate_format(
         media_type.as_str(),
         "application/javascript" | "text/javascript" | "text/plain"
     ) {
-        if fields.any(|field| !field.eq_ignore_ascii_case("charset=utf-8")) {
-            return Err(content_error("workers.content_format_unsupported"));
+        let mut seen = false;
+        for field in fields {
+            let (key, value) = parse_parameter(field)?;
+            if key != "charset" || !value.eq_ignore_ascii_case("utf-8") || seen {
+                return Err(content_error("workers.content_format_unsupported"));
+            }
+            seen = true;
         }
         if bytes.is_empty() || bytes.contains(&0) || std::str::from_utf8(bytes).is_err() {
             return Err(content_error("workers.content_format_invalid"));
@@ -201,20 +206,21 @@ fn validate_format(
     if media_type != "multipart/form-data" {
         return Err(content_error("workers.content_format_unsupported"));
     }
-    let parameter = fields
-        .next()
-        .ok_or_else(|| content_error("workers.content_format_invalid"))?;
-    let boundary_value = parameter.strip_prefix("boundary=").unwrap_or_default();
-    let boundary = if boundary_value.starts_with('"') {
-        boundary_value
-            .strip_prefix('"')
-            .and_then(|v| v.strip_suffix('"'))
-            .unwrap_or_default()
-    } else {
-        boundary_value
-    };
-    if fields.next().is_some()
-        || boundary.is_empty()
+    let mut boundary = None;
+    let mut seen = std::collections::BTreeSet::new();
+    for field in fields {
+        let (key, value) = parse_parameter(field)?;
+        if !seen.insert(key.clone()) {
+            return Err(content_error("workers.content_format_invalid"));
+        }
+        match key.as_str() {
+            "boundary" => boundary = Some(value),
+            "charset" if value.eq_ignore_ascii_case("utf-8") => {}
+            _ => return Err(content_error("workers.content_format_unsupported")),
+        }
+    }
+    let boundary = boundary.ok_or_else(|| content_error("workers.content_format_invalid"))?;
+    if boundary.is_empty()
         || boundary.len() > 70
         || !boundary
             .bytes()
@@ -260,23 +266,17 @@ fn validate_format(
             match name.as_str() {
                 "content-disposition" => {
                     let mut parameters = value.trim().split(';').map(str::trim);
-                    if parameters.next() != Some("form-data") {
+                    if !parameters
+                        .next()
+                        .is_some_and(|v| v.eq_ignore_ascii_case("form-data"))
+                    {
                         return Err(content_error("workers.content_format_invalid"));
                     }
                     let mut keys = std::collections::BTreeSet::new();
                     for parameter in parameters {
-                        let (key, value) = parameter
-                            .split_once('=')
-                            .ok_or_else(|| content_error("workers.content_format_invalid"))?;
-                        let value = value
-                            .strip_prefix('"')
-                            .and_then(|v| v.strip_suffix('"'))
-                            .filter(|v| {
-                                !v.is_empty()
-                                    && !v.chars().any(|c| c.is_control() || c == '"' || c == '\\')
-                            })
-                            .ok_or_else(|| content_error("workers.content_format_invalid"))?;
-                        if !matches!(key, "name" | "filename") || !keys.insert(key) {
+                        let (key, value) = parse_parameter(parameter)?;
+                        if !matches!(key.as_str(), "name" | "filename") || !keys.insert(key.clone())
+                        {
                             return Err(content_error("workers.content_format_invalid"));
                         }
                         if key == "name" {
@@ -318,6 +318,36 @@ fn validate_format(
         }
         rest = &rest[end + marker.len()..];
     }
+}
+
+fn parse_parameter(field: &str) -> Result<(String, &str), AdapterError> {
+    let invalid = || content_error("workers.content_format_invalid");
+    let token = |v: &str| {
+        !v.is_empty()
+            && v.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+    };
+    let (key, value) = field.split_once('=').ok_or_else(invalid)?;
+    let key = key.trim();
+    let value = value.trim();
+    if !token(key) {
+        return Err(invalid());
+    }
+    let value = if value.starts_with('"') {
+        value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .filter(|v| {
+                !v.is_empty() && !v.chars().any(|c| c.is_control() || c == '"' || c == '\\')
+            })
+            .ok_or_else(invalid)?
+    } else {
+        if !token(value) {
+            return Err(invalid());
+        }
+        value
+    };
+    Ok((key.to_ascii_lowercase(), value))
 }
 
 #[cfg(target_os = "linux")]

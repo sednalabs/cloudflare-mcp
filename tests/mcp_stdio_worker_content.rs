@@ -220,6 +220,8 @@ fn expected_error(code: &str) -> Value {
 fn private_content_success_is_complete_exact_and_never_active_version_proof() {
     for (content_type, bytes, format, count) in [
         ("application/javascript", SOURCE.as_bytes().to_vec(), "javascript_text", 1),
+        ("Application/JavaScript; CHARSET=\"UTF-8\"", SOURCE.as_bytes().to_vec(), "javascript_text", 1),
+        ("multipart/form-data; charset=\"UTF-8\"; BOUNDARY=\"fixture\"", format!("--fixture\r\nContent-Disposition: FORM-DATA; NAME=main.js; FILENAME=\"main.js\"\r\nContent-Type: application/javascript\r\n\r\n{SOURCE}\r\n--fixture--\r\n").into_bytes(), "multipart_form_data", 1),
         ("multipart/form-data; boundary=fixture", format!("--fixture\r\nContent-Disposition: form-data; name=\"main.js\"; filename=\"main.js\"\r\nContent-Type: application/javascript\r\n\r\n{SOURCE}\r\n--fixture\r\nContent-Disposition: form-data; name=\"data.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n\0\u{1}\r\n--fixture--\r\n").into_bytes(), "multipart_form_data", 2),
     ] {
         let root = PrivateRoot::new();
@@ -262,6 +264,9 @@ fn content_http_and_format_failures_leave_no_artifact_or_source_output() {
         (response("application/json", b"{\"source\":\"source-private-sentinel\"}"), 1024, Duration::ZERO, "workers.content_format_unsupported"),
         (response("application/javascript", &[255]), 1024, Duration::ZERO, "workers.content_format_invalid"),
         (response("application/javascript", b""), 1024, Duration::ZERO, "workers.content_format_invalid"),
+        (response("application/javascript; charset=\"UTF-8", SOURCE.as_bytes()), 1024, Duration::ZERO, "workers.content_format_invalid"),
+        (response("multipart/form-data; boundary=fixture; BOUNDARY=fixture", SOURCE.as_bytes()), 1024, Duration::ZERO, "workers.content_format_invalid"),
+        (response("multipart/form-data; boundary=fixture", b"--fixture\r\nContent-Disposition: form-data; name=main.js; NAME=other.js\r\n\r\nsource-private-sentinel\r\n--fixture--\r\n"), 1024, Duration::ZERO, "workers.content_format_invalid"),
         (response("multipart/form-data; boundary=fixture", b"--fixture\r\nContent-Disposition: form-data; filename=\"main.js\"\r\n\r\nsource-private-sentinel\r\n--fixture--\r\n"), 1024, Duration::ZERO, "workers.content_format_invalid"),
         (response("multipart/form-data; boundary=fixture", b"--fixture\r\nContent-Disposition: form-data; name=\"unterminated\r\n\r\nsource-private-sentinel\r\n--fixture--\r\n"), 1024, Duration::ZERO, "workers.content_format_invalid"),
         (b"HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Encoding: gzip\r\nContent-Length: 0\r\n\r\n".to_vec(), 1024, Duration::ZERO, "workers.content_encoding_unsupported"),
