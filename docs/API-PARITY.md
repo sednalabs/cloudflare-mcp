@@ -3,6 +3,13 @@
 This server provides broad Cloudflare REST API v4 parity through an
 OpenAPI-derived operation catalog plus guarded generic executor tools.
 
+Exception: `worker-script-get-content` is a non-JSON sensitive read. `api_read`
+refuses it before dispatch; `api_prepare_call` returns a curated
+`workers_get_script_content` call with acknowledgement false and its private-root
+requirement. Explicitly review and acknowledge private retention before that
+call. `api_read.max_bytes` remains an outward decoded-JSON result cap; the
+curated content reader's `max_bytes` is an incoming wire-body cap.
+
 Cloudflare also provides an official hosted MCP server for broad API access.
 Use that server when the goal is general-purpose Cloudflare API reach with
 minimal tool context. This server keeps a generic REST executor as a guarded

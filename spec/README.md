@@ -41,6 +41,13 @@ restored, hidden, or behaviorally changed, add or update MCP stdio smoke
 coverage so the executable is called through JSON-RPC and rmcp extraction errors
 cannot hide behind direct Rust handler tests.
 
+`workers_get_script_content` is a curated sensitive-read contract. Its root
+gate, explicit acknowledgement, exact response-body retention and content-free
+receipt are exercised by `tests/mcp_stdio_worker_content.rs` through the actual
+stdio executable and synthetic HTTP. `api_read` refuses this non-JSON endpoint;
+`api_prepare_call` routes it to the curated tool with acknowledgement still false.
+No active-version source equivalence is claimed.
+
 Pages project update input normalization and secret preservation are behavioral
 contracts, not schema-field changes: keep the snapshot unchanged unless the
 tool schema changes, and cover curated plus generic update paths through stdio.

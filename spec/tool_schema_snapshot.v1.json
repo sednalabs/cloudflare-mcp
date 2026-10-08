@@ -5099,6 +5099,25 @@
       "name": "workers_capture_version_evidence"
     },
     {
+      "description": "Retain one bounded Worker content/v2 response in configured private custody; return content-free integrity metadata, not source or active-version proof.",
+      "inputSchema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+          "account_id": {
+            "default": null,
+            "type": ["string", "null"]
+          },
+          "acknowledge_private_source": {"type": "boolean"},
+          "max_bytes": {"format": "uint", "minimum": 0, "type": "integer"},
+          "script_name": {"type": "string"}
+        },
+        "required": ["script_name", "acknowledge_private_source", "max_bytes"],
+        "type": "object"
+      },
+      "name": "workers_get_script_content"
+    },
+    {
       "description": "Get Cloudflare Worker script settings.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",

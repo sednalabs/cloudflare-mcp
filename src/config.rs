@@ -88,6 +88,17 @@ pub struct CloudflareApiConfig {
     pub user_agent: String,
 }
 
+/// A configured private root is also the opt-in gate for source retention.
+pub(crate) fn worker_content_root() -> Option<std::path::PathBuf> {
+    std::env::var_os("CLOUDFLARE_MCP_WORKER_CONTENT_ROOT")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+pub(crate) fn worker_content_fixture_http_enabled() -> bool {
+    std::env::var("CLOUDFLARE_MCP_WORKER_CONTENT_FIXTURE_HTTP").as_deref() == Ok("true")
+}
+
 #[derive(Clone)]
 pub struct CloudflareOAuthConfig {
     pub enabled: bool,

@@ -18,6 +18,61 @@ Companion docs:
 
 ## Preconditions
 
+### Private Worker source read
+
+Use `workers_get_script_content`, not `api_read`, for the official
+[`GET .../workers/scripts/{script_name}/content/v2`](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/content/methods/get/).
+This response is not a JSON API envelope. Cloudflare's
+[Wrangler reader](https://github.com/cloudflare/workers-sdk/blob/main/packages/wrangler/src/cfetch/internal.ts)
+handles text and multipart module responses separately.
+
+Configure `CLOUDFLARE_MCP_WORKER_CONTENT_ROOT` to an existing trusted private Linux
+directory owned by the executing user (normally mode `0700`). The unset gate
+denies the read before provider dispatch. Pass the exact account/script,
+`acknowledge_private_source=true`, and `max_bytes` from 1 through 10485760.
+This authorizes local source retention, not publication or a provider mutation.
+With a remote MCP, the directory belongs to that executor: arrange explicit
+authorized private access there before using it; no download or proxy is added.
+
+The request retains existing bearer-token selection but permits only the
+official HTTPS API origin. It reuses the no-redirect Worker client, makes one
+GET without retries, requests identity encoding, bounds declared and streamed
+body bytes, and has a total network deadline of the configured API timeout or
+15 seconds, whichever is smaller. Non-200, compressed, oversized, incomplete,
+unsupported or malformed responses produce content-free errors and no artifact.
+
+Supported formats are nonempty UTF-8 JavaScript/text (not syntax-validated), and
+strictly framed `multipart/form-data` with up to 256 distinct named parts, bounded
+headers, and a terminal boundary. Multipart binary parts are retained intact;
+they are never extracted as paths or executed. The artifact is the exact full
+response body, not a reconstructed source bundle. The create-only file is mode
+`0600` and descriptor-bound toolkit readback verifies namespace, byte equality,
+size and SHA-256 before a success receipt. The result returns a generated
+basename relative to the configured root, not a private absolute path, source,
+credentials, raw provider headers/errors or module names. Operators own the
+retained artifact and its eventual authorized cleanup. Failed private persistence
+is not success; best-effort removal addresses only that invocation's new file.
+
+`body_complete` describes transport and supported MIME framing only. Neither it,
+the SHA-256, a stable deployment listing, nor the latest uploaded script endpoint
+proves equality to the version currently serving traffic. The receipt always
+reports `source_generation=unversioned_endpoint_content`,
+`active_version_equivalence=unverified`, and `syntax_validated=false`.
+Establish active-version source provenance separately if the consumer needs it.
+The file is reachable at return, not an immutable promise against later same-user
+out-of-band changes; reverify its hash before later private inspection.
+
+Synthetic stdio/HTTP tests alone may set
+`CLOUDFLARE_MCP_WORKER_CONTENT_FIXTURE_HTTP=true` to allow an explicit loopback IP
+HTTP API base. The result is unmistakably `synthetic_http_fixture`, never live
+provider proof. Do not enable this gate in operational configuration.
+
+Hosted `cargo test` includes `mcp_stdio_worker_content`: exact GET/auth, full
+private custody/hash equality, declaration/chunked caps, timeout, redirects,
+permissions, malformed/truncated/unsupported content, disclosure sentinels,
+admission denial, inventory, and ordinary JSON-read preservation. Release and
+configured-consumer startup/restart proof remain separate acceptance gates.
+
 Before using the server for production-like changes:
 
 - Configure a Cloudflare API credential source:

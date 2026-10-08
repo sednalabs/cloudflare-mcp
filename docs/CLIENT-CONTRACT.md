@@ -2,6 +2,23 @@
 
 This document is the client-facing request contract for `cloudflare-mcp`: what to send, what is required, and what safety headers to include.
 
+## Private Worker source content
+
+Call `workers_get_script_content` with `script_name`, optional `account_id`
+(otherwise the configured default), required `acknowledge_private_source=true`,
+and required `max_bytes` (1 to 10485760). Unknown fields are rejected. The
+configured `CLOUDFLARE_MCP_WORKER_CONTENT_ROOT` is a private-retention opt-in gate.
+No root or acknowledgement means no provider dispatch.
+
+The result contains a basename relative to that executor's private root, complete
+response-body byte count and SHA-256, supported format class and part count,
+target hash, bounds, and content-free provenance. No source or absolute custody
+path is returned. Synthetic fixture provenance cannot be used as live evidence.
+The unversioned content endpoint is not proof of the active deployed version;
+`active_version_equivalence` is always `unverified`. Follow the
+[private source procedure](RUNBOOK.md#private-worker-source-read) for access,
+hash revalidation and artifact cleanup.
+
 Related docs:
 - `../README.md` for setup/auth/systemd/Codex wiring.
 - `./RUNBOOK.md` for phased rollout and rollback sequencing.

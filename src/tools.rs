@@ -765,6 +765,16 @@ pub struct GetWorkerSettingsArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GetWorkerContentArgs {
+    #[serde(default)]
+    pub account_id: Option<String>,
+    pub script_name: String,
+    pub acknowledge_private_source: bool,
+    pub max_bytes: usize,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct WorkersUploadScriptArgs {
     #[serde(default)]
     pub account_id: Option<String>,
@@ -2351,6 +2361,22 @@ impl CloudflareMcp {
             self.default_zone_id.as_deref(),
         )
         .ok();
+        if selected.operation_id == "worker-script-get-content" {
+            return Ok(CallToolResult::structured(json!({
+                "ok": true,
+                "operation": "api_prepare_call",
+                "status": "sensitive_read_requires_acknowledgement",
+                "executor": "workers_get_script_content",
+                "call": { "tool": "workers_get_script_content", "arguments": {
+                    "account_id": resolved_path_params.as_ref().and_then(|p| p.get("account_id")),
+                    "script_name": resolved_path_params.as_ref().and_then(|p| p.get("script_name")),
+                    "acknowledge_private_source": false,
+                    "max_bytes": 1_048_576,
+                }},
+                "requires_configured_private_root": true,
+                "active_version_equivalence": "unverified",
+            })));
+        }
         let rendered_path = render_path(
             selected,
             &args.path_params,
@@ -2416,6 +2442,13 @@ impl CloudflareMcp {
                 ApiCatalogError::OperationNotFound(args.operation_id),
             ));
         };
+        if operation.operation_id == "worker-script-get-content" {
+            return Ok(invalid_argument_result(
+                "workers.content_sensitive_route_required",
+                "Worker source content requires private artifact custody, not JSON api_read",
+                "Use workers_get_script_content with a configured private root and explicit acknowledgement.",
+            ));
+        }
         if !operation.method.eq_ignore_ascii_case("GET") {
             return Ok(api_catalog_error_result(ApiCatalogError::MethodMismatch {
                 expected: "GET".into(),
@@ -2467,6 +2500,30 @@ impl CloudflareMcp {
                 args.max_bytes.unwrap_or(1_048_576).clamp(1, 10_485_760),
             ))),
             Err(err) => Ok(adapter_error_result(err)),
+        }
+    }
+
+    #[tool(
+        name = "workers_get_script_content",
+        description = "Retain one bounded Worker content/v2 response in configured private custody; return content-free integrity metadata, not source or active-version proof."
+    )]
+    async fn cloudflare_workers_get_script_content(
+        &self,
+        Parameters(args): Parameters<GetWorkerContentArgs>,
+    ) -> Result<CallToolResult, crate::McpError> {
+        let account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        match self
+            .cloudflare
+            .get_worker_content(
+                account_id,
+                &args.script_name,
+                args.acknowledge_private_source,
+                args.max_bytes,
+            )
+            .await
+        {
+            Ok(result) => Ok(CallToolResult::structured(result)),
+            Err(error) => Ok(adapter_error_result(error)),
         }
     }
 
