@@ -2687,7 +2687,10 @@ mod tests {
             "bindings":[{"name":"SECRET","type":"inherit","version_id":base_id}]
         });
         let expectation = prepare_worker_binding_expectation(&base, &metadata).unwrap();
-        let candidate = detail(candidate_id, json!([{"name":"SECRET","type":"secret_text"}]));
+        let candidate = detail(
+            candidate_id,
+            json!([{"name":"SECRET","type":"secret_text"}]),
+        );
         assert!(verify_worker_candidate_bindings(&expectation, &candidate).matched);
         for changed in [
             json!([]),
@@ -2695,13 +2698,18 @@ mod tests {
             json!([{"name":"SECRET","type":"plain_text","text":"fixture"}]),
             json!([{"name":"SECRET","type":"secret_text","text":"fixture"}]),
         ] {
-            assert!(!verify_worker_candidate_bindings(&expectation, &detail(candidate_id, changed)).matched);
+            assert!(
+                !verify_worker_candidate_bindings(&expectation, &detail(candidate_id, changed))
+                    .matched
+            );
         }
         let explicit_redacted = json!({
             "bindings":[{"name":"SECRET","type":"secret_text"}]
         });
         assert_eq!(
-            prepare_worker_binding_expectation(&base, &explicit_redacted).unwrap_err().code,
+            prepare_worker_binding_expectation(&base, &explicit_redacted)
+                .unwrap_err()
+                .code,
             "workers.version_binding_plan_invalid"
         );
     }
