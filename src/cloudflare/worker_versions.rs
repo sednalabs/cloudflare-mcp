@@ -870,9 +870,8 @@ fn sanitize_version_detail(
         !matches!(
             key.as_str(),
             "annotations" | "id" | "metadata" | "number" | "resources"
-        )
-            && !(upload_response
-                && matches!(key.as_str(), "exports_reconciliation" | "startup_time_ms"))
+        ) && !(upload_response
+            && matches!(key.as_str(), "exports_reconciliation" | "startup_time_ms"))
     }) {
         return Err(operation_error(
             "workers.version_detail_unknown_field",
@@ -2429,7 +2428,10 @@ mod tests {
     fn successful_envelope_accepts_only_present_empty_error_collections() {
         for errors in [Value::Null, json!([])] {
             let envelope = json!({"success":true,"errors":errors,"result":{"items":[]}});
-            assert_eq!(valid_envelope_result(&envelope).unwrap(), &json!({"items":[]}));
+            assert_eq!(
+                valid_envelope_result(&envelope).unwrap(),
+                &json!({"items":[]})
+            );
         }
         for errors in [json!([{"code":1000}]), json!({}), json!(""), json!(false)] {
             let envelope = json!({"success":true,"errors":errors,"result":{}});
@@ -2475,7 +2477,10 @@ mod tests {
         let preview = metadata.remove("has_preview").unwrap();
         metadata.insert("hasPreview".to_string(), preview);
         let conventional = sanitize_version_detail(conventional, Some(id), proof()).unwrap();
-        assert_eq!(observed.runtime_projection_sha256, conventional.runtime_projection_sha256);
+        assert_eq!(
+            observed.runtime_projection_sha256,
+            conventional.runtime_projection_sha256
+        );
         assert_eq!(
             observed.version_metadata_projection_sha256,
             conventional.version_metadata_projection_sha256
@@ -2483,13 +2488,41 @@ mod tests {
         assert_ne!(observed.raw_result_sha256, conventional.raw_result_sha256);
 
         for (pointer, value, code) in [
-            ("/resources/script_runtime/compatibility_flags", Value::Null, "workers.version_detail_compatibility_flags_invalid"),
-            ("/resources/script_runtime/compatibility_flags", json!(["flag", "flag"]), "workers.version_detail_compatibility_flags_duplicate"),
-            ("/metadata/has_preview", json!("true"), "workers.version_detail_metadata_invalid"),
-            ("/metadata/author_email", Value::Null, "workers.version_detail_metadata_invalid"),
-            ("/metadata/author_id", json!(""), "workers.version_detail_metadata_invalid"),
-            ("/annotations/workers~1commit_sha", json!("not-a-source-sha"), "workers.version_detail_annotations_invalid"),
-            ("/annotations/workers~1triggered_by", json!([]), "workers.version_detail_annotations_invalid"),
+            (
+                "/resources/script_runtime/compatibility_flags",
+                Value::Null,
+                "workers.version_detail_compatibility_flags_invalid",
+            ),
+            (
+                "/resources/script_runtime/compatibility_flags",
+                json!(["flag", "flag"]),
+                "workers.version_detail_compatibility_flags_duplicate",
+            ),
+            (
+                "/metadata/has_preview",
+                json!("true"),
+                "workers.version_detail_metadata_invalid",
+            ),
+            (
+                "/metadata/author_email",
+                Value::Null,
+                "workers.version_detail_metadata_invalid",
+            ),
+            (
+                "/metadata/author_id",
+                json!(""),
+                "workers.version_detail_metadata_invalid",
+            ),
+            (
+                "/annotations/workers~1commit_sha",
+                json!("not-a-source-sha"),
+                "workers.version_detail_annotations_invalid",
+            ),
+            (
+                "/annotations/workers~1triggered_by",
+                json!([]),
+                "workers.version_detail_annotations_invalid",
+            ),
         ] {
             let mut malformed = original.clone();
             if pointer.ends_with("compatibility_flags") {
@@ -2498,7 +2531,9 @@ mod tests {
                 *malformed.pointer_mut(pointer).unwrap() = value;
             }
             assert_eq!(
-                sanitize_version_detail(malformed, Some(id), proof()).unwrap_err().code,
+                sanitize_version_detail(malformed, Some(id), proof())
+                    .unwrap_err()
+                    .code,
                 code,
                 "{pointer}"
             );
@@ -2507,47 +2542,93 @@ mod tests {
             let mut malformed = original.clone();
             malformed["metadata"][field] = json!(true);
             assert_eq!(
-                sanitize_version_detail(malformed, Some(id), proof()).unwrap_err().code,
+                sanitize_version_detail(malformed, Some(id), proof())
+                    .unwrap_err()
+                    .code,
                 "workers.version_detail_metadata_invalid"
             );
         }
         let mut unknown = original.clone();
         unknown["annotations"]["workers/unreviewed"] = json!("value");
         assert_eq!(
-            sanitize_version_detail(unknown, Some(id), proof()).unwrap_err().code,
+            sanitize_version_detail(unknown, Some(id), proof())
+                .unwrap_err()
+                .code,
             "workers.version_detail_annotations_invalid"
         );
         let mut changed = original.clone();
         changed["annotations"]["workers/commit_sha"] = json!("d".repeat(40));
         assert_ne!(
-            sanitize_version_detail(changed, Some(id), proof()).unwrap().version_metadata_projection_sha256,
+            sanitize_version_detail(changed, Some(id), proof())
+                .unwrap()
+                .version_metadata_projection_sha256,
             observed.version_metadata_projection_sha256
         );
         let runtime_check = verify_worker_candidate_runtime("2026-09-18", &[], &observed);
         assert!(runtime_check.matched);
-        assert!(!verify_worker_candidate_runtime("2026-09-18", &["nodejs_compat".to_string()], &observed).matched);
+        assert!(
+            !verify_worker_candidate_runtime(
+                "2026-09-18",
+                &["nodejs_compat".to_string()],
+                &observed
+            )
+            .matched
+        );
     }
 
     #[tokio::test]
     async fn real_provider_shape_fixture_captures_active_not_latest_version() {
         let fixture = provider_fixture();
-        let active_id = fixture["active_detail"]["result"]["id"].as_str().unwrap().to_string();
-        let inactive_id = fixture["inactive_detail"]["result"]["id"].as_str().unwrap().to_string();
+        let active_id = fixture["active_detail"]["result"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let inactive_id = fixture["inactive_detail"]["result"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
         let router = Router::new()
-            .route("/accounts/acct-1/workers/scripts/worker-a/versions", get({
-                let response = fixture["version_list"].clone();
-                move || { let response = response.clone(); async move { Json(response) } }
-            }))
-            .route(&format!("/accounts/acct-1/workers/scripts/worker-a/versions/{active_id}"), get({
-                let response = fixture["active_detail"].clone();
-                move || { let response = response.clone(); async move { Json(response) } }
-            }))
-            .route("/accounts/acct-1/workers/scripts/worker-a/deployments", get({
-                let response = fixture["deployments"].clone();
-                move || { let response = response.clone(); async move { Json(response) } }
-            }));
+            .route(
+                "/accounts/acct-1/workers/scripts/worker-a/versions",
+                get({
+                    let response = fixture["version_list"].clone();
+                    move || {
+                        let response = response.clone();
+                        async move { Json(response) }
+                    }
+                }),
+            )
+            .route(
+                &format!("/accounts/acct-1/workers/scripts/worker-a/versions/{active_id}"),
+                get({
+                    let response = fixture["active_detail"].clone();
+                    move || {
+                        let response = response.clone();
+                        async move { Json(response) }
+                    }
+                }),
+            )
+            .route(
+                "/accounts/acct-1/workers/scripts/worker-a/deployments",
+                get({
+                    let response = fixture["deployments"].clone();
+                    move || {
+                        let response = response.clone();
+                        async move { Json(response) }
+                    }
+                }),
+            );
         let client = CloudflareClient::new(test_config(spawn_router(router).await)).unwrap();
-        let evidence = client.capture_worker_version_state("acct-1", "worker-a", 100, Some(&active_id), Some(&inactive_id)).await.unwrap();
+        let evidence = client
+            .capture_worker_version_state(
+                "acct-1",
+                "worker-a",
+                100,
+                Some(&active_id),
+                Some(&inactive_id),
+            )
+            .await
+            .unwrap();
         assert_eq!(evidence.versions.version_ids.len(), 17);
         assert_eq!(evidence.deployments.deployments.len(), 18);
         assert_eq!(evidence.detail.unwrap().version_id, active_id);

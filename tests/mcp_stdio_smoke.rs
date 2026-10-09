@@ -19474,7 +19474,10 @@ fn workers_upload_version_stdio_body_loss_preserves_reconciliation_without_retry
     assert_worker_version_stdio_apply(true, false);
 }
 
-fn assert_worker_version_stdio_apply(incomplete_upload_response: bool, observed_provider_shape: bool) {
+fn assert_worker_version_stdio_apply(
+    incomplete_upload_response: bool,
+    observed_provider_shape: bool,
+) {
     let expected_requests = if incomplete_upload_response { 16 } else { 21 };
     let (base_url, requests) = spawn_fake_worker_version_api_with_faults(
         expected_requests,
@@ -19722,7 +19725,8 @@ fn assert_worker_version_stdio_apply(incomplete_upload_response: bool, observed_
 
 #[test]
 fn workers_capture_version_evidence_rejects_same_set_active_order_drift() {
-    let (base_url, requests) = spawn_fake_worker_version_api_with_faults(4, false, false, true, false);
+    let (base_url, requests) =
+        spawn_fake_worker_version_api_with_faults(4, false, false, true, false);
     let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
     let response = mcp.call_tool(
         2,
