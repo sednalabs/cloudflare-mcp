@@ -293,4 +293,13 @@ Preserved curated tool families:
   (`provider_response_body_complete`). Incomplete responses expose neither a
   complete-body digest nor size. Complete invalid bodies retain custody evidence
   without implying provider success or permission to retry an upload.
+- Worker version response parsing accepts explicit null or empty error
+  collections only with `success:true` and a non-null result. Omitted runtime
+  flags normalize to an empty array; null remains malformed. The two provider
+  preview spellings normalize to one field but cannot coexist. Token-created
+  empty author emails and the bounded annotation union are read projections,
+  not permission to broaden upload metadata. Raw response custody remains
+  distinct from normalized semantic fingerprints. Full redacted provider
+  fixtures, negative projections and actual stdio upload/readback tests cover
+  these joins without live provider writes.
 - Queues readback tools (`queues_list`, `queues_get`, `queues_get_metrics`, `queues_list_consumers`, `queues_health`) are first-class contract tools and must remain present for operational backlog/DLQ/consumer diagnostics.

@@ -5188,6 +5188,7 @@ fn spawn_fake_worker_version_api_with_response_fault(
         initially_uploaded,
         incomplete_upload_response,
         false,
+        false,
     )
 }
 
@@ -5196,6 +5197,7 @@ fn spawn_fake_worker_version_api_with_faults(
     initially_uploaded: bool,
     incomplete_upload_response: bool,
     deployment_order_drift: bool,
+    observed_provider_shape: bool,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0") // DevSkim: ignore DS162092 -- loopback-only test fixture listener.
         .expect("bind fake Worker version API");
@@ -5241,7 +5243,7 @@ fn spawn_fake_worker_version_api_with_faults(
                 }));
 
             let path_without_query = path.split('?').next().unwrap_or_default();
-            let response = if method == "GET"
+            let mut response = if method == "GET"
                 && path_without_query == "/accounts/acct-1/workers/scripts/worker-a/versions"
             {
                 let mut items = vec![json!({"id": base_id})];
@@ -5365,6 +5367,29 @@ fn spawn_fake_worker_version_api_with_faults(
                     "result": null,
                 })
             };
+            if observed_provider_shape {
+                if path_without_query.ends_with("/versions") && method == "GET" {
+                    response["errors"] = Value::Null;
+                    response["messages"] = Value::Null;
+                }
+                if response["result"]["resources"].is_object() {
+                    response["result"]["resources"]["script_runtime"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("compatibility_flags");
+                    response["result"]["resources"]["script_runtime"]["usage_model"] =
+                        json!("standard");
+                    response["result"]["metadata"] = json!({
+                        "author_email":"", "author_id":"0".repeat(32),
+                        "created_on":"2026-07-10T00:00:00Z",
+                        "has_preview":true, "source":"api"
+                    });
+                    response["result"]["annotations"] = json!({
+                        "workers/commit_sha":"c".repeat(40),
+                        "workers/triggered_by":"upload"
+                    });
+                }
+            }
             let response = serde_json::to_vec(&response).expect("serialize response");
             write!(
                 stream,
@@ -19436,20 +19461,27 @@ fn workers_upload_version_oversized_private_artifact_error_withholds_exact_size(
 
 #[test]
 fn workers_upload_version_stdio_applies_once_and_proves_disabled_candidate() {
-    assert_worker_version_stdio_apply(false);
+    assert_worker_version_stdio_apply(false, false);
+}
+
+#[test]
+fn workers_upload_version_stdio_supports_observed_provider_response_shapes() {
+    assert_worker_version_stdio_apply(false, true);
 }
 
 #[test]
 fn workers_upload_version_stdio_body_loss_preserves_reconciliation_without_retry() {
-    assert_worker_version_stdio_apply(true);
+    assert_worker_version_stdio_apply(true, false);
 }
 
-fn assert_worker_version_stdio_apply(incomplete_upload_response: bool) {
+fn assert_worker_version_stdio_apply(incomplete_upload_response: bool, observed_provider_shape: bool) {
     let expected_requests = if incomplete_upload_response { 16 } else { 21 };
-    let (base_url, requests) = spawn_fake_worker_version_api_with_response_fault(
+    let (base_url, requests) = spawn_fake_worker_version_api_with_faults(
         expected_requests,
         false,
         incomplete_upload_response,
+        false,
+        observed_provider_shape,
     );
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -19690,7 +19722,7 @@ fn assert_worker_version_stdio_apply(incomplete_upload_response: bool) {
 
 #[test]
 fn workers_capture_version_evidence_rejects_same_set_active_order_drift() {
-    let (base_url, requests) = spawn_fake_worker_version_api_with_faults(4, false, false, true);
+    let (base_url, requests) = spawn_fake_worker_version_api_with_faults(4, false, false, true, false);
     let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
     let response = mcp.call_tool(
         2,
