@@ -1372,6 +1372,33 @@ not be deployed yet. It is intentionally separate from
 previews full arguments, while this tool's sole approval path is its private
 random-handle preparation lifecycle.
 
+The response adapter accepts Cloudflare's successful envelopes with an explicit
+empty `errors` array or `errors:null`; a missing member, nonempty errors,
+wrong type, or anything other than `success:true` still fails closed. Version
+detail normalizes omitted compatibility flags to `[]`, the provider's
+`has_preview` and documented `hasPreview` names to one preview field, and an
+empty author email. Both preview aliases in one response are rejected. Null
+flags, malformed identities, unknown fields, duplicate keys and provider drift
+remain failures.
+
+The bounded read-only annotation projection accepts `workers/message`,
+`workers/tag`, `workers/triggered_by` and the observed `workers/commit_sha`.
+Annotations participate in the metadata fingerprint, so a changed annotation
+cannot silently pass upload-to-readback comparison. This response support does
+not permit annotations or other additional fields in the closed upload request.
+Version GET responses may expose secret bindings as name/type descriptors with
+no secret text. The reader preserves that redacted projection; it neither
+fabricates secret bytes nor proves equality of values the provider withholds.
+Exact-base strict inheritance must remain pinned, and readback must match the
+visible projection. Missing, renamed, retyped or newly exposed secret fields
+are drift, not equivalent redaction. Explicit secret uploads still require
+their text, and a redacted descriptor is never a valid explicit upload input.
+The redacted provider-shape fixture covers the full version/deployment result
+inventory, distinct active and latest inactive versions, omitted flags and
+token-created metadata; no live provider write is needed to qualify parsing.
+See [Cloudflare's version detail reference](https://developers.cloudflare.com/api/resources/workers/subresources/scripts/subresources/versions/methods/get/)
+and [Wrangler's provider types](https://github.com/cloudflare/workers-sdk/blob/main/packages/wrangler/src/versions/types.ts).
+
 1. Call `workers_capture_version_evidence` with the exact account, script,
    fixed `per_page`, and exact base version ID. Review the two stable complete
    version-list passes, exact base ETag and sanitized binding descriptors, and

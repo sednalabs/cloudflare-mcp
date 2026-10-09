@@ -1,0 +1,965 @@
+{
+  "version_list": {
+    "success": true,
+    "errors": null,
+    "messages": null,
+    "result": {
+      "items": [
+        {
+          "annotations": {
+            "workers/commit_sha": "cccccccccccccccccccccccccccccccccccccccc",
+            "workers/triggered_by": "version_upload"
+          },
+          "id": "00000002-0000-4000-8000-000000000002",
+          "metadata": {
+            "author_email": "",
+            "author_id": "00000000000000000000000000000000",
+            "created_on": "2026-09-18T00:00:00.000Z",
+            "has_preview": true,
+            "source": "api"
+          },
+          "number": 17
+        },
+        {
+          "annotations": {
+            "workers/commit_sha": "cccccccccccccccccccccccccccccccccccccccc",
+            "workers/triggered_by": "version_upload"
+          },
+          "id": "00000001-0000-4000-8000-000000000001",
+          "metadata": {
+            "author_email": "",
+            "author_id": "00000000000000000000000000000000",
+            "created_on": "2026-09-18T00:00:00.000Z",
+            "has_preview": true,
+            "source": "api"
+          },
+          "number": 16
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "version_upload"
+          },
+          "id": "00000003-0000-4000-8000-000000000003",
+          "metadata": {
+            "author_email": "",
+            "author_id": "00000000000000000000000000000000",
+            "created_on": "2026-09-18T00:00:00.000Z",
+            "has_preview": true,
+            "source": "wrangler"
+          },
+          "number": 15
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "secret"
+          },
+          "id": "00000004-0000-4000-8000-000000000004",
+          "metadata": {
+            "author_email": "",
+            "author_id": "00000000000000000000000000000000",
+            "created_on": "2026-09-18T00:00:00.000Z",
+            "has_preview": false,
+            "source": "api"
+          },
+          "number": 14
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "version_upload"
+          },
+          "id": "00000005-0000-4000-8000-000000000005",
+          "metadata": {
+            "author_email": "",
+            "author_id": "00000000000000000000000000000000",
+            "created_on": "2026-09-18T00:00:00.000Z",
+            "has_preview": true,
+            "source": "wrangler"
+          },
+          "number": 13
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "version_upload"
+          },
+          "id": "00000006-0000-4000-8000-000000000006",
+          "metadata": {
+            "author_email": "",
+            "author_id": "00000000000000000000000000000000",
+            "created_on": "2026-09-18T00:00:00.000Z",
+            "has_preview": true,
+            "source": "wrangler"
+          },
+          "number": 12
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "version_upload"
+          },
+          "id": "00000007-0000-4000-8000-000000000007",
+          "metadata": {
+            "author_email": "",
+            "author_id": "00000000000000000000000000000000",
+            "created_on": "2026-09-18T00:00:00.000Z",
+            "has_preview": true,
+            "source": "wrangler"
+          },
+          "number": 11
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "version_upload"
+          },
+          "id": "00000008-0000-4000-8000-000000000008",
+          "metadata": {
+            "author_email": "",
+            "author_id": "00000000000000000000000000000000",
+            "created_on": "2026-09-18T00:00:00.000Z",
+            "has_preview": true,
+            "source": "wrangler"
+          },
+          "number": 10
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "version_upload"
+          },
+          "id": "00000009-0000-4000-8000-000000000009",
+          "metadata": {
+            "author_email": "",
+            "author_id": "00000000000000000000000000000000",
+            "created_on": "2026-09-18T00:00:00.000Z",
+            "has_preview": true,
+            "source": "wrangler"
+          },
+          "number": 9
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "version_upload"
+          },
+          "id": "00000010-0000-4000-8000-000000000010",
+          "metadata": {
+            "author_email": "",
+            "author_id": "00000000000000000000000000000000",
+            "created_on": "2026-09-18T00:00:00.000Z",
+            "has_preview": true,
+            "source": "wrangler"
+          },
+          "number": 8
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "version_upload"
+          },
+          "id": "00000011-0000-4000-8000-000000000011",
+          "metadata": {
+            "author_email": "",
+            "author_id": "00000000000000000000000000000000",
+            "created_on": "2026-09-18T00:00:00.000Z",
+            "has_preview": true,
+            "source": "wrangler"
+          },
+          "number": 7
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "version_upload"
+          },
+          "id": "00000012-0000-4000-8000-000000000012",
+          "metadata": {
+            "author_email": "",
+            "author_id": "00000000000000000000000000000000",
+            "created_on": "2026-09-18T00:00:00.000Z",
+            "has_preview": true,
+            "source": "wrangler"
+          },
+          "number": 6
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "version_upload"
+          },
+          "id": "00000013-0000-4000-8000-000000000013",
+          "metadata": {
+            "author_email": "",
+            "author_id": "00000000000000000000000000000000",
+            "created_on": "2026-09-18T00:00:00.000Z",
+            "has_preview": true,
+            "source": "wrangler"
+          },
+          "number": 5
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "secret"
+          },
+          "id": "00000014-0000-4000-8000-000000000014",
+          "metadata": {
+            "author_email": "",
+            "author_id": "00000000000000000000000000000000",
+            "created_on": "2026-09-18T00:00:00.000Z",
+            "has_preview": false,
+            "source": "api"
+          },
+          "number": 4
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "secret"
+          },
+          "id": "00000015-0000-4000-8000-000000000015",
+          "metadata": {
+            "author_email": "",
+            "author_id": "00000000000000000000000000000000",
+            "created_on": "2026-09-18T00:00:00.000Z",
+            "has_preview": false,
+            "source": "api"
+          },
+          "number": 3
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "secret"
+          },
+          "id": "00000016-0000-4000-8000-000000000016",
+          "metadata": {
+            "author_email": "",
+            "author_id": "00000000000000000000000000000000",
+            "created_on": "2026-09-18T00:00:00.000Z",
+            "has_preview": false,
+            "source": "api"
+          },
+          "number": 2
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "upload"
+          },
+          "id": "00000017-0000-4000-8000-000000000017",
+          "metadata": {
+            "author_email": "",
+            "author_id": "00000000000000000000000000000000",
+            "created_on": "2026-09-18T00:00:00.000Z",
+            "has_preview": true,
+            "source": "wrangler"
+          },
+          "number": 1
+        }
+      ]
+    }
+  },
+  "active_detail": {
+    "success": true,
+    "errors": [],
+    "messages": [],
+    "result": {
+      "annotations": {
+        "workers/commit_sha": "cccccccccccccccccccccccccccccccccccccccc",
+        "workers/triggered_by": "version_upload"
+      },
+      "id": "00000001-0000-4000-8000-000000000001",
+      "metadata": {
+        "author_email": "",
+        "author_id": "00000000000000000000000000000000",
+        "created_on": "2026-09-18T00:00:00.000Z",
+        "has_preview": true,
+        "source": "api"
+      },
+      "number": 16,
+      "resources": {
+        "bindings": [
+          {
+            "name": "BINDING_00",
+            "type": "secret_text"
+          },
+          {
+            "name": "BINDING_01",
+            "type": "secret_text"
+          },
+          {
+            "name": "BINDING_02",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "bucket_name": "synthetic-fixture-value",
+            "name": "BINDING_03",
+            "type": "r2_bucket"
+          },
+          {
+            "name": "BINDING_04",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "bucket_name": "synthetic-fixture-value",
+            "name": "BINDING_05",
+            "type": "r2_bucket"
+          },
+          {
+            "name": "BINDING_06",
+            "type": "secret_text"
+          },
+          {
+            "name": "BINDING_07",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_08",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_09",
+            "type": "secret_text"
+          },
+          {
+            "bucket_name": "synthetic-fixture-value",
+            "name": "BINDING_10",
+            "type": "r2_bucket"
+          },
+          {
+            "name": "BINDING_11",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_12",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_13",
+            "type": "secret_text"
+          },
+          {
+            "name": "BINDING_14",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_15",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_16",
+            "type": "secret_text"
+          },
+          {
+            "bucket_name": "synthetic-fixture-value",
+            "name": "BINDING_17",
+            "type": "r2_bucket"
+          },
+          {
+            "name": "BINDING_18",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_19",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_20",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "bucket_name": "synthetic-fixture-value",
+            "name": "BINDING_21",
+            "type": "r2_bucket"
+          },
+          {
+            "name": "BINDING_22",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_23",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_24",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_25",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_26",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_27",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_28",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_29",
+            "type": "secret_text"
+          },
+          {
+            "name": "BINDING_30",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_31",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_32",
+            "type": "secret_text"
+          },
+          {
+            "bucket_name": "synthetic-fixture-value",
+            "name": "BINDING_33",
+            "type": "r2_bucket"
+          },
+          {
+            "name": "BINDING_34",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          }
+        ],
+        "script": {
+          "etag": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "handlers": [
+            "fetch"
+          ],
+          "last_deployed_from": "api"
+        },
+        "script_runtime": {
+          "compatibility_date": "2026-09-18",
+          "usage_model": "standard"
+        }
+      }
+    }
+  },
+  "inactive_detail": {
+    "success": true,
+    "errors": [],
+    "messages": [],
+    "result": {
+      "annotations": {
+        "workers/commit_sha": "cccccccccccccccccccccccccccccccccccccccc",
+        "workers/triggered_by": "version_upload"
+      },
+      "id": "00000002-0000-4000-8000-000000000002",
+      "metadata": {
+        "author_email": "",
+        "author_id": "00000000000000000000000000000000",
+        "created_on": "2026-09-18T00:00:00.000Z",
+        "has_preview": true,
+        "source": "api"
+      },
+      "number": 17,
+      "resources": {
+        "bindings": [
+          {
+            "name": "BINDING_00",
+            "type": "secret_text"
+          },
+          {
+            "name": "BINDING_01",
+            "type": "secret_text"
+          },
+          {
+            "name": "BINDING_02",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "bucket_name": "synthetic-fixture-value",
+            "name": "BINDING_03",
+            "type": "r2_bucket"
+          },
+          {
+            "name": "BINDING_04",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_05",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_06",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_07",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "bucket_name": "synthetic-fixture-value",
+            "name": "BINDING_08",
+            "type": "r2_bucket"
+          },
+          {
+            "name": "BINDING_09",
+            "type": "secret_text"
+          },
+          {
+            "name": "BINDING_10",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_11",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_12",
+            "type": "secret_text"
+          },
+          {
+            "bucket_name": "synthetic-fixture-value",
+            "name": "BINDING_13",
+            "type": "r2_bucket"
+          },
+          {
+            "name": "BINDING_14",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_15",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_16",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_17",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_18",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_19",
+            "type": "secret_text"
+          },
+          {
+            "name": "BINDING_20",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_21",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_22",
+            "type": "secret_text"
+          },
+          {
+            "bucket_name": "synthetic-fixture-value",
+            "name": "BINDING_23",
+            "type": "r2_bucket"
+          },
+          {
+            "name": "BINDING_24",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_25",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_26",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "bucket_name": "synthetic-fixture-value",
+            "name": "BINDING_27",
+            "type": "r2_bucket"
+          },
+          {
+            "name": "BINDING_28",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_29",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_30",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_31",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_32",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_33",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_34",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_35",
+            "type": "secret_text"
+          },
+          {
+            "name": "BINDING_36",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_37",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          },
+          {
+            "name": "BINDING_38",
+            "type": "secret_text"
+          },
+          {
+            "bucket_name": "synthetic-fixture-value",
+            "name": "BINDING_39",
+            "type": "r2_bucket"
+          },
+          {
+            "name": "BINDING_40",
+            "text": "synthetic-fixture-value",
+            "type": "plain_text"
+          }
+        ],
+        "script": {
+          "etag": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "handlers": [
+            "fetch"
+          ],
+          "last_deployed_from": "api"
+        },
+        "script_runtime": {
+          "compatibility_date": "2026-09-18",
+          "usage_model": "standard"
+        }
+      }
+    }
+  },
+  "deployments": {
+    "success": true,
+    "errors": [],
+    "messages": [],
+    "result": {
+      "deployments": [
+        {
+          "annotations": {
+            "workers/triggered_by": "deployment"
+          },
+          "created_on": "2026-09-18T00:00:00.000Z",
+          "id": "00000018-0000-4000-8000-000000000018",
+          "source": "api",
+          "strategy": "percentage",
+          "versions": [
+            {
+              "percentage": 100,
+              "version_id": "00000001-0000-4000-8000-000000000001"
+            }
+          ]
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "deployment"
+          },
+          "created_on": "2026-09-18T00:00:00.000Z",
+          "id": "00000019-0000-4000-8000-000000000019",
+          "source": "wrangler",
+          "strategy": "percentage",
+          "versions": [
+            {
+              "percentage": 100,
+              "version_id": "00000003-0000-4000-8000-000000000003"
+            }
+          ]
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "secret"
+          },
+          "created_on": "2026-09-18T00:00:00.000Z",
+          "id": "00000020-0000-4000-8000-000000000020",
+          "source": "api",
+          "strategy": "percentage",
+          "versions": [
+            {
+              "percentage": 100,
+              "version_id": "00000004-0000-4000-8000-000000000004"
+            }
+          ]
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "deployment"
+          },
+          "created_on": "2026-09-18T00:00:00.000Z",
+          "id": "00000021-0000-4000-8000-000000000021",
+          "source": "wrangler",
+          "strategy": "percentage",
+          "versions": [
+            {
+              "percentage": 100,
+              "version_id": "00000005-0000-4000-8000-000000000005"
+            }
+          ]
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "deployment"
+          },
+          "created_on": "2026-09-18T00:00:00.000Z",
+          "id": "00000022-0000-4000-8000-000000000022",
+          "source": "wrangler",
+          "strategy": "percentage",
+          "versions": [
+            {
+              "percentage": 100,
+              "version_id": "00000006-0000-4000-8000-000000000006"
+            }
+          ]
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "deployment"
+          },
+          "created_on": "2026-09-18T00:00:00.000Z",
+          "id": "00000023-0000-4000-8000-000000000023",
+          "source": "wrangler",
+          "strategy": "percentage",
+          "versions": [
+            {
+              "percentage": 100,
+              "version_id": "00000007-0000-4000-8000-000000000007"
+            }
+          ]
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "deployment"
+          },
+          "created_on": "2026-09-18T00:00:00.000Z",
+          "id": "00000024-0000-4000-8000-000000000024",
+          "source": "wrangler",
+          "strategy": "percentage",
+          "versions": [
+            {
+              "percentage": 100,
+              "version_id": "00000008-0000-4000-8000-000000000008"
+            }
+          ]
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "deployment"
+          },
+          "created_on": "2026-09-18T00:00:00.000Z",
+          "id": "00000025-0000-4000-8000-000000000025",
+          "source": "wrangler",
+          "strategy": "percentage",
+          "versions": [
+            {
+              "percentage": 100,
+              "version_id": "00000009-0000-4000-8000-000000000009"
+            }
+          ]
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "deployment"
+          },
+          "created_on": "2026-09-18T00:00:00.000Z",
+          "id": "00000026-0000-4000-8000-000000000026",
+          "source": "wrangler",
+          "strategy": "percentage",
+          "versions": [
+            {
+              "percentage": 100,
+              "version_id": "00000010-0000-4000-8000-000000000010"
+            }
+          ]
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "deployment"
+          },
+          "created_on": "2026-09-18T00:00:00.000Z",
+          "id": "00000027-0000-4000-8000-000000000027",
+          "source": "wrangler",
+          "strategy": "percentage",
+          "versions": [
+            {
+              "percentage": 100,
+              "version_id": "00000011-0000-4000-8000-000000000011"
+            }
+          ]
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "deployment"
+          },
+          "created_on": "2026-09-18T00:00:00.000Z",
+          "id": "00000028-0000-4000-8000-000000000028",
+          "source": "wrangler",
+          "strategy": "percentage",
+          "versions": [
+            {
+              "percentage": 100,
+              "version_id": "00000012-0000-4000-8000-000000000012"
+            }
+          ]
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "deployment"
+          },
+          "created_on": "2026-09-18T00:00:00.000Z",
+          "id": "00000029-0000-4000-8000-000000000029",
+          "source": "wrangler",
+          "strategy": "percentage",
+          "versions": [
+            {
+              "percentage": 100,
+              "version_id": "00000013-0000-4000-8000-000000000013"
+            }
+          ]
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "secret"
+          },
+          "created_on": "2026-09-18T00:00:00.000Z",
+          "id": "00000030-0000-4000-8000-000000000030",
+          "source": "api",
+          "strategy": "percentage",
+          "versions": [
+            {
+              "percentage": 100,
+              "version_id": "00000014-0000-4000-8000-000000000014"
+            }
+          ]
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "deployment"
+          },
+          "created_on": "2026-09-18T00:00:00.000Z",
+          "id": "00000031-0000-4000-8000-000000000031",
+          "source": "api",
+          "strategy": "percentage",
+          "versions": [
+            {
+              "percentage": 100,
+              "version_id": "00000015-0000-4000-8000-000000000015"
+            }
+          ]
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "deployment"
+          },
+          "created_on": "2026-09-18T00:00:00.000Z",
+          "id": "00000032-0000-4000-8000-000000000032",
+          "source": "api",
+          "strategy": "percentage",
+          "versions": [
+            {
+              "percentage": 100,
+              "version_id": "00000017-0000-4000-8000-000000000017"
+            }
+          ]
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "secret"
+          },
+          "created_on": "2026-09-18T00:00:00.000Z",
+          "id": "00000033-0000-4000-8000-000000000033",
+          "source": "api",
+          "strategy": "percentage",
+          "versions": [
+            {
+              "percentage": 100,
+              "version_id": "00000015-0000-4000-8000-000000000015"
+            }
+          ]
+        },
+        {
+          "annotations": {
+            "workers/triggered_by": "secret"
+          },
+          "created_on": "2026-09-18T00:00:00.000Z",
+          "id": "00000034-0000-4000-8000-000000000034",
+          "source": "api",
+          "strategy": "percentage",
+          "versions": [
+            {
+              "percentage": 100,
+              "version_id": "00000016-0000-4000-8000-000000000016"
+            }
+          ]
+        },
+        {
+          "annotations": {
+            "workers/message": "Synthetic fixture",
+            "workers/triggered_by": "upload"
+          },
+          "created_on": "2026-09-18T00:00:00.000Z",
+          "id": "00000035-0000-4000-8000-000000000035",
+          "source": "wrangler",
+          "strategy": "percentage",
+          "versions": [
+            {
+              "percentage": 100,
+              "version_id": "00000017-0000-4000-8000-000000000017"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

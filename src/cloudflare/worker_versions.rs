@@ -7,7 +7,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::client::{AdapterError, CloudflareClient, decode_json_rejecting_duplicate_object_keys};
-use crate::worker_version_upload::canonicalize_provider_binding;
+use crate::worker_version_upload::{
+    canonicalize_explicit_upload_binding, canonicalize_provider_binding,
+};
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_VERSION_IDS: usize = 4096;
@@ -813,15 +815,18 @@ fn valid_envelope_result(envelope: &Value) -> Result<&Value, WorkerVersionOperat
             "Treat the provider evidence as malformed.",
         )
     })?;
-    if object.get("success") != Some(&Value::Bool(true))
-        || !object
-            .get("errors")
-            .and_then(Value::as_array)
-            .is_some_and(Vec::is_empty)
-    {
+    // Workers list responses use null for an empty error collection. Require
+    // the member to be present and empty: missing, malformed and nonempty
+    // errors never establish success, even with a 2xx status.
+    let errors_empty = match object.get("errors") {
+        Some(Value::Null) => true,
+        Some(Value::Array(errors)) => errors.is_empty(),
+        _ => false,
+    };
+    if object.get("success") != Some(&Value::Bool(true)) || !errors_empty {
         return Err(operation_error(
             "workers.version_response_contradictory",
-            "Worker version response did not contain success=true with an empty errors array",
+            "Worker version response did not contain success=true with an empty errors collection",
             "Treat the provider response as contradictory and do not continue.",
         ));
     }
@@ -864,9 +869,11 @@ fn sanitize_version_detail(
     })?;
     let upload_response = expected_version_id.is_none();
     if object.keys().any(|key| {
-        !matches!(key.as_str(), "id" | "metadata" | "number" | "resources")
-            && !(upload_response
-                && matches!(key.as_str(), "exports_reconciliation" | "startup_time_ms"))
+        !matches!(
+            key.as_str(),
+            "annotations" | "id" | "metadata" | "number" | "resources"
+        ) && !(upload_response
+            && matches!(key.as_str(), "exports_reconciliation" | "startup_time_ms"))
     }) {
         return Err(operation_error(
             "workers.version_detail_unknown_field",
@@ -1126,10 +1133,15 @@ fn canonical_date(value: &str) -> bool {
 }
 
 fn canonical_flags(value: Option<&Value>) -> Result<Vec<String>, WorkerVersionOperationError> {
-    let flags = value.and_then(Value::as_array).ok_or_else(|| {
+    // Cloudflare omits this optional member when there are no flags. Null is
+    // not an omitted member and remains an invalid runtime configuration.
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let flags = value.as_array().ok_or_else(|| {
         operation_error(
             "workers.version_detail_compatibility_flags_invalid",
-            "version detail omitted its compatibility flag array",
+            "version detail compatibility flags were not an array",
             "Treat the exact runtime evidence as incomplete.",
         )
     })?;
@@ -1559,6 +1571,7 @@ fn canonicalize_version_metadata_projection(
                             | "author_id"
                             | "created_on"
                             | "hasPreview"
+                            | "has_preview"
                             | "modified_on"
                             | "source"
                     )
@@ -1574,7 +1587,15 @@ fn canonicalize_version_metadata_projection(
         let mut projected = serde_json::Map::new();
         for field in ["author_email", "author_id", "created_on", "modified_on"] {
             if let Some(value) = metadata.get(field) {
-                let value = canonical_text(value, 512).ok_or_else(|| {
+                // Account-token-created versions can have no user email.
+                // Other author/time identity members retain their existing
+                // nonempty canonical-string requirement.
+                let value = if field == "author_email" && value == "" {
+                    Some("")
+                } else {
+                    canonical_text(value, 512)
+                }
+                .ok_or_else(|| {
                     operation_error(
                         "workers.version_detail_metadata_invalid",
                         "version metadata contained a non-canonical string",
@@ -1584,7 +1605,17 @@ fn canonicalize_version_metadata_projection(
                 projected.insert(field.to_string(), json!(value));
             }
         }
-        if let Some(value) = metadata.get("hasPreview") {
+        if metadata.contains_key("hasPreview") && metadata.contains_key("has_preview") {
+            return Err(operation_error(
+                "workers.version_detail_metadata_invalid",
+                "version metadata contained both preview aliases",
+                "Treat the version metadata evidence as contradictory.",
+            ));
+        }
+        if let Some(value) = metadata
+            .get("hasPreview")
+            .or_else(|| metadata.get("has_preview"))
+        {
             if !value.is_boolean() {
                 return Err(operation_error(
                     "workers.version_detail_metadata_invalid",
@@ -1623,6 +1654,58 @@ fn canonicalize_version_metadata_projection(
             projected.insert("source".to_string(), json!(source));
         }
         canonical.insert("metadata".to_string(), Value::Object(projected));
+    }
+    if let Some(annotations) = object.get("annotations") {
+        let annotations = annotations.as_object().ok_or_else(|| {
+            operation_error(
+                "workers.version_detail_annotations_invalid",
+                "version annotations were not a closed string object",
+                "Treat the version metadata evidence as malformed.",
+            )
+        })?;
+        let mut projected = serde_json::Map::new();
+        for (key, value) in annotations {
+            let max_len = match key.as_str() {
+                "workers/message" => 1000,
+                "workers/tag" => 100,
+                "workers/triggered_by" => 128,
+                "workers/commit_sha" => 40,
+                _ => {
+                    return Err(operation_error(
+                        "workers.version_detail_annotations_invalid",
+                        "version annotations contained an unsupported field",
+                        "Extend the bounded provider evidence contract in a reviewed change.",
+                    ));
+                }
+            };
+            // Annotations are opaque provider metadata, not executable input.
+            // Preserve permitted whitespace and empty human-readable values in
+            // the fingerprint rather than imposing an identity-string grammar.
+            let text = value
+                .as_str()
+                .filter(|text| text.len() <= max_len && !text.as_bytes().contains(&0))
+                .ok_or_else(|| {
+                    operation_error(
+                        "workers.version_detail_annotations_invalid",
+                        "version annotation was not a bounded string",
+                        "Treat the version metadata evidence as malformed.",
+                    )
+                })?;
+            if key == "workers/commit_sha"
+                && (text.len() != 40
+                    || !text
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
+            {
+                return Err(operation_error(
+                    "workers.version_detail_annotations_invalid",
+                    "version commit annotation was not a canonical source SHA",
+                    "Treat the version metadata evidence as malformed.",
+                ));
+            }
+            projected.insert(key.clone(), json!(text));
+        }
+        canonical.insert("annotations".to_string(), Value::Object(projected));
     }
     Ok(Value::Object(canonical))
 }
@@ -1717,7 +1800,7 @@ pub(crate) fn prepare_worker_binding_expectation(
             inherited.insert("name".to_string(), Value::String(name.to_string()));
             Value::Object(inherited)
         } else {
-            Value::Object(canonicalize_provider_binding(binding).map_err(|_| {
+            Value::Object(canonicalize_explicit_upload_binding(binding).map_err(|_| {
                 operation_error(
                     "workers.version_binding_plan_invalid",
                     "reviewed explicit binding was outside the closed canonical projection",
@@ -2336,6 +2419,225 @@ mod tests {
         json!({"compatibility_date":"2026-07-10","compatibility_flags":[]})
     }
 
+    fn provider_fixture() -> Value {
+        serde_json::from_str(include_str!(
+            "../../tests/fixtures/worker_version_provider_shapes.json"
+        ))
+        .expect("redacted provider fixture")
+    }
+
+    #[test]
+    fn successful_envelope_accepts_only_present_empty_error_collections() {
+        for errors in [Value::Null, json!([])] {
+            let envelope = json!({"success":true,"errors":errors,"result":{"items":[]}});
+            assert_eq!(
+                super::valid_envelope_result(&envelope).unwrap(),
+                &json!({"items":[]})
+            );
+        }
+        for errors in [json!([{"code":1000}]), json!({}), json!(""), json!(false)] {
+            let envelope = json!({"success":true,"errors":errors,"result":{}});
+            assert_eq!(
+                super::valid_envelope_result(&envelope).unwrap_err().code,
+                "workers.version_response_contradictory"
+            );
+        }
+        for envelope in [
+            json!({"success":true,"result":{}}),
+            json!({"success":false,"errors":null,"result":{}}),
+            json!({"success":"true","errors":[],"result":{}}),
+        ] {
+            assert_eq!(
+                super::valid_envelope_result(&envelope).unwrap_err().code,
+                "workers.version_response_contradictory"
+            );
+        }
+        for result in [None, Some(Value::Null)] {
+            let mut envelope = json!({"success":true,"errors":null});
+            if let Some(result) = result {
+                envelope["result"] = result;
+            }
+            assert_eq!(
+                super::valid_envelope_result(&envelope).unwrap_err().code,
+                "workers.version_response_result_missing"
+            );
+        }
+    }
+
+    #[test]
+    fn observed_detail_normalizes_only_supported_provider_variations() {
+        let fixture = provider_fixture();
+        let original = fixture["active_detail"]["result"].clone();
+        let id = original["id"].as_str().unwrap();
+        let observed = sanitize_version_detail(original.clone(), Some(id), proof()).unwrap();
+        assert!(observed.compatibility_flags.is_empty());
+        assert_eq!(observed.binding_descriptors.len(), 35);
+
+        let mut conventional = original.clone();
+        conventional["resources"]["script_runtime"]["compatibility_flags"] = json!([]);
+        let metadata = conventional["metadata"].as_object_mut().unwrap();
+        let preview = metadata.remove("has_preview").unwrap();
+        metadata.insert("hasPreview".to_string(), preview);
+        let conventional = sanitize_version_detail(conventional, Some(id), proof()).unwrap();
+        assert_eq!(
+            observed.runtime_projection_sha256,
+            conventional.runtime_projection_sha256
+        );
+        assert_eq!(
+            observed.version_metadata_projection_sha256,
+            conventional.version_metadata_projection_sha256
+        );
+        assert_ne!(observed.raw_result_sha256, conventional.raw_result_sha256);
+
+        for (pointer, value, code) in [
+            (
+                "/resources/script_runtime/compatibility_flags",
+                Value::Null,
+                "workers.version_detail_compatibility_flags_invalid",
+            ),
+            (
+                "/resources/script_runtime/compatibility_flags",
+                json!(["flag", "flag"]),
+                "workers.version_detail_compatibility_flags_duplicate",
+            ),
+            (
+                "/metadata/has_preview",
+                json!("true"),
+                "workers.version_detail_metadata_invalid",
+            ),
+            (
+                "/metadata/author_email",
+                Value::Null,
+                "workers.version_detail_metadata_invalid",
+            ),
+            (
+                "/metadata/author_id",
+                json!(""),
+                "workers.version_detail_metadata_invalid",
+            ),
+            (
+                "/annotations/workers~1commit_sha",
+                json!("not-a-source-sha"),
+                "workers.version_detail_annotations_invalid",
+            ),
+            (
+                "/annotations/workers~1triggered_by",
+                json!([]),
+                "workers.version_detail_annotations_invalid",
+            ),
+        ] {
+            let mut malformed = original.clone();
+            if pointer.ends_with("compatibility_flags") {
+                malformed["resources"]["script_runtime"]["compatibility_flags"] = value;
+            } else {
+                *malformed.pointer_mut(pointer).unwrap() = value;
+            }
+            assert_eq!(
+                sanitize_version_detail(malformed, Some(id), proof())
+                    .unwrap_err()
+                    .code,
+                code,
+                "{pointer}"
+            );
+        }
+        for field in ["hasPreview", "unreviewed_field"] {
+            let mut malformed = original.clone();
+            malformed["metadata"][field] = json!(true);
+            assert_eq!(
+                sanitize_version_detail(malformed, Some(id), proof())
+                    .unwrap_err()
+                    .code,
+                "workers.version_detail_metadata_invalid"
+            );
+        }
+        let mut unknown = original.clone();
+        unknown["annotations"]["workers/unreviewed"] = json!("value");
+        assert_eq!(
+            sanitize_version_detail(unknown, Some(id), proof())
+                .unwrap_err()
+                .code,
+            "workers.version_detail_annotations_invalid"
+        );
+        let mut changed = original.clone();
+        changed["annotations"]["workers/commit_sha"] = json!("d".repeat(40));
+        assert_ne!(
+            sanitize_version_detail(changed, Some(id), proof())
+                .unwrap()
+                .version_metadata_projection_sha256,
+            observed.version_metadata_projection_sha256
+        );
+        let runtime_check = verify_worker_candidate_runtime("2026-09-18", &[], &observed);
+        assert!(runtime_check.matched);
+        assert!(
+            !verify_worker_candidate_runtime(
+                "2026-09-18",
+                &["nodejs_compat".to_string()],
+                &observed
+            )
+            .matched
+        );
+    }
+
+    #[tokio::test]
+    async fn real_provider_shape_fixture_captures_active_not_latest_version() {
+        let fixture = provider_fixture();
+        let active_id = fixture["active_detail"]["result"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let inactive_id = fixture["inactive_detail"]["result"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let router = Router::new()
+            .route(
+                "/accounts/acct-1/workers/scripts/worker-a/versions",
+                get({
+                    let response = fixture["version_list"].clone();
+                    move || {
+                        let response = response.clone();
+                        async move { Json(response) }
+                    }
+                }),
+            )
+            .route(
+                &format!("/accounts/acct-1/workers/scripts/worker-a/versions/{active_id}"),
+                get({
+                    let response = fixture["active_detail"].clone();
+                    move || {
+                        let response = response.clone();
+                        async move { Json(response) }
+                    }
+                }),
+            )
+            .route(
+                "/accounts/acct-1/workers/scripts/worker-a/deployments",
+                get({
+                    let response = fixture["deployments"].clone();
+                    move || {
+                        let response = response.clone();
+                        async move { Json(response) }
+                    }
+                }),
+            );
+        let client = CloudflareClient::new(test_config(spawn_router(router).await)).unwrap();
+        let evidence = client
+            .capture_worker_version_state(
+                "acct-1",
+                "worker-a",
+                100,
+                Some(&active_id),
+                Some(&inactive_id),
+            )
+            .await
+            .unwrap();
+        assert_eq!(evidence.versions.version_ids.len(), 17);
+        assert_eq!(evidence.deployments.deployments.len(), 18);
+        assert_eq!(evidence.detail.unwrap().version_id, active_id);
+        assert_eq!(evidence.versions.version_ids[0], inactive_id);
+        assert_eq!(evidence.deployments.candidate_absent, Some(true));
+    }
+
     #[test]
     fn detail_projection_omits_binding_values_and_requires_etag() {
         let detail = sanitize_version_detail(
@@ -2359,6 +2661,57 @@ mod tests {
         assert!(!outward.contains("private-id"));
         assert_eq!(detail.binding_descriptors.len(), 2);
         assert_eq!(detail.binding_projection_sha256.len(), 64);
+    }
+
+    #[test]
+    fn redacted_secret_inheritance_requires_exact_visible_projection() {
+        let base_id = "11111111-1111-4111-8111-111111111111";
+        let candidate_id = "22222222-2222-4222-8222-222222222222";
+        let detail = |id, bindings| {
+            sanitize_version_detail(
+                json!({
+                    "id":id,
+                    "resources":{
+                        "script":{"etag":"a".repeat(64)},
+                        "script_runtime":runtime(),
+                        "bindings":bindings
+                    }
+                }),
+                Some(id),
+                proof(),
+            )
+            .unwrap()
+        };
+        let base = detail(base_id, json!([{"name":"SECRET","type":"secret_text"}]));
+        let metadata = json!({
+            "bindings":[{"name":"SECRET","type":"inherit","version_id":base_id}]
+        });
+        let expectation = prepare_worker_binding_expectation(&base, &metadata).unwrap();
+        let candidate = detail(
+            candidate_id,
+            json!([{"name":"SECRET","type":"secret_text"}]),
+        );
+        assert!(verify_worker_candidate_bindings(&expectation, &candidate).matched);
+        for changed in [
+            json!([]),
+            json!([{"name":"OTHER","type":"secret_text"}]),
+            json!([{"name":"SECRET","type":"plain_text","text":"fixture"}]),
+            json!([{"name":"SECRET","type":"secret_text","text":"fixture"}]),
+        ] {
+            assert!(
+                !verify_worker_candidate_bindings(&expectation, &detail(candidate_id, changed))
+                    .matched
+            );
+        }
+        let explicit_redacted = json!({
+            "bindings":[{"name":"SECRET","type":"secret_text"}]
+        });
+        assert_eq!(
+            prepare_worker_binding_expectation(&base, &explicit_redacted)
+                .unwrap_err()
+                .code,
+            "workers.version_binding_plan_invalid"
+        );
     }
 
     #[test]
