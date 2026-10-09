@@ -2429,14 +2429,14 @@ mod tests {
         for errors in [Value::Null, json!([])] {
             let envelope = json!({"success":true,"errors":errors,"result":{"items":[]}});
             assert_eq!(
-                valid_envelope_result(&envelope).unwrap(),
+                super::valid_envelope_result(&envelope).unwrap(),
                 &json!({"items":[]})
             );
         }
         for errors in [json!([{"code":1000}]), json!({}), json!(""), json!(false)] {
             let envelope = json!({"success":true,"errors":errors,"result":{}});
             assert_eq!(
-                valid_envelope_result(&envelope).unwrap_err().code,
+                super::valid_envelope_result(&envelope).unwrap_err().code,
                 "workers.version_response_contradictory"
             );
         }
@@ -2446,7 +2446,7 @@ mod tests {
             json!({"success":"true","errors":[],"result":{}}),
         ] {
             assert_eq!(
-                valid_envelope_result(&envelope).unwrap_err().code,
+                super::valid_envelope_result(&envelope).unwrap_err().code,
                 "workers.version_response_contradictory"
             );
         }
@@ -2456,7 +2456,7 @@ mod tests {
                 envelope["result"] = result;
             }
             assert_eq!(
-                valid_envelope_result(&envelope).unwrap_err().code,
+                super::valid_envelope_result(&envelope).unwrap_err().code,
                 "workers.version_response_result_missing"
             );
         }
