@@ -5373,6 +5373,14 @@ fn spawn_fake_worker_version_api_with_faults(
                     response["messages"] = Value::Null;
                 }
                 if response["result"]["resources"].is_object() {
+                    for binding in response["result"]["resources"]["bindings"]
+                        .as_array_mut()
+                        .unwrap()
+                    {
+                        if binding["type"] == json!("secret_text") {
+                            binding.as_object_mut().unwrap().remove("text");
+                        }
+                    }
                     response["result"]["resources"]["script_runtime"]
                         .as_object_mut()
                         .unwrap()

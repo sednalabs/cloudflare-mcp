@@ -302,4 +302,9 @@ Preserved curated tool families:
   distinct from normalized semantic fingerprints. Full redacted provider
   fixtures, negative projections and actual stdio upload/readback tests cover
   these joins without live provider writes.
+- Provider-redacted secret binding descriptors are read-only evidence. Keep
+  name/type-only provider normalization separate from explicit upload binding
+  validation; absence of secret text in a GET cannot authorize an explicit
+  secret upload or attest unknown secret-value equality. Exact-base strict
+  inheritance and visible projection drift checks remain required.
 - Queues readback tools (`queues_list`, `queues_get`, `queues_get_metrics`, `queues_list_consumers`, `queues_health`) are first-class contract tools and must remain present for operational backlog/DLQ/consumer diagnostics.

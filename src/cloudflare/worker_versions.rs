@@ -7,7 +7,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::client::{AdapterError, CloudflareClient, decode_json_rejecting_duplicate_object_keys};
-use crate::worker_version_upload::canonicalize_provider_binding;
+use crate::worker_version_upload::{
+    canonicalize_explicit_upload_binding, canonicalize_provider_binding,
+};
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_VERSION_IDS: usize = 4096;
@@ -1798,7 +1800,7 @@ pub(crate) fn prepare_worker_binding_expectation(
             inherited.insert("name".to_string(), Value::String(name.to_string()));
             Value::Object(inherited)
         } else {
-            Value::Object(canonicalize_provider_binding(binding).map_err(|_| {
+            Value::Object(canonicalize_explicit_upload_binding(binding).map_err(|_| {
                 operation_error(
                     "workers.version_binding_plan_invalid",
                     "reviewed explicit binding was outside the closed canonical projection",
@@ -2659,6 +2661,49 @@ mod tests {
         assert!(!outward.contains("private-id"));
         assert_eq!(detail.binding_descriptors.len(), 2);
         assert_eq!(detail.binding_projection_sha256.len(), 64);
+    }
+
+    #[test]
+    fn redacted_secret_inheritance_requires_exact_visible_projection() {
+        let base_id = "11111111-1111-4111-8111-111111111111";
+        let candidate_id = "22222222-2222-4222-8222-222222222222";
+        let detail = |id, bindings| {
+            sanitize_version_detail(
+                json!({
+                    "id":id,
+                    "resources":{
+                        "script":{"etag":"a".repeat(64)},
+                        "script_runtime":runtime(),
+                        "bindings":bindings
+                    }
+                }),
+                Some(id),
+                proof(),
+            )
+            .unwrap()
+        };
+        let base = detail(base_id, json!([{"name":"SECRET","type":"secret_text"}]));
+        let metadata = json!({
+            "bindings":[{"name":"SECRET","type":"inherit","version_id":base_id}]
+        });
+        let expectation = prepare_worker_binding_expectation(&base, &metadata).unwrap();
+        let candidate = detail(candidate_id, json!([{"name":"SECRET","type":"secret_text"}]));
+        assert!(verify_worker_candidate_bindings(&expectation, &candidate).matched);
+        for changed in [
+            json!([]),
+            json!([{"name":"OTHER","type":"secret_text"}]),
+            json!([{"name":"SECRET","type":"plain_text","text":"fixture"}]),
+            json!([{"name":"SECRET","type":"secret_text","text":"fixture"}]),
+        ] {
+            assert!(!verify_worker_candidate_bindings(&expectation, &detail(candidate_id, changed)).matched);
+        }
+        let explicit_redacted = json!({
+            "bindings":[{"name":"SECRET","type":"secret_text"}]
+        });
+        assert_eq!(
+            prepare_worker_binding_expectation(&base, &explicit_redacted).unwrap_err().code,
+            "workers.version_binding_plan_invalid"
+        );
     }
 
     #[test]

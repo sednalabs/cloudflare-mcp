@@ -360,6 +360,19 @@ fn canonical_compatibility_date(value: &str) -> bool {
 pub(crate) fn canonicalize_provider_binding(
     binding: &Map<String, Value>,
 ) -> Result<Map<String, Value>, WorkerUploadError> {
+    // Version GET responses deliberately omit secret bytes. This representation
+    // proves only the visible descriptor; it must never become an upload input.
+    if binding.get("type").and_then(Value::as_str) == Some("secret_text")
+        && !binding.contains_key("text")
+    {
+        require_only_fields(binding, &["name", "type"])?;
+        binding
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(canonical_binding_name)
+            .ok_or_else(binding_invalid)?;
+        return Ok(binding.clone());
+    }
     if binding.get("type").and_then(Value::as_str) == Some("inherit") {
         return Err(version_upload_error(
             "workers.version_binding_provider_inherit_unresolved",
@@ -367,6 +380,12 @@ pub(crate) fn canonicalize_provider_binding(
             "Capture a provider detail whose binding projection is fully materialized; implicit, latest, and unresolved provider inheritance cannot be proven.",
         ));
     }
+    canonicalize_binding(binding, None)
+}
+
+pub(crate) fn canonicalize_explicit_upload_binding(
+    binding: &Map<String, Value>,
+) -> Result<Map<String, Value>, WorkerUploadError> {
     canonicalize_binding(binding, None)
 }
 
@@ -1101,6 +1120,44 @@ mod tests {
         assert_ne!(expected, drifted);
         assert_eq!(expected["namespace"], json!("default"));
         assert_eq!(drifted["namespace"], json!("tenant-a"));
+    }
+
+    #[test]
+    fn redacted_provider_secret_is_not_an_explicit_upload_binding() {
+        let redacted = json!({"name":"SECRET","type":"secret_text"});
+        let projection = canonicalize_provider_binding(redacted.as_object().unwrap()).unwrap();
+        assert_eq!(Value::Object(projection), redacted);
+        assert!(
+            super::canonicalize_explicit_upload_binding(redacted.as_object().unwrap()).is_err()
+        );
+        for malformed in [
+            json!({"name":"SECRET","type":"plain_text"}),
+            json!({"name":"SECRET","type":"secret_text","text":null}),
+            json!({"name":"SECRET","type":"secret_text","future":true}),
+            json!({"name":"bad-name","type":"secret_text"}),
+        ] {
+            assert!(canonicalize_provider_binding(malformed.as_object().unwrap()).is_err());
+        }
+        let metadata = json!({
+            "main_module":"index.js",
+            "compatibility_date":"2026-07-10",
+            "compatibility_flags":[],
+            "bindings":[redacted]
+        });
+        let error = build_worker_version_upload(
+            WorkerUploadInput {
+                script_path: None,
+                script_content: Some("export default {}"),
+                script_content_base64: None,
+                multipart_path: None,
+                main_module: Some("index.js"),
+                metadata: &metadata,
+                content_type: None,
+            },
+            BASE,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "workers.version_upload_binding_invalid");
     }
 
     #[test]

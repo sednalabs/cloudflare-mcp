@@ -20,3 +20,8 @@ unknown-field and semantic-drift denials. The stdio tests exercise the guarded
 upload/readback path with synthetic provider responses and verify one POST,
 strict inheritance, no deployment, no secret output and consumed-approval
 replay denial. No real provider mutation is performed by these tests.
+
+The reader accepts the observed name/type-only secret descriptors, while the
+explicit upload validator still rejects them without text. Additional negative
+cases cover missing, renamed, retyped and newly exposed secret fields. Matching
+redacted projections is not a claim that unknown secret bytes were compared.

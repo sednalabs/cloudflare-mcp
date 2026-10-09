@@ -1386,6 +1386,13 @@ The bounded read-only annotation projection accepts `workers/message`,
 Annotations participate in the metadata fingerprint, so a changed annotation
 cannot silently pass upload-to-readback comparison. This response support does
 not permit annotations or other additional fields in the closed upload request.
+Version GET responses may expose secret bindings as name/type descriptors with
+no secret text. The reader preserves that redacted projection; it neither
+fabricates secret bytes nor proves equality of values the provider withholds.
+Exact-base strict inheritance must remain pinned, and readback must match the
+visible projection. Missing, renamed, retyped or newly exposed secret fields
+are drift, not equivalent redaction. Explicit secret uploads still require
+their text, and a redacted descriptor is never a valid explicit upload input.
 The redacted provider-shape fixture covers the full version/deployment result
 inventory, distinct active and latest inactive versions, omitted flags and
 token-created metadata; no live provider write is needed to qualify parsing.
