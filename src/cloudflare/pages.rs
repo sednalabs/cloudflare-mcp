@@ -54,7 +54,7 @@ impl CloudflareClient {
         let account_id = require_non_empty("account_id", account_id)?;
         let token = self.bearer_token()?;
         let url = self.endpoint(&format!("/accounts/{account_id}/pages/projects"));
-        let mut query = Vec::new();
+        let mut query = Vec::with_capacity(2);
         if let Some(page) = page {
             query.push(("page", page));
         }
@@ -67,16 +67,11 @@ impl CloudflareClient {
                 "cloudflare.pages.projects.list",
                 RetryPolicy::Idempotent,
                 || {
-                    let builder = self
-                        .http
+                    self.http
                         .get(url.clone())
                         .bearer_auth(&token)
-                        .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone());
-                    if query.is_empty() {
-                        builder
-                    } else {
-                        builder.query(&query)
-                    }
+                        .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone())
+                        .query(&query)
                 },
             )
             .await?;
