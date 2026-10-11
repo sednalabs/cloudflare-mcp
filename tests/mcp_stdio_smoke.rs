@@ -7034,8 +7034,8 @@ fn pages_project_list_preserves_optional_query_and_provider_errors_through_stdio
 
     let invalid = mcp.call_tool(21, "pages_list_projects", json!({"page": "2"}));
     assert!(
-        invalid.get("error").is_some(),
-        "invalid numeric argument must be rejected"
+        invalid["error"].is_object() || invalid["result"]["isError"] == json!(true),
+        "invalid numeric argument must be rejected: {invalid}"
     );
 
     let discovery = mcp.call_tool(22, "bindings_discover", json!({"include_workers": false}));
