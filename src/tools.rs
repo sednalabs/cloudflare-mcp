@@ -6522,11 +6522,11 @@ impl CloudflareMcp {
         Parameters(args): Parameters<PagesListProjectsArgs>,
     ) -> Result<CallToolResult, crate::McpError> {
         let account_id = resolve_account_id(self, args.account_id.as_deref())?;
-        let page = args.page.unwrap_or(1).max(1);
-        let per_page = args.per_page.unwrap_or(50).clamp(1, 100);
+        let page = args.page.map(|value| value.max(1));
+        let per_page = args.per_page.map(|value| value.clamp(1, 100));
         match self
             .cloudflare
-            .list_pages_projects(account_id, page, per_page)
+            .list_pages_projects_with_options(account_id, page, per_page)
             .await
         {
             Ok(page) => Ok(CallToolResult::structured(
@@ -9680,7 +9680,7 @@ impl CloudflareMcp {
         let pages = if args.include_pages {
             match self
                 .cloudflare
-                .list_pages_projects(account_id, 1, 100)
+                .list_pages_projects_with_options(account_id, None, None)
                 .await
             {
                 Ok(page) => page.items,
