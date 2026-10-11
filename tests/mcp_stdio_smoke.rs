@@ -7038,19 +7038,12 @@ fn pages_project_list_preserves_optional_query_and_provider_errors_through_stdio
         "invalid numeric argument must be rejected"
     );
 
-    let discovery = mcp.call_tool(
-        22,
-        "bindings_discover",
-        json!({"include_workers": false}),
-    );
+    let discovery = mcp.call_tool(22, "bindings_discover", json!({"include_workers": false}));
     let discovery = structured_content(&discovery);
     assert_eq!(discovery["ok"], json!(true), "{discovery}");
     assert_eq!(discovery["status"], json!("complete"));
     assert_eq!(discovery["pages"][0]["name"], json!("site"));
-    assert_eq!(
-        discovery["completeness"]["sampled_first_page"],
-        json!(true)
-    );
+    assert_eq!(discovery["completeness"]["sampled_first_page"], json!(true));
     assert_eq!(
         requests.lock().expect("request log").as_slice(),
         [
