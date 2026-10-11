@@ -41,9 +41,26 @@ impl CloudflareClient {
         page: u32,
         per_page: u32,
     ) -> Result<Page<PagesProject>, AdapterError> {
+        self.list_pages_projects_with_options(account_id, Some(page), Some(per_page))
+            .await
+    }
+
+    pub async fn list_pages_projects_with_options(
+        &self,
+        account_id: &str,
+        page: Option<u32>,
+        per_page: Option<u32>,
+    ) -> Result<Page<PagesProject>, AdapterError> {
         let account_id = require_non_empty("account_id", account_id)?;
         let token = self.bearer_token()?;
         let url = self.endpoint(&format!("/accounts/{account_id}/pages/projects"));
+        let mut query = Vec::with_capacity(2);
+        if let Some(page) = page {
+            query.push(("page", page));
+        }
+        if let Some(per_page) = per_page {
+            query.push(("per_page", per_page));
+        }
 
         let envelope: CloudflareEnvelope<Vec<PagesProject>> = self
             .send_envelope(
@@ -54,7 +71,7 @@ impl CloudflareClient {
                         .get(url.clone())
                         .bearer_auth(&token)
                         .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone())
-                        .query(&[("page", page), ("per_page", per_page)])
+                        .query(&query)
                 },
             )
             .await?;

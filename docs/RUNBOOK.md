@@ -1689,6 +1689,16 @@ tools/call name=r2_put_object arguments='{
 }'
 ```
 
+## Pages Project Listing
+
+`pages_list_projects` follows Cloudflare's [optional list query parameters](https://developers.cloudflare.com/api/resources/pages/subresources/projects/methods/list/):
+omitted or null `page` and `per_page` do not introduce server-chosen query values.
+Start discovery without pagination arguments to retain provider defaults;
+`bindings_discover` uses the same default Pages read. Explicit pagination stays
+explicit, and provider rejections remain errors rather than silently falling
+back to a different request. The tool returns one page plus provider pagination
+metadata; it does not attest a complete account inventory.
+
 ## Pages Project Settings
 
 For `pages_update_project` and generic `api_mutate` using

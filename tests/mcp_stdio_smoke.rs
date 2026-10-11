@@ -5930,6 +5930,61 @@ test -z "$config" || printf '%s' '{"routes":[{"routePath":"/api/agent/changes/de
     path
 }
 
+fn spawn_fake_pages_project_list_api() -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind Pages list API");
+    let addr = listener.local_addr().expect("Pages list API address");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming().take(11) {
+            let mut stream = stream.expect("Pages list stream");
+            let (headers, body) = read_http_request(&mut stream);
+            assert!(body.is_empty(), "list requests must not carry a body");
+            let request = headers.lines().next().expect("request line").to_string();
+            recorded.lock().expect("request log").push(request.clone());
+            let target = request.split_whitespace().nth(1).expect("request target");
+            let path = target.split('?').next().expect("request path");
+            let rejected = target == "/accounts/acct-1/pages/projects?page=99";
+            let result = match path {
+                "/accounts/acct-1/pages/projects" => json!([{
+                    "id": "project-1", "name": "site", "domains": null,
+                    "subdomain": "site.pages.dev", "production_branch": "main"
+                }]),
+                "/accounts/acct-1/d1/database" | "/accounts/acct-1/queues" => json!([]),
+                _ => panic!("unexpected fixture path: {path}"),
+            };
+            let response = if rejected {
+                json!({
+                    "success": false, "result": null, "messages": [],
+                    "errors": [{"code": 8000024, "message": "Invalid list options"}]
+                })
+            } else {
+                json!({
+                    "success": true, "errors": [], "messages": [], "result": result,
+                    "result_info": {
+                        "page": 1, "per_page": 20, "count": 1,
+                        "total_count": 1, "total_pages": 1
+                    }
+                })
+            };
+            let response = serde_json::to_vec(&response).expect("serialize list response");
+            let status = if rejected {
+                "400 Bad Request"
+            } else {
+                "200 OK"
+            };
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                response.len()
+            )
+            .expect("write list headers");
+            stream.write_all(&response).expect("write list body");
+        }
+    });
+    (format!("http://{addr}"), requests)
+}
+
 fn spawn_fake_pages_direct_upload_api(
     expect_check_missing: bool,
 ) -> (String, Arc<Mutex<Vec<String>>>) {
@@ -6942,6 +6997,70 @@ fn r2_get_object_auto_writes_binary_to_file_through_stdio_boundary() {
         ["HEAD /bucket-a/bin/blob.dat", "GET /bucket-a/bin/blob.dat"]
     );
     let _ = fs::remove_dir_all(output_dir);
+}
+
+#[test]
+fn pages_project_list_preserves_optional_query_and_provider_errors_through_stdio() {
+    let (base_url, requests) = spawn_fake_pages_project_list_api();
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let cases = [
+        json!({}),
+        json!({"page": null, "per_page": null}),
+        json!({"page": 2}),
+        json!({"per_page": 25}),
+        json!({"page": 2, "per_page": 25}),
+        json!({"page": 0, "per_page": 0}),
+        json!({"per_page": 101}),
+    ];
+    for (index, arguments) in cases.into_iter().enumerate() {
+        let response = mcp.call_tool(index as u64 + 2, "pages_list_projects", arguments);
+        let content = structured_content(&response);
+        assert_eq!(content["ok"], json!(true), "{content}");
+        assert_eq!(content["account_id"], json!("acct-1"));
+        assert_eq!(content["page"]["items"][0]["name"], json!("site"));
+        assert_eq!(content["page"]["items"][0]["domains"], json!([]));
+        assert_eq!(
+            content["page"]["page_info"],
+            json!({
+                "page": 1, "per_page": 20, "count": 1,
+                "total_count": 1, "total_pages": 1
+            })
+        );
+    }
+    let rejected = mcp.call_tool(20, "pages_list_projects", json!({"page": 99}));
+    let rejected = structured_content(&rejected);
+    assert_eq!(rejected["ok"], json!(false));
+    assert_eq!(rejected["error"]["status"], json!(400));
+
+    let invalid = mcp.call_tool(21, "pages_list_projects", json!({"page": "2"}));
+    assert!(
+        invalid["error"].is_object() || invalid["result"]["isError"] == json!(true),
+        "invalid numeric argument must be rejected: {invalid}"
+    );
+
+    let discovery = mcp.call_tool(22, "bindings_discover", json!({"include_workers": false}));
+    let discovery = structured_content(&discovery);
+    assert_eq!(discovery["ok"], json!(true), "{discovery}");
+    assert_eq!(discovery["status"], json!("complete"));
+    assert_eq!(discovery["pages"][0]["name"], json!("site"));
+    assert_eq!(discovery["completeness"]["sampled_first_page"], json!(true));
+    assert_eq!(
+        requests.lock().expect("request log").as_slice(),
+        [
+            "GET /accounts/acct-1/pages/projects HTTP/1.1",
+            "GET /accounts/acct-1/pages/projects HTTP/1.1",
+            "GET /accounts/acct-1/pages/projects?page=2 HTTP/1.1",
+            "GET /accounts/acct-1/pages/projects?per_page=25 HTTP/1.1",
+            "GET /accounts/acct-1/pages/projects?page=2&per_page=25 HTTP/1.1",
+            "GET /accounts/acct-1/pages/projects?page=1&per_page=1 HTTP/1.1",
+            "GET /accounts/acct-1/pages/projects?per_page=100 HTTP/1.1",
+            "GET /accounts/acct-1/pages/projects?page=99 HTTP/1.1",
+            "GET /accounts/acct-1/d1/database?page=1&per_page=100 HTTP/1.1",
+            "GET /accounts/acct-1/queues HTTP/1.1",
+            "GET /accounts/acct-1/pages/projects HTTP/1.1",
+        ],
+        "explicit options, errors and discovery must not introduce a fallback or default request"
+    );
 }
 
 #[test]
