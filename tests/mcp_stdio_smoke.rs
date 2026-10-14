@@ -13,6 +13,9 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+#[path = "support/r2_publication.rs"]
+mod r2_publication;
+
 fn sha256_hex(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.as_bytes());

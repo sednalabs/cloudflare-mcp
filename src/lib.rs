@@ -38,6 +38,7 @@ pub mod portal;
 #[allow(dead_code)] // staged low-level boundary; lifecycle consumers are intentionally out of scope
 pub(crate) mod private_file_custody;
 pub mod publish;
+pub mod r2_publication;
 pub mod resources;
 pub mod server;
 pub(crate) mod sql_preflight;

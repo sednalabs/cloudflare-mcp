@@ -651,6 +651,12 @@ pub struct R2PutObjectArgs {
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
     #[serde(default)]
+    pub if_none_match: Option<String>,
+    #[serde(default)]
+    pub if_match: Option<String>,
+    #[serde(default)]
+    pub expected_request_sha256: Option<String>,
+    #[serde(default)]
     pub dry_run: bool,
 }
 
@@ -7060,6 +7066,14 @@ impl CloudflareMcp {
                 Ok(download) => download,
                 Err(err) => return Ok(adapter_error_result(err)),
             };
+            let complete = crate::r2_publication::complete_read(
+                download.status,
+                args.range.as_deref(),
+                download.range.as_deref(),
+                download.truncated,
+                download.content_length,
+                download.bytes_written,
+            );
             return Ok(CallToolResult::structured(json!({
                 "ok": true,
                 "operation": "r2_get_object",
@@ -7074,6 +7088,8 @@ impl CloudflareMcp {
                 "content_type": download.content_type,
                 "content_length": download.content_length,
                 "etag": download.etag,
+                "complete": complete,
+                "strong_etag": download.etag.as_deref().filter(|etag| complete && crate::r2_publication::is_strong_etag(etag)),
                 "last_modified": download.last_modified,
                 "range": download.range,
                 "truncated": download.truncated,
@@ -7111,6 +7127,14 @@ impl CloudflareMcp {
             &object.body
         };
         let utf8_body = std::str::from_utf8(body).ok();
+        let complete = crate::r2_publication::complete_read(
+            object.status,
+            effective_range.as_deref(),
+            object.range.as_deref(),
+            truncated,
+            object.content_length,
+            body.len() as u64,
+        );
         if response_mode == "auto" && utf8_body.is_none() {
             if effective_output_path.is_some() {
                 let output_path =
@@ -7128,6 +7152,7 @@ impl CloudflareMcp {
                     true,
                     output_path_source,
                     persisted_output_path_active,
+                    complete,
                 ));
             }
             return Ok(CallToolResult::structured_error(json!({
@@ -7192,6 +7217,9 @@ impl CloudflareMcp {
             "content_type": object.content_type,
             "content_length": object.content_length,
             "etag": object.etag,
+            "complete": complete,
+            "strong_etag": object.etag.as_deref().filter(|etag| complete && crate::r2_publication::is_strong_etag(etag)),
+            "sha256": crate::r2_publication::digest(body),
             "last_modified": object.last_modified,
             "range": object.range,
             "encoding": encoding,
@@ -7249,11 +7277,55 @@ impl CloudflareMcp {
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, crate::McpError> {
         let account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        if !crate::r2_publication::valid_target(account_id, &args.bucket_name, &args.object_key) {
+            return Ok(invalid_argument_result(
+                "r2.invalid_target",
+                "Use exact nonempty account/bucket identities and an object key without dot path segments.",
+                "Do not rely on whitespace trimming or URL path normalization to select an R2 object.",
+            ));
+        }
         let body = match r2_write_body(args.content_text.as_deref(), args.content_base64.as_deref())
         {
             Ok(body) => body,
             Err(base) => return Ok(base),
         };
+        let condition = match crate::r2_publication::R2WriteCondition::parse(
+            args.if_none_match.as_deref(),
+            args.if_match.as_deref(),
+        ) {
+            Ok(condition) => condition,
+            Err(message) => {
+                return Ok(invalid_argument_result(
+                    "r2.invalid_condition",
+                    message,
+                    "Caller must select the ETag from the same complete object GET; PUT does not attest read provenance.",
+                ));
+            }
+        };
+        let payload_sha256 = crate::r2_publication::digest(&body);
+        let request_sha256 = crate::r2_publication::digest(
+            &serde_json::to_vec(&json!({
+                "contract": "r2-put-v1", "account_id": account_id,
+                "bucket_name": args.bucket_name, "object_key": args.object_key,
+                "payload_sha256": payload_sha256, "condition": condition,
+                "content_type": args.content_type, "metadata": args.metadata,
+            }))
+            .expect("R2 request JSON serializes"),
+        );
+        if args
+            .expected_request_sha256
+            .as_deref()
+            .is_some_and(|expected| expected != request_sha256)
+            || (!args.dry_run
+                && condition.header().is_some()
+                && args.expected_request_sha256.is_none())
+        {
+            return Ok(invalid_argument_result(
+                "r2.preview_mismatch",
+                "Conditional apply requires the exact request_sha256 returned by dry_run.",
+                "Preview the complete unchanged request, then pass expected_request_sha256 on apply. This digest is equality evidence, not provider or operator authority.",
+            ));
+        }
         let metadata = args
             .metadata
             .iter()
@@ -7267,6 +7339,8 @@ impl CloudflareMcp {
             body_len,
             args.content_type.as_deref(),
             metadata.len(),
+            &payload_sha256,
+            &condition,
         );
         let audit = MutationAuditSession::start(
             Some(&parts),
@@ -7278,6 +7352,8 @@ impl CloudflareMcp {
                 "bytes": body_len,
                 "content_type": args.content_type.clone(),
                 "metadata_keys": metadata.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+                "payload_sha256": payload_sha256,
+                "condition": condition,
             }),
             args.dry_run,
         );
@@ -7293,17 +7369,19 @@ impl CloudflareMcp {
                 "content_type": args.content_type.clone(),
                 "metadata_keys": metadata.iter().map(|(key, _)| key).collect::<Vec<_>>(),
                 "dry_run_note": "No R2 object write applied.",
+                "publication_state": "previewed",
             }))
         } else {
             match self
                 .cloudflare
-                .put_r2_object(
+                .put_r2_object_conditional(
                     account_id,
                     &args.bucket_name,
                     &args.object_key,
                     body,
                     args.content_type.as_deref(),
                     &metadata,
+                    &condition,
                 )
                 .await
             {
@@ -7319,12 +7397,39 @@ impl CloudflareMcp {
                     "etag": result.etag,
                     "version_id": result.version_id,
                     "bytes_written": body_len,
+                    "publication_state": "submitted",
+                    "readback_required": true,
                 })),
                 Err(err) => adapter_error_result(err),
             }
         };
 
-        Ok(finalize_mutation_result(base, &plan, audit, args.dry_run))
+        let mut result = finalize_mutation_result(base, &plan, audit, args.dry_run);
+        if let Some(content) = result
+            .structured_content
+            .as_mut()
+            .and_then(Value::as_object_mut)
+        {
+            content.insert("payload_sha256".to_string(), json!(payload_sha256));
+            content.insert("request_sha256".to_string(), json!(request_sha256));
+            content.insert("condition".to_string(), json!(condition));
+            if result.is_error == Some(true) {
+                let code = content
+                    .get("error")
+                    .and_then(|error| error.get("code"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                content.insert(
+                    "publication_state".to_string(),
+                    json!(match code {
+                        "cloudflare.r2_precondition_failed" => "not_applied",
+                        "cloudflare.r2_put_uncertain" => "reconcile_only",
+                        _ => "not_submitted",
+                    }),
+                );
+            }
+        }
+        Ok(result)
     }
 
     #[tool(
@@ -13222,6 +13327,7 @@ fn r2_write_body(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_r2_put_object(
     account_id: &str,
     bucket_name: &str,
@@ -13229,6 +13335,8 @@ fn plan_r2_put_object(
     bytes: usize,
     content_type: Option<&str>,
     metadata_count: usize,
+    payload_sha256: &str,
+    condition: &crate::r2_publication::R2WriteCondition,
 ) -> MutationPlan {
     MutationPlan::new("r2_put_object")
         .step(
@@ -13241,6 +13349,8 @@ fn plan_r2_put_object(
                 "bytes": bytes,
                 "content_type": content_type,
                 "metadata_count": metadata_count,
+                "payload_sha256": payload_sha256,
+                "condition": condition,
             }),
         )
         .step(
@@ -14877,6 +14987,7 @@ fn write_r2_inline_body_to_file_result(
     auto_switched_to_file: bool,
     output_path_source: Option<&str>,
     persisted_output_path: bool,
+    complete: bool,
 ) -> CallToolResult {
     if let Err(err) = fs::write(output_path, body) {
         return CallToolResult::structured_error(json!({
@@ -14905,6 +15016,8 @@ fn write_r2_inline_body_to_file_result(
         "content_type": object.content_type,
         "content_length": object.content_length,
         "etag": object.etag,
+        "complete": complete,
+        "strong_etag": object.etag.as_deref().filter(|etag| complete && crate::r2_publication::is_strong_etag(etag)),
         "last_modified": object.last_modified,
         "range": object.range,
         "truncated": truncated,

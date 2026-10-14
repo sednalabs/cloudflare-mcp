@@ -193,6 +193,7 @@ struct R2RequestOptions<'a> {
     content_type: Option<&'a str>,
     metadata: &'a [(String, String)],
     body: Vec<u8>,
+    condition: Option<&'a crate::r2_publication::R2WriteCondition>,
 }
 
 struct R2Response {
@@ -1454,6 +1455,7 @@ impl CloudflareClient {
                 object_key,
                 R2RequestOptions {
                     range,
+                    condition: None,
                     content_type: None,
                     metadata: &[],
                     body: Vec::new(),
@@ -1489,6 +1491,7 @@ impl CloudflareClient {
                 object_key,
                 R2RequestOptions {
                     range: None,
+                    condition: None,
                     content_type: None,
                     metadata: &[],
                     body: Vec::new(),
@@ -1527,6 +1530,7 @@ impl CloudflareClient {
                 object_key,
                 R2RequestOptions {
                     range,
+                    condition: None,
                     content_type: None,
                     metadata: &[],
                     body: Vec::new(),
@@ -1613,6 +1617,29 @@ impl CloudflareClient {
         content_type: Option<&str>,
         metadata: &[(String, String)],
     ) -> Result<R2PutObjectResult, AdapterError> {
+        self.put_r2_object_conditional(
+            account_id,
+            bucket_name,
+            object_key,
+            body,
+            content_type,
+            metadata,
+            &crate::r2_publication::R2WriteCondition::Unconditional,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn put_r2_object_conditional(
+        &self,
+        account_id: &str,
+        bucket_name: &str,
+        object_key: &str,
+        body: Vec<u8>,
+        content_type: Option<&str>,
+        metadata: &[(String, String)],
+        condition: &crate::r2_publication::R2WriteCondition,
+    ) -> Result<R2PutObjectResult, AdapterError> {
         let response = self
             .r2_request(
                 reqwest::Method::PUT,
@@ -1621,6 +1648,7 @@ impl CloudflareClient {
                 object_key,
                 R2RequestOptions {
                     range: None,
+                    condition: Some(condition),
                     content_type,
                     metadata,
                     body,
@@ -1656,6 +1684,9 @@ impl CloudflareClient {
             .await?;
 
         let body = open.response.bytes().await.map_err(|err| {
+            if method == reqwest::Method::PUT {
+                return r2_put_uncertain(Some(open.status));
+            }
             AdapterError::new(
                 "cloudflare.r2_body_read_failed",
                 format!("failed to read R2 object body: {err}"),
@@ -1681,7 +1712,13 @@ impl CloudflareClient {
     ) -> Result<R2OpenResponse, AdapterError> {
         let account_id = require_non_empty("account_id", account_id)?;
         let bucket_name = require_non_empty("bucket_name", bucket_name)?;
-        let object_key = require_non_empty("object_key", object_key)?;
+        if !crate::r2_publication::valid_target(account_id, bucket_name, object_key) {
+            return Err(AdapterError::new(
+                "cloudflare.r2_target_invalid",
+                "R2 target cannot contain empty identities, bucket slashes or dot path segments",
+                "Use exact object-key bytes; URL-normalized dot segments cannot be signed safely.",
+            ));
+        }
         let access_key_id = self.cfg.r2_access_key_id.as_deref().ok_or_else(|| {
             AdapterError::new(
                 "cloudflare.r2_credentials_missing",
@@ -1702,6 +1739,22 @@ impl CloudflareClient {
             .clone()
             .unwrap_or_else(|| format!("https://{account_id}.r2.cloudflarestorage.com"));
         let endpoint = endpoint.trim_end_matches('/');
+        let endpoint_url = Url::parse(endpoint).map_err(|_| r2_endpoint_invalid())?;
+        let loopback_http = endpoint_url.scheme() == "http"
+            && matches!(
+                endpoint_url.host_str(),
+                Some("127.0.0.1" | "localhost" | "[::1]") // DevSkim: ignore DS162092 -- explicit loopback-only fixture exception, not a production destination
+            );
+        if !(endpoint_url.scheme() == "https" || loopback_http)
+            || !endpoint_url.username().is_empty()
+            || endpoint_url.password().is_some()
+            || endpoint_url.query().is_some()
+            || endpoint_url.fragment().is_some()
+            || endpoint_url.path() != "/"
+            || endpoint_url.host_str().is_none()
+        {
+            return Err(r2_endpoint_invalid());
+        }
         let canonical_uri = format!(
             "/{}/{}",
             aws_uri_encode(bucket_name, false),
@@ -1711,16 +1764,10 @@ impl CloudflareClient {
         let now = OffsetDateTime::now_utc();
         let amz_date = aws_amz_date(now);
         let short_date = aws_short_date(now);
-        let host = Url::parse(endpoint)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_string))
-            .ok_or_else(|| {
-                AdapterError::new(
-                    "cloudflare.r2_endpoint_invalid",
-                    "R2 endpoint must be an absolute URL with a host",
-                    "Set CLOUDFLARE_MCP_R2_ENDPOINT to a valid https endpoint or unset it for the account default.",
-                )
-            })?;
+        let host = match endpoint_url.port() {
+            Some(port) => format!("{}:{port}", endpoint_url.host_str().unwrap()),
+            None => endpoint_url.host_str().unwrap().to_string(),
+        };
 
         let payload_hash = sha256_hex(&options.body);
         let mut signed_headers = vec![
@@ -1728,6 +1775,17 @@ impl CloudflareClient {
             ("x-amz-content-sha256".to_string(), payload_hash.clone()),
             ("x-amz-date".to_string(), amz_date.clone()),
         ];
+        if let Some((name, value)) = options.condition.and_then(|condition| condition.header()) {
+            // Validate again at the adapter boundary, including direct Rust callers.
+            if name == "if-match" && !crate::r2_publication::is_strong_etag(value) {
+                return Err(AdapterError::new(
+                    "cloudflare.r2_condition_invalid",
+                    "Invalid strong ETag",
+                    "Use a single strong ETag from a complete GET.",
+                ));
+            }
+            signed_headers.push((name.to_string(), value.to_string()));
+        }
         if let Some(range) = options.range.filter(|value| !value.trim().is_empty()) {
             signed_headers.push(("range".to_string(), range.trim().to_string()));
         }
@@ -1744,6 +1802,13 @@ impl CloudflareClient {
             }
         }
         signed_headers.sort_by(|left, right| left.0.cmp(&right.0));
+        if signed_headers.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(AdapterError::new(
+                "cloudflare.r2_metadata_invalid",
+                "Duplicate normalized R2 metadata header",
+                "Use unique case-insensitive metadata keys.",
+            ));
+        }
         let canonical_headers = signed_headers
             .iter()
             .map(|(name, value)| format!("{name}:{}\n", value.trim()))
@@ -1768,51 +1833,24 @@ impl CloudflareClient {
         );
 
         let mut headers = HeaderMap::new();
-        headers.insert(reqwest::header::HOST, header_value("host", &host)?);
-        headers.insert(
-            HeaderName::from_static("x-amz-content-sha256"),
-            header_value("x-amz-content-sha256", &payload_hash)?,
-        );
-        headers.insert(
-            HeaderName::from_static("x-amz-date"),
-            header_value("x-amz-date", &amz_date)?,
-        );
+        // Transmit precisely the same names/values that were canonicalized.
+        for (name, value) in &signed_headers {
+            let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                AdapterError::new(
+                    "cloudflare.r2_metadata_invalid",
+                    "Invalid R2 metadata header name",
+                    "Use simple ASCII metadata keys.",
+                )
+            })?;
+            headers.insert(name, header_value("R2 signed", value)?);
+        }
         headers.insert(
             reqwest::header::AUTHORIZATION,
             header_value("authorization", &authorization)?,
         );
-        if let Some(range) = options.range.filter(|value| !value.trim().is_empty()) {
-            headers.insert(reqwest::header::RANGE, header_value("range", range.trim())?);
-        }
-        if let Some(content_type) = options
-            .content_type
-            .filter(|value| !value.trim().is_empty())
-        {
-            headers.insert(
-                reqwest::header::CONTENT_TYPE,
-                header_value("content-type", content_type.trim())?,
-            );
-        }
-        for (name, value) in options.metadata {
-            let name = name.trim().to_ascii_lowercase();
-            if !name.is_empty() && !value.trim().is_empty() {
-                headers.insert(
-                    HeaderName::from_bytes(format!("x-amz-meta-{name}").as_bytes()).map_err(
-                        |err| {
-                            AdapterError::new(
-                                "cloudflare.r2_metadata_invalid",
-                                format!("invalid R2 metadata header name: {err}"),
-                                "Use simple ASCII metadata keys.",
-                            )
-                        },
-                    )?,
-                    header_value("x-amz-meta", value.trim())?,
-                );
-            }
-        }
 
         let response = self
-            .http
+            .reconciliation_http
             .request(method.clone(), url)
             .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone())
             .headers(headers)
@@ -1820,6 +1858,9 @@ impl CloudflareClient {
             .send()
             .await
             .map_err(|err| {
+                if method == reqwest::Method::PUT {
+                    return r2_put_uncertain(None);
+                }
                 AdapterError::new(
                     "cloudflare.r2_request_failed",
                     format!("R2 object {} failed: {err}", method.as_str()),
@@ -1831,6 +1872,14 @@ impl CloudflareClient {
         let status = response.status();
         let headers = response.headers().clone();
         if !status.is_success() {
+            if method == reqwest::Method::PUT {
+                // 412 is definite non-application even if its error body is lost.
+                return Err(if status == StatusCode::PRECONDITION_FAILED {
+                    AdapterError::new("cloudflare.r2_precondition_failed", "R2 PUT condition was not satisfied; object was not changed", "Read the exact object and reconsider the condition; never retry this unchanged write.").with_status(Some(412))
+                } else {
+                    r2_put_uncertain(Some(status.as_u16()))
+                });
+            }
             let body = response.text().await.unwrap_or_default();
             return Err(AdapterError::new(
                 "cloudflare.r2_request_rejected",
@@ -4120,6 +4169,18 @@ fn header_value(name: &'static str, value: &str) -> Result<HeaderValue, AdapterE
             "Check configured endpoint, credentials, and request arguments for invalid characters.",
         )
     })
+}
+
+fn r2_endpoint_invalid() -> AdapterError {
+    AdapterError::new(
+        "cloudflare.r2_endpoint_invalid",
+        "R2 endpoint must be an HTTPS origin without user info, path, query or fragment",
+        "Use the account R2 endpoint; HTTP is allowed only for loopback fixtures.",
+    )
+}
+
+fn r2_put_uncertain(status: Option<u16>) -> AdapterError {
+    AdapterError::new("cloudflare.r2_put_uncertain", "R2 PUT outcome requires reconciliation; no automatic retry is permitted", "Use an independent complete GET of the exact object and compare content SHA256 and ETag. Even absence does not prove a dispatched write cannot complete later.").with_status(status)
 }
 
 fn header_string(headers: &HeaderMap, name: reqwest::header::HeaderName) -> Option<String> {
