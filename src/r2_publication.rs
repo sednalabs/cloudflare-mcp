@@ -57,6 +57,7 @@ pub fn valid_target(account: &str, bucket: &str, key: &str) -> bool {
         && !bucket.is_empty()
         && bucket.trim() == bucket
         && !bucket.contains('/')
+        && !matches!(bucket, "." | "..")
         && !key.is_empty()
         && !key.split('/').any(|segment| matches!(segment, "." | ".."))
 }

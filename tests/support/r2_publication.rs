@@ -130,6 +130,8 @@ fn r2_conditional_preview_denials_have_zero_provider_calls() {
         ("bucket_name", " bucket-a"),
         ("object_key", "folder/../file.txt"),
         ("bucket_name", "bucket/a"),
+        ("bucket_name", "."),
+        ("bucket_name", ".."),
     ] {
         let mut candidate = args.clone();
         candidate[field] = json!(value);
