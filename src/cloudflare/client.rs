@@ -1712,7 +1712,13 @@ impl CloudflareClient {
     ) -> Result<R2OpenResponse, AdapterError> {
         let account_id = require_non_empty("account_id", account_id)?;
         let bucket_name = require_non_empty("bucket_name", bucket_name)?;
-        let object_key = require_non_empty("object_key", object_key)?;
+        if !crate::r2_publication::valid_target(account_id, bucket_name, object_key) {
+            return Err(AdapterError::new(
+                "cloudflare.r2_target_invalid",
+                "R2 target cannot contain empty identities, bucket slashes or dot path segments",
+                "Use exact object-key bytes; URL-normalized dot segments cannot be signed safely.",
+            ));
+        }
         let access_key_id = self.cfg.r2_access_key_id.as_deref().ok_or_else(|| {
             AdapterError::new(
                 "cloudflare.r2_credentials_missing",
@@ -1737,7 +1743,7 @@ impl CloudflareClient {
         let loopback_http = endpoint_url.scheme() == "http"
             && matches!(
                 endpoint_url.host_str(),
-                Some("127.0.0.1" | "localhost" | "[::1]")
+                Some("127.0.0.1" | "localhost" | "[::1]") // DevSkim: ignore DS162092 -- explicit loopback-only fixture exception, not a production destination
             );
         if !(endpoint_url.scheme() == "https" || loopback_http)
             || !endpoint_url.username().is_empty()

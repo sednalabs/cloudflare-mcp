@@ -3,11 +3,13 @@
 R2 conditional publication is covered through the actual stdio boundary in
 `tests/support/r2_publication.rs`: preview equality and zero-effect denial,
 independently verified signed transmitted conditions, 412/nonretryable
-uncertainty, redirect refusal, and complete-GET strong-ETag authority.
+uncertainty, redirect refusal, and complete-GET qualified strong-ETag evidence.
 `r2_put_object` keeps legacy unconditional writes and adds mutually exclusive
 `if_none_match="*"` / single strong `if_match` plus
 `expected_request_sha256` for conditional apply. PUT success is `submitted`
 with independent readback required, never `applied-proven`.
+The generic write enforces caller-selected provider CAS, not read provenance;
+the caller retains the same complete GET used to select its correction ETag.
 
 Related docs:
 - `../README.md` for operator/client setup and runtime behavior.

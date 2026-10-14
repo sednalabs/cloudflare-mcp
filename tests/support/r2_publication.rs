@@ -4,7 +4,7 @@ use hmac::{Hmac, Mac};
 type Requests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
 fn fixture(responses: Vec<String>) -> (String, Requests, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap(); // DevSkim: ignore DS162092 -- ephemeral loopback-only fixture
     let endpoint = format!("http://{}", listener.local_addr().unwrap()); // DevSkim: ignore DS137138 -- loopback-only fixture
     let requests = Arc::new(Mutex::new(Vec::new()));
     let log = requests.clone();
@@ -65,6 +65,12 @@ fn hmac(key: &[u8], bytes: &[u8]) -> Vec<u8> {
 /// Independent verifier reconstructs SigV4 from the actual transmitted bytes,
 /// not the adapter's request-planning helpers.
 fn verify_signature(headers: &str, body: &[u8], condition: Option<(&str, &str)>) {
+    assert_eq!(
+        headers.lines().next(),
+        Some("PUT /bucket-a/folder/file.txt HTTP/1.1")
+    );
+    assert_eq!(header(headers, "content-type"), "text/plain");
+    assert_eq!(header(headers, "x-amz-meta-revision"), "v2");
     let authorization = header(headers, "authorization");
     let signed = authorization
         .split("SignedHeaders=")
@@ -109,7 +115,7 @@ fn verify_signature(headers: &str, body: &[u8], condition: Option<(&str, &str)>)
 
 #[test]
 fn r2_conditional_preview_denials_have_zero_provider_calls() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap(); // DevSkim: ignore DS162092 -- ephemeral loopback-only zero-call fixture
     listener.set_nonblocking(true).unwrap();
     let mut mcp = start(format!("http://{}", listener.local_addr().unwrap())); // DevSkim: ignore DS137138 -- loopback-only fixture
     let args = request_args();
@@ -120,6 +126,17 @@ fn r2_conditional_preview_denials_have_zero_provider_calls() {
         sha256_hex("candidate")
     );
     let mut id = 3;
+    for (field, value) in [
+        ("bucket_name", " bucket-a"),
+        ("object_key", "folder/../file.txt"),
+        ("bucket_name", "bucket/a"),
+    ] {
+        let mut candidate = args.clone();
+        candidate[field] = json!(value);
+        let rejected = structured_content(&mcp.call_tool(id, "r2_put_object", candidate)).clone();
+        assert_eq!(rejected["error"]["code"], "r2.invalid_target");
+        id += 1;
+    }
     for invalid in [
         json!({"if_match":"*"}),
         json!({"if_match":"W/\"v1\""}),
@@ -239,10 +256,10 @@ fn r2_put_conflict_and_uncertain_results_never_authorize_retry() {
 #[test]
 fn r2_signed_requests_do_not_follow_redirects() {
     for method in ["PUT", "GET"] {
-        let destination = TcpListener::bind("127.0.0.1:0").unwrap();
+        let destination = TcpListener::bind("127.0.0.1:0").unwrap(); // DevSkim: ignore DS162092 -- loopback-only never-follow destination
         destination.set_nonblocking(true).unwrap();
         let response = format!(
-            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{}/capture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{}/capture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", // DevSkim: ignore DS137138 -- loopback-only never-follow response
             destination.local_addr().unwrap()
         ); // DevSkim: ignore DS137138 -- loopback-only fixture
         let (endpoint, _, handle) = fixture(vec![response]);
@@ -301,4 +318,58 @@ fn r2_get_authority_uses_actual_complete_get_not_head_etag() {
         );
         handle.join().unwrap();
     }
+}
+
+#[test]
+fn r2_create_read_correct_conflict_and_readback_join_in_one_stdio_process() {
+    fn response(method: &str, body: &str, etag: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nETag: {etag}\r\nConnection: close\r\n\r\n{}",
+            if method == "PUT" { 0 } else { body.len() },
+            if method == "GET" { body } else { "" }
+        )
+    }
+    let (endpoint, requests, handle) = fixture(vec![
+        response("PUT", "", "\"v1\""),
+        response("HEAD", "candidate", "\"v1\""),
+        response("GET", "candidate", "\"v1\""),
+        response("PUT", "", "\"v2\""),
+        response("HEAD", "correction", "\"v2\""),
+        response("GET", "correction", "\"v2\""),
+        "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            .to_string(),
+        response("HEAD", "correction", "\"v2\""),
+        response("GET", "correction", "\"v2\""),
+    ]);
+    let mut mcp = start(endpoint);
+    let created = preview_apply(&mut mcp, request_args());
+    assert_eq!(created["publication_state"], "submitted");
+    let get_args = json!({"bucket_name":"bucket-a", "object_key":"folder/file.txt", "response_mode":"text", "max_bytes":100});
+    let initial = structured_content(&mcp.call_tool(4, "r2_get_object", get_args.clone())).clone();
+    assert_eq!(initial["complete"], true);
+    assert_eq!(initial["sha256"], created["payload_sha256"]);
+    let mut update = request_args();
+    update.as_object_mut().unwrap().remove("if_none_match");
+    update["if_match"] = initial["strong_etag"].clone();
+    update["content_text"] = json!("correction");
+    let preview = structured_content(&mcp.call_tool(5, "r2_put_object", update.clone())).clone();
+    update["dry_run"] = json!(false);
+    update["expected_request_sha256"] = preview["request_sha256"].clone();
+    let corrected = structured_content(&mcp.call_tool(6, "r2_put_object", update.clone())).clone();
+    assert_eq!(corrected["publication_state"], "submitted");
+    let current = structured_content(&mcp.call_tool(7, "r2_get_object", get_args.clone())).clone();
+    assert_eq!(current["complete"], true);
+    assert_eq!(current["sha256"], corrected["payload_sha256"]);
+    assert_eq!(current["strong_etag"], "\"v2\"");
+    let conflict = structured_content(&mcp.call_tool(8, "r2_put_object", update)).clone();
+    assert_eq!(conflict["publication_state"], "not_applied");
+    let unchanged = structured_content(&mcp.call_tool(9, "r2_get_object", get_args)).clone();
+    assert_eq!(unchanged["content"], current["content"]);
+    assert_eq!(unchanged["strong_etag"], current["strong_etag"]);
+    handle.join().unwrap();
+    let log = requests.lock().unwrap();
+    assert_eq!(log.len(), 9);
+    verify_signature(&log[0].0, &log[0].1, Some(("if-none-match", "*")));
+    verify_signature(&log[3].0, &log[3].1, Some(("if-match", "\"v1\"")));
+    assert_eq!(log[3].1, b"correction");
 }

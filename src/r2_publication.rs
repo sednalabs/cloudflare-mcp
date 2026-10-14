@@ -51,6 +51,16 @@ pub fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+pub fn valid_target(account: &str, bucket: &str, key: &str) -> bool {
+    !account.is_empty()
+        && account.trim() == account
+        && !bucket.is_empty()
+        && bucket.trim() == bucket
+        && !bucket.contains('/')
+        && !key.is_empty()
+        && !key.split('/').any(|segment| matches!(segment, "." | ".."))
+}
+
 pub fn complete_read(
     status: u16,
     requested_range: Option<&str>,
@@ -95,7 +105,7 @@ mod tests {
     }
 
     #[test]
-    fn only_full_get_can_supply_update_authority() {
+    fn only_full_get_is_qualified_complete_read_evidence() {
         assert!(complete_read(200, None, None, false, Some(3), 3));
         assert!(!complete_read(206, None, None, false, Some(3), 3));
         assert!(!complete_read(

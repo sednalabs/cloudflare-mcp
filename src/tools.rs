@@ -7277,6 +7277,13 @@ impl CloudflareMcp {
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, crate::McpError> {
         let account_id = resolve_account_id(self, args.account_id.as_deref())?;
+        if !crate::r2_publication::valid_target(account_id, &args.bucket_name, &args.object_key) {
+            return Ok(invalid_argument_result(
+                "r2.invalid_target",
+                "Use exact nonempty account/bucket identities and an object key without dot path segments.",
+                "Do not rely on whitespace trimming or URL path normalization to select an R2 object.",
+            ));
+        }
         let body = match r2_write_body(args.content_text.as_deref(), args.content_base64.as_deref())
         {
             Ok(body) => body,
@@ -7291,7 +7298,7 @@ impl CloudflareMcp {
                 return Ok(invalid_argument_result(
                     "r2.invalid_condition",
                     message,
-                    "Read the same complete object before a conditional update; do not use HEAD or partial GET authority.",
+                    "Caller must select the ETag from the same complete object GET; PUT does not attest read provenance.",
                 ));
             }
         };

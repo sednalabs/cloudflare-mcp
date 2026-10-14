@@ -1694,9 +1694,16 @@ For race-safe creation, use `if_none_match="*"`. For correction, perform a
 fresh `r2_get_object` of the same account, bucket and key and use its
 `strong_etag` as `if_match`. Only a complete GET supplies this field; HEAD,
 range responses, capped/truncated content, unknown body length, missing or
-weak ETags are not update authority. For small text, choose `response_mode=text`
+weak ETags are not qualified complete-read evidence. For small text, choose `response_mode=text`
 with a sufficient `max_bytes`; for larger objects use a complete file download.
 The ETag comes from the same GET as the returned bytes, never the earlier HEAD.
+The raw `etag` remains unqualified provider metadata. `strong_etag` is a
+complete-read convenience field, not an issued capability or authenticated
+provenance receipt. The generic PUT validates a caller-selected ETag and relies
+on the provider's compare-and-swap; it does not attest where that ETag was read.
+The caller is responsible for retaining the complete same-object GET and using
+its `strong_etag` for correction. Neither a preview hash nor another preflight
+read could authenticate that prior review or manufacture publication approval.
 
 Preview returns `payload_sha256`, the exact condition, and `request_sha256`,
 which binds account, bucket, key, body digest, content type and all metadata.
