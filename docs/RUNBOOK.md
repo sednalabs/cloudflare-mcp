@@ -1685,9 +1685,55 @@ tools/call name=r2_put_object arguments='{
   "bucket_name":"<bucket>",
   "object_key":"<key>",
   "content_text":"<content>",
+  "if_none_match":"*",
   "dry_run":true
 }'
 ```
+
+For race-safe creation, use `if_none_match="*"`. For correction, perform a
+fresh `r2_get_object` of the same account, bucket and key and use its
+`strong_etag` as `if_match`. Only a complete GET supplies this field; HEAD,
+range responses, capped/truncated content, unknown body length, missing or
+weak ETags are not update authority. For small text, choose `response_mode=text`
+with a sufficient `max_bytes`; for larger objects use a complete file download.
+The ETag comes from the same GET as the returned bytes, never the earlier HEAD.
+
+Preview returns `payload_sha256`, the exact condition, and `request_sha256`,
+which binds account, bucket, key, body digest, content type and all metadata.
+Apply the unchanged request with `dry_run=false` and
+`expected_request_sha256` equal to that preview. Conditional apply refuses a
+missing or changed preview digest before any provider call. Digests establish
+request equality, not authenticated approval. The tool accepts only mutually
+exclusive create-only `*` or one quoted strong ASCII ETag; it rejects weak tags,
+lists, wildcard matching, whitespace repair and control characters.
+Unconditional writes remain available for legacy generic callers, but do not
+provide compare-and-swap safety.
+
+PUT transmits the same condition headers included in its SigV4 signature and
+refuses redirects. Its states are:
+
+- `previewed`: zero provider calls and no object mutation.
+- `submitted`: successful PUT response, but `readback_required=true`; this is
+  not independent proof of the current object.
+- `not_applied`: HTTP 412 definitively rejected the precondition.
+- `reconcile_only`: a dispatched PUT's outcome is uncertain (including lost
+  response/body, redirects and other non-success statuses); `retryable=false`.
+- `not_submitted`: local configuration or validation refused dispatch.
+
+After a submitted or uncertain PUT, independently GET the exact object,
+require `complete=true`, compare its returned-byte `sha256` to the previewed
+payload and inspect its `strong_etag`. Do not automatically retry an uncertain
+write: a current absence or mismatch does not rule out a delayed first request.
+Resolve that uncertainty before making a new publication decision. A 412 may
+lead to a new read and deliberate new candidate, never blind unchanged replay.
+Raw provider PUT error bodies and transport URLs are not returned.
+
+Cloudflare documents [conditional PUT support](https://developers.cloudflare.com/r2/api/s3/api/)
+and [PreconditionFailed / HTTP 412](https://developers.cloudflare.com/r2/api/error-codes/).
+The adapter deliberately supports a narrower condition grammar than the API.
+These pure R2 policy rules remain adapter-local; existing Toolkit error
+sanitization is reused, and no second generic consumer justifies another
+Toolkit abstraction or a parallel registry, lock or publisher service.
 
 ## Pages Project Listing
 

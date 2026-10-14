@@ -1,5 +1,14 @@
 # Tool Contract Workflow
 
+R2 conditional publication is covered through the actual stdio boundary in
+`tests/support/r2_publication.rs`: preview equality and zero-effect denial,
+independently verified signed transmitted conditions, 412/nonretryable
+uncertainty, redirect refusal, and complete-GET strong-ETag authority.
+`r2_put_object` keeps legacy unconditional writes and adds mutually exclusive
+`if_none_match="*"` / single strong `if_match` plus
+`expected_request_sha256` for conditional apply. PUT success is `submitted`
+with independent readback required, never `applied-proven`.
+
 Related docs:
 - `../README.md` for operator/client setup and runtime behavior.
 - `../docs/CLIENT-CONTRACT.md` for explicit per-tool request argument expectations.

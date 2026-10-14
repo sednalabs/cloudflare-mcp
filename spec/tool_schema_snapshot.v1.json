@@ -4181,6 +4181,27 @@
             "default": false,
             "type": "boolean"
           },
+          "expected_request_sha256": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "if_match": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "if_none_match": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "metadata": {
             "additionalProperties": {
               "type": "string"
