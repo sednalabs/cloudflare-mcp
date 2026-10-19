@@ -16,6 +16,9 @@ use sha2::{Digest, Sha256};
 #[path = "support/r2_publication.rs"]
 mod r2_publication;
 
+#[path = "support/waf_rulesets.rs"]
+mod waf_rulesets;
+
 fn sha256_hex(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.as_bytes());
@@ -4916,7 +4919,11 @@ fn spawn_fake_cloudflare_api() -> String {
                 .ends_with("/rulesets/phases/http_request_firewall_custom/entrypoint")
             {
                 if method == "PUT" {
-                    waf_custom_ruleset = body_json.clone();
+                    for field in ["description", "rules"] {
+                        if let Some(value) = body_json.get(field) {
+                            waf_custom_ruleset[field] = value.clone();
+                        }
+                    }
                 }
                 json!({
                     "success": true,
