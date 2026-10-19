@@ -1,7 +1,7 @@
 //! Ruleset response -> entrypoint PUT projection and complete-state verification.
 //! Rule IDs are supported PUT fields; the ruleset's top-level ID is not.
 
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
 const RULE_FIELDS: &[&str] = &[
     "id",
@@ -37,7 +37,7 @@ pub(crate) fn write_body(ruleset: &Value) -> Result<Value, &'static str> {
     {
         return Err("ruleset.unsupported_fields");
     }
-    for field in ["id", "name", "kind", "phase", "version"] {
+    for field in ["id", "name", "kind", "phase"] {
         if !object
             .get(field)
             .and_then(Value::as_str)
@@ -45,6 +45,18 @@ pub(crate) fn write_body(ruleset: &Value) -> Result<Value, &'static str> {
         {
             return Err("ruleset.identity");
         }
+    }
+    // API examples/SDKs use decimal strings; the object reference also describes
+    // an integer. Both retain their original bytes in the pre-state token.
+    if !object.get("version").is_some_and(|value| {
+        value.as_u64().is_some_and(|version| version > 0)
+            || value.as_str().is_some_and(|version| {
+                !version.is_empty()
+                    && version.bytes().all(|byte| byte.is_ascii_digit())
+                    && version.parse::<u64>().is_ok_and(|version| version > 0)
+            })
+    }) {
+        return Err("ruleset.version");
     }
     let rules = object
         .get("rules")
@@ -145,7 +157,9 @@ pub(crate) fn verify_readback(
             }
         }
     }
-    if expected_body.get("description").is_none() && actual.get("description") == Some(&json!("")) {
+    if expected_body.get("description").is_none()
+        && actual.get("description").and_then(Value::as_str) == Some("")
+    {
         actual
             .as_object_mut()
             .ok_or("ruleset")?

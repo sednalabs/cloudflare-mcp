@@ -410,3 +410,40 @@ fn waf_add_delete_move_and_bounded_verdicts_work_through_stdio() {
     assert_eq!(content["error"]["code"], "waf.readback_mismatch");
     server.join().unwrap();
 }
+
+#[test]
+fn waf_versions_accept_string_or_positive_integer_and_reject_malformed_values() {
+    for version in [json!("7"), json!(7)] {
+        let mut initial = ruleset();
+        initial["version"] = version;
+        let (endpoint, _, _, server) = fixture(initial, Fault::None, 4);
+        let mut mcp =
+            McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", endpoint)]);
+        let plan = preview(&mut mcp, args());
+        assert_eq!(plan["ok"], true, "{plan}");
+        let result = apply(&mut mcp, args(), &plan);
+        assert_eq!(structured_content(&result)["status"], "applied-proven");
+        server.join().unwrap();
+    }
+    for version in [
+        json!(null),
+        json!(false),
+        json!(0),
+        json!(-1),
+        json!(1.5),
+        json!(""),
+        json!("latest"),
+        json!("-1"),
+    ] {
+        let mut initial = ruleset();
+        initial["version"] = version;
+        let (endpoint, _, requests, server) = fixture(initial, Fault::None, 1);
+        let mut mcp =
+            McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", endpoint)]);
+        let plan = preview(&mut mcp, args());
+        assert_eq!(plan["ok"], false, "{plan}");
+        assert_eq!(plan["error"]["field"], "ruleset.version");
+        server.join().unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+}

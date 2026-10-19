@@ -1651,7 +1651,9 @@ configuration. It omits top-level ruleset ID/name/kind/phase/version/timestamp
 and rule response-only version/timestamp/categories. Rule IDs inside `rules`
 and IDs/versions inside action parameters are supported configuration and are
 preserved, as are rate limits and logging. Unknown fields or malformed provider
-state block preview/apply rather than silently discarding configuration. See
+state block preview/apply rather than silently discarding configuration.
+Ruleset version metadata may be a positive integer or its decimal string;
+malformed/non-positive versions block without a write. See
 the [entrypoint update API](https://developers.cloudflare.com/api/resources/rulesets/subresources/phases/methods/update/)
 and [ruleset replacement semantics](https://developers.cloudflare.com/ruleset-engine/rulesets-api/update/).
 
