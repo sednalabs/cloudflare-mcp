@@ -34,6 +34,7 @@ use crate::cache::{
     CacheZoneSettingAction, purge_confirmation_token, replace_rules_confirmation_token,
 };
 use crate::cloudflare::model::WorkerScript;
+use crate::cloudflare::waf_rulesets;
 use crate::cloudflare::worker_versions::{
     WorkerVersionOperationError, prepare_worker_binding_expectation,
     validate_worker_deployment_projection, validate_worker_version_ids,
@@ -2952,6 +2953,7 @@ impl CloudflareMcp {
                 "planned": true,
                 "current_ruleset": plan.current_ruleset,
                 "planned_ruleset": plan.planned_ruleset,
+                "request_body": plan.request_body,
                 "diff": plan.diff,
                 "validation": plan.validation,
                 "ordering": plan.ordering,
@@ -3050,7 +3052,7 @@ impl CloudflareMcp {
                     reqwest::Method::PUT,
                     &lifecycle.entrypoint_path,
                     &[],
-                    Some(lifecycle.planned_ruleset.clone()),
+                    Some(lifecycle.request_body.clone()),
                 )
                 .await
             {
@@ -3065,6 +3067,15 @@ impl CloudflareMcp {
                             None,
                         )
                         .await;
+                    let verification = match &readback_result {
+                        Ok(value) => waf_rulesets::verify_readback(
+                            &lifecycle.current_ruleset,
+                            &lifecycle.request_body,
+                            value,
+                        )
+                        .map_err(|field| ("waf.readback_mismatch", field)),
+                        Err(_) => Err(("waf.readback_unavailable", "ruleset")),
+                    };
                     let readback = waf_ruleset_readback_entry(
                         &lifecycle.target,
                         &lifecycle.phase,
@@ -3088,22 +3099,44 @@ impl CloudflareMcp {
                             "reason": "readback_security_events=false",
                         })
                     };
-                    CallToolResult::structured(truncate_api_payload(
-                        json!({
-                            "ok": readback.get("ok").and_then(Value::as_bool).unwrap_or(false),
-                            "operation": "waf_ruleset_apply_change",
-                            "target": lifecycle.target.to_json(),
-                            "phase": lifecycle.phase,
-                            "applied_ruleset": apply_result,
-                            "readback": readback,
-                            "diff": lifecycle.diff,
-                            "validation": lifecycle.validation,
-                            "ordering": lifecycle.ordering,
-                            "performance_readback": lifecycle.performance_readback,
-                            "security_events_readback": security_events,
-                        }),
-                        args.max_bytes.unwrap_or(1_048_576).clamp(1, 10_485_760),
-                    ))
+                    let mut payload = json!({
+                        "ok": verification.is_ok(),
+                        "status": if verification.is_ok() { "applied-proven" } else { "applied-unproven" },
+                        "operation": "waf_ruleset_apply_change",
+                        "target": lifecycle.target.to_json(),
+                        "phase": lifecycle.phase,
+                        "applied_ruleset": apply_result,
+                        "readback": readback,
+                        "diff": lifecycle.diff,
+                        "validation": lifecycle.validation,
+                        "ordering": lifecycle.ordering,
+                        "performance_readback": lifecycle.performance_readback,
+                        "security_events_readback": security_events,
+                    });
+                    if let Err((code, field)) = verification {
+                        payload["error"] = json!({
+                            "code": code,
+                            "message": "The requested complete WAF state was not proven by authoritative readback.",
+                            "field": field,
+                            "hint": "Reconcile the current Ruleset before any retry; do not replay the apply automatically.",
+                        });
+                        let error = payload["error"].clone();
+                        let mut bounded = truncate_api_payload(
+                            payload,
+                            args.max_bytes.unwrap_or(1_048_576).clamp(1, 10_485_760),
+                        );
+                        bounded["ok"] = json!(false);
+                        bounded["status"] = json!("applied-unproven");
+                        bounded["error"] = error;
+                        CallToolResult::structured_error(bounded)
+                    } else {
+                        let mut bounded = truncate_api_payload(
+                            payload,
+                            args.max_bytes.unwrap_or(1_048_576).clamp(1, 10_485_760),
+                        );
+                        bounded["status"] = json!("applied-proven");
+                        CallToolResult::structured(bounded)
+                    }
                 }
                 Err(err) => adapter_error_result(err),
             }
@@ -12092,6 +12125,7 @@ struct WafLifecyclePlan {
     entrypoint_path: String,
     current_ruleset: Value,
     planned_ruleset: Value,
+    request_body: Value,
     diff: Value,
     validation: Value,
     ordering: Value,
@@ -12135,6 +12169,10 @@ async fn build_waf_lifecycle_plan(
         .await
         .map_err(adapter_error_result)?;
 
+    waf_rulesets::write_body(&current_ruleset).map_err(waf_ruleset_shape_error)?;
+    if current_ruleset.get("phase").and_then(Value::as_str) != Some(phase.as_str()) {
+        return Err(waf_ruleset_shape_error("phase"));
+    }
     let planned = plan_waf_ruleset_changes(
         &current_ruleset,
         edits,
@@ -12143,8 +12181,12 @@ async fn build_waf_lifecycle_plan(
         empty_list_refs,
         fail_on_stale_lists,
     )?;
-    let required_confirmation_token =
-        waf_ruleset_confirmation_token(&entrypoint_path, &planned.planned_ruleset);
+    let request_body =
+        waf_rulesets::write_body(&planned.planned_ruleset).map_err(waf_ruleset_shape_error)?;
+    let required_confirmation_token = waf_ruleset_confirmation_token(
+        &entrypoint_path,
+        &json!({"current_ruleset": current_ruleset, "request_body": request_body}),
+    );
     let analytics_zone_id = zone_id
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -12167,6 +12209,7 @@ async fn build_waf_lifecycle_plan(
         entrypoint_path,
         current_ruleset,
         planned_ruleset: planned.planned_ruleset,
+        request_body,
         diff: planned.diff,
         validation: planned.validation,
         ordering: planned.ordering,
@@ -12175,6 +12218,18 @@ async fn build_waf_lifecycle_plan(
         changed_rule_ids: planned.changed_rule_ids,
         analytics_zone_id,
     })
+}
+
+fn waf_ruleset_shape_error(field: &'static str) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "error": {
+            "code": "waf.unsupported_ruleset_shape",
+            "message": "The Ruleset cannot be safely projected to a supported complete update body.",
+            "field": field,
+            "hint": "Inspect the provider contract before planning or applying; no mutation was dispatched.",
+        },
+    }))
 }
 
 struct PlannedWafRuleset {

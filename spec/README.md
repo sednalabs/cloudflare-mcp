@@ -1,5 +1,18 @@
 # Tool Contract Workflow
 
+The WAF lifecycle retains its argument schemas. `waf_ruleset_plan_change`
+additionally exposes the exact supported `request_body` separately from the
+response-shaped `planned_ruleset`; confirmation binds the complete pre-state
+and that request. `waf_ruleset_apply_change` may report `applied-proven` only
+after complete writable-state/order and immutable-identity equality on
+independent readback. Unavailable/malformed/mismatched readback is an audited
+`applied-unproven` error. Verdicts survive output truncation. The strict
+synthetic provider in `tests/support/waf_rulesets.rs` rejects response-only PUT
+fields through the real stdio boundary and covers preservation, stale tokens,
+cap/list denial, provider rejection and readback failure. It deliberately
+preserves rule IDs and nested managed-rule configuration IDs rather than
+recursively deleting every `id` key.
+
 R2 conditional publication is covered through the actual stdio boundary in
 `tests/support/r2_publication.rs`: preview equality and zero-effect denial,
 independently verified signed transmitted conditions, 412/nonretryable

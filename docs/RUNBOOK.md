@@ -1637,6 +1637,38 @@ WAF Rulesets are read through the Ruleset Engine entrypoint phases
 dataset `firewallEventsAdaptive`; a single HTTP request can produce multiple
 security events and large windows may be sampled.
 
+### Guarded WAF replacement workflow
+
+Preview typed edits with `waf_ruleset_plan_change` and inspect `request_body`,
+the complete rules/order, cap and list validation before echoing its
+`required_confirmation_token` to `waf_ruleset_apply_change`. Apply re-reads the
+current ruleset and binds confirmation to both that complete pre-state and the
+exact writable request; a stale or mismatched token dispatches no PUT.
+
+Entrypoint PUT replaces the complete rule array. The curated request contains
+only the existing ruleset description and every planned rule's writable
+configuration. It omits top-level ruleset ID/name/kind/phase/version/timestamp
+and rule response-only version/timestamp/categories. Rule IDs inside `rules`
+and IDs/versions inside action parameters are supported configuration and are
+preserved, as are rate limits and logging. Unknown fields or malformed provider
+state block preview/apply rather than silently discarding configuration. See
+the [entrypoint update API](https://developers.cloudflare.com/api/resources/rulesets/subresources/phases/methods/update/)
+and [ruleset replacement semantics](https://developers.cloudflare.com/ruleset-engine/rulesets-api/update/).
+
+Only `status=applied-proven` with `ok=true` proves authoritative readback matched
+the entire intended writable state, rule membership/order and immutable
+ruleset identity. `applied-unproven` is an audited error, including unavailable,
+malformed, mismatched or reordered readback. Security Events are contextual,
+not apply proof. A rejected/ambiguous provider operation or unproven readback
+must be reconciled before a fresh preview; do not automatically replay an apply.
+Response truncation preserves this verdict and error classification.
+
+Regression proof uses the real MCP stdio boundary and a strict synthetic
+provider in `tests/support/waf_rulesets.rs`; it needs no live WAF mutation.
+For release smoke, run these fixtures against the selected hosted binary and
+then check the configured alias after a coordinated MCP restart. A versioned
+install or changed symlink does not update existing stdio processes.
+
 ## R2 Object Workflow
 
 Inspect before reading or writing:
