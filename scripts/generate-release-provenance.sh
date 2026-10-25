@@ -71,7 +71,10 @@ tool_inventory_json="$(mktemp)"
 normalized_tool_inventory_json="$(mktemp)"
 trap 'rm -f "$tool_inventory_json" "$normalized_tool_inventory_json"' EXIT
 
-CLOUDFLARE_MCP_AUTH_MODE=off "$binary_realpath" --print-tools > "$tool_inventory_json"
+if ! CLOUDFLARE_MCP_AUTH_MODE=off "$binary_realpath" --print-tools > "$tool_inventory_json"; then
+  echo "failed to execute binary with --print-tools: $binary_realpath" >&2
+  exit 1
+fi
 jq -e 'type == "array" and all(.[]; type == "string")' "$tool_inventory_json" >/dev/null
 jq -cS 'sort' "$tool_inventory_json" > "$normalized_tool_inventory_json"
 tool_count="$(jq 'length' "$normalized_tool_inventory_json")"
@@ -81,9 +84,13 @@ schema_snapshot_sha256="$(sha256sum spec/tool_schema_snapshot.v1.json | awk '{pr
 api_catalog_sha256="$(sha256sum spec/cloudflare_api_catalog.v1.json | awk '{print $1}')"
 toolkit_revision="$(
   grep -E -m 1 'rev = "[0-9a-f]+"' Cargo.toml |
-    head -n 1 |
     sed -E 's/.*"([0-9a-f]+)".*/\1/'
 )"
+
+if [[ -z "$toolkit_revision" ]]; then
+  echo "failed to extract mcp-toolkit-rs revision from Cargo.toml" >&2
+  exit 1
+fi
 
 manifest="$(
   jq -n \
