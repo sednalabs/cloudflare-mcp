@@ -43,7 +43,7 @@ echo "[3/3] cargo outdated (direct dependency stale-risk)"
 if [[ "${STRICT_OUTDATED}" == "1" ]]; then
   run_cmd cargo outdated --root-deps-only --depth 1 --exit-code 1
 else
-  run_cmd cargo outdated --root-deps-only --depth 1     || echo "cargo outdated report unavailable; continuing because STRICT_OUTDATED=0" >&2
+  run_cmd cargo outdated --root-deps-only --depth 1 || echo "cargo outdated report unavailable; continuing because STRICT_OUTDATED=0" >&2
 fi
 
 echo "dependency governance checks passed"
