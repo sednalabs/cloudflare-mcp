@@ -3111,6 +3111,80 @@ impl CloudflareClient {
         Ok(envelope.result.unwrap_or_else(|| json!({})))
     }
 
+    /// The account R2 object endpoint returns object bytes, not an API envelope.
+    /// Only bounded JSON is accepted here; other objects use the R2 download tool.
+    pub async fn api_get_r2_json_object(
+        &self,
+        path: &str,
+        query: &[(String, String)],
+        max_bytes: usize,
+    ) -> Result<Value, AdapterError> {
+        let path = require_non_empty("path", path)?;
+        let token = self.bearer_token()?;
+        let response = self
+            .http
+            .get(self.endpoint(path))
+            .query(query)
+            .bearer_auth(&token)
+            .header(reqwest::header::USER_AGENT, self.cfg.user_agent.clone())
+            .send()
+            .await
+            .map_err(|_| {
+                AdapterError::new(
+                    "cloudflare.transport_error",
+                    "Cloudflare R2 object request failed",
+                    "Check API reachability and token permissions.",
+                )
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(AdapterError::new(
+                "cloudflare.r2_object_read_failed",
+                format!(
+                    "Cloudflare R2 object request returned HTTP {}",
+                    status.as_u16()
+                ),
+                "Check the account, object identity, and token permissions.",
+            )
+            .with_status(Some(status.as_u16())));
+        }
+        let too_large = || {
+            AdapterError::new(
+                "cloudflare.r2_object_too_large",
+                "Cloudflare R2 JSON object exceeds the requested byte limit",
+                "Use the bounded R2 object download route for larger objects.",
+            )
+        };
+        if response
+            .content_length()
+            .is_some_and(|size| size > max_bytes as u64)
+        {
+            return Err(too_large());
+        }
+        let mut bytes = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| {
+                AdapterError::new(
+                    "cloudflare.response_read_failed",
+                    "Failed reading the Cloudflare R2 object response",
+                    "Inspect the object read without exposing its contents.",
+                )
+            })?;
+            if bytes.len().saturating_add(chunk.len()) > max_bytes {
+                return Err(too_large());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&bytes).map_err(|_| {
+            AdapterError::new(
+                "cloudflare.r2_object_not_json",
+                "Cloudflare R2 object is not valid JSON",
+                "Use the R2 object download route for non-JSON data.",
+            )
+        })
+    }
+
     pub async fn graphql_analytics_query(&self, payload: &Value) -> Result<Value, AdapterError> {
         let token = self.bearer_token()?;
         let url = self.endpoint("/graphql");
