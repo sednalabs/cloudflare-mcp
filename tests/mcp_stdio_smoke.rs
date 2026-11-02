@@ -652,6 +652,103 @@ fn spawn_fake_r2_api() -> (String, Arc<Mutex<Vec<String>>>) {
     spawn_fake_r2_api_with_requests(2)
 }
 
+fn spawn_fake_r2_account_api() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake account API");
+    let addr = listener.local_addr().expect("fake account API addr");
+    thread::spawn(move || {
+        for stream in listener.incoming().take(7) {
+            let mut stream = stream.expect("fake account API stream");
+            let (headers, _) = read_http_request(&mut stream);
+            let request = headers.lines().next().unwrap_or_default();
+            let (status, body) = if request.contains("/objects/good") {
+                ("200 OK", r#"{"schema":"receipt","run":42}"#.to_string())
+            } else if request.contains("/objects/denied") {
+                ("403 Forbidden", "private provider detail".to_string())
+            } else if request.contains("/objects/large") {
+                ("200 OK", format!("{{\"value\":\"{}\"}}", "x".repeat(128)))
+            } else if request.contains("/objects/invalid") {
+                ("200 OK", "not-json-private-content".to_string())
+            } else if request.contains("/objects/chunked-large") {
+                ("200 OK", format!("{{\"value\":\"{}\"}}", "x".repeat(128)))
+            } else if request.contains("/objects/chunked") {
+                ("200 OK", r#"{"chunked":true}"#.to_string())
+            } else {
+                (
+                    "200 OK",
+                    r#"{"success":true,"result":[{"key":"one"}]}"#.to_string(),
+                )
+            };
+            if request.contains("/objects/chunked") {
+                write!(stream, "HTTP/1.1 {status}\r\nconnection: close\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n", body.len()).expect("write chunked response");
+            } else {
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .expect("write account response");
+            }
+        }
+    });
+    format!("http://{addr}") // DevSkim: ignore DS137138 -- loopback-only test fixture
+}
+
+#[test]
+fn api_read_r2_account_object_handles_bounded_raw_json_through_stdio() {
+    let base_url = spawn_fake_r2_account_api();
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let read = |mcp: &mut McpStdioProcess, id, key, max_bytes| {
+        mcp.call_tool(
+            id,
+            "api_read",
+            json!({
+                "operation_id": "r2-get-object",
+                "path_params": {"bucket_name": "bucket-a", "object_key": key},
+                "max_bytes": max_bytes
+            }),
+        )
+    };
+    let good = read(&mut mcp, 2, "good", 4096);
+    assert_eq!(
+        structured_content(&good)["result"],
+        json!({"schema":"receipt", "run":42})
+    );
+    let denied = read(&mut mcp, 3, "denied", 4096);
+    let denial = structured_content(&denied);
+    assert_eq!(denial["error"]["status"], json!(403));
+    assert!(!denial.to_string().contains("private provider detail"));
+    let large = read(&mut mcp, 4, "large", 16);
+    assert_eq!(
+        structured_content(&large)["error"]["code"],
+        json!("cloudflare.r2_object_too_large")
+    );
+    let invalid = read(&mut mcp, 5, "invalid", 4096);
+    let error = structured_content(&invalid);
+    assert_eq!(
+        error["error"]["code"],
+        json!("cloudflare.r2_object_not_json")
+    );
+    assert!(!error.to_string().contains("not-json-private-content"));
+    let chunked = read(&mut mcp, 6, "chunked", 4096);
+    assert_eq!(
+        structured_content(&chunked)["result"],
+        json!({"chunked":true})
+    );
+    let chunked_large = read(&mut mcp, 7, "chunked-large", 16);
+    assert_eq!(
+        structured_content(&chunked_large)["error"]["code"],
+        json!("cloudflare.r2_object_too_large")
+    );
+    let list = mcp.call_tool(
+        8,
+        "api_read",
+        json!({
+            "operation_id":"r2-list-objects", "path_params":{"bucket_name":"bucket-a"}
+        }),
+    );
+    assert_eq!(structured_content(&list)["result"], json!([{"key":"one"}]));
+}
+
 fn spawn_fake_r2_api_with_requests(expected_requests: usize) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake R2 API");
     let addr = listener.local_addr().expect("fake R2 addr");

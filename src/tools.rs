@@ -2479,17 +2479,26 @@ impl CloudflareMcp {
             Err(err) => return Ok(api_catalog_error_result(err)),
         };
 
-        match self
-            .cloudflare
-            .api_request(
-                "cloudflare.api.read",
-                reqwest::Method::GET,
-                &path,
-                &query,
-                None,
-            )
-            .await
-        {
+        let result = if operation.operation_id == "r2-get-object" {
+            self.cloudflare
+                .api_get_r2_json_object(
+                    &path,
+                    &query,
+                    args.max_bytes.unwrap_or(1_048_576).clamp(1, 1_048_576),
+                )
+                .await
+        } else {
+            self.cloudflare
+                .api_request(
+                    "cloudflare.api.read",
+                    reqwest::Method::GET,
+                    &path,
+                    &query,
+                    None,
+                )
+                .await
+        };
+        match result {
             Ok(result) => Ok(CallToolResult::structured(truncate_api_payload(
                 json!({
                     "ok": true,
