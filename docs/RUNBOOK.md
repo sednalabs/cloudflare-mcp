@@ -692,6 +692,10 @@ effects. The additive assertion refuses those same effects except for its exact
 ADD COLUMN and foreign-keys-on forms; a caller assertion is not proof. An
 effect capability gap means retain the lease and add
 a purpose-built registry assertion/readback contract before continuing.
+The additive classifier recognizes one narrow external-content FTS5 shape only
+to explain that its engine shadow tables and initialized data are not yet
+covered. Recognition still returns a capability gap before provider access;
+it is not an FTS5 effect assertion, approval, or permission to retry a migration.
 
 The tool opens the existing target and guard without creating entries, requires
 exactly one active or retiring regular private evidence file, and holds the

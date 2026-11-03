@@ -1831,6 +1831,96 @@ enum ClassifiedEffect {
     SeedRows(SeedInsertEffect),
 }
 
+// Identification is deliberately separate from acceptance: a supported shape
+// still needs a complete engine-shadow/data proof before it can be reconciled.
+#[derive(Debug, PartialEq, Eq)]
+struct ExternalFts5Shape {
+    table: String,
+    content: String,
+    columns: Vec<String>,
+}
+
+fn classify_external_fts5(tokens: &[SqlToken]) -> Option<ExternalFts5Shape> {
+    if !token_is_word(tokens.first(), "create")
+        || !token_is_word(tokens.get(1), "virtual")
+        || !token_is_word(tokens.get(2), "table")
+        || !token_is_word(tokens.get(4), "using")
+        || !token_is_word(tokens.get(5), "fts5")
+        || tokens.get(6) != Some(&SqlToken::Symbol('('))
+        || balanced_parenthesized_end(tokens, 6)? != tokens.len()
+    {
+        return None;
+    }
+    let table = token_identifier(tokens.get(3))?;
+    validate_identifier("FTS table", &table).ok()?;
+    if table.to_ascii_lowercase().starts_with("sqlite_") {
+        return None;
+    }
+    for suffix in ["_data", "_idx", "_docsize", "_config"] {
+        validate_identifier("FTS shadow table", &format!("{table}{suffix}")).ok()?;
+    }
+    let body = &tokens[7..tokens.len() - 1];
+    let mut columns = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut content = None;
+    let mut rowid = false;
+    let mut tokenizer = false;
+    let mut in_options = false;
+    for part in body.split(|token| *token == SqlToken::Symbol(',')) {
+        if part.len() == 1 && !in_options {
+            let name = token_identifier(part.first())?;
+            validate_identifier("FTS column", &name).ok()?;
+            let key = name.to_ascii_lowercase();
+            if key == "rowid"
+                || key == "rank"
+                || key == table.to_ascii_lowercase()
+                || !seen.insert(key)
+                || columns.len() >= 16
+            {
+                return None;
+            }
+            columns.push(name);
+            continue;
+        }
+        in_options = true;
+        if part.len() != 3 || part[1] != SqlToken::Symbol('=') {
+            return None;
+        }
+        let SqlToken::StringLiteral(value) = &part[2] else {
+            return None;
+        };
+        if token_is_word(part.first(), "content") && content.is_none() {
+            validate_identifier("FTS content table", value).ok()?;
+            if value.eq_ignore_ascii_case(&table)
+                || ["_data", "_idx", "_docsize", "_config"]
+                    .iter()
+                    .any(|suffix| value.eq_ignore_ascii_case(&format!("{table}{suffix}")))
+                || value.to_ascii_lowercase().starts_with("sqlite_")
+            {
+                return None;
+            }
+            content = Some(value.clone());
+        } else if token_is_word(part.first(), "content_rowid") && !rowid && value == "rowid" {
+            rowid = true;
+        } else if token_is_word(part.first(), "tokenize")
+            && !tokenizer
+            && value == "unicode61 remove_diacritics 2"
+        {
+            tokenizer = true;
+        } else {
+            return None;
+        }
+    }
+    if columns.is_empty() || !rowid || !tokenizer {
+        return None;
+    }
+    Some(ExternalFts5Shape {
+        table,
+        content: content?,
+        columns,
+    })
+}
+
 #[cfg(test)]
 fn derive_effect_assertion(
     effect_assertion_id: Option<&str>,
@@ -1990,6 +2080,13 @@ fn derive_additive_effect_assertion(
                 trigger_lexical_token_values.extend(trigger_tokens);
                 effects.push(ClassifiedEffect::Create(object));
                 continue;
+            }
+            if classify_external_fts5(&tokens).is_some() {
+                return Err(reconciliation_error(
+                    "capability_gap",
+                    "d1.migration_reconciliation_effect_proof_unavailable",
+                    "external-content FTS5 creation additionally requires exact shadow-table and initial-data reconciliation; no current effect assertion provides that proof",
+                ));
             }
             match classify_additive_statement(&tokens).map_err(additive_contract_error)? {
                 Some(AdditiveStatement::AddColumn(mut effect)) => {
@@ -4465,6 +4562,62 @@ mod tests {
                 )
                 .is_err(),
                 "must reject data-producing or non-schema-only CREATE: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_fts5_shape_is_narrow_and_never_grants_existing_assertions() {
+        let sql = "CREATE VIRTUAL TABLE lookup USING fts5(title, body, content='documents', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');";
+        let tokens = tokenize_sql_statements(sql).expect("tokenized");
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(
+            classify_external_fts5(&tokens[0]),
+            Some(ExternalFts5Shape {
+                table: "lookup".into(),
+                content: "documents".into(),
+                columns: vec!["title".into(), "body".into()],
+            })
+        );
+        for id in [
+            EFFECT_ASSERTION_SCHEMA_CREATE_ONLY_V1,
+            EFFECT_ASSERTION_SCHEMA_CREATE_OBJECTS_V1,
+            EFFECT_ASSERTION_SCHEMA_ADDITIVE_V1,
+            EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1,
+            EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V2,
+        ] {
+            assert!(
+                derive_effect_assertion(Some(id), &manifest(sql)).is_err(),
+                "existing assertion must deny {id}"
+            );
+        }
+        for bad in [
+            "CREATE VIRTUAL TABLE IF NOT EXISTS lookup USING fts5(title, content='documents', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');",
+            "CREATE VIRTUAL TABLE lookup USING other(title, content='documents', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');",
+            "CREATE VIRTUAL TABLE lookup USING fts5(title, content='', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');",
+            "CREATE VIRTUAL TABLE lookup USING fts5(title, content='lookup', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');",
+            "CREATE VIRTUAL TABLE lookup USING fts5(title, content='LOOKUP_DATA', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');",
+            "CREATE VIRTUAL TABLE lookup USING fts5(title, content='documents', content_rowid='id', tokenize='unicode61 remove_diacritics 2');",
+            "CREATE VIRTUAL TABLE lookup USING fts5(title, content='documents', content_rowid='rowid', tokenize='porter');",
+            "CREATE VIRTUAL TABLE lookup USING fts5(title, content='documents', content='other', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');",
+            "CREATE VIRTUAL TABLE lookup USING fts5(title, content='documents', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2', detail='none');",
+            "CREATE VIRTUAL TABLE lookup USING fts5(title, TITLE, content='documents', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');",
+            "CREATE VIRTUAL TABLE lookup USING fts5(rank, content='documents', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');",
+            "CREATE VIRTUAL TABLE lookup USING fts5(title, content='documents', body, content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');",
+            "CREATE VIRTUAL TABLE sqlite_lookup USING fts5(title, content='documents', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');",
+        ] {
+            let tokens = tokenize_sql_statements(bad).expect("tokenized bad SQL");
+            assert_eq!(tokens.len(), 1);
+            assert!(
+                classify_external_fts5(&tokens[0]).is_none(),
+                "must not recognize {bad}"
+            );
+            assert!(
+                derive_effect_assertion(
+                    Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V2),
+                    &manifest(bad)
+                )
+                .is_err()
             );
         }
     }

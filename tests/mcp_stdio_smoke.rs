@@ -15997,6 +15997,32 @@ fn d1_post_parse_custody_release_overrides_parse_failure_in_reconcile_and_termin
 #[test]
 fn d1_reconcile_migration_manifest_stdio_rejects_unproven_effects_and_incomplete_expectations_before_custody()
  {
+    let fts = "CREATE VIRTUAL TABLE lookup USING fts5(title, content='documents', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');";
+    let mut fts_mcp = McpStdioProcess::start();
+    let rejected_fts = fts_mcp.call_tool(740, "d1_reconcile_migration_manifest", json!({
+        "database_id": "123e4567-e89b-42d3-a456-426614174000",
+        "migration_family": "example-core",
+        "manifest": [{"name":"0001_create.sql", "size_bytes":fts.len(), "sql_sha256":sha256_hex(fts), "sql":fts}],
+        "approved_plan_sha256":"a".repeat(64), "lease_nonce":"b".repeat(64), "lease_payload_sha256":"c".repeat(64),
+        "effect_assertion_id":"schema_create_objects_additive_seed_rows_v2",
+        "state_expectations":[{"manifest_prefix_length":0,"schema_objects":[],"tables":[]},
+                              {"manifest_prefix_length":1,"schema_objects":[],"tables":[]}]
+    }));
+    let fts_content = structured_content(&rejected_fts);
+    assert_eq!(fts_content["status"], "reconciliation_required");
+    assert_eq!(fts_content["capability_state"], "capability_gap");
+    assert_eq!(
+        fts_content["error"]["code"],
+        "d1.migration_reconciliation_effect_proof_unavailable"
+    );
+    assert_eq!(
+        fts_content["error"]["message"],
+        "external-content FTS5 creation additionally requires exact shadow-table and initial-data reconciliation; no current effect assertion provides that proof"
+    );
+    assert_eq!(fts_content["provider_calls"], 0);
+    assert_eq!(fts_content["local_namespace_mutations"], 0);
+    assert_eq!(fts_content["provider_mutations"], 0);
+
     let data_create = "CREATE TABLE items AS VALUES (1);";
     let data_manifest = json!([{
         "name": "0001_create.sql",
