@@ -23,6 +23,8 @@ pub(crate) const EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V2: &str =
 pub(crate) enum SeedAssertionVersion {
     V1,
     V2,
+    // Internal groundwork only; no effect assertion selects this version yet.
+    V3Fts,
 }
 
 impl SeedAssertionVersion {
@@ -30,11 +32,16 @@ impl SeedAssertionVersion {
         match self {
             Self::V1 => 1,
             Self::V2 => 2,
+            Self::V3Fts => 3,
         }
     }
 
     fn allows_null(self) -> bool {
-        self == Self::V2
+        matches!(self, Self::V2 | Self::V3Fts)
+    }
+
+    fn allows_blob(self) -> bool {
+        self == Self::V3Fts
     }
 }
 
@@ -60,6 +67,9 @@ pub(crate) enum SeedLiteral {
     Null,
     Text(String),
     Integer(i64),
+    // Synthesized expected engine state only; top-level SQL BLOB literals
+    // are not accepted by the seed INSERT parser.
+    Blob(Vec<u8>),
 }
 
 impl SeedLiteral {
@@ -68,6 +78,7 @@ impl SeedLiteral {
             Self::Null => Value::Null,
             Self::Text(value) => Value::String(hex_upper(value.as_bytes())),
             Self::Integer(value) => Value::String(value.to_string()),
+            Self::Blob(value) => Value::String(hex_upper(value)),
         }
     }
 
@@ -76,6 +87,7 @@ impl SeedLiteral {
             Self::Null => 0,
             Self::Text(value) => value.len().saturating_mul(2),
             Self::Integer(value) => signed_decimal_len(*value),
+            Self::Blob(value) => value.len().saturating_mul(2),
         }
     }
 
@@ -84,6 +96,7 @@ impl SeedLiteral {
             Self::Null => "null",
             Self::Text(_) => "text",
             Self::Integer(_) => "integer",
+            Self::Blob(_) => "blob",
         }
     }
 }
@@ -157,7 +170,7 @@ impl SeedContractError {
                 SeedAssertionVersion::V1 => {
                     "the seed-row assertion accepts only plain unqualified INSERT INTO a manifest-created table with explicit canonical columns and bounded TEXT or INTEGER literal VALUES tuples"
                 }
-                SeedAssertionVersion::V2 => {
+                SeedAssertionVersion::V2 | SeedAssertionVersion::V3Fts => {
                     "the seed-row v2 assertion accepts only plain unqualified INSERT INTO a manifest-created table with explicit canonical columns and bounded NULL, TEXT, or INTEGER literal VALUES tuples"
                 }
             },
@@ -347,7 +360,9 @@ pub(crate) fn seed_literal_is_identity_stable_for_declared_type(
     if strict_table {
         return matches!(
             (literal, declared_type.as_str()),
-            (SeedLiteral::Text(_), "TEXT") | (SeedLiteral::Integer(_), "INT" | "INTEGER")
+            (SeedLiteral::Text(_), "TEXT")
+                | (SeedLiteral::Integer(_), "INT" | "INTEGER")
+                | (SeedLiteral::Blob(_), "BLOB")
         );
     }
     let affinity = if declared_type.contains("INT") {
@@ -371,6 +386,7 @@ pub(crate) fn seed_literal_is_identity_stable_for_declared_type(
         (literal, affinity),
         (SeedLiteral::Text(_), "text" | "blob")
             | (SeedLiteral::Integer(_), "integer" | "numeric" | "blob")
+            | (SeedLiteral::Blob(_), _)
     )
 }
 
@@ -382,7 +398,7 @@ pub(crate) fn seed_literal_is_identity_stable_for_reviewed_column(
     primary_key_position: i64,
     rowid_table: bool,
 ) -> bool {
-    if matches!(literal, SeedLiteral::Null)
+    if matches!(literal, SeedLiteral::Null | SeedLiteral::Blob(_))
         && rowid_table
         && primary_key_position > 0
         && declared_type.eq_ignore_ascii_case("INTEGER")
@@ -401,6 +417,52 @@ pub(crate) fn insert_seed_effect(
     cumulative: &mut BTreeMap<String, SeedTableState>,
     effect: SeedInsertEffect,
 ) -> Result<(), SeedContractError> {
+    if effect.assertion_version == SeedAssertionVersion::V3Fts {
+        let existing_bytes = cumulative
+            .values()
+            .flat_map(|state| &state.rows)
+            .flatten()
+            .map(SeedLiteral::canonical_value_bytes)
+            .try_fold(0usize, usize::checked_add);
+        let effect_bytes = effect
+            .rows
+            .iter()
+            .flatten()
+            .map(SeedLiteral::canonical_value_bytes)
+            .try_fold(0usize, usize::checked_add);
+        let column_keys = effect
+            .columns
+            .iter()
+            .map(|name| sqlite_ascii_identifier_key(name))
+            .collect::<BTreeSet<_>>();
+        let unique_rows = effect.rows.iter().collect::<BTreeSet<_>>();
+        let bounded = existing_bytes
+            .zip(effect_bytes)
+            .and_then(|(left, right)| left.checked_add(right))
+            .is_some_and(|total| total <= MAX_SEED_LITERAL_BYTES_TOTAL)
+            && !effect.columns.is_empty()
+            && effect.columns.len() <= MAX_SEED_COLUMNS_PER_TABLE
+            && effect.columns.iter().all(|name| valid_identifier(name))
+            && column_keys.len() == effect.columns.len()
+            && effect.rows.len() <= MAX_SEED_ROWS_PER_TABLE
+            && unique_rows.len() == effect.rows.len()
+            && effect.rows.iter().all(|row| {
+                row.len() == effect.columns.len()
+                    && row.iter().all(|literal| match literal {
+                        SeedLiteral::Text(value) => {
+                            value.len() <= MAX_SEED_VALUE_BYTES && !value.contains('\0')
+                        }
+                        SeedLiteral::Blob(value) => value.len() <= MAX_SEED_VALUE_BYTES,
+                        SeedLiteral::Null | SeedLiteral::Integer(_) => true,
+                    })
+            });
+        if !bounded {
+            return Err(SeedContractError::contradictory(
+                "d1.migration_reconciliation_seed_rows_unbounded",
+                "synthesized seed evidence exceeds its row, column, value or aggregate bound",
+            ));
+        }
+    }
     let authority_key = sqlite_ascii_identifier_key(&effect.table_name);
     if cumulative.len() >= MAX_SEED_TABLES || cumulative.contains_key(&authority_key) {
         return Err(SeedContractError::contradictory(
@@ -487,6 +549,9 @@ pub(crate) fn seed_select_sql(state: &SeedTableState) -> String {
                 SeedAssertionVersion::V2 => format!(
                     "CASE typeof({column}) WHEN 'null' THEN NULL WHEN 'text' THEN hex(CAST({column} AS BLOB)) WHEN 'integer' THEN printf('%lld', {column}) ELSE NULL END AS \"v{index}\""
                 ),
+                SeedAssertionVersion::V3Fts => format!(
+                    "CASE typeof({column}) WHEN 'null' THEN NULL WHEN 'text' THEN CASE WHEN length(CAST({column} AS BLOB)) <= {MAX_SEED_VALUE_BYTES} THEN hex(CAST({column} AS BLOB)) ELSE NULL END WHEN 'integer' THEN printf('%lld', {column}) WHEN 'blob' THEN CASE WHEN length({column}) <= {MAX_SEED_VALUE_BYTES} THEN hex({column}) ELSE NULL END ELSE NULL END AS \"v{index}\""
+                ),
             };
             [
                 format!("typeof({column}) AS \"t{index}\""),
@@ -497,11 +562,19 @@ pub(crate) fn seed_select_sql(state: &SeedTableState) -> String {
     let order = (0..state.columns.len())
         .flat_map(|index| [format!("\"t{index}\""), format!("\"v{index}\"")])
         .collect::<Vec<_>>();
+    // V3's bounded physical-state reads must stop after the sentinel row;
+    // sorting an unexpectedly large engine table before LIMIT is unbounded.
+    // The receipt normalizer sorts the at-most-limit rows afterwards.
+    let order_clause = if state.assertion_version == SeedAssertionVersion::V3Fts {
+        String::new()
+    } else {
+        format!(" ORDER BY {}", order.join(", "))
+    };
     format!(
-        "SELECT {} FROM {} ORDER BY {} LIMIT {}",
+        "SELECT {} FROM {}{} LIMIT {}",
         projections.join(", "),
         quote_identifier(&state.table_name),
-        order.join(", "),
+        order_clause,
         state.rows.len() + 1,
     )
 }
@@ -535,7 +608,9 @@ pub(crate) fn observed_seed_summary(
                 .ok_or_else(seed_row_malformed)?;
             let valid = match storage_class.as_str() {
                 "null" => state.assertion_version.allows_null() && value.is_null(),
-                "text" => {
+                "text" | "blob"
+                    if storage_class == "text" || state.assertion_version.allows_blob() =>
+                {
                     let Some(value) = value.as_str() else {
                         return Err(seed_row_malformed());
                     };
@@ -1010,6 +1085,123 @@ mod tests {
             "the v2 row-set proof identity must not alias v1"
         );
         assert!(!seed_select_sql(&v1_state).contains("WHEN 'null' THEN NULL"));
+    }
+
+    #[test]
+    fn fts_internal_blob_evidence_is_exact_and_not_added_to_older_assertions() {
+        let state = SeedTableState {
+            assertion_version: SeedAssertionVersion::V3Fts,
+            table_name: "lookup_data".into(),
+            columns: vec!["id".into(), "block".into()],
+            rows: vec![
+                vec![SeedLiteral::Integer(1), SeedLiteral::Blob(vec![])],
+                vec![
+                    SeedLiteral::Integer(10),
+                    SeedLiteral::Blob(vec![0, 0, 0, 0, 0, 0, 0]),
+                ],
+            ],
+        };
+        let observed = [
+            json!({"t0":"integer","v0":"1","t1":"blob","v1":""}),
+            json!({"t0":"integer","v0":"10","t1":"blob","v1":"00000000000000"}),
+        ];
+        assert_eq!(
+            observed_seed_summary(&state, &observed).unwrap(),
+            seed_table_summary(&state)
+        );
+        assert!(
+            seed_select_sql(&state)
+                .contains("WHEN 'blob' THEN CASE WHEN length(\"block\") <= 1024")
+        );
+        assert!(!seed_select_sql(&state).contains(" ORDER BY "));
+        for malformed in [
+            json!({"t0":"integer","v0":"1","t1":"blob","v1":"a0"}),
+            json!({"t0":"integer","v0":"1","t1":"blob","v1":"0"}),
+            json!({"t0":"integer","v0":"1","t1":"blob","v1":null}),
+        ] {
+            assert!(observed_seed_summary(&state, &[malformed]).is_err());
+        }
+        let altered = [
+            observed[0].clone(),
+            json!({"t0":"integer","v0":"10","t1":"blob","v1":"00000000000001"}),
+        ];
+        assert_ne!(
+            observed_seed_summary(&state, &altered).unwrap(),
+            seed_table_summary(&state)
+        );
+        for version in [SeedAssertionVersion::V1, SeedAssertionVersion::V2] {
+            let old = SeedTableState {
+                assertion_version: version,
+                ..state.clone()
+            };
+            assert!(observed_seed_summary(&old, &observed).is_err());
+            assert!(!seed_select_sql(&old).contains("WHEN 'blob'"));
+        }
+        assert!(seed_literal_is_identity_stable_for_declared_type(
+            &SeedLiteral::Blob(vec![1]),
+            "TEXT",
+            false,
+            false
+        ));
+        assert!(!seed_literal_is_identity_stable_for_declared_type(
+            &SeedLiteral::Blob(vec![1]),
+            "TEXT",
+            true,
+            false
+        ));
+        assert!(seed_literal_is_identity_stable_for_declared_type(
+            &SeedLiteral::Blob(vec![1]),
+            "BLOB",
+            true,
+            false
+        ));
+        assert!(!seed_literal_is_identity_stable_for_reviewed_column(
+            &SeedLiteral::Blob(vec![1]),
+            "INTEGER",
+            false,
+            false,
+            1,
+            true
+        ));
+        assert!(seed_literal_is_identity_stable_for_reviewed_column(
+            &SeedLiteral::Blob(vec![1]),
+            "INTEGER",
+            false,
+            false,
+            1,
+            false
+        ));
+        let blob_sql = vec![
+            SqlToken::Word("INSERT".into()),
+            SqlToken::Word("INTO".into()),
+            SqlToken::Word("items".into()),
+            SqlToken::Symbol('('),
+            SqlToken::Word("value".into()),
+            SqlToken::Symbol(')'),
+            SqlToken::Word("VALUES".into()),
+            SqlToken::Symbol('('),
+            SqlToken::Word("X".into()),
+            SqlToken::StringLiteral("AB".into()),
+            SqlToken::Symbol(')'),
+        ];
+        assert!(classify_seed_insert(&blob_sql, SeedAssertionVersion::V3Fts).is_err());
+        let mut effects = BTreeMap::new();
+        let oversized = SeedInsertEffect {
+            assertion_version: SeedAssertionVersion::V3Fts,
+            table_name: "lookup_data".into(),
+            columns: vec!["block".into()],
+            rows: vec![vec![SeedLiteral::Blob(vec![0; MAX_SEED_VALUE_BYTES + 1])]],
+        };
+        assert!(insert_seed_effect(&mut effects, oversized).is_err());
+        assert!(effects.is_empty());
+        let duplicate = SeedInsertEffect {
+            assertion_version: SeedAssertionVersion::V3Fts,
+            table_name: "lookup_data".into(),
+            columns: vec!["id".into()],
+            rows: vec![vec![SeedLiteral::Integer(1)], vec![SeedLiteral::Integer(1)]],
+        };
+        assert!(insert_seed_effect(&mut effects, duplicate).is_err());
+        assert!(effects.is_empty());
     }
 
     #[test]

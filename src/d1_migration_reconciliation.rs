@@ -204,6 +204,7 @@ enum BatchStatement {
     TableXinfo(String),
     ForeignKeyList(String),
     ForeignKeyCheck(String),
+    SeedCount(SeedTableState),
     SeedRows(SeedTableState),
 }
 
@@ -215,6 +216,7 @@ impl BatchStatement {
             Self::TableXinfo(table) => format!("table_xinfo\0{table}"),
             Self::ForeignKeyList(table) => format!("foreign_key_list\0{table}"),
             Self::ForeignKeyCheck(table) => format!("foreign_key_check\0{table}"),
+            Self::SeedCount(state) => format!("seed_count\0{}", state.table_name),
             Self::SeedRows(state) => {
                 format!(
                     "seed_rows\0{}\0{}",
@@ -265,6 +267,7 @@ impl BatchStatement {
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
+            Self::SeedCount(_) => vec!["row_count".to_string()],
             Self::SeedRows(state) => seed_data_fields(state.columns.len()),
         }
     }
@@ -330,7 +333,12 @@ impl FixedQuery {
                 foreign_key_check: class(|statement| {
                     matches!(statement, BatchStatement::ForeignKeyCheck(_))
                 }),
-                seed: class(|statement| matches!(statement, BatchStatement::SeedRows(_))),
+                seed: class(|statement| {
+                    matches!(
+                        statement,
+                        BatchStatement::SeedCount(_) | BatchStatement::SeedRows(_)
+                    )
+                }),
             },
         };
         let receipt_sha256 = sha256_bytes_hex(
@@ -3143,6 +3151,20 @@ fn build_fixed_query(
         statements.push(foreign_key_check);
     }
     for state in seed_states {
+        if state.assertion_version == SeedAssertionVersion::V3Fts {
+            let count = BatchStatement::SeedCount(state.clone());
+            sql.push(tagged_statement(
+                &count,
+                proof_sha256,
+                &format!(
+                    "SELECT COUNT(*) AS row_count FROM (SELECT 1 FROM {} LIMIT {})",
+                    quote_identifier(&state.table_name),
+                    state.rows.len() + 1
+                ),
+                &[3],
+            ));
+            statements.push(count);
+        }
         let seed_rows = BatchStatement::SeedRows(state.clone());
         let value_positions = (0..state.columns.len())
             .flat_map(|index| [3 + index * 2, 4 + index * 2])
@@ -3226,6 +3248,7 @@ fn parse_complete_batch(
     let mut schema_objects = None;
     let mut tables: BTreeMap<String, ObservedTable> = BTreeMap::new();
     let mut seed_tables = Vec::new();
+    let mut seed_counts = BTreeMap::<String, usize>::new();
     for (result_set, statement) in result_sets.iter().zip(statements) {
         let rows = result_rows(result_set, statement, proof_sha256)?;
         match statement {
@@ -3303,10 +3326,56 @@ fn parse_complete_batch(
                     ));
                 }
             }
+            BatchStatement::SeedCount(state) => {
+                let object = if rows.len() == 1 {
+                    exact_row(&rows[0], &["row_count"])?
+                } else {
+                    return Err(reconciliation_error(
+                        "contradictory",
+                        "d1.migration_reconciliation_seed_count_missing",
+                        "bounded seed count evidence must contain exactly one count",
+                    ));
+                };
+                let count =
+                    usize::try_from(exact_nonnegative_i64(object, "row_count")?).map_err(|_| {
+                        reconciliation_error(
+                            "contradictory",
+                            "d1.migration_reconciliation_seed_count_mismatch",
+                            "bounded seed count exceeded the supported integer range",
+                        )
+                    })?;
+                if count != state.rows.len()
+                    || seed_counts
+                        .insert(state.table_name.clone(), count)
+                        .is_some()
+                {
+                    return Err(reconciliation_error(
+                        "contradictory",
+                        "d1.migration_reconciliation_seed_count_mismatch",
+                        "bounded seed count did not match the exact expected row set",
+                    ));
+                }
+            }
             BatchStatement::SeedRows(state) => {
+                if state.assertion_version == SeedAssertionVersion::V3Fts
+                    && seed_counts.remove(&state.table_name) != Some(rows.len())
+                {
+                    return Err(reconciliation_error(
+                        "contradictory",
+                        "d1.migration_reconciliation_seed_count_mismatch",
+                        "seed rows were incomplete or did not match their independently bounded count",
+                    ));
+                }
                 seed_tables.push(observed_seed_summary(state, &rows).map_err(seed_contract_error)?);
             }
         }
+    }
+    if !seed_counts.is_empty() {
+        return Err(reconciliation_error(
+            "contradictory",
+            "d1.migration_reconciliation_seed_count_mismatch",
+            "bounded seed count was not paired with its exact row set",
+        ));
     }
     Ok(CanonicalSnapshot {
         ledger: ledger.ok_or_else(|| {
@@ -4478,6 +4547,7 @@ fn reconciliation_error_with_evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::d1_migration_seed_rows::SeedLiteral;
 
     const PROOF: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // DevSkim: ignore DS173237 -- synthetic SHA-256 fixture, not a credential
     const SECOND_PROOF: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"; // DevSkim: ignore DS173237 -- synthetic SHA-256 fixture, not a credential
@@ -4497,6 +4567,48 @@ mod tests {
             schema_objects: Vec::new(),
             tables: Vec::new(),
             seed_tables: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn fts_physical_rows_require_bounded_count_and_complete_tagged_readback() {
+        let state = SeedTableState {
+            assertion_version: SeedAssertionVersion::V3Fts,
+            table_name: "lookup_data".into(),
+            columns: vec!["id".into(), "block".into()],
+            rows: vec![vec![SeedLiteral::Integer(1), SeedLiteral::Blob(vec![])]],
+        };
+        let query = build_fixed_query("d1_migrations", 0, &[], &[], &[state.clone()], PROOF, true);
+        assert_eq!(query.statements.len(), 4);
+        assert!(
+            query.sql.contains(
+                "SELECT COUNT(*) AS row_count FROM (SELECT 1 FROM \"lookup_data\" LIMIT 2)"
+            )
+        );
+        let make = |count: Vec<Value>, rows: Vec<Value>| {
+            json!([
+                tagged_result(&query.statements[0], PROOF, vec![], None),
+                tagged_result(&query.statements[1], PROOF, vec![], None),
+                tagged_result(&query.statements[2], PROOF, count, None),
+                tagged_result(&query.statements[3], PROOF, rows, None),
+            ])
+        };
+        let item = json!({"t0":"integer","v0":"1","t1":"blob","v1":""});
+        let complete = make(vec![json!({"row_count":1})], vec![item.clone()]);
+        let snapshot =
+            parse_complete_batch(&complete, &query.statements, PROOF, &[], &BTreeMap::new())
+                .unwrap();
+        assert_eq!(snapshot.seed_tables, state_summaries(&[state]));
+        for bad in [
+            make(vec![json!({"row_count":2})], vec![item.clone()]),
+            make(vec![json!({"row_count":1})], vec![]),
+            make(vec![], vec![item.clone()]),
+            make(vec![json!({"row_count":0})], vec![]),
+        ] {
+            assert!(
+                parse_complete_batch(&bad, &query.statements, PROOF, &[], &BTreeMap::new())
+                    .is_err()
+            );
         }
     }
 
