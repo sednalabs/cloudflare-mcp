@@ -15997,7 +15997,7 @@ fn d1_post_parse_custody_release_overrides_parse_failure_in_reconcile_and_termin
 #[test]
 fn d1_reconcile_migration_manifest_stdio_rejects_unproven_effects_and_incomplete_expectations_before_custody()
  {
-    let fts = "CREATE VIRTUAL TABLE lookup USING fts5(title, content='documents', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');";
+    let fts = "CREATE TABLE documents(rowid INTEGER PRIMARY KEY, title TEXT); CREATE VIRTUAL TABLE lookup USING fts5(title, content='documents', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');";
     let mut fts_mcp = McpStdioProcess::start();
     let rejected_fts = fts_mcp.call_tool(740, "d1_reconcile_migration_manifest", json!({
         "database_id": "123e4567-e89b-42d3-a456-426614174000",

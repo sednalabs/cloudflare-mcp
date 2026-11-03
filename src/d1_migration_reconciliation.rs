@@ -1929,6 +1929,91 @@ fn classify_external_fts5(tokens: &[SqlToken]) -> Option<ExternalFts5Shape> {
     })
 }
 
+// A deliberately narrow source shape. This only classifies the manifest's
+// declaration; provider schema, physical emptiness and row identity still
+// require independent readback before any FTS assertion can be accepted.
+fn fts5_content_declaration_matches(tokens: &[SqlToken], fts: &ExternalFts5Shape) -> bool {
+    if !token_is_word(tokens.first(), "create")
+        || !token_is_word(tokens.get(1), "table")
+        || !token_identifier(tokens.get(2))
+            .is_some_and(|name| name.eq_ignore_ascii_case(&fts.content))
+        || tokens.get(3) != Some(&SqlToken::Symbol('('))
+    {
+        return false;
+    }
+    let Some(end) = balanced_parenthesized_end(tokens, 3) else {
+        return false;
+    };
+    if !valid_table_suffix(&tokens[end..]) || schema_create_table_is_without_rowid(tokens) {
+        return false;
+    }
+    let mut start = 4usize;
+    let mut depth = 0usize;
+    let mut fields = BTreeMap::new();
+    for index in 4..end {
+        let token = &tokens[index];
+        if *token == SqlToken::Symbol('(') {
+            depth += 1;
+        } else if *token == SqlToken::Symbol(')') && depth > 0 {
+            depth -= 1;
+        }
+        if (*token == SqlToken::Symbol(',') && depth == 0) || index == end - 1 {
+            let part = &tokens[start..index];
+            if part.is_empty() {
+                return false;
+            }
+            if token_is_word(part.first(), "primary")
+                || (token_is_word(part.first(), "constraint")
+                    && part.iter().any(|item| token_is_word(Some(item), "primary")))
+            {
+                return false;
+            }
+            if !["check", "foreign", "unique", "constraint"]
+                .iter()
+                .any(|word| token_is_word(part.first(), word))
+            {
+                let Some(name) = token_identifier(part.first()) else {
+                    return false;
+                };
+                if validate_identifier("FTS content column", &name).is_err()
+                    || fields.insert(name.to_ascii_lowercase(), part).is_some()
+                {
+                    return false;
+                }
+            }
+            start = index + 1;
+        }
+    }
+    let Some(rowid) = fields.get("rowid") else {
+        return false;
+    };
+    if rowid.len() != 4
+        || !token_is_word(rowid.get(1), "integer")
+        || !token_is_word(rowid.get(2), "primary")
+        || !token_is_word(rowid.get(3), "key")
+    {
+        return false;
+    }
+    fts.columns.iter().all(|name| {
+        fields.get(&name.to_ascii_lowercase()).is_some_and(|part| {
+            let mut nested = 0usize;
+            let mut generated = false;
+            for item in *part {
+                if *item == SqlToken::Symbol('(') {
+                    nested += 1;
+                } else if *item == SqlToken::Symbol(')') {
+                    nested = nested.saturating_sub(1);
+                } else if nested == 0
+                    && (token_is_word(Some(item), "generated") || token_is_word(Some(item), "as"))
+                {
+                    generated = true;
+                }
+            }
+            token_is_word(part.get(1), "text") && !generated
+        })
+    })
+}
+
 #[cfg(test)]
 fn derive_effect_assertion(
     effect_assertion_id: Option<&str>,
@@ -2020,6 +2105,7 @@ fn derive_additive_effect_assertion(
     let mut migrations = Vec::with_capacity(manifest.len());
     let mut trigger_lexical_token_values = BTreeSet::new();
     let mut manifest_created_tables = BTreeMap::<String, String>::new();
+    let mut content_declarations = BTreeMap::<String, Vec<SqlToken>>::new();
     let mut trigger_seen = BTreeSet::new();
     let mut seeded_tables = BTreeSet::new();
     let mut strict_seed_table_keys = BTreeSet::new();
@@ -2051,6 +2137,10 @@ fn derive_additive_effect_assertion(
                         "d1.migration_reconciliation_seed_create_if_not_exists_unavailable",
                         "the seed-row assertion requires every classified CREATE object to be an unconditional actual creation",
                     ));
+                }
+                if object.object_type == "table" {
+                    content_declarations
+                        .insert(sqlite_ascii_identifier_key(&object.name), tokens.clone());
                 }
                 if allow_seed_rows && object.object_type == "table" {
                     let authority_key = sqlite_ascii_identifier_key(&object.name);
@@ -2089,7 +2179,17 @@ fn derive_additive_effect_assertion(
                 effects.push(ClassifiedEffect::Create(object));
                 continue;
             }
-            if classify_external_fts5(&tokens).is_some() {
+            if let Some(shape) = classify_external_fts5(&tokens) {
+                if !content_declarations
+                    .get(&sqlite_ascii_identifier_key(&shape.content))
+                    .is_some_and(|content| fts5_content_declaration_matches(content, &shape))
+                {
+                    return Err(reconciliation_error(
+                        "capability_gap",
+                        "d1.migration_reconciliation_effect_proof_unavailable",
+                        "external-content FTS5 requires an earlier ordinary rowid table with an exact integer primary-key alias and declared text columns",
+                    ));
+                }
                 return Err(reconciliation_error(
                     "capability_gap",
                     "d1.migration_reconciliation_effect_proof_unavailable",
@@ -4732,6 +4832,63 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn external_fts5_content_shape_requires_real_rowid_and_indexed_columns() {
+        let fts_sql = "CREATE VIRTUAL TABLE lookup USING fts5(title, body, content='documents', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');";
+        let fts = classify_external_fts5(&tokenize_sql_statements(fts_sql).unwrap()[0]).unwrap();
+        let missing = derive_effect_assertion_details(
+            Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V2),
+            &manifest(fts_sql),
+        )
+        .expect_err("a missing source table cannot be proved")
+        .structured_content
+        .unwrap();
+        assert!(
+            missing["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("earlier ordinary rowid table")
+        );
+        let valid = "CREATE TABLE documents(rowid INTEGER PRIMARY KEY, title TEXT NOT NULL DEFAULT '', body TEXT CHECK(length(body) < 1000), other INTEGER);";
+        assert!(fts5_content_declaration_matches(
+            &tokenize_sql_statements(valid).unwrap()[0],
+            &fts
+        ));
+        for invalid in [
+            "CREATE TABLE documents(rowid TEXT PRIMARY KEY, title TEXT, body TEXT);",
+            "CREATE TABLE documents(rowid INTEGER PRIMARY KEY DESC, title TEXT, body TEXT);",
+            "CREATE TABLE documents(rowid INTEGER PRIMARY KEY, title TEXT, body TEXT) WITHOUT ROWID;",
+            "CREATE TABLE documents(rowid INTEGER, title TEXT, body TEXT, PRIMARY KEY(rowid));",
+            "CREATE TABLE documents(rowid INTEGER PRIMARY KEY, title TEXT);",
+            "CREATE TABLE documents(rowid INTEGER PRIMARY KEY, title INTEGER, body TEXT);",
+            "CREATE TABLE documents(rowid INTEGER PRIMARY KEY, title TEXT, TITLE TEXT, body TEXT);",
+            "CREATE TABLE documents(rowid INTEGER PRIMARY KEY, title TEXT GENERATED ALWAYS AS ('x'), body TEXT);",
+            "CREATE TABLE documents(rowid INTEGER PRIMARY KEY, title TEXT AS ('x'), body TEXT);",
+            "CREATE TABLE other(rowid INTEGER PRIMARY KEY, title TEXT, body TEXT);",
+            "CREATE TABLE IF NOT EXISTS documents(rowid INTEGER PRIMARY KEY, title TEXT, body TEXT);",
+        ] {
+            let parsed = tokenize_sql_statements(invalid).expect("tokenized content declaration");
+            assert_eq!(parsed.len(), 1);
+            assert!(
+                !fts5_content_declaration_matches(&parsed[0], &fts),
+                "must reject {invalid}"
+            );
+        }
+        let sql = format!("{valid} {fts_sql}");
+        let result = derive_effect_assertion_details(
+            Some(EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V2),
+            &manifest(&sql),
+        );
+        let content = result
+            .expect_err("recognized schema is still not an accepting proof")
+            .structured_content
+            .unwrap();
+        assert_eq!(
+            content["error"]["code"],
+            "d1.migration_reconciliation_effect_proof_unavailable"
+        );
     }
 
     #[test]
