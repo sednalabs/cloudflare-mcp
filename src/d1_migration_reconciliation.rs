@@ -2968,6 +2968,151 @@ fn schema_create_table_is_without_rowid(tokens: &[SqlToken]) -> bool {
     })
 }
 
+// Recover byte-exact statements for a future source-bound FTS assertion.
+// Unlike token-equivalence, exact bytes cannot silently join split operators or
+// reinterpret SQLite's permissive double-quoted strings as identifiers.
+// The deliberately smaller grammar rejects comments, unterminated statements,
+// and oversized input; predecessor assertion versions do not use this helper.
+#[cfg_attr(not(test), allow(dead_code))]
+fn strict_manifest_statement_sources(sql: &str) -> Option<Vec<&str>> {
+    const MAX_SQL_BYTES: usize = 65_536;
+    const MAX_TERMINATORS: usize = 256;
+    if sql.len() > MAX_SQL_BYTES {
+        return None;
+    }
+    let expected = tokenize_sql_statements(sql)?;
+    if expected.is_empty() {
+        return None;
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+        Backtick,
+        Bracket,
+    }
+    let bytes = sql.as_bytes();
+    let mut quote = Quote::None;
+    let mut start = 0;
+    let mut index = 0;
+    let mut terminators = 0;
+    let mut sources = Vec::with_capacity(expected.len());
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let next = bytes.get(index + 1).copied();
+        match quote {
+            Quote::None => match (byte, next) {
+                (b'-', Some(b'-')) | (b'/', Some(b'*')) => return None,
+                (b'\'', _) => quote = Quote::Single,
+                (b'"', _) => quote = Quote::Double,
+                (b'`', _) => quote = Quote::Backtick,
+                (b'[', _) => quote = Quote::Bracket,
+                (b';', _) => {
+                    terminators += 1;
+                    if terminators > MAX_TERMINATORS {
+                        return None;
+                    }
+                    let candidate = &sql[start..=index];
+                    if let Some(parsed) = tokenize_sql_statements(candidate) {
+                        if parsed.len() == 1 && expected.get(sources.len()) == parsed.first() {
+                            let source = sql[start..index].trim();
+                            if source.is_empty() {
+                                return None;
+                            }
+                            sources.push(source);
+                            start = index + 1;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Quote::Single | Quote::Double | Quote::Backtick => {
+                let delimiter = match quote {
+                    Quote::Single => b'\'',
+                    Quote::Double => b'"',
+                    Quote::Backtick => b'`',
+                    _ => unreachable!(),
+                };
+                if byte == delimiter {
+                    if next == Some(delimiter) {
+                        index += 1;
+                    } else {
+                        quote = Quote::None;
+                    }
+                }
+            }
+            Quote::Bracket if byte == b']' => quote = Quote::None,
+            Quote::Bracket => {}
+        }
+        index += 1;
+    }
+    if quote != Quote::None || !sql[start..].trim().is_empty() || sources.len() != expected.len() {
+        return None;
+    }
+    Some(sources)
+}
+
+// Bind each ordinary declaration and FTS virtual-table declaration to the
+// approved source bytes, never to a caller-selected sqlite_master digest.
+// This supports only unconditional, canonical CREATE forms and canonical
+// seed INSERTs. Engine-generated shadow objects require separate proof.
+#[cfg_attr(not(test), allow(dead_code))]
+fn strict_manifest_schema_digests(
+    manifest: &[D1MigrationManifestEntry],
+) -> Option<Vec<BTreeMap<(String, String), String>>> {
+    let mut current = BTreeMap::new();
+    let mut names = BTreeSet::new();
+    let mut prefixes = vec![current.clone()];
+    for migration in manifest {
+        for source in strict_manifest_statement_sources(&migration.sql)? {
+            let tokens = tokenize_sql_statements(source)?;
+            if tokens.len() != 1 {
+                return None;
+            }
+            let tokens = &tokens[0];
+            let object = if let Some((object, _)) = classify_schema_create(tokens, true) {
+                if schema_create_uses_if_not_exists(tokens) {
+                    return None;
+                }
+                let prefix = match object.object_type.as_str() {
+                    "table" => "CREATE TABLE ",
+                    "index" => "CREATE INDEX ",
+                    "trigger" => "CREATE TRIGGER ",
+                    _ => return None,
+                };
+                if !source.starts_with(prefix) {
+                    return None;
+                }
+                Some((object.object_type, object.name))
+            } else if let Some(fts) = classify_external_fts5(tokens) {
+                if !source.starts_with("CREATE VIRTUAL TABLE ") {
+                    return None;
+                }
+                Some(("table".to_string(), fts.table))
+            } else if classify_seed_insert(tokens, SeedAssertionVersion::V3Fts)
+                .ok()?
+                .is_some()
+            {
+                None
+            } else {
+                return None;
+            };
+            if let Some((kind, name)) = object {
+                if !names.insert(sqlite_ascii_identifier_key(&name))
+                    || current
+                        .insert((kind, name), sha256_bytes_hex(source.as_bytes()))
+                        .is_some()
+                {
+                    return None;
+                }
+            }
+        }
+        prefixes.push(current.clone());
+    }
+    Some(prefixes)
+}
+
 fn tokenize_sql_statements(sql: &str) -> Option<Vec<Vec<SqlToken>>> {
     #[derive(Clone, Copy)]
     enum Mode {
@@ -4830,6 +4975,86 @@ mod tests {
                     &manifest(bad)
                 )
                 .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn strict_statement_sources_preserve_exact_bytes_and_trigger_bodies() {
+        let sql = "  CREATE TABLE documents(rowid INTEGER PRIMARY KEY, title TEXT DEFAULT 'semi;--');\nCREATE TRIGGER documents_check BEFORE INSERT ON documents BEGIN SELECT CASE WHEN new.title = 'x;' THEN RAISE(ABORT, 'no;/*') END; SELECT 1; END;\nCREATE VIRTUAL TABLE lookup USING fts5(title, content='documents', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');\n";
+        let sources = strict_manifest_statement_sources(sql).unwrap();
+        assert_eq!(sources.len(), 3);
+        assert_eq!(
+            sources[0],
+            "CREATE TABLE documents(rowid INTEGER PRIMARY KEY, title TEXT DEFAULT 'semi;--')"
+        );
+        assert_eq!(
+            sources[1],
+            "CREATE TRIGGER documents_check BEFORE INSERT ON documents BEGIN SELECT CASE WHEN new.title = 'x;' THEN RAISE(ABORT, 'no;/*') END; SELECT 1; END"
+        );
+        assert_eq!(
+            sources[2],
+            "CREATE VIRTUAL TABLE lookup USING fts5(title, content='documents', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2')"
+        );
+    }
+
+    #[test]
+    fn strict_statement_sources_fail_closed_on_ambiguous_or_unbounded_input() {
+        for sql in [
+            "CREATE TABLE t(a TEXT); -- comment\n",
+            "CREATE TABLE t(a TEXT); /* comment */",
+            "CREATE TABLE t(a TEXT)",
+            "CREATE TABLE t(a TEXT);;",
+            "CREATE TABLE t(a TEXT DEFAULT 'unterminated);",
+            "CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1;",
+        ] {
+            assert!(strict_manifest_statement_sources(sql).is_none(), "{sql}");
+        }
+        assert!(strict_manifest_statement_sources(&" ".repeat(65_537)).is_none());
+        assert!(strict_manifest_statement_sources(&"SELECT 1;".repeat(257)).is_none());
+    }
+
+    #[test]
+    fn strict_schema_digests_come_from_manifest_not_caller_expectations() {
+        let table = "CREATE TABLE documents(rowid INTEGER PRIMARY KEY, title TEXT)";
+        let fts = "CREATE VIRTUAL TABLE lookup USING fts5(title, content='documents', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2')";
+        let trigger = "CREATE TRIGGER doc_add AFTER INSERT ON documents BEGIN INSERT INTO lookup(rowid,title) VALUES(new.rowid,new.title); END";
+        let migrations = manifest(&format!("{table}; {fts}; {trigger};"));
+        let prefixes = strict_manifest_schema_digests(&migrations).unwrap();
+        assert!(prefixes[0].is_empty());
+        let schema = &prefixes[1];
+        assert_eq!(schema.len(), 3);
+        assert_eq!(
+            schema[&("table".into(), "documents".into())],
+            sha256_bytes_hex(table.as_bytes())
+        );
+        assert_eq!(
+            schema[&("table".into(), "lookup".into())],
+            sha256_bytes_hex(fts.as_bytes())
+        );
+        assert_eq!(
+            schema[&("trigger".into(), "doc_add".into())],
+            sha256_bytes_hex(trigger.as_bytes())
+        );
+        let wrong = fts.replace("content='documents'", "content='other'");
+        assert_ne!(
+            schema[&("table".into(), "lookup".into())],
+            sha256_bytes_hex(wrong.as_bytes())
+        );
+        let wrong_trigger = trigger.replace("new.title", "'different'");
+        assert_ne!(
+            schema[&("trigger".into(), "doc_add".into())],
+            sha256_bytes_hex(wrong_trigger.as_bytes())
+        );
+        for invalid in [
+            "CREATE TABLE IF NOT EXISTS documents(rowid INTEGER PRIMARY KEY, title TEXT);",
+            "create table documents(rowid INTEGER PRIMARY KEY, title TEXT);",
+            "CREATE TABLE documents(rowid INTEGER PRIMARY KEY); CREATE TABLE DOCUMENTS(rowid INTEGER);",
+            "CREATE TABLE documents(rowid INTEGER PRIMARY KEY); DROP TABLE documents;",
+        ] {
+            assert!(
+                strict_manifest_schema_digests(&manifest(invalid)).is_none(),
+                "{invalid}"
             );
         }
     }
