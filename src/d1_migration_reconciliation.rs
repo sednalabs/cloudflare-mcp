@@ -33,7 +33,7 @@ use crate::d1_migration_manifest::{
 use crate::d1_migration_seed_rows::{
     D1MigrationSeedTableExpectation, EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1,
     EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V2, SeedAssertionVersion, SeedContractError,
-    SeedInsertEffect, SeedManifestPlan, SeedTableRegistration, SeedTableState,
+    SeedInsertEffect, SeedLiteral, SeedManifestPlan, SeedTableRegistration, SeedTableState,
     classify_seed_insert, insert_seed_effect, observed_seed_summary, seed_data_fields,
     seed_literal_is_identity_stable_for_reviewed_column, seed_select_sql,
     sqlite_ascii_identifier_key, state_summaries,
@@ -1841,7 +1841,7 @@ enum ClassifiedEffect {
 
 // Identification is deliberately separate from acceptance: a supported shape
 // still needs a complete engine-shadow/data proof before it can be reconciled.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ExternalFts5Shape {
     table: String,
     content: String,
@@ -2014,6 +2014,165 @@ fn fts5_content_declaration_matches(tokens: &[SqlToken], fts: &ExternalFts5Shape
     })
 }
 
+// Internal expected state for the one supported, empty external-content FTS5
+// shape. This is not an assertion or evidence about any D1 provider. A
+// future accepting path must also prove the content table is empty, bind the
+// actual CREATE statements to the manifest, exclude extra trigger authority,
+// and independently verify the provider's virtual/shadow table types.
+#[cfg_attr(not(test), allow(dead_code))]
+fn fts5_empty_physical_seed_effects(fts: &ExternalFts5Shape) -> Vec<SeedInsertEffect> {
+    let state =
+        |table_name: String, columns: &[&str], rows: Vec<Vec<SeedLiteral>>| SeedInsertEffect {
+            assertion_version: SeedAssertionVersion::V3Fts,
+            table_name,
+            columns: columns.iter().map(|name| (*name).to_string()).collect(),
+            rows,
+        };
+    vec![
+        state(fts.content.clone(), &["rowid"], vec![]),
+        state(
+            format!("{}_config", fts.table),
+            &["k", "v"],
+            vec![vec![
+                SeedLiteral::Text("version".into()),
+                SeedLiteral::Integer(4),
+            ]],
+        ),
+        state(
+            format!("{}_data", fts.table),
+            &["id", "block"],
+            vec![
+                vec![SeedLiteral::Integer(1), SeedLiteral::Blob(vec![])],
+                vec![SeedLiteral::Integer(10), SeedLiteral::Blob(vec![0; 7])],
+            ],
+        ),
+        state(format!("{}_docsize", fts.table), &["id"], vec![]),
+        state(format!("{}_idx", fts.table), &["segid"], vec![]),
+    ]
+}
+
+// SQLite's external-content FTS5 implementation owns these definitions, not
+// the caller. Exact comparison is intentionally conservative: an engine that
+// emits a different definition remains unproved instead of being normalized
+// into a match. Names have already passed the restricted identifier validator.
+#[cfg_attr(not(test), allow(dead_code))]
+fn fts5_shadow_schema_digests(fts: &ExternalFts5Shape) -> BTreeMap<(String, String), String> {
+    [
+        ("_config", "(k PRIMARY KEY, v) WITHOUT ROWID"),
+        ("_data", "(id INTEGER PRIMARY KEY, block BLOB)"),
+        ("_docsize", "(id INTEGER PRIMARY KEY, sz BLOB)"),
+        (
+            "_idx",
+            "(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID",
+        ),
+    ]
+    .into_iter()
+    .map(|(suffix, definition)| {
+        let name = format!("{}{suffix}", fts.table);
+        let sql = format!("CREATE TABLE '{name}'{definition}");
+        (
+            ("table".to_string(), name),
+            sha256_bytes_hex(sql.as_bytes()),
+        )
+    })
+    .collect()
+}
+
+// A schema SQL string alone does not prove SQLite treats the objects as the
+// required virtual and shadow tables. These are fixed, bounded read-only SQL
+// shapes for a future FTS assertion, not caller-supplied provider SQL.
+#[cfg_attr(not(test), allow(dead_code))]
+fn fts5_table_type_query(fts: &ExternalFts5Shape) -> String {
+    let names = std::iter::once(fts.content.clone())
+        .chain(std::iter::once(fts.table.clone()))
+        .chain(
+            ["_config", "_data", "_docsize", "_idx"]
+                .into_iter()
+                .map(|suffix| format!("{}{suffix}", fts.table)),
+        )
+        .map(|name| quote_string(&name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "SELECT name, type FROM pragma_table_list WHERE schema = 'main' AND name COLLATE NOCASE IN ({names}) ORDER BY name LIMIT 7"
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn fts5_table_types_match(
+    fts: &ExternalFts5Shape,
+    source_exists: bool,
+    fts_exists: bool,
+    rows: &[Value],
+) -> bool {
+    let mut expected = BTreeMap::new();
+    if source_exists {
+        expected.insert(fts.content.clone(), "table".to_string());
+    }
+    if fts_exists {
+        if !source_exists {
+            return false;
+        }
+        expected.insert(fts.table.clone(), "virtual".to_string());
+        for suffix in ["_config", "_data", "_docsize", "_idx"] {
+            expected.insert(format!("{}{suffix}", fts.table), "shadow".to_string());
+        }
+    }
+    if rows.len() != expected.len() {
+        return false;
+    }
+    let mut observed = BTreeMap::new();
+    let mut previous = None::<String>;
+    for row in rows {
+        let Ok(object) = exact_row(row, &["name", "type"]) else {
+            return false;
+        };
+        let (Ok(name), Ok(kind)) = (exact_string(object, "name"), exact_string(object, "type"))
+        else {
+            return false;
+        };
+        if previous.as_ref().is_some_and(|prior| prior >= &name)
+            || observed.insert(name.clone(), kind).is_some()
+        {
+            return false;
+        }
+        previous = Some(name);
+    }
+    observed == expected
+}
+
+// The dedicated database must have no additional trigger authority, even if
+// an extra trigger has a name outside the manifest's declared object union.
+#[cfg_attr(not(test), allow(dead_code))]
+fn fts5_trigger_authority_query() -> String {
+    format!(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger' ORDER BY type, name LIMIT {}",
+        MAX_SCHEMA_OBJECTS + 1
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn fts5_trigger_authority_matches(rows: &[Value], state: &D1MigrationStateExpectation) -> bool {
+    if rows.len() > MAX_SCHEMA_OBJECTS {
+        return false;
+    }
+    let Ok(observed) = parse_schema_rows(rows) else {
+        return false;
+    };
+    let expected = state
+        .schema_objects
+        .iter()
+        .filter(|object| object.object_type == "trigger")
+        .map(|object| ObservedSchemaObject {
+            object_type: object.object_type.clone(),
+            name: object.name.clone(),
+            table_name: object.table_name.clone(),
+            sql_sha256: object.sql_sha256.clone(),
+        })
+        .collect::<Vec<_>>();
+    observed == expected
+}
+
 #[cfg(test)]
 fn derive_effect_assertion(
     effect_assertion_id: Option<&str>,
@@ -2102,6 +2261,7 @@ fn derive_additive_effect_assertion(
     seed_assertion_version: Option<SeedAssertionVersion>,
 ) -> Result<DerivedEffectAssertion, CallToolResult> {
     let allow_seed_rows = seed_assertion_version.is_some();
+    let fts_prototype = seed_assertion_version == Some(SeedAssertionVersion::V3Fts);
     let mut migrations = Vec::with_capacity(manifest.len());
     let mut trigger_lexical_token_values = BTreeSet::new();
     let mut manifest_created_tables = BTreeMap::<String, String>::new();
@@ -2111,6 +2271,8 @@ fn derive_additive_effect_assertion(
     let mut strict_seed_table_keys = BTreeSet::new();
     let mut rowid_seed_table_keys = BTreeSet::new();
     let mut table_identity_spellings = BTreeMap::<String, String>::new();
+    let mut fts_sources = BTreeSet::new();
+    let mut fts_shapes = Vec::<(usize, ExternalFts5Shape)>::new();
     for migration in manifest {
         let statements = tokenize_sql_statements(&migration.sql).ok_or_else(|| {
             reconciliation_error(
@@ -2190,6 +2352,34 @@ fn derive_additive_effect_assertion(
                         "external-content FTS5 requires an earlier ordinary rowid table with an exact integer primary-key alias and declared text columns",
                     ));
                 }
+                if fts_prototype {
+                    let source_key = sqlite_ascii_identifier_key(&shape.content);
+                    if !fts_shapes.is_empty()
+                        || !fts_sources.insert(source_key.clone())
+                        || seeded_tables.contains(&source_key)
+                        || !trigger_seen.is_empty()
+                        || manifest_created_tables.get(&source_key) != Some(&shape.content)
+                    {
+                        return Err(reconciliation_error(
+                            "capability_gap",
+                            "d1.migration_reconciliation_effect_proof_unavailable",
+                            "the empty FTS prototype requires one unseeded content table and no earlier triggers",
+                        ));
+                    }
+                    for name in std::iter::once(shape.table.clone()).chain(
+                        ["_config", "_data", "_docsize", "_idx"]
+                            .into_iter()
+                            .map(|suffix| format!("{}{suffix}", shape.table)),
+                    ) {
+                        effects.push(ClassifiedEffect::Create(DerivedSchemaObject {
+                            object_type: "table".into(),
+                            table_name: name.clone(),
+                            name,
+                        }));
+                    }
+                    fts_shapes.push((migrations.len() + 1, shape));
+                    continue;
+                }
                 return Err(reconciliation_error(
                     "capability_gap",
                     "d1.migration_reconciliation_effect_proof_unavailable",
@@ -2198,6 +2388,13 @@ fn derive_additive_effect_assertion(
             }
             match classify_additive_statement(&tokens).map_err(additive_contract_error)? {
                 Some(AdditiveStatement::AddColumn(mut effect)) => {
+                    if fts_prototype {
+                        return Err(reconciliation_error(
+                            "capability_gap",
+                            "d1.migration_reconciliation_effect_proof_unavailable",
+                            "the FTS prototype does not accept ALTER statements",
+                        ));
+                    }
                     if allow_seed_rows {
                         let authority_key = sqlite_ascii_identifier_key(&effect.table_name);
                         effect.table_name = table_identity_spellings
@@ -2209,6 +2406,13 @@ fn derive_additive_effect_assertion(
                     effects.push(ClassifiedEffect::AddColumn(effect));
                 }
                 Some(AdditiveStatement::ForeignKeysOn) => {
+                    if fts_prototype {
+                        return Err(reconciliation_error(
+                            "capability_gap",
+                            "d1.migration_reconciliation_effect_proof_unavailable",
+                            "the FTS prototype does not accept PRAGMA statements",
+                        ));
+                    }
                     pragma_count += 1;
                     effects.push(ClassifiedEffect::ForeignKeysOn);
                 }
@@ -2221,6 +2425,16 @@ fn derive_additive_effect_assertion(
                         .map_err(seed_contract_error)?
                         {
                             let authority_key = sqlite_ascii_identifier_key(&effect.table_name);
+                            if fts_prototype
+                                && (fts_sources.contains(&authority_key)
+                                    || !trigger_seen.is_empty())
+                            {
+                                return Err(reconciliation_error(
+                                    "capability_gap",
+                                    "d1.migration_reconciliation_effect_proof_unavailable",
+                                    "the FTS prototype forbids seeding its content table or seeding after a trigger",
+                                ));
+                            }
                             let reviewed_table_name = manifest_created_tables
                                 .get(&authority_key)
                                 .ok_or_else(|| {
@@ -2372,6 +2586,90 @@ fn derive_additive_effect_assertion(
                     );
                 }
             }
+        }
+    }
+    if fts_prototype {
+        if fts_shapes.len() != 1 || !preexisting_tables.is_empty() {
+            return Err(reconciliation_error(
+                "capability_gap",
+                "d1.migration_reconciliation_effect_proof_unavailable",
+                "the FTS prototype requires one FTS family and no pre-existing parent tables",
+            ));
+        }
+        for (created_prefix, shape) in &fts_shapes {
+            for effect in fts5_empty_physical_seed_effects(shape) {
+                let key = sqlite_ascii_identifier_key(&effect.table_name);
+                let table_prefix = if effect.table_name == shape.content {
+                    rowid_seed_table_keys.insert(key.clone());
+                    let (_, source_index) = created_names.get(&key).ok_or_else(|| {
+                        reconciliation_error(
+                            "contradictory",
+                            "d1.migration_reconciliation_seed_parent_missing",
+                            "the FTS content source must be created by the exact manifest",
+                        )
+                    })?;
+                    source_index + 1
+                } else if effect.table_name.ends_with("_data")
+                    || effect.table_name.ends_with("_docsize")
+                {
+                    rowid_seed_table_keys.insert(key.clone());
+                    *created_prefix
+                } else {
+                    *created_prefix
+                };
+                insert_seed_effect(&mut full_seed_states, effect).map_err(seed_contract_error)?;
+                seed_locations.insert(key, (table_prefix, table_prefix));
+            }
+        }
+        // Every other newly created table must also remain empty unless its
+        // complete literal seed rows are independently derived above. This
+        // prevents an unrelated hidden row from being mistaken for an exact
+        // migration result. The first declared column is used only for the
+        // bounded physical row-count witness when the expected set is empty.
+        for (key, table_name) in &manifest_created_tables {
+            if full_seed_states.contains_key(key) {
+                continue;
+            }
+            let declaration = content_declarations.get(key).ok_or_else(|| {
+                reconciliation_error(
+                    "contradictory",
+                    "d1.migration_reconciliation_seed_parent_missing",
+                    "the empty table witness requires its exact CREATE declaration",
+                )
+            })?;
+            let first_column = token_identifier(declaration.get(4))
+                .filter(|name| {
+                    !matches_ignore_ascii_case(
+                        name,
+                        &["constraint", "primary", "foreign", "unique", "check"],
+                    ) && validate_identifier("empty table witness column", name).is_ok()
+                })
+                .ok_or_else(|| {
+                    reconciliation_error(
+                        "capability_gap",
+                        "d1.migration_reconciliation_effect_proof_unavailable",
+                        "the empty table witness requires a canonical first declared column",
+                    )
+                })?;
+            let (_, source_index) = created_names.get(key).ok_or_else(|| {
+                reconciliation_error(
+                    "contradictory",
+                    "d1.migration_reconciliation_seed_parent_missing",
+                    "the empty table witness requires a manifest-created table",
+                )
+            })?;
+            let created_prefix = source_index + 1;
+            insert_seed_effect(
+                &mut full_seed_states,
+                SeedInsertEffect {
+                    assertion_version: SeedAssertionVersion::V3Fts,
+                    table_name: table_name.clone(),
+                    columns: vec![first_column],
+                    rows: vec![],
+                },
+            )
+            .map_err(seed_contract_error)?;
+            seed_locations.insert(key.clone(), (created_prefix, created_prefix));
         }
     }
     let seed_registry = full_seed_states
@@ -3111,6 +3409,80 @@ fn strict_manifest_schema_digests(
         prefixes.push(current.clone());
     }
     Some(prefixes)
+}
+
+// Extend exact manifest-sourced digests with the engine-owned shadow schema.
+// The virtual-table type and physical data still require independent reads.
+#[cfg_attr(not(test), allow(dead_code))]
+fn strict_fts_schema_digests(
+    manifest: &[D1MigrationManifestEntry],
+) -> Option<Vec<BTreeMap<(String, String), String>>> {
+    let mut prefixes = strict_manifest_schema_digests(manifest)?;
+    let manifest_names = prefixes
+        .last()?
+        .keys()
+        .map(|(_, name)| sqlite_ascii_identifier_key(name))
+        .collect::<BTreeSet<_>>();
+    let mut shadows = BTreeMap::new();
+    let mut fts_seen = false;
+    for (index, migration) in manifest.iter().enumerate() {
+        for source in strict_manifest_statement_sources(&migration.sql)? {
+            let parsed = tokenize_sql_statements(source)?;
+            if let Some(shape) = classify_external_fts5(parsed.first()?) {
+                if fts_seen {
+                    return None;
+                }
+                fts_seen = true;
+                for (key, digest) in fts5_shadow_schema_digests(&shape) {
+                    if manifest_names.contains(&sqlite_ascii_identifier_key(&key.1))
+                        || shadows.insert(key, digest).is_some()
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
+        for (key, digest) in &shadows {
+            if prefixes
+                .get_mut(index + 1)?
+                .insert(key.clone(), digest.clone())
+                .is_some()
+            {
+                return None;
+            }
+        }
+    }
+    fts_seen.then_some(prefixes)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn fts_expected_schema_is_source_bound(
+    manifest: &[D1MigrationManifestEntry],
+    states: &[D1MigrationStateExpectation],
+) -> bool {
+    let Some(prefixes) = strict_fts_schema_digests(manifest) else {
+        return false;
+    };
+    states.len() == prefixes.len()
+        && states
+            .iter()
+            .zip(prefixes)
+            .enumerate()
+            .all(|(prefix, (state, expected))| {
+                let supplied = state
+                    .schema_objects
+                    .iter()
+                    .map(|object| {
+                        (
+                            (object.object_type.clone(), object.name.clone()),
+                            object.sql_sha256.clone(),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                state.manifest_prefix_length == prefix
+                    && supplied.len() == state.schema_objects.len()
+                    && supplied == expected
+            })
 }
 
 fn tokenize_sql_statements(sql: &str) -> Option<Vec<Vec<SqlToken>>> {
@@ -5057,6 +5429,227 @@ mod tests {
                 "{invalid}"
             );
         }
+    }
+
+    #[test]
+    fn external_fts5_empty_engine_evidence_is_bounded_and_not_caller_supplied() {
+        let sql = "CREATE VIRTUAL TABLE lookup USING fts5(title, content='documents', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');";
+        let shape = classify_external_fts5(&tokenize_sql_statements(sql).unwrap()[0]).unwrap();
+        let effects = fts5_empty_physical_seed_effects(&shape);
+        let mut registry = BTreeMap::new();
+        for effect in effects {
+            insert_seed_effect(&mut registry, effect).unwrap();
+        }
+        assert_eq!(registry.len(), 5);
+        assert!(registry["documents"].rows.is_empty());
+        assert_eq!(
+            registry["lookup_config"].rows,
+            vec![vec![
+                SeedLiteral::Text("version".into()),
+                SeedLiteral::Integer(4)
+            ]]
+        );
+        assert_eq!(
+            registry["lookup_data"].rows,
+            vec![
+                vec![SeedLiteral::Integer(1), SeedLiteral::Blob(vec![])],
+                vec![SeedLiteral::Integer(10), SeedLiteral::Blob(vec![0; 7])]
+            ]
+        );
+        assert!(registry["lookup_docsize"].rows.is_empty());
+        assert!(registry["lookup_idx"].rows.is_empty());
+        let shadow = fts5_shadow_schema_digests(&shape);
+        assert_eq!(shadow.len(), 4);
+        assert_eq!(
+            shadow[&("table".into(), "lookup_data".into())],
+            sha256_bytes_hex(b"CREATE TABLE 'lookup_data'(id INTEGER PRIMARY KEY, block BLOB)")
+        );
+        assert_ne!(
+            shadow[&("table".into(), "lookup_data".into())],
+            sha256_bytes_hex(b"CREATE TABLE 'lookup_data'(id INTEGER PRIMARY KEY, block TEXT)")
+        );
+        assert!(
+            canonical_effect_assertion_id(Some("schema_create_objects_additive_fts_v3")).is_err()
+        );
+    }
+
+    #[test]
+    fn unselected_fts_table_classes_deny_fake_or_missing_engine_objects() {
+        let sql = "CREATE VIRTUAL TABLE lookup USING fts5(title, content='documents', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');";
+        let shape = classify_external_fts5(&tokenize_sql_statements(sql).unwrap()[0]).unwrap();
+        let good = vec![
+            json!({"name":"documents","type":"table"}),
+            json!({"name":"lookup","type":"virtual"}),
+            json!({"name":"lookup_config","type":"shadow"}),
+            json!({"name":"lookup_data","type":"shadow"}),
+            json!({"name":"lookup_docsize","type":"shadow"}),
+            json!({"name":"lookup_idx","type":"shadow"}),
+        ];
+        assert!(fts5_table_types_match(&shape, true, true, &good));
+        assert!(fts5_table_types_match(&shape, true, false, &good[..1]));
+        assert!(fts5_table_types_match(&shape, false, false, &[]));
+        assert!(!fts5_table_types_match(&shape, false, true, &good));
+        assert!(!fts5_table_types_match(&shape, true, true, &good[..5]));
+        let mut fake = good.clone();
+        fake[3] = json!({"name":"lookup_data","type":"table"});
+        assert!(!fts5_table_types_match(&shape, true, true, &fake));
+        let mut extra = good.clone();
+        extra.push(json!({"name":"other","type":"shadow"}));
+        assert!(!fts5_table_types_match(&shape, true, true, &extra));
+        let mut reordered = good.clone();
+        reordered.swap(0, 1);
+        assert!(!fts5_table_types_match(&shape, true, true, &reordered));
+        let query = fts5_table_type_query(&shape);
+        assert!(query.starts_with("SELECT name, type FROM pragma_table_list"));
+        assert!(query.ends_with("ORDER BY name LIMIT 7"));
+        assert!(!query.contains(";"));
+    }
+
+    #[test]
+    fn unselected_fts_trigger_authority_detects_unlisted_database_triggers() {
+        let sql = "CREATE TRIGGER audit AFTER INSERT ON documents BEGIN SELECT 1; END";
+        let mut state = empty_state();
+        state
+            .schema_objects
+            .push(D1MigrationSchemaObjectExpectation {
+                object_type: "trigger".into(),
+                name: "audit".into(),
+                table_name: "documents".into(),
+                sql_sha256: sha256_bytes_hex(sql.as_bytes()),
+            });
+        let rows = vec![json!({"type":"trigger","name":"audit","tbl_name":"documents","sql":sql})];
+        assert!(fts5_trigger_authority_matches(&rows, &state));
+        assert!(!fts5_trigger_authority_matches(&[], &state));
+        let mut extra = rows.clone();
+        extra.push(json!({"type":"trigger","name":"z_hidden","tbl_name":"elsewhere","sql":"CREATE TRIGGER z_hidden AFTER INSERT ON elsewhere BEGIN SELECT 1; END"}));
+        assert!(!fts5_trigger_authority_matches(&extra, &state));
+        let changed = vec![
+            json!({"type":"trigger","name":"audit","tbl_name":"documents","sql":"CREATE TRIGGER audit AFTER INSERT ON documents BEGIN SELECT 2; END"}),
+        ];
+        assert!(!fts5_trigger_authority_matches(&changed, &state));
+        assert!(fts5_trigger_authority_matches(&[], &empty_state()));
+        assert!(fts5_trigger_authority_query().ends_with("LIMIT 129"));
+    }
+
+    #[test]
+    fn unselected_fts_prototype_derives_shadow_and_empty_source_by_prefix() {
+        let first = "CREATE TABLE documents(rowid INTEGER PRIMARY KEY, title TEXT);";
+        let second = "CREATE VIRTUAL TABLE lookup USING fts5(title, content='documents', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');";
+        let mut entries = manifest(first);
+        let mut next = manifest(second).remove(0);
+        next.name = "0002_create.sql".into();
+        entries.push(next);
+        let proof =
+            derive_additive_effect_assertion(&entries, Some(SeedAssertionVersion::V3Fts)).unwrap();
+        assert!(proof.states[0].is_empty());
+        assert_eq!(proof.states[1].len(), 1);
+        assert_eq!(proof.states[2].len(), 6);
+        let plan = proof.seed_plan.unwrap();
+        assert!(plan.states[0].is_empty());
+        assert_eq!(plan.states[1].len(), 1);
+        assert_eq!(plan.states[1][0].table_name, "documents");
+        assert!(plan.states[1][0].rows.is_empty());
+        assert_eq!(plan.states[2].len(), 5);
+        for sql in [
+            format!("{first} INSERT INTO documents(rowid,title) VALUES(1,'x'); {second}"),
+            format!("{first} {second} INSERT INTO documents(rowid,title) VALUES(1,'x');"),
+            format!("{first} CREATE TABLE lookup_data(id INTEGER); {second}"),
+            format!(
+                "{first} CREATE TRIGGER early AFTER INSERT ON documents BEGIN SELECT 1; END; {second}"
+            ),
+            format!(
+                "{first} {second} CREATE VIRTUAL TABLE lookup2 USING fts5(title, content='documents', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');"
+            ),
+        ] {
+            assert!(
+                derive_additive_effect_assertion(
+                    &manifest(&sql),
+                    Some(SeedAssertionVersion::V3Fts)
+                )
+                .is_err(),
+                "{sql}"
+            );
+        }
+        assert!(
+            canonical_effect_assertion_id(Some("schema_create_objects_additive_fts_v3")).is_err()
+        );
+    }
+
+    #[test]
+    fn unselected_fts_prototype_witnesses_every_new_ordinary_table() {
+        let sql = "CREATE TABLE documents(rowid INTEGER PRIMARY KEY, title TEXT); CREATE TABLE queue(id INTEGER PRIMARY KEY, data TEXT); CREATE TABLE state(id INTEGER PRIMARY KEY, value TEXT); INSERT INTO state(id,value) VALUES(1,'ready'); CREATE VIRTUAL TABLE lookup USING fts5(title, content='documents', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');";
+        let proof =
+            derive_additive_effect_assertion(&manifest(sql), Some(SeedAssertionVersion::V3Fts))
+                .unwrap();
+        let seed = &proof.seed_plan.unwrap().states[1];
+        assert_eq!(seed.len(), 7);
+        let queue = seed
+            .iter()
+            .find(|state| state.table_name == "queue")
+            .unwrap();
+        assert_eq!(queue.columns, ["id"]);
+        assert!(queue.rows.is_empty());
+        let state = seed
+            .iter()
+            .find(|state| state.table_name == "state")
+            .unwrap();
+        assert_eq!(
+            state.rows,
+            vec![vec![
+                SeedLiteral::Integer(1),
+                SeedLiteral::Text("ready".into())
+            ]]
+        );
+    }
+
+    #[test]
+    fn unselected_fts_schema_expectations_bind_manifest_and_engine_definitions() {
+        let sql = "CREATE TABLE documents(rowid INTEGER PRIMARY KEY, title TEXT); CREATE VIRTUAL TABLE lookup USING fts5(title, content='documents', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2');";
+        let entries = manifest(sql);
+        let prefixes = strict_fts_schema_digests(&entries).unwrap();
+        assert_eq!(prefixes[1].len(), 6);
+        let states = prefixes
+            .iter()
+            .enumerate()
+            .map(|(prefix, objects)| D1MigrationStateExpectation {
+                manifest_prefix_length: prefix,
+                schema_objects: objects
+                    .iter()
+                    .map(
+                        |((object_type, name), digest)| D1MigrationSchemaObjectExpectation {
+                            object_type: object_type.clone(),
+                            name: name.clone(),
+                            table_name: name.clone(),
+                            sql_sha256: digest.clone(),
+                        },
+                    )
+                    .collect(),
+                tables: vec![],
+                seed_tables: vec![],
+            })
+            .collect::<Vec<_>>();
+        assert!(fts_expected_schema_is_source_bound(&entries, &states));
+        let mut forged = states.clone();
+        let object = forged[1]
+            .schema_objects
+            .iter_mut()
+            .find(|object| object.name == "lookup")
+            .unwrap();
+        object.sql_sha256 = sha256_bytes_hex(b"CREATE VIRTUAL TABLE lookup USING fts5(title, content='other', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2')");
+        assert!(!fts_expected_schema_is_source_bound(&entries, &forged));
+        let mut duplicate = states.clone();
+        duplicate[1].schema_objects[0] = duplicate[1].schema_objects[1].clone();
+        assert!(!fts_expected_schema_is_source_bound(&entries, &duplicate));
+        let mut shadow = states.clone();
+        shadow[1]
+            .schema_objects
+            .iter_mut()
+            .find(|object| object.name == "lookup_data")
+            .unwrap()
+            .sql_sha256 = "0".repeat(64);
+        assert!(!fts_expected_schema_is_source_bound(&entries, &shadow));
+        let collision = format!("{sql} CREATE TABLE lookup_data(id INTEGER);");
+        assert!(strict_fts_schema_digests(&manifest(&collision)).is_none());
     }
 
     #[test]
