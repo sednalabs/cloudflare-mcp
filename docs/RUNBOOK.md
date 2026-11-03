@@ -619,6 +619,24 @@ Select one explicit built-in effect assertion:
   reconciliation, terminal dry run, live finalization, durable receipt, and
   completed replay. This assertion does not change provider migration-write or
   PRAGMA transmission behavior; treat that as a separate execution boundary.
+- `effect_assertion_id=schema_create_objects_empty_external_fts5_v1` is a
+  separate, narrowly bounded assertion for one manifest-created external-content
+  FTS5 table. The content table must have an inline `rowid INTEGER PRIMARY KEY`
+  and the indexed fields must be declared TEXT. Only the supported unicode61
+  tokenizer and exact content/rowid options are accepted; FTS content starts
+  empty, and canonical literal seeds must precede all triggers. Other new tables
+  must be empty or have their complete reviewed literal seeds. The assertion
+  derives schema SQL digests from exact canonical manifest bytes and fixed
+  engine shadow definitions, verifies real virtual/shadow classes, rejects
+  extra objects in the FTS shadow-name prefix and checks the complete database
+  trigger set, and checks bounded physical row counts and
+  typed values in both primary reads. It rejects comments, unsupported CREATE
+  forms, ALTER/PRAGMA, pre-existing parents and unrecognized engine layouts.
+  Engine SQL, row bytes, table-list support and primary metadata are provider
+  compatibility requirements, not assumed evidence: a mismatch or unavailable
+  read remains reconciliation-required. This does not bypass the shared lease,
+  authorize a migration, prove a provider version, or allow an ambiguous apply
+  to be replayed. Keep the same assertion through terminal reconciliation.
 
 The successful response identifies that same closed scope without flattening
 the broader assertions back to the legacy label: `effect_assertion.scope`
@@ -692,6 +710,10 @@ effects. The additive assertion refuses those same effects except for its exact
 ADD COLUMN and foreign-keys-on forms; a caller assertion is not proof. An
 effect capability gap means retain the lease and add
 a purpose-built registry assertion/readback contract before continuing.
+The predecessor additive assertions continue to refuse external-content FTS5;
+only the separate, narrowly scoped FTS5 assertion above can attempt its
+independent engine and source proof. Neither recognition nor a capability gap
+is permission to retry a migration or release retained custody.
 
 The tool opens the existing target and guard without creating entries, requires
 exactly one active or retiring regular private evidence file, and holds the
