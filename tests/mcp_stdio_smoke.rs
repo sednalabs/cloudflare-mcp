@@ -2106,6 +2106,101 @@ fn tagged_reconciliation_result(
     result
 }
 
+fn fts_reconciliation_case() -> (Value, Value, Vec<Value>, Vec<Vec<Value>>) {
+    let definitions = [
+        (
+            "documents",
+            "CREATE TABLE documents(rowid INTEGER PRIMARY KEY, title TEXT)",
+        ),
+        (
+            "lookup",
+            "CREATE VIRTUAL TABLE lookup USING fts5(title, content='documents', content_rowid='rowid', tokenize='unicode61 remove_diacritics 2')",
+        ),
+        (
+            "lookup_config",
+            "CREATE TABLE 'lookup_config'(k PRIMARY KEY, v) WITHOUT ROWID",
+        ),
+        (
+            "lookup_data",
+            "CREATE TABLE 'lookup_data'(id INTEGER PRIMARY KEY, block BLOB)",
+        ),
+        (
+            "lookup_docsize",
+            "CREATE TABLE 'lookup_docsize'(id INTEGER PRIMARY KEY, sz BLOB)",
+        ),
+        (
+            "lookup_idx",
+            "CREATE TABLE 'lookup_idx'(segid, term, pgno, PRIMARY KEY(segid, term)) WITHOUT ROWID",
+        ),
+    ];
+    let sql = format!("{}; {};", definitions[0].1, definitions[1].1);
+    let manifest = json!([{ "name":"0001_create.sql", "size_bytes":sql.len(), "sql_sha256":sha256_hex(&sql), "sql":sql }]);
+    let schema_rows = definitions
+        .iter()
+        .map(|(name, sql)| json!({"type":"table","name":name,"tbl_name":name,"sql":sql}))
+        .collect::<Vec<_>>();
+    let schema = definitions.iter().map(|(name, sql)| json!({"object_type":"table","name":name,"table_name":name,"sql_sha256":sha256_hex(sql)})).collect::<Vec<_>>();
+    let column = |cid, name, ty, not_null, pk, hidden| json!({"cid":cid,"name":name,"type":ty,"notnull":not_null,"dflt_value":null,"pk":pk,"hidden":hidden});
+    let xinfo = vec![
+        vec![
+            column(0, "rowid", "INTEGER", 0, 1, 0),
+            column(1, "title", "TEXT", 0, 0, 0),
+        ],
+        vec![
+            column(0, "title", "", 0, 0, 0),
+            column(1, "lookup", "", 0, 0, 1),
+            column(2, "rank", "", 0, 0, 1),
+        ],
+        vec![column(0, "k", "", 1, 1, 0), column(1, "v", "", 0, 0, 0)],
+        vec![
+            column(0, "id", "INTEGER", 0, 1, 0),
+            column(1, "block", "BLOB", 0, 0, 0),
+        ],
+        vec![
+            column(0, "id", "INTEGER", 0, 1, 0),
+            column(1, "sz", "BLOB", 0, 0, 0),
+        ],
+        vec![
+            column(0, "segid", "", 1, 1, 0),
+            column(1, "term", "", 1, 2, 0),
+            column(2, "pgno", "", 0, 0, 0),
+        ],
+    ];
+    let tables = definitions.iter().zip(&xinfo).map(|((name, _), columns)| json!({
+        "name":name,"foreign_keys":[],"columns":columns.iter().map(|column| json!({"cid":column["cid"],"name":column["name"],"declared_type":column["type"],"not_null":column["notnull"] == 1,"default_value":null,"primary_key_position":column["pk"],"hidden":column["hidden"]})).collect::<Vec<_>>()
+    })).collect::<Vec<_>>();
+    let seed = |name: &str, columns: Vec<&str>, rows: Vec<Value>| {
+        let proof = json!({"version":3,"table_name":name,"columns":columns,"rows":rows});
+        json!({"table_name":name,"columns":columns,"row_count":rows.len(),"rows_sha256":sha256_hex(&serde_json::to_string(&proof).unwrap())})
+    };
+    let seeds = vec![
+        seed("documents", vec!["rowid"], vec![]),
+        seed(
+            "lookup_config",
+            vec!["k", "v"],
+            vec![
+                json!([{"storage_class":"text","value":"76657273696F6E"},{"storage_class":"integer","value":"4"}]),
+            ],
+        ),
+        seed(
+            "lookup_data",
+            vec!["id", "block"],
+            vec![
+                json!([{"storage_class":"integer","value":"1"},{"storage_class":"blob","value":""}]),
+                json!([{"storage_class":"integer","value":"10"},{"storage_class":"blob","value":"00000000000000"}]),
+            ],
+        ),
+        seed("lookup_docsize", vec!["id"], vec![]),
+        seed("lookup_idx", vec!["segid"], vec![]),
+    ];
+    (
+        manifest,
+        json!([{"manifest_prefix_length":0,"schema_objects":[],"tables":[],"seed_tables":[]},{"manifest_prefix_length":1,"schema_objects":schema,"tables":tables,"seed_tables":seeds}]),
+        schema_rows,
+        xinfo,
+    )
+}
+
 fn one_table_reconciliation_case() -> (Value, Value) {
     let migration_sql = "CREATE TABLE items(id INTEGER PRIMARY KEY);";
     let manifest = json!([{
@@ -3357,6 +3452,169 @@ fn spawn_fake_schema_object_reconciliation_api(
             json!({"cid": 1, "name": "name", "type": "TEXT", "notnull": 0, "dflt_value": null, "pk": 0, "hidden": 0}),
         ],
     )
+}
+
+fn spawn_fake_fts_reconciliation_api(
+    call_count: usize,
+    schema: Vec<Value>,
+    xinfo: Vec<Vec<Value>>,
+    fault: Option<&'static str>,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake FTS API"); // DevSkim: ignore DS162092 -- loopback-only test fixture
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = requests.clone();
+    thread::spawn(move || {
+        for (call_index, stream) in listener.incoming().take(call_count).enumerate() {
+            let mut stream = stream.unwrap();
+            let (_, body) = read_http_request(&mut stream);
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            let sql = request["sql"].as_str().unwrap();
+            let markers = reconciliation_statement_markers(sql);
+            assert!(
+                matches!(markers.len(), 2 | 34),
+                "unexpected result count {}",
+                markers.len()
+            );
+            let full = markers.len() == 34;
+            captured.lock().unwrap().push(request.clone());
+            let mut results = vec![
+                tagged_reconciliation_result(
+                    &markers[0],
+                    &["id", "name"],
+                    vec![json!({"id":1,"name":"0001_create.sql"})],
+                    None,
+                ),
+                tagged_reconciliation_result(
+                    &markers[1],
+                    &["type", "name", "tbl_name", "sql"],
+                    if full { schema.clone() } else { vec![] },
+                    None,
+                ),
+            ];
+            if full {
+                let xfields = [
+                    "cid",
+                    "name",
+                    "type",
+                    "notnull",
+                    "dflt_value",
+                    "pk",
+                    "hidden",
+                ];
+                let ffields = [
+                    "id",
+                    "seq",
+                    "table",
+                    "from",
+                    "to",
+                    "on_update",
+                    "on_delete",
+                    "match",
+                ];
+                for columns in &xinfo {
+                    let offset = results.len();
+                    results.push(tagged_reconciliation_result(
+                        &markers[offset],
+                        &xfields,
+                        columns.clone(),
+                        None,
+                    ));
+                    results.push(tagged_reconciliation_result(
+                        &markers[offset + 1],
+                        &ffields,
+                        vec![],
+                        None,
+                    ));
+                    results.push(tagged_reconciliation_result(
+                        &markers[offset + 2],
+                        &["table", "rowid", "parent", "fkid"],
+                        vec![],
+                        None,
+                    ));
+                }
+                let seed_rows = vec![
+                    (vec!["t0", "v0"], vec![]),
+                    (
+                        vec!["t0", "v0", "t1", "v1"],
+                        vec![json!({"t0":"text","v0":"76657273696F6E","t1":"integer","v1":"4"})],
+                    ),
+                    (
+                        vec!["t0", "v0", "t1", "v1"],
+                        vec![
+                            json!({"t0":"integer","v0":"1","t1":"blob","v1":""}),
+                            json!({"t0":"integer","v0":"10","t1":"blob","v1":"00000000000000"}),
+                        ],
+                    ),
+                    (vec!["t0", "v0"], vec![]),
+                    (vec!["t0", "v0"], vec![]),
+                ];
+                for (fields, rows) in seed_rows {
+                    let offset = results.len();
+                    results.push(tagged_reconciliation_result(
+                        &markers[offset],
+                        &["row_count"],
+                        vec![json!({"row_count":rows.len()})],
+                        None,
+                    ));
+                    results.push(tagged_reconciliation_result(
+                        &markers[offset + 1],
+                        &fields,
+                        rows,
+                        None,
+                    ));
+                }
+                let mut types = vec![
+                    json!({"name":"documents","type":"table"}),
+                    json!({"name":"lookup","type":"virtual"}),
+                    json!({"name":"lookup_config","type":"shadow"}),
+                    json!({"name":"lookup_data","type":"shadow"}),
+                    json!({"name":"lookup_docsize","type":"shadow"}),
+                    json!({"name":"lookup_idx","type":"shadow"}),
+                ];
+                if fault == Some("wrong_type")
+                    || (fault == Some("changed_second") && call_index == 2)
+                {
+                    types[1]["type"] = json!("table");
+                }
+                if fault == Some("truncated_types") {
+                    types.pop();
+                }
+                let offset = results.len();
+                results.push(tagged_reconciliation_result(
+                    &markers[offset],
+                    &["row_count"],
+                    vec![json!({"row_count":6})],
+                    None,
+                ));
+                results.push(tagged_reconciliation_result(
+                    &markers[offset + 1],
+                    &["name", "type"],
+                    types,
+                    None,
+                ));
+                results.push(tagged_reconciliation_result(
+                    &markers[offset + 2],
+                    &["row_count"],
+                    vec![json!({"row_count":if fault == Some("dropped_trigger") { 1 } else { 0 }})],
+                    None,
+                ));
+                results.push(tagged_reconciliation_result(
+                    &markers[offset + 3],
+                    &["type", "name", "tbl_name", "sql"],
+                    vec![],
+                    None,
+                ));
+            }
+            let response = serde_json::to_vec(
+                &json!({"success":true,"errors":[],"messages":[],"result":results}),
+            )
+            .unwrap();
+            write!(stream,"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",response.len()).unwrap();
+            stream.write_all(&response).unwrap();
+        }
+    });
+    (format!("http://{addr}"), requests) // DevSkim: ignore DS137138 -- loopback-only test fixture
 }
 
 fn spawn_fake_canonical_seed_reconciliation_api(
@@ -11936,6 +12194,164 @@ fn generic_manifest_tools_reject_the_reserved_bootstrap_family_before_any_effect
 
     mcp.terminate();
     let _ = fs::remove_dir_all(lease_root);
+}
+
+#[test]
+fn d1_fts_reconciliation_and_terminal_finalize_share_exact_proof() {
+    let (manifest, states, schema, xinfo) = fts_reconciliation_case();
+    let (base_url, requests) = spawn_fake_fts_reconciliation_api(11, schema, xinfo, None);
+    let lease_root = PathBuf::from("/tmp").join(format!(
+        "cloudflare-mcp-fts-reconcile-{}",
+        std::process::id()
+    ));
+    fs::create_dir(&lease_root).expect("create private test root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let (plan, nonce, lease_hash) = create_retained_reconciliation_fixture(&lease_root, &manifest);
+    let mut mcp = McpStdioProcess::start_with_env(vec![
+        ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+        (
+            "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+            lease_root.to_string_lossy().to_string(),
+        ),
+    ]);
+    let args = json!({"database_id":"123e4567-e89b-42d3-a456-426614174000","migration_family":"newsletter-core","manifest":manifest,"approved_plan_sha256":plan,"lease_nonce":nonce,"lease_payload_sha256":lease_hash,"effect_assertion_id":"schema_create_objects_empty_external_fts5_v1","state_expectations":states});
+    let retained_before = fs::read(assert_private_regular_active_lease(&lease_root)).unwrap();
+    let mut forged = args.clone();
+    let schema = forged["state_expectations"][1]["schema_objects"]
+        .as_array_mut()
+        .unwrap();
+    schema
+        .iter_mut()
+        .find(|item| item["name"] == "lookup")
+        .unwrap()["sql_sha256"] = json!("0".repeat(64));
+    let denied = mcp.call_tool(1849, "d1_reconcile_migration_manifest", forged);
+    let denied = structured_content(&denied);
+    assert_eq!(
+        denied["error"]["code"], "d1.migration_reconciliation_fts_source_binding_mismatch",
+        "{denied}"
+    );
+    assert_eq!(denied["provider_calls"], 0);
+    assert_eq!(denied["local_namespace_mutations"], 0);
+    assert_eq!(
+        fs::read(assert_private_regular_active_lease(&lease_root)).unwrap(),
+        retained_before
+    );
+    assert!(requests.lock().unwrap().is_empty());
+    let response = mcp.call_tool(1850, "d1_reconcile_migration_manifest", args.clone());
+    let proof = structured_content(&response).clone();
+    assert_eq!(proof["ok"], true, "{proof}");
+    assert_eq!(proof["outcome"], "full_state_converged");
+    assert_eq!(proof["provider_calls"], 3);
+    assert_eq!(proof["provider_mutations"], 0);
+    assert_eq!(proof["lease_retained"], true);
+    let mut terminal = args;
+    terminal["expected_reconciliation_plan_sha256"] = proof["reconciliation_plan_sha256"].clone();
+    terminal["expected_expectation_proof_sha256"] = proof["expectation_proof_sha256"].clone();
+    terminal["expected_query_sha256"] = proof["query_sha256"].clone();
+    terminal["expected_canonical_snapshot_sha256"] = proof["canonical_snapshot_sha256"].clone();
+    terminal["expected_outcome"] = proof["outcome"].clone();
+    terminal["expected_original_prefix_length"] =
+        proof["reconstructed_original_prefix_length"].clone();
+    terminal["expected_current_prefix_length"] = proof["current_manifest_prefix_length"].clone();
+    terminal["terminal_request_sha256"] = json!("d".repeat(64));
+    terminal["terminal_attempt_sha256"] = json!("e".repeat(64));
+    terminal["dry_run"] = json!(true);
+    let dry = mcp.call_tool(
+        1851,
+        "d1_finalize_migration_reconciliation",
+        terminal.clone(),
+    );
+    let dry = structured_content(&dry).clone();
+    assert_eq!(dry["ok"], true, "{dry}");
+    terminal["dry_run"] = json!(false);
+    terminal["approved_terminal_plan_sha256"] = dry["terminal_plan_sha256"].clone();
+    let done = mcp.call_tool(
+        1852,
+        "d1_finalize_migration_reconciliation",
+        terminal.clone(),
+    );
+    let done = structured_content(&done);
+    assert_eq!(done["ok"], true, "{done}");
+    assert_eq!(done["status"], "terminal_reconciliation_complete");
+    assert_eq!(done["provider_mutations"], 0);
+    assert_released_manifest_target_custody(&lease_root);
+    let replay = mcp.call_tool(1853, "d1_finalize_migration_reconciliation", terminal);
+    let replay = structured_content(&replay);
+    assert_eq!(
+        replay["status"], "terminal_reconciliation_already_complete",
+        "{replay}"
+    );
+    assert_eq!(replay["provider_calls"], 0);
+    assert_eq!(requests.lock().unwrap().len(), 11);
+    mcp.terminate();
+    fs::remove_dir_all(lease_root).unwrap();
+}
+
+#[test]
+fn d1_fts_reconciliation_rejects_truncated_wrong_and_unstable_witnesses() {
+    for (fault, calls, expected_error) in [
+        (
+            "wrong_type",
+            3,
+            "d1.migration_reconciliation_fts_authority_mismatch",
+        ),
+        (
+            "truncated_types",
+            2,
+            "d1.migration_reconciliation_fts_types_unbounded",
+        ),
+        (
+            "dropped_trigger",
+            2,
+            "d1.migration_reconciliation_fts_triggers_unbounded",
+        ),
+        (
+            "changed_second",
+            3,
+            "d1.migration_reconciliation_evidence_unstable",
+        ),
+    ] {
+        let (manifest, states, schema, xinfo) = fts_reconciliation_case();
+        let (base_url, requests) =
+            spawn_fake_fts_reconciliation_api(calls, schema, xinfo, Some(fault));
+        let lease_root = PathBuf::from("/tmp").join(format!(
+            "cloudflare-mcp-fts-negative-{}-{fault}",
+            std::process::id()
+        ));
+        fs::create_dir(&lease_root).expect("create private test root");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&lease_root, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let (plan, nonce, lease_hash) =
+            create_retained_reconciliation_fixture(&lease_root, &manifest);
+        let retained_before = fs::read(assert_private_regular_active_lease(&lease_root)).unwrap();
+        let mut mcp = McpStdioProcess::start_with_env(vec![
+            ("CLOUDFLARE_MCP_API_BASE_URL", base_url),
+            (
+                "CLOUDFLARE_MCP_D1_MIGRATION_LEASE_ROOT",
+                lease_root.to_string_lossy().to_string(),
+            ),
+        ]);
+        let response = mcp.call_tool(1854,"d1_reconcile_migration_manifest",json!({"database_id":"123e4567-e89b-42d3-a456-426614174000","migration_family":"newsletter-core","manifest":manifest,"approved_plan_sha256":plan,"lease_nonce":nonce,"lease_payload_sha256":lease_hash,"effect_assertion_id":"schema_create_objects_empty_external_fts5_v1","state_expectations":states}));
+        let result = structured_content(&response);
+        assert_eq!(result["ok"], false, "{fault}: {result}");
+        assert_eq!(result["error"]["code"], expected_error, "{fault}: {result}");
+        assert_eq!(result["provider_mutations"], 0);
+        assert_eq!(result["retry_decision"], "do_not_retry_same_attempt");
+        assert_eq!(
+            fs::read(assert_private_regular_active_lease(&lease_root)).unwrap(),
+            retained_before
+        );
+        assert_eq!(requests.lock().unwrap().len(), calls);
+        mcp.terminate();
+        fs::remove_dir_all(lease_root).unwrap();
+    }
 }
 
 #[test]

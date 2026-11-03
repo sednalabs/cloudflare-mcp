@@ -230,6 +230,7 @@ fn valid_terminal_receipt_authority(receipt: &D1TerminalReconciliationReceipt) -
                 | "schema_create_objects_additive_v1"
                 | "schema_create_objects_additive_seed_rows_v1"
                 | "schema_create_objects_additive_seed_rows_v2"
+                | "schema_create_objects_empty_external_fts5_v1"
         ),
         "d1_finalize_bootstrap_migration_ledger" => {
             receipt.effect_assertion_id == "bootstrap_canonical_empty_ledger_v1"

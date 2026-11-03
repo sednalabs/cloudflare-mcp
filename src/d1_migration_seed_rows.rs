@@ -18,12 +18,14 @@ pub(crate) const EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V1: &str =
     "schema_create_objects_additive_seed_rows_v1";
 pub(crate) const EFFECT_ASSERTION_SCHEMA_ADDITIVE_SEED_ROWS_V2: &str =
     "schema_create_objects_additive_seed_rows_v2";
+pub(crate) const EFFECT_ASSERTION_SCHEMA_EMPTY_FTS5_V1: &str =
+    "schema_create_objects_empty_external_fts5_v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SeedAssertionVersion {
     V1,
     V2,
-    // Internal groundwork only; no effect assertion selects this version yet.
+    // Narrow external-content FTS5 proof with engine-owned shadow evidence.
     V3Fts,
 }
 
