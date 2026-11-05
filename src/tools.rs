@@ -1114,8 +1114,12 @@ pub struct PagesListDeploymentsArgs {
     #[serde(default)]
     pub environment: Option<String>,
     #[serde(default)]
+    #[schemars(range(min = 1))]
+    /// One-based page number. Omitted or null uses page 1.
     pub page: Option<u32>,
     #[serde(default)]
+    #[schemars(range(min = 1, max = 25))]
+    /// Supported page size from 1 through 25. Omitted or null uses 25.
     pub per_page: Option<u32>,
 }
 
@@ -6650,15 +6654,15 @@ impl CloudflareMcp {
 
     #[tool(
         name = "pages_list_deployments",
-        description = "List Cloudflare Pages deployments."
+        description = "Read one Cloudflare Pages deployment page. Defaults to page 1 and 25 items; per_page supports 1 through 25. Returns provider pagination metadata, not a complete or atomic inventory, and makes no ordering guarantee."
     )]
     async fn cloudflare_pages_list_deployments(
         &self,
         Parameters(args): Parameters<PagesListDeploymentsArgs>,
     ) -> Result<CallToolResult, crate::McpError> {
         let account_id = resolve_account_id(self, args.account_id.as_deref())?;
-        let page = args.page.unwrap_or(1).max(1);
-        let per_page = args.per_page.unwrap_or(50).clamp(1, 100);
+        let page = args.page.unwrap_or(1);
+        let per_page = args.per_page.unwrap_or(25);
         match self
             .cloudflare
             .list_pages_deployments(

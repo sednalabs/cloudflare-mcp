@@ -1808,6 +1808,23 @@ explicit, and provider rejections remain errors rather than silently falling
 back to a different request. The tool returns one page plus provider pagination
 metadata; it does not attest a complete account inventory.
 
+## Pages Deployment Listing
+
+`pages_list_deployments` reads one deployment page. Omitted or null pagination
+uses `page=1&per_page=25`. This adapter supports page sizes 1 through 25 and
+positive page numbers; out-of-range values fail locally before any provider
+request, rather than being silently clamped or retried with different options.
+The default avoids an upstream invalid-list-options response seen with larger
+page sizes. This supported adapter bound is not a claim that Cloudflare
+documents a universal maximum.
+
+The result preserves the provider's `page_info`. A page is not a complete
+project inventory: follow its pagination metadata deliberately and retain any
+incomplete, changing or unavailable state. The tool does not assume creation-time
+ordering, provide a date filter, combine pages, or claim an atomic snapshot.
+Provider errors for otherwise valid input remain errors. This read-only fix
+does not change deployment, rollback or release-authority behavior.
+
 ## Pages Project Settings
 
 For `pages_update_project` and generic `api_mutate` using

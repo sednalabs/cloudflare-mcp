@@ -3514,7 +3514,7 @@
       "name": "pages_get_project"
     },
     {
-      "description": "List Cloudflare Pages deployments.",
+      "description": "Read one Cloudflare Pages deployment page. Defaults to page 1 and 25 items; per_page supports 1 through 25. Returns provider pagination metadata, not a complete or atomic inventory, and makes no ordering guarantee.",
       "inputSchema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
@@ -3534,8 +3534,9 @@
           },
           "page": {
             "default": null,
+            "description": "One-based page number. Omitted or null uses page 1.",
             "format": "uint32",
-            "minimum": 0,
+            "minimum": 1,
             "type": [
               "integer",
               "null"
@@ -3543,8 +3544,10 @@
           },
           "per_page": {
             "default": null,
+            "description": "Supported page size from 1 through 25. Omitted or null uses 25.",
             "format": "uint32",
-            "minimum": 0,
+            "maximum": 25,
+            "minimum": 1,
             "type": [
               "integer",
               "null"
