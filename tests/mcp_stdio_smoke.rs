@@ -19,6 +19,9 @@ mod r2_publication;
 #[path = "support/waf_rulesets.rs"]
 mod waf_rulesets;
 
+#[path = "support/pages_deployments.rs"]
+mod pages_deployments;
+
 fn sha256_hex(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.as_bytes());

@@ -1,5 +1,13 @@
 # Tool Contract Workflow
 
+`pages_list_deployments` advertises positive page numbers and the adapter's
+supported page-size range of 1 through 25. Runtime validation matches the schema,
+and omitted/null values use page 1 with 25 items. The stdio regression in
+`tests/support/pages_deployments.rs` covers exact transmitted queries, local
+zero-provider-call rejection and preservation of provider pagination/error
+responses. It remains a single-page read, with no full-inventory or ordering
+attestation.
+
 The WAF lifecycle retains its argument schemas. `waf_ruleset_plan_change`
 additionally exposes the exact supported `request_body` separately from the
 response-shaped `planned_ruleset`; confirmation binds the complete pre-state

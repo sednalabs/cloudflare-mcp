@@ -163,6 +163,13 @@ impl CloudflareClient {
         page: u32,
         per_page: u32,
     ) -> Result<Page<PagesDeployment>, AdapterError> {
+        if page == 0 || !(1..=25).contains(&per_page) {
+            return Err(AdapterError::new(
+                "cloudflare.pages.pagination_invalid",
+                "Pages deployment pagination requires page >= 1 and per_page from 1 through 25",
+                "Omit pagination to read page 1 with 25 items, or request explicit supported page values. This tool returns one page; follow provider pagination metadata for further pages.",
+            ));
+        }
         let account_id = require_non_empty("account_id", account_id)?;
         let project_name = require_non_empty("project_name", project_name)?;
         let token = self.bearer_token()?;
