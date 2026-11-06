@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 use super::client::{AdapterError, CloudflareClient, decode_json_rejecting_duplicate_object_keys};
 use crate::worker_version_upload::{
-    canonicalize_explicit_upload_binding, canonicalize_provider_binding,
+    canonicalize_cache_options, canonicalize_explicit_upload_binding, canonicalize_provider_binding,
 };
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -70,8 +70,23 @@ pub(crate) struct WorkerVersionDetailEvidence {
     pub(crate) binding_projection_sha256: String,
     pub(crate) raw_result_sha256: String,
     pub(crate) provider_proof: WorkerProviderProof,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cache_options: Option<Value>,
+    #[serde(skip_serializing)]
+    pub(crate) migration_tag: Option<String>,
     #[serde(skip_serializing)]
     binding_projection: BTreeMap<String, Value>,
+}
+
+impl WorkerVersionDetailEvidence {
+    pub(crate) fn matches_cache_options(&self, requested: Option<&Value>) -> bool {
+        self.cache_options.as_ref() == requested
+    }
+
+    pub(crate) fn preserves_runtime_settings(&self, candidate: &Self) -> bool {
+        self.cache_options == candidate.cache_options
+            && self.migration_tag == candidate.migration_tag
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -984,6 +999,7 @@ fn sanitize_version_detail(
             key.as_str(),
             "compatibility_date"
                 | "compatibility_flags"
+                | "cache_options"
                 | "exports"
                 | "limits"
                 | "migration_tag"
@@ -1010,6 +1026,11 @@ fn sanitize_version_detail(
         .to_string();
     let compatibility_flags = canonical_flags(runtime.get("compatibility_flags"))?;
     let canonical_runtime = canonicalize_runtime_projection(runtime)?;
+    let cache_options = canonical_runtime.get("cache_options").cloned();
+    let migration_tag = canonical_runtime
+        .get("migration_tag")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let runtime_projection_sha256 = sha256_json(&canonical_runtime); // DevSkim: ignore DS197836 -- collision-resistant evidence digest, not a secret.
     let canonical_version_metadata = canonicalize_version_metadata_projection(object)?;
     let version_metadata_projection_sha256 = sha256_json(&canonical_version_metadata); // DevSkim: ignore DS197836 -- collision-resistant evidence digest, not a secret.
@@ -1097,6 +1118,8 @@ fn sanitize_version_detail(
         binding_projection_sha256,
         raw_result_sha256,
         provider_proof,
+        cache_options,
+        migration_tag,
         binding_projection,
     })
 }
@@ -1496,6 +1519,11 @@ fn canonicalize_runtime_projection(
         "compatibility_flags".to_string(),
         json!(canonical_flags(runtime.get("compatibility_flags"))?),
     );
+    if let Some(options) = runtime.get("cache_options") {
+        let options = canonicalize_cache_options(options)
+            .map_err(|error| operation_error(error.code, error.message, error.hint))?;
+        canonical.insert("cache_options".to_string(), options);
+    }
     if let Some(exports) = runtime.get("exports") {
         canonical.insert("exports".to_string(), canonicalize_exports(exports)?);
     }
@@ -2424,6 +2452,85 @@ mod tests {
             "../../tests/fixtures/worker_version_provider_shapes.json"
         ))
         .expect("redacted provider fixture")
+    }
+
+    #[test]
+    fn inherited_durable_object_and_version_cache_must_preserve_the_exact_base() {
+        let base_id = "11111111-1111-4111-8111-111111111111";
+        let candidate_id = "22222222-2222-4222-8222-222222222222";
+        let namespace_value = "0123456789abcdef".repeat(2);
+        let namespace = namespace_value.as_str();
+        let detail = |id: &str, options: Option<Value>, tag: Option<&str>, ns: &str| {
+            let mut rt = runtime();
+            if let Some(options) = options {
+                rt["cache_options"] = options;
+            }
+            if let Some(tag) = tag {
+                rt["migration_tag"] = json!(tag);
+            }
+            sanitize_version_detail(
+                json!({"id": id, "resources": {"script": {"etag": "a".repeat(64)},
+                    "script_runtime": rt, "bindings": [{"name":"INDEX", "type":"durable_object_namespace",
+                    "class_name":"SearchIndex", "namespace_id":ns}]}}),
+                Some(id),
+                proof(),
+            )
+            .unwrap()
+        };
+        let base = detail(
+            base_id,
+            Some(json!({"enabled":true})),
+            Some("v1"),
+            namespace,
+        );
+        let same = detail(
+            candidate_id,
+            Some(json!({"enabled":true,"cross_version_cache":false})),
+            Some("v1"),
+            namespace,
+        );
+        assert!(
+            base.matches_cache_options(Some(&json!({"enabled":true,"cross_version_cache":false})))
+        );
+        assert!(!base.matches_cache_options(None));
+        assert!(
+            !base
+                .matches_cache_options(Some(&json!({"enabled":false,"cross_version_cache":false})))
+        );
+        assert!(base.preserves_runtime_settings(&same));
+        assert!(!base.preserves_runtime_settings(&detail(
+            candidate_id,
+            None,
+            Some("v1"),
+            namespace
+        )));
+        assert!(!base.preserves_runtime_settings(&detail(
+            candidate_id,
+            Some(json!({"enabled":true})),
+            Some("v2"),
+            namespace
+        )));
+        assert!(!base.preserves_runtime_settings(&detail(
+            candidate_id,
+            Some(json!({"enabled":true,"cross_version_cache":true})),
+            Some("v1"),
+            namespace
+        )));
+
+        let metadata = json!({"bindings":[{"name":"INDEX","type":"inherit","version_id":base_id}]});
+        let expected = prepare_worker_binding_expectation(&base, &metadata).unwrap();
+        assert!(verify_worker_candidate_bindings(&expected, &same).matched);
+        let changed = detail(
+            candidate_id,
+            Some(json!({"enabled":true})),
+            Some("v1"),
+            &"fedcba9876543210".repeat(2),
+        );
+        assert!(!verify_worker_candidate_bindings(&expected, &changed).matched);
+        let outward = serde_json::to_string(&base).unwrap();
+        assert!(outward.contains("cross_version_cache"));
+        assert!(!outward.contains(namespace));
+        assert!(!outward.contains("SearchIndex"));
     }
 
     #[test]

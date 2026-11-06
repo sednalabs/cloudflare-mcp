@@ -339,4 +339,11 @@ Preserved curated tool families:
   validation; absence of secret text in a GET cannot authorize an explicit
   secret upload or attest unknown secret-value equality. Exact-base strict
   inheritance and visible projection drift checks remain required.
+- Worker version cache options are a closed `enabled` plus optional
+  `cross_version_cache` boolean pair. The documented omitted cross-version flag
+  is false. An upload must request the exact base setting before dispatch and
+  prove the candidate retains that setting and the base migration tag. A
+  materialized Durable Object class/namespace is provider evidence only: an
+  upload may preserve it by exact-base inheritance, not explicit binding.
+  Missing, changed or malformed settings and namespace identity fail closed.
 - Queues readback tools (`queues_list`, `queues_get`, `queues_get_metrics`, `queues_list_consumers`, `queues_health`) are first-class contract tools and must remain present for operational backlog/DLQ/consumer diagnostics.

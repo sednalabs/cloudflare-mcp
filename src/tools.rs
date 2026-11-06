@@ -1004,11 +1004,31 @@ pub enum WorkerVersionR2Jurisdiction {
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct WorkerVersionCacheOptions {
+    pub enabled: bool,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "bool")]
+    pub cross_version_cache: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerVersionUploadMetadata {
     pub main_module: String,
     pub compatibility_date: String,
     pub compatibility_flags: Vec<String>,
     pub bindings: Vec<WorkerVersionUploadBinding>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "WorkerVersionCacheOptions")]
+    pub cache_options: Option<WorkerVersionCacheOptions>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -8841,6 +8861,7 @@ impl CloudflareMcp {
             }
         };
         let canonical_binding_metadata = artifact.canonical_metadata.clone();
+        let requested_cache_options = artifact.canonical_metadata.get("cache_options").cloned();
         let expected_compatibility_date = artifact
             .canonical_metadata
             .get("compatibility_date")
@@ -9051,6 +9072,35 @@ impl CloudflareMcp {
             }
             None => unreachable!("exact base detail is required by the pre-state proof"),
         };
+        if pre_state
+            .detail
+            .as_ref()
+            .is_none_or(|detail| !detail.matches_cache_options(requested_cache_options.as_ref()))
+        {
+            return Ok(finalize_mutation_result(
+                CallToolResult::structured_error(json!({
+                    "ok": false,
+                    "operation": "workers_upload_version",
+                    "error": {
+                        "code": "workers.version_upload_cache_preimage_mismatch",
+                        "message": "reviewed cache options did not exactly preserve the base version",
+                        "hint": "Use the captured base cache settings; this guarded route does not change them.",
+                    },
+                    "approval": consumed_approval,
+                    "local_mutation_performed": true,
+                    "deployment_created": false,
+                    "provider_request_lifecycle": {
+                        "request_prepared": false,
+                        "dispatch_attempted": false,
+                        "provider_response_received": false,
+                        "provider_response_body_complete": false,
+                    },
+                })),
+                &plan,
+                audit,
+                false,
+            ));
+        }
         let mut dispatch_attempt = match prepare_worker_version_dispatch_attempt(&attempt_input) {
             Ok(attempt) => attempt,
             Err(error) => {
@@ -9112,7 +9162,12 @@ impl CloudflareMcp {
         let dispatch_base_matches = dispatch_pre_state
             .detail
             .as_ref()
-            .is_some_and(|detail| detail.script_etag == args.base_version_etag);
+            .zip(pre_state.detail.as_ref())
+            .is_some_and(|(detail, base)| {
+                detail.script_etag == args.base_version_etag
+                    && detail.runtime_projection_sha256 == base.runtime_projection_sha256 // DevSkim: ignore DS197836 -- digest of complete runtime evidence, not a time-based secret.
+                    && detail.binding_projection_sha256 == base.binding_projection_sha256
+            });
         if dispatch_pre_state.versions.semantic_snapshot_sha256
             != args.pre_upload_version_snapshot_sha256
             || dispatch_pre_state.deployments.semantic_snapshot_sha256
@@ -9377,6 +9432,11 @@ impl CloudflareMcp {
         let runtime_matches = runtime_verification
             .as_ref()
             .is_some_and(|verification| verification.matched);
+        let runtime_preserved = pre_state
+            .detail
+            .as_ref()
+            .zip(post_state.detail.as_ref())
+            .is_some_and(|(base, candidate)| base.preserves_runtime_settings(candidate));
         let exact_candidate = added.len() == 1
             && added[0].as_str() == upload.candidate_version_id
             && pre_ids.is_subset(&post_ids)
@@ -9390,6 +9450,7 @@ impl CloudflareMcp {
             || !post_detail_matches
             || !bindings_match
             || !runtime_matches
+            || !runtime_preserved
             || !deployments_unchanged
         {
             return Ok(finalize_mutation_result(
@@ -9407,6 +9468,7 @@ impl CloudflareMcp {
                     "dispatch_attempt_authority": terminal_attempt,
                     "binding_verification_matched": bindings_match,
                     "runtime_verification_matched": runtime_matches,
+                    "runtime_preservation_matched": runtime_preserved,
                     "provider_request_lifecycle": {
                         "request_prepared": true,
                         "dispatch_attempted": true,

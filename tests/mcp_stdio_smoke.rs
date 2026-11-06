@@ -5460,6 +5460,7 @@ fn spawn_fake_worker_version_api_with_response_fault(
         incomplete_upload_response,
         false,
         false,
+        false,
     )
 }
 
@@ -5469,6 +5470,7 @@ fn spawn_fake_worker_version_api_with_faults(
     incomplete_upload_response: bool,
     deployment_order_drift: bool,
     observed_provider_shape: bool,
+    candidate_cache_drift: bool,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0") // DevSkim: ignore DS162092 -- loopback-only test fixture listener.
         .expect("bind fake Worker version API");
@@ -5658,6 +5660,15 @@ fn spawn_fake_worker_version_api_with_faults(
                         .remove("compatibility_flags");
                     response["result"]["resources"]["script_runtime"]["usage_model"] =
                         json!("standard");
+                    response["result"]["resources"]["script_runtime"]["cache_options"] = json!({"enabled":!(candidate_cache_drift && (method == "POST" || path_without_query.ends_with(candidate_id))),"cross_version_cache":false});
+                    response["result"]["resources"]["script_runtime"]["migration_tag"] =
+                        json!("fixture-v1");
+                    response["result"]["resources"]["bindings"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({"name":"INDEX",
+                            "type":"durable_object_namespace", "class_name":"FixtureIndex",
+                            "namespace_id":"0123456789abcdef".repeat(2)}));
                     response["result"]["metadata"] = json!({
                         "author_email":"", "author_id":"0".repeat(32),
                         "created_on":"2026-07-10T00:00:00Z",
@@ -19771,6 +19782,19 @@ fn workers_upload_version_schema_and_deserialization_are_closed() {
         schema["$defs"][metadata_name]["additionalProperties"],
         json!(false)
     );
+    let cache_schema = resolve_local(
+        schema,
+        &schema["$defs"][metadata_name]["properties"]["cache_options"],
+    );
+    assert_eq!(cache_schema["additionalProperties"], json!(false));
+    assert_eq!(
+        cache_schema["properties"]["enabled"]["type"],
+        json!("boolean")
+    );
+    assert_eq!(
+        cache_schema["properties"]["cross_version_cache"]["type"],
+        json!("boolean")
+    );
     let binding_items = &schema["$defs"][metadata_name]["properties"]["bindings"]["items"];
     assert_ne!(binding_items, &json!(true), "binding items must be typed");
     let binding_schema = resolve_local(schema, binding_items);
@@ -19906,6 +19930,17 @@ fn workers_upload_version_schema_and_deserialization_are_closed() {
         assert_eq!(content["local_mutation_performed"], json!(false));
         assert_eq!(content["provider_calls"], json!(0));
     }
+    let mut cached = base_args.clone();
+    cached["metadata"]["cache_options"] = json!({"enabled":true,"cross_version_cache":false});
+    let response = mcp.call_tool(20, "workers_upload_version", cached.clone());
+    assert_eq!(
+        structured_content(&response)["status"],
+        json!("preview_validated")
+    );
+    cached["metadata"]["cache_options"]["unexpected"] = json!(true);
+    let response = mcp.call_tool(21, "workers_upload_version", cached);
+    assert!(response.to_string().contains("unknown field"), "{response}");
+    assert!(response["error"].is_object() || response["result"]["isError"] == json!(true));
     let mut invalid_phase = base_args;
     invalid_phase["dry_run"] = json!(false);
     let response = mcp.call_tool(9, "workers_upload_version", invalid_phase);
@@ -20043,30 +20078,49 @@ fn workers_upload_version_oversized_private_artifact_error_withholds_exact_size(
 
 #[test]
 fn workers_upload_version_stdio_applies_once_and_proves_disabled_candidate() {
-    assert_worker_version_stdio_apply(false, false);
+    assert_worker_version_stdio_apply(false, false, false, false);
 }
 
 #[test]
 fn workers_upload_version_stdio_supports_observed_provider_response_shapes() {
-    assert_worker_version_stdio_apply(false, true);
+    assert_worker_version_stdio_apply(false, true, false, false);
 }
 
 #[test]
 fn workers_upload_version_stdio_body_loss_preserves_reconciliation_without_retry() {
-    assert_worker_version_stdio_apply(true, false);
+    assert_worker_version_stdio_apply(true, false, false, false);
+}
+
+#[test]
+fn workers_upload_version_stdio_denies_cache_drift_before_post() {
+    assert_worker_version_stdio_apply(false, true, true, false);
+}
+
+#[test]
+fn workers_upload_version_stdio_rejects_changed_cache_after_upload() {
+    assert_worker_version_stdio_apply(false, true, false, true);
 }
 
 fn assert_worker_version_stdio_apply(
     incomplete_upload_response: bool,
     observed_provider_shape: bool,
+    cache_preimage_mismatch: bool,
+    candidate_cache_drift: bool,
 ) {
-    let expected_requests = if incomplete_upload_response { 16 } else { 21 };
+    let expected_requests = if cache_preimage_mismatch {
+        10
+    } else if incomplete_upload_response {
+        16
+    } else {
+        21
+    };
     let (base_url, requests) = spawn_fake_worker_version_api_with_faults(
         expected_requests,
         false,
         incomplete_upload_response,
         false,
         observed_provider_shape,
+        candidate_cache_drift,
     );
     let suffix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -20114,7 +20168,7 @@ fn assert_worker_version_stdio_apply(
         json!("44444444-4444-4444-8444-444444444444")
     );
 
-    let upload_args = json!({
+    let mut upload_args = json!({
         "script_name":"worker-a",
         "base_version_id":base_id,
         "base_version_etag":"a".repeat(64),
@@ -20136,6 +20190,17 @@ fn assert_worker_version_stdio_apply(
         "dry_run":true,
         "reason":"stdio guarded version apply regression"
     });
+    if observed_provider_shape {
+        upload_args["metadata"]["cache_options"] = json!({
+            "enabled": !cache_preimage_mismatch, "cross_version_cache":false
+        });
+        upload_args["metadata"]["bindings"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "name":"INDEX", "type":"inherit", "version_id":base_id
+            }));
+    }
     let dry_run = mcp.call_tool(3, "workers_upload_version", upload_args.clone());
     let dry_run_content = structured_content(&dry_run);
     assert_eq!(dry_run_content["ok"], json!(true), "{dry_run_content}");
@@ -20157,6 +20222,51 @@ fn assert_worker_version_stdio_apply(
     let replay_args = apply_args.clone();
     let apply = mcp.call_tool(5, "workers_upload_version", apply_args);
     let apply_content = structured_content(&apply);
+    if cache_preimage_mismatch {
+        assert_eq!(apply_content["ok"], json!(false), "{apply_content}");
+        assert_eq!(
+            apply_content["error"]["code"],
+            json!("workers.version_upload_cache_preimage_mismatch")
+        );
+        assert_eq!(
+            apply_content["provider_request_lifecycle"]["dispatch_attempted"],
+            json!(false)
+        );
+        let calls = requests.lock().expect("request log lock");
+        assert_eq!(calls.len(), expected_requests);
+        assert!(
+            calls
+                .iter()
+                .all(|request| request["method"] != json!("POST"))
+        );
+        drop(calls);
+        mcp.terminate();
+        fs::remove_dir_all(attempt_root).expect("remove attempt root");
+        fs::remove_dir_all(approval_root).expect("remove approval root");
+        return;
+    }
+    if candidate_cache_drift {
+        assert_eq!(apply_content["ok"], json!(false), "{apply_content}");
+        assert_eq!(
+            apply_content["error"]["code"],
+            json!("workers.version_upload_post_state_conflict")
+        );
+        assert_eq!(apply_content["runtime_preservation_matched"], json!(false));
+        assert_eq!(apply_content["deployment_created"], json!(false));
+        let calls = requests.lock().expect("request log lock");
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|request| request["method"] == json!("POST"))
+                .count(),
+            1
+        );
+        drop(calls);
+        mcp.terminate();
+        fs::remove_dir_all(attempt_root).expect("remove attempt root");
+        fs::remove_dir_all(approval_root).expect("remove approval root");
+        return;
+    }
     if incomplete_upload_response {
         assert_eq!(apply_content["ok"], json!(false), "{apply_content}");
         assert_eq!(
@@ -20308,7 +20418,7 @@ fn assert_worker_version_stdio_apply(
 #[test]
 fn workers_capture_version_evidence_rejects_same_set_active_order_drift() {
     let (base_url, requests) =
-        spawn_fake_worker_version_api_with_faults(4, false, false, true, false);
+        spawn_fake_worker_version_api_with_faults(4, false, false, true, false, false);
     let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
     let response = mcp.call_tool(
         2,
