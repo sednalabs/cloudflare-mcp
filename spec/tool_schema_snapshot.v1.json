@@ -5752,6 +5752,21 @@
             ],
             "type": "string"
           },
+          "WorkerVersionCacheOptions": {
+            "additionalProperties": false,
+            "properties": {
+              "cross_version_cache": {
+                "type": "boolean"
+              },
+              "enabled": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "enabled"
+            ],
+            "type": "object"
+          },
           "WorkerVersionR2Jurisdiction": {
             "enum": [
               "eu",
@@ -6283,6 +6298,9 @@
                   "$ref": "#/$defs/WorkerVersionUploadBinding"
                 },
                 "type": "array"
+              },
+              "cache_options": {
+                "$ref": "#/$defs/WorkerVersionCacheOptions"
               },
               "compatibility_date": {
                 "type": "string"

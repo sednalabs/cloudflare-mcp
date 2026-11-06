@@ -9,8 +9,9 @@ use crate::worker_upload::{
 };
 
 const MAX_BINDINGS: usize = 256;
-const ALLOWED_VERSION_METADATA_FIELDS: [&str; 4] = [
+const ALLOWED_VERSION_METADATA_FIELDS: [&str; 5] = [
     "bindings",
+    "cache_options",
     "compatibility_date",
     "compatibility_flags",
     "main_module",
@@ -192,7 +193,7 @@ fn canonicalize_version_metadata(
         return Err(version_upload_error(
             "workers.version_upload_metadata_unknown_field",
             "metadata contained a field outside the closed guarded version-upload contract",
-            "Provide only main_module, compatibility_date, compatibility_flags, and the complete bindings array.",
+            "Provide only main_module, compatibility_date, compatibility_flags, cache_options, and the complete bindings array.",
         ));
     }
     let main_module = metadata
@@ -259,6 +260,12 @@ fn canonicalize_version_metadata(
         })?;
     let mut canonical_metadata = Map::new();
     canonical_metadata.insert("bindings".to_string(), Value::Array(Vec::new()));
+    if let Some(cache_options) = metadata.get("cache_options") {
+        canonical_metadata.insert(
+            "cache_options".to_string(),
+            canonicalize_cache_options(cache_options)?,
+        );
+    }
     canonical_metadata.insert(
         "compatibility_date".to_string(),
         Value::String(compatibility_date.to_string()),
@@ -360,6 +367,31 @@ fn canonical_compatibility_date(value: &str) -> bool {
 pub(crate) fn canonicalize_provider_binding(
     binding: &Map<String, Value>,
 ) -> Result<Map<String, Value>, WorkerUploadError> {
+    // A materialized Durable Object binding is accepted only as provider
+    // evidence. Uploads may preserve it solely by exact-version inheritance;
+    // an explicit binding or an unresolved provider inherit remains denied.
+    if binding.get("type").and_then(Value::as_str) == Some("durable_object_namespace") {
+        require_only_fields(binding, &["name", "type", "class_name", "namespace_id"])?;
+        let name = required_nonempty_string(binding, "name")?;
+        canonical_binding_name(name).ok_or_else(binding_invalid)?;
+        let class_name = required_nonempty_string(binding, "class_name")?;
+        let namespace_id = required_nonempty_string(binding, "namespace_id")?;
+        if class_name.len() > 128
+            || !class_name.bytes().enumerate().all(|(i, byte)| {
+                byte.is_ascii_alphabetic()
+                    || byte == b'_'
+                    || byte == b'$'
+                    || (i > 0 && byte.is_ascii_digit())
+            })
+            || !matches!(namespace_id.len(), 32 | 64)
+            || !namespace_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(binding_invalid());
+        }
+        return Ok(binding.clone());
+    }
     // Version GET responses deliberately omit secret bytes. This representation
     // proves only the visible descriptor; it must never become an upload input.
     if binding.get("type").and_then(Value::as_str) == Some("secret_text")
@@ -381,6 +413,48 @@ pub(crate) fn canonicalize_provider_binding(
         ));
     }
     canonicalize_binding(binding, None)
+}
+
+pub(crate) fn canonicalize_cache_options(value: &Value) -> Result<Value, WorkerUploadError> {
+    let options = value.as_object().ok_or_else(|| {
+        version_upload_error(
+            "workers.version_cache_options_invalid",
+            "cache_options must be the closed documented boolean object",
+            "Provide enabled and optional cross_version_cache as booleans.",
+        )
+    })?;
+    if options
+        .keys()
+        .any(|key| !matches!(key.as_str(), "enabled" | "cross_version_cache"))
+    {
+        return Err(version_upload_error(
+            "workers.version_cache_options_invalid",
+            "cache_options contained an unsupported field",
+            "Provide only the documented cache options.",
+        ));
+    }
+    let enabled = options
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            version_upload_error(
+                "workers.version_cache_options_invalid",
+                "cache_options.enabled must be a boolean",
+                "Provide the exact reviewed cache setting.",
+            )
+        })?;
+    let cross = match options.get("cross_version_cache") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(version_upload_error(
+                "workers.version_cache_options_invalid",
+                "cache_options.cross_version_cache must be a boolean when present",
+                "Provide the exact reviewed cache setting.",
+            ));
+        }
+    };
+    Ok(json!({"enabled": enabled, "cross_version_cache": cross}))
 }
 
 pub(crate) fn canonicalize_explicit_upload_binding(
@@ -849,10 +923,79 @@ fn version_upload_error(
 mod tests {
     use serde_json::{Value, json};
 
-    use super::{build_worker_version_upload, canonicalize_provider_binding};
+    use super::{
+        build_worker_version_upload, canonicalize_cache_options,
+        canonicalize_explicit_upload_binding, canonicalize_provider_binding,
+    };
     use crate::worker_upload::WorkerUploadInput;
 
     const BASE: &str = "11111111-1111-4111-8111-111111111111";
+
+    #[test]
+    fn cache_options_are_closed_and_default_only_the_documented_cross_version_flag() {
+        assert_eq!(
+            canonicalize_cache_options(&json!({"enabled": true})).unwrap(),
+            json!({"enabled": true, "cross_version_cache": false})
+        );
+        assert_eq!(
+            canonicalize_cache_options(&json!({"enabled": false, "cross_version_cache": true}))
+                .unwrap(),
+            json!({"enabled": false, "cross_version_cache": true})
+        );
+        for invalid in [
+            json!(null),
+            json!({}),
+            json!({"enabled": "true"}),
+            json!({"enabled": true, "cross_version_cache": null}),
+            json!({"enabled": true, "extra": false}),
+        ] {
+            assert!(canonicalize_cache_options(&invalid).is_err());
+        }
+        let metadata = json!({"main_module":"index.js", "compatibility_date":"2026-07-10",
+            "compatibility_flags":[], "bindings":[], "cache_options":{"enabled":true}});
+        let artifact = build_worker_version_upload(
+            WorkerUploadInput {
+                script_path: None,
+                script_content: Some("export default {}"),
+                script_content_base64: None,
+                multipart_path: None,
+                main_module: Some("index.js"),
+                metadata: &metadata,
+                content_type: None,
+            },
+            BASE,
+        )
+        .unwrap();
+        assert_eq!(
+            artifact.canonical_metadata["cache_options"],
+            json!({"enabled":true,"cross_version_cache":false})
+        );
+        let body = String::from_utf8(artifact.body).unwrap();
+        assert!(
+            body.contains("\"cache_options\":{\"cross_version_cache\":false,\"enabled\":true}")
+        );
+    }
+
+    #[test]
+    fn durable_object_provider_binding_is_exact_but_explicit_upload_remains_denied() {
+        let binding = json!({
+            "name":"INDEX", "type":"durable_object_namespace", "class_name":"SearchIndex",
+            "namespace_id":"0123456789abcdef0123456789abcdef"
+        });
+        assert_eq!(
+            Value::Object(canonicalize_provider_binding(binding.as_object().unwrap()).unwrap()),
+            binding
+        );
+        assert!(canonicalize_explicit_upload_binding(binding.as_object().unwrap()).is_err());
+        for invalid in [
+            json!({"name":"INDEX","type":"durable_object_namespace","class_name":"SearchIndex"}),
+            json!({"name":"INDEX","type":"durable_object_namespace","class_name":"SearchIndex","namespace_id":"bad"}),
+            json!({"name":"INDEX","type":"durable_object_namespace","class_name":"9bad","namespace_id":"0123456789abcdef0123456789abcdef"}),
+            json!({"name":"INDEX","type":"durable_object_namespace","class_name":"SearchIndex","namespace_id":"0123456789abcdef0123456789abcdef","script_name":"other"}),
+        ] {
+            assert!(canonicalize_provider_binding(invalid.as_object().unwrap()).is_err());
+        }
+    }
 
     #[test]
     fn module_upload_is_deterministic_and_pins_exact_inherit_base() {

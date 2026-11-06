@@ -1431,17 +1431,24 @@ and [Wrangler's provider types](https://github.com/cloudflare/workers-sdk/blob/m
 2. Call `workers_upload_version` with `dry_run:true`, that exact base and
    pre-state evidence, one reviewed module or multipart artifact, complete
    metadata, and `bindings_inherit:"strict"`. Metadata is a deny-unknown
-   contract containing exactly `main_module`, a valid `compatibility_date`, a
-   duplicate-free `compatibility_flags` array, and the complete `bindings`
-   array. Every binding item must match one tagged, deny-unknown supported-type
+   contract containing `main_module`, a valid `compatibility_date`, a
+   duplicate-free `compatibility_flags` array, the complete `bindings` array,
+   and optional `cache_options`. If the exact base has cache options, supply
+   the same `enabled` and `cross_version_cache` booleans; absent
+   `cross_version_cache` has the documented false default. A mismatch or
+   omission stops before the version POST. This route does not change cache
+   settings. Every binding item must match one tagged, deny-unknown supported-type
    schema before its values reach the stricter runtime canonicalizer. Omission
    is never interpreted as an empty binding plan. Export
-   reconciliation, migrations, durable-object lifecycle inputs, assets/cache
+   reconciliation, migrations, durable-object lifecycle inputs, other assets/cache
    controls, annotations, dependencies, logpush/tails/tags/observability,
    placement, limits, usage model, and other runtime controls are rejected
    before any provider request. Every inherited binding must
    explicitly name the exact base version; never use implicit or `latest`
-   inheritance. For a path artifact, set
+   inheritance. A materialized Durable Object binding with an exact class and
+   namespace ID is supported as read evidence only; it can be uploaded only by
+   strict exact-base inheritance, never as an explicit namespace binding.
+   For a path artifact, set
    `CLOUDFLARE_MCP_WORKER_UPLOAD_ROOT` to an operator-owned mode-0700 directory
    and pass only a canonical relative path beneath it. The MCP opens every
    component descriptor-relatively without following symlinks, then validates,
@@ -1517,7 +1524,9 @@ and [Wrangler's provider types](https://github.com/cloudflare/workers-sdk/blob/m
    requires exactly one new candidate, exact candidate ID/ETag, exact allowed
    compatibility date/flags, response-to-readback script/runtime/version
    metadata projections, and a complete binding projection matching
-   both explicit metadata and exact-base inheritance. If provider detail still
+   both explicit metadata and exact-base inheritance. Candidate cache options
+   and migration tag must equal the base; a mismatch leaves the version
+   disabled and requires reconciliation, not another upload. If provider detail still
    contains an `inherit` binding, stop: this ceremony deliberately rejects it
    rather than pretending to prove an uncaptured recursive inheritance chain.
    It also requires an
