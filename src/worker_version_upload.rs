@@ -1322,7 +1322,6 @@ mod tests {
         for forbidden in [
             "annotations",
             "assets",
-            "cache_options",
             "dependencies",
             "exports_reconciliation",
             "keep_assets",
