@@ -9165,7 +9165,7 @@ impl CloudflareMcp {
             .zip(pre_state.detail.as_ref())
             .is_some_and(|(detail, base)| {
                 detail.script_etag == args.base_version_etag
-                    && detail.runtime_projection_sha256 == base.runtime_projection_sha256
+                    && detail.runtime_projection_sha256 == base.runtime_projection_sha256 // DevSkim: ignore DS197836 -- digest of complete runtime evidence, not a time-based secret.
                     && detail.binding_projection_sha256 == base.binding_projection_sha256
             });
         if dispatch_pre_state.versions.semantic_snapshot_sha256

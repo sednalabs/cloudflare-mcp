@@ -2458,7 +2458,8 @@ mod tests {
     fn inherited_durable_object_and_version_cache_must_preserve_the_exact_base() {
         let base_id = "11111111-1111-4111-8111-111111111111";
         let candidate_id = "22222222-2222-4222-8222-222222222222";
-        let namespace = "0123456789abcdef0123456789abcdef";
+        let namespace_value = "0123456789abcdef".repeat(2);
+        let namespace = namespace_value.as_str();
         let detail = |id: &str, options: Option<Value>, tag: Option<&str>, ns: &str| {
             let mut rt = runtime();
             if let Some(options) = options {
@@ -2523,7 +2524,7 @@ mod tests {
             candidate_id,
             Some(json!({"enabled":true})),
             Some("v1"),
-            "fedcba9876543210fedcba9876543210",
+            &"fedcba9876543210".repeat(2),
         );
         assert!(!verify_worker_candidate_bindings(&expected, &changed).matched);
         let outward = serde_json::to_string(&base).unwrap();

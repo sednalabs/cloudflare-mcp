@@ -5668,7 +5668,7 @@ fn spawn_fake_worker_version_api_with_faults(
                         .unwrap()
                         .push(json!({"name":"INDEX",
                             "type":"durable_object_namespace", "class_name":"FixtureIndex",
-                            "namespace_id":"0123456789abcdef0123456789abcdef"}));
+                            "namespace_id":"0123456789abcdef".repeat(2)}));
                     response["result"]["metadata"] = json!({
                         "author_email":"", "author_id":"0".repeat(32),
                         "created_on":"2026-07-10T00:00:00Z",

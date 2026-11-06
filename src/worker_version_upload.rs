@@ -980,7 +980,7 @@ mod tests {
     fn durable_object_provider_binding_is_exact_but_explicit_upload_remains_denied() {
         let binding = json!({
             "name":"INDEX", "type":"durable_object_namespace", "class_name":"SearchIndex",
-            "namespace_id":"0123456789abcdef0123456789abcdef"
+            "namespace_id":"0123456789abcdef".repeat(2)
         });
         assert_eq!(
             Value::Object(canonicalize_provider_binding(binding.as_object().unwrap()).unwrap()),
@@ -990,8 +990,8 @@ mod tests {
         for invalid in [
             json!({"name":"INDEX","type":"durable_object_namespace","class_name":"SearchIndex"}),
             json!({"name":"INDEX","type":"durable_object_namespace","class_name":"SearchIndex","namespace_id":"bad"}),
-            json!({"name":"INDEX","type":"durable_object_namespace","class_name":"9bad","namespace_id":"0123456789abcdef0123456789abcdef"}),
-            json!({"name":"INDEX","type":"durable_object_namespace","class_name":"SearchIndex","namespace_id":"0123456789abcdef0123456789abcdef","script_name":"other"}),
+            json!({"name":"INDEX","type":"durable_object_namespace","class_name":"9bad","namespace_id":"0123456789abcdef".repeat(2)}),
+            json!({"name":"INDEX","type":"durable_object_namespace","class_name":"SearchIndex","namespace_id":"0123456789abcdef".repeat(2),"script_name":"other"}),
         ] {
             assert!(canonicalize_provider_binding(invalid.as_object().unwrap()).is_err());
         }
