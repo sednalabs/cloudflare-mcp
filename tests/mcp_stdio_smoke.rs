@@ -7724,6 +7724,45 @@ fn d1_validate_query_works_through_stdio_boundary_without_executing_user_query()
 }
 
 #[test]
+fn d1_validate_query_scopes_declared_cte_columns_through_stdio() {
+    let base_url = spawn_fake_cloudflare_api();
+    let mut mcp = McpStdioProcess::start_with_env(vec![("CLOUDFLARE_MCP_API_BASE_URL", base_url)]);
+    let response = mcp.call_tool(
+        2,
+        "d1_validate_query",
+        json!({
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "sql": "WITH candidate(path) AS (SELECT value FROM json_each(?)) SELECT id FROM submissions WHERE id IN (SELECT path FROM candidate)",
+            "include_query_plan": false
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(true), "{content}");
+    assert_eq!(content["executed_user_query"], json!(false));
+    assert_eq!(
+        content["validation"]["referenced_functions"],
+        json!(["json_each"])
+    );
+
+    let response = mcp.call_tool(
+        3,
+        "d1_validate_query",
+        json!({
+            "database_id": "123e4567-e89b-42d3-a456-426614174000",
+            "sql": "WITH candidate(path) AS (SELECT value FROM json_each(?)) SELECT path FROM submissions WHERE id IN (SELECT path FROM candidate)",
+            "include_query_plan": false
+        }),
+    );
+    let content = structured_content(&response);
+    assert_eq!(content["ok"], json!(false), "{content}");
+    assert_eq!(content["executed_user_query"], json!(false));
+    assert_eq!(
+        content["validation"]["error"]["missing_columns"],
+        json!(["path"])
+    );
+}
+
+#[test]
 fn d1_apply_migrations_retires_live_mutation_through_stdio_boundary() {
     let (base_url, requests) = spawn_fake_d1_migrations_api(3, false);
     let dir = PathBuf::from("/tmp").join(format!("cloudflare-mcp-d1-stdio-{}", std::process::id()));
