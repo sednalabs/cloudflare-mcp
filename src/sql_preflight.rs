@@ -193,6 +193,7 @@ fn referenced_sql_columns(sql: &str) -> Vec<String> {
         .collect::<BTreeSet<_>>();
     let cte_definitions = sql_cte_definitions(sql);
     let cte_names = cte_definitions.keys().cloned().collect::<BTreeSet<_>>();
+    let cte_declarations = sql_cte_declaration_identifiers(&tokens);
     let aliases = sql_aliases(sql);
     let virtual_source_aliases = sql_virtual_source_aliases(sql);
     for (index, token) in tokens.iter().enumerate() {
@@ -244,7 +245,7 @@ fn referenced_sql_columns(sql: &str) -> Vec<String> {
             || is_virtual_output_column_at(&tokens, index)
             || is_cte_output_column_at(&tokens, index, &cte_definitions)
             || (cte_names.contains(token) && is_source_identifier_at(&tokens, index))
-            || (cte_names.contains(token) && is_cte_definition_identifier_at(&tokens, index))
+            || cte_declarations.contains(&index)
         {
             continue;
         }
@@ -440,32 +441,44 @@ fn is_function_name_at(
     )
 }
 
-fn is_cte_definition_identifier_at(tokens: &[SqlToken], index: usize) -> bool {
+fn sql_cte_declaration_identifiers(tokens: &[SqlToken]) -> BTreeSet<usize> {
+    let mut identifiers = BTreeSet::new();
     let mut cursor = match tokens.first() {
         Some(SqlToken::Identifier(keyword)) if keyword == "with" => 1,
-        _ => return false,
+        _ => return identifiers,
     };
     if matches!(tokens.get(cursor), Some(SqlToken::Identifier(keyword)) if keyword == "recursive") {
         cursor += 1;
     }
 
     loop {
-        if cursor == index {
-            return true;
-        }
+        let name_index = cursor;
         if !matches!(tokens.get(cursor), Some(SqlToken::Identifier(_))) {
-            return false;
+            return identifiers;
         }
         cursor += 1;
 
+        let mut column_indices = Vec::new();
         if matches!(tokens.get(cursor), Some(SqlToken::Symbol('('))) {
             let Some(after_columns) = skip_parenthesized_tokens(tokens, cursor) else {
-                return false;
+                return identifiers;
             };
+            for (offset, token) in tokens[cursor + 1..after_columns - 1].iter().enumerate() {
+                if offset % 2 == 0 && matches!(token, SqlToken::Identifier(_)) {
+                    column_indices.push(cursor + 1 + offset);
+                } else if offset % 2 == 1 && matches!(token, SqlToken::Symbol(',')) {
+                    continue;
+                } else {
+                    return identifiers;
+                }
+            }
+            if column_indices.is_empty() || after_columns - cursor != column_indices.len() * 2 + 1 {
+                return identifiers;
+            }
             cursor = after_columns;
         }
         if !matches!(tokens.get(cursor), Some(SqlToken::Identifier(keyword)) if keyword == "as") {
-            return false;
+            return identifiers;
         }
         cursor += 1;
         if matches!(tokens.get(cursor), Some(SqlToken::Identifier(keyword)) if keyword == "materialized")
@@ -477,17 +490,19 @@ fn is_cte_definition_identifier_at(tokens: &[SqlToken], index: usize) -> bool {
             cursor += 2;
         }
         if !matches!(tokens.get(cursor), Some(SqlToken::Symbol('('))) {
-            return false;
+            return identifiers;
         }
         let Some(after_body) = skip_parenthesized_tokens(tokens, cursor) else {
-            return false;
+            return identifiers;
         };
+        identifiers.insert(name_index);
+        identifiers.extend(column_indices);
         cursor = after_body;
         if matches!(tokens.get(cursor), Some(SqlToken::Symbol(','))) {
             cursor += 1;
             continue;
         }
-        return false;
+        return identifiers;
     }
 }
 
@@ -1189,11 +1204,13 @@ fn skip_parenthesized_tokens(tokens: &[SqlToken], open_index: usize) -> Option<u
 fn sql_function_names(sql: &str) -> BTreeSet<String> {
     let tokens = sql_tokens(sql);
     let keywords = sql_validation_keywords();
+    let cte_declarations = sql_cte_declaration_identifiers(&tokens);
     tokens
         .windows(2)
-        .filter_map(|window| match (&window[0], &window[1]) {
+        .enumerate()
+        .filter_map(|(index, window)| match (&window[0], &window[1]) {
             (SqlToken::Identifier(name), SqlToken::Symbol('('))
-                if !keywords.contains(name.as_str()) =>
+                if !keywords.contains(name.as_str()) && !cte_declarations.contains(&index) =>
             {
                 Some(name.clone())
             }
@@ -1682,6 +1699,59 @@ mod tests {
         assert_eq!(validation["ok"], json!(true));
         assert_eq!(validation["referenced_tables"], json!(["users"]));
         assert_eq!(validation["referenced_columns"], json!(["id"]));
+    }
+
+    #[test]
+    fn nested_cte_consumers_accept_declared_columns_without_listing_fake_functions() {
+        let schema = json!({
+            "objects": [{"type": "table", "name": "article_catalog"}],
+            "columns": [
+                {"column_name": "id"},
+                {"column_name": "canonical_path"},
+                {"column_name": "slug"}
+            ]
+        });
+        let sql = "WITH candidate(path) AS (SELECT value FROM json_each(?)), candidate_slug(slug) AS (SELECT value FROM json_each(?)) SELECT DISTINCT a.id FROM article_catalog a WHERE a.canonical_path IN (SELECT path FROM candidate) OR a.slug IN (SELECT slug FROM candidate_slug) ORDER BY a.id LIMIT 101 OFFSET 0";
+
+        let validation = validate_sql_against_schema(sql, &schema, "d1");
+
+        assert_eq!(validation["ok"], json!(true));
+        assert_eq!(validation["referenced_tables"], json!(["article_catalog"]));
+        assert_eq!(
+            validation["referenced_columns"],
+            json!(["canonical_path", "id", "slug"])
+        );
+        assert_eq!(validation["referenced_functions"], json!(["json_each"]));
+    }
+
+    #[test]
+    fn cte_declared_columns_do_not_hide_missing_outer_columns() {
+        let schema = json!({
+            "objects": [{"type": "table", "name": "article_catalog"}],
+            "columns": [{"column_name": "id"}]
+        });
+        let sql = "WITH candidate(path) AS (SELECT value FROM json_each(?)) SELECT path FROM article_catalog WHERE id IN (SELECT path FROM candidate)";
+
+        let validation = validate_sql_against_schema(sql, &schema, "d1");
+
+        assert_eq!(validation["ok"], json!(false));
+        assert_eq!(validation["error"]["missing_columns"], json!(["path"]));
+    }
+
+    #[test]
+    fn cte_column_declaration_does_not_hide_a_real_same_named_function() {
+        let schema = json!({"objects": [], "columns": []});
+        let validation = validate_sql_against_schema(
+            "WITH candidate(path) AS (SELECT value FROM json_each(?)) SELECT candidate(1) FROM candidate",
+            &schema,
+            "d1",
+        );
+
+        assert_eq!(validation["ok"], json!(true));
+        assert_eq!(
+            validation["referenced_functions"],
+            json!(["candidate", "json_each"])
+        );
     }
 
     #[test]
